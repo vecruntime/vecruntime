@@ -43,18 +43,18 @@ defaults for both engines: 1,800.5 s against Apache Spark's 2,207.3 s (1.23x, ge
 ### Changed
 
 - **AQE sees Spark-scale map output sizes for our exchanges** (#511, #514): new keys
-  `spark.vector.shuffle.aqe.mapSizeScaling` (default `true`) and
-  `spark.vector.shuffle.aqe.sparkCompressionRatio` (default `0`, the uncompressed-bytes ratio). Our
+  `spark.vecruntime.shuffle.aqe.mapSizeScaling` (default `true`) and
+  `spark.vecruntime.shuffle.aqe.sparkCompressionRatio` (default `0`, the uncompressed-bytes ratio). Our
   columnar shuffle is 1.6-4.3x smaller than Spark's for the same rows, and AQE had packed up to twice
   Spark's rows into a task; TPC-DS q67 went from 92 s with a 115 GB spill to 39 s with none.
-- **The aggregate spill budget defaults to 1g**, the sort's (`spark.vector.agg.spillThreshold`, #512).
+- **The aggregate spill budget defaults to 1g**, the sort's (`spark.vecruntime.agg.spillThreshold`, #512).
 - **Rebalance exchanges (the Iceberg write)**: AQE sizes the partitions by rows (#485), and the
   advisory size is scaled to our shuffle's bytes per row, with measured string bytes (#495, #506;
-  `spark.vector.shuffle.rebalance.advisoryScaling`, `spark.vector.shuffle.rebalance.rowSizing`).
+  `spark.vecruntime.shuffle.rebalance.advisoryScaling`, `spark.vecruntime.shuffle.rebalance.rowSizing`).
 - **The shuffle no longer fsyncs its map outputs**, as Spark does not (#496); on the Iceberg CDC MERGE
   that was the last gap to Spark on the scan stage.
 - **Shuffle writer**: scatter-based staged flush, warmed kernels, scatter in 64K-row chunks, off by
-  default (`spark.vector.shuffle.writer.scatterFlush`, #487, #488, #490).
+  default (`spark.vecruntime.shuffle.writer.scatterFlush`, #487, #488, #490).
 - **Platform**: `VectorMask.fromLong` masks only on AVX-512; on Graviton's SVE the native compress path
   stays (#484). The cluster image builds for x86-64 or arm64 (#481).
 
