@@ -4,7 +4,7 @@
   <parent>
     <groupId>io.github.vecruntime</groupId>
     <artifactId>vecruntime-parent</artifactId>
-    <version>0.0.2</version>
+    <version>0.0.3-SNAPSHOT</version>
   </parent>
   <artifactId>vecruntime-shuffle_2.13</artifactId>
   <name>vecruntime-shuffle</name>

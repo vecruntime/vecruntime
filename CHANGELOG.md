@@ -4,6 +4,8 @@ All notable changes to vecruntime. The format follows [Keep a Changelog](https:/
 the project uses [semantic versioning](https://semver.org/) once it reaches 1.0 -- until then a minor
 version may change configuration keys or defaults, always noted here.
 
+## Unreleased
+
 ## 0.0.2 -- 2026-09-26
 
 The first release as **vecruntime** (previously spark-vector); the repository moved to
