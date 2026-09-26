@@ -41,9 +41,9 @@ demand through `benchmarks/scripts/run-spark-sql-tests.sh`.
   `spark-sql-tests/src/test/resources/vector-sql-coverage.tsv` (#17). A case whose accelerated count
   dropped **fails the suite**, naming the case, because a fallback introduced by a planner change is
   otherwise invisible. Cases above the floor are listed; `SQL_TESTS_UPDATE_BASELINE=true` rewrites it.
-  As documented, of the ~33,856 query executions across the suite, 2,972 ran at least one vecruntime
-  operator; the per-case table splits the cases into the 147 that run one of our operators and the
-  437 that never can (analyzer-only cases, DDL, files with no supported operator). A filtered run
+  The checked-in floor covers 584 test cases: 164 run at least one vecruntime operator (4,219
+  accelerated executions in total; the full run on 0.0.2 measured 4,231 of 33,856), and 420 never can
+  (analyzer-only cases, DDL, files with no supported operator). A filtered run
   (a name regex as the first argument) skips the floor comparison.
 - The suite earns its keep: its runs have caught real correctness bugs the hand-written suites
   missed — eager `nanvl` second-argument evaluation, `count(DISTINCT)` over literal arguments,
