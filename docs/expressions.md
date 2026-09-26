@@ -10,6 +10,10 @@ incompatibility that still makes it fall back where one exists. Modelled on Come
 [Spark Expression Support](https://datafusion.apache.org/comet/user-guide/latest/expressions.html)
 page; the companion for operators is [docs/operators.md](operators.html).
 
+For the tested-against-Spark subset — the exact cases that run on vecruntime versus fall back, taken
+from the ported Comet suites — see the [Compatibility matrix](compatibility.html), and
+[Testing & correctness](testing.html) for how it is all validated.
+
 **How to read it.** `ExpressionCompiler.compile` (`spark/src/main/scala/io/vecruntime/spark/expr/`)
 is one `match` over Catalyst expressions. Every case either produces a `VectorExpr` node with a kernel
 behind it or returns a `Left(reason)`; the reason is what the operator records (`VectorFallback`), what

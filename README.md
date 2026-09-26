@@ -849,6 +849,11 @@ the `spark-sql` tests jar, unpacks its `sql-tests/` golden files and `test-data/
 `spark.sql.extensions` to ours and requires every golden result to match whether an operator was
 converted or not. Run it on demand, whole or by a regex over test-case names:
 
+The site documents this end to end: [Testing & correctness](https://vecruntime.github.io/vecruntime/testing.html)
+covers the golden suite, the ported Comet matrices and the benchmark checksums, and the
+[Compatibility matrix](https://vecruntime.github.io/vecruntime/compatibility.html) lists what runs on
+vecruntime versus falls back, row by row.
+
 ```bash
 benchmarks/scripts/run-spark-sql-tests.sh                 # everything
 benchmarks/scripts/run-spark-sql-tests.sh '^(group-by|join|decimal)'
@@ -860,10 +865,10 @@ A few files are excluded by default (`VectorSQLQueryTestSuite.defaultExclude`): 
 whose golden output is Spark's own physical plan, the DataSketches files (`hll`, `kllquantiles`,
 `thetasketch`), whose library refuses to start on any JDK newer than 21, and `udtf/udtf.sql`, which
 needs `pyspark` installed (the Python UDF variants skip themselves without it and count as ignored).
-Everything else passes: 642 test cases, 111 ignored, with 2972 of the 33856 query executions running
+Everything else passes: 642 test cases, 111 ignored, with 4231 of the 33856 query executions running
 at least one vecruntime operator. Passing is the low bar -- a file passes just as well when every
 operator falls back -- so the run also prints a per-test-case table (executions, executions that ran
-one of our operators, operators) split into the 147 cases that run our operators and the 437 that never
+one of our operators, operators) split into the 164 cases that run our operators and the 420 that never
 can (analyzer-only cases, DDL, files with no supported operator), and a full run compares every case
 with the checked-in floor `spark-sql-tests/src/test/resources/vector-sql-coverage.tsv`: a case that
 lost accelerated executions fails the suite, naming the case, because a fallback introduced by a planner
