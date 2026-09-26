@@ -17,7 +17,12 @@ package io.vecruntime.spark
 
 import io.vecruntime.spark.test.{TestTables, VectorQuerySuite}
 import org.apache.spark.sql.execution.window.{WindowExec, WindowGroupLimitExec}
-import org.apache.spark.sql.vector.{VectorFilterExec, VectorProjectExec, VectorWindowExec, VectorWindowGroupLimitExec}
+import org.apache.spark.sql.vecruntime.{
+  VectorFilterExec,
+  VectorProjectExec,
+  VectorWindowExec,
+  VectorWindowGroupLimitExec
+}
 
 /** Window functions (#58), first layer: row_number, rank, dense_rank over sorted input. */
 class VectorWindowSuite extends VectorQuerySuite {
@@ -129,7 +134,7 @@ class VectorWindowSuite extends VectorQuerySuite {
       )
       assert(nodesOf[VectorWindowGroupLimitExec](df).isEmpty, finalPlan(df).treeString)
     }
-    withConf("spark.vector.exec.window.enabled" -> "false") {
+    withConf("spark.vecruntime.exec.window.enabled" -> "false") {
       val df = withPlugin(enabled = true) {
         val d = spark.sql(
           "SELECT s, i, rk FROM (SELECT s, i, rank() OVER (PARTITION BY s ORDER BY l DESC) AS rk FROM t) w WHERE rk <= 3"
@@ -370,7 +375,7 @@ class VectorWindowSuite extends VectorQuerySuite {
       Seq(Window),
       "running frame for stddev not supported"
     )
-    withConf("spark.vector.exec.window.enabled" -> "false") {
+    withConf("spark.vecruntime.exec.window.enabled" -> "false") {
       val df = withPlugin(enabled = true) {
         val d = spark.sql("SELECT i, rank() OVER (PARTITION BY s ORDER BY i) AS rk FROM t"); d.collect(); d
       }

@@ -21,7 +21,7 @@ import org.apache.spark.sql.{DataFrame, Row, SparkSession}
 import org.apache.spark.sql.execution.{ColumnarToRowExec, RowToColumnarExec, SparkPlan}
 import org.apache.spark.sql.execution.adaptive.{AdaptiveSparkPlanExec, AQEShuffleReadExec, QueryStageExec}
 import org.apache.spark.sql.execution.exchange.ShuffleExchangeExec
-import org.apache.spark.sql.vector.VectorShuffleExchangeExec
+import org.apache.spark.sql.vecruntime.VectorShuffleExchangeExec
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.funsuite.AnyFunSuite
 
@@ -47,9 +47,9 @@ class VectorShuffleSuite extends AnyFunSuite with BeforeAndAfterAll {
       .config("spark.sql.shuffle.partitions", "6")
       .config("spark.sql.warehouse.dir", tempDir.resolve("wh").toString)
       .config("spark.plugins", "io.vecruntime.spark.VectorPlugin")
-      .config("spark.shuffle.manager", "org.apache.spark.sql.vector.shuffle.VectorShuffleManager")
-      .config("spark.vector.shuffle.enabled", "true")
-      .config("spark.vector.exec.strictFloatingPoint", "true")
+      .config("spark.shuffle.manager", "org.apache.spark.sql.vecruntime.shuffle.VectorShuffleManager")
+      .config("spark.vecruntime.shuffle.enabled", "true")
+      .config("spark.vecruntime.exec.strictFloatingPoint", "true")
       .getOrCreate()
     val data = spark.range(0, 20000).selectExpr(
       "id",
@@ -92,11 +92,11 @@ class VectorShuffleSuite extends AnyFunSuite with BeforeAndAfterAll {
   /** Rows of `sql` with the plugin's shuffle against the same query with the plugin off, order-insensitive. */
   private def checkAgainstSpark(sql: String): Unit = {
     val ours = spark.sql(sql).collect().toSeq.sortBy(_.toString)
-    val theirs = spark.sessionState.conf.setConfString("spark.vector.enabled", "false")
+    val theirs = spark.sessionState.conf.setConfString("spark.vecruntime.enabled", "false")
     try {
       val expected = spark.sql(sql).collect().toSeq.sortBy(_.toString)
       assert(ours === expected, sql)
-    } finally spark.sessionState.conf.setConfString("spark.vector.enabled", "true")
+    } finally spark.sessionState.conf.setConfString("spark.vecruntime.enabled", "true")
   }
 
   private def assertOurExchange(df: DataFrame, expectedCount: Int = 1): SparkPlan = {
@@ -145,7 +145,7 @@ class VectorShuffleSuite extends AnyFunSuite with BeforeAndAfterAll {
     assert(exchanges(plan).exists(_.isInstanceOf[VectorShuffleExchangeExec]), s"expected our exchange in\n$plan")
     assert(exchanges(plan).forall(_.isInstanceOf[VectorShuffleExchangeExec]), s"Spark's exchange survived in\n$plan")
     def rows(enabled: Boolean): Seq[String] = {
-      spark.sessionState.conf.setConfString("spark.vector.enabled", enabled.toString)
+      spark.sessionState.conf.setConfString("spark.vecruntime.enabled", enabled.toString)
       try
         spark.table("st").repartition(
           5,
@@ -153,7 +153,7 @@ class VectorShuffleSuite extends AnyFunSuite with BeforeAndAfterAll {
           org.apache.spark.sql.functions.col("k")
         )
           .selectExpr("spark_partition_id() as p", "k", "st").collect().map(_.toString).toSeq.sorted
-      finally spark.sessionState.conf.setConfString("spark.vector.enabled", "true")
+      finally spark.sessionState.conf.setConfString("spark.vecruntime.enabled", "true")
     }
     assert(rows(enabled = true) === rows(enabled = false))
   }
@@ -210,9 +210,9 @@ class VectorShuffleSuite extends AnyFunSuite with BeforeAndAfterAll {
   test("range partitioning: a global order by is Spark's rows in Spark's order") {
     val sql = "select s, x, k from t order by s desc, x, k limit 5000"
     val ours = spark.sql(sql).collect().toSeq
-    spark.sessionState.conf.setConfString("spark.vector.enabled", "false")
+    spark.sessionState.conf.setConfString("spark.vecruntime.enabled", "false")
     try assert(ours === spark.sql(sql).collect().toSeq)
-    finally spark.sessionState.conf.setConfString("spark.vector.enabled", "true")
+    finally spark.sessionState.conf.setConfString("spark.vecruntime.enabled", "true")
     val plan = collectPlan(spark.sql("select s, x, k from t order by s desc, x, k"))
     assert(exchanges(plan).exists(_.isInstanceOf[VectorShuffleExchangeExec]), s"$plan")
   }

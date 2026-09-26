@@ -24,7 +24,7 @@ import scala.io.Source
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.execution.SparkPlan
 import org.apache.spark.sql.execution.adaptive.{AdaptiveSparkPlanExec, QueryStageExec}
-import org.apache.spark.sql.vector.ui.{Engine, PlanAcceleration}
+import org.apache.spark.sql.vecruntime.ui.{Engine, PlanAcceleration}
 import io.vecruntime.spark.iceberg.IcebergVectorAdapter
 
 /**
@@ -102,8 +102,8 @@ object TpchRunner {
    */
   val VectorFast: Map[String, String] = Map(
     "spark.plugins" -> "io.vecruntime.spark.VectorPlugin",
-    "spark.vector.exec.strictFloatingPoint" -> "false",
-    "spark.vector.exec.sortMergeJoin.mode" -> "auto", // #287: the merge join where the order can show or statistics are missing, the hash rewrite otherwise
+    "spark.vecruntime.exec.strictFloatingPoint" -> "false",
+    "spark.vecruntime.exec.sortMergeJoin.mode" -> "auto", // #287: the merge join where the order can show or statistics are missing, the hash rewrite otherwise
     // #403: the vectorized Parquet reader is what our operators consume (Spark's default, made explicit),
     // and its off-heap column vectors already hold Arrow's fixed-width layout, so those lanes are wrapped
     // in place instead of copied (SF10: q8 1.46 -> 1.14 s, q47 6.28 -> 5.30).
@@ -117,8 +117,8 @@ object TpchRunner {
     "vector" -> VectorFast,
     // #288: our columnar exchange over Arrow IPC files and Arrow Flight, no row conversion around shuffles.
     "vector-shuffle" -> (VectorFast ++ Map(
-      "spark.shuffle.manager" -> "org.apache.spark.sql.vector.shuffle.VectorShuffleManager",
-      "spark.vector.shuffle.enabled" -> "true"
+      "spark.shuffle.manager" -> "org.apache.spark.sql.vecruntime.shuffle.VectorShuffleManager",
+      "spark.vecruntime.shuffle.enabled" -> "true"
     )),
     "comet-scan" -> (Map("spark.plugins" -> "org.apache.spark.CometPlugin") ++ CometScanOnly),
     "comet-scan-vector" -> (VectorFast ++ Map(
@@ -128,15 +128,15 @@ object TpchRunner {
     // Spark's order, so every result equals vanilla Spark's bit for bit. The maintainer's question
     // for the 1 TB runs: what exact agreement costs against the fast mode the benchmarks use.
     "vector-shuffle-strict" -> (VectorFast ++ Map(
-      "spark.shuffle.manager" -> "org.apache.spark.sql.vector.shuffle.VectorShuffleManager",
-      "spark.vector.shuffle.enabled" -> "true",
-      "spark.vector.exec.strictFloatingPoint" -> "true"
+      "spark.shuffle.manager" -> "org.apache.spark.sql.vecruntime.shuffle.VectorShuffleManager",
+      "spark.vecruntime.shuffle.enabled" -> "true",
+      "spark.vecruntime.exec.strictFloatingPoint" -> "true"
     )),
     // #311: Comet's native scan, our operators, and OUR columnar shuffle (#288) -- Comet's shuffle off.
     "comet-scan-vector-ourshuffle" -> (VectorFast ++ Map(
       "spark.plugins" -> "org.apache.spark.CometPlugin,io.vecruntime.spark.VectorPlugin",
-      "spark.shuffle.manager" -> "org.apache.spark.sql.vector.shuffle.VectorShuffleManager",
-      "spark.vector.shuffle.enabled" -> "true"
+      "spark.shuffle.manager" -> "org.apache.spark.sql.vecruntime.shuffle.VectorShuffleManager",
+      "spark.vecruntime.shuffle.enabled" -> "true"
     ) ++ CometScanOnly),
     // Comet scan and Comet native shuffle, everything in between (and the Final aggregate) ours.
     "comet-scan-vector-shuffle" -> (VectorFast ++ Map(
@@ -147,14 +147,14 @@ object TpchRunner {
     // #281: comet-scan-vector-shuffle plus the mixed-chain pass and the shipped allowlist. The allowlist is
     // the repository default (empty until an entry meets the three-part rule of docs/comet.md), and Comet's
     // operator toggles stay off as in the scan-only configurations; a study run turns a candidate on with
-    // `--conf spark.comet.exec.<kind>.enabled=true --conf spark.vector.comet.preferComet=<kind> --label <kind>`.
+    // `--conf spark.comet.exec.<kind>.enabled=true --conf spark.vecruntime.comet.preferComet=<kind> --label <kind>`.
     "hybrid" -> (VectorFast ++ Map(
       "spark.plugins" -> "org.apache.spark.CometPlugin,io.vecruntime.spark.VectorPlugin",
       "spark.shuffle.manager" -> "org.apache.spark.sql.comet.execution.shuffle.CometShuffleManager"
     ) ++
       CometScanOnly ++ Map(
         "spark.comet.exec.shuffle.enabled" -> "true",
-        "spark.vector.comet.mixed.enabled" -> "true",
+        "spark.vecruntime.comet.mixed.enabled" -> "true",
         // Comet's operators take their memory from Spark's off-heap pool; without it Comet's sort grew its
         // native allocation until the kernel killed the JVM (TPC-H q5 at SF10, 12.7 GB resident).
         "spark.memory.offHeap.enabled" -> "true",

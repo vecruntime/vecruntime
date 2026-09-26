@@ -12,22 +12,33 @@ defaults for both engines: 1,800.5 s against Apache Spark's 2,207.3 s (1.23x, ge
 
 ### Changed (breaking)
 
-- **Renamed the code and Maven coordinates to vecruntime.** The plugin class, the Java/Scala
-  packages, and the published artifacts changed; anyone loading the plugin, importing the packages,
-  or depending on the artifacts must update. Old → new:
+- **Renamed everything to vecruntime, a clean break with no aliases or compatibility shims.**
+  Anyone loading the plugin, importing the packages, depending on the artifacts, configuring the
+  shuffle manager, or setting configuration keys or JVM properties must update; the old names are
+  unknown, not accepted. Old → new:
   - Plugin class: `io.sparkvector.spark.VectorPlugin` → `io.vecruntime.spark.VectorPlugin`
     (`--conf spark.plugins=...`).
-  - Packages: `io.sparkvector.*` → `io.vecruntime.*` (kernels, spark, shuffle, benchmarks, sqltests,
-    the Iceberg bridge `io.sparkvector.spark.iceberg` → `io.vecruntime.spark.iceberg`).
-  - Maven groupId: `io.sparkvector` → `io.github.vecruntime`.
-  - Artifacts: `spark-vector-*` → `vecruntime-*` (`vecruntime-parent`, `vecruntime-kernels`,
-    `vecruntime-spark_2.13`, `vecruntime-shuffle_2.13`, `vecruntime-benchmarks`,
-    `vecruntime-spark-sql-tests_2.13`); jar names follow.
-  - **Unchanged:** the `spark.vector.*` configuration keys, the `sparkvector.*` JVM system properties
-    and metric names, and the shuffle manager class
-    `org.apache.spark.sql.vector.shuffle.VectorShuffleManager` (it stays in Spark's namespace to reach
-    package-private APIs); `org.apache.spark.sql.vector.*` and `org.apache.iceberg.*` are unchanged for
-    the same reason.
+  - Java/Scala packages: `io.sparkvector.*` → `io.vecruntime.*` (kernels, spark, shuffle, benchmarks,
+    sqltests, the Iceberg bridge `io.sparkvector.spark.iceberg` → `io.vecruntime.spark.iceberg`).
+  - Maven groupId `io.sparkvector` → `io.github.vecruntime`; artifacts `spark-vector-*` →
+    `vecruntime-*` (`vecruntime-parent`, `vecruntime-kernels`, `vecruntime-spark_2.13`,
+    `vecruntime-shuffle_2.13`, `vecruntime-benchmarks`, `vecruntime-spark-sql-tests_2.13`); jar names
+    follow.
+  - Internal package: `org.apache.spark.sql.vector.*` → `org.apache.spark.sql.vecruntime.*` (the
+    `Vector*Exec` operators, the shuffle exchange, the UI). It stays inside `org.apache.spark.sql`
+    because Spark's `ShuffleManager` and other APIs used here are `private[spark]` / `private[sql]`;
+    class names are unchanged.
+  - Shuffle manager class: `spark.shuffle.manager=org.apache.spark.sql.vector.shuffle.VectorShuffleManager`
+    → `org.apache.spark.sql.vecruntime.shuffle.VectorShuffleManager`. **No alias** — the old class is
+    gone.
+  - Configuration keys: `spark.vector.*` → `spark.vecruntime.*` (every key, e.g.
+    `spark.vector.enabled` → `spark.vecruntime.enabled`, `spark.vector.shuffle.*` →
+    `spark.vecruntime.shuffle.*`, `spark.vector.exec.*` → `spark.vecruntime.exec.*`). No fallback to
+    the old keys.
+  - JVM system properties: `sparkvector.*` → `vecruntime.*` (e.g. `sparkvector.agg.interleave` →
+    `vecruntime.agg.interleave`, `sparkvector.platform` → `vecruntime.platform`).
+  - **Unchanged:** `org.apache.iceberg.*` (Iceberg's package-private APIs) and every Spark / Iceberg /
+    Comet name, including `org.apache.spark.sql.vectorized.*` and `spark.sql.parquet.enableVectorizedReader`.
 
 ### Changed
 

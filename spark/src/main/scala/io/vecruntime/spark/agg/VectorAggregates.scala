@@ -83,7 +83,7 @@ trait VectorAggFunction extends Serializable {
 /**
  * SUM over doubles: buffer `sum` is null until the first non-null input. `strict` selects Spark's
  * rounding (rows added in order into one accumulator) over the faster lane-parallel and interleaved
- * partial sums; see `spark.vector.exec.strictFloatingPoint`.
+ * partial sums; see `spark.vecruntime.exec.strictFloatingPoint`.
  */
 final case class SumDoubleAgg(input: VectorExpr, strict: Boolean) extends VectorAggFunction {
   override def bufferTypes: Seq[DataType] = Seq(DoubleType)
@@ -113,7 +113,7 @@ final case class SumLongAgg(input: VectorExpr, checked: Boolean, queryContext: o
     extends VectorAggFunction {
   override def bufferTypes: Seq[DataType] = Seq(LongType)
   private def overflow(): Nothing =
-    throw org.apache.spark.sql.vector.VectorErrors.arithmeticOverflow("long overflow", "try_sum", queryContext)
+    throw org.apache.spark.sql.vecruntime.VectorErrors.arithmeticOverflow("long overflow", "try_sum", queryContext)
   override def newState(): AggState = new AggState {
     private var sum = 0L
     private var count = 0L
@@ -278,7 +278,7 @@ final case class WideDecimalSumAgg(
         val t = total
         if (t.abs.compareTo(limit) >= 0) {
           if (nullOnOverflow) null
-          else throw org.apache.spark.sql.vector.VectorErrors.decimalPrecisionOverflow(
+          else throw org.apache.spark.sql.vecruntime.VectorErrors.decimalPrecisionOverflow(
             org.apache.spark.sql.types.Decimal(new java.math.BigDecimal(t, bufferType.scale)),
             bufferType.precision,
             bufferType.scale,
@@ -661,12 +661,12 @@ final case class WideDecimalSumMergeAgg(
         else if (overflowed(g)) {
           // A partial that overflowed left a null sum: Spark's CheckOverflowInSum raises on it in ANSI.
           if (nullOnOverflow) null
-          else throw org.apache.spark.sql.vector.VectorErrors.overflowInSumOfDecimal(queryContext)
+          else throw org.apache.spark.sql.vecruntime.VectorErrors.overflowInSumOfDecimal(queryContext)
         } else {
           val t = total(g)
           if (t.abs.compareTo(limit) >= 0) {
             if (nullOnOverflow) null
-            else throw org.apache.spark.sql.vector.VectorErrors.decimalPrecisionOverflow(
+            else throw org.apache.spark.sql.vecruntime.VectorErrors.decimalPrecisionOverflow(
               org.apache.spark.sql.types.Decimal(new java.math.BigDecimal(t, bufferType.scale)),
               bufferType.precision,
               bufferType.scale,
@@ -1047,7 +1047,7 @@ object VectorAggregates {
    * (`Partial`, `Complete`) read the function's input; the merge modes (`PartialMerge`, `Final`)
    * merge the partial buffers (`inputAggBufferAttributes`) found in `input`. What the operator then
    * emits -- buffers or results -- is the planner's decision, not the function's. `strict` is
-   * `spark.vector.exec.strictFloatingPoint` (default on): double sums round exactly like Spark's.
+   * `spark.vecruntime.exec.strictFloatingPoint` (default on): double sums round exactly like Spark's.
    */
   def compile(
       agg: AggregateExpression,

@@ -36,11 +36,11 @@ class PlatformTest {
         boolean predicated = Platform.NAME.equals(Platform.AVX512) || Platform.NAME.equals(Platform.SVE);
         assertEquals(predicated, Platform.NATIVE_COMPRESS);
         // #253: fromLong masks only on AVX-512 (not intrinsified at 128-bit SVE on JDK 25), unless overridden.
-        String maskOverride = System.getProperty("sparkvector.maskRegisters");
+        String maskOverride = System.getProperty("vecruntime.maskRegisters");
         boolean expectedMasks = maskOverride == null ? Platform.NAME.equals(Platform.AVX512) : Boolean.parseBoolean(maskOverride);
         assertEquals(expectedMasks, Platform.MASK_REGISTERS);
         String arch = System.getProperty("os.arch", "");
-        if (System.getProperty("sparkvector.platform") == null && (arch.equals("amd64") || arch.equals("x86_64"))) {
+        if (System.getProperty("vecruntime.platform") == null && (arch.equals("amd64") || arch.equals("x86_64"))) {
             // HotSpot on x86-64 always has some AVX level; the probe must not fall through to "unknown".
             assertTrue(Platform.NAME.equals(Platform.AVX2) || Platform.NAME.equals(Platform.AVX512), Platform.NAME);
             assertTrue(Platform.MAX_VECTOR_BYTES >= 16, "MaxVectorSize " + Platform.MAX_VECTOR_BYTES);
@@ -56,10 +56,10 @@ class PlatformTest {
         assertEquals(Platform.MASK_REGISTERS && lanes >= 4 ? 4 : 1,
                 GroupAssignment.defaultMaskPathMaxGroups());
         assertEquals(Platform.NAME.equals(Platform.AVX512) ? 1 : 4, GroupedAccumulators.defaultInterleave());
-        if (System.getProperty("sparkvector.agg.maskPathMaxGroups") == null) {
+        if (System.getProperty("vecruntime.agg.maskPathMaxGroups") == null) {
             assertEquals(GroupAssignment.defaultMaskPathMaxGroups(), GroupAssignment.LOW_CARDINALITY);
         }
-        String interleave = System.getProperty("sparkvector.agg.interleave");
+        String interleave = System.getProperty("vecruntime.agg.interleave");
         assertEquals("1".equals(interleave), GroupedAccumulators.SEQUENTIAL_SUMS);
         if (interleave == null) {
             assertEquals(GroupedAccumulators.defaultInterleave(), GroupedAccumulators.INTERLEAVE);

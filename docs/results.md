@@ -85,7 +85,7 @@ group re-reads the whole batch, and with 2 lanes a masked reduction is barely fa
 loop. The threshold is now 1 group on ≤4-lane species (8 on wider ones, untested).
 
 The scatter itself is a dependent `sum[g] += x` chain whenever consecutive rows hit the same group.
-Rotating over `sparkvector.agg.interleave` independent accumulator copies (default 4):
+Rotating over `vecruntime.agg.interleave` independent accumulator copies (default 4):
 
 | groups | 1 copy | 2 copies | 4 copies |
 |---:|---:|---:|---:|
@@ -96,7 +96,7 @@ Rotating over `sparkvector.agg.interleave` independent accumulator copies (defau
 +40% at the target case, -10% where the chain was not the bottleneck (one group: every row hits
 the same slot anyway; 16 groups: the load-store forwarding stalls are already rare). Copies are
 summed on read, so double sums round in a different order than Spark's sequential loop; on TPC-H
-Q1 the results differ from Spark's in the 12th significant digit. `spark.vector.exec.strictFloatingPoint`
+Q1 the results differ from Spark's in the 12th significant digit. `spark.vecruntime.exec.strictFloatingPoint`
 (default on, like Comet's `spark.comet.exec.strictFloatingPoint` but with the opposite default) uses
 one copy and sequential reductions for double sums and reproduces Spark's rounding bit for bit, at
 7% of aggregate kernel time (2.5% of Q1 at SF10); the benchmarks set it to `false`.
@@ -114,7 +114,7 @@ profiles, which held in every JFR recording taken for this document.
 noise) rather than the M3 the rest of this document uses; the before/after ratio is the point.
 "Before" encodes only values of ≤8 bytes and bails on a batch holding a longer one; "after" encodes
 any length (64-bit fingerprint plus byte compare) and stops encoding a column for good once its
-dictionary passes `sparkvector.agg.plainDictMaxEntries` (default 512).
+dictionary passes `vecruntime.agg.plainDictMaxEntries` (default 512).
 
 | distinct values | 8-byte keys, before | after | 24-byte keys, before | after |
 |---:|---:|---:|---:|---:|
@@ -243,7 +243,7 @@ plugin trails Spark by 10-20 %; a coverage reading, not a timing one, and not mo
 
 ### The merge join (#286): order-preserving, against the hash rewrite and Spark
 
-`VectorSortMergeJoinExec` under `spark.vector.exec.sortMergeJoin.mode=merge`, measured three ways on
+`VectorSortMergeJoinExec` under `spark.vecruntime.exec.sortMergeJoin.mode=merge`, measured three ways on
 the x86 build host (8 threads, JDK 25).
 
 **Golden files.** Spark's SQL golden-file suite with the merge join: 642 passed, 0 failed. The three
@@ -297,24 +297,24 @@ Spark's row order. Which one a given join gets is #287's decision.
 
 ### The planning mode `auto` (#287): the merge join where the order can show, the hash rewrite otherwise
 
-`spark.vector.exec.sortMergeJoin.mode=auto` decides per sort-merge join in the pre-pass over the plan
+`spark.vecruntime.exec.sortMergeJoin.mode=auto` decides per sort-merge join in the pre-pass over the plan
 (`markSortMergeJoins`). Three things send a join to the merge join: a parent that relies on its
 ordering (a window over the same keys, a merge join above without a shuffle in between); an *order
 that can show* -- the join sits below a `LIMIT`, a `TakeOrderedAndProject`, a `Sort`, or a
 range-partitioned exchange (a global sort's, which is all an adaptive stage sees of the sort above it)
 with no aggregate and no other exchange in between, so the rows a `LIMIT` picks or the tie order under
 `ORDER BY` would differ under the hash rewrite; and a hash rewrite that is not allowed -- no runtime
-statistics, both sides over `spark.vector.join.maxBuildSize`, a skew join -- Everything else takes the hash
+statistics, both sides over `spark.vecruntime.join.maxBuildSize`, a skew join -- Everything else takes the hash
 rewrite; a hash rewrite whose inputs are refused (Spark's operators below) leaves the join to Spark --
 the merge join could read those inputs, but on q97 (a full outer join of two 300k-row unique-key sides
 over Spark's aggregates) it ran 2960 ms against 385 ms for Spark's own merge join, the per-run
 bookkeeping of #286, so it does not take them until it walks runs without a run object. The plan prints the decision on the operator:
-`Sort-merge join as hash join: right side fits spark.vector.join.maxBuildSize by statistics`, `... as
+`Sort-merge join as hash join: right side fits spark.vecruntime.join.maxBuildSize by statistics`, `... as
 merge join: the row order reaches a limit or a sort`, `... ordering relied on by the parent`, `... no
 size statistics for a build side`.
 
 **Golden files.** The Spark SQL golden suite under `auto` (`benchmarks/scripts/run-spark-sql-tests.sh`
-with `-Dspark.vector.exec.sortMergeJoin.mode=auto`): 642 passed, 0 failed, 111 ignored -- including
+with `-Dspark.vecruntime.exec.sortMergeJoin.mode=auto`): 642 passed, 0 failed, 111 ignored -- including
 `subquery/in-subquery/in-limit.sql`, `in-order-by.sql` and `in-set-operations.sql`, the three files the
 hash rewrite alone changes (its tie order). 3891 of 33856 executions ran at least one operator of ours,
 8687 operators in total.
@@ -342,15 +342,15 @@ under `auto` (shown above, condition met); memory accounted through the task mem
 a maintainer's decision); TPC-DS SF10 under `auto` no slower than `hash` (not measured here -- SF1 is a
 wash, SF10 needs the data and a session). The flip itself is one default in `VectorConf.sortMergeJoinMode`;
 this crew leaves it to the maintainer with the two readings it could take. The boolean flag
-`spark.vector.exec.sortMergeJoin.enabled=true` reads as `auto` since #287, and the TPC-DS harness's
+`spark.vecruntime.exec.sortMergeJoin.enabled=true` reads as `auto` since #287, and the TPC-DS harness's
 `vector` configuration runs under `auto`.
 
 ### The columnar shuffle (#288): TPC-H SF10, the row shuffle versus ours
 
 `vector` is the plugin over Spark's row shuffle -- `ColumnarToRowExec` above every shuffled
 operator, `RowToColumnarExec` below its consumer; `vector-shuffle` is the same plugin with
-`spark.shuffle.manager=org.apache.spark.sql.vector.shuffle.VectorShuffleManager` and
-`spark.vector.shuffle.enabled=true`, every exchange above our operators `VectorShuffleExchangeExec`
+`spark.shuffle.manager=org.apache.spark.sql.vecruntime.shuffle.VectorShuffleManager` and
+`spark.vecruntime.shuffle.enabled=true`, every exchange above our operators `VectorShuffleExchangeExec`
 over Arrow IPC files (zstd bodies, 8192-row record batches, dictionary strings) with the Arrow Flight
 data plane in place (all reads are local in this one-JVM run). One session per configuration,
 `local[8]`, 8 GB heap, 8 shuffle partitions, 3 measured iterations after 1 warm-up (a study run in a
@@ -389,7 +389,7 @@ places. Where the exchange used to sit between two of our operators, the row con
 and the operator above reads Arrow batches straight off the wire (Q1 and Q6 are now whole-plan
 accelerated, 7/7 and 5/5, though their shuffles are too small for it to show). Where the plan has
 shuffled joins, the statistics changed them: with `dataSize` reported the way Spark does (the
-uncompressed size), `spark.vector.exec.sortMergeJoin.mode=auto` now sees build sides that fit and
+uncompressed size), `spark.vecruntime.exec.sortMergeJoin.mode=auto` now sees build sides that fit and
 plans hash joins where the row shuffle's estimates made it keep the merge joins -- Q21's two
 `VectorSortMergeJoinExec` (the #310 per-run cost, 271 s of task time in the q21 analysis) became
 `VectorShuffledHashJoinExec`, 38.9 s to 10.5 s; Q3, Q4, Q12, Q18 and Q22 follow the same pattern
@@ -417,14 +417,14 @@ under `local[4]` unit tests:
    bytes and turned every shuffled join into a broadcast join (first run: Q3 12.8 s vs 4.3 s, Q7
    22 s vs 7 s). Every map task now adds what it wrote.
 2. Raw Arrow IPC wrote 1.8x the bytes of Spark's lz4-compressed rows (Q3: 1008 MB vs 551 MB).
-   Record-batch bodies are zstd-compressed (`spark.vector.shuffle.compression`); Arrow's own lz4
+   Record-batch bodies are zstd-compressed (`spark.vecruntime.shuffle.compression`); Arrow's own lz4
    codec is commons-compress pure Java and an order of magnitude slower -- Q3 crawled for fourteen
    minutes under it -- so zstd is the default and lz4 is documented as the slow option. Q3 now
    writes 247 MB.
 3. One record batch per (input batch, partition): 512 rows at 8 partitions, 20 at 200, and the
    per-message costs (Arrow object churn, metadata, a compression call per buffer) made shuffled
    joins 2x slower after fixes 1 and 2. The writer now holds each partition's compacted slices and
-   writes 8192-row record batches with one merged dictionary (`spark.vector.shuffle.batchRows`,
+   writes 8192-row record batches with one merged dictionary (`spark.vecruntime.shuffle.batchRows`,
    `batchBytes`, `bufferBytes`). Q3 went from 8.3 s to 4.0 s, below the row shuffle.
 4. The task-level shuffle read metrics showed zero bytes: Spark's reader merges them in its
    completion iterator and the executor only merges on heartbeats, so ours merges them at task
@@ -488,7 +488,7 @@ the sort's next work, not the join's.)
 `auto`, TPC-DS with every checksum equal to Spark's, and TPC-H SF10 under `auto` not slower than
 without it. Two rules were added on the way and are part of the default (AGENTS 3.6b): the **size
 gate** -- a merge join `auto` would choose is left to Spark unless both inputs have statistics and fit
-`spark.vector.exec.sortMergeJoin.maxInputSize` (1 GiB; the shape that failed the third condition in
+`spark.vecruntime.exec.sortMergeJoin.maxInputSize` (1 GiB; the shape that failed the third condition in
 #287 was q21's merge joins over Spark's spilling row sort) -- and the **build-side rule** -- the hash
 rewrite declines a build side larger than the streamed side (a semi or anti join may only build its
 right side).
@@ -525,7 +525,7 @@ worth far more than that: 37 of the ~90 fallback reasons over Spark's shuffle we
 | a `Union` with no columnar child | 1 | cascade of the above |
 
 **TPC-H SF10** (2 iterations, 1 warmup, doubles schema; `vector` = our operators over Spark's row
-shuffle, `vector-shuffle` = over our columnar shuffle; `off` = `--conf spark.vector.exec.sortMergeJoin.mode=off`,
+shuffle, `vector-shuffle` = over our columnar shuffle; `off` = `--conf spark.vecruntime.exec.sortMergeJoin.mode=off`,
 Spark's own sort-merge join with our operators around it). Medians in ms, ratio = `auto` / `off`:
 
 | query | `vector` off | `vector` auto | ratio | `vector-shuffle` off | `vector-shuffle` auto | ratio |
@@ -568,7 +568,7 @@ Spark's merge join: there the rewrite's build side arrives as rows and is conver
 conversion plus the per-task hash build cost more than Spark's merge over the inputs Spark has already
 sorted. At SF1 (#287) the same rewrite won over Spark's shuffle, so this is a matter of scale, and it
 is recorded here rather than gated on: a deployment without our shuffle manager that sees it can set
-`spark.vector.exec.sortMergeJoin.mode=off` (or `merge`), and the shuffle manager is the configuration
+`spark.vecruntime.exec.sortMergeJoin.mode=off` (or `merge`), and the shuffle manager is the configuration
 this project is heading for.
 
 ### The five configurations (#311 follow-up): TPC-H SF10 and TPC-DS SF1
@@ -577,7 +577,7 @@ The maintainer's matrix after the `auto` default: pure Spark; Spark with our ope
 columnar shuffle (`vector-shuffle`); Comet's native scan feeding our operators over our shuffle
 (`comet-scan-vector-ourshuffle`, new in #324); native Comet; and hybrid (Comet's scan and shuffle,
 ours in between, #279's empty allowlist). One JVM per configuration, 3 iterations after 1 warmup,
-medians in ms, `JVM_MEM=8g`, 8 threads, our configurations with `spark.vector.exec.strictFloatingPoint=false`
+medians in ms, `JVM_MEM=8g`, 8 threads, our configurations with `spark.vecruntime.exec.strictFloatingPoint=false`
 (the runner's `VectorFast`, the counterpart of Comet's default), every checksum equal to Spark's in
 every cell. In parentheses: the ratio to pure Spark and the operators run by our kernels or Comet's
 over the plan's total. A first `vector-shuffle` run ended at q21 under a 13 GB memory cap (8 GB heap
@@ -1394,7 +1394,7 @@ where the engine puts it. Spark ran at 20 g heap / 30 g overhead, `ours` at 30 /
 with 16 g off-heap, Comet at 20 / 6 with 24 g off-heap -- each engine's split follows where it
 allocates, and a plain-Spark leg at 30 g of heap is the check that the reference column is not
 handicapped by its own. Two more Spark legs, 40 / 10 and 30 / 20, and one `ours` leg with the
-prefetching scan converter (#465, `spark.vector.scan.prefetch=2`), all on the v24/v25 images of the
+prefetching scan converter (#465, `spark.vecruntime.scan.prefetch=2`), all on the v24/v25 images of the
 same tree:
 
 | set | Spark 20/30 | Spark 30/20 | Spark 40/10 | Comet | `csvo` | `ours` | `ours` prefetch 2 |
@@ -1440,7 +1440,7 @@ gains q88 141.7 to 129.7, q95 69.3 to 60.4, q94 57.3 to 53.6; losses q78 79.3 to
 each) the task thread waited 28.1 min per scan for converted batches, the helper thread waited
 27.7 min *on the Parquet reader*, and converting took 1.2 min: the conversion this operator overlaps is
 4% of the read, and the queue hand-off plus one batch copy per 710 k batches is the tax the losses
-show. The default stays `spark.vector.scan.prefetch=0`; the operator remains as an opt-in instrument
+show. The default stays `spark.vecruntime.scan.prefetch=0`; the operator remains as an opt-in instrument
 with its three wait metrics. The scan-side cost is the reader, which is also what `csvo`'s wins on
 q88, q95 and q28 measure -- Comet's DataFusion reader, not the Arrow boundary.
 
@@ -1746,10 +1746,10 @@ Doubles: 21 of 22 checksums identical between `spark` and `vector`. Decimals: 22
 double mismatch is Q15, and it is a finding in its own right: the query joins on
 `total_revenue = (select max(total_revenue) ...)`, an equality between two separately computed
 double sums. Spark sums each partition in one order and the two aggregations agree bit for bit;
-our interleaved accumulators (`sparkvector.agg.interleave=4`) can sum the same rows in a different
+our interleaved accumulators (`vecruntime.agg.interleave=4`) can sum the same rows in a different
 order in the two aggregations, the last bits differ, the equality finds nothing and AQE replaces the
 join with an `EmptyRelation` -- `vector` returns 0 rows where Spark returns 1. Over decimals the
-sums are exact and both engines agree. This is why `spark.vector.exec.strictFloatingPoint` exists
+sums are exact and both engines agree. This is why `spark.vecruntime.exec.strictFloatingPoint` exists
 and defaults to on: it restores Spark's order (Q15 returns its row), and the benchmarks turn it off
 to measure the fast sums, which is also what Comet's default does, so the Q15 mismatch stays in the
 reports by design.
@@ -1895,7 +1895,7 @@ and evaluate the equality-delete set as our own `IN` / anti-join over the batch 
 that would move these numbers; recorded here, not implemented (it needs the reader to expose the
 un-applied equality deletes, which the 1.11 API does not).
 
-**The forwarding threshold is not the lever.** `sparkvector.selection.minFraction` decides whether a
+**The forwarding threshold is not the lever.** `vecruntime.selection.minFraction` decides whether a
 filter or project forwards a selection or compacts (0.5: forward when at least half the rows
 survive). On `pos_30` under `vector` (7 iterations) raising it to 0.8 changes nothing on the probes
 (within 3 %); compacting always (1.01) makes `probe-sum` 130 to 112 ms, `probe-group` 160 to 143 ms
@@ -2062,7 +2062,7 @@ Refreshed again after the string, datetime, cast and `try_*` families, nested lo
 and the literal work (#37--#49, #52, #60, #63): **2956 of 4735 operators ours (62%)**, 40 queries at
 75% or more, 47 at 50% or more, and the first fully accelerated query, q9 (every operator ours; its
 plan has no global sort). Sort-merge joins are named in 19 queries. With the opt-in rewrite of
-sort-merge joins into the shuffled hash join (#10, `spark.vector.exec.sortMergeJoin.enabled=true`):
+sort-merge joins into the shuffled hash join (#10, `spark.vecruntime.exec.sortMergeJoin.enabled=true`):
 **3051 of 4682 operators ours (65%)**, 44 queries at 75% or more; 12 queries change -- ten gain
 (q8, q11, q14a, q14b, q25, q29, q31, q54, q72 and q78, q72 from 16/51 to 37/49, q25 and q29 from 14/38
 to 27/36) and two lose a few (q38, q92: adaptive execution re-plans a join as a broadcast join whose
@@ -2148,7 +2148,7 @@ and the per-query readings are the comparable figures, not the raw counts.
 ## Phase 5: q9/q14/q17/q18 against Comet -- profiles and what they changed
 
 Profiling the four SF1 queries where `comet-scan-vector-shuffle` trailed `comet` the most led to
-three changes (plus `spark.vector.exec.strictFloatingPoint`, documented with the aggregation
+three changes (plus `spark.vecruntime.exec.strictFloatingPoint`, documented with the aggregation
 sections above).
 
 **Why q14 was slow: eight tasks rebuilding the same broadcast table.** The q14 JFR profile put 47%
@@ -2194,7 +2194,7 @@ Not measured: this document is written from an Apple M3. The kernels select the 
 preferred vector shape at start-up and the code paths for 4 and 8 double lanes exist (a real
 `compress` for 16-lane int compaction, 256-entry shuffle tables for 8-lane 64-bit types, the
 8-group masked-reduction cut-over), but they were only ever executed emulated:
-`-Dsparkvector.vectorBits=256` and `512` force those shapes on any machine, and the kernel test
+`-Dvecruntime.vectorBits=256` and `512` force those shapes on any machine, and the kernel test
 suite passes at all three widths. Two things worth re-measuring on AVX-512 before trusting the
 defaults: `VectorMask.fromLong` is a single `kmov` there, so the broadcast-AND-compare mask
 construction chosen for NEON may be the slower option; and the masked-reduction threshold of 8
@@ -2445,7 +2445,7 @@ the report prints the same matrix. The x86 host is an 8-vCPU EC2 instance; the k
 
 ## The allowlist decided (#281)
 
-The candidates of `spark.vector.comet.preferComet` measured as the harness's `hybrid` configuration
+The candidates of `spark.vecruntime.comet.preferComet` measured as the harness's `hybrid` configuration
 (`comet-scan-vector-shuffle` plus the mixed pass and one candidate's Comet toggle), TPC-H SF10 on the
 same host and protocol as the #279 matrices above. The decision table with the three rules per entry
 is in `docs/comet.md`. Protocol note: the #279 baselines and the first joins run kept Spark's shuffle
@@ -2482,7 +2482,7 @@ Intel Xeon Platinum 8488C (Sapphire Rapids; 8 vCPUs; AVX-512 F/BW/DQ/VL/VBMI/VNN
 lab's `x86-spr` pool in all but name), Corretto 25.0.4.8.1 (25.0.4.1+8-LTS), base commit `e00cc27`.
 The evidence rule is the project's: a JMH number before and after, at `vectorBits=512` and `256`, and
 under `-XX:UseAVX=2` for the AVX2 row. Both paths of a decision run on the same build, one of them
-forced through `-Dsparkvector.platform` (the probe of `kernels/Platform.java`, which reads HotSpot's
+forced through `-Dvecruntime.platform` (the probe of `kernels/Platform.java`, which reads HotSpot's
 `UseAVX`/`UseSVE`/`MaxVectorSize` once and folds the answer into `static final` booleans the JIT
 constant-folds). Not measured here, for #282/#284: Ice Lake, Genoa (its double-pumped 512 and
 `vpcompress` latency), the Arm pools (the NEON path is untouched by construction), the `hsdis` dumps.
@@ -2515,7 +2515,7 @@ The rule before the lab was `compress` only for the 16-lane species (512-bit int
 shuffle table for every species of 8 lanes or fewer, so on AVX-512 the long and double compactions
 at 512 bits and every compaction at 256 bits took the table. `CompactBenchmark` (rows per
 microsecond, `-wi 2 -i 3 -w 1 -r 1`, 1M rows; both forms on one build through the
-`sparkvector.platform` override, `avx512` = `compress`, `avx2` = the table; the last column is the JIT
+`vecruntime.platform` override, `avx512` = `compress`, `avx2` = the table; the last column is the JIT
 held at `-XX:UseAVX=2`, where `compress` does not exist and the table is the only form):
 
 | type, selectivity, nulls | 512 `compress` | 512 table | 256 `compress` | 256 table | AVX2 table |
@@ -2580,7 +2580,7 @@ above). On this host the picture inverts: 4 copies win only at 1-2 groups (753 a
 group), which the masked path owns, and from 4 groups one copy is 45-70% faster (1070 against 740 at
 4, 1250 against 748 at 8, 1278 against 731 at 32) -- the four-way loop's extra indexing costs more
 than the store-to-load chains it breaks, which random group ids already break. Decision: one copy on
-AVX-512 by default, four elsewhere; the explicit `sparkvector.agg.interleave=1` keeps its meaning
+AVX-512 by default, four elsewhere; the explicit `vecruntime.agg.interleave=1` keeps its meaning
 (Spark's order in every double sum, `GroupedAccumulators.SEQUENTIAL_SUMS`), the default of one copy
 does not imply it. Also visible: in Spark's order the masked path walks only the group's rows while
 the lane-parallel one re-reads the batch per group, so from 8 groups the sequential masked sum is the
@@ -2589,7 +2589,7 @@ faster of the two masked forms (1051 against 686) -- moot, since the scatter own
 ### Decision 5: the default width
 
 TPC-H Q1 and Q6 at SF10, the `vector` configuration (`local[8]`, 8g, 5 warm-ups, 7 measured), the
-only change between the two runs `-Dsparkvector.vectorBits`; same checksums.
+only change between the two runs `-Dvecruntime.vectorBits`; same checksums.
 
 | query | 512 bits | 256 bits | 512 / 256 | where |
 |---|---:|---:|---:|---|
@@ -2599,7 +2599,7 @@ only change between the two runs `-Dsparkvector.vectorBits`; same checksums.
 Reading. Q1 is the kernel query and 512 bits win it by 23%, almost all of it in the 4-group masked
 aggregation (decisions 1 and 3 are both on that path: `fromLong` masks and the masked path up to 4
 groups); Q6 is a scan-bound filter whose time does not move with the width at all. Decision: the
-preferred width (`Species.SHAPE`, 512 on this host) stays the default; `-Dsparkvector.vectorBits=256`
+preferred width (`Species.SHAPE`, 512 on this host) stays the default; `-Dvecruntime.vectorBits=256`
 stays the override for a host where the JIT's 512-bit code is slower than its 256-bit code (Ice Lake's
 frequency licence, Genoa's double-pumped units -- the measurement for #282/#284 to make). The
 decision-2 table agrees from the other side: compaction at 512 bits is 1.3-1.9x its 256-bit self.
@@ -2617,7 +2617,7 @@ index map against.
 | 1, mask construction | broadcast-AND-compare on every platform | `VectorMask.fromLong` where the platform has mask registers | +14-25% on the null paths at 512, a wash at 256 (#312) |
 | 2, compaction | `compress` only on 16-lane species, the shuffle table below | `compress` at every width where the platform has it | +10-28% on dense selections, a tie at 2% (#313) |
 | 3, grouped thresholds | masked path up to 8 groups on 8 lanes, 1 on 4; four scatter copies | masked path up to 4 groups where masks are registers and the species has 4+ lanes; one scatter copy on AVX-512 | the masked path never loses up to 4; one copy +45-70% from 4 groups (#314) |
-| 4, the platform switch | none | `kernels/Platform.java`, `-Dsparkvector.platform` override | both paths of every decision measured on one build (#312) |
+| 4, the platform switch | none | `kernels/Platform.java`, `-Dvecruntime.platform` override | both paths of every decision measured on one build (#312) |
 | 5, default width | preferred (512 here) | unchanged | Q1 0.77x at 512, Q6 flat |
 | 6, gather | -- | not taken | no profile shows one |
 
@@ -2650,7 +2650,7 @@ The first two isolate our SVE paths on the same machine code. The findings:
 - **Cause:** with `-XX:+PrintIntrinsics`, the SVE run inlines `jdk.incubator.vector.VectorMask::lambda$fromLong$0`, the Vector API's Java fallback. So `fromLong` is not intrinsified at 128-bit SVE on this JDK.
 - **Everything else:** SVE codegen against NEON codegen is up to 3.1x on compaction with nulls. The sort and group-key table are neutral.
 
-Decision (#484): `Platform.MASK_REGISTERS` is AVX-512 only, while `NATIVE_COMPRESS` stays on for AVX-512 and SVE. `-Dsparkvector.maskRegisters=true` re-measures SVE after a JDK update.
+Decision (#484): `Platform.MASK_REGISTERS` is AVX-512 only, while `NATIVE_COMPRESS` stays on for AVX-512 and SVE. `-Dvecruntime.maskRegisters=true` re-measures SVE after a JDK update.
 
 ### TPC-DS 1 TB
 
@@ -2679,7 +2679,7 @@ The page is [benchmarks/tpcds-1tb-graviton.html](benchmarks/tpcds-1tb-graviton.h
 The page now shows this run. Changes from the one above:
 
 - **AQE settings:** the advisory size is left at Spark's default (64 MB), and `minPartitionNum` is unset.
-- **Our build:** main d50d3e9, plus AQE map-size scaling from #514 (`spark.vector.shuffle.aqe.mapSizeScaling=true`, `sparkCompressionRatio=0`).
+- **Our build:** main d50d3e9, plus AQE map-size scaling from #514 (`spark.vecruntime.shuffle.aqe.mapSizeScaling=true`, `sparkCompressionRatio=0`).
 - **The rest is the same:** same nodes, executors and data, one engine after the other, each alone on the cluster.
 
 | | Spark (s) | ours (s) | speedup | geomean |
