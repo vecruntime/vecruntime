@@ -454,18 +454,18 @@ class VectorJoinSuite extends VectorQuerySuite {
   }
 
   test(
-    "a broadcast build side estimated above spark.vector.join.maxBuildSize stays with Spark; unknown sizes convert; the shuffled join splits instead (#416)"
+    "a broadcast build side estimated above spark.vecruntime.join.maxBuildSize stays with Spark; unknown sizes convert; the shuffled join splits instead (#416)"
   ) {
     withConf(VectorConf.JoinMaxBuildSize -> "1") {
       checkFallback(
         "SELECT tk.i, dim.name FROM tk JOIN dim ON tk.i50 = dim.di",
         Seq(BHJ),
-        "exceeds spark.vector.join.maxBuildSize=1"
+        "exceeds spark.vecruntime.join.maxBuildSize=1"
       )
       checkFallback(
         "SELECT tk.i, dim.name FROM tk JOIN dim ON tk.i50 < dim.di WHERE tk.i < 500",
         Seq(BNLJ),
-        "exceeds spark.vector.join.maxBuildSize=1"
+        "exceeds spark.vecruntime.join.maxBuildSize=1"
       )
       // The shuffled hash join is not gated by size: its build side past the budget splits into buckets on disk.
       checkVectorized("SELECT /*+ SHUFFLE_HASH(dim) */ tk.i, dim.name FROM tk JOIN dim ON tk.i50 = dim.di", Seq(SHJ))
@@ -505,7 +505,7 @@ class VectorJoinSuite extends VectorQuerySuite {
   private val SortMerge = Seq(
     "spark.sql.autoBroadcastJoinThreshold" -> "-1",
     "spark.sql.join.preferSortMergeJoin" -> "true",
-    "spark.vector.exec.sortMergeJoin.mode" -> "hash"
+    "spark.vecruntime.exec.sortMergeJoin.mode" -> "hash"
   ) // the rewrite itself; the boolean flag reads as `auto` since #287
 
   private def checkSortMerge(
@@ -633,7 +633,7 @@ class VectorJoinSuite extends VectorQuerySuite {
     }
     // Size no longer gates the rewrite (#416): over the budget the shuffled join splits into buckets on
     // disk, and without statistics it builds from the right side.
-    withConf((SortMerge :+ ("spark.vector.join.maxBuildSize" -> "1")): _*) {
+    withConf((SortMerge :+ ("spark.vecruntime.join.maxBuildSize" -> "1")): _*) {
       checkVectorized("SELECT tk.i, dim.name FROM tk JOIN dim ON tk.i50 = dim.di", Seq(SHJ))
     }
     withConf((SortMerge :+ ("spark.sql.adaptive.enabled" -> "false")): _*) {
@@ -739,7 +739,7 @@ class VectorJoinSuite extends VectorQuerySuite {
   }
 
   test(
-    "#416: a build side past spark.vector.join.spillBytes splits both sides into buckets on disk -- every join type"
+    "#416: a build side past spark.vecruntime.join.spillBytes splits both sides into buckets on disk -- every join type"
   ) {
     // A one-byte budget: the first build batch overflows, every build and streamed row is bucketed,
     // and the buckets are joined one at a time. Rows compared with Spark's; four buckets so that

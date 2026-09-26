@@ -32,7 +32,7 @@ JVM_OPTS=(
 )
 # The forked benchmark JVMs get the same options; the reader's coalescing threshold rides along as a property.
 FORK_OPTS="${JVM_OPTS[*]}"
-if [ -n "${COALESCE_ROWS:-}" ]; then FORK_OPTS="$FORK_OPTS -Dsparkvector.shuffle.reader.coalesceRows=$COALESCE_ROWS"; fi
+if [ -n "${COALESCE_ROWS:-}" ]; then FORK_OPTS="$FORK_OPTS -Dvecruntime.shuffle.reader.coalesceRows=$COALESCE_ROWS"; fi
 
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 exec "$JAVA" "${JVM_OPTS[@]}" -cp "$CP" org.openjdk.jmh.Main FlightShuffle \

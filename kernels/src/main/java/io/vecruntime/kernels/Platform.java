@@ -27,7 +27,7 @@ import java.lang.management.ManagementFactory;
  * UseSVE} (0-2) and {@code MaxVectorSize} -- through the diagnostic MXBean, so
  * a JVM started with {@code -XX:UseAVX=2} on AVX-512 hardware is an {@code
  * avx2} platform, as the code the JIT emits will be. {@code
- * -Dsparkvector.platform=neon|sve|avx2|avx512} overrides the probe, for tests
+ * -Dvecruntime.platform=neon|sve|avx2|avx512} overrides the probe, for tests
  * that force a foreign path (emulated: the Vector API stays correct, only the
  * fast paths change) and for measuring one path against another on the same
  * machine.
@@ -46,7 +46,7 @@ import java.lang.management.ManagementFactory;
  */
 public final class Platform {
 
-    /** The platform names accepted by {@code -Dsparkvector.platform}. */
+    /** The platform names accepted by {@code -Dvecruntime.platform}. */
     public static final String NEON = "neon";
 
     public static final String SVE = "sve";
@@ -68,7 +68,7 @@ public final class Platform {
      * the Vector API's Java fallback ({@code VectorMask::lambda$fromLong$0}),
      * and the masked kernels measured 0.50-0.79x of the broadcast-AND-compare
      * form on the same SVE codegen. Re-measure on a JDK update and flip it back
-     * once {@code fromLong} is native. {@code -Dsparkvector.maskRegisters=true|false}
+     * once {@code fromLong} is native. {@code -Dvecruntime.maskRegisters=true|false}
      * overrides the choice, for that measurement.
      */
     public static final boolean MASK_REGISTERS = maskRegisters();
@@ -86,7 +86,7 @@ public final class Platform {
     private Platform() {}
 
     private static boolean maskRegisters() {
-        String override = System.getProperty("sparkvector.maskRegisters");
+        String override = System.getProperty("vecruntime.maskRegisters");
         if (override != null && !override.isEmpty()) {
             switch (override) {
                 case "true" -> {
@@ -95,20 +95,20 @@ public final class Platform {
                 case "false" -> {
                     return false;
                 }
-                default -> throw new IllegalArgumentException("sparkvector.maskRegisters must be true or false, got " + override);
+                default -> throw new IllegalArgumentException("vecruntime.maskRegisters must be true or false, got " + override);
             }
         }
         return NAME.equals(AVX512);
     }
 
     private static String probe() {
-        String override = System.getProperty("sparkvector.platform");
+        String override = System.getProperty("vecruntime.platform");
         if (override != null && !override.isEmpty()) {
             switch (override) {
                 case NEON, SVE, AVX2, AVX512 -> {
                     return override;
                 }
-                default -> throw new IllegalArgumentException("sparkvector.platform must be neon, sve, avx2 or avx512, got " + override);
+                default -> throw new IllegalArgumentException("vecruntime.platform must be neon, sve, avx2 or avx512, got " + override);
             }
         }
         String arch = System.getProperty("os.arch", "");

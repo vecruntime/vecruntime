@@ -44,7 +44,7 @@ class RebalanceAdvisorySuite extends AnyFunSuite with BeforeAndAfterAll {
       .config("spark.sql.shuffle.partitions", "8")
       .config("spark.plugins", "io.vecruntime.spark.VectorPlugin")
       .config("spark.shuffle.manager", "org.apache.spark.sql.vecruntime.shuffle.VectorShuffleManager")
-      .config("spark.vector.shuffle.enabled", "true")
+      .config("spark.vecruntime.shuffle.enabled", "true")
       .getOrCreate()
     tempDir = java.nio.file.Files.createTempDirectory("vecruntime-advisory")
     // The write exchange's shape in small: narrow key columns plus a mostly-null payload.

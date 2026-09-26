@@ -31,7 +31,7 @@ object VectorUi extends Logging {
 
   /**
    * Registers the listener and the tab. Does nothing when the UI is disabled (either by Spark or
-   * by `spark.vector.ui.enabled=false`), which is also the case in most tests.
+   * by `spark.vecruntime.ui.enabled=false`), which is also the case in most tests.
    *
    * @return true when the tab was attached
    */

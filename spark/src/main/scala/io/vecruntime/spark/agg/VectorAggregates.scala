@@ -83,7 +83,7 @@ trait VectorAggFunction extends Serializable {
 /**
  * SUM over doubles: buffer `sum` is null until the first non-null input. `strict` selects Spark's
  * rounding (rows added in order into one accumulator) over the faster lane-parallel and interleaved
- * partial sums; see `spark.vector.exec.strictFloatingPoint`.
+ * partial sums; see `spark.vecruntime.exec.strictFloatingPoint`.
  */
 final case class SumDoubleAgg(input: VectorExpr, strict: Boolean) extends VectorAggFunction {
   override def bufferTypes: Seq[DataType] = Seq(DoubleType)
@@ -1047,7 +1047,7 @@ object VectorAggregates {
    * (`Partial`, `Complete`) read the function's input; the merge modes (`PartialMerge`, `Final`)
    * merge the partial buffers (`inputAggBufferAttributes`) found in `input`. What the operator then
    * emits -- buffers or results -- is the planner's decision, not the function's. `strict` is
-   * `spark.vector.exec.strictFloatingPoint` (default on): double sums round exactly like Spark's.
+   * `spark.vecruntime.exec.strictFloatingPoint` (default on): double sums round exactly like Spark's.
    */
   def compile(
       agg: AggregateExpression,

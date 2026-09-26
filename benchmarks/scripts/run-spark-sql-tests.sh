@@ -8,7 +8,7 @@
 #   benchmarks/scripts/run-spark-sql-tests.sh '^(join|decimal)'
 #   SQL_TESTS_EXCLUDE='^$' benchmarks/scripts/run-spark-sql-tests.sh   # also the excluded files
 #   SQL_TESTS_UPDATE_BASELINE=true benchmarks/scripts/run-spark-sql-tests.sh   # full run; rewrite the coverage floor
-#   SQL_TESTS_JVM_ARGS='-Dspark.vector.exec.sortMergeJoin.enabled=true' benchmarks/scripts/run-spark-sql-tests.sh 'join'   # a non-default configuration
+#   SQL_TESTS_JVM_ARGS='-Dspark.vecruntime.exec.sortMergeJoin.enabled=true' benchmarks/scripts/run-spark-sql-tests.sh 'join'   # a non-default configuration
 #
 # Excluded by default (VectorSQLQueryTestSuite.defaultExclude): explain*.sql, whose golden output
 # is Spark's own physical plan, and the DataSketches files (hll, kllquantiles, thetasketch), whose

@@ -54,7 +54,7 @@ import org.apache.spark.util.collection.Utils
  *
  * `offset` is not supported (the rule falls back). The partition-local stage holds the whole
  * partition in memory like [[VectorSortExec]]; partitions that need a spill should keep Spark's
- * operator (`spark.vector.exec.takeOrdered.enabled=false`).
+ * operator (`spark.vecruntime.exec.takeOrdered.enabled=false`).
  */
 case class VectorTakeOrderedAndProjectExec(
     limit: Int,

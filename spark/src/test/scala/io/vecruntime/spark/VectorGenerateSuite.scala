@@ -133,7 +133,7 @@ class VectorGenerateSuite extends VectorQuerySuite {
     checkFallback("SELECT i, e FROM arrs LATERAL VIEW explode(array(st)) t AS e", Seq(Generate), "not supported")
     checkFallback("SELECT inline(array(st)) FROM arrs", Seq(Generate), "generator inline not supported")
     checkFallback("SELECT i, stack(2, i, i + 1) FROM arrs", Seq(Generate), "generator stack not supported")
-    withConf("spark.vector.exec.generate.enabled" -> "false") {
+    withConf("spark.vecruntime.exec.generate.enabled" -> "false") {
       val df = withPlugin(enabled = true) {
         val d = spark.sql("SELECT i, e FROM arrs LATERAL VIEW explode(arr) t AS e"); d.collect(); d
       }

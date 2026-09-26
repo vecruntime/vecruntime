@@ -122,8 +122,8 @@ private[vecruntime] class VectorFilterIterator(
  */
 object SelectionPolicy {
 
-  /** Minimum surviving fraction for forwarding a selection; `sparkvector.selection.minFraction`. */
-  val MinFraction: Double = java.lang.Double.parseDouble(System.getProperty("sparkvector.selection.minFraction", "0.5"))
+  /** Minimum surviving fraction for forwarding a selection; `vecruntime.selection.minFraction`. */
+  val MinFraction: Double = java.lang.Double.parseDouble(System.getProperty("vecruntime.selection.minFraction", "0.5"))
 
   def keep(selected: Int, numRows: Int): Boolean = selected >= numRows * MinFraction
 }

@@ -44,7 +44,7 @@ import org.apache.spark.sql.vecruntime.{ListenerSync, PlanUtils, VectorPlan}
  * the run instead.
  *
  * Runs only under the `spark-sql-tests` Maven profile; `-DsqlTests.filter=<regex>` (the system
- * property `spark.vector.sqlTests.filter`) restricts the test cases by name.
+ * property `spark.vecruntime.sqlTests.filter`) restricts the test cases by name.
  */
 class VectorSQLQueryTestSuite extends SQLQueryTestSuite {
 
@@ -56,8 +56,8 @@ class VectorSQLQueryTestSuite extends SQLQueryTestSuite {
 
   // Called from the parent constructor, before this class's fields exist: read the properties here.
   private def selected(name: String): Boolean =
-    System.getProperty("spark.vector.sqlTests.filter", ".*").r.findFirstIn(name).isDefined &&
-      Option(System.getProperty("spark.vector.sqlTests.exclude")).filter(_.nonEmpty)
+    System.getProperty("spark.vecruntime.sqlTests.filter", ".*").r.findFirstIn(name).isDefined &&
+      Option(System.getProperty("spark.vecruntime.sqlTests.exclude")).filter(_.nonEmpty)
         .getOrElse(VectorSQLQueryTestSuite.defaultExclude).r.findFirstIn(name).isEmpty
 
   override protected def createScalaTestCase(testCase: TestCase): Unit =
@@ -84,9 +84,9 @@ class VectorSQLQueryTestSuite extends SQLQueryTestSuite {
   override def afterAll(): Unit = {
     try super.afterAll()
     finally VectorSQLQueryTestSuite.report(isFullRun =
-        System.getProperty("spark.vector.sqlTests.filter", ".*") == ".*" &&
+        System.getProperty("spark.vecruntime.sqlTests.filter", ".*") == ".*" &&
           Option(
-            System.getProperty("spark.vector.sqlTests.exclude")
+            System.getProperty("spark.vecruntime.sqlTests.exclude")
           ).filter(_.nonEmpty).forall(_ == VectorSQLQueryTestSuite.defaultExclude)
       )
   }
@@ -154,7 +154,7 @@ object VectorSQLQueryTestSuite {
     catch { case e: Exception => println(s"[spark-vector] could not write $runOutput: $e") }
 
     if (isFullRun && rows.nonEmpty) {
-      if (java.lang.Boolean.getBoolean("spark.vector.sqlTests.updateBaseline")) {
+      if (java.lang.Boolean.getBoolean("spark.vecruntime.sqlTests.updateBaseline")) {
         write(baselineSource, rows)
         println(s"[spark-vector] baseline rewritten: $baselineSource")
       } else {

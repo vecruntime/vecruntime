@@ -129,7 +129,7 @@ class VectorSortSuite extends VectorQuerySuite {
   }
 
   test("sorted runs merged: hundred-row runs over a 100k-row partition, every key type, ties stable") {
-    // One partition of 100k rows: with spark.vector.sort.runRows=100 the sort seals a thousand runs
+    // One partition of 100k rows: with spark.vecruntime.sort.runRows=100 the sort seals a thousand runs
     // and the output is the k-way merge of them; the same statements with one run are the tests above.
     val path = newTempPath("sort/tbig")
     TestTables.mixedDataFrame(spark, 100000).coalesce(1).write.mode("overwrite").parquet(path)

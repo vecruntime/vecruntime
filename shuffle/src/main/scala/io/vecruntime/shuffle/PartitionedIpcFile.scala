@@ -45,19 +45,19 @@ import org.apache.spark.sql.vectorized.{ColumnarBatch, ColumnVector}
  * rebuild the operators' column vectors: a string column is a dictionary-encoded `int32` field
  * (dictionary id = column ordinal + 1) whatever the batch's own encoding, and a decimal of at most 18
  * digits is an `int64` of unscaled values. Every field carries the Spark type in its metadata under
- * `sparkvector.type`.
+ * `vecruntime.type`.
  */
 object PartitionedIpcFile {
 
   val Magic: Long = 0x53564950434631L // "SVIPCF1"
-  val TypeKey = "sparkvector.type"
+  val TypeKey = "vecruntime.type"
 
   /**
    * Rows a reader accumulates small plain batches up to before handing a batch to the operators (#411).
-   * The system property `sparkvector.shuffle.reader.coalesceRows` overrides the default for a JVM
+   * The system property `vecruntime.shuffle.reader.coalesceRows` overrides the default for a JVM
    * (the transport benchmark sweeps it per fork; on a cluster, `spark.executor.extraJavaOptions`).
    */
-  val CoalesceRows: Int = Integer.getInteger("sparkvector.shuffle.reader.coalesceRows", 1024)
+  val CoalesceRows: Int = Integer.getInteger("vecruntime.shuffle.reader.coalesceRows", 1024)
 
   /**
    * A small block with a dictionary-encoded column reaches the operators as it is -- ids over its
@@ -67,7 +67,7 @@ object PartitionedIpcFile {
    * partitions, whose blocks are a few hundred rows over their map's dictionary, was 10-30% slower
    * for it. Below the floor a block is too small to amortise the kernels' set-up either way.
    */
-  val PassEncodedRows: Int = Integer.getInteger("sparkvector.shuffle.reader.passEncodedRows", 128)
+  val PassEncodedRows: Int = Integer.getInteger("vecruntime.shuffle.reader.passEncodedRows", 128)
 
   final case class Index(offsets: Array[Long], lengths: Array[Long], rows: Array[Long]) {
     def numPartitions: Int = offsets.length

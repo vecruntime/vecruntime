@@ -37,7 +37,7 @@ import org.apache.spark.util.Utils
  * Future work, not in this issue: a push-based shuffle service such as Apache Celeborn, which is
  * what makes executors disposable (a lost executor loses no map output, no external shuffle
  * service, no `maps x reduces` small objects). Such a backend implements this trait from its own
- * jar and is named by class in `spark.vector.shuffle.backend`: [[mapOutputCommitted]] is where it
+ * jar and is named by class in `spark.vecruntime.shuffle.backend`: [[mapOutputCommitted]] is where it
  * pushes each partition's IPC bytes, [[read]] is overridden whole because it reads a reduce
  * partition from the service rather than from executors, and [[io.vecruntime.shuffle.PartitionedIpcFile.StreamReader]]
  * already decodes the concatenation of several map outputs' streams, which is what an aggregated
@@ -129,7 +129,7 @@ trait VectorShuffleBackend {
 }
 
 object VectorShuffleBackend {
-  val Key = "spark.vector.shuffle.backend"
+  val Key = "spark.vecruntime.shuffle.backend"
 
   def backendName(conf: SparkConf): String = conf.get(Key, "flight").trim
 

@@ -42,7 +42,7 @@ public final class GroupAssignment {
      * species, where the masked path lost to the scatter from 2 groups. The
      * 4-lane AVX2 species is unmeasured and keeps the NEON value.
      */
-    public static final int LOW_CARDINALITY = Integer.getInteger("sparkvector.agg.maskPathMaxGroups", defaultMaskPathMaxGroups());
+    public static final int LOW_CARDINALITY = Integer.getInteger("vecruntime.agg.maskPathMaxGroups", defaultMaskPathMaxGroups());
 
     static int defaultMaskPathMaxGroups() {
         return Platform.MASK_REGISTERS && Species.DOUBLE_LANES >= 4 ? 4 : 1;

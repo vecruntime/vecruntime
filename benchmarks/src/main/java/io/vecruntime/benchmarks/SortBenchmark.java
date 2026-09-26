@@ -227,7 +227,7 @@ public class SortBenchmark {
      * The sort in eight runs of {@code rows / 8} rows each, then the k-way
      * merge ({@link RunMerge}) walked to the end, emitting the merged order as
      * (run, row) pairs -- the operator's path when a partition exceeds {@code
-     * spark.vector.sort.runRows}.
+     * spark.vecruntime.sort.runRows}.
      */
     @Benchmark
     public int runs8() {

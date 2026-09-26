@@ -113,7 +113,7 @@ case class VectorShuffleExchangeExec(
   @transient private lazy val inputRDD: RDD[ColumnarBatch] = child.executeColumnar()
 
   /**
-   * Rebalance exchanges only (#20; `spark.vector.shuffle.rebalance.rowSizing`, default on): the map
+   * Rebalance exchanges only (#20; `spark.vecruntime.shuffle.rebalance.rowSizing`, default on): the map
    * tasks' per-partition record counts, from which AQE gets row-proportional partition sizes. Every
    * other origin -- the joins' and aggregates' exchanges -- keeps the real bytes.
    */
@@ -222,7 +222,7 @@ case class VectorShuffleExchangeExec(
 object VectorShuffleExchangeExec {
 
   /** `false` turns the row-proportional sizing of rebalance exchanges off (#20). */
-  val RebalanceRowSizingKey = "spark.vector.shuffle.rebalance.rowSizing"
+  val RebalanceRowSizingKey = "spark.vecruntime.shuffle.rebalance.rowSizing"
 
   /** Only the origins whose partition sizes AQE uses to pack and split rebalanced output (#20). */
   def rowSized(origin: ShuffleOrigin, conf: SQLConf): Boolean = origin match {
@@ -232,7 +232,7 @@ object VectorShuffleExchangeExec {
   }
 
   /** `false` keeps a rebalance's requested advisory size as is, on our shuffle's bytes (#20). */
-  val RebalanceAdvisoryScalingKey = "spark.vector.shuffle.rebalance.advisoryScaling"
+  val RebalanceAdvisoryScalingKey = "spark.vecruntime.shuffle.rebalance.advisoryScaling"
 
   /** Iceberg's session setting for the write's advisory size: a value the user chose. */
   val IcebergAdvisorySizeKey = "spark.sql.iceberg.advisory-partition-size"
@@ -252,7 +252,7 @@ object VectorShuffleExchangeExec {
    * aggregate ran 150 tasks of 5.5 M rows where Spark's ran 300. Only the statistics change: the
    * reducers fetch the real bytes. Rebalances are sized by rows already (#20).
    */
-  val MapSizeScalingKey = "spark.vector.shuffle.aqe.mapSizeScaling"
+  val MapSizeScalingKey = "spark.vecruntime.shuffle.aqe.mapSizeScaling"
 
   /**
    * The compression [[MapSizeScalingKey]] expects of Spark's shuffle (uncompressed `UnsafeRow` bytes
@@ -262,7 +262,7 @@ object VectorShuffleExchangeExec {
    * 2.57 over the run) 1,973.8 s and a 4.5 % worse one -- the larger factor stops AQE merging the short
    * queries' small partitions. Both fix q67 (91.6 s to 39-40 s).
    */
-  val SparkCompressionKey = "spark.vector.shuffle.aqe.sparkCompressionRatio"
+  val SparkCompressionKey = "spark.vecruntime.shuffle.aqe.sparkCompressionRatio"
   val DefaultSparkCompression = 0.0
 
   def mapSizesScaled(origin: ShuffleOrigin, conf: SQLConf): Boolean = origin match {

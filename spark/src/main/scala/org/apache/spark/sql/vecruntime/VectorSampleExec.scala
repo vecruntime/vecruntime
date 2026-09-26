@@ -119,7 +119,7 @@ private[vecruntime] class VectorSampleIterator(
  * Columnar replacement for LocalTableScanExec (`VALUES`, small `createDataFrame`, most test data).
  * There is nothing to accelerate -- the rows are already on the driver -- so this only removes the
  * `RowToColumnarExec` transition above such a relation and lets small-table tests run our operators.
- * Off by default (`spark.vector.exec.localTableScan.enabled`), as Comet's equivalent is. The rows are
+ * Off by default (`spark.vecruntime.exec.localTableScan.enabled`), as Comet's equivalent is. The rows are
  * distributed as Spark does it (`min(max(rows, 1), leafNodeDefaultParallelism)` partitions) and each
  * partition becomes one on-heap batch through the row writer the collect-limit stage already uses.
  */

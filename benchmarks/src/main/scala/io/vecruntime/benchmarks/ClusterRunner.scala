@@ -220,7 +220,7 @@ object ClusterRunner {
       "spark.plugins",
       "spark.shuffle.manager",
       "spark.comet.",
-      "spark.vector.",
+      "spark.vecruntime.",
       "spark.memory.offHeap",
       "spark.sql.adaptive.enabled"
     )

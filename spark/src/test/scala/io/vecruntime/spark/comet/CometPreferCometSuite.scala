@@ -27,7 +27,7 @@ import org.apache.spark.sql.vecruntime.{
 }
 
 /**
- * The operator allowlist `spark.vector.comet.preferComet` (#281). Comet's own rule runs first and takes
+ * The operator allowlist `spark.vecruntime.comet.preferComet` (#281). Comet's own rule runs first and takes
  * what sits directly on its scan, so the list is about the operators above one of our chains: a listed
  * one is offered to Comet through the #280 leaf and ours steps aside with the reason; an unlisted one
  * stays ours; a listed one Comet declines is converted by ours after all, never left to Spark. Comet's

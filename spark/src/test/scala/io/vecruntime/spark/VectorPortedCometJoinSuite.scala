@@ -30,7 +30,7 @@ import org.apache.spark.sql.vecruntime.{
 /**
  * SQL correctness coverage ported from DataFusion Comet's `CometJoinSuite`, adapted to
  * spark-vector's plugin-on/plugin-off comparison model: every join query is run twice on one session
- * with `spark.vector.enabled` toggled, the rows compared, and the right vector join operator asserted
+ * with `spark.vecruntime.enabled` toggled, the rows compared, and the right vector join operator asserted
  * in the accelerated plan (a join we don't accelerate asserts fallback with its reason).
  *
  * This is the join slice of the SQL-coverage survey. It complements the hand-written
@@ -214,7 +214,7 @@ class VectorPortedCometJoinSuite extends VectorQuerySuite {
   private val SortMerge = Seq(
     "spark.sql.autoBroadcastJoinThreshold" -> "-1",
     "spark.sql.join.preferSortMergeJoin" -> "true",
-    "spark.vector.exec.sortMergeJoin.mode" -> "hash"
+    "spark.vecruntime.exec.sortMergeJoin.mode" -> "hash"
   )
 
   private def checkMerge(sql: String): org.apache.spark.sql.DataFrame = {
@@ -260,7 +260,7 @@ class VectorPortedCometJoinSuite extends VectorQuerySuite {
   private val MergeMode = Seq(
     "spark.sql.autoBroadcastJoinThreshold" -> "-1",
     "spark.sql.join.preferSortMergeJoin" -> "true",
-    "spark.vector.exec.sortMergeJoin.mode" -> "merge"
+    "spark.vecruntime.exec.sortMergeJoin.mode" -> "merge"
   )
 
   private def checkTrueMerge(sql: String): org.apache.spark.sql.DataFrame = {

@@ -35,7 +35,7 @@ import org.apache.spark.sql.vectorized.{ColumnarBatch, ColumnVector}
 
 /**
  * The prefetching scan converter (#403, lever 2). Inserted by the rule between a Spark vectorized
- * file scan and the first operator of ours above it when `spark.vector.scan.prefetch` is positive.
+ * file scan and the first operator of ours above it when `spark.vecruntime.scan.prefetch` is positive.
  * Per task a helper thread pulls the reader's batches, converts every column into our own Arrow
  * vectors (which the adapters read zero-copy) and hands the converted batch through a bounded queue
  * of `depth` batches to the task thread, so the reader's waits (S3, decode) overlap our kernels.

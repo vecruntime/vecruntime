@@ -112,7 +112,7 @@ a string column's cost. Now:
 Since a block's bytes alone no longer decode, every transport prepends the map file's dictionary
 section to each range it serves: the Flight producer once per map output in a `DoGet`, the local
 reader through `PartitionedIpcFile.blockChannel`. Spark's block-transfer backend delivers a block's
-bytes alone, so under `spark.vector.shuffle.backend=block` the writer keeps per-block dictionaries
+bytes alone, so under `spark.vecruntime.shuffle.backend=block` the writer keeps per-block dictionaries
 (`fileDictionary = false`), the pre-#416 format.
 
 ### 3.3 Staging and flushing
@@ -174,7 +174,7 @@ Flight record batches (#338: Flight's own framing sends dictionaries once per st
 them within one) and not one message per map output (#416: 2,000 map outputs as 2,000 gRPC messages
 of a few KB each cost a Flight decode and a flow-control round trip apiece -- a third of a reduce
 task's time at 1 TB / 1000 partitions); the chunk fills across map outputs and is sent when full or
-when the range ends. The server's executor pool is `spark.vector.shuffle.flight.threads`
+when the range ends. The server's executor pool is `spark.vecruntime.shuffle.flight.threads`
 (default `max(4, cores)`).
 
 Client side, `FlightBlockStream` wraps the stream in a `ReadableByteChannel` (`ChunkChannel`) the
@@ -187,7 +187,7 @@ JVM per remote location.
 token and an unauthenticated `DoGet` is refused; the server refuses to start when auth is on but no
 secret can be read. TLS is the open gap of #288: the server needs PEM material and Spark configures
 JKS, so under `spark.ssl.rpc.enabled` the server refuses to start rather than run in the clear --
-use `spark.vector.shuffle.backend=block` there. Without `spark.authenticate` the endpoint is as open
+use `spark.vecruntime.shuffle.backend=block` there. Without `spark.authenticate` the endpoint is as open
 as Spark's own block transfer in that configuration.
 
 **Failures.** A remote fetch that fails for any reason other than the reducer's own Arrow memory
@@ -201,7 +201,7 @@ propagate as the reducer's error, wrapped into a serialisable exception (Arrow's
 `VectorShuffleBackend` is the interface between the reader and the transport: `remoteBlocks(address,
 blocks, …)` returns batch iterators for one executor's blocks. Three implementations:
 
-| `spark.vector.shuffle.backend` | what it is |
+| `spark.vecruntime.shuffle.backend` | what it is |
 |---|---|
 | `flight` (default) | the Flight data plane above |
 | `block` | Spark's block transfer against the same files, all of an executor's blocks in one request; per-block dictionaries |
@@ -211,16 +211,16 @@ blocks, …)` returns batch iterators for one executor's blocks. Three implement
 
 | knob | default | moves |
 |---|---|---|
-| `spark.vector.shuffle.batchRows` / `batchBytes` | 8192 / 1 MB | record batch size on the map side: larger batches, fewer messages, more map-side memory |
-| `spark.vector.shuffle.bufferBytes` | 64 MB | task-wide cap on held rows before a forced flush |
-| `spark.vector.shuffle.flushBytes` | 1 MB | compression frame size (one zstd call per frame) |
-| `spark.vector.shuffle.compression` | `zstd` | `zstd`, `lz4`, `none` |
-| `spark.vector.shuffle.writer.dictionaryMaxRatio` | 0.5 | distinct/rows above which a string column is frozen plain (0 never encodes, 1 always) |
-| `spark.vector.shuffle.writer.memoryLimit` | 1 GB | the writer allocator's hard limit (backstop; flushes happen long before) |
-| `spark.vector.shuffle.flight.threads` | `max(4, cores)` | server executor pool: concurrent `DoGet`s an executor serves |
-| `spark.vector.shuffle.flight.bindHost` | block manager host | server bind address |
+| `spark.vecruntime.shuffle.batchRows` / `batchBytes` | 8192 / 1 MB | record batch size on the map side: larger batches, fewer messages, more map-side memory |
+| `spark.vecruntime.shuffle.bufferBytes` | 64 MB | task-wide cap on held rows before a forced flush |
+| `spark.vecruntime.shuffle.flushBytes` | 1 MB | compression frame size (one zstd call per frame) |
+| `spark.vecruntime.shuffle.compression` | `zstd` | `zstd`, `lz4`, `none` |
+| `spark.vecruntime.shuffle.writer.dictionaryMaxRatio` | 0.5 | distinct/rows above which a string column is frozen plain (0 never encodes, 1 always) |
+| `spark.vecruntime.shuffle.writer.memoryLimit` | 1 GB | the writer allocator's hard limit (backstop; flushes happen long before) |
+| `spark.vecruntime.shuffle.flight.threads` | `max(4, cores)` | server executor pool: concurrent `DoGet`s an executor serves |
+| `spark.vecruntime.shuffle.flight.bindHost` | block manager host | server bind address |
 | `Producer(chunkBytes)` | 4 MB | bytes per gRPC message (constructor parameter; benchmark sweep) |
-| `-Dsparkvector.shuffle.reader.coalesceRows` | 1024 | rows a reader accumulates before handing a batch to the operators |
+| `-Dvecruntime.shuffle.reader.coalesceRows` | 1024 | rows a reader accumulates before handing a batch to the operators |
 
 ## 8. Measuring it
 

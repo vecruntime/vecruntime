@@ -23,7 +23,7 @@ import org.apache.spark.sql.vecruntime.VectorHashAggregateExec
 /**
  * SQL correctness coverage ported from DataFusion Comet's `CometAggregateSuite`, adapted to
  * spark-vector's plugin-on/off comparison model: every aggregate query is run twice on one session
- * with `spark.vector.enabled` toggled, the rows compared, and a `VectorHashAggregateExec` asserted
+ * with `spark.vecruntime.enabled` toggled, the rows compared, and a `VectorHashAggregateExec` asserted
  * in the accelerated plan.
  *
  * This is the aggregate slice of the SQL-coverage survey. It complements the hand-written
