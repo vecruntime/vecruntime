@@ -36,7 +36,7 @@ off individually (`io.vecruntime.benchmarks.TpchRunner.CometScanOnly` lists the 
 --conf spark.memory.offHeap.size=2g
 --conf spark.driver.extraJavaOptions="--add-modules=jdk.incubator.vector --enable-native-access=ALL-UNNAMED"
 --conf spark.executor.extraJavaOptions="--add-modules=jdk.incubator.vector --enable-native-access=ALL-UNNAMED"
---jars comet-spark-spark4.1_2.13-1.0.0.jar,vecruntime-spark_2.13-0.0.1.jar
+--jars comet-spark-spark4.1_2.13-1.0.0.jar,vecruntime-spark_2.13-0.0.2.jar
 ```
 
 List Comet's plugin first: session extensions run in registration order, and vecruntime's

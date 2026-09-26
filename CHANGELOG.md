@@ -4,7 +4,11 @@ All notable changes to vecruntime. The format follows [Keep a Changelog](https:/
 the project uses [semantic versioning](https://semver.org/) once it reaches 1.0 -- until then a minor
 version may change configuration keys or defaults, always noted here.
 
-## Unreleased
+## 0.0.2 -- 2026-09-26
+
+The first release as **vecruntime** (previously spark-vector); the repository moved to
+[vecruntime/vecruntime](https://github.com/vecruntime/vecruntime). TPC-DS 1 TB on AWS Graviton4 with AQE's
+defaults for both engines: 1,800.5 s against Apache Spark's 2,207.3 s (1.23x, geometric mean 1.21x).
 
 ### Changed (breaking)
 
@@ -24,6 +28,39 @@ version may change configuration keys or defaults, always noted here.
     `org.apache.spark.sql.vector.shuffle.VectorShuffleManager` (it stays in Spark's namespace to reach
     package-private APIs); `org.apache.spark.sql.vector.*` and `org.apache.iceberg.*` are unchanged for
     the same reason.
+
+### Changed
+
+- **AQE sees Spark-scale map output sizes for our exchanges** (#511, #514): new keys
+  `spark.vector.shuffle.aqe.mapSizeScaling` (default `true`) and
+  `spark.vector.shuffle.aqe.sparkCompressionRatio` (default `0`, the uncompressed-bytes ratio). Our
+  columnar shuffle is 1.6-4.3x smaller than Spark's for the same rows, and AQE had packed up to twice
+  Spark's rows into a task; TPC-DS q67 went from 92 s with a 115 GB spill to 39 s with none.
+- **The aggregate spill budget defaults to 1g**, the sort's (`spark.vector.agg.spillThreshold`, #512).
+- **Rebalance exchanges (the Iceberg write)**: AQE sizes the partitions by rows (#485), and the
+  advisory size is scaled to our shuffle's bytes per row, with measured string bytes (#495, #506;
+  `spark.vector.shuffle.rebalance.advisoryScaling`, `spark.vector.shuffle.rebalance.rowSizing`).
+- **The shuffle no longer fsyncs its map outputs**, as Spark does not (#496); on the Iceberg CDC MERGE
+  that was the last gap to Spark on the scan stage.
+- **Shuffle writer**: scatter-based staged flush, warmed kernels, scatter in 64K-row chunks, off by
+  default (`spark.vector.shuffle.writer.scatterFlush`, #487, #488, #490).
+- **Platform**: `VectorMask.fromLong` masks only on AVX-512; on Graviton's SVE the native compress path
+  stays (#484). The cluster image builds for x86-64 or arm64 (#481).
+
+### Added
+
+- Struct columns and struct hash keys in the columnar shuffle (#480).
+- `ON true` / `ON false` nested-loop joins and decimal `AVG` over a running window frame stay columnar
+  (#513).
+- `MERGE INTO`'s table-insert cast is compiled, so `MergeRows` stays columnar (#477).
+- Iceberg adapter: int-backed and dictionary-encoded small decimals (#476, #491).
+- Ported DataFusion Comet test matrices for expressions, casts, aggregates, joins and windows; the SQL
+  golden-suite coverage floor rose to 4,219+ accelerated executions (#497, #500, #501, #503, #507, #510).
+
+### Fixed
+
+- Ordered string compare no longer uses `MemorySegment.mismatch`, which deoptimised in a loop on q67
+  (#493).
 
 ## 0.0.1 -- 2026-09-24
 
