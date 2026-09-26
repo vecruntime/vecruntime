@@ -295,12 +295,12 @@ object AggSpillPolicy {
   /** Result modes merging buffers (Final): spill the table into `buckets` and merge one bucket at a time. */
   final case class GraceHash(thresholdBytes: Long, buckets: Int) extends AggSpillPolicy
 
-  val ThresholdKey = "spark.vector.agg.spillThreshold"
-  val BucketsKey = "spark.vector.agg.spillBuckets"
-  val PassThroughKey = "spark.vector.agg.passThroughRatio"
+  val ThresholdKey = "spark.vecruntime.agg.spillThreshold"
+  val BucketsKey = "spark.vecruntime.agg.spillBuckets"
+  val PassThroughKey = "spark.vecruntime.agg.passThroughRatio"
 
   /**
-   * 1 GiB, the sort's budget (`spark.vector.sort.spillBytes`, #416/#451). #511: at 512m, TPC-DS q67 at
+   * 1 GiB, the sort's budget (`spark.vecruntime.sort.spillBytes`, #416/#451). #511: at 512m, TPC-DS q67 at
    * 1 TB on Graviton4 spilled 115 GB from its final ROLLUP aggregate once AQE coalesced the stage to 150
    * partitions (5.5 M groups per task) and took 86.5 s; at 1g nothing spilled and it took 54.4 s (2g:
    * 50.1 s, also no spill). The cap stays below a task's share of the executors' direct memory (30 GB

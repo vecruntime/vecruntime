@@ -185,7 +185,7 @@ object PlanAcceleration {
    * operator we either did or did not convert, so they are shown but do not count as a fallback.
    * The prefetching scan converter (#403) is a format conversion too -- Spark's scan vectors into
    * ours, on a helper thread -- and computes nothing, so it is plumbing like them rather than an
-   * accelerated operator: a plan's operator count is the same with `spark.vector.scan.prefetch` on
+   * accelerated operator: a plan's operator count is the same with `spark.vecruntime.scan.prefetch` on
    * or off.
    */
   private val TransitionNames = Set("ColumnarToRow", "RowToColumnar", "VectorPrefetchScan")

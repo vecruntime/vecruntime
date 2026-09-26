@@ -38,7 +38,7 @@ class RowProportionalSizesSuite extends AnyFunSuite with BeforeAndAfterAll {
       .config("spark.sql.shuffle.partitions", "8")
       .config("spark.plugins", "io.vecruntime.spark.VectorPlugin")
       .config("spark.shuffle.manager", "org.apache.spark.sql.vecruntime.shuffle.VectorShuffleManager")
-      .config("spark.vector.shuffle.enabled", "true")
+      .config("spark.vecruntime.shuffle.enabled", "true")
       .getOrCreate()
     tempDir = java.nio.file.Files.createTempDirectory("vecruntime-rowsizes")
     // Two kinds of rows: a constant string (tiny once dictionary-encoded) and a near-unique one, on

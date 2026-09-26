@@ -42,19 +42,19 @@ public final class GroupedAccumulators {
      * double sum against the maximum of the same sums computed by Spark,
      * returned no rows. {@link DoubleSum} therefore takes a {@code strict} flag
      * (one accumulator, sequential reductions: Spark's rounding) that the
-     * operator sets from {@code spark.vector.exec.strictFloatingPoint}; this
+     * operator sets from {@code spark.vecruntime.exec.strictFloatingPoint}; this
      * property only sets the copies used when strictness is off.
      */
     public static final int INTERLEAVE = interleave();
 
     /**
      * Whether the property was set to 1 explicitly: the legacy meaning of
-     * {@code sparkvector.agg.interleave=1} is "Spark's order everywhere", which
+     * {@code vecruntime.agg.interleave=1} is "Spark's order everywhere", which
      * the ungrouped double sums in {@link AggKernels} honour too. The platform
      * default of one copy (below) does not carry that meaning: it only picks
      * the faster scatter loop.
      */
-    public static final boolean SEQUENTIAL_SUMS = "1".equals(System.getProperty("sparkvector.agg.interleave"));
+    public static final boolean SEQUENTIAL_SUMS = "1".equals(System.getProperty("vecruntime.agg.interleave"));
 
     /**
      * The copies the scatter loops rotate through when the property is unset.
@@ -69,9 +69,9 @@ public final class GroupedAccumulators {
     }
 
     private static int interleave() {
-        int v = Integer.getInteger("sparkvector.agg.interleave", defaultInterleave());
+        int v = Integer.getInteger("vecruntime.agg.interleave", defaultInterleave());
         if (v != 1 && v != 2 && v != 4) {
-            throw new IllegalArgumentException("sparkvector.agg.interleave must be 1, 2 or 4, got " + v);
+            throw new IllegalArgumentException("vecruntime.agg.interleave must be 1, 2 or 4, got " + v);
         }
         return v;
     }

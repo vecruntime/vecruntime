@@ -64,11 +64,11 @@ class FlightShuffleClusterSuite extends AnyFunSuite with BeforeAndAfterAll {
       .config("spark.executor.extraJavaOptions", jvmArgs)
       .config("spark.plugins", "io.vecruntime.spark.VectorPlugin")
       .config("spark.shuffle.manager", "org.apache.spark.sql.vecruntime.shuffle.VectorShuffleManager")
-      .config("spark.vector.shuffle.enabled", "true")
-      .config("spark.vector.shuffle.backend", "flight")
-      .config("spark.vector.exec.strictFloatingPoint", "true")
+      .config("spark.vecruntime.shuffle.enabled", "true")
+      .config("spark.vecruntime.shuffle.backend", "flight")
+      .config("spark.vecruntime.exec.strictFloatingPoint", "true")
       // Small record batches: a block holds several, each with its own string dictionary (#338).
-      .config("spark.vector.shuffle.batchBytes", "16k")
+      .config("spark.vecruntime.shuffle.batchBytes", "16k")
     if (authenticate)
       b.config("spark.authenticate", "true").config("spark.authenticate.secret", "flight-shuffle-test-secret")
     b.getOrCreate()
@@ -86,10 +86,10 @@ class FlightShuffleClusterSuite extends AnyFunSuite with BeforeAndAfterAll {
     df.createOrReplaceTempView("t")
     val sql = "select k, count(*) c, count(distinct s) ds, max(s) ms from t group by k"
     val ours = spark.sql(sql).collect().toSeq.sortBy(_.toString)
-    spark.sessionState.conf.setConfString("spark.vector.enabled", "false")
+    spark.sessionState.conf.setConfString("spark.vecruntime.enabled", "false")
     val expected =
       try spark.sql(sql).collect().toSeq.sortBy(_.toString)
-      finally spark.sessionState.conf.setConfString("spark.vector.enabled", "true")
+      finally spark.sessionState.conf.setConfString("spark.vecruntime.enabled", "true")
     assert(ours === expected)
     assert(ours.size === 53)
     // Remote fetches happened: the metrics of the last query's shuffle read stages.
@@ -163,10 +163,10 @@ class FlightShuffleClusterSuite extends AnyFunSuite with BeforeAndAfterAll {
       // The shuffle carries s; the aggregate reads it back on the other executor.
       val sql = "select k, count(distinct s) ds, max(s) ms, min(s) mn from u group by k order by k"
       val ours = spark.sql(sql).collect().toSeq
-      spark.sessionState.conf.setConfString("spark.vector.enabled", "false")
+      spark.sessionState.conf.setConfString("spark.vecruntime.enabled", "false")
       val expected =
         try spark.sql(sql).collect().toSeq
-        finally spark.sessionState.conf.setConfString("spark.vector.enabled", "true")
+        finally spark.sessionState.conf.setConfString("spark.vecruntime.enabled", "true")
       assert(ours === expected)
       assert(ours.map(_.getLong(1)).sum === 200000L)
     }

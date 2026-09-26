@@ -22,7 +22,7 @@ import org.apache.spark.sql.vecruntime.VectorProjectExec
  * SQL correctness coverage ported from DataFusion Comet's expression suites
  * (`CometBitwiseExpressionSuite`, `CometMathExpressionSuite`, `CometExpressionSuite`), adapted to
  * spark-vector's validation model: every query is run twice on the same session with
- * `spark.vector.enabled` toggled and the rows compared (Comet's `checkSparkAnswerAndOperator`),
+ * `spark.vecruntime.enabled` toggled and the rows compared (Comet's `checkSparkAnswerAndOperator`),
  * while asserting the projection ran on our operator (`VectorProjectExec`). This is the second
  * coverage lever of the SQL-coverage survey: the golden-file suite already runs the whole
  * enumerable universe of Spark's `sql-tests/inputs`, so the gain is data-driven expression cases

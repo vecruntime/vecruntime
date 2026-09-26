@@ -54,8 +54,8 @@ import org.apache.spark.storage.ShuffleBlockId
 object FlightShuffle extends Logging {
 
   val BackendKey: String = org.apache.spark.sql.vecruntime.shuffle.VectorShuffleBackend.Key
-  val BindHostKey = "spark.vector.shuffle.flight.bindHost"
-  val ThreadsKey = "spark.vector.shuffle.flight.threads"
+  val BindHostKey = "spark.vecruntime.shuffle.flight.bindHost"
+  val ThreadsKey = "spark.vecruntime.shuffle.flight.threads"
 
   def backend(conf: SparkConf): String =
     org.apache.spark.sql.vecruntime.shuffle.VectorShuffleBackend.backendName(conf).toLowerCase
@@ -252,7 +252,7 @@ object FlightShuffle extends Logging {
       if (conf.getBoolean("spark.ssl.rpc.enabled", false)) {
         throw new IllegalStateException(
           "spark.ssl.rpc.enabled is on but the Flight shuffle server has no TLS material yet (#288): " +
-            "use spark.vector.shuffle.backend=block or turn RPC TLS off"
+            "use spark.vecruntime.shuffle.backend=block or turn RPC TLS off"
         )
       }
       val builder = FlightServer.builder(

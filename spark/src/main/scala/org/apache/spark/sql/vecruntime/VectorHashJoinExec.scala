@@ -1318,7 +1318,7 @@ object VectorJoinPlanner {
 
   /**
    * The broadcast joins hold the relation in memory per task with no limit but the JVM's (#86): a build
-   * side estimated above `spark.vector.join.maxBuildSize` stays with Spark. An unknown estimate converts --
+   * side estimated above `spark.vecruntime.join.maxBuildSize` stays with Spark. An unknown estimate converts --
    * Spark planned this join after its own size checks, so "unknown" means the statistic is absent,
    * not that the side is large. The shuffled join is not gated: past the budget it splits into buckets
    * on disk (#416).
@@ -1453,7 +1453,7 @@ object VectorJoinPlanner {
    * same distribution of the same keys and produce the same rows for the same join types, so the
    * hash join is a drop-in per partition; what changes is the memory profile -- the smaller side is
    * held in a per-task hash table -- hence the build side is chosen by the runtime statistics of the
-   * two sides (`estimatedBuildSize`: an AQE stage's real size) and must fit `spark.vector.join.maxBuildSize`.
+   * two sides (`estimatedBuildSize`: an AQE stage's real size) and must fit `spark.vecruntime.join.maxBuildSize`.
    * A side without statistics is not assumed small: the rule of the issue is "when statistics say
    * the build side fits". `left` / `right` are the join's inputs with the sorts Spark placed for the
    * merge already removed (the caller strips them: a hash join does not need them).

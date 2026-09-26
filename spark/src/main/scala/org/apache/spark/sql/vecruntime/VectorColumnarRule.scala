@@ -466,7 +466,7 @@ case class VectorExecRule(session: SparkSession) extends Rule[SparkPlan] with Lo
    * ([[CometMixedBridge.leaf]]: Comet's sink placeholder over a [[VectorToCometExec]]), and Comet's own
    * rule builds the operator above it. Comet's rule ran before ours and never saw our operators, so
    * this is the only way a Comet operator ends up above ours; the split is the two engines' per-operator
-   * toggles (an operator ours refused, or `spark.vector.exec.<op>.enabled=false`, with
+   * toggles (an operator ours refused, or `spark.vecruntime.exec.<op>.enabled=false`, with
    * `spark.comet.exec.<op>.enabled=true`). Two boundaries the planner keeps: an aggregate pair stays on
    * one engine (Comet's final needs Comet's partial buffers, ours needs ours), and a selection is
    * compacted by the export itself. Comet's fallback reasons, when it declines, are its own explain's.
@@ -589,7 +589,7 @@ case class VectorExecRule(session: SparkSession) extends Rule[SparkPlan] with Lo
   /**
    * Range partitioning is bridged too when Comet's native range partitioning is on (its default):
    * Comet samples the child for the bounds through Spark's `RangePartitioner`, exactly as Spark's
-   * own exchange does, so the child runs twice in both cases. `spark.vector.comet.shuffle.range.enabled`
+   * own exchange does, so the child runs twice in both cases. `spark.vecruntime.comet.shuffle.range.enabled`
    * turns just this part off.
    */
   private def bridgeable(child: SparkPlan, partitioning: Partitioning, conf: SQLConf): Boolean = {
@@ -623,7 +623,7 @@ case class VectorExecRule(session: SparkSession) extends Rule[SparkPlan] with Lo
   }
 
   /**
-   * The prefetching scan converter (#403, lever 2): under `spark.vector.scan.prefetch > 0`, every
+   * The prefetching scan converter (#403, lever 2): under `spark.vecruntime.scan.prefetch > 0`, every
    * Spark vectorized file scan that feeds one of our operators directly is wrapped in a
    * [[VectorPrefetchScanExec]], so the first operator of ours above a scan -- a filter, a projection,
    * an aggregate, a join side, a sort, an expand -- reads batches of our own vectors converted on a
@@ -970,7 +970,7 @@ case class VectorExecRule(session: SparkSession) extends Rule[SparkPlan] with Lo
   /**
    * The size rule of `mode=auto` (#416), once the order is known not to show and a build side is chosen:
    * what the build side weighs per task, by statistics, against the hash join's two budgets. Within
-   * `spark.vector.join.spillBytes` it builds in memory; within `spark.vector.join.hashMaxBuildSize`
+   * `spark.vecruntime.join.spillBytes` it builds in memory; within `spark.vecruntime.join.hashMaxBuildSize`
    * (one bucketing pass: `spillBuckets` buckets of at most `spillBytes`) it splits into buckets on
    * disk; past that, or with no estimate to judge by, the merge join over the spilling sort takes it --
    * its memory is bounded by the sort's budget whatever the inputs weigh, where a hash join's grows

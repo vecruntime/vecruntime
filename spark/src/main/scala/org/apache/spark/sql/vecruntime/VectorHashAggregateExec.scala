@@ -180,7 +180,7 @@ case class VectorHashAggregateExec(
   )
 
   /**
-   * Past the budget (`spark.vector.agg.spillThreshold`, 0 = never): buffer-emitting modes emit the
+   * Past the budget (`spark.vecruntime.agg.spillThreshold`, 0 = never): buffer-emitting modes emit the
    * table and start over; a Final whose buffers are re-mergeable as emitted spills hash-partitioned
    * (#363). A Final that emits a result in a buffer slot (the wide decimal average) or a Complete
    * aggregate, whose input is not buffers, keeps everything in memory.

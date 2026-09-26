@@ -35,7 +35,7 @@ import org.apache.spark.sql.vectorized.ColumnarBatch
  *
  * A blocking operator: every batch of the partition is appended to one [[ColumnBuilder]] per
  * output attribute and per computed key (Spark's columnar contract lets the producer reuse a batch
- * as soon as the next one is requested). Every `spark.vector.sort.runRows` rows the builders are
+ * as soon as the next one is requested). Every `spark.vecruntime.sort.runRows` rows the builders are
  * sealed into a run -- its columns and the permutation [[SortKernels.sortIndices]] computed over
  * them -- so the sort's scratch is bounded by the run, not the partition. One run emits its rows
  * through the permutation; several are k-way merged by [[RunMerge]] in the same total order, ties by
@@ -49,7 +49,7 @@ import org.apache.spark.sql.vectorized.ColumnarBatch
  * over Spark's row shuffle the rule leaves SortExec in place, since converting rows to columns just
  * to sort them buys nothing.
  *
- * Memory is bounded by `spark.vector.sort.spillBytes` (#416): runs past the budget are written to
+ * Memory is bounded by `spark.vecruntime.sort.spillBytes` (#416): runs past the budget are written to
  * local disk in sorted order and merged from there, so a partition of any size sorts in bounded
  * memory -- which is what lets the merge join above it take large inputs.
  */

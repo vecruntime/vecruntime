@@ -377,14 +377,14 @@ final class VectorShuffleWriter(
 object VectorShuffleWriter {
 
   /** The hard limit of one map task's writer allocator; the writer flushes long before it, this is the backstop. */
-  val MemoryLimitKey = "spark.vector.shuffle.writer.memoryLimit"
+  val MemoryLimitKey = "spark.vecruntime.shuffle.writer.memoryLimit"
   def memoryLimit(conf: SparkConf): Long = conf.getSizeAsBytes(MemoryLimitKey, "1g")
 
   /** A record batch's string column is dictionary-encoded only when distinct/rows is at most this (#356); 0 never, 1 always. */
-  val DictionaryMaxRatioKey = "spark.vector.shuffle.writer.dictionaryMaxRatio"
+  val DictionaryMaxRatioKey = "spark.vecruntime.shuffle.writer.dictionaryMaxRatio"
 
   /** `true`: the staged flush scatters instead of gathering through the partition order (#20; off by default, see #487); for A/B. */
-  val ScatterFlushKey = "spark.vector.shuffle.writer.scatterFlush"
+  val ScatterFlushKey = "spark.vecruntime.shuffle.writer.scatterFlush"
 
   /**
    * Arrow's `OutOfMemoryException` is not `Serializable` (it carries an `Optional`); a task failing with
@@ -403,10 +403,10 @@ object VectorShuffleWriter {
     )
 
   /** A partition's held rows / bytes before they become one record batch, and the task-wide cap on held bytes. */
-  val BatchRowsKey = "spark.vector.shuffle.batchRows"
-  val BatchBytesKey = "spark.vector.shuffle.batchBytes"
-  val BufferBytesKey = "spark.vector.shuffle.bufferBytes"
-  val FlushBytesKey = "spark.vector.shuffle.flushBytes"
+  val BatchRowsKey = "spark.vecruntime.shuffle.batchRows"
+  val BatchBytesKey = "spark.vecruntime.shuffle.batchBytes"
+  val BufferBytesKey = "spark.vecruntime.shuffle.bufferBytes"
+  val FlushBytesKey = "spark.vecruntime.shuffle.flushBytes"
   def flushBytes(conf: SparkConf): Long = conf.getSizeAsBytes(FlushBytesKey, "1m")
 
   /**
@@ -414,7 +414,7 @@ object VectorShuffleWriter {
    * of magnitude slower, a TPC-H Q3 shuffle crawled under it), or `none`: body compression of the
    * shuffle's record batches.
    */
-  val CompressionKey = "spark.vector.shuffle.compression"
+  val CompressionKey = "spark.vecruntime.shuffle.compression"
   def compression(conf: SparkConf): Option[org.apache.arrow.vector.compression.CompressionUtil.CodecType] =
     conf.get(CompressionKey, "zstd").trim.toLowerCase match {
       case "lz4" => Some(org.apache.arrow.vector.compression.CompressionUtil.CodecType.LZ4_FRAME)

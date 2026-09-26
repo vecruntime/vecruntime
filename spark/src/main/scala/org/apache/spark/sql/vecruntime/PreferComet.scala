@@ -29,7 +29,7 @@ import org.apache.spark.sql.execution.window.{WindowExec, WindowGroupLimitExec}
 import org.apache.spark.sql.types.{DecimalType, StringType}
 
 /**
- * The operator allowlist of `spark.vector.comet.preferComet` (#281): which Spark operators above one of
+ * The operator allowlist of `spark.vecruntime.comet.preferComet` (#281): which Spark operators above one of
  * our chains are offered to Comet by the mixed-chain pass (#280), and which of the operators our rule
  * would take itself are left to Comet instead. Comma-separated entries, each an operator kind with an
  * optional predicate the planner evaluates from the plan alone:
@@ -41,7 +41,7 @@ import org.apache.spark.sql.types.{DecimalType, StringType}
  *
  * `aggregate` is refused with a warning: an aggregate pair cannot be split across the engines; under
  * `all` an aggregate half is offered and Comet's own buffer rule decides whether it may cross (#280). An empty list under
- * `spark.vector.comet.mixed.enabled=true` allows mixed plans but requests none.
+ * `spark.vecruntime.comet.mixed.enabled=true` allows mixed plans but requests none.
  */
 final case class PreferComet(entries: Seq[PreferComet.Entry]) {
 
@@ -56,7 +56,7 @@ final case class PreferComet(entries: Seq[PreferComet.Entry]) {
 
 object PreferComet extends Logging {
 
-  val Reason = "delegated to Comet (spark.vector.comet.preferComet)"
+  val Reason = "delegated to Comet (spark.vecruntime.comet.preferComet)"
 
   val Kinds: Set[String] = Set(
     "filter",
@@ -118,12 +118,12 @@ object PreferComet extends Logging {
       }
       if (kind == "aggregate") {
         logWarning(
-          s"spark.vector.comet.preferComet: '$raw' ignored -- an aggregate pair cannot be split across the engines (#280)"
+          s"spark.vecruntime.comet.preferComet: '$raw' ignored -- an aggregate pair cannot be split across the engines (#280)"
         )
         None
       } else if (kind != "all" && !Kinds.contains(kind)) {
         logWarning(
-          s"spark.vector.comet.preferComet: unknown operator kind '$kind' in '$raw' ignored; known: ${Kinds.toSeq.sorted.mkString(", ")}, all"
+          s"spark.vecruntime.comet.preferComet: unknown operator kind '$kind' in '$raw' ignored; known: ${Kinds.toSeq.sorted.mkString(", ")}, all"
         )
         None
       } else pred match {
@@ -133,7 +133,7 @@ object PreferComet extends Logging {
         case Some(EstimatedRowsPattern(n)) => Some(Entry(kind, Some(EstimatedRows(n.toLong))))
         case Some(other) =>
           logWarning(
-            s"spark.vector.comet.preferComet: unknown predicate '$other' in '$raw' ignored; known: wideDecimal, strings, estimatedRows>N"
+            s"spark.vecruntime.comet.preferComet: unknown predicate '$other' in '$raw' ignored; known: wideDecimal, strings, estimatedRows>N"
           )
           None
       }

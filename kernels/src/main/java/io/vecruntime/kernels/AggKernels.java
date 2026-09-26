@@ -148,7 +148,7 @@ public final class AggKernels {
     /**
      * Sum of the valid doubles (0.0 when there are none). The lane-parallel sum
      * rounds in a different order than Spark's sequential one (and so can
-     * differ in the last digits); with {@code sparkvector.agg.interleave=1} the
+     * differ in the last digits); with {@code vecruntime.agg.interleave=1} the
      * sum is sequential, the order Spark uses, so that setting is bit-identical
      * to Spark for doubles across the grouped and ungrouped paths.
      */
@@ -197,10 +197,10 @@ public final class AggKernels {
     /**
      * {@code start} plus the valid doubles of {@code a}: the lane-parallel sum
      * added to {@code start}, or Spark's exact rounding when {@code strict}
-     * asks for it (or the legacy {@code sparkvector.agg.interleave=1} property
+     * asks for it (or the legacy {@code vecruntime.agg.interleave=1} property
      * forces it globally): the doubles added one after the other into {@code
      * start} in row order. Which one an operator uses is decided by {@code
-     * spark.vector.exec.strictFloatingPoint}.
+     * spark.vecruntime.exec.strictFloatingPoint}.
      */
     public static double sumDoubleFrom(VectorBuffers a, double start, boolean strict) {
         return strict || GroupedAccumulators.SEQUENTIAL_SUMS

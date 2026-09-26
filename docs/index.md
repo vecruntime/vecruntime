@@ -30,7 +30,7 @@ operators, expressions, and types transparently fall back to Spark, always with 
 
 ## Getting started
 
-> vecruntime was previously named spark-vector. The configuration keys (`spark.vector.*`), the `sparkvector.*` JVM system properties, and the shuffle manager class (`spark.shuffle.manager=org.apache.spark.sql.vecruntime.shuffle.VectorShuffleManager`) are **unchanged**. What changed: the plugin class `io.sparkvector.spark.VectorPlugin` → `io.vecruntime.spark.VectorPlugin`; the Java/Scala packages `io.sparkvector.*` → `io.vecruntime.*`; and the Maven coordinates — groupId `io.sparkvector` → `io.github.vecruntime`, artifacts `spark-vector-*` → `vecruntime-*` (e.g. `spark-vector-spark_2.13` → `vecruntime-spark_2.13`).
+> vecruntime was previously named spark-vector. In 0.0.2 every name changed, with no aliases: the plugin class `io.sparkvector.spark.VectorPlugin` → `io.vecruntime.spark.VectorPlugin`; the Java/Scala packages `io.sparkvector.*` → `io.vecruntime.*`; the Maven coordinates — groupId `io.sparkvector` → `io.github.vecruntime`, artifacts `spark-vector-*` → `vecruntime-*` (e.g. `spark-vector-spark_2.13` → `vecruntime-spark_2.13`); the shuffle manager class `spark.shuffle.manager=org.apache.spark.sql.vector.shuffle.VectorShuffleManager` → `org.apache.spark.sql.vecruntime.shuffle.VectorShuffleManager`; the configuration keys `spark.vector.*` → `spark.vecruntime.*`; and the JVM system properties `sparkvector.*` → `vecruntime.*`. Old names are unknown, not accepted.
 
 Add the plugin jar to an existing Spark job -- no code changes:
 
@@ -49,7 +49,7 @@ plugin jar, the columnar shuffle jar and a `SHA256SUMS` file, is on the
 [releases page](https://github.com/vecruntime/vecruntime/releases); the same artifacts are
 published to a Maven repository served from the repository's `maven-repo` branch. See the
 [README](https://github.com/vecruntime/vecruntime#getting-the-jars) for Maven coordinates and
-`--packages` usage, and the [Configuration reference](configuration.html) for every `spark.vector.*`
+`--packages` usage, and the [Configuration reference](configuration.html) for every `spark.vecruntime.*`
 key.
 
 ## Status
@@ -73,7 +73,7 @@ Comet. The per-query tables, configurations, and every study behind the numbers 
 
 ## Reference
 
-- [Configuration](configuration.html) -- every `spark.vector.*` key with its default.
+- [Configuration](configuration.html) -- every `spark.vecruntime.*` key with its default.
 - [Operators](operators.html), [Expressions](expressions.html) -- what converts, under which
   conditions, and why the rest falls back.
 - [Comet as the scan](comet.html), [Apache Iceberg](iceberg.html),
