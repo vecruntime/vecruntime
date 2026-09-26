@@ -849,6 +849,11 @@ the `spark-sql` tests jar, unpacks its `sql-tests/` golden files and `test-data/
 `spark.sql.extensions` to ours and requires every golden result to match whether an operator was
 converted or not. Run it on demand, whole or by a regex over test-case names:
 
+The site documents this end to end: [Testing & correctness](https://vecruntime.github.io/vecruntime/testing.html)
+covers the golden suite, the ported Comet matrices and the benchmark checksums, and the
+[Compatibility matrix](https://vecruntime.github.io/vecruntime/compatibility.html) lists what runs on
+vecruntime versus falls back, row by row.
+
 ```bash
 benchmarks/scripts/run-spark-sql-tests.sh                 # everything
 benchmarks/scripts/run-spark-sql-tests.sh '^(group-by|join|decimal)'

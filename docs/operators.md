@@ -11,6 +11,10 @@ planner records when it does not convert. Modelled on Comet's
 [Spark Operator Support](https://datafusion.apache.org/comet/user-guide/latest/operators.html) page;
 the companion for expressions is [docs/expressions.md](expressions.html).
 
+For the tested-against-Spark subset — the exact cases that run on vecruntime versus fall back, taken
+from the ported Comet suites — see the [Compatibility matrix](compatibility.html), and
+[Testing & correctness](testing.html) for how it is all validated.
+
 **How to read a plan.** `VectorExecRule` (`VectorColumnarRule.scala`) walks the physical plan bottom-up
 and replaces an operator only when (a) its input already produces columnar batches of supported types
 -- a vectorized Parquet scan, a Comet scan, an Iceberg scan through the adapter, or another

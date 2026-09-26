@@ -76,5 +76,8 @@ Comet. The per-query tables, configurations, and every study behind the numbers 
 - [Configuration](configuration.html) -- every `spark.vecruntime.*` key with its default.
 - [Operators](operators.html), [Expressions](expressions.html) -- what converts, under which
   conditions, and why the rest falls back.
+- [Compatibility matrix](compatibility.html) -- what runs on vecruntime and what falls back, row by
+  row from the ported Comet test suites; [Testing & correctness](testing.html) -- how correctness is
+  established (Spark's golden suite, the ported matrices, the benchmark checksums).
 - [Comet as the scan](comet.html), [Apache Iceberg](iceberg.html),
   [The Flight shuffle](flight-shuffle.html).
