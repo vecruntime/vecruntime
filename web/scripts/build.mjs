@@ -128,14 +128,17 @@ function renderSidebar(activeUrl) {
 
 function shell({ title, description, content, activeUrl, headExtra = "", bodyClass = "" }) {
   const fullTitle = title && title !== SITE_TITLE ? `${title} \u00b7 ${SITE_TITLE}` : SITE_TITLE;
+  // Every value is inserted with a replacer function: a plain replacement string would treat `$'`,
+  // `` $` ``, `$&` and `$$` as patterns, and a page quoting e.g. SQL_TESTS_EXCLUDE='^$' pasted the rest
+  // of the template (footer included) into the middle of its own content.
   let html = pageTpl
-    .replace("__TITLE__", esc(fullTitle))
-    .replace("__DESCRIPTION__", esc(description || nav.site.description))
-    .replaceAll("__BASE__", BASE)
-    .replaceAll("__REPO_URL__", REPO_URL)
-    .replace("__HEAD_EXTRA__", headExtra)
-    .replace("__SIDEBAR__", renderSidebar(activeUrl))
-    .replace("__CONTENT__", content);
+    .replace("__TITLE__", () => esc(fullTitle))
+    .replace("__DESCRIPTION__", () => esc(description || nav.site.description))
+    .replaceAll("__BASE__", () => BASE)
+    .replaceAll("__REPO_URL__", () => REPO_URL)
+    .replace("__HEAD_EXTRA__", () => headExtra)
+    .replace("__SIDEBAR__", () => renderSidebar(activeUrl))
+    .replace("__CONTENT__", () => content);
   if (bodyClass) html = html.replace('<div class="layout">', `<div class="layout ${bodyClass}">`);
   return html;
 }
@@ -167,8 +170,8 @@ for (const [file, url] of MD_PAGES) {
   if (file === "index.md") {
     // Home: hero + terminal, then the overview body (drop its leading duplicate <h1>).
     contentHtml = contentHtml.replace(/^\s*<h[12][^>]*>[\s\S]*?<\/h[12]>/, "");
-    content = homeTpl.replaceAll("__BASE__", BASE).replaceAll("__REPO_URL__", REPO_URL)
-      .replace("__OVERVIEW_BODY__", contentHtml);
+    content = homeTpl.replaceAll("__BASE__", () => BASE).replaceAll("__REPO_URL__", () => REPO_URL)
+      .replace("__OVERVIEW_BODY__", () => contentHtml);
     bodyClass = "home";
   } else {
     content = contentHtml;
