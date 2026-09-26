@@ -22,16 +22,14 @@ import org.scalatest.BeforeAndAfterEach
 import org.scalatest.funsuite.AnyFunSuite
 
 /**
- * The shuffle manager was renamed in 0.0.2 from
- * `org.apache.spark.sql.vector.shuffle.VectorShuffleManager` to
- * `org.apache.spark.sql.vecruntime.shuffle.VectorShuffleManager`, with the old name kept as a
- * deprecated delegating alias. This verifies both class names configure a working columnar shuffle
- * end to end and produce identical results.
+ * The columnar shuffle manager is configured as
+ * `org.apache.spark.sql.vecruntime.shuffle.VectorShuffleManager` (0.0.2 renamed the package from
+ * `org.apache.spark.sql.vector.shuffle`; no alias is kept). This verifies that name configures a
+ * working columnar shuffle end to end.
  */
-class ShuffleManagerAliasSuite extends AnyFunSuite with BeforeAndAfterEach {
+class ShuffleManagerNameSuite extends AnyFunSuite with BeforeAndAfterEach {
 
-  private val NewName = "org.apache.spark.sql.vecruntime.shuffle.VectorShuffleManager"
-  private val OldAlias = "org.apache.spark.sql.vector.shuffle.VectorShuffleManager"
+  private val ManagerName = "org.apache.spark.sql.vecruntime.shuffle.VectorShuffleManager"
 
   private var spark: SparkSession = _
   private var tempDir: Path = _
@@ -46,18 +44,18 @@ class ShuffleManagerAliasSuite extends AnyFunSuite with BeforeAndAfterEach {
   }
 
   private def sessionWith(manager: String): SparkSession = {
-    tempDir = Files.createTempDirectory("vecruntime-alias")
+    tempDir = Files.createTempDirectory("vecruntime-shuffle-name")
     SparkSession.builder()
       .master("local[4]")
-      .appName(s"ShuffleManagerAliasSuite-$manager")
+      .appName(s"ShuffleManagerNameSuite-$manager")
       .config("spark.ui.enabled", "false")
       .config("spark.driver.host", "localhost")
       .config("spark.sql.shuffle.partitions", "6")
       .config("spark.sql.warehouse.dir", tempDir.resolve("wh").toString)
       .config("spark.plugins", "io.vecruntime.spark.VectorPlugin")
       .config("spark.shuffle.manager", manager)
-      .config("spark.vector.shuffle.enabled", "true")
-      .config("spark.vector.exec.strictFloatingPoint", "true")
+      .config("spark.vecruntime.shuffle.enabled", "true")
+      .config("spark.vecruntime.exec.strictFloatingPoint", "true")
       .getOrCreate()
   }
 
@@ -68,39 +66,11 @@ class ShuffleManagerAliasSuite extends AnyFunSuite with BeforeAndAfterEach {
     session.sql("SELECT k, count(*) c, sum(id) s FROM t GROUP BY k ORDER BY k").collect().toSeq
   }
 
-  test("the new shuffle manager name runs a shuffle query") {
-    spark = sessionWith(NewName)
-    assert(spark.conf.get("spark.shuffle.manager") == NewName)
+  test("the vecruntime shuffle manager name runs a shuffle query") {
+    spark = sessionWith(ManagerName)
+    assert(spark.conf.get("spark.shuffle.manager") == ManagerName)
     val rows = runShuffleQuery(spark)
     assert(rows.size == 97)
     assert(rows.map(_.getLong(1)).sum == 20000L)
-  }
-
-  test("the deprecated old alias name still runs the same shuffle query with equal results") {
-    // Reference result from the new name.
-    spark = sessionWith(NewName)
-    val expected = runShuffleQuery(spark)
-    spark.stop()
-    spark = null
-    SparkSession.clearActiveSession()
-    SparkSession.clearDefaultSession()
-
-    // Same query under the deprecated alias.
-    spark = sessionWith(OldAlias)
-    assert(spark.conf.get("spark.shuffle.manager") == OldAlias)
-    val actual = runShuffleQuery(spark)
-
-    assert(actual == expected)
-    assert(actual.size == 97)
-  }
-
-  test("the deprecated alias class instantiates and is a ShuffleManager") {
-    val conf = new org.apache.spark.SparkConf(false)
-    val mgr: org.apache.spark.shuffle.ShuffleManager =
-      new org.apache.spark.sql.vector.shuffle.VectorShuffleManager(conf): @annotation.nowarn(
-        "cat=deprecation"
-      )
-    assert(mgr != null)
-    mgr.stop()
   }
 }
