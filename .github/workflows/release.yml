@@ -54,7 +54,7 @@ jobs:
       - name: Checksums
         run: |
           mkdir -p target/release
-          cp spark/target/spark-vector-spark_2.13-${VERSION}.jar shuffle/target/spark-vector-shuffle_2.13-${VERSION}.jar target/release/
+          cp spark/target/vecruntime-spark_2.13-${VERSION}.jar shuffle/target/vecruntime-shuffle_2.13-${VERSION}.jar target/release/
           (cd target/release && sha256sum *.jar > SHA256SUMS && cat SHA256SUMS)
 
       - name: Release notes from CHANGELOG.md
@@ -64,7 +64,7 @@ jobs:
             on && /^## / { exit }
             on { print }' CHANGELOG.md > target/release/notes.md
           [ -s target/release/notes.md ] || echo "Release ${VERSION}." > target/release/notes.md
-          printf '\n---\nMaven: repository `https://raw.githubusercontent.com/%s/maven-repo/`, artifacts `io.sparkvector:spark-vector-spark_2.13:%s` and `io.sparkvector:spark-vector-shuffle_2.13:%s`.\n' \
+          printf '\n---\nMaven: repository `https://raw.githubusercontent.com/%s/maven-repo/`, artifacts `io.github.vecruntime:vecruntime-spark_2.13:%s` and `io.github.vecruntime:vecruntime-shuffle_2.13:%s`.\n' \
             "$GITHUB_REPOSITORY" "$VERSION" "$VERSION" >> target/release/notes.md
 
       - name: Publish to the maven-repo branch
@@ -78,7 +78,7 @@ jobs:
             git worktree add --detach target/maven-repo-branch
             git -C target/maven-repo-branch checkout --orphan maven-repo
             git -C target/maven-repo-branch rm -rfq .
-            printf '# spark-vector Maven repository\n\nServed by raw.githubusercontent.com; see the README of the main branch.\n' > target/maven-repo-branch/README.md
+            printf '# vecruntime Maven repository\n\nServed by raw.githubusercontent.com; see the README of the main branch.\n' > target/maven-repo-branch/README.md
           fi
           cp -R target/maven-repo/. target/maven-repo-branch/
           git -C target/maven-repo-branch add -A
@@ -90,7 +90,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "${GITHUB_REF_NAME}" \
-            --title "spark-vector ${VERSION}" \
+            --title "vecruntime ${VERSION}" \
             --notes-file target/release/notes.md \
             --verify-tag \
             target/release/*.jar target/release/SHA256SUMS
