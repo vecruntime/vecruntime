@@ -65,6 +65,98 @@ run them in the background and poll.
 Each item is a decision the code depends on. If you change one, update this section and the tests
 that pin it.
 
+### 3.0 Rules per module (read first)
+
+The short form of what every change is held to, per module. The sections after this one and
+section 4 carry the detail and the history behind each rule.
+
+**Across all modules**
+
+- **Arrow data structures, Comet-compatible.** Columns are Arrow layout end to end (validity bitmap,
+  data, offsets, dictionary; `VectorBuffers`, section 3.2), so a batch crosses to Spark, Arrow and
+  Comet without conversion: Comet's off-heap buffers are wrapped zero-copy and our batches go back to
+  it through the Arrow C Data Interface (`ArrowCData`, section 3.8). A new structure that is not Arrow
+  layout needs a measured reason, and it must not break the Comet hand-over in either direction (the
+  `CometTest` suites, `-Pcomet`, are the check). Arrow stays unshaded and Comet stays a runtime-only
+  dependency.
+- **Keep the garbage collector out of hot paths.** Per-row or per-batch objects in a kernel or an
+  operator's inner loop are a defect: prefer native `MemorySegment`s from the batch's `Arena`,
+  primitive arrays reused across batches, and struct-of-arrays over boxed or per-row objects. Take a
+  GC-free structure when it is measured to be faster (JMH for a kernel, TPC-H/TPC-DS plus a JFR
+  profile for an operator); if it is not faster, keep the simpler code. A JFR profile with GC pauses
+  or allocation sites in our frames near the top is a finding to fix, not noise. (For scale: the
+  target-scan stage of the v3 CDC MERGE spends ~38 % of its task time in GC, #20.)
+- **JFR before any explanation.** A number worse than expected, or better in a way you cannot
+  account for, is profiled with Java Flight Recorder before a word is written about its cause
+  (section 4.7): `benchmarks/scripts/profile-query.sh` to record one query, `jfr-summary.sh` to read
+  it (hot methods, callers of JDK-internal `MemorySegment` frames, our frames by self time,
+  allocation sites, GC pauses). On the cluster, record executors with
+  `-XX:StartFlightRecording=...,settings=profile` and dump with `jcmd JFR.dump` while the application
+  still runs (section 5).
+- **Testing conventions.** Correctness first, by comparison with an oracle: the scalar reference for
+  kernels, Spark itself for SQL, byte-for-byte results for shuffle and Iceberg writes. Every change
+  runs the gate (`mvn -B -Pcomet,iceberg -pl kernels,spark,shuffle,benchmarks install`, exit 0);
+  planner or expression changes also run the SQL golden suite with no arguments and must hold its
+  coverage floor (section 4.2). Report exit codes, not impressions. Build in an isolated Maven
+  repository (`-Dmaven.repo.local=...`) when several worktrees build on one machine, or a parallel
+  `install` overwrites the jar under test. A performance claim needs a measurement (JMH, or a
+  benchmark run with matching checksums); a benchmark whose checksums differ is a correctness bug.
+
+**`kernels/` (Java)**
+
+- **The Java Vector API is the implementation.** Kernels are written against `jdk.incubator.vector`,
+  with the single `Species` (section 3.3): operators as compile-time constants, `compress` only where
+  it is native, platform-aware fallbacks. No JNI, no native code.
+- **Every kernel has a scalar twin** in `reference/ScalarReference` (or `SortReference`); the kernel
+  suite compares them on random data with nulls, selections and awkward lengths, at 128, 256 and 512
+  bits (`-Dvecruntime.vectorBits=...`).
+- **JMH for every kernel change.** A kernel is not faster until a JMH benchmark in `benchmarks/`
+  (`AggBenchmark`, `CompactBenchmark`, `SortBenchmark`, ...) says so, with the convention
+  `-wi 2 -i 3 -w 1 -r 1 -f 1`; add one when a kernel has none. Several intuitive kernel changes were
+  slower (the reversed assumptions in `docs/results.md`), so the benchmark decides, not the reasoning.
+- **Allocation-free inner loops.** Kernels read and write `MemorySegment`s and caller-owned buffers;
+  they do not allocate per row or per vector.
+
+**`spark/` (operators, planner, expressions)**
+
+- **Comet-style columnar rule with explicit fallbacks** (section 3.1): an operator is converted only
+  when every input and expression is supported, otherwise Spark's stays and the reason is recorded.
+  Results must equal Spark's (exact for decimals, `1e-9` for doubles under
+  `strictFloatingPoint=false`).
+- **Tests per change:** a `VectorQuerySuite` comparison (`checkVectorized` with the expected operators
+  asserted in the final post-AQE plan; `checkFallback` for the unsupported case and its reason); the
+  ported DataFusion Comet suites (`VectorPortedComet{Expr,Cast,Aggregate,Join,Window}Suite`) must keep
+  passing, and a gap they reveal is fixed or recorded as a known gap; the SQL golden suite for planner
+  and expression changes; the Comet and Iceberg suites under their profiles.
+- **Batches stay Arrow and dictionary-encoded** through operators, and a batch is released under
+  Spark's columnar contract (section 3.2): operators copy only what they keep.
+- **Bounded memory.** Operators that hold data (aggregate, sort, joins, window) stay within a memory
+  budget and spill to local disk instead of growing unbounded (sections 3.5-3.6b); the aggregate
+  accounts its memory with Spark's `TaskMemoryManager`.
+- **Profile operator changes with JFR** on TPC-H/TPC-DS (`profile-query.sh`) and check that GC and
+  allocation in our frames did not grow.
+- **Iceberg:** the read side adapts Iceberg's batches in place; the v3 deletion-vector writer lives
+  in the optional `iceberg-bridge` module, whose suite is run by hand (`docs/iceberg-dv-writer.md`).
+
+**`shuffle/` (columnar shuffle)**
+
+- **Arrow IPC on disk and over the wire:** map outputs are Arrow IPC streams per record batch
+  (`PartitionedIpcWriter`), remote reads go over Arrow Flight, and a failed fetch is Spark's
+  `FetchFailedException` so Spark recomputes the lost map outputs (section 3.10). Do not introduce a
+  private wire format.
+- **Stay Spark-compatible:** `VectorShuffleManager` handles only our dependency type and falls back to
+  Spark's sort shuffle for everything else; `spark.authenticate`'s secret is honoured; shuffle files
+  are deleted on `unregisterShuffle`.
+- **Low garbage on both paths:** partition ids from `PartitionKernels`; the IPC and Flight readers'
+  roots and the serialised schema message reused across batches; strings dictionary-encoded per
+  batch only when the dictionary pays (`spark.vecruntime.shuffle.writer.dictionaryMaxRatio`).
+- **Tests per change:** `VectorShuffleSuite`, `PartitionedIpcSuite`, the Flight suites
+  (`FlightSmokeSuite`, `FlightBlockStreamSuite`, `FlightShuffleClusterSuite`), `ShuffleManagerNameSuite`
+  and the rebalance-sizing suites; a change
+  that affects AQE's view of map outputs is also measured on TPC-DS and the CDC MERGE (#511, #514).
+- **JMH for writer or reader hot paths** (`FlightShuffleBenchmark`, `ScatterBenchmark`), then a cluster
+  run for the end-to-end effect.
+
 ### 3.1 Planning: a Comet-style columnar rule with explicit fallbacks
 
 - Operators are replaced by `VectorExecRule` (registered through `injectColumnar`, in
