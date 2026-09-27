@@ -4,7 +4,12 @@ All notable changes to vecruntime. The format follows [Keep a Changelog](https:/
 the project uses [semantic versioning](https://semver.org/) once it reaches 1.0 -- until then a minor
 version may change configuration keys or defaults, always noted here.
 
-## Unreleased
+## 0.0.3 -- 2026-09-27
+
+Window `RANGE` frames with value offsets, a columnar `range()`, `spark_partition_id()`, an opt-in
+Iceberg v3 deletion-vector writer, and the Vector Acceleration tab working with the plugin on
+`--packages` / `--jars`. Getting started now uses `--packages` / `--repositories` and shows the
+columnar shuffle.
 
 ### Added
 
@@ -35,6 +40,13 @@ version may change configuration keys or defaults, always noted here.
 - `VectorArrowColumnVector.reusable(...)`: an owned column that ignores the per-batch
   `closeIfFreeable()` Spark 4.1's `ColumnarToRowExec` calls (as Spark's own `WritableColumnVector`s do)
   and is freed by `close()`, for producers that refill one vector across batches.
+
+### Changed
+
+- Getting started (web and README) leads with `--packages` / `--repositories` against the `maven-repo`
+  branch and shows the columnar shuffle. `--sun-misc-unsafe-memory-access=allow` is now in every
+  command: on JDK 25 it is required, not cosmetic (without it Arrow's Netty allocator cannot address
+  direct memory and the first columnar operator fails).
 
 ### Fixed
 
