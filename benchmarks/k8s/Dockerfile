@@ -31,6 +31,10 @@ COPY . /src
 # The shaded benchmarks.jar carries io.github.vecruntime:* (kernels, spark, shuffle, benchmarks); Spark, Comet
 # and Iceberg are provided by the image's jars directory.
 RUN mvn -B -q -Pcomet,iceberg -DskipTests -pl benchmarks -am install
+# The optional Iceberg v3 deletion-vector writer bridge (#20): a thin jar compiled against the same
+# iceberg-spark-runtime the image provides; without it on the class path the writer stays Spark's.
+RUN mvn -B -q -Piceberg -DskipTests -pl iceberg-bridge package \
+ && cp iceberg-bridge/target/vecruntime-iceberg-bridge_2.13-*.jar /src/iceberg-bridge.jar
 # The Flight shuffle's runtime jars: the shaded benchmarks.jar carries only io.github.vecruntime:*, and Spark's
 # distribution has Arrow and guava but no flight-core, gRPC or protobuf-java (the Netty classes are Spark's).
 RUN mvn -B -q -pl shuffle dependency:copy-dependencies -DincludeScope=runtime -DoutputDirectory=/src/flight-jars \
@@ -139,6 +143,7 @@ RUN cd /opt/spark/jars \
     && curl -fsSLO "https://repo1.maven.org/maven2/org/apache/spark/spark-hadoop-cloud_2.13/${SPARK_VERSION}/spark-hadoop-cloud_2.13-${SPARK_VERSION}.jar"
 
 COPY --from=build /src/benchmarks/target/benchmarks.jar /opt/spark/jars/benchmarks.jar
+COPY --from=build /src/iceberg-bridge.jar /opt/spark/jars/vecruntime-iceberg-bridge.jar
 COPY --from=build /src/flight-jars/*.jar /opt/spark/jars/
 COPY --from=build /opt/tpcds-kit/tools/dsdgen /opt/tpcds-kit/tools/tpcds.idx /opt/tpcds-kit/tools/
 
