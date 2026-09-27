@@ -87,8 +87,9 @@ the delta write's REBALANCE exchange already clusters by `_spec_id` / `_partitio
 own `RowDelta`. Inserts and the insert half of updates stay on Iceberg's data writer; v2 tables and
 unsupported shapes decline to Spark's writer unchanged.
 
-This is gated behind `spark.vecruntime.iceberg.dvWriter.enabled` (default off while it is landed in
-slices). The design, the placement decision (an optional Iceberg-compiled bridge module vs.
+This is gated behind `spark.vecruntime.iceberg.dvWriter.enabled` (default off: it covers DELETE, UPDATE
+and MERGE, partitioned tables and repeated deletes, but on a CDC MERGE the write is a small share of the
+statement, so it stays opt-in until a released Iceberg shows a clear gain). The design, the placement decision (an optional Iceberg-compiled bridge module vs.
 reflection), and the slice-1 profile split that gates the work are in
 [`docs/iceberg-dv-writer.md`](iceberg-dv-writer.md).
 

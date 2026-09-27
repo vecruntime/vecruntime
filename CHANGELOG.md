@@ -8,6 +8,11 @@ version may change configuration keys or defaults, always noted here.
 
 ### Added
 
+- An Iceberg v3 deletion-vector writer (#20), off by default (`spark.vecruntime.iceberg.dvWriter.enabled`):
+  DELETE, UPDATE and MERGE on format-version-3 merge-on-read tables write their deletes as deletion
+  vectors per data file (partitioned tables and repeated deletes included; the insert half through
+  Iceberg's own writer; one `RowDelta` commit). The Iceberg-typed code is the new optional
+  `vecruntime-iceberg-bridge` module. `CdcMergeRunner --delete-only` measures a delete-only batch.
 - `RANGE` window frames with value offsets (`sum(c) OVER (PARTITION BY a ORDER BY b RANGE BETWEEN 5
   PRECEDING AND CURRENT ROW)`, `RANGE BETWEEN 1 FOLLOWING AND 3 FOLLOWING`, an unbounded side with an
   offset on the other) for `sum`/`avg`/`count`/`min`/`max` over one integral or date order key, `ASC` or
