@@ -2,8 +2,6 @@
 
 **A vectorized execution runtime for Apache Spark using Java**
 
-> vecruntime was previously named spark-vector. In 0.0.2 every name changed, with no aliases: the plugin class `io.sparkvector.spark.VectorPlugin` → `io.vecruntime.spark.VectorPlugin`; the Java/Scala packages `io.sparkvector.*` → `io.vecruntime.*`; the Maven coordinates — groupId `io.sparkvector` → `io.github.vecruntime`, artifacts `spark-vector-*` → `vecruntime-*` (e.g. `spark-vector-spark_2.13` → `vecruntime-spark_2.13`); the shuffle manager class `spark.shuffle.manager=org.apache.spark.sql.vector.shuffle.VectorShuffleManager` → `org.apache.spark.sql.vecruntime.shuffle.VectorShuffleManager`; the configuration keys `spark.vector.*` → `spark.vecruntime.*`; and the JVM system properties `sparkvector.*` → `vecruntime.*`. Old names are unknown, not accepted.
-
 vecruntime accelerates Spark SQL workloads by executing core operators directly on **Arrow-layout columnar batches** using the **Java Vector API**, bringing SIMD-optimized execution to the JVM without native libraries, JNI, or serialization boundaries.
 
 Inspired by the execution architecture of Apache DataFusion Comet, vecruntime provides a native-style execution path for **Filter, Project, HashAggregate, Sort, and hash joins**, while preserving Spark as the execution fallback for unsupported operators, expressions, and data types.
@@ -307,8 +305,7 @@ measurements behind each item are in the linked docs and issues.
   implemented, and under `spark.ssl.rpc.enabled` the server refuses to start -- use
   `spark.vecruntime.shuffle.backend=block` (Spark's own block transfer carrying our batches) there
   (`docs/flight-shuffle.md`). Without the manager the plugin runs over Spark's row shuffle,
-  converting at the boundary. The manager was renamed in 0.0.2 from
-  `org.apache.spark.sql.vector.shuffle.VectorShuffleManager`; the old name is not accepted.
+  converting at the boundary.
 - **Platforms measured:** x86-64 with AVX-512 (the 1 TB campaign) and AVX2, and Apple silicon
   (NEON, 128-bit lanes) for the local suites. Graviton (SVE) is untested (#253); the kernels choose
   the lane width at start-up, so it should run, but the thresholds were set on x86.
