@@ -36,6 +36,7 @@ import org.apache.spark.sql.execution.{
   LocalLimitExec,
   LocalTableScanExec,
   ProjectExec,
+  RangeExec,
   SampleExec,
   SortExec,
   SparkPlan,
@@ -199,6 +200,11 @@ case class VectorExecRule(session: SparkSession) extends Rule[SparkPlan] with Lo
 
         case l: LocalTableScanExec if VectorConf.localTableScanEnabled(conf) =>
           VectorSamplePlanner.planLocalTableScan(l).fold(reason => fallback(l, reason), v => v)
+
+        // The range leaf: the same rows in the same partitions as Spark's, written as native INT64
+        // batches, so the operators above convert from the source (over Spark's row leaf they could not).
+        case r: RangeExec if VectorConf.rangeEnabled(conf) =>
+          VectorRangePlanner.plan(r).fold(reason => fallback(r, reason), v => v)
 
         case l: LocalLimitExec if VectorConf.limitEnabled(conf) =>
           laneInputReason(l.child) match {

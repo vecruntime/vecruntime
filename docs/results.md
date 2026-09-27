@@ -107,6 +107,53 @@ one copy and sequential reductions for double sums and reproduces Spark's roundi
 bitmaps per ms (127x). Included as a sanity check that bitmap bookkeeping never shows up in
 profiles, which held in every JFR recording taken for this document.
 
+### The range fill: `SequenceKernels.range` against the scalar oracle, and `range()` + `sum` end to end
+
+`RangeFillBenchmark`: one 10000-row batch of `start + i * step` written into a native INT64 buffer
+(one `spark.sql.inMemoryColumnarStorage.batchSize` batch of the columnar `range()` leaf,
+`VectorRangeExec`), rows per ms, on the x86 host above (Xeon 8488C, AVX-512, 512-bit species; quiet
+machine, `-wi 2 -i 3 -w 1 -r 1 -f 1`). The vector kernel is a broadcast multiply of the lane index
+for the offsets and one add plus one store per block; the scalar twin is one multiply-add per row.
+
+| step | scalar (`ScalarReference.range`) | vector (`SequenceKernels.range`) | ratio |
+|---:|---:|---:|---:|
+| 1 (the `iota` path, also `monotonically_increasing_id()`) | 3412 k rows/ms | 6467 k rows/ms | 1.9x |
+| 3 | 3425 k | 6798 k | 2.0x |
+| -7 | 3429 k | 6615 k | 1.9x |
+
+Both are write-bandwidth bound (6.6 M rows/ms is 53 GB/s of 8-byte values into a buffer that stays
+in cache), so the 2x is the ceiling this loop has; the kernel is not where a `range()` query spends its
+time. `RangeQueryBenchmark` measures the query: `SELECT sum(id) FROM range(0, 1e9, 1, 8)` in one
+`local[8]` session, milliseconds per query, three ways -- `spark` (plugin off: Spark's generated range
+loop feeding its generated aggregate), `rowRange` (plugin on, `spark.vecruntime.exec.range.enabled=false`:
+the shape before the leaf, Spark's row `RangeExec` feeding Spark's generated partial aggregate, since
+a row leaf converts nothing of ours above it, our Final aggregate behind a `RowToColumnarExec` over
+the shuffle) and `vector` (`VectorRangeExec` feeding our partial aggregate):
+
+| configuration | 1e9 rows | notes |
+|---|---:|---|
+| `spark` | 219 ms (±27) | Spark's codegen: a tight `long` loop, 4.6 G rows/s over 8 cores |
+| `rowRange` | 202 ms (±116) | the same loop under Spark's partial aggregate; only the two-row Final is ours |
+| `vector` | 150 ms (±118); 190 ms in the JFR run below | our leaf and our partial aggregate |
+
+Three one-second iterations give wide bands (the errors are JMH's 99.9% intervals over three points),
+so read this as "at least on par with Spark's generated loop, up to 1.4x": what the leaf buys is not
+this query -- Spark's codegen over a number generator is as good as a JVM loop gets -- but the chain
+above `range()`, which is now ours from the source (a filter, a projection, a partial aggregate, a
+join side) where before it stayed Spark's until the first exchange. The JFR recording of the `vector`
+configuration over 1e9 rows (`settings=profile`, 9 s, 840-910 execution samples; `jfr-summary.sh`)
+has the two kernels as half the samples -- `AggKernels.sumLongExact` 30.7%, `SequenceKernels.iota`
+19.7% -- then the aggregate iterator's per-batch scaffolding (`VectorUngroupedAggregateIterator.update`
+5%, Arrow's `getNullCount` / `checkIndexD` / `refCnt` 2.6-3.3% each: the adapter's null count over the
+validity bitmap per batch, a consumer-side cost); no `MemorySegment` bookkeeping frame above 0.7%
+(`loadFromMemorySegmentScopedInternal` under `sumLongExact`), and no range frame among the allocation
+sites: the leaf allocates one vector per task and refills it, the per-batch garbage is the aggregate's
+`EvalContext` and arena (6% of allocation pressure) and Spark's own scheduler and Netty buffers
+(`HeapByteBuffer`, `Arrays.copyOf`, `HashMap.resize`, 25% together). GC: 56 pauses, 220 ms in total over
+the 9 s, none attributable to the range. An earlier recording had `SequenceKernels.iota` at 6.7% of
+allocation pressure from a per-call `long[]` of lane offsets; it is a `static final` lane-index vector
+now (a broadcast multiply gives the stepped offsets), and the frame is gone from the list.
+
 ### Group-key assignment over plain strings: on-the-fly dictionary for any length, with a cap
 
 `GroupKeyTableBenchmark`, 64 batches of 4096 plain (non-dictionary) UTF8 keys into one
@@ -180,6 +227,42 @@ What the numbers say:
   path -- but the compare loop is a candidate for a branch-free formulation.
 
 Run it with `"WideDecimal"` as the benchmark filter.
+
+### `RANGE` window frames with value offsets: the frame kernels (#58, layer 2d)
+
+`WindowFrameBenchmark`, one sorted partition of 65536 rows, one thread, same flags as above
+(Xeon Platinum 8488C, AVX-512; rows per microsecond). The key is a random walk with steps in
+`[0, 4)`, so `frameRows` (8, 256) is about how many rows a `RANGE BETWEEN 2*frameRows PRECEDING AND
+CURRENT ROW` frame spans; `nulls` is the share of null input values. `reference` is
+`ScalarReference`: Spark's own shape -- the sliding buffer replayed row by row and every frame
+re-aggregated from scratch; `boxed row path` is a per-row re-aggregation over pre-boxed `Long`s,
+standing for (and flattering: no `newState` object, no `valueAt` boxing, no `batchOf` lookup per read)
+what the held-partition row path would have done for these frames. Three measured iterations of one
+second give wide error bars on the fastest rows; the ratios below are the medians' and hold across
+the two runs taken.
+
+| kernel | frame rows | nulls | reference | kernel | ratio | note |
+|---|---:|---:|---:|---:|---:|---|
+| `rangeBounds` (the two-pointer walk) | 8 / 256 | – | 8.4 | 80 | 9.5x | the reference re-derives each bound through `BigInteger`; 12 ns a row for the kernel, flat in the frame width |
+| `frameCount` | 8 | 10% | 34 | 77 | 2.3x | slides: subtract the leaving rows, add the entering ones |
+| `frameCount` | 256 | 10% | 2.9 | 79 | 27x | O(1) a row whatever the frame width |
+| `frameSumLong` (unchecked) | 256 | 0% | 10.6 (boxed row path 8.7) | 83 | 7.8x (9.5x) | slides under wrapping arithmetic |
+| `frameSumLong` (unchecked) | 256 | 10% | 2.5 (boxed 4.8) | 60 | 24x (12.5x) | |
+| `frameSumLong` (unchecked) | 8 | 0% | 92 (boxed 84) | 78 | 0.85x | a frame of 8 rows is as cheap to re-add as to slide; within the run-to-run noise |
+| `frameSumLong` (ANSI, `addExact` in order) | 256 | 0% | 10.6 | 8.1 | 0.8x | Spark's work: the overflow is a property of the partial sums |
+| `frameSumDouble` | 256 | 0% | 5.9 | 9.3 | 1.6x | in row order (bit-identical); a lower bound that has not moved continues the previous frame |
+| `frameMinMaxLong` (`max`) | 256 | 0% | 7.2 | 20.7 | 2.9x | `LongVector` MAX over the re-scanned frame when the column has no nulls |
+| `frameMinMaxLong` (`max`) | 256 | 10% | 2.0 | 3.1 | 1.6x | scalar under nulls |
+
+What this says: the bound search and the order-independent reductions (`count`, an unchecked bigint
+`sum`) are linear in the partition whatever the frame width, which is what the operator needed to
+stop being O(n x frame) for the common `sum`/`count` moving windows; the order-dependent ones
+(double sums, ANSI sums, min/max) keep Spark's re-aggregation cost by design -- bit-identical double
+sums need Spark's addition order -- and gain only what the primitive arrays and the vector re-scan
+give. In the profile of a 4M-row local job (`sum`, `count`, `avg`, `max` over `RANGE` frames of 30 to
+40 keys, plugin on) the frame kernels together are under 5% of the samples; Spark's row sort below
+the window and the row-to-columnar transition are the cost, and the only allocation of ours is the
+scratch arrays grown once per task.
 
 ### The index sort: radix passes versus one comparison sort per pass (#285)
 

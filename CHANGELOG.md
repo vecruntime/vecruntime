@@ -6,6 +6,31 @@ version may change configuration keys or defaults, always noted here.
 
 ## Unreleased
 
+### Added
+
+- `RANGE` window frames with value offsets (`sum(c) OVER (PARTITION BY a ORDER BY b RANGE BETWEEN 5
+  PRECEDING AND CURRENT ROW)`, `RANGE BETWEEN 1 FOLLOWING AND 3 FOLLOWING`, an unbounded side with an
+  offset on the other) for `sum`/`avg`/`count`/`min`/`max` over one integral or date order key, `ASC` or
+  `DESC`, either null ordering -- the last residual of #58. New `WindowFrameKernels` (two-pointer frame
+  bounds replaying Spark's `SlidingWindowFunctionFrame`, frame aggregates over primitive arrays) with
+  scalar twins in `ScalarReference`, a `WindowFrameBenchmark`, and the peer-bounded `RANGE` frames
+  without an offset (`CURRENT ROW AND UNBOUNDED FOLLOWING`, `CURRENT ROW AND CURRENT ROW`) on the row
+  path. Fallback reasons now name the key or input type (`RANGE offsets over a decimal(12,2) order key
+  not supported`) instead of `RANGE frames with value offsets`.
+- `VectorRangeExec`, a columnar replacement for Spark's `RangeExec` (`spark.range(...)`, the `range()`
+  table-valued function): Spark's rows in Spark's partitions (the same split, the same clamping at the
+  `Long` bounds, the same `outputOrdering` / `outputPartitioning`), written into native INT64 batches
+  by a Vector API kernel (`SequenceKernels.range`) -- one reused vector per task, nothing allocated per
+  batch -- so the filter, projection and partial aggregate over `range()` are ours from the leaf, where
+  over Spark's row leaf they stayed Spark's until the first exchange. `spark.vecruntime.exec.range.enabled`
+  (default `true`). Spark's SQL golden suite gains 105 accelerated executions (4219 -> 4324 of 33856;
+  26 cases above the previous floor, now recorded).
+- `spark_partition_id()` is compiled (`SparkPartitionIdExpr`, a constant INT32 column per task written by the
+  new `SequenceKernels.fillInt`), so a projection or filter over it stays columnar.
+- `VectorArrowColumnVector.reusable(...)`: an owned column that ignores the per-batch
+  `closeIfFreeable()` Spark 4.1's `ColumnarToRowExec` calls (as Spark's own `WritableColumnVector`s do)
+  and is freed by `close()`, for producers that refill one vector across batches.
+
 ## 0.0.2 -- 2026-09-26
 
 The first release as **vecruntime** (previously spark-vector); the repository moved to

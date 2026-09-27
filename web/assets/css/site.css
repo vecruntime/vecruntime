@@ -253,9 +253,6 @@ a:hover { text-decoration: underline; }
 .hero .btn.primary:hover { filter: brightness(1.06); }
 .hero .btn.ghost { background: var(--bg-alt); color: var(--fg); }
 .hero .btn.ghost:hover { background: var(--card); }
-.hero .lead-config { color: var(--muted); font-size: .95rem; line-height: 1.5; }
-.hero .lead-config code { font-size: .84em; }
-
 /* ---------- Animated terminal ---------- */
 .terminal {
   background: #0d1117;

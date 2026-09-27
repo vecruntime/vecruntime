@@ -48,8 +48,7 @@ Every engine returned Spark's results (two footnoted exceptions).</div>
 <p><b>Methodology.</b> The three engines ran one after another in the same window on the same nodes, each alone on the cluster, over the same
 S3 data with the same Spark settings; only the execution engine and its own memory split differ (every engine has 50 GB per executor; where it
 puts them follows where it allocates). Each query ran once after the plan was compiled; the time is the wall-clock of the query's execution as the
-runner measures it. The result files, event logs and every study behind a number are in
-<a href="{{ '/results.html' | relative_url }}">Benchmark results</a>.</p>
+runner measures it.</p>
 <h3>Test environment</h3>
 <table class="kv"><thead><tr><th>Component</th><th>Configuration</th></tr></thead><tbody><tr><td>Dataset</td><td>TPC-DS scale factor 1000 (1 TB), Parquet on Amazon S3 (103 query variants, one measured iteration each, no warm-up)</td></tr><tr><td>Cluster</td><td>Amazon EKS 1.36; 9 x m5.4xlarge (16 vCPU, 64 GB, x86-64 with AVX-512), 20 GB root volume; one node group, the driver on the ninth node</td></tr><tr><td>Executors</td><td>8 executors x 13 cores x 50 GB each (Spark: 20 GB heap / 30 GB overhead; vecruntime: 30 GB heap / 20 GB overhead; Comet: 20 GB heap / 6 GB overhead / 24 GB off-heap); driver 2 cores x 6 GB</td></tr><tr><td>Storage</td><td>Amazon S3 through Hadoop 3.4.3 S3A with the Analytics Accelerator input stream (the default in 3.4.3)</td></tr></tbody></table>
 <h3>Versions</h3>
@@ -107,7 +106,7 @@ q4 60.1 against 90.1, q95 57.5 against 69.3, q14a/b by about 12 s each -- its na
 and off-heap execution (GC 0.02 h against Spark's 0.59 and vecruntime's 0.41) pay on the queries that are read-bound.
 vecruntime's one heavy loss to Spark is q88 (141.7 against 125.5; Comet 158.1): eight scans of <code>store_sales</code>
 through Spark's own Parquet reader, where the reader's per-file request latency is the cost and the operators have little to add; its other regressions are short queries (2-9 s)
-where the columnar boundary and shuffle set-up outweigh the operator gains. Each is analysed in <a href="{{ '/results.html' | relative_url }}">Benchmark results</a>.</p>
+where the columnar boundary and shuffle set-up outweigh the operator gains.</p>
 
 <h3>Notes</h3>
 <ul><li>Every engine returned Spark&#x27;s row counts and checksums on every query except q65 (its result has ties, ordered differently by every engine) and, for Comet, q64 (0 rows against 12,185 -- a stale dynamic-pruning value, apache/datafusion-comet#6133).</li><li>The four legs ran in one window on the same nodes, one after another (Spark, vecruntime, Comet), each alone on the cluster; the AQE minimum of 208 partitions keeps the sort stages of the window queries wide (measured: Spark -4%, Comet -3%, vecruntime q67 -12%, the rest inside the run-to-run band).</li><li>Spark&#x27;s memory split is the one that completes: at 30 GB heap / 20 GB overhead Spark loses q23b, q24a and q24b to node-disk evictions during q23b&#x27;s 503 GB spill; per query the heavier heap is 2-3% faster where it completes. Every split is measured in docs/results.md.</li><li>coalescePartitions.minPartitionNum=208 is set for this run (and the Graviton4 run that compares with it); it is deprecated in Spark 3.2+, and later TPC-DS runs leave it unset (#253).</li></ul>

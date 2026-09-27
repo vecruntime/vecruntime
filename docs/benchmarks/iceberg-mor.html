@@ -151,8 +151,7 @@ Spark's, and both engines committed the same 46,641,979 added records and 64 del
 Spark in 14). On v2 both engines left 425,665,996 rows after the merge; Spark's v2 checksums were not kept (the harness lost that
 job's result file), so v2 is checked by row count only.</p>
 
-<p class="foot">Numbers from <a href="{{ '/results.html' | relative_url }}">Benchmark results</a>
-(the #260 harness, #261 v2, #262 v3): TPC-H SF1 on one 8-vCPU host, median of 10 measured iterations, <code>local[8]</code>. Not a
+<p class="foot">Numbers from the #260 harness (#261 v2, #262 v3): TPC-H SF1 on one 8-vCPU host, median of 10 measured iterations, <code>local[8]</code>. Not a
 cluster benchmark and not comparable to the 1 TB TPC-DS results. Checksums equalled Spark's on all 90 cells; every <code>dv_*</code>
 checksum equalled its <code>pos_*</code> twin (same rows, different encoding). Two of sixteen JVMs showed a transient JIT-deopt spike
 on Q1's first post-warm-up iterations that recovered within the same JVM — a compilation storm, not a delete-layout cost.</p>

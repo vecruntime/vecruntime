@@ -2,11 +2,9 @@
 
 **A vectorized execution runtime for Apache Spark using Java**
 
-> vecruntime was previously named spark-vector. In 0.0.2 every name changed, with no aliases: the plugin class `io.sparkvector.spark.VectorPlugin` → `io.vecruntime.spark.VectorPlugin`; the Java/Scala packages `io.sparkvector.*` → `io.vecruntime.*`; the Maven coordinates — groupId `io.sparkvector` → `io.github.vecruntime`, artifacts `spark-vector-*` → `vecruntime-*` (e.g. `spark-vector-spark_2.13` → `vecruntime-spark_2.13`); the shuffle manager class `spark.shuffle.manager=org.apache.spark.sql.vector.shuffle.VectorShuffleManager` → `org.apache.spark.sql.vecruntime.shuffle.VectorShuffleManager`; the configuration keys `spark.vector.*` → `spark.vecruntime.*`; and the JVM system properties `sparkvector.*` → `vecruntime.*`. Old names are unknown, not accepted.
-
 vecruntime accelerates Spark SQL workloads by executing core operators directly on **Arrow-layout columnar batches** using the **Java Vector API**, bringing SIMD-optimized execution to the JVM without native libraries, JNI, or serialization boundaries.
 
-Inspired by the execution architecture of Apache DataFusion Comet, vecruntime provides a native-style execution path for **Filter, Project, HashAggregate, Sort, and hash joins**, while preserving Spark as the execution fallback for unsupported operators, expressions, and data types.
+Inspired by the execution architecture of Apache DataFusion Comet, vecruntime provides a native-style execution path for **Filter, Project, HashAggregate, Sort, Window (`ROWS` and `RANGE` frames), Range, Expand, Generate, Union and the hash, sort-merge and nested-loop joins**, while preserving Spark as the execution fallback for unsupported operators, expressions, and data types.
 
 The result is a **fully JVM-based execution engine** that combines the performance potential of vectorized execution with the portability and simplicity of the Java ecosystem.
 
@@ -61,7 +59,7 @@ with its default is in [docs/configuration.md](docs/configuration.md).
 | Module | Language | Contents |
 |---|---|---|
 | `kernels/` | Java 25 | `VectorBuffers` (Arrow-layout `MemorySegment`s), SIMD kernels: compare, bitmap logic, compaction, arithmetic, decimal rescaling and division, casts, reductions (plain and overflow-checked), group hashing and key table, grouped accumulators, sort, gather, column builder; scalar references used as test oracles |
-| `spark/` | Scala 2.13 + Java | `VectorPlugin`, session extension, `VectorColumnarRule`, expression compiler, the operators (`VectorFilterExec`, `VectorProjectExec`, `VectorHashAggregateExec` with its spill, `VectorSortExec`, `VectorTakeOrderedAndProjectExec`, the limit family, `VectorUnionExec` / `VectorCoalesceExec`, `VectorExpandExec`, `VectorWindowExec`, `VectorGenerateExec`, `VectorSampleExec`, `VectorMergeRowsExec`, `VectorBroadcastHashJoinExec` / `VectorShuffledHashJoinExec` / `VectorBroadcastNestedLoopJoinExec` / `VectorSortMergeJoinExec`, `VectorShuffleExchangeExec`, `VectorToCometExec`, `VectorPrefetchScanExec`), Arrow output, input adapters (Spark vectors, Arrow, Comet, Iceberg), the Vector Acceleration UI tab |
+| `spark/` | Scala 2.13 + Java | `VectorPlugin`, session extension, `VectorColumnarRule`, expression compiler, the operators (`VectorFilterExec`, `VectorProjectExec`, `VectorHashAggregateExec` with its spill, `VectorSortExec`, `VectorTakeOrderedAndProjectExec`, the limit family, `VectorUnionExec` / `VectorCoalesceExec`, `VectorExpandExec`, `VectorWindowExec`, `VectorGenerateExec`, `VectorSampleExec`, `VectorRangeExec`, `VectorMergeRowsExec`, `VectorBroadcastHashJoinExec` / `VectorShuffledHashJoinExec` / `VectorBroadcastNestedLoopJoinExec` / `VectorSortMergeJoinExec`, `VectorShuffleExchangeExec`, `VectorToCometExec`, `VectorPrefetchScanExec`), Arrow output, input adapters (Spark vectors, Arrow, Comet, Iceberg), the Vector Acceleration UI tab |
 | `shuffle/` | Scala 2.13 | the columnar shuffle (#288): `VectorShuffleManager` (writer, reader, file cleanup), `PartitionedIpcWriter` / `PartitionedIpcFile` (Arrow IPC record batches per reduce partition in Spark's data-file layout, adaptive dictionaries, zstd), the Flight data plane (`FlightShuffle`: one server per executor, one `DoGet` per executor and reducer) and the `block` backend over Spark's block transfer |
 | `benchmarks/` | Java + Scala | JMH kernel microbenchmarks; the TPC-H (22 queries) and TPC-DS (103 queries) runners, local and on a cluster; `submit-cluster.sh` and the Kubernetes `SparkApplication` manifest under `benchmarks/k8s/` (the image build and the run matrix of the EKS campaign arrive with #247); `profile-query.sh` (one query under JFR) |
 | `spark-sql-tests/` | Scala 2.13 | Spark's own SQL golden-file suite run with the plugin (profile `spark-sql-tests`, on demand only; see below) |
@@ -154,6 +152,7 @@ Configuration keys (all default to `true` except the last; the complete referenc
 | `spark.vecruntime.exec.generate.enabled` | convert `GenerateExec` with `explode`/`posexplode` (and the `_outer` forms) over an array column: the other columns gathered through a repeat index built from the array lengths, the elements copied once per array from Spark's array vector |
 | `spark.vecruntime.exec.sample.enabled` | convert `SampleExec` without replacement over a columnar child: Spark's own Bernoulli sequence per partition as a selection bitmap, so a seed returns Spark's rows |
 | `spark.vecruntime.exec.localTableScan.enabled` | convert `LocalTableScanExec` (`VALUES`, local relations) into one batch per partition; **off by default** -- nothing to accelerate, it only lets small-table tests run our operators |
+| `spark.vecruntime.exec.range.enabled` | convert `RangeExec` (`spark.range`, the `range()` table function) into native INT64 batches -- Spark's rows in Spark's partitions, one reused vector per task -- so the chain above `range()` is ours from the leaf (over Spark's row leaf nothing of ours ran until the first exchange) |
 | `spark.vecruntime.exec.expand.enabled` | convert `ExpandExec` (`ROLLUP` / `CUBE` / `GROUPING SETS`, the `count(distinct)` rewrite) over a columnar child: one borrowed-column batch per grouping set, no data copy |
 | `spark.vecruntime.exec.broadcastHashJoin.enabled` | convert `BroadcastHashJoinExec` when the streamed side is columnar or an exchange (the build side stays Spark's broadcast) |
 | `spark.vecruntime.exec.broadcastNestedLoopJoin.enabled` | convert `BroadcastNestedLoopJoinExec` (non-equi joins) when the streamed side is columnar or an exchange; inner/cross, semi/anti/existence and outer joins with the streamed side preserved |
@@ -307,8 +306,7 @@ measurements behind each item are in the linked docs and issues.
   implemented, and under `spark.ssl.rpc.enabled` the server refuses to start -- use
   `spark.vecruntime.shuffle.backend=block` (Spark's own block transfer carrying our batches) there
   (`docs/flight-shuffle.md`). Without the manager the plugin runs over Spark's row shuffle,
-  converting at the boundary. The manager was renamed in 0.0.2 from
-  `org.apache.spark.sql.vector.shuffle.VectorShuffleManager`; the old name is not accepted.
+  converting at the boundary.
 - **Platforms measured:** x86-64 with AVX-512 (the 1 TB campaign) and AVX2, and Apple silicon
   (NEON, 128-bit lanes) for the local suites. Graviton (SVE) is untested (#253); the kernels choose
   the lane width at start-up, so it should run, but the thresholds were set on x86.
@@ -323,7 +321,7 @@ measurements behind each item are in the linked docs and issues.
 - Nested-type accessors and constructors: `arr[i]`, `map[key]`, struct/array/map construction, the
   lambda function families (#50); struct fields and pass-through nested columns work.
 - Python UDFs (#65) and the Parquet write path, `DataWritingCommandExec` (#64).
-- `RANGE` window frames with value offsets, decimal window aggregates (#28), `IGNORE NULLS` (#58).
+- Decimal window aggregates over sliding frames (#28), `IGNORE NULLS` (#58), `RANGE` window offsets over decimal or timestamp (interval) order keys.
 - The window operator holds its whole partition in memory (the sort and the joins spill; the window
   does not yet).
 - Regular expressions, collated strings, binary and Float columns as computed values or keys (they
@@ -530,7 +528,7 @@ Comet's shuffle manager and `spark.comet.exec.shuffle.enabled=true`; see [docs/c
 | Aggregates | `sum` (ANSI bigint sums overflow-checked), `count`, `count_if`, `min`, `max` (incl. booleans and strings), `avg`, `first`/`last`, `bool_and`/`bool_or`, `bit_and`/`bit_or`/`bit_xor`, `max_by`/`min_by`, the statistical family (`stddev`/`variance` pop and samp, `skewness`, `kurtosis`, `covar_*`, `corr`, `regr_*`; Spark's Welford update and merge, agreement to a relative tolerance) in every aggregate mode (`Partial`, `PartialMerge`, `Final`, `Complete`), with `FILTER` clauses, `DISTINCT` (Spark's rewrites, incl. TPC-H Q16's `count(distinct)`) and keys-only aggregates (`SELECT DISTINCT`, `UNION`); `sum`/`avg` of decimals up to 8/11 digits through Spark's own rewrite to long/double sums, wider ones through 128-bit accumulators emitting Spark's own wide buffers (a decimal `avg`'s result is Spark's own division over the merged buffer); keys of Int/Long/Boolean/String/Date/Byte/Short/Decimal (wide DECIMAL128 included) and Double (compared by bits, as Spark's `NormalizeNaNAndZero` makes them); Spark's `SortAggregateExec` for string buffers converted too. Past `spark.vecruntime.agg.spillThreshold` a partial aggregate emits its table and starts over, a final one spills hash-partitioned and merges bucket by bucket, the budget arbitrated by Spark's task memory manager (#363, #367, #376) | `ObjectHashAggregateExec` functions (`collect_*`, `percentile_*`) |
 | Sort | `SORT BY`/`ORDER BY` over a columnar child, every supported type as key, spilling past its budget (#416) | sorts over Spark's row shuffle (kept by Spark), spilling |
 | Generate | `explode`, `posexplode`, `explode_outer`, `posexplode_outer` over an array column or a struct field of one (elements of any lane type; nulls, empty arrays and arrays longer than a batch) | `inline`, `stack`, `json_tuple`, generators over maps, user-defined generators, computed arrays |
-| Windows | `row_number`, `rank`, `dense_rank` over `PARTITION BY ... ORDER BY ...` (one walk over the sorted input; a partition longer than a batch is one partition); whole-partition `sum`/`avg`/`count`/`min`/`max` and the rest of the aggregate family over non-decimal inputs (the default frame without `ORDER BY`, or `ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING`); running `sum`/`avg`/`count`/`min`/`max` (`ROWS` or `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`, the latter the default with `ORDER BY`); the child may be Spark's row sort; the per-partition top-k Spark inserts under a `rank <= k` filter (`WindowGroupLimitExec`, both modes) ; `lag`/`lead` (literal offset and default), `first_value`/`last_value`/`nth_value` over the same frames ; `percent_rank`/`cume_dist`/`ntile`; sliding `sum`/`avg`/`count`/`min`/`max` over `ROWS BETWEEN a AND b` | `RANGE` frames with value offsets, decimal window aggregates (#28), `IGNORE NULLS` (#58) |
+| Windows | `row_number`, `rank`, `dense_rank` over `PARTITION BY ... ORDER BY ...` (one walk over the sorted input; a partition longer than a batch is one partition); whole-partition `sum`/`avg`/`count`/`min`/`max` and the rest of the aggregate family over non-decimal inputs (the default frame without `ORDER BY`, or `ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING`); running `sum`/`avg`/`count`/`min`/`max` (`ROWS` or `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`, the latter the default with `ORDER BY`); the child may be Spark's row sort; the per-partition top-k Spark inserts under a `rank <= k` filter (`WindowGroupLimitExec`, both modes) ; `lag`/`lead` (literal offset and default), `first_value`/`last_value`/`nth_value` over the same frames ; `percent_rank`/`cume_dist`/`ntile`; sliding `sum`/`avg`/`count`/`min`/`max` over `ROWS BETWEEN a AND b` and over `RANGE BETWEEN a AND b` with value offsets (one integral or date order key, `ASC`/`DESC`, either null ordering; the frame kernels' two-pointer walk) | decimal window aggregates over sliding frames (#28), `IGNORE NULLS` (#58), `RANGE` offsets over decimal or timestamp keys |
 | Joins | broadcast and shuffled hash joins: inner, left/right/full outer, left semi, left anti (including the null-aware anti join Spark plans for `NOT IN (subquery)` over nullable columns), existence (`EXISTS` as a value), each with an optional non-equi condition; keys of Int/Long/Boolean/String/Date/Byte/Short/Decimal (wide included) and Double (by bits); sort-merge joins as an order-preserving merge join over Spark's sorted inputs (`spark.vecruntime.exec.sortMergeJoin.mode`, `auto` by default, #286/#311); broadcast nested-loop joins | a columnar broadcast exchange (the build side is read from Spark's `HashedRelation`, once per executor) |
 
 ## Benchmarks
@@ -742,6 +740,10 @@ replacement) is a selection producer like the filter: it runs Spark's own Bernou
 over the live rows, so the same seed returns exactly Spark's rows, and forwards the bitmap. `VectorLocalTableScanExec`
 turns a `VALUES` relation into batches; it is off by default (`spark.vecruntime.exec.localTableScan.enabled`)
 because there is nothing to accelerate -- it only removes the row-to-columnar transition for small-table tests.
+`VectorRangeExec` (`spark.range`, the `range()` table function) is the other leaf: it writes Spark's rows, in
+Spark's partitions, straight into native INT64 batches -- one vector per task, refilled by a Vector API
+kernel for every batch -- so the filter, projection and partial aggregate over `range()` are ours from the leaf, where over Spark's row
+leaf they stayed Spark's until the first exchange (`spark.vecruntime.exec.range.enabled`).
 
 Window functions start with the ranking layer (#58): `VectorWindowExec` computes `row_number`, `rank`
 and `dense_rank` in one walk over the input Spark already sorted by partition and order keys -- a new
@@ -763,7 +765,12 @@ or row a group and combine its buffers with the running buffers before it -- sum
 the held rows across batch boundaries; `percent_rank`, `cume_dist` and `ntile`, which need the partition
 size, take the same path, as do sliding frames (`sum(x) OVER (... ROWS BETWEEN 2 PRECEDING AND 1
 FOLLOWING)`), re-aggregated per row over the frame's rows in order exactly as Spark's sliding frames are.
-Decimal window aggregates run over the 128-bit lane for whole-partition and running frames (#259); a sliding frame over a decimal and `RANGE` frames with value offsets are refused.
+`RANGE` frames with value offsets (`sum(x) OVER (... ORDER BY d RANGE BETWEEN 5 PRECEDING AND CURRENT
+ROW)`) are computed per partition by the frame kernels: the sorted order keys are walked once with two
+monotone pointers to find every row's frame (Spark's own buffer walk, so a null key's frame is the null
+peer group and the bound arithmetic wraps or raises exactly as Spark's `Add` does), and the aggregate is
+re-run over each frame in row order -- bit-identical double sums -- without a per-row object.
+Decimal window aggregates run over the 128-bit lane for whole-partition and running frames (#259); a sliding frame over a decimal and `RANGE` offsets over decimal or timestamp keys are refused.
 
 `ROLLUP`, `CUBE` and `GROUPING SETS` (and the rewrite Spark applies to `count(distinct)`) go through
 `ExpandExec`, which duplicates every row once per grouping set with the unused keys nulled and a

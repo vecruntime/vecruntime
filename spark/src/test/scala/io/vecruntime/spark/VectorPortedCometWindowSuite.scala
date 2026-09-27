@@ -40,9 +40,10 @@ import org.apache.spark.sql.vecruntime.VectorWindowExec
  * LAST_VALUE over a ROWS frame and NTH_VALUE.
  *
  * It also pins the shapes Comet documents as *not* accelerated or as errors, which are contracts
- * `docs/operators.md` also records: a RANGE frame with a value offset falls back, a RANGE frame whose
- * lower bound is FOLLOWING falls back, `IGNORE NULLS` on lag/lead falls back, and a non-literal
- * lag/lead offset or default is a Spark *analysis error* (not a fallback) that both engines raise.
+ * `docs/operators.md` also records: a RANGE frame with a value offset and a RANGE frame whose lower
+ * bound is FOLLOWING (both Comet fallbacks) are ours, `IGNORE NULLS` on lag/lead falls back, and a
+ * non-literal lag/lead offset or default is a Spark *analysis error* (not a fallback) that both engines
+ * raise.
  * Where a shape uncovered an engine bug the case is `ignore`d with a one-line reason and a minimal
  * repro in the PR, per the task's rule not to fix engine code in a coverage change.
  *
@@ -214,18 +215,14 @@ class VectorPortedCometWindowSuite extends VectorQuerySuite {
   // back", the RANGE value-offset frame, IGNORE NULLS).
   // ---------------------------------------------------------------------------
 
-  test("RANGE value-offset frames, IGNORE NULLS and unsupported functions fall back with a reason") {
-    // A RANGE frame with a value offset needs per-row order-key value comparisons.
-    checkFallback(
-      "SELECT a, b, sum(c) OVER (PARTITION BY a ORDER BY b RANGE BETWEEN 5 PRECEDING AND CURRENT ROW) AS moving FROM w",
-      Seq(Window),
-      "RANGE frames with value offsets"
+  test("RANGE value-offset frames are ours; IGNORE NULLS and unsupported functions fall back with a reason") {
+    // A RANGE frame with a value offset: the frame kernels' two-pointer walk over the order key (Comet falls back).
+    checkWindow(
+      "SELECT a, b, sum(c) OVER (PARTITION BY a ORDER BY b RANGE BETWEEN 5 PRECEDING AND CURRENT ROW) AS moving FROM w"
     )
-    // A RANGE frame whose lower bound is FOLLOWING (Comet's "rangeBetween FOLLOWING lower bound").
-    checkFallback(
-      "SELECT a, b, sum(c) OVER (PARTITION BY a ORDER BY b RANGE BETWEEN 1 FOLLOWING AND 3 FOLLOWING) AS ahead FROM w",
-      Seq(Window),
-      "RANGE frames with value offsets"
+    // A RANGE frame whose lower bound is FOLLOWING (Comet's "rangeBetween FOLLOWING lower bound falls back").
+    checkWindow(
+      "SELECT a, b, sum(c) OVER (PARTITION BY a ORDER BY b RANGE BETWEEN 1 FOLLOWING AND 3 FOLLOWING) AS ahead FROM w"
     )
     // IGNORE NULLS on lag/lead.
     checkFallback(

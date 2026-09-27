@@ -57,7 +57,8 @@ GitHub Pages **project** site uses, so links and assets resolve exactly as they 
 - **Overview / home** (`../docs/index.md`) — rendered with the animated-terminal hero.
 - **User guide** — `operators.md`, `expressions.md`, `configuration.md`, `comet.md`, `iceberg.md`,
   `flight-shuffle.md`.
-- **Benchmarks** — `results.md` (the lab notebook) plus the three generated benchmark pages.
+- **Benchmarks** — the three generated benchmark pages. `docs/results.md` (the lab notebook) stays in
+  the repository but is not published; links to it from the site go to the file on GitHub.
 
 Doc content is read straight from `../docs/*.md`. To change wording, edit those Markdown files (they
 serve both this site and the Jekyll site) and rebuild.

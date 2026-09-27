@@ -60,6 +60,7 @@ object VectorConf {
   val GenerateEnabled = "spark.vecruntime.exec.generate.enabled"
   val WindowEnabled = "spark.vecruntime.exec.window.enabled"
   val LocalTableScanEnabled = "spark.vecruntime.exec.localTableScan.enabled"
+  val RangeEnabled = "spark.vecruntime.exec.range.enabled"
   val BroadcastHashJoinEnabled = "spark.vecruntime.exec.broadcastHashJoin.enabled"
   val BroadcastNestedLoopJoinEnabled = "spark.vecruntime.exec.broadcastNestedLoopJoin.enabled"
   val ShuffledHashJoinEnabled = "spark.vecruntime.exec.shuffledHashJoin.enabled"
@@ -166,6 +167,9 @@ object VectorConf {
 
   /** Convert LocalTableScanExec (`VALUES`, small local relations) into one batch per partition; off by default. */
   def localTableScanEnabled(conf: SQLConf): Boolean = bool(conf, LocalTableScanEnabled, default = false)
+
+  /** Convert RangeExec (`spark.range`, the `range()` table function) into native INT64 batches, so the chain above is ours from the leaf. */
+  def rangeEnabled(conf: SQLConf): Boolean = bool(conf, RangeEnabled, default = true)
 
   /** Convert BroadcastHashJoinExec over a columnar streamed side (the build side stays Spark's broadcast). */
   def broadcastHashJoinEnabled(conf: SQLConf): Boolean = bool(conf, BroadcastHashJoinEnabled, default = true)
