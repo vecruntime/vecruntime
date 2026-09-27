@@ -107,6 +107,53 @@ one copy and sequential reductions for double sums and reproduces Spark's roundi
 bitmaps per ms (127x). Included as a sanity check that bitmap bookkeeping never shows up in
 profiles, which held in every JFR recording taken for this document.
 
+### The range fill: `SequenceKernels.range` against the scalar oracle, and `range()` + `sum` end to end
+
+`RangeFillBenchmark`: one 10000-row batch of `start + i * step` written into a native INT64 buffer
+(one `spark.sql.inMemoryColumnarStorage.batchSize` batch of the columnar `range()` leaf,
+`VectorRangeExec`), rows per ms, on the x86 host above (Xeon 8488C, AVX-512, 512-bit species; quiet
+machine, `-wi 2 -i 3 -w 1 -r 1 -f 1`). The vector kernel is a broadcast multiply of the lane index
+for the offsets and one add plus one store per block; the scalar twin is one multiply-add per row.
+
+| step | scalar (`ScalarReference.range`) | vector (`SequenceKernels.range`) | ratio |
+|---:|---:|---:|---:|
+| 1 (the `iota` path, also `monotonically_increasing_id()`) | 3412 k rows/ms | 6467 k rows/ms | 1.9x |
+| 3 | 3425 k | 6798 k | 2.0x |
+| -7 | 3429 k | 6615 k | 1.9x |
+
+Both are write-bandwidth bound (6.6 M rows/ms is 53 GB/s of 8-byte values into a buffer that stays
+in cache), so the 2x is the ceiling this loop has; the kernel is not where a `range()` query spends its
+time. `RangeQueryBenchmark` measures the query: `SELECT sum(id) FROM range(0, 1e9, 1, 8)` in one
+`local[8]` session, milliseconds per query, three ways -- `spark` (plugin off: Spark's generated range
+loop feeding its generated aggregate), `rowRange` (plugin on, `spark.vecruntime.exec.range.enabled=false`:
+the shape before the leaf, Spark's row `RangeExec` feeding Spark's generated partial aggregate, since
+a row leaf converts nothing of ours above it, our Final aggregate behind a `RowToColumnarExec` over
+the shuffle) and `vector` (`VectorRangeExec` feeding our partial aggregate):
+
+| configuration | 1e9 rows | notes |
+|---|---:|---|
+| `spark` | 219 ms (±27) | Spark's codegen: a tight `long` loop, 4.6 G rows/s over 8 cores |
+| `rowRange` | 202 ms (±116) | the same loop under Spark's partial aggregate; only the two-row Final is ours |
+| `vector` | 150 ms (±118); 190 ms in the JFR run below | our leaf and our partial aggregate |
+
+Three one-second iterations give wide bands (the errors are JMH's 99.9% intervals over three points),
+so read this as "at least on par with Spark's generated loop, up to 1.4x": what the leaf buys is not
+this query -- Spark's codegen over a number generator is as good as a JVM loop gets -- but the chain
+above `range()`, which is now ours from the source (a filter, a projection, a partial aggregate, a
+join side) where before it stayed Spark's until the first exchange. The JFR recording of the `vector`
+configuration over 1e9 rows (`settings=profile`, 9 s, 840-910 execution samples; `jfr-summary.sh`)
+has the two kernels as half the samples -- `AggKernels.sumLongExact` 30.7%, `SequenceKernels.iota`
+19.7% -- then the aggregate iterator's per-batch scaffolding (`VectorUngroupedAggregateIterator.update`
+5%, Arrow's `getNullCount` / `checkIndexD` / `refCnt` 2.6-3.3% each: the adapter's null count over the
+validity bitmap per batch, a consumer-side cost); no `MemorySegment` bookkeeping frame above 0.7%
+(`loadFromMemorySegmentScopedInternal` under `sumLongExact`), and no range frame among the allocation
+sites: the leaf allocates one vector per task and refills it, the per-batch garbage is the aggregate's
+`EvalContext` and arena (6% of allocation pressure) and Spark's own scheduler and Netty buffers
+(`HeapByteBuffer`, `Arrays.copyOf`, `HashMap.resize`, 25% together). GC: 56 pauses, 220 ms in total over
+the 9 s, none attributable to the range. An earlier recording had `SequenceKernels.iota` at 6.7% of
+allocation pressure from a per-call `long[]` of lane offsets; it is a `static final` lane-index vector
+now (a broadcast multiply gives the stepped offsets), and the frame is gone from the list.
+
 ### Group-key assignment over plain strings: on-the-fly dictionary for any length, with a cap
 
 `GroupKeyTableBenchmark`, 64 batches of 4096 plain (non-dictionary) UTF8 keys into one

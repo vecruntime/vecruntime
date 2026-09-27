@@ -841,6 +841,21 @@ public final class ScalarReference {
         return count;
     }
 
+    // ---------------------------------------------------------------- sequences
+
+    /**
+     * {@code out[i] = start + i * step} for {@code i} in {@code [0, n)}, one
+     * scalar multiply-add per lane; returns {@code start + n * step}. The
+     * oracle of {@link io.vecruntime.kernels.SequenceKernels#range}.
+     */
+    public static long range(MemorySegment out, int n, long start,
+            long step) {
+        for (int i = 0; i < n; i++) {
+            out.setAtIndex(VectorBuffers.LE_LONG, i, start + (long) i * step);
+        }
+        return start + (long) n * step;
+    }
+
     // ---------------------------------------------------------------- gather
 
     /**

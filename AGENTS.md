@@ -8,7 +8,7 @@ considered done. `README.md` is the user-facing description, `docs/results.md` t
 ## 1. What this project is
 
 A Spark SQL plugin that runs `Filter`, `Project`, `HashAggregate` (all four modes, spilling),
-`Sort`, `Window`, `Expand`, `Generate`, the limit family, `Sample`, `Union`/`Coalesce`, Iceberg's
+`Sort`, `Window`, `Expand`, `Generate`, the limit family, `Sample`, `Range`, `Union`/`Coalesce`, Iceberg's
 `MergeRows`, the hash, broadcast-nested-loop and sort-merge joins, and its own columnar shuffle over
 Arrow-layout columnar batches with the Java Vector API (`jdk.incubator.vector`), in the style of
 Apache DataFusion Comet but entirely on the JVM. It reads batches from Spark's vectorized Parquet
@@ -421,6 +421,19 @@ that pin it.
   `VectorLocalTableScanExec` (off by default, `spark.vecruntime.exec.localTableScan.enabled`) is a leaf that
   writes each partition of a local relation into one on-heap batch through `VectorRowStages.toBatch`; tests
   over `VALUES` must exclude the optimizer's `ConvertToLocalRelation` or no operator survives above it.
+- `VectorRangeExec` replaces Spark's `RangeExec` leaf (`spark.range`, the `range()` table function) so the
+  chain over it is ours from the leaf (a row leaf converts nothing above it: filter, projection and partial
+  aggregate over `range()` stayed Spark's until the first exchange). Spark's semantics are kept exactly because they
+  are visible: the same split (`VectorRangeExec.partition` is `RangeExec.doExecute`'s arithmetic -- element
+  bounds `[i * n / slices, (i + 1) * n / slices)`, both clamped to `Long` by `getSafeMargin`, the row count
+  from the clamped bounds as the generated `initRange` computes it), so `spark_partition_id()` and
+  `monotonically_increasing_id()` match, and the same `outputOrdering` / `outputPartitioning`
+  (`RangePartitioning(id, slices)`), which the plan above was already built on (a sort on `id` elided, no
+  exchange under `GROUP BY id`). Per task one native `BigIntVector` of `conf.columnBatchSize` rows is filled
+  by `SequenceKernels.range` (lane offsets + broadcast base; scalar twin `ScalarReference.range`) and re-emitted
+  for every batch: the columnar contract allows reuse once the next batch is requested and Spark's own
+  `RowToColumnarExec` reuses its vectors the same way; nothing is allocated per batch. Refused: a streaming
+  range, a slice count below 1 (Spark's own execution error).
 - `VectorExpandExec` (also `VectorPassThrough`) emits one output batch per projection per input batch:
   `ColumnRef` slots are `BorrowedColumnVector`s of the input, `NULL` literals `ArrowOutput.nulls`, other
   literals `ArrowOutput.constant`; the planner refuses any other slot shape. Literal slots bypass the
@@ -936,7 +949,7 @@ A change is not done until all of the following that apply have run green, local
    attaches to the cluster runner of #246 when it lands; the summary script reads those recordings
    unchanged.
 
-Current counts: 176 kernel tests, 300 Spark tests with the Comet and Iceberg profiles (259 with
+Current counts: 200 kernel tests, 425 Spark tests with the Comet and Iceberg profiles (259 with
 Iceberg alone; the Comet suites contribute 42, `CometMixedChainSuite` 10, `CometMixedShuffleSuite` 3 and `CometPreferCometSuite` 7 of them). If a change lowers either number, explain why in the commit.
 
 ## 5. Benchmarking protocol

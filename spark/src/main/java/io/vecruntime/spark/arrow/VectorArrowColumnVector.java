@@ -27,20 +27,42 @@ import org.apache.spark.sql.vectorized.ArrowColumnVector;
  * column unchanged wraps the child's vector without taking ownership, so
  * closing the output batch leaves the child's memory alone (the child releases
  * it when it produces its next batch).
+ *
+ * <p>A column may be <em>reusable</em>: a producer that refills the same vector
+ * for every batch (the range leaf) owns it and releases it at task end, and
+ * Spark's {@code ColumnarToRowExec} must not free it after reading a batch --
+ * it calls {@link #closeIfFreeable()} on every batch it has consumed, which
+ * Spark's own reusable {@code WritableColumnVector}s answer with a no-op, and
+ * so does a reusable column here. {@link #close()} still frees it.
  */
 public final class VectorArrowColumnVector extends ArrowColumnVector {
 
     private final ValueVector valueVector;
     private final boolean owns;
+    private final boolean reusable;
 
     public VectorArrowColumnVector(ValueVector vector) {
-        this(vector, true);
+        this(vector, true, false);
     }
 
     public VectorArrowColumnVector(ValueVector vector, boolean owns) {
+        this(vector, owns, false);
+    }
+
+    private VectorArrowColumnVector(ValueVector vector, boolean owns, boolean reusable) {
         super(vector);
         this.valueVector = vector;
         this.owns = owns;
+        this.reusable = reusable;
+    }
+
+    /**
+     * An owned column over a vector its producer refills for every batch:
+     * survives Spark's per-batch {@link #closeIfFreeable()}, freed by {@link
+     * #close()}.
+     */
+    public static VectorArrowColumnVector reusable(ValueVector vector) {
+        return new VectorArrowColumnVector(vector, true, true);
     }
 
     @Override
@@ -54,7 +76,14 @@ public final class VectorArrowColumnVector extends ArrowColumnVector {
 
     /** Same vector, not owned. */
     public VectorArrowColumnVector borrow() {
-        return new VectorArrowColumnVector(valueVector, false);
+        return new VectorArrowColumnVector(valueVector, false, false);
+    }
+
+    @Override
+    public void closeIfFreeable() {
+        if (!reusable) {
+            close();
+        }
     }
 
     @Override

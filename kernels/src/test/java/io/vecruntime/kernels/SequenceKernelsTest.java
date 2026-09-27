@@ -19,6 +19,7 @@ import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.util.Random;
 
+import io.vecruntime.kernels.reference.ScalarReference;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -40,6 +41,64 @@ class SequenceKernelsTest {
                 assertEquals(start + n, next, "next after " + n);
                 for (int i = 0; i < n; i++) {
                     assertEquals(start + i, out.getAtIndex(VectorBuffers.LE_LONG, i), "lane " + i + " of " + n);
+                }
+            }
+        }
+    }
+
+    @Test
+    void steppedSequenceMatchesTheScalarReference() {
+        try (Arena arena = Arena.ofConfined()) {
+            Random rnd = new Random(11);
+            long[] steps = {
+                1,
+                2,
+                3,
+                7,
+                -1,
+                -2,
+                -5,
+                1000,
+                -1000,
+                1L << 40,
+                -(1L << 40)
+            };
+            for (int n : TestData.LENGTHS) {
+                for (long step : steps) {
+                    long start = rnd.nextLong() >> 8; // leaves room for n * step on either side
+                    MemorySegment out = ArrowLayout.allocateData(arena, VecType.INT64, Math.max(n, 1));
+                    MemorySegment expected = ArrowLayout.allocateData(arena, VecType.INT64, Math.max(n, 1));
+                    long next = SequenceKernels.range(out, n, start, step);
+                    long expectedNext = ScalarReference.range(expected, n, start, step);
+                    assertEquals(expectedNext, next, "next after " + n + " by " + step);
+                    for (int i = 0; i < n; i++) {
+                        assertEquals(expected.getAtIndex(VectorBuffers.LE_LONG, i),
+                                out.getAtIndex(VectorBuffers.LE_LONG, i), "lane " + i + " of " + n + " by " + step);
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
+    void steppedSequenceReachesTheLongBoundsWithoutWrapping() {
+        // The last batches of range(Long.MAX_VALUE - k, Long.MAX_VALUE, step) and of the mirror image with
+        // a negative step: the final lane lands exactly on the bound, the kernel must not run past it.
+        try (Arena arena = Arena.ofConfined()) {
+            for (int n : new int[] {1, 5, 64, 65, 1000}) {
+                for (long step : new long[] {1, 3, 64}) {
+                    MemorySegment out = ArrowLayout.allocateData(arena, VecType.INT64, n);
+                    long top = Long.MAX_VALUE - (long) (n - 1) * step;
+                    assertEquals(Long.MAX_VALUE + step, SequenceKernels.range(out, n, top, step)); // wraps, unused
+                    assertEquals(Long.MAX_VALUE, out.getAtIndex(VectorBuffers.LE_LONG, n - 1));
+                    assertEquals(top, out.getAtIndex(VectorBuffers.LE_LONG, 0));
+                    long bottom = Long.MIN_VALUE + (long) (n - 1) * step;
+                    SequenceKernels.range(out, n, bottom, -step);
+                    assertEquals(Long.MIN_VALUE, out.getAtIndex(VectorBuffers.LE_LONG, n - 1));
+                    assertEquals(bottom, out.getAtIndex(VectorBuffers.LE_LONG, 0));
+                    for (int i = 1; i < n; i++) {
+                        assertEquals(bottom - (long) i * step, out.getAtIndex(VectorBuffers.LE_LONG, i));
+                    }
                 }
             }
         }
