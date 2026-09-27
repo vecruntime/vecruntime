@@ -1,7 +1,7 @@
 # spark-operator SparkApplication for one (configuration, dataset) pair of the cluster runner (#246).
 # Template: NOT yet run against a cluster. Substitute IMAGE, S3_BUCKET, DATASET, CONFIG and add the
 # engine sparkConf entries `benchmarks/scripts/submit-cluster.sh <CONFIG> ... ` prints with DRY_RUN=1
-# (spark.plugins, spark.vector.*, spark.comet.*, spark.shuffle.manager, spark.memory.offHeap.*).
+# (spark.plugins, spark.vecruntime.*, spark.comet.*, spark.shuffle.manager, spark.memory.offHeap.*).
 apiVersion: sparkoperator.k8s.io/v1beta2
 kind: SparkApplication
 metadata:

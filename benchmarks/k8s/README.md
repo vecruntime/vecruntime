@@ -20,7 +20,7 @@ tables, 12,096 objects, 27 GB, exact row counts, in about 30 minutes on four 4-c
 **Iceberg legs (#249), decided 2026-09-24:** read S3 through Iceberg's `S3FileIO` with the S3 Analytics
 Accelerator's prefetching stream -- `spark.sql.catalog.<catalog>.io-impl=org.apache.iceberg.aws.s3.S3FileIO`
 and `spark.sql.catalog.<catalog>.s3.analytics-accelerator.enabled=true` (Iceberg 1.11; the `iceberg-aws-bundle`
-is on the image) -- on every engine alike; the `ours`/`csvo` legs add `spark.vector.scan.prefetch=2` (#465) once
+is on the image) -- on every engine alike; the `ours`/`csvo` legs add `spark.vecruntime.scan.prefetch=2` (#465) once
 its measurement is in. The runner's `--iceberg <warehouse>` resolves a local path today and must take an
 `s3a://` warehouse before these legs run.
 

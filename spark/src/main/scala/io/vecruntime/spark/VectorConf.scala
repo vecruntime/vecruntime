@@ -20,17 +20,17 @@ import org.apache.spark.sql.internal.SQLConf
 /** Configuration keys for the spark-vector plugin. All keys are read from the session's SQLConf. */
 object VectorConf {
 
-  val Enabled = "spark.vector.enabled"
-  val FilterEnabled = "spark.vector.exec.filter.enabled"
-  val MergeRowsEnabled = "spark.vector.exec.mergeRows.enabled"
-  val ProjectEnabled = "spark.vector.exec.project.enabled"
-  val AggregateEnabled = "spark.vector.exec.aggregate.enabled"
-  val FinalAggregateEnabled = "spark.vector.exec.aggregate.final.enabled"
-  val SelectionEnabled = "spark.vector.exec.selection.enabled"
-  val CometShuffleEnabled = "spark.vector.comet.shuffle.enabled"
+  val Enabled = "spark.vecruntime.enabled"
+  val FilterEnabled = "spark.vecruntime.exec.filter.enabled"
+  val MergeRowsEnabled = "spark.vecruntime.exec.mergeRows.enabled"
+  val ProjectEnabled = "spark.vecruntime.exec.project.enabled"
+  val AggregateEnabled = "spark.vecruntime.exec.aggregate.enabled"
+  val FinalAggregateEnabled = "spark.vecruntime.exec.aggregate.final.enabled"
+  val SelectionEnabled = "spark.vecruntime.exec.selection.enabled"
+  val CometShuffleEnabled = "spark.vecruntime.comet.shuffle.enabled"
 
   /** Our own columnar shuffle exchange (#288; needs the shuffle module and its shuffle manager). */
-  val ShuffleEnabled = "spark.vector.shuffle.enabled"
+  val ShuffleEnabled = "spark.vecruntime.shuffle.enabled"
 
   /**
    * The columnar Iceberg v3 deletion-vector writer (#20, option B): on a merge-on-read table whose
@@ -43,46 +43,46 @@ object VectorConf {
    * landed slice by slice (the operator is not yet wired); it will default on once every Iceberg
    * merge-on-read suite is byte-identical with it on and off. See `docs/iceberg.md`.
    */
-  val IcebergDvWriterEnabled = "spark.vector.iceberg.dvWriter.enabled"
+  val IcebergDvWriterEnabled = "spark.vecruntime.iceberg.dvWriter.enabled"
 
   /** The grouped aggregate emits its UTF8 keys dictionary-encoded, ids over the group table's own dictionary (#377). */
-  val AggDictionaryKeys = "spark.vector.agg.dictionaryKeys"
-  val SortEnabled = "spark.vector.exec.sort.enabled"
-  val SortRunRows = "spark.vector.sort.runRows"
-  val SortSpillBytes = "spark.vector.sort.spillBytes"
-  val TakeOrderedEnabled = "spark.vector.exec.takeOrdered.enabled"
-  val LimitEnabled = "spark.vector.exec.limit.enabled"
-  val UnionEnabled = "spark.vector.exec.union.enabled"
-  val CoalesceEnabled = "spark.vector.exec.coalesce.enabled"
-  val ExpandEnabled = "spark.vector.exec.expand.enabled"
-  val RollupRewriteEnabled = "spark.vector.exec.aggregate.rollupRewrite.enabled"
-  val SampleEnabled = "spark.vector.exec.sample.enabled"
-  val GenerateEnabled = "spark.vector.exec.generate.enabled"
-  val WindowEnabled = "spark.vector.exec.window.enabled"
-  val LocalTableScanEnabled = "spark.vector.exec.localTableScan.enabled"
-  val BroadcastHashJoinEnabled = "spark.vector.exec.broadcastHashJoin.enabled"
-  val BroadcastNestedLoopJoinEnabled = "spark.vector.exec.broadcastNestedLoopJoin.enabled"
-  val ShuffledHashJoinEnabled = "spark.vector.exec.shuffledHashJoin.enabled"
-  val SortMergeJoinEnabled = "spark.vector.exec.sortMergeJoin.enabled"
-  val SortMergeJoinMode = "spark.vector.exec.sortMergeJoin.mode"
-  val JoinMaxBuildSize = "spark.vector.join.maxBuildSize"
-  val JoinHashMaxBuildSize = "spark.vector.join.hashMaxBuildSize"
-  val JoinSpillBuckets = "spark.vector.join.spillBuckets"
-  val JoinSpillBytes = "spark.vector.join.spillBytes"
-  val CometRangeShuffleEnabled = "spark.vector.comet.shuffle.range.enabled"
+  val AggDictionaryKeys = "spark.vecruntime.agg.dictionaryKeys"
+  val SortEnabled = "spark.vecruntime.exec.sort.enabled"
+  val SortRunRows = "spark.vecruntime.sort.runRows"
+  val SortSpillBytes = "spark.vecruntime.sort.spillBytes"
+  val TakeOrderedEnabled = "spark.vecruntime.exec.takeOrdered.enabled"
+  val LimitEnabled = "spark.vecruntime.exec.limit.enabled"
+  val UnionEnabled = "spark.vecruntime.exec.union.enabled"
+  val CoalesceEnabled = "spark.vecruntime.exec.coalesce.enabled"
+  val ExpandEnabled = "spark.vecruntime.exec.expand.enabled"
+  val RollupRewriteEnabled = "spark.vecruntime.exec.aggregate.rollupRewrite.enabled"
+  val SampleEnabled = "spark.vecruntime.exec.sample.enabled"
+  val GenerateEnabled = "spark.vecruntime.exec.generate.enabled"
+  val WindowEnabled = "spark.vecruntime.exec.window.enabled"
+  val LocalTableScanEnabled = "spark.vecruntime.exec.localTableScan.enabled"
+  val BroadcastHashJoinEnabled = "spark.vecruntime.exec.broadcastHashJoin.enabled"
+  val BroadcastNestedLoopJoinEnabled = "spark.vecruntime.exec.broadcastNestedLoopJoin.enabled"
+  val ShuffledHashJoinEnabled = "spark.vecruntime.exec.shuffledHashJoin.enabled"
+  val SortMergeJoinEnabled = "spark.vecruntime.exec.sortMergeJoin.enabled"
+  val SortMergeJoinMode = "spark.vecruntime.exec.sortMergeJoin.mode"
+  val JoinMaxBuildSize = "spark.vecruntime.join.maxBuildSize"
+  val JoinHashMaxBuildSize = "spark.vecruntime.join.hashMaxBuildSize"
+  val JoinSpillBuckets = "spark.vecruntime.join.spillBuckets"
+  val JoinSpillBytes = "spark.vecruntime.join.spillBytes"
+  val CometRangeShuffleEnabled = "spark.vecruntime.comet.shuffle.range.enabled"
 
   /** The scan-side prefetching converter (#403, lever 2): the queue depth, `0` off. */
-  val ScanPrefetch = "spark.vector.scan.prefetch"
+  val ScanPrefetch = "spark.vecruntime.scan.prefetch"
 
   /** Mixed chains (#280): Comet's native operators above ours through the sink leaf. Off until #281 decides an allowlist. */
-  val CometMixedEnabled = "spark.vector.comet.mixed.enabled"
+  val CometMixedEnabled = "spark.vecruntime.comet.mixed.enabled"
 
   /** The operator allowlist of the mixed-chain pass (#281): kinds, optionally qualified, offered to Comet. */
-  val CometPreferComet = "spark.vector.comet.preferComet"
-  val StrictFloatingPoint = "spark.vector.exec.strictFloatingPoint"
-  val ExplainFallbackEnabled = "spark.vector.explainFallback.enabled"
-  val UiEnabled = "spark.vector.ui.enabled"
-  val UiRetainedExecutions = "spark.vector.ui.retainedExecutions"
+  val CometPreferComet = "spark.vecruntime.comet.preferComet"
+  val StrictFloatingPoint = "spark.vecruntime.exec.strictFloatingPoint"
+  val ExplainFallbackEnabled = "spark.vecruntime.explainFallback.enabled"
+  val UiEnabled = "spark.vecruntime.ui.enabled"
+  val UiRetainedExecutions = "spark.vecruntime.ui.retainedExecutions"
 
   def isEnabled(conf: SQLConf): Boolean = bool(conf, Enabled, default = true)
   def filterEnabled(conf: SQLConf): Boolean = bool(conf, FilterEnabled, default = true)
@@ -179,7 +179,7 @@ object VectorConf {
 
   /**
    * Re-express SortMergeJoinExec as our shuffled hash join when the smaller side's statistics fit
-   * `spark.vector.join.maxBuildSize` (#10). Opt-in: it trades Spark's streaming merge for a per-task
+   * `spark.vecruntime.join.maxBuildSize` (#10). Opt-in: it trades Spark's streaming merge for a per-task
    * hash table, a different memory profile.
    */
   def sortMergeJoinEnabled(conf: SQLConf): Boolean = sortMergeJoinMode(conf) == "hash"
@@ -236,7 +236,7 @@ object VectorConf {
 
   /**
    * The most a sort-merge join's build side may weigh per task, by statistics, for `mode=auto` to
-   * re-express it as the hash join: within `spark.vector.join.spillBytes` it builds in memory, within
+   * re-express it as the hash join: within `spark.vecruntime.join.spillBytes` it builds in memory, within
    * this cap it splits into buckets on disk once (`spillBuckets` buckets of at most `spillBytes`
    * each), and past it -- or without an estimate -- the merge join over the spilling sort takes it
    * (#416). Default `spillBuckets * spillBytes`; `0` or a negative value removes the cap.
@@ -268,7 +268,7 @@ object VectorConf {
   /**
    * Depth of the prefetching converter's queue under the first operator of ours above a Spark file
    * scan (#403, lever 2): `0` (the default) leaves the scan's batches to be converted lazily on the
-   * task thread; `1` or `2` inserts [[org.apache.spark.sql.vector.VectorPrefetchScanExec]], whose
+   * task thread; `1` or `2` inserts [[org.apache.spark.sql.vecruntime.VectorPrefetchScanExec]], whose
    * helper thread pulls the reader's next batch and converts every column into our Arrow vectors
    * while the task thread works on the previous one. Memory grows by that many converted batches
    * per task. Larger values are accepted and capped at 8.

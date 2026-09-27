@@ -30,7 +30,7 @@ operators, expressions, and types transparently fall back to Spark, always with 
 
 ## Getting started
 
-> vecruntime was previously named spark-vector. The configuration keys (`spark.vector.*`), the `sparkvector.*` JVM system properties, and the shuffle manager class (`spark.shuffle.manager=org.apache.spark.sql.vector.shuffle.VectorShuffleManager`) are **unchanged**. What changed: the plugin class `io.sparkvector.spark.VectorPlugin` → `io.vecruntime.spark.VectorPlugin`; the Java/Scala packages `io.sparkvector.*` → `io.vecruntime.*`; and the Maven coordinates — groupId `io.sparkvector` → `io.github.vecruntime`, artifacts `spark-vector-*` → `vecruntime-*` (e.g. `spark-vector-spark_2.13` → `vecruntime-spark_2.13`).
+> vecruntime was previously named spark-vector. In 0.0.2 every name changed, with no aliases: the plugin class `io.sparkvector.spark.VectorPlugin` → `io.vecruntime.spark.VectorPlugin`; the Java/Scala packages `io.sparkvector.*` → `io.vecruntime.*`; the Maven coordinates — groupId `io.sparkvector` → `io.github.vecruntime`, artifacts `spark-vector-*` → `vecruntime-*` (e.g. `spark-vector-spark_2.13` → `vecruntime-spark_2.13`); the shuffle manager class `spark.shuffle.manager=org.apache.spark.sql.vector.shuffle.VectorShuffleManager` → `org.apache.spark.sql.vecruntime.shuffle.VectorShuffleManager`; the configuration keys `spark.vector.*` → `spark.vecruntime.*`; and the JVM system properties `sparkvector.*` → `vecruntime.*`. Old names are unknown, not accepted.
 
 Add the plugin jar to an existing Spark job -- no code changes:
 
@@ -39,7 +39,7 @@ spark-submit \
   --conf spark.plugins=io.vecruntime.spark.VectorPlugin \
   --conf spark.driver.extraJavaOptions="--add-modules=jdk.incubator.vector --enable-native-access=ALL-UNNAMED" \
   --conf spark.executor.extraJavaOptions="--add-modules=jdk.incubator.vector --enable-native-access=ALL-UNNAMED" \
-  --jars vecruntime-spark_2.13-0.0.1.jar \
+  --jars vecruntime-spark_2.13-0.0.2.jar \
   ...
 ```
 
@@ -49,12 +49,12 @@ plugin jar, the columnar shuffle jar and a `SHA256SUMS` file, is on the
 [releases page](https://github.com/vecruntime/vecruntime/releases); the same artifacts are
 published to a Maven repository served from the repository's `maven-repo` branch. See the
 [README](https://github.com/vecruntime/vecruntime#getting-the-jars) for Maven coordinates and
-`--packages` usage, and the [Configuration reference](configuration.html) for every `spark.vector.*`
+`--packages` usage, and the [Configuration reference](configuration.html) for every `spark.vecruntime.*`
 key.
 
 ## Status
 
-Version 0.0.1, a preview release under the Apache License 2.0. The plugin runs the whole of TPC-DS
+Version 0.0.2, a preview release under the Apache License 2.0. The plugin runs the whole of TPC-DS
 (103 queries) and TPC-H (22) with every operator accelerated and returns Spark's results. On the
 1 TB TPC-DS Parquet dataset on EKS, vecruntime finished the 103 queries in 2,557 s against
 Spark's 3,309 s (23% less runtime, faster on 82 of 103 queries), within 2% of Apache DataFusion
@@ -73,8 +73,11 @@ Comet. The per-query tables, configurations, and every study behind the numbers 
 
 ## Reference
 
-- [Configuration](configuration.html) -- every `spark.vector.*` key with its default.
+- [Configuration](configuration.html) -- every `spark.vecruntime.*` key with its default.
 - [Operators](operators.html), [Expressions](expressions.html) -- what converts, under which
   conditions, and why the rest falls back.
+- [Compatibility matrix](compatibility.html) -- what runs on vecruntime and what falls back, row by
+  row from the ported Comet test suites; [Testing & correctness](testing.html) -- how correctness is
+  established (Spark's golden suite, the ported matrices, the benchmark checksums).
 - [Comet as the scan](comet.html), [Apache Iceberg](iceberg.html),
   [The Flight shuffle](flight-shuffle.html).

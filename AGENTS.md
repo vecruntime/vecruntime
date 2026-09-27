@@ -29,7 +29,7 @@ Comet-backed tests and benchmarks. Maven builds everything.
 | `kernels/` | Java 25 | `VectorBuffers` (Arrow-layout `MemorySegment`s), `VecType`, `Species`, the SIMD kernels (compare, bitmap, compact, arith, decimal, cast, agg incl. overflow-checked sums, hash, grouped accumulators, group key table with lookup), the sort, gather and column-builder kernels, and `reference/` (`ScalarReference`, `SortReference`), the scalar oracles the tests compare against |
 | `spark-sql-tests/` | Scala 2.13 | Spark's `SQLQueryTestSuite` with the extension injected; profile `spark-sql-tests` only, run by `benchmarks/scripts/run-spark-sql-tests.sh` |
 | `spark/` | Scala 2.13 + Java | plugin, session extension, `VectorColumnarRule`, expression compiler, the operators (sections 3.5-3.6b), Arrow output, input adapters (Spark on-heap, Arrow, Comet), the Comet bridge, the Vector Acceleration UI tab |
-| `shuffle/` | Scala 2.13 | the columnar shuffle (#288; still open there: TLS and a push-based service): `VectorShuffleExchangeExec` (a `ShuffleExchangeLike`, planned by the rule under `spark.vector.shuffle.enabled` when `spark.shuffle.manager` is `VectorShuffleManager`; hash, round-robin, single and range partitionings), `VectorShuffleManager` (ours by dependency type, Spark's sort shuffle for everything else), the map-side `VectorShuffleWriter` (`PartitionKernels` ids, `PartitionedIpcWriter`: one Arrow IPC stream per record batch, several per reduce partition, concatenated into the resolver's data file with a per-partition index (#340); strings dictionary-encoded per batch only when the dictionary pays, `spark.vector.shuffle.writer.dictionaryMaxRatio` (#356); zstd through zstd-jni with `SafeZstdCodec`; data and index files deleted on `unregisterShuffle` by tracked map task id (#358)) and the `VectorShuffleReader` (local file segments; remote map outputs over Arrow Flight -- `flight/FlightShuffle`: one `FlightServer` per executor started by the executor plugin and registered with the driver plugin, one `DoGet` per executor and reducer carrying all of that executor's blocks for the reducer, their IPC bytes streamed back to back straight from the shuffle files (#347), `spark.authenticate`'s secret as the bearer token; a failed remote fetch is Spark's `FetchFailedException` with the block's map index, so the lost map outputs are recomputed (#364); `spark.vector.shuffle.backend=block` keeps Spark's block transfer instead; both through the `VectorShuffleBackend` seam, whose class-name form is where a push-based shuffle service such as Celeborn would plug in -- future work, not part of #288); `flight-core` 18.3.0 runs on the gRPC transport over Spark's Netty 4.2 and lives here so the plugin jar never carries gRPC |
+| `shuffle/` | Scala 2.13 | the columnar shuffle (#288; still open there: TLS and a push-based service): `VectorShuffleExchangeExec` (a `ShuffleExchangeLike`, planned by the rule under `spark.vecruntime.shuffle.enabled` when `spark.shuffle.manager` is `VectorShuffleManager`; hash, round-robin, single and range partitionings), `VectorShuffleManager` (ours by dependency type, Spark's sort shuffle for everything else), the map-side `VectorShuffleWriter` (`PartitionKernels` ids, `PartitionedIpcWriter`: one Arrow IPC stream per record batch, several per reduce partition, concatenated into the resolver's data file with a per-partition index (#340); strings dictionary-encoded per batch only when the dictionary pays, `spark.vecruntime.shuffle.writer.dictionaryMaxRatio` (#356); zstd through zstd-jni with `SafeZstdCodec`; data and index files deleted on `unregisterShuffle` by tracked map task id (#358)) and the `VectorShuffleReader` (local file segments; remote map outputs over Arrow Flight -- `flight/FlightShuffle`: one `FlightServer` per executor started by the executor plugin and registered with the driver plugin, one `DoGet` per executor and reducer carrying all of that executor's blocks for the reducer, their IPC bytes streamed back to back straight from the shuffle files (#347), `spark.authenticate`'s secret as the bearer token; a failed remote fetch is Spark's `FetchFailedException` with the block's map index, so the lost map outputs are recomputed (#364); `spark.vecruntime.shuffle.backend=block` keeps Spark's block transfer instead; both through the `VectorShuffleBackend` seam, whose class-name form is where a push-based shuffle service such as Celeborn would plug in -- future work, not part of #288); `flight-core` 18.3.0 runs on the gRPC transport over Spark's Netty 4.2 and lives here so the plugin jar never carries gRPC |
 | `benchmarks/` | Java + Scala | JMH kernel microbenchmarks and the TPC-H / TPC-DS runners (`TpchQueries`: all 22 queries, `TpchRunner`; `TpcdsRunner`: the 103 queries from Spark's `tpcds/q*.sql` test resources, sharing `TpchRunner`'s engine through `TpchRunner.Suite`) with their markdown/HTML reports and per-query accelerated-operator counts |
 
 Commands that are known to work (always unset `JAVA_TOOL_OPTIONS` first; the IDE sets one that
@@ -40,7 +40,7 @@ unset JAVA_TOOL_OPTIONS; export JAVA_HOME=/opt/homebrew/opt/openjdk@25
 mvn -B -q clean install                    # kernels + Spark suites, Comet suites skipped (~3 min)
 mvn -B -q -Pcomet clean install            # also the Comet-backed suites (needs the Comet jar in ~/.m2)
 mvn -B -q -Pcomet,iceberg clean install    # plus the Iceberg suites (Iceberg 1.11 runtime from Maven Central)
-mvn -pl kernels test -Dvector.jvm.args="--add-modules=jdk.incubator.vector --enable-native-access=ALL-UNNAMED --sun-misc-unsafe-memory-access=allow -Dsparkvector.vectorBits=512"
+mvn -pl kernels test -Dvector.jvm.args="--add-modules=jdk.incubator.vector --enable-native-access=ALL-UNNAMED --sun-misc-unsafe-memory-access=allow -Dvecruntime.vectorBits=512"
 mvn -pl spark install -Dsuites=io.vecruntime.spark.VectorAggregateSuite   # one suite
 mvn -B -Pcomet,iceberg -pl kernels,spark,shuffle,benchmarks install   # the gate the crews run before a PR
 benchmarks/scripts/gen-tpch.sh 1           # DuckDB-generated eight tables, decimals as doubles; 10 for SF10 (gitignored)
@@ -74,7 +74,7 @@ that pin it.
 - Everything that is not converted gets a reason attached as a `VectorFallback.Tag` on the
   original operator. There is no silent fallback: tests assert on the reason text
   (`checkFallback(..., reasonContains = ...)`), the UI shows it, and
-  `spark.vector.explainFallback.enabled` prints it with `EXPLAIN`.
+  `spark.vecruntime.explainFallback.enabled` prints it with `EXPLAIN`.
 - Supported types are exactly `VecType`: BOOL, INT32 (also DateType), INT64 (also TimestampType and
   `Decimal(p <= 18)` as the unscaled value), FLOAT64, UTF8, and DECIMAL128 for `Decimal(p > 18)` --
   two little-endian `long` limbs per value (`kernels/Decimal128.java`), Arrow's `Decimal128` layout,
@@ -171,7 +171,7 @@ that pin it.
   dictionaries still take the copy. The benchmark configurations set that flag since #403 (SF10:
   q8 1.46 -> 1.14 s, q47 6.28 -> 5.30); the copying path's validity and dictionary loops were made
   bulk in #398 (one segment call per row was 25% of q8's executor time). Lever 2 of #403 is
-  `VectorPrefetchScanExec` (`spark.vector.scan.prefetch=1|2`, default 0): inserted by the rule
+  `VectorPrefetchScanExec` (`spark.vecruntime.scan.prefetch=1|2`, default 0): inserted by the rule
   (`prefetchScans`, after the conversions) between a Spark vectorized file scan -- `FileSourceScanExec`
   or Iceberg's `BatchScanExec`, every column a lane, never a Comet scan -- and the first operator of
   ours above it, a per-task helper thread (`PrefetchingBatchConverter`) pulls the reader's next batch,
@@ -199,7 +199,7 @@ that pin it.
 ### 3.3 SIMD: one species, constant operators, platform-aware paths
 
 - `Species` is the single source of vector shape: the platform's preferred width by default (128
-  bits on NEON, 256 on AVX2, 512 on AVX-512), forced with `-Dsparkvector.vectorBits=128|256|512`.
+  bits on NEON, 256 on AVX2, 512 on AVX-512), forced with `-Dvecruntime.vectorBits=128|256|512`.
   Kernels never pick their own species.
 - Three Vector API lessons learned by JMH, all now baked into the kernels and easy to undo by
   accident:
@@ -213,22 +213,22 @@ that pin it.
      walk over set bits on NEON. Full selection words are bulk copied; partial words take the scalar
      walk when the species has two lanes, the 256-entry shuffle table on 8-lane species.
 - Grouped aggregation decides between one masked reduction per group and a scatter into
-  accumulators by `sparkvector.agg.maskPathMaxGroups` (default 4 where the platform has mask
+  accumulators by `vecruntime.agg.maskPathMaxGroups` (default 4 where the platform has mask
   registers and the double species has 4+ lanes, 1 elsewhere: the measured crossover, #283 decision
   3; the masked path never loses up to 4 groups in either rounding mode). The scatter rotates over
-  `sparkvector.agg.interleave` accumulator copies (default 1 on AVX-512, where one copy is 45-70%
+  `vecruntime.agg.interleave` accumulator copies (default 1 on AVX-512, where one copy is 45-70%
   faster from 4 groups up; 4 elsewhere, +40% at 4 groups on NEON) and with several copies sums
   doubles in a different order than Spark; strict floating point (below) forces one copy for double
   sums, and an explicit `interleave=1` forces Spark's order in every double sum.
 - Platform dispatch (`kernels/Platform.java`, #283): the SIMD target is probed once at class init from
-  HotSpot's own `UseAVX` / `UseSVE` / `MaxVectorSize` (`-Dsparkvector.platform=neon|sve|avx2|avx512`
+  HotSpot's own `UseAVX` / `UseSVE` / `MaxVectorSize` (`-Dvecruntime.platform=neon|sve|avx2|avx512`
   overrides it, for forcing a foreign path emulated or measuring one path against another on the same
   machine) and folded into `static final` booleans -- `MASK_REGISTERS` (AVX-512 only;
-  `-Dsparkvector.maskRegisters=true|false` overrides it) and `NATIVE_COMPRESS` (AVX-512, SVE).
+  `-Dvecruntime.maskRegisters=true|false` overrides it) and `NATIVE_COMPRESS` (AVX-512, SVE).
   `MASK_REGISTERS` is off on SVE since #253: on Graviton4 (JDK 25, 128-bit SVE) `VectorMask.fromLong`
   is not intrinsified (the Vector API's Java fallback runs) and the `fromLong` mask paths measured
   0.50-0.79x of broadcast-AND-compare, while native `compress` wins (1.36x at 50 % selectivity).
-  Re-measure `-Dsparkvector.maskRegisters=true` on SVE after each JDK update. Kernels switch on those
+  Re-measure `-Dvecruntime.maskRegisters=true` on SVE after each JDK update. Kernels switch on those
   at the top of a loop, never per call, and
   never on CPU flags read at runtime. A decision that differs by platform is gated here so the NEON
   path is untouched by construction.
@@ -248,9 +248,9 @@ that pin it.
 
 - A filter feeding another vecruntime operator forwards a `SelectedColumnarBatch` (the input
   batch plus a selection bitmap) instead of compacting, when at least
-  `sparkvector.selection.minFraction` (0.5) of the rows survive; below that it compacts, because
+  `vecruntime.selection.minFraction` (0.5) of the rows survive; below that it compacts, because
   downstream operators then walk far fewer rows (Q6 at 2% selectivity forwarded made the project
-  and aggregate walk all 6M rows). `spark.vector.exec.selection.enabled` turns forwarding off.
+  and aggregate walk all 6M rows). `spark.vecruntime.exec.selection.enabled` turns forwarding off.
 - Later conjuncts are evaluated only for 64-row blocks with an undecided row (`EvalContext.active`
   and the `active` overloads of `CompareKernels`). With survivors spread uniformly this rarely
   skips anything (TPC-H Q6); it is there for clustered data.
@@ -280,20 +280,20 @@ that pin it.
   rewritten boolean. A string buffer makes Spark plan `SortAggregateExec`: the rule builds the same
   hash operator from its fields, drops the sort Spark placed below when it is exactly the required one,
   and keeps the output ordering of a result-emitting stage with a `VectorSortExec` above.
-  `spark.vector.exec.aggregate.final.enabled` turns the Final conversion off.
+  `spark.vecruntime.exec.aggregate.final.enabled` turns the Final conversion off.
 - `GroupKeyTable` memoises group ids per combination of dictionary indices when every key is
   dictionary encoded and the product of dictionary sizes is small. Plain UTF8 keys are dictionary
   encoded on the fly against a per-column dictionary kept across batches so the same path applies:
   values of up to 8 bytes are keyed by their packed bytes (single-byte values through a 256-entry
   direct table), longer ones by a 64-bit fingerprint over 8-byte words confirmed with a byte
-  compare. A column whose dictionary grows past `sparkvector.agg.plainDictMaxEntries` (default 512)
+  compare. A column whose dictionary grows past `vecruntime.agg.plainDictMaxEntries` (default 512)
   makes the table stop encoding plain strings for good and hash and compare per row: the memoised
   path's per-batch reset and miss rate grow with the combinations, and `GroupKeyTableBenchmark`
   puts the crossover at a few hundred distinct values (2x slower by 4000, for 8- and 24-byte keys
   alike). This exists because Comet's native scan delivers plain strings where Spark's reader keeps
   dictionaries, and without it the zero-copy configuration lost to the copying one at SF10.
 - Floating-point rounding is a configuration choice, like Comet's `spark.comet.exec.strictFloatingPoint`.
-  `spark.vector.exec.strictFloatingPoint` (default `true`) makes every double `sum`/`avg`, Partial and
+  `spark.vecruntime.exec.strictFloatingPoint` (default `true`) makes every double `sum`/`avg`, Partial and
   Final, grouped or not, bit-identical to Spark's: `GroupedAccumulators.DoubleSum(strict = true)` keeps
   one accumulator per group and `AggKernels.sumDoubleSequential(v, start)` continues the running sum
   row by row (adding a per-batch sum to the running one would round differently; `AggKernelsTest`
@@ -312,9 +312,9 @@ that pin it.
 - `VectorSortExec` replaces `SortExec` only over a columnar child (Comet's columnar shuffle, or one
   of our operators for a local `SORT BY`). Over Spark's row shuffle the rule leaves `SortExec` with
   the reason "child ... is not columnar": converting rows to columns to sort them gains nothing.
-  `spark.vector.exec.sort.enabled` turns it off.
-- The partition is sorted in runs (#285): every `spark.vector.sort.runRows` rows (default 1M; the
-  issue names it `sparkvector.sort.runRows`) the iterator seals the builders into a run -- its
+  `spark.vecruntime.exec.sort.enabled` turns it off.
+- The partition is sorted in runs (#285): every `spark.vecruntime.sort.runRows` rows (default 1M; the
+  issue names it `vecruntime.sort.runRows`) the iterator seals the builders into a run -- its
   columns, a dictionary string column decoded once, its keys and the permutation -- so the sort's
   JVM scratch is bounded by the run, not the partition. One run emits through its permutation as
   before; several are k-way merged by `kernels/RunMerge` (a loser tree over one cursor per run, one
@@ -338,13 +338,13 @@ that pin it.
   `LazilyGeneratedOrdering` takes the final top `n`, Spark's `UnsafeProjection` applies the select
   list (copy each projected row -- the projection reuses one buffer) and the rows become one
   columnar batch of `OnHeapColumnVector`s for the `ColumnarToRowExec` above. `OFFSET` falls back.
-  `spark.vector.exec.takeOrdered.enabled` turns it off.
+  `spark.vecruntime.exec.takeOrdered.enabled` turns it off.
 - `VectorLocalLimitExec` / `VectorGlobalLimitExec` / `VectorCollectLimitExec` share `VectorLimitIterator`
   (a `VectorBatchIterator` with the `exhausted` hook: whole batches pass through, the boundary batch is
   compacted to its first surviving live rows through `ArrowOutput.compact` -- a forwarded selection is
   honoured -- and the child is not pulled again once the limit is reached). The collect limit's final
   take reuses `VectorRowStages` (UnsafeRow copies -> single-partition shuffle -> one on-heap batch),
-  the same tail as the top-N operator. `spark.vector.exec.limit.enabled`; `OFFSET` falls back.
+  the same tail as the top-N operator. `spark.vecruntime.exec.limit.enabled`; `OFFSET` falls back.
 - `VectorUnionExec` / `VectorCoalesceExec` are `VectorPassThrough` operators: they forward children's
   batches unchanged, so the rule does not mark a filter below them as a selection producer (a forwarded
   selection would reach whatever sits above). The union keeps Spark's partitioning contract:
@@ -418,7 +418,7 @@ that pin it.
   way: per partition it seeds Spark's own `BernoulliCellSampler` with `seed + partitionIndex` and draws once
   per *live* row in order -- the row path and codegen of `SampleExec` do exactly that, so the rows match
   Spark's for a seed; a forwarded input selection means rows the filter dropped draw nothing, as in Spark.
-  `VectorLocalTableScanExec` (off by default, `spark.vector.exec.localTableScan.enabled`) is a leaf that
+  `VectorLocalTableScanExec` (off by default, `spark.vecruntime.exec.localTableScan.enabled`) is a leaf that
   writes each partition of a local relation into one on-heap batch through `VectorRowStages.toBatch`; tests
   over `VALUES` must exclude the optimizer's `ConvertToLocalRelation` or no operator survives above it.
 - `VectorExpandExec` (also `VectorPassThrough`) emits one output batch per projection per input batch:
@@ -432,7 +432,7 @@ that pin it.
   decoded because every chunk may carry a different dictionary), sorted, and gathered out in
   4096-row batches through `GatherKernels` (shared with the joins; `-1` indices pad outer joins). The sort does not spill (that is
   documented, and the reason the config key exists; #380 designs the external merge sort). The
-  grouped aggregate does, since #363: past `spark.vector.agg.spillThreshold` (1g since #511) or a refusal by
+  grouped aggregate does, since #363: past `spark.vecruntime.agg.spillThreshold` (1g since #511) or a refusal by
   Spark's task memory manager -- the operator acquires its real footprint as the table grows (#367,
   #376) -- a buffer-emitting mode emits its table and starts over (`EmitAndReset`, with a
   pass-through once a full table shows the input does not reduce), a merging mode spills into hash
@@ -486,13 +486,13 @@ that pin it.
   columnar `UnionExec`. Run the TPC-DS harness (`run-tpcds.sh`, SF1 in scratch, ~5 minutes) after any
   change to an operator's output contract.
 - There is a merge join (#286, section 3.6b): `VectorSortMergeJoinExec` under
-  `spark.vector.exec.sortMergeJoin.mode=merge`, or under `auto` (#287) where the pre-pass chooses it. The
+  `spark.vecruntime.exec.sortMergeJoin.mode=merge`, or under `auto` (#287) where the pre-pass chooses it. The
   modes: `off` | `hash` (the rewrite below) | `merge` | `auto`; the boolean flag set to `false` reads as
   `off`, `true` as `auto`; the default is `auto` since #311 (it was `off` until the issue's three
   conditions were measured: the golden files under `auto` 642/0, TPC-DS SF1 with every checksum equal
   to Spark's, and TPC-H SF10 under `auto` not slower than `off` under our shuffle -- see results.md,
   "auto by default"). One size rule guards `auto` since #416 (the second, #311's input-size gate that
-  left large merge joins to Spark, went when the sort learned to spill -- `spark.vector.sort.spillBytes`
+  left large merge joins to Spark, went when the sort learned to spill -- `spark.vecruntime.sort.spillBytes`
   bounds a task's sort memory at 1 GiB by default, the join's build budget -- #451's 32 MB came from a sweep that shared the cluster with a full run; alone and in the full run's shape it cost the merge-join queries 30-50% -- and runs past it are merged from local disk): the hash rewrite declines a build side larger
   than the streamed side by statistics (`VectorJoinPlanner.sortMergeBuildSide`: a semi or anti join may
   only build its right side; q4 hashed lineitem and ran 14% slower than Spark's merge -- with the rule
@@ -510,7 +510,7 @@ that pin it.
   rewrite when `sortMergeEligibility` finds a side whose statistics fit the budget, the merge join when
   it does not (no statistics, both sides large, a skew join). The choice is the `SortMergeChoice` tag,
   its reason the `SortMergeWhy` tag both operators print (`Sort-merge join as hash join: built from the
-  right side (split into buckets on disk past spark.vector.join.spillBytes)` / `as merge join: the row
+  right side (split into buckets on disk past spark.vecruntime.join.spillBytes)` / `as merge join: the row
   order reaches a limit or a sort` / `ordering relied on by the parent`; since #416 neither size nor
   statistics decide -- the shuffled hash join splits past its budget, `GraceHashJoin`). A hash join below a merge join
   (its sorts stripped) gets a `VectorSortExec` back (`resortedMerge`). Measured at TPC-H SF10 (#279):
@@ -557,7 +557,7 @@ that pin it.
   columns back in left ++ right order. Null keys never match. Tested positionally against Spark
   (`VectorSortMergeJoinSuite`): the hash join suites compare row sets, this one row order.
 - `SortMergeJoinExec` is re-expressed as `VectorShuffledHashJoinExec` under the opt-in
-  `spark.vector.exec.sortMergeJoin.enabled` (#10): `VectorJoinPlanner.sortMergeBuildSide` picks the smaller
+  `spark.vecruntime.exec.sortMergeJoin.enabled` (#10): `VectorJoinPlanner.sortMergeBuildSide` picks the smaller
   side by `estimatedBuildSize` (both sides must have statistics -- without AQE they do not -- and the
   smaller must fit the budget), the rule strips the two required sorts (`sortMergeInputs`), and a
   top-down pre-pass (`markSortMergeJoins`) keeps a merge join whose ordering an ancestor relies on. The
@@ -572,7 +572,7 @@ that pin it.
   above a chain that did). Tie order
   under `ORDER BY` and unordered `LIMIT` picks differ from Spark's order-preserving merge (three
   `subquery/in-subquery` golden files); `SQL_TESTS_JVM_ARGS` runs the golden suite under the flag.
-- The two broadcast joins refuse a build side whose estimate exceeds `spark.vector.join.maxBuildSize`;
+- The two broadcast joins refuse a build side whose estimate exceeds `spark.vecruntime.join.maxBuildSize`;
   the shuffled hash join is not gated since #416 (past the budget it splits into buckets on disk)
   (`VectorJoinPlanner.buildSizeReason`; the estimate is the AQE stage's `computeStats` for a
   materialised stage, else the logical link's `stats.sizeInBytes`; `Long.MaxValue` or no link =
@@ -659,9 +659,9 @@ into these rather than adding special cases to operators.
   on our classpath (Comet keeps `org.apache.arrow.c.*` unshaded but with shaded signatures, so the
   classes collide), maven-shade relocation (Comet's JNI looks classes up by literal name), and a
   bulk-copy bridge (replaced by the zero-copy one).
-- The Comet allowlist (#281): `spark.vector.comet.preferComet` (`PreferComet.scala`) gates the mixed offer --
+- The Comet allowlist (#281): `spark.vecruntime.comet.preferComet` (`PreferComet.scala`) gates the mixed offer --
   a listed operator is tagged `VectorFallback.Delegated` and left with the reason `delegated to Comet
-  (spark.vector.comet.preferComet)` before our conversions run; if Comet declines it in `mixedChains`, the
+  (spark.vecruntime.comet.preferComet)` before our conversions run; if Comet declines it in `mixedChains`, the
   same `conversions` partial function converts it to ours, so a requested swap never lands on Spark's
   operator. Adding an entry needs the three-part rule of `docs/comet.md` (Comet faster by 2x the crossing
   cost in the queries the operator dominates; no query regressed against the better pure configuration;
@@ -677,7 +677,7 @@ into these rather than adding special cases to operators.
   INT64 decimal lanes are widened. Widening a wide lane word by word made every value two rows -- wrong
   TPC-H q11/q15/q17/q18 at SF1 decimals through the mixed seam (#281). The shuffle bridge carries wide
   decimals too (`CometBatchBridge.isSupported` = `hasLane`).
-- Mixed chains (#280): Comet above ours is our rule's doing (`mixedChains`, `spark.vector.comet.mixed.enabled`,
+- Mixed chains (#280): Comet above ours is our rule's doing (`mixedChains`, `spark.vecruntime.comet.mixed.enabled`,
   default off) -- the sink leaf `CometSinkPlaceHolder(scanOp, chain, CometUnionExec(chain, output,
   Seq(VectorToCometExec(chain))))` built reflectively in `CometMixedBridge`, then Comet's `CometExecRule`
   applied to the parent subtree. Rejected, do not retry: `sparkToColumnar` (leaf-only, copies) and a
@@ -711,11 +711,11 @@ into these rather than adding special cases to operators.
   and range partitioning. Range partitioning makes Comet sample the child through Spark's
   `RangePartitioner`, exactly as Spark's own exchange does (the child runs twice either way); it is
   gated by Comet's `spark.comet.shuffle.native.partitioning.range.enabled` and our
-  `spark.vector.comet.shuffle.range.enabled`. That sampling pass reads the bridged batches through
+  `spark.vecruntime.comet.shuffle.range.enabled`. That sampling pass reads the bridged batches through
   `rowIterator()` and never closes the imported vectors, so the bridge remembers its exports and
   `releaseOutstanding()`s them on task completion (registered after the child iterators, run
   before them). Requires `spark.shuffle.manager=...CometShuffleManager` and
-  `spark.comet.exec.shuffle.enabled=true`; `spark.vector.comet.shuffle.enabled` turns the rewrite
+  `spark.comet.exec.shuffle.enabled=true`; `spark.vecruntime.comet.shuffle.enabled` turns the rewrite
   off. Decimals cross the bridge widened to the 128-bit `d:p,s` layout.
 - Not combined with Comet: Comet's Final aggregate (needs Comet's own partial buffers) and native
   blocks (our operators are not `CometNativeExec`s). Comet's `LargeVarCharVector`
@@ -728,7 +728,7 @@ into these rather than adding special cases to operators.
 
 ### 3.9 The Vector Acceleration UI tab
 
-- Attached from the driver plugin; lives under `org.apache.spark.sql.vector.ui` because
+- Attached from the driver plugin; lives under `org.apache.spark.sql.vecruntime.ui` because
   `SparkUITab`, `WebUIPage` and `UIUtils` are `private[spark]`. It never influences execution: every
   listener callback and the attachment itself are wrapped so a UI failure cannot fail a query or
   application start.
@@ -749,7 +749,7 @@ into these rather than adding special cases to operators.
 
 Our exchange, `VectorShuffleExchangeExec` (a `ShuffleExchangeLike`, so AQE's coalescing, skew
 splitting and local reads apply unchanged), replaces `ShuffleExchangeExec` above a vecruntime
-operator when `spark.vector.shuffle.enabled` is on, the `vecruntime-shuffle` jar is present and
+operator when `spark.vecruntime.shuffle.enabled` is on, the `vecruntime-shuffle` jar is present and
 `spark.shuffle.manager` is `VectorShuffleManager`; Comet's native shuffle takes precedence where it
 is configured. Four pieces, in the `shuffle` module except the kernel:
 
@@ -762,7 +762,7 @@ is configured. Four pieces, in the `shuffle` module except the kernel:
 - The map output: `PartitionedIpcWriter` keeps one Arrow IPC stream per reduce partition, strings
   dictionary-encoded per stream (a plain batch is encoded on the way in; a batch that is already
   dictionary-encoded gets a replacement dictionary), small decimals as int64 with the Spark type in
-  field metadata, spilling a partition's stream to a temporary file past `spark.vector.shuffle.flushBytes`
+  field metadata, spilling a partition's stream to a temporary file past `spark.vecruntime.shuffle.flushBytes`
   and concatenating at finish. The file is committed through Spark's `IndexShuffleBlockResolver`, so
   `MapStatus`, the index file and Spark's own block transfer all work on it. Record batches are
   sized by the writer, not the input: every partition holds one builder per column -- an Arrow
@@ -779,11 +779,11 @@ is configured. Four pieces, in the `shuffle` module except the kernel:
   decodes concatenated streams anyway. Flushes are decided by the writer allocator's *real*
   allocation as well as the slices' used bytes (`setSafe`-grown vectors and per-slice dictionaries
   ran the estimate 10-20x under the truth: 1.1 GB against a 64 MB `bufferBytes`), the allocator is
-  limited by `spark.vector.shuffle.writer.memoryLimit` (1g), and Arrow's `OutOfMemoryException`
+  limited by `spark.vecruntime.shuffle.writer.memoryLimit` (1g), and Arrow's `OutOfMemoryException`
   is rethrown as a serializable `SparkException` at the writer and reader (`VectorShuffleWriter
   .serializable`): Arrow's own is not serializable, and on JDK 25 Spark's `SerializationDebugger`
   then dies in its static initializer (SPARK-55679, fixed in 4.2.0 only) and the executor exits 50.
-  Bodies are zstd-compressed (`spark.vector.shuffle.compression`): raw IPC
+  Bodies are zstd-compressed (`spark.vecruntime.shuffle.compression`): raw IPC
   wrote 1.8x Spark's lz4 bytes, and Arrow's own lz4 codec is commons-compress pure Java, an order of
   magnitude too slow (Q3 crawled for minutes under it). The codecs come from `ShuffleCompression
   .Factory`, never `CommonsCompressionFactory` directly: arrow-java 18.3.0's zstd codec hands zstd
@@ -836,10 +836,10 @@ A change is not done until all of the following that apply have run green, local
 1. Kernel correctness against the scalar oracle. Every kernel has a scalar twin in
    `ScalarReference`; `kernels/src/test` compares them on random data with nulls, selections and
    awkward lengths (tails shorter than a vector, batches not multiple of 64). Run the kernel suite
-   at 128, 256 and 512 bits (`-Dsparkvector.vectorBits=...`); the wider ones are emulated but they
+   at 128, 256 and 512 bits (`-Dvecruntime.vectorBits=...`); the wider ones are emulated but they
    are the only coverage the AVX2/AVX-512 paths have.
 2. Spark SQL comparison. Operator and expression behaviour is validated by running the same SQL
-   twice on the same session with `spark.vector.enabled` toggled and comparing rows
+   twice on the same session with `spark.vecruntime.enabled` toggled and comparing rows
    (`VectorQuerySuite.checkVectorized`, tolerance `1e-9` for doubles), while asserting the expected
    vecruntime operators are in the final (post-AQE) plan. Unsupported cases are validated the same
    way with `checkFallback`, which asserts the Spark operator stayed and the recorded reason
@@ -853,7 +853,7 @@ A change is not done until all of the following that apply have run green, local
    It prints a per-case coverage table and, on a full run, fails when a case runs fewer of our
    operators than `spark-sql-tests/src/test/resources/vector-sql-coverage.tsv` records
    (`SQL_TESTS_UPDATE_BASELINE=true` rewrites the floor; #17). Its JVM sets
-   `sparkvector.agg.interleave=1` so double sums add in Spark's order and match the golden digits.
+   `vecruntime.agg.interleave=1` so double sums add in Spark's order and match the golden digits.
    Run it after any planner or expression change: after a day of merges it found four bugs the
    hand-written suites had not (lazy `nanvl`, `count` over literal arguments, collated strings as
    lanes, a build side pruned to zero columns).
@@ -918,7 +918,7 @@ A change is not done until all of the following that apply have run green, local
 
    ```bash
    benchmarks/scripts/profile-query.sh benchmarks/data/sf10 vector q6 --iterations 3 --warmup 2   # run + record + summarise
-   benchmarks/scripts/profile-query.sh benchmarks/data/tpcds-sf1 vector q72 --tpcds --conf spark.vector.exec.sortMergeJoin.enabled=true
+   benchmarks/scripts/profile-query.sh benchmarks/data/tpcds-sf1 vector q72 --tpcds --conf spark.vecruntime.exec.sortMergeJoin.enabled=true
    benchmarks/scripts/jfr-summary.sh /tmp/profiling/sf10/q6-vector.jfr --top 20                     # any recording, as text for an issue
    benchmarks/scripts/profile-query.sh - vector q6 --flags-only   # the recording flags for a cluster run's executor/driver options
    ```
@@ -952,7 +952,7 @@ Iceberg alone; the Comet suites contribute 42, `CometMixedChainSuite` 10, `Comet
   explicit -- our operators consume the vectorized reader's batches, the row reader would make every
   plan fall back) and `spark.sql.columnVector.offheap.enabled=true` (#403: fixed-width lanes wrapped
   in place, see section 3's scan note); `vector-shuffle` adds the `VectorShuffleManager` and
-  `spark.vector.shuffle.enabled`. Change a setting in both tables and in README's "The benchmark
+  `spark.vecruntime.shuffle.enabled`. Change a setting in both tables and in README's "The benchmark
   configurations" in the same PR.
 - On the cluster (`benchmarks/k8s/run-matrix.sh`, `render-run.sh`; the campaign branch carries the
   k8s scripts) the 1 TB protocol is: `EXECUTORS=8 EXEC_CORES=13 EXEC_MEM=30g EXEC_OVERHEAD=20g
@@ -1014,9 +1014,9 @@ Iceberg alone; the Comet suites contribute 42, `CometMixedChainSuite` 10, `Comet
 
 - Scala for planner rules, operators and expression compilation; Java for kernels and anything
   touching `MemorySegment` in a hot loop. No native code.
-- Spark-facing configuration is `spark.vector.*` (read from `SQLConf`, or from `SparkConf` for the
+- Spark-facing configuration is `spark.vecruntime.*` (read from `SQLConf`, or from `SparkConf` for the
   UI keys the plugin needs before a session exists); kernel tuning knobs are JVM system properties
-  `sparkvector.*` (`vectorBits`, `agg.interleave`, `agg.maskPathMaxGroups`, `selection.minFraction`)
+  `vecruntime.*` (`vectorBits`, `agg.interleave`, `agg.maskPathMaxGroups`, `selection.minFraction`)
   because kernels have no Spark dependency. Document every new key in `README.md`.
 - Commit messages follow Conventional Commits with an explanatory body; commit early, never push
   from an agent session. Build before committing.
@@ -1031,7 +1031,7 @@ Iceberg alone; the Comet suites contribute 42, `CometMixedChainSuite` 10, `Comet
 ## 7. Known gaps
 
 - The columnar shuffle (#288): the Flight server has no TLS (Spark's material is JKS, Flight wants
-  PEM; with `spark.ssl.rpc.enabled` it refuses to start -- use `spark.vector.shuffle.backend=block`);
+  PEM; with `spark.ssl.rpc.enabled` it refuses to start -- use `spark.vecruntime.shuffle.backend=block`);
   one `DoGet` per executor and reducer rather than one stream per executor across reducers; both
   backends assume executors that stay up for the job -- a lost executor's map outputs are recomputed
   through `FetchFailedException` (#364), a push-based shuffle service is future work.
@@ -1076,7 +1076,7 @@ Iceberg alone; the Comet suites contribute 42, `CometMixedChainSuite` 10, `Comet
   `NestedColumnRef` -> `NestedFieldColumnVector.of(ctx.column, path, numRows)`, a view with the
   ancestors' nulls folded in; remapped like any foreign column under a selection). `SizeExpr` and
   `NestedValidityExpr` read the array/map length and the nulls of such a column from Spark's vector.
-- Generate (#59): `VectorGenerateExec` (spark/src/main/scala/org/apache/spark/sql/vector/VectorGenerateExec.scala)
+- Generate (#59): `VectorGenerateExec` (spark/src/main/scala/org/apache/spark/sql/vecruntime/VectorGenerateExec.scala)
   replaces `GenerateExec` for `Explode`/`PosExplode` over a nested column path
   (`ExpressionCompiler.nestedColumnPath`) with a lane element type. The iterator builds `rowIdx`/`elemIdx`
   from the array lengths (a null/empty array -> one `-1` row under `outer`), gathers lanes with

@@ -20,7 +20,7 @@ import java.nio.file.{Files, Path}
 import io.vecruntime.spark.VectorConf
 import io.vecruntime.spark.test.{IcebergTest, VectorQuerySuite}
 import org.apache.spark.sql.DataFrame
-import org.apache.spark.sql.vector.{IcebergDvBridge, VectorWriteDeltaStrategy}
+import org.apache.spark.sql.vecruntime.{IcebergDvBridge, VectorWriteDeltaStrategy}
 import org.scalatest.Tag
 
 /**

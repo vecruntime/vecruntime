@@ -36,7 +36,7 @@ off individually (`io.vecruntime.benchmarks.TpchRunner.CometScanOnly` lists the 
 --conf spark.memory.offHeap.size=2g
 --conf spark.driver.extraJavaOptions="--add-modules=jdk.incubator.vector --enable-native-access=ALL-UNNAMED"
 --conf spark.executor.extraJavaOptions="--add-modules=jdk.incubator.vector --enable-native-access=ALL-UNNAMED"
---jars comet-spark-spark4.1_2.13-1.0.0.jar,vecruntime-spark_2.13-0.0.1.jar
+--jars comet-spark-spark4.1_2.13-1.0.0.jar,vecruntime-spark_2.13-0.0.2.jar
 ```
 
 List Comet's plugin first: session extensions run in registration order, and vecruntime's
@@ -78,7 +78,7 @@ over a sampling pass of the child, which is exactly what Spark's own exchange do
 twice in either case; the sort above the shuffle then becomes `VectorSortExec` because Comet's
 shuffle output is columnar. It follows Comet's own switch
 (`spark.comet.shuffle.native.partitioning.range.enabled`, default on) and can be turned off alone
-with `spark.vector.comet.shuffle.range.enabled=false`. Comet's sampling pass never closes the
+with `spark.vecruntime.comet.shuffle.range.enabled=false`. Comet's sampling pass never closes the
 vectors it imports, so the bridge releases whatever is still outstanding when the task completes.
 Decimals cross the bridge widened to Arrow's 128-bit decimal layout. In the other direction a wide
 decimal column (`decimal(p > 18)`) of a Comet batch is Arrow `Decimal128` already, the DECIMAL128
@@ -119,7 +119,7 @@ and the `IcebergTest` tag and runs with `-Pcomet,iceberg`; see [iceberg.md](iceb
 Comet below ours needs nothing new: a Comet native block is a columnar child like any other, and
 `CometVectorAdapter` reads its vectors zero-copy. Comet *above* ours cannot come from Comet's own
 rule, which runs first and never sees our operators, so our rule builds it (`mixedChains`, behind
-`spark.vector.comet.mixed.enabled`, default `false`): a Spark operator that was left to Spark and
+`spark.vecruntime.comet.mixed.enabled`, default `false`): a Spark operator that was left to Spark and
 whose children are all ours is offered to Comet through the **sink leaf** -- Comet's
 `CometSinkPlaceHolder` over a one-child `CometUnionExec` over our `VectorToCometExec` -- and Comet's
 `CometExecRule` is applied to that subtree; the result is kept only when Comet planned the operator
@@ -148,7 +148,7 @@ dictionaries are decoded and INT64 decimals widened as for the shuffle (#279 mea
 Comet declines an operator the plan records its reasons (`mixed: Comet declined -- ...`, read through
 Comet's `ExtendedExplainInfo`), and a column type Comet's sink refuses is a reason too. The split
 between the engines is otherwise the two per-operator toggles: an operator ours refused or has
-switched off (`spark.vector.exec.<op>.enabled=false`) with Comet's `spark.comet.exec.<op>.enabled=true`
+switched off (`spark.vecruntime.exec.<op>.enabled=false`) with Comet's `spark.comet.exec.<op>.enabled=true`
 goes to Comet. The acceleration view classifies the one-child union over `VectorToComet` as the
 bridge, so a mixed plan shows both engines and counts as accelerated without the hand-off inflating
 either. `CometMixedChainSuite` (`-Pcomet`) pins Comet's projection, collect limit, expand and union
@@ -172,7 +172,7 @@ bridge already had. What the seam cannot reach in Comet 1.0: a window (Comet has
 and a sort-merge join without Comet's shuffle. Which operators *should* go to Comet is the
 allowlist below.
 
-### The allowlist: `spark.vector.comet.preferComet` (#281)
+### The allowlist: `spark.vecruntime.comet.preferComet` (#281)
 
 The pass offers Comet only the operator kinds this key names -- comma-separated, each optionally
 qualified by a predicate the planner reads off the plan: `project:wideDecimal` (an input or output
@@ -184,10 +184,10 @@ half is offered and Comet's buffer rule decides. Comet's own rule runs before ou
 whatever sits on its scan, so the list is about the operators above our chains.
 
 A listed operator our rule could take is left to the pass instead, with the reason `delegated to
-Comet (spark.vector.comet.preferComet)` (shown on Comet's operator once it runs there); if Comet
+Comet (spark.vecruntime.comet.preferComet)` (shown on Comet's operator once it runs there); if Comet
 declines it -- its own fallback, the sink's type rule, the aggregate pair -- ours converts it after
 all, so a requested swap never ends on Spark's operator (`CometPreferCometSuite`). The two escape
-hatches: `spark.vector.comet.mixed.enabled=false` is today's plan, and an empty list under it allows
+hatches: `spark.vecruntime.comet.mixed.enabled=false` is today's plan, and an empty list under it allows
 mixed plans but requests none.
 
 An entry is added only when all three hold on the SF10 matrices of #279 (`docs/results.md`): Comet's

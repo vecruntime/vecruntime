@@ -58,7 +58,7 @@ class VectorDvWriteSuite extends AnyFunSuite with BeforeAndAfterAll {
   }
 
   private def withFlag[T](on: Boolean)(f: => T): T = {
-    val key = "spark.vector.iceberg.dvWriter.enabled"
+    val key = "spark.vecruntime.iceberg.dvWriter.enabled"
     val prev = spark.conf.getOption(key)
     spark.conf.set(key, on.toString)
     try f
@@ -110,9 +110,9 @@ class VectorDvWriteSuite extends AnyFunSuite with BeforeAndAfterAll {
 
   test("bridge + eligibility preconditions hold on a v3 table") {
     createV3("ice.db.dv_pre")
-    assert(org.apache.spark.sql.vector.IcebergDvBridge.isAvailable, "bridge must be on the classpath in this module")
+    assert(org.apache.spark.sql.vecruntime.IcebergDvBridge.isAvailable, "bridge must be on the classpath in this module")
     val tbl = org.apache.iceberg.spark.Spark3Util.loadIcebergTable(spark, "ice.db.dv_pre")
-    assert(org.apache.spark.sql.vector.IcebergDvBridge.isDvEligible(tbl), "v3 table must be DV-eligible")
+    assert(org.apache.spark.sql.vecruntime.IcebergDvBridge.isDvEligible(tbl), "v3 table must be DV-eligible")
     val df = withFlag(on = true)(spark.sql("DELETE FROM ice.db.dv_pre WHERE id % 3 = 0"))
     assert(planHasVectorWriteDelta(df), "our operator must be planned when every gate passes")
     df.collect()

@@ -17,10 +17,17 @@
       "items": [
         { "title": "Supported operators", "url": "/operators.html" },
         { "title": "Supported expressions", "url": "/expressions.html" },
+        { "title": "Compatibility matrix", "url": "/compatibility.html" },
         { "title": "Configuration reference", "url": "/configuration.html" },
         { "title": "Comet as the scan", "url": "/comet.html" },
         { "title": "Apache Iceberg", "url": "/iceberg.html" },
         { "title": "Flight shuffle", "url": "/flight-shuffle.html" }
+      ]
+    },
+    {
+      "section": "Testing",
+      "items": [
+        { "title": "Testing & correctness", "url": "/testing.html" }
       ]
     },
     {

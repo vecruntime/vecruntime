@@ -7,7 +7,7 @@ title: Columnar v3 deletion-vector writer (design)
 
 This is the design and placement decision for the columnar deletion-vector (DV) writer, and the
 record of slice 1 (the profile split that gates the work). The writer itself lands in slices; this
-document is the map, and `spark.vector.iceberg.dvWriter.enabled` (default off) is the switch it will
+document is the map, and `spark.vecruntime.iceberg.dvWriter.enabled` (default off) is the switch it will
 hang from.
 
 ## What it does
@@ -115,7 +115,7 @@ optional artifact.
    `IcebergDvCommitBridge.isDvEligible(table)` (public-API format-version check, the stand-in for the
    private `Context.useDVs()`) decides v3 vs decline, tested (v3 eligible, v2/null decline). The live
    `SparkStrategy` (`injectPlannerStrategy`) matches the logical `WriteDelta` and, when eligible and
-   `spark.vector.iceberg.dvWriter.enabled` and the write is **delete-only** (no row/insert
+   `spark.vecruntime.iceberg.dvWriter.enabled` and the write is **delete-only** (no row/insert
    projection), on an **unpartitioned** table that **does not already carry deletes**, plans a
    `VectorWriteDeltaExec` command; it runs an RDD job over the child's columnar
    batches, builds DVs per `_file` run via the bridge, assembles `DeltaTaskCommit` per task, and
@@ -148,7 +148,7 @@ Not in option B: a columnar Parquet **data** writer, and v2 position-delete file
 
 ## Configuration
 
-`spark.vector.iceberg.dvWriter.enabled` (session `SQLConf`, boolean, default `false`). Off while the
+`spark.vecruntime.iceberg.dvWriter.enabled` (session `SQLConf`, boolean, default `false`). Off while the
 writer is landed in slices; flips to `true` once every Iceberg merge-on-read suite is byte-identical
 with it on and off. See `docs/configuration.md`.
 

@@ -6,24 +6,74 @@ version may change configuration keys or defaults, always noted here.
 
 ## Unreleased
 
+## 0.0.2 -- 2026-09-26
+
+The first release as **vecruntime** (previously spark-vector); the repository moved to
+[vecruntime/vecruntime](https://github.com/vecruntime/vecruntime). TPC-DS 1 TB on AWS Graviton4 with AQE's
+defaults for both engines: 1,800.5 s against Apache Spark's 2,207.3 s (1.23x, geometric mean 1.21x).
+
 ### Changed (breaking)
 
-- **Renamed the code and Maven coordinates to vecruntime.** The plugin class, the Java/Scala
-  packages, and the published artifacts changed; anyone loading the plugin, importing the packages,
-  or depending on the artifacts must update. Old → new:
+- **Renamed everything to vecruntime, a clean break with no aliases or compatibility shims.**
+  Anyone loading the plugin, importing the packages, depending on the artifacts, configuring the
+  shuffle manager, or setting configuration keys or JVM properties must update; the old names are
+  unknown, not accepted. Old → new:
   - Plugin class: `io.sparkvector.spark.VectorPlugin` → `io.vecruntime.spark.VectorPlugin`
     (`--conf spark.plugins=...`).
-  - Packages: `io.sparkvector.*` → `io.vecruntime.*` (kernels, spark, shuffle, benchmarks, sqltests,
-    the Iceberg bridge `io.sparkvector.spark.iceberg` → `io.vecruntime.spark.iceberg`).
-  - Maven groupId: `io.sparkvector` → `io.github.vecruntime`.
-  - Artifacts: `spark-vector-*` → `vecruntime-*` (`vecruntime-parent`, `vecruntime-kernels`,
-    `vecruntime-spark_2.13`, `vecruntime-shuffle_2.13`, `vecruntime-benchmarks`,
-    `vecruntime-spark-sql-tests_2.13`); jar names follow.
-  - **Unchanged:** the `spark.vector.*` configuration keys, the `sparkvector.*` JVM system properties
-    and metric names, and the shuffle manager class
-    `org.apache.spark.sql.vector.shuffle.VectorShuffleManager` (it stays in Spark's namespace to reach
-    package-private APIs); `org.apache.spark.sql.vector.*` and `org.apache.iceberg.*` are unchanged for
-    the same reason.
+  - Java/Scala packages: `io.sparkvector.*` → `io.vecruntime.*` (kernels, spark, shuffle, benchmarks,
+    sqltests, the Iceberg bridge `io.sparkvector.spark.iceberg` → `io.vecruntime.spark.iceberg`).
+  - Maven groupId `io.sparkvector` → `io.github.vecruntime`; artifacts `spark-vector-*` →
+    `vecruntime-*` (`vecruntime-parent`, `vecruntime-kernels`, `vecruntime-spark_2.13`,
+    `vecruntime-shuffle_2.13`, `vecruntime-benchmarks`, `vecruntime-spark-sql-tests_2.13`); jar names
+    follow.
+  - Internal package: `org.apache.spark.sql.vector.*` → `org.apache.spark.sql.vecruntime.*` (the
+    `Vector*Exec` operators, the shuffle exchange, the UI). It stays inside `org.apache.spark.sql`
+    because Spark's `ShuffleManager` and other APIs used here are `private[spark]` / `private[sql]`;
+    class names are unchanged.
+  - Shuffle manager class: `spark.shuffle.manager=org.apache.spark.sql.vector.shuffle.VectorShuffleManager`
+    → `org.apache.spark.sql.vecruntime.shuffle.VectorShuffleManager`. **No alias** — the old class is
+    gone.
+  - Configuration keys: `spark.vector.*` → `spark.vecruntime.*` (every key, e.g.
+    `spark.vector.enabled` → `spark.vecruntime.enabled`, `spark.vector.shuffle.*` →
+    `spark.vecruntime.shuffle.*`, `spark.vector.exec.*` → `spark.vecruntime.exec.*`). No fallback to
+    the old keys.
+  - JVM system properties: `sparkvector.*` → `vecruntime.*` (e.g. `sparkvector.agg.interleave` →
+    `vecruntime.agg.interleave`, `sparkvector.platform` → `vecruntime.platform`).
+  - **Unchanged:** `org.apache.iceberg.*` (Iceberg's package-private APIs) and every Spark / Iceberg /
+    Comet name, including `org.apache.spark.sql.vectorized.*` and `spark.sql.parquet.enableVectorizedReader`.
+
+### Changed
+
+- **AQE sees Spark-scale map output sizes for our exchanges** (#511, #514): new keys
+  `spark.vecruntime.shuffle.aqe.mapSizeScaling` (default `true`) and
+  `spark.vecruntime.shuffle.aqe.sparkCompressionRatio` (default `0`, the uncompressed-bytes ratio). Our
+  columnar shuffle is 1.6-4.3x smaller than Spark's for the same rows, and AQE had packed up to twice
+  Spark's rows into a task; TPC-DS q67 went from 92 s with a 115 GB spill to 39 s with none.
+- **The aggregate spill budget defaults to 1g**, the sort's (`spark.vecruntime.agg.spillThreshold`, #512).
+- **Rebalance exchanges (the Iceberg write)**: AQE sizes the partitions by rows (#485), and the
+  advisory size is scaled to our shuffle's bytes per row, with measured string bytes (#495, #506;
+  `spark.vecruntime.shuffle.rebalance.advisoryScaling`, `spark.vecruntime.shuffle.rebalance.rowSizing`).
+- **The shuffle no longer fsyncs its map outputs**, as Spark does not (#496); on the Iceberg CDC MERGE
+  that was the last gap to Spark on the scan stage.
+- **Shuffle writer**: scatter-based staged flush, warmed kernels, scatter in 64K-row chunks, off by
+  default (`spark.vecruntime.shuffle.writer.scatterFlush`, #487, #488, #490).
+- **Platform**: `VectorMask.fromLong` masks only on AVX-512; on Graviton's SVE the native compress path
+  stays (#484). The cluster image builds for x86-64 or arm64 (#481).
+
+### Added
+
+- Struct columns and struct hash keys in the columnar shuffle (#480).
+- `ON true` / `ON false` nested-loop joins and decimal `AVG` over a running window frame stay columnar
+  (#513).
+- `MERGE INTO`'s table-insert cast is compiled, so `MergeRows` stays columnar (#477).
+- Iceberg adapter: int-backed and dictionary-encoded small decimals (#476, #491).
+- Ported DataFusion Comet test matrices for expressions, casts, aggregates, joins and windows; the SQL
+  golden-suite coverage floor rose to 4,219+ accelerated executions (#497, #500, #501, #503, #507, #510).
+
+### Fixed
+
+- Ordered string compare no longer uses `MemorySegment.mismatch`, which deoptimised in a loop on q67
+  (#493).
 
 ## 0.0.1 -- 2026-09-24
 

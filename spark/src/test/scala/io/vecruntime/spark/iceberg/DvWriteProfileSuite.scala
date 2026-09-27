@@ -42,7 +42,7 @@ class DvWriteProfileSuite extends VectorQuerySuite {
 
   override protected def extraSparkConf: Map[String, String] =
     super.extraSparkConf ++ IcebergTables.catalogConf(DvWriteProfileSuite.warehouse.toString) +
-      ("spark.vector.enabled" -> "false") // Spark's own row writer, so the split is the baseline's
+      ("spark.vecruntime.enabled" -> "false") // Spark's own row writer, so the split is the baseline's
 
   /** Sums task run-time (ms) of the stages a body triggers, tagged by a marker we set per phase. */
   private class WriteStageTimer extends SparkListener {

@@ -19,12 +19,12 @@ import io.vecruntime.spark.test.VectorQuerySuite
 import org.apache.spark.sql.Row
 import org.apache.spark.sql.execution.window.WindowExec
 import org.apache.spark.sql.types._
-import org.apache.spark.sql.vector.VectorWindowExec
+import org.apache.spark.sql.vecruntime.VectorWindowExec
 
 /**
  * SQL correctness coverage ported from DataFusion Comet's `CometWindowExecSuite`, adapted to
  * spark-vector's plugin-on/plugin-off comparison model: every window query is run twice on one
- * session with `spark.vector.enabled` toggled, the rows compared, and a `VectorWindowExec` asserted
+ * session with `spark.vecruntime.enabled` toggled, the rows compared, and a `VectorWindowExec` asserted
  * in the accelerated plan (a frame or function we don't accelerate asserts fallback with its reason).
  *
  * This is the window slice of the SQL-coverage survey. It complements the hand-written

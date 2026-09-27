@@ -50,8 +50,8 @@ DEFAULT_META = {
     ],
     "vector_conf": [
         "spark.plugins=io.vecruntime.spark.VectorPlugin",
-        "spark.shuffle.manager=org.apache.spark.sql.vector.shuffle.VectorShuffleManager",
-        "spark.vector.exec.strictFloatingPoint=false   # Comet's default too",
+        "spark.shuffle.manager=org.apache.spark.sql.vecruntime.shuffle.VectorShuffleManager",
+        "spark.vecruntime.exec.strictFloatingPoint=false   # Comet's default too",
         "AOT class-data cache off",
         "--add-modules=jdk.incubator.vector --enable-native-access=ALL-UNNAMED (driver and executors)",
     ],

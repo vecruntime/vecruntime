@@ -18,12 +18,12 @@ package io.vecruntime.spark
 import io.vecruntime.spark.test.VectorQuerySuite
 import org.apache.spark.sql.Row
 import org.apache.spark.sql.types._
-import org.apache.spark.sql.vector.VectorProjectExec
+import org.apache.spark.sql.vecruntime.VectorProjectExec
 
 /**
  * SQL correctness coverage ported from DataFusion Comet's `CometCastSuite`, adapted to
  * spark-vector's validation model: each `CAST` is run twice on the same session with
- * `spark.vector.enabled` toggled and the rows compared (Comet's `checkSparkAnswerAndOperator`),
+ * `spark.vecruntime.enabled` toggled and the rows compared (Comet's `checkSparkAnswerAndOperator`),
  * asserting the cast ran on our operator -- a `Cast` is a projection, so the assertion is a
  * `VectorProjectExec` in the final plan.
  *
