@@ -81,7 +81,13 @@ object CdcMergeRunner {
        * batch -- ~73 % updates, ~19 % deletes, ~8 % inserts -- and placed on buckets no generator
        * delete touched (see [[IcebergMorGenerator.firstLiveBucket]]). None = the historical batch.
        */
-      changePct: Option[Double] = None
+      changePct: Option[Double] = None,
+      /**
+       * `--delete-only`: the whole `--change-pct` batch is deletes (no updates, no inserts), so the
+       * MERGE's write is all position deletes -- the shape where a deletion-vector writer is the
+       * largest share of the statement (#20).
+       */
+      deleteOnly: Boolean = false
   )
 
   def main(argv: Array[String]): Unit = {
@@ -99,6 +105,7 @@ object CdcMergeRunner {
       case "--threads" :: v :: t => parse(t, a.copy(threads = v.toInt))
       case "--shuffle-partitions" :: v :: t => parse(t, a.copy(shufflePartitions = v.toInt))
       case "--merge-only" :: t => parse(t, a.copy(mergeOnly = true))
+      case "--delete-only" :: t => parse(t, a.copy(deleteOnly = true))
       case "--change-pct" :: v :: t =>
         parse(t, a.copy(changePct = if (v == "default") None else Some(v.toDouble)))
       case "--report" :: v :: t => parse(t, a.copy(report = Some(v)))
@@ -132,16 +139,25 @@ object CdcMergeRunner {
    * the historical 150/40/16. The buckets hash the ticket/order key, which is spread over every data
    * file, so the batch touches all of them.
    */
-  private[benchmarks] def changeRanges(table: String, changePct: Option[Double]): ((Int, Int), (Int, Int), (Int, Int)) =
+  private[benchmarks] def changeRanges(
+      table: String,
+      changePct: Option[Double],
+      deleteOnly: Boolean = false
+  ): ((Int, Int), (Int, Int), (Int, Int)) =
     changePct match {
-      case None => (UpdateBuckets, DeleteBuckets, InsertBuckets)
+      case None =>
+        require(!deleteOnly, "--delete-only needs --change-pct")
+        (UpdateBuckets, DeleteBuckets, InsertBuckets)
       case Some(pct) =>
         val from = IcebergMorGenerator.firstLiveBucket(table.substring(table.lastIndexOf('.') + 1))
         val total = math.round(pct * 10).toInt
         require(total > 0 && from + total <= 1000, s"--change-pct $pct does not fit buckets [$from, 1000)")
-        val u = math.round(total * 0.73).toInt
-        val d = math.round(total * 0.19).toInt
-        ((from, from + u), (from + u, from + u + d), (from + u + d, from + total))
+        if (deleteOnly) ((from, from), (from, from + total), (from + total, from + total))
+        else {
+          val u = math.round(total * 0.73).toInt
+          val d = math.round(total * 0.19).toInt
+          ((from, from + u), (from + u, from + u + d), (from + u + d, from + total))
+        }
     }
 
   private def buckets(p: TableProfile, range: (Int, Int)): String =
@@ -206,9 +222,12 @@ object CdcMergeRunner {
       // files. On the cluster it must live where the executors can read it: an object-store prefix
       // when `out` has a scheme, a driver-local dir otherwise.
       val outScheme = args.out.contains("://")
+      // A delete-only batch is a different batch: its own directory, or the cached mixed batch is reused.
+      val batchName = s"cdc-changes-${args.table.replace('.', '_')}" +
+        (if (args.deleteOnly) s"-delete-${args.changePct.getOrElse(0.0)}" else "")
       val changesDir =
-        if (outScheme) s"${args.out.stripSuffix("/")}/cdc-changes-${args.table.replace('.', '_')}"
-        else new File(new File(args.out), s"cdc-changes-${args.table.replace('.', '_')}").getAbsolutePath
+        if (outScheme) s"${args.out.stripSuffix("/")}/$batchName"
+        else new File(new File(args.out), batchName).getAbsolutePath
       val changeExists =
         if (outScheme) {
           try { spark.read.parquet(changesDir).limit(1).count() > 0 }
@@ -229,7 +248,7 @@ object CdcMergeRunner {
               s"CAST(${tweaks.getOrElse(f.name, f.name)} AS ${f.dataType.sql}) AS ${f.name}"
             }.mkString(", ")} FROM cdc_base"
         val grainCols = p.grain.mkString(", ")
-        val (updR, delR, insR) = changeRanges(args.table, args.changePct)
+        val (updR, delR, insR) = changeRanges(args.table, args.changePct, args.deleteOnly)
         println(s"[cdc] change buckets: U=$updR D=$delR I=$insR (of 1000)")
         val touched = spark.sql(s"SELECT count(DISTINCT _file) FROM $table WHERE " +
           s"pmod(xxhash64(${p.hashKey}), 1000) >= ${updR._1} AND pmod(xxhash64(${p.hashKey}), 1000) < ${delR._2}")
