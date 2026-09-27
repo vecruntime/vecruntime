@@ -44,13 +44,31 @@ spark-submit \
   ...
 ```
 
+Or let Spark download it: `--packages` takes the Maven coordinates and `--repositories` points at the
+Maven repository served from this project's `maven-repo` branch:
+
+```bash
+spark-submit \
+  --repositories https://raw.githubusercontent.com/vecruntime/vecruntime/maven-repo/ \
+  --packages io.github.vecruntime:vecruntime-spark_2.13:0.0.2 \
+  --conf spark.plugins=io.vecruntime.spark.VectorPlugin \
+  --conf spark.driver.extraJavaOptions="--add-modules=jdk.incubator.vector --enable-native-access=ALL-UNNAMED" \
+  --conf spark.executor.extraJavaOptions="--add-modules=jdk.incubator.vector --enable-native-access=ALL-UNNAMED" \
+  ...
+```
+
+The same two flags work on `spark-shell`, `pyspark` and `spark-sql`. To add the columnar shuffle, list
+both coordinates, comma-separated:
+`--packages io.github.vecruntime:vecruntime-spark_2.13:0.0.2,io.github.vecruntime:vecruntime-shuffle_2.13:0.0.2`.
+The plugin's dependencies (Spark, Arrow, Scala) are `provided`, so only the vecruntime jars are
+downloaded.
+
 `spark.plugins` registers the session extension automatically; alternatively set
 `spark.sql.extensions=io.vecruntime.spark.VectorSparkSessionExtensions`. Every release, with the
 plugin jar, the columnar shuffle jar and a `SHA256SUMS` file, is on the
-[releases page](https://github.com/vecruntime/vecruntime/releases); the same artifacts are
-published to a Maven repository served from the repository's `maven-repo` branch. See the
-[README](https://github.com/vecruntime/vecruntime#getting-the-jars) for Maven coordinates and
-`--packages` usage, and the [Configuration reference](configuration.html) for every `spark.vecruntime.*`
+[releases page](https://github.com/vecruntime/vecruntime/releases). See the
+[README](https://github.com/vecruntime/vecruntime#getting-the-jars) for the Maven
+coordinates, and the [Configuration reference](configuration.html) for every `spark.vecruntime.*`
 key.
 
 ## Status

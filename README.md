@@ -108,8 +108,18 @@ account or token needed:
 </dependencies>
 ```
 
-The same coordinates work with `--packages` on `spark-submit` together with
-`--repositories https://raw.githubusercontent.com/vecruntime/vecruntime/maven-repo/`. A release is cut
+The same coordinates work with `--packages` on `spark-submit`, `spark-shell`, `pyspark` and `spark-sql`,
+together with `--repositories` (only the vecruntime jars are downloaded; everything else is `provided`):
+
+```bash
+spark-submit \
+  --repositories https://raw.githubusercontent.com/vecruntime/vecruntime/maven-repo/ \
+  --packages io.github.vecruntime:vecruntime-spark_2.13:0.0.2 \
+  --conf spark.plugins=io.vecruntime.spark.VectorPlugin \
+  ...
+```
+
+A release is cut
 by pushing a `v<version>` tag: the release workflow builds the jars on JDK 25, attaches them to the
 GitHub release with their checksums, and publishes them to the `maven-repo` branch
 (`.github/workflows/release.yml`). `CHANGELOG.md` has what each release carries.
