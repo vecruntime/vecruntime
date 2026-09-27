@@ -6,6 +6,18 @@ version may change configuration keys or defaults, always noted here.
 
 ## Unreleased
 
+### Added
+
+- `RANGE` window frames with value offsets (`sum(c) OVER (PARTITION BY a ORDER BY b RANGE BETWEEN 5
+  PRECEDING AND CURRENT ROW)`, `RANGE BETWEEN 1 FOLLOWING AND 3 FOLLOWING`, an unbounded side with an
+  offset on the other) for `sum`/`avg`/`count`/`min`/`max` over one integral or date order key, `ASC` or
+  `DESC`, either null ordering -- the last residual of #58. New `WindowFrameKernels` (two-pointer frame
+  bounds replaying Spark's `SlidingWindowFunctionFrame`, frame aggregates over primitive arrays) with
+  scalar twins in `ScalarReference`, a `WindowFrameBenchmark`, and the peer-bounded `RANGE` frames
+  without an offset (`CURRENT ROW AND UNBOUNDED FOLLOWING`, `CURRENT ROW AND CURRENT ROW`) on the row
+  path. Fallback reasons now name the key or input type (`RANGE offsets over a decimal(12,2) order key
+  not supported`) instead of `RANGE frames with value offsets`.
+
 ## 0.0.2 -- 2026-09-26
 
 The first release as **vecruntime** (previously spark-vector); the repository moved to

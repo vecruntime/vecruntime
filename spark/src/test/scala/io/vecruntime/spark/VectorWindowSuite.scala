@@ -309,13 +309,100 @@ class VectorWindowSuite extends VectorQuerySuite {
     withConf("spark.sql.ansi.enabled" -> "false") { checkWindow(overflowing) }
   }
 
-  test("other window functions and frames fall back with a reason; the operator can be disabled") {
-    // RANGE frames with value offsets, sliding frames of functions without a form here, and two frame kinds in one operator.
-    checkFallback(
-      "SELECT i, sum(l) OVER (PARTITION BY s ORDER BY i RANGE BETWEEN 5 PRECEDING AND CURRENT ROW) AS moving FROM t",
-      Seq(Window),
-      "RANGE frames with value offsets"
+  test("RANGE frames with value offsets equal Spark: every bound shape, order, null placement and key type") {
+    // ASC int key with ties (i % 100), preceding-only and both-sided frames; a null partition key; nulls in l.
+    checkWindow(
+      "SELECT i, l, sum(l) OVER (PARTITION BY s ORDER BY i % 100 RANGE BETWEEN 5 PRECEDING AND CURRENT ROW) AS moving, count(*) OVER (PARTITION BY s ORDER BY i % 100 RANGE BETWEEN 5 PRECEDING AND CURRENT ROW) AS n, count(l) OVER (PARTITION BY s ORDER BY i % 100 RANGE BETWEEN 3 PRECEDING AND 3 FOLLOWING) AS nn FROM t"
     )
+    // FOLLOWING-only and PRECEDING-only frames (empty near the partition's ends: null sums, 0 counts), avg and min/max.
+    checkWindow(
+      "SELECT i, sum(l) OVER (PARTITION BY s ORDER BY i % 100 RANGE BETWEEN 1 FOLLOWING AND 3 FOLLOWING) AS ahead, avg(i) OVER (PARTITION BY s ORDER BY i % 100 RANGE BETWEEN 10 PRECEDING AND 5 PRECEDING) AS behind, min(l) OVER (PARTITION BY s ORDER BY i % 100 RANGE BETWEEN 2 PRECEDING AND 2 FOLLOWING) AS lo, max(i) OVER (PARTITION BY s ORDER BY i % 100 RANGE BETWEEN 2 PRECEDING AND 2 FOLLOWING) AS hi FROM t"
+    )
+    // DESC over a long key with nulls (NULLS LAST by default): a null key's frame is the null peer group; NULLS FIRST too.
+    checkWindow(
+      "SELECT i, l, sum(i) OVER (PARTITION BY i % 7 ORDER BY l DESC RANGE BETWEEN 6 PRECEDING AND 3 FOLLOWING) AS moving, count(*) OVER (PARTITION BY i % 7 ORDER BY l DESC RANGE BETWEEN 6 PRECEDING AND 3 FOLLOWING) AS n FROM t"
+    )
+    checkWindow(
+      "SELECT i, l, sum(i) OVER (PARTITION BY i % 7 ORDER BY l ASC NULLS FIRST RANGE BETWEEN 3 PRECEDING AND 6 FOLLOWING) AS a, sum(i) OVER (PARTITION BY i % 7 ORDER BY l DESC NULLS FIRST RANGE BETWEEN 3 PRECEDING AND 6 FOLLOWING) AS b FROM t"
+    )
+    // Many duplicates and null keys (nullif(l % 7, 0), null where l is null): peers share the frame.
+    checkWindow(
+      "SELECT i, l, sum(i) OVER (PARTITION BY s ORDER BY nullif(l % 7, 0) RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS moving, avg(l) OVER (PARTITION BY s ORDER BY nullif(l % 7, 0) DESC RANGE BETWEEN 2 PRECEDING AND CURRENT ROW) AS mean FROM t"
+    )
+    // Doubles (NaN, infinities and nulls in d) summed in Spark's order: bit-identical; min/max in Spark's NaN order.
+    checkWindow(
+      "SELECT i, d, sum(d) OVER (PARTITION BY s ORDER BY i % 100 RANGE BETWEEN 4 PRECEDING AND CURRENT ROW) AS moving, avg(d) OVER (PARTITION BY s ORDER BY i % 100 RANGE BETWEEN 4 PRECEDING AND 4 FOLLOWING) AS mean, min(d) OVER (PARTITION BY s ORDER BY i % 100 RANGE BETWEEN 4 PRECEDING AND 4 FOLLOWING) AS lo, max(d) OVER (PARTITION BY s ORDER BY i % 100 RANGE BETWEEN 4 PRECEDING AND 4 FOLLOWING) AS hi FROM t"
+    )
+    // A date key (DateAdd bounds), a long key, an unbounded side with an offset on the other.
+    checkWindow(
+      "SELECT i, dt, count(*) OVER (PARTITION BY b ORDER BY dt RANGE BETWEEN 30 PRECEDING AND CURRENT ROW) AS month, avg(l) OVER (PARTITION BY b ORDER BY dt RANGE BETWEEN 7 PRECEDING AND 7 FOLLOWING) AS fortnight, max(dt) OVER (PARTITION BY b ORDER BY dt RANGE BETWEEN CURRENT ROW AND 10 FOLLOWING) AS next FROM t"
+    )
+    checkWindow(
+      "SELECT i, l, sum(l) OVER (PARTITION BY s ORDER BY l RANGE BETWEEN 9 PRECEDING AND 9 FOLLOWING) AS moving, sum(i) OVER (PARTITION BY s ORDER BY l RANGE BETWEEN UNBOUNDED PRECEDING AND 6 FOLLOWING) AS ahead, sum(i) OVER (PARTITION BY s ORDER BY l RANGE BETWEEN 6 PRECEDING AND UNBOUNDED FOLLOWING) AS behind FROM t"
+    )
+    // A 20000-row partition across batches (one partition, an int key with ties), and the RANGE peer frames.
+    checkWindow(
+      "SELECT i, sum(l) OVER (ORDER BY i % 5000 RANGE BETWEEN 100 PRECEDING AND 100 FOLLOWING) AS wide, count(*) OVER (ORDER BY i RANGE BETWEEN 3 PRECEDING AND 3 FOLLOWING) AS n FROM t"
+    )
+    checkWindow(
+      "SELECT i, sum(l) OVER (PARTITION BY s ORDER BY i % 100 RANGE BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) AS suffix, count(*) OVER (PARTITION BY s ORDER BY s, i % 100 RANGE BETWEEN CURRENT ROW AND CURRENT ROW) AS peers FROM t"
+    )
+    // A RANGE aggregate beside a ROWS frame, a running frame, an offset and a rank in one operator.
+    checkWindow(
+      "SELECT i, sum(l) OVER (PARTITION BY s ORDER BY i % 100 RANGE BETWEEN 5 PRECEDING AND CURRENT ROW) AS moving, sum(l) OVER (PARTITION BY s ORDER BY i % 100 ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS rows3, sum(l) OVER (PARTITION BY s ORDER BY i % 100) AS running, lag(l) OVER (PARTITION BY s ORDER BY i % 100) AS prev, rank() OVER (PARTITION BY s ORDER BY i % 100) AS rk FROM t"
+    )
+    // A lower bound that overflows the int key (-i - 2147483640 for i > 8): ANSI raises like Spark's Add, non-ANSI
+    // wraps like Spark's (the wrapped bound empties the frame). Spark evaluates a bound only when a row is compared
+    // with it, so an overflow past the partition's last buffered row is silent; the kernel short-circuits the same way.
+    val overflowing =
+      "SELECT i, count(*) OVER (ORDER BY -i RANGE BETWEEN 2147483640 PRECEDING AND CURRENT ROW) AS n FROM t WHERE i < 100"
+    val silent =
+      "SELECT i, count(*) OVER (ORDER BY i RANGE BETWEEN CURRENT ROW AND 2147483640 FOLLOWING) AS n FROM t WHERE i < 100"
+    withConf("spark.sql.ansi.enabled" -> "true") {
+      val e = intercept[Exception] { withPlugin(enabled = true) { spark.sql(overflowing).collect() } }
+      assert(e.getMessage.contains("ARITHMETIC_OVERFLOW") || e.getMessage.contains("overflow"), e.getMessage)
+      val spark0 = intercept[Exception] { withPlugin(enabled = false) { spark.sql(overflowing).collect() } }
+      assert(
+        spark0.getMessage.contains("ARITHMETIC_OVERFLOW") || spark0.getMessage.contains("overflow"),
+        spark0.getMessage
+      )
+    }
+    withConf("spark.sql.ansi.enabled" -> "false") {
+      checkWindow(overflowing, Seq[Class[_ <: org.apache.spark.sql.execution.SparkPlan]](classOf[VectorFilterExec]))
+    }
+    withConf("spark.sql.ansi.enabled" -> "true") {
+      checkWindow(silent, Seq[Class[_ <: org.apache.spark.sql.execution.SparkPlan]](classOf[VectorFilterExec]))
+    }
+    // ANSI: a bigint sum over a RANGE frame that overflows raises like Spark; non-ANSI wraps.
+    val overflowingSum =
+      "SELECT i, sum(CASE WHEN i = 1 THEN 9223372036854775807L ELSE l END) OVER (ORDER BY i RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) AS moving FROM t WHERE i < 10"
+    withConf("spark.sql.ansi.enabled" -> "true") {
+      val e = intercept[Exception] { withPlugin(enabled = true) { spark.sql(overflowingSum).collect() } }
+      assert(e.getMessage.contains("ARITHMETIC_OVERFLOW") || e.getMessage.contains("overflow"), e.getMessage)
+    }
+    withConf("spark.sql.ansi.enabled" -> "false") {
+      checkWindow(overflowingSum, Seq[Class[_ <: org.apache.spark.sql.execution.SparkPlan]](classOf[VectorFilterExec]))
+    }
+    // Refused with a reason: a decimal order key, a string input to min/max, a timestamp key with an interval offset.
+    checkFallback(
+      "SELECT i, sum(l) OVER (PARTITION BY s ORDER BY cast(i AS decimal(12,2)) RANGE BETWEEN 5 PRECEDING AND CURRENT ROW) AS moving FROM t",
+      Seq(Window),
+      "RANGE offsets over a decimal(12,2) order key not supported"
+    )
+    checkFallback(
+      "SELECT i, max(s) OVER (PARTITION BY b ORDER BY i RANGE BETWEEN 5 PRECEDING AND CURRENT ROW) AS m FROM t",
+      Seq(Window),
+      "integral, date and double inputs are"
+    )
+    checkFallback(
+      "SELECT i, sum(l) OVER (PARTITION BY s ORDER BY cast(dt AS timestamp) RANGE BETWEEN INTERVAL 5 DAYS PRECEDING AND CURRENT ROW) AS moving FROM t",
+      Seq(Window),
+      "RANGE offsets over a timestamp order key not supported"
+    )
+  }
+
+  test("other window functions and frames fall back with a reason; the operator can be disabled") {
+    // Sliding frames of functions without a form here, and two frame kinds in one operator.
     checkFallback(
       "SELECT i, stddev(l) OVER (PARTITION BY s ORDER BY i ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS sd FROM t",
       Seq(Window),

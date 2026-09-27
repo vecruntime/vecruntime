@@ -412,8 +412,32 @@ that pin it.
   `runningStates` (rows added in order as the end moves -- Spark's UnboundedPrecedingWindowFunctionFrame);
   any other frame re-aggregates its rows in order per row (Spark's SlidingWindowFunctionFrame does the same,
   so double sums are bit-identical and the O(n x frame) cost is Spark's). `aggregateReason` defers ROWS
-  frames with literal bounds to `slidingAggregate` for the reason text. `RANGE ... n PRECEDING` needs
-  order-key value comparisons and is refused.
+  and RANGE frames to `slidingAggregate` for the reason text. The peer-bounded RANGE frames without an
+  offset (`CURRENT ROW AND UNBOUNDED FOLLOWING`, `CURRENT ROW AND CURRENT ROW`) use the `PeerStartLo` /
+  `PeerEndHi` sentinels on that path, any key type.
+  Layer 2d, RANGE frames with value offsets (`RANGE BETWEEN 5 PRECEDING AND CURRENT ROW`, `1 FOLLOWING AND
+  3 FOLLOWING`, an unbounded side with an offset on the other): `VectorWindowPlanner.rangeSpec` resolves
+  the single order key (Spark's analyzer already rejects several) to a `RangeSpec` -- key width (8/16/32
+  bits or 64; a date is a 32-bit `DateAdd` key), direction, null ordering, the two folded offsets with
+  Spark's sign (`n PRECEDING` is `-n`, negated again under DESC, exactly `createBoundOrdering`'s
+  `UnaryMinus`), and `checked` = ANSI for an integral key (Spark's `Add` raises, `DateAdd` wraps). Decimal
+  keys (`DecimalAddNoOverflowCheck`), timestamp keys (interval offsets, time zone) and min/max over
+  strings/booleans are refused with a reason naming the type. The iterator's `RangeFrames` (one per such
+  function) computes a partition at once when its first batch is released: the keys (captured per held
+  row as a long in `Held.keys` / `keyValidity`) and the input are gathered from `released ++ held` into
+  primitive arrays reused across partitions (`partitionFirstGlobal` addresses the partition), the
+  `WindowFrameKernels` do the rest -- `rangeBounds` is Spark's `SlidingWindowFunctionFrame` walk (two
+  monotone pointers, `lo <= hi`; a null key has a null bound that compares equal to null keys and by the
+  null ordering to values, so a null row's frame is the null peer group), `frameSumDouble` re-adds in row
+  order per frame (bit-identical to Spark) continuing the previous frame when its lower bound has not
+  moved, `frameCount` / unchecked `frameSumLong` slide (subtract the leaving rows), a checked `frameSumLong`
+  re-adds with `addExact` (Spark's overflow is a property of the partial sums), `frameMinMaxLong` re-scans
+  with `LongVector` MIN/MAX when the column has no nulls -- and the column is written straight into its
+  Arrow buffers. The results are cached per function until the partition's last batch is written. Oracle:
+  `ScalarReference.rangeBounds` replays Spark's buffer literally (drop, then add skipping rows below the
+  lower bound) and the reference aggregates re-run every frame from scratch; `WindowFrameKernelsTest` covers
+  every frame shape, key width, direction and null placement plus the wrap/ANSI bound cases;
+  `WindowFrameBenchmark` the kernels against the reference and a boxed per-row re-aggregation.
 - `VectorSampleExec` (no replacement) is a selection producer like the filter, marked by the rule the same
   way: per partition it seeds Spark's own `BernoulliCellSampler` with `seed + partitionIndex` and draws once
   per *live* row in order -- the row path and codegen of `SampleExec` do exactly that, so the rows match
@@ -936,8 +960,9 @@ A change is not done until all of the following that apply have run green, local
    attaches to the cluster runner of #246 when it lands; the summary script reads those recordings
    unchanged.
 
-Current counts: 176 kernel tests, 300 Spark tests with the Comet and Iceberg profiles (259 with
-Iceberg alone; the Comet suites contribute 42, `CometMixedChainSuite` 10, `CometMixedShuffleSuite` 3 and `CometPreferCometSuite` 7 of them). If a change lowers either number, explain why in the commit.
+Current counts: 201 kernel tests, 414 Spark tests with the Comet and Iceberg profiles (`mvn -Pcomet,iceberg
+-pl kernels,spark clean install`, measured with the RANGE frames of #58; the earlier breakdown by Comet suite
+predates several merges and was dropped rather than guessed). If a change lowers either number, explain why in the commit.
 
 ## 5. Benchmarking protocol
 
