@@ -36,6 +36,12 @@ version may change configuration keys or defaults, always noted here.
   `closeIfFreeable()` Spark 4.1's `ColumnarToRowExec` calls (as Spark's own `WritableColumnVector`s do)
   and is freed by `close()`, for producers that refill one vector across batches.
 
+### Fixed
+
+- The Vector Acceleration UI tab now serves its CSS and JS with the plugin on `--packages` or `--jars`
+  (they were 404: Spark's static handler looks only in Spark's own class loader, so the tab rendered
+  unstyled and without its plan DAG).
+
 ## 0.0.2 -- 2026-09-26
 
 The first release as **vecruntime** (previously spark-vector); the repository moved to

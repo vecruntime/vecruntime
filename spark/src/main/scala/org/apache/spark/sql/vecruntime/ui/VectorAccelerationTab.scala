@@ -17,7 +17,7 @@ package org.apache.spark.sql.vecruntime.ui
 
 import scala.xml.Node
 
-import jakarta.servlet.http.HttpServletRequest
+import jakarta.servlet.http.{HttpServlet, HttpServletRequest, HttpServletResponse}
 import org.apache.spark.SparkConf
 import org.apache.spark.internal.Logging
 import org.apache.spark.ui.{SparkUI, SparkUITab}
@@ -40,7 +40,17 @@ class VectorAccelerationTab(val store: VectorAccelerationStore, sparkUI: SparkUI
   attachPage(new AllExecutionsPage(this))
   attachPage(new ExecutionPlanPage(this))
   parent.attachTab(this)
-  parent.addStaticHandler(VectorAccelerationTab.StaticResourceDir, "/static/vector")
+  // Not `addStaticHandler`: Spark's static handler resolves the directory with Spark's own class
+  // loader, which does not see a plugin on `--packages` / `--jars`. This servlet reads through ours.
+  UiHandlers.attachServlet(
+    parent,
+    VectorAccelerationTab.StaticPath,
+    new VectorAccelerationTab.StaticServlet(
+      VectorAccelerationTab.StaticResourceDir,
+      VectorAccelerationTab.getClass.getClassLoader
+    ),
+    "/*"
+  )
 
   /** After the SQL tab (0), before the rest. */
   override def displayOrder: Int = 1
@@ -48,6 +58,39 @@ class VectorAccelerationTab(val store: VectorAccelerationStore, sparkUI: SparkUI
 
 object VectorAccelerationTab {
   val StaticResourceDir = "org/apache/spark/sql/vecruntime/ui/static"
+  val StaticPath = "/static/vector"
+
+  /** The files the tab serves, and their content types. Anything else is a 404. */
+  val StaticFiles: Map[String, String] = Map(
+    "vector-acceleration.css" -> "text/css;charset=utf-8",
+    "vector-acceleration.js" -> "text/javascript;charset=utf-8"
+  )
+
+  /**
+   * Serves [[StaticFiles]] from `resourceDir` through `loader` -- the plugin's class loader. Spark's
+   * `WebUI.addStaticHandler` resolves the directory through `Utils.getSparkClassLoader`, which only
+   * sees `$SPARK_HOME/jars`, so with the plugin on `--packages` or `--jars` (a child loader) the CSS
+   * and JS were 404 and the tab rendered unstyled, without its plan DAG. Only the listed names are
+   * served (no path is ever built from the request beyond a known file name).
+   */
+  class StaticServlet(resourceDir: String, loader: ClassLoader) extends HttpServlet {
+    override def doGet(req: HttpServletRequest, resp: HttpServletResponse): Unit = {
+      val name = Option(req.getPathInfo).getOrElse("").stripPrefix("/")
+      val found =
+        StaticFiles.get(name).flatMap(ct => Option(loader.getResourceAsStream(s"$resourceDir/$name")).map(ct -> _))
+      found match {
+        case Some((contentType, in)) =>
+          try {
+            val bytes = in.readAllBytes()
+            resp.setContentType(contentType)
+            resp.setHeader("Cache-Control", "max-age=3600")
+            resp.setContentLength(bytes.length)
+            resp.getOutputStream.write(bytes)
+          } finally in.close()
+        case None => resp.sendError(HttpServletResponse.SC_NOT_FOUND)
+      }
+    }
+  }
 
   /** Shared legend, so the list and the plan page agree on what each colour means. */
   def legend: Seq[Node] =
