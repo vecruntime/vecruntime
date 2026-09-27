@@ -99,18 +99,25 @@ object VectorWriteDeltaExec {
     val taskId = if (tc != null) tc.taskAttemptId() else 0L
 
     val rowId = projections.rowIdProjection
-    // The rowId projection carries {_spec_id, _partition, _file, _pos}; resolve ordinals by name so a
+    // Iceberg splits the row-level metadata across two projections: the rowId projection carries
+    // {_file, _pos}, and the metadata projection carries {_spec_id, _partition} (see Iceberg's
+    // SparkPositionDeltaWrite, which reads the spec and partition from `metadata`, not `rowId`).
+    // Reading `_partition` from the rowId projection finds nothing, so every partition came out
+    // null and a partitioned table's commit failed. Resolve ordinals by name in each projection so a
     // schema reordering across Iceberg versions cannot silently mis-read them.
     val rowIdSchema = rowId.schema
-    def ordinal(name: String): Int = {
-      val i = rowIdSchema.fieldIndex(name)
-      i
-    }
+    val metadata = projections.metadataProjection
+    val metaSchema = metadata.map(_.schema)
+    def has(schema: Option[org.apache.spark.sql.types.StructType], name: String): Option[Int] =
+      schema.filter(_.fieldNames.contains(name)).map(_.fieldIndex(name))
 
-    val fileOrd = ordinal("_file")
-    val posOrd = ordinal("_pos")
-    val specOrdOpt = if (rowIdSchema.fieldNames.contains("_spec_id")) Some(ordinal("_spec_id")) else None
-    val partOrdRowId = if (rowIdSchema.fieldNames.contains("_partition")) Some(ordinal("_partition")) else None
+    val fileOrd = rowIdSchema.fieldIndex("_file")
+    val posOrd = rowIdSchema.fieldIndex("_pos")
+    val specOrdOpt = has(metaSchema, "_spec_id")
+    val partOrdOpt = has(metaSchema, "_partition")
+    val partWidth = partOrdOpt.map { o =>
+      metaSchema.get.fields(o).dataType.asInstanceOf[org.apache.spark.sql.types.StructType].size
+    }
 
     val writer = IcebergDvBridge.createTaskWriter(table, partitionId, taskId)
     try {
@@ -131,12 +138,12 @@ object VectorWriteDeltaExec {
       while (rows.hasNext) {
         val row = rows.next()
         rowId.project(row)
+        metadata.foreach(_.project(row))
         val file = rowId.getUTF8String(fileOrd).toString
         val pos = rowId.getLong(posOrd)
-        val specId = specOrdOpt.map(rowId.getInt).getOrElse(0)
-        val partition: InternalRow = partOrdRowId match {
-          case Some(o) if !rowId.isNullAt(o) =>
-            rowId.getStruct(o, rowIdSchema.fields(o).dataType.asInstanceOf[org.apache.spark.sql.types.StructType].size)
+        val specId = specOrdOpt.map(metadata.get.getInt).getOrElse(0)
+        val partition: InternalRow = partOrdOpt match {
+          case Some(o) if !metadata.get.isNullAt(o) => metadata.get.getStruct(o, partWidth.get)
           case _ => null
         }
         if (file != currentFile || specId != currentSpec) {

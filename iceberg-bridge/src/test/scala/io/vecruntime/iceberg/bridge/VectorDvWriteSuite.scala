@@ -206,7 +206,7 @@ class VectorDvWriteSuite extends AnyFunSuite with BeforeAndAfterAll {
     assert(rows("ice.db.dv_rep_on").sameElements(rows("ice.db.dv_rep_off")), "repeated-delete contents differ")
   }
 
-  test("partitioned v3 DELETE falls back (partitioned not yet supported), result correct") {
+  test("partitioned v3 DELETE: our operator runs, each DV in its file's partition, result correct") {
     def createPart(name: String): Unit = {
       spark.sql(s"DROP TABLE IF EXISTS $name")
       spark.sql(
@@ -229,10 +229,25 @@ class VectorDvWriteSuite extends AnyFunSuite with BeforeAndAfterAll {
       df.collect()
       h
     }
-    // A partitioned target is out of scope this landing: the strategy declines, Spark's writer runs.
-    assert(!onHad, "partitioned v3 DELETE must fall back to Spark's writer (operator absent)")
+    // Partitioned targets are supported: the spec id and partition tuple are read from the metadata
+    // projection, so each DV is committed under its data file's partition, as Spark's writer does.
+    assert(onHad, "partitioned v3 DELETE must plan our operator")
     assert(rows("ice.db.dv_part_on").sameElements(rows("ice.db.dv_part_off")), "partitioned contents differ")
     assert(count("SELECT count(*) FROM ice.db.dv_part_on WHERE id % 3 = 0") == 0L, "deleted rows still present")
+    // Every DV lands in its data file's partition: the delete-file partitions match Spark's.
+    def delParts(t: String): Seq[Row] =
+      spark
+        .sql(s"SELECT partition.p, count(*), sum(record_count) FROM $t.delete_files GROUP BY 1 ORDER BY 1")
+        .collect()
+        .toSeq
+    assert(delParts("ice.db.dv_part_on") == delParts("ice.db.dv_part_off"), "delete files per partition differ")
+    for (p <- 0 until 4) {
+      assert(
+        count(s"SELECT count(*) FROM ice.db.dv_part_on WHERE p = $p") ==
+          count(s"SELECT count(*) FROM ice.db.dv_part_off WHERE p = $p"),
+        s"partition $p differs"
+      )
+    }
   }
 
   test("a failing task aborts: nothing is committed, table unchanged") {

@@ -48,7 +48,7 @@ object IcebergDvBridge {
     m.exists(_.invoke(null, table).asInstanceOf[Boolean])
   }
 
-  /** Whether the table's current spec is unpartitioned (the operator's supported case this landing). */
+  /** Whether the table's current spec is unpartitioned. No longer gates the operator (partitioned tables are supported). */
   def isUnpartitioned(table: AnyRef): Boolean = commitBridgeClass.exists { c =>
     val m = c.getMethods.find(x => x.getName == "isUnpartitioned" && x.getParameterCount == 1)
     m.exists(_.invoke(null, table).asInstanceOf[Boolean])

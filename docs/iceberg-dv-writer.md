@@ -116,22 +116,24 @@ optional artifact.
    private `Context.useDVs()`) decides v3 vs decline, tested (v3 eligible, v2/null decline). The live
    `SparkStrategy` (`injectPlannerStrategy`) matches the logical `WriteDelta` and, when eligible and
    `spark.vecruntime.iceberg.dvWriter.enabled` and the write is **delete-only** (no row/insert
-   projection), on an **unpartitioned** table that **does not already carry deletes**, plans a
+   projection), on a table that **does not already carry deletes** (partitioned or not), plans a
    `VectorWriteDeltaExec` command; it runs an RDD job over the child's columnar
    batches, builds DVs per `_file` run via the bridge, assembles `DeltaTaskCommit` per task, and
    commits through `deltaWrite.toBatch().commit(...)` (Iceberg's own `RowDelta`). Executor-side
    `OutputFileFactory` is built from `OutputFileFactory.builderFor(table, partId, taskId)` (public) and
-   the previous-DV loader from Iceberg's public `DeleteLoader`. Flag off, bridge absent, v2, a write
-   with an insert half, a **partitioned** table, or a table that **already has committed deletes**
-   → `Nil`, so Spark's `DataSourceV2Strategy` plans the ordinary writer. Two cases are deliberately
-   left to Spark for now because a half-correct commit is worse than a fallback: **partitioned tables**
-   (the per-file partition tuple must be threaded into the commit — a later slice) and **repeated
-   deletes on a file that already has a DV** (Iceberg rejects two DVs for one data file; merging the
-   prior DV via `rewritableDeletes` is a later slice).
+   the previous-DV loader from Iceberg's public `DeleteLoader`. Each run's spec id and partition tuple
+   come from the write's **metadata** projection (`_spec_id`, `_partition`), as in Iceberg's own
+   `SparkPositionDeltaWrite`; the rowId projection carries only `_file`/`_pos`. Flag off, bridge
+   absent, v2, a write with an insert half, or a table that **already has committed deletes** → `Nil`,
+   so Spark's `DataSourceV2Strategy` plans the ordinary writer. **Repeated deletes on a file that
+   already has a DV** are deliberately left to Spark for now because a half-correct commit is worse
+   than a fallback: Iceberg rejects two DVs for one data file, and merging the prior DV via
+   `rewritableDeletes` is a later slice.
    Correctness is covered by `VectorDvWriteSuite` (bridge module): on/off identical, operator planned
    on the supported path, v2 falls back, DVs readable via Spark metadata tables and the Iceberg API,
    snapshot summary counts match, nulls, empty delete set, a failing task aborts with no snapshot
-   committed, a partitioned DELETE falls back with a correct result, and a repeated DELETE accelerates
+   committed, a partitioned DELETE accelerates with each DV in its data file's partition (delete files
+   per partition equal to Spark's), and a repeated DELETE accelerates
    the first and falls back thereafter with a correct result. The decline/fallback paths are also
    covered inside the CI gate by `DvWriteStrategyFallbackSuite` (spark module), where the bridge is by
    construction absent.
@@ -162,7 +164,7 @@ module (the bridge is absent there by construction).
 - Gate-visible fallback suite (runs in CI, needs `-Piceberg`):
 
   ```
-  mvn -B -Pcomet,iceberg -pl spark test -Dsuites='io.sparkvector.spark.iceberg.DvWriteStrategyFallbackSuite'
+  mvn -B -Pcomet,iceberg -pl spark test -Dsuites='io.vecruntime.spark.iceberg.DvWriteStrategyFallbackSuite'
   ```
 
 - Operator correctness suite (manual — bridge module, not in the gate):
@@ -175,5 +177,6 @@ module (the bridge is absent there by construction).
   `VectorDvWriteSuite` asserts, on a v3 merge-on-read table: results identical with the writer on and
   off, `VectorWriteDeltaExec` in the plan on the supported path, v2 falls back, DVs readable via Spark
   metadata tables and the Iceberg Java API, snapshot summary counts match, nulls, an empty delete set,
-  a failing task aborts with nothing committed, a partitioned DELETE falls back with a correct result,
-  and a repeated DELETE accelerates the first and falls back thereafter with a correct result.
+  a failing task aborts with nothing committed, a partitioned DELETE accelerates with each DV in its
+  data file's partition, and a repeated DELETE accelerates the first and falls back thereafter with a
+  correct result.

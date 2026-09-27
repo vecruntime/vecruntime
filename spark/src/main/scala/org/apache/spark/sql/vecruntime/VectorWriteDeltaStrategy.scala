@@ -61,11 +61,10 @@ case class VectorWriteDeltaStrategy(session: SparkSession) extends SparkStrategy
     if (table.isEmpty) return Some("target is not an Iceberg table")
     if (!IcebergDvBridge.isDvEligible(table.get))
       return Some("target is not a format-version-3 (deletion-vector) table")
-    // This landing supports only unpartitioned tables and only the first delete on a data file: the
-    // per-file partition tuple threading and previous-DV merge are later slices, and shipping them
-    // half-correct would corrupt the commit. Decline (Spark's own writer stays correct) otherwise.
-    if (!IcebergDvBridge.isUnpartitioned(table.get))
-      return Some("partitioned v3 tables are not supported yet (slice)")
+    // This landing supports only the first delete on a data file: the previous-DV merge is a later
+    // slice, and shipping it half-correct would corrupt the commit. Decline (Spark's own writer stays
+    // correct) otherwise. Partitioned tables are supported: the spec id and partition tuple come from
+    // the metadata projection, as in Iceberg's own writer.
     if (IcebergDvBridge.hasCommittedDeletes(table.get))
       return Some("target already carries deletes; repeated-delete DV merge is a later slice")
     None
