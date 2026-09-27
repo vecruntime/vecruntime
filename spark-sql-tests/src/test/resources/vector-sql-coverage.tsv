@@ -295,11 +295,11 @@ postgreSQL/timestamp.sql	45	13	28
 postgreSQL/timestamp.sql_analyzer_test	15	0	0
 postgreSQL/union.sql	73	54	147
 postgreSQL/union.sql_analyzer_test	3	0	0
-postgreSQL/window_part1.sql	152	103	271
+postgreSQL/window_part1.sql	152	103	274
 postgreSQL/window_part1.sql_analyzer_test	23	0	0
-postgreSQL/window_part2.sql	113	33	57
+postgreSQL/window_part2.sql	113	39	75
 postgreSQL/window_part2.sql_analyzer_test	23	0	0
-postgreSQL/window_part3.sql	86	24	36
+postgreSQL/window_part3.sql	86	24	66
 postgreSQL/window_part3.sql_analyzer_test	32	0	0
 postgreSQL/window_part4.sql	119	33	63
 postgreSQL/window_part4.sql_analyzer_test	5	0	0
