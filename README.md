@@ -4,7 +4,7 @@
 
 vecruntime accelerates Spark SQL workloads by executing core operators directly on **Arrow-layout columnar batches** using the **Java Vector API**, bringing SIMD-optimized execution to the JVM without native libraries, JNI, or serialization boundaries.
 
-Inspired by the execution architecture of Apache DataFusion Comet, vecruntime provides a native-style execution path for **Filter, Project, HashAggregate, Sort, and hash joins**, while preserving Spark as the execution fallback for unsupported operators, expressions, and data types.
+Inspired by the execution architecture of Apache DataFusion Comet, vecruntime provides a native-style execution path for **Filter, Project, HashAggregate, Sort, Window (`ROWS` and `RANGE` frames), Range, Expand, Generate, Union and the hash, sort-merge and nested-loop joins**, while preserving Spark as the execution fallback for unsupported operators, expressions, and data types.
 
 The result is a **fully JVM-based execution engine** that combines the performance potential of vectorized execution with the portability and simplicity of the Java ecosystem.
 
@@ -59,7 +59,7 @@ with its default is in [docs/configuration.md](docs/configuration.md).
 | Module | Language | Contents |
 |---|---|---|
 | `kernels/` | Java 25 | `VectorBuffers` (Arrow-layout `MemorySegment`s), SIMD kernels: compare, bitmap logic, compaction, arithmetic, decimal rescaling and division, casts, reductions (plain and overflow-checked), group hashing and key table, grouped accumulators, sort, gather, column builder; scalar references used as test oracles |
-| `spark/` | Scala 2.13 + Java | `VectorPlugin`, session extension, `VectorColumnarRule`, expression compiler, the operators (`VectorFilterExec`, `VectorProjectExec`, `VectorHashAggregateExec` with its spill, `VectorSortExec`, `VectorTakeOrderedAndProjectExec`, the limit family, `VectorUnionExec` / `VectorCoalesceExec`, `VectorExpandExec`, `VectorWindowExec`, `VectorGenerateExec`, `VectorSampleExec`, `VectorMergeRowsExec`, `VectorBroadcastHashJoinExec` / `VectorShuffledHashJoinExec` / `VectorBroadcastNestedLoopJoinExec` / `VectorSortMergeJoinExec`, `VectorShuffleExchangeExec`, `VectorToCometExec`, `VectorPrefetchScanExec`), Arrow output, input adapters (Spark vectors, Arrow, Comet, Iceberg), the Vector Acceleration UI tab |
+| `spark/` | Scala 2.13 + Java | `VectorPlugin`, session extension, `VectorColumnarRule`, expression compiler, the operators (`VectorFilterExec`, `VectorProjectExec`, `VectorHashAggregateExec` with its spill, `VectorSortExec`, `VectorTakeOrderedAndProjectExec`, the limit family, `VectorUnionExec` / `VectorCoalesceExec`, `VectorExpandExec`, `VectorWindowExec`, `VectorGenerateExec`, `VectorSampleExec`, `VectorRangeExec`, `VectorMergeRowsExec`, `VectorBroadcastHashJoinExec` / `VectorShuffledHashJoinExec` / `VectorBroadcastNestedLoopJoinExec` / `VectorSortMergeJoinExec`, `VectorShuffleExchangeExec`, `VectorToCometExec`, `VectorPrefetchScanExec`), Arrow output, input adapters (Spark vectors, Arrow, Comet, Iceberg), the Vector Acceleration UI tab |
 | `shuffle/` | Scala 2.13 | the columnar shuffle (#288): `VectorShuffleManager` (writer, reader, file cleanup), `PartitionedIpcWriter` / `PartitionedIpcFile` (Arrow IPC record batches per reduce partition in Spark's data-file layout, adaptive dictionaries, zstd), the Flight data plane (`FlightShuffle`: one server per executor, one `DoGet` per executor and reducer) and the `block` backend over Spark's block transfer |
 | `benchmarks/` | Java + Scala | JMH kernel microbenchmarks; the TPC-H (22 queries) and TPC-DS (103 queries) runners, local and on a cluster; `submit-cluster.sh` and the Kubernetes `SparkApplication` manifest under `benchmarks/k8s/` (the image build and the run matrix of the EKS campaign arrive with #247); `profile-query.sh` (one query under JFR) |
 | `spark-sql-tests/` | Scala 2.13 | Spark's own SQL golden-file suite run with the plugin (profile `spark-sql-tests`, on demand only; see below) |
@@ -152,6 +152,7 @@ Configuration keys (all default to `true` except the last; the complete referenc
 | `spark.vecruntime.exec.generate.enabled` | convert `GenerateExec` with `explode`/`posexplode` (and the `_outer` forms) over an array column: the other columns gathered through a repeat index built from the array lengths, the elements copied once per array from Spark's array vector |
 | `spark.vecruntime.exec.sample.enabled` | convert `SampleExec` without replacement over a columnar child: Spark's own Bernoulli sequence per partition as a selection bitmap, so a seed returns Spark's rows |
 | `spark.vecruntime.exec.localTableScan.enabled` | convert `LocalTableScanExec` (`VALUES`, local relations) into one batch per partition; **off by default** -- nothing to accelerate, it only lets small-table tests run our operators |
+| `spark.vecruntime.exec.range.enabled` | convert `RangeExec` (`spark.range`, the `range()` table function) into native INT64 batches -- Spark's rows in Spark's partitions, one reused vector per task -- so the chain above `range()` is ours from the leaf (over Spark's row leaf nothing of ours ran until the first exchange) |
 | `spark.vecruntime.exec.expand.enabled` | convert `ExpandExec` (`ROLLUP` / `CUBE` / `GROUPING SETS`, the `count(distinct)` rewrite) over a columnar child: one borrowed-column batch per grouping set, no data copy |
 | `spark.vecruntime.exec.broadcastHashJoin.enabled` | convert `BroadcastHashJoinExec` when the streamed side is columnar or an exchange (the build side stays Spark's broadcast) |
 | `spark.vecruntime.exec.broadcastNestedLoopJoin.enabled` | convert `BroadcastNestedLoopJoinExec` (non-equi joins) when the streamed side is columnar or an exchange; inner/cross, semi/anti/existence and outer joins with the streamed side preserved |
@@ -739,6 +740,10 @@ replacement) is a selection producer like the filter: it runs Spark's own Bernou
 over the live rows, so the same seed returns exactly Spark's rows, and forwards the bitmap. `VectorLocalTableScanExec`
 turns a `VALUES` relation into batches; it is off by default (`spark.vecruntime.exec.localTableScan.enabled`)
 because there is nothing to accelerate -- it only removes the row-to-columnar transition for small-table tests.
+`VectorRangeExec` (`spark.range`, the `range()` table function) is the other leaf: it writes Spark's rows, in
+Spark's partitions, straight into native INT64 batches -- one vector per task, refilled by a Vector API
+kernel for every batch -- so the filter, projection and partial aggregate over `range()` are ours from the leaf, where over Spark's row
+leaf they stayed Spark's until the first exchange (`spark.vecruntime.exec.range.enabled`).
 
 Window functions start with the ranking layer (#58): `VectorWindowExec` computes `row_number`, `rank`
 and `dense_rank` in one walk over the input Spark already sorted by partition and order keys -- a new

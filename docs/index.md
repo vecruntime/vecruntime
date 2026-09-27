@@ -6,7 +6,8 @@ description: A vectorized execution runtime for Apache Spark using Java
 
 # vecruntime
 
-A Spark SQL plugin that runs Filter, Project, HashAggregate, Sort, Window and the hash joins on
+A Spark SQL plugin that runs Filter, Project, HashAggregate, Sort, Window (`ROWS` and `RANGE`
+frames), Range, Expand, Generate, the limits, Union and the hash, sort-merge and nested-loop joins on
 Arrow-layout batches with the Java Vector API -- on the JVM, no native code -- with its own columnar
 shuffle over Arrow Flight. Source, releases and the README:
 [github.com/vecruntime/vecruntime](https://github.com/vecruntime/vecruntime).
@@ -22,7 +23,9 @@ operators, expressions, and types transparently fall back to Spark, always with 
 - **SIMD-accelerated:** uses the Java Vector API for hardware-vectorized execution.
 - **Columnar by design:** operators consume and produce Arrow-layout batches.
 - **Spark-compatible:** unsupported operators, expressions, and types fall back to Spark.
-- **Vectorized operators:** Filter, Project, HashAggregate, Sort, Window, and hash joins.
+- **Vectorized operators:** Filter, Project, HashAggregate, Sort, Window (including `RANGE` frames with
+  value offsets), Range, Expand, Generate, the limits, Union, and the hash, sort-merge and nested-loop
+  joins -- the full list is on the [Operators](operators.html) page.
 - **Zero-copy integration:** interoperates with columnar native components such as Apache
   DataFusion Comet without serialization between execution stages.
 - **Incremental adoption:** operators can be accelerated individually while the rest of the Spark

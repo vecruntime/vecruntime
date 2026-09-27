@@ -17,6 +17,19 @@ version may change configuration keys or defaults, always noted here.
   without an offset (`CURRENT ROW AND UNBOUNDED FOLLOWING`, `CURRENT ROW AND CURRENT ROW`) on the row
   path. Fallback reasons now name the key or input type (`RANGE offsets over a decimal(12,2) order key
   not supported`) instead of `RANGE frames with value offsets`.
+- `VectorRangeExec`, a columnar replacement for Spark's `RangeExec` (`spark.range(...)`, the `range()`
+  table-valued function): Spark's rows in Spark's partitions (the same split, the same clamping at the
+  `Long` bounds, the same `outputOrdering` / `outputPartitioning`), written into native INT64 batches
+  by a Vector API kernel (`SequenceKernels.range`) -- one reused vector per task, nothing allocated per
+  batch -- so the filter, projection and partial aggregate over `range()` are ours from the leaf, where
+  over Spark's row leaf they stayed Spark's until the first exchange. `spark.vecruntime.exec.range.enabled`
+  (default `true`). Spark's SQL golden suite gains 105 accelerated executions (4219 -> 4324 of 33856;
+  26 cases above the previous floor, now recorded).
+- `spark_partition_id()` is compiled (`SparkPartitionIdExpr`, a constant INT32 column per task written by the
+  new `SequenceKernels.fillInt`), so a projection or filter over it stays columnar.
+- `VectorArrowColumnVector.reusable(...)`: an owned column that ignores the per-batch
+  `closeIfFreeable()` Spark 4.1's `ColumnarToRowExec` calls (as Spark's own `WritableColumnVector`s do)
+  and is freed by `close()`, for producers that refill one vector across batches.
 
 ## 0.0.2 -- 2026-09-26
 

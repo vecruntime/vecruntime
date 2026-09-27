@@ -11,7 +11,7 @@ everything else lives in `docs/results.md`.
 ## 1. What this project is
 
 A Spark SQL plugin that runs `Filter`, `Project`, `HashAggregate` (all four modes, spilling), `Sort`
-(spilling runs), `Window`, `Expand`, `Generate`, the limit family, `Sample`, `Union` / `Coalesce`,
+(spilling runs), `Window`, `Expand`, `Generate`, the limit family, `Sample`, `Range`, `Union` / `Coalesce`,
 Iceberg's `MergeRows`, the hash, broadcast-nested-loop and sort-merge joins, and its own columnar
 shuffle over Arrow-layout columnar batches with the Java Vector API (`jdk.incubator.vector`), in the
 style of Apache DataFusion Comet but entirely on the JVM. It reads batches from Spark's vectorized
@@ -371,6 +371,17 @@ Expressions compile to a small `VectorExpr` tree (`expr/VectorExpr.scala`; one f
   lane-less payload column (`_partition` beside `_file` / `_pos` / `_spec_id`) passed through on the
   streamed side as a `RemappedColumnVector`; a lane-less column on the build side is still refused.
   The write stays Spark's. `VectorMergeRowsSuite` compares against Spark's operator.
+- `VectorRangeExec` replaces Spark's `RangeExec` (`range()`, `spark.range`), so the chain above it is
+  ours from the leaf. The split is `RangeExec.doExecute`'s arithmetic exactly (`VectorRangeExec.partition`:
+  bounds clamped to `Long`, the row count from the clamped bounds), so `spark_partition_id()` and
+  `monotonically_increasing_id()` match, and `outputOrdering` / `outputPartitioning` are Spark's. Per task
+  one native `BigIntVector` of `conf.columnBatchSize` rows is filled by `SequenceKernels.range` (scalar twin
+  `ScalarReference.range`) and re-emitted for each batch, nothing allocated per batch; the vector is
+  `VectorArrowColumnVector.reusable`, which ignores the per-batch `closeIfFreeable()` of Spark's
+  `ColumnarToRowExec` and is freed at task end. Refused: a streaming range, fewer than 1 slice
+  (`spark.vecruntime.exec.range.enabled` turns it off). Known difference: for a step so large a batch
+  overflows a `Long`, Spark's *generated* range drops the last partition's rows; ours returns what Spark's
+  interpreted path returns (`VectorRangeSuite` pins both).
 
 ### 5.8 Window (`VectorWindowExec`, #58)
 
@@ -681,7 +692,7 @@ A change is not done until all of the following that apply have run green, local
 the exit codes are reported.
 
 1. The gate: `mvn -B -Pcomet,iceberg -pl kernels,spark,shuffle,benchmarks install`, exit 0. Last full
-   gate: kernels 201 tests, spark 414 (Comet and Iceberg profiles on), shuffle 54. If a change lowers
+   gate: kernels 204 tests, spark 426 (Comet and Iceberg profiles on), shuffle 54. If a change lowers
    a number, explain why in the commit.
 2. Kernel changes: the kernel suite at 128, 256 and 512 bits (`-Dvecruntime.vectorBits=...`).
 3. Planner or expression changes: the SQL golden suite with no arguments, every case passing and the

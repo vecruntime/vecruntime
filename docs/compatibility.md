@@ -13,8 +13,8 @@ A row marked **✓** means the query ran on a vecruntime operator and matched Sp
 **falls back** means the planner declined it, the query stayed on Spark, and the test asserts the
 recorded fallback reason. A **known gap** is a case the suite marks `ignore`.
 
-The rows below come **only** from the five ported test suites named in each section — nothing is
-inferred for a case that is not tested. For the full per-operator and per-expression reference (every
+The rows below come **only** from the five ported test suites named in each section (and, for the
+`range()` leaf, from its own suite) — nothing is inferred for a case that is not tested. For the full per-operator and per-expression reference (every
 condition and every fallback reason), see [Supported operators](operators.html) and
 [Supported expressions](expressions.html); this page is the tested-against-Spark subset.
 
@@ -166,3 +166,30 @@ Source: [`VectorPortedCometWindowSuite.scala`](https://github.com/vecruntime/vec
 **Analysis errors, not fallbacks (both engines raise the same):** a non-literal `lag`/`lead` offset
 (`lag(b, c)`) is a Spark analysis error; `nth_value` without an `ORDER BY` is a Spark analysis error.
 The suite asserts both engines raise, so these are neither accelerated nor a recorded fallback.
+
+---
+
+## Range (`spark.range`, the `range()` table-valued function)
+
+Not a Comet port: `VectorRangeExec` replaces Spark's `RangeExec` leaf, so every shape below runs the
+same `range()` with the plugin on and off and compares the rows -- and, since the leaf decides the
+partitions, the partition-dependent results too. Each case asserts `VectorRangeExec` in the final
+plan, that Spark's `RangeExec` is gone, and that no `RowToColumnarExec` sits above ours.
+Source: [`VectorRangeSuite.scala`](https://github.com/vecruntime/vecruntime/blob/main/spark/src/test/scala/io/vecruntime/spark/VectorRangeSuite.scala)
+(lines 67-291) and, for the batch lifecycle without a Spark job,
+[`VectorRangeIteratorSuite.scala`](https://github.com/vecruntime/vecruntime/blob/main/spark/src/test/scala/org/apache/spark/sql/vecruntime/VectorRangeIteratorSuite.scala).
+
+| Shape | Covered | Accelerated | Notes (suite lines) |
+|---|---|:--:|---|
+| `range(n)`, `range(start, end)`, positive and negative steps, explicit `numSlices` (1, 4, 32 -- more slices than rows) | 12 ranges, plus 7-row batches (`spark.sql.inMemoryColumnarStorage.batchSize=7`) | ✓ | `numOutputRows` equals Spark's count (67-92) |
+| Empty ranges (`start = end`, step against the direction) | 5 shapes | ✓ | an RDD with no partitions, `UnknownPartitioning(0)` as Spark's (94-109) |
+| Ranges ending at `Long.MaxValue` / starting at `Long.MinValue`, one and several slices, huge steps | 13 ranges | ✓ | the last partition's end is clamped as `RangeExec.getSafeMargin` clamps it; for a step so large that a 1000-row batch of it overflows a Long, Spark's *generated* range loses the last partition's rows (`range(MinValue, MaxValue, MaxValue / 2)` returns 2 rows under codegen, 5 without) -- ours returns the 5, compared against Spark with codegen off, and the suite pins Spark's 2 so the divergence is visible when it changes (111-150) |
+| The per-partition split | 11 `(start, end, step, slices)` shapes, every slice | ✓ | `VectorRangeExec.partition` against `RangeExec.doExecute`'s arithmetic element by element (152-193) |
+| Filter, projection, ungrouped and grouped aggregate, a filter dropping every row, `LIMIT` over one slice | — | ✓ | `VectorFilterExec` / `VectorProjectExec` / `VectorHashAggregateExec` directly on the leaf (195-209) |
+| `ORDER BY id` (sort elided by the planner), `GROUP BY id` (no exchange: the leaf is range-partitioned on `id`) | — | ✓ | `outputOrdering` / `outputPartitioning` are Spark's; `RangePartitioning(id, 4)`, `SinglePartition` for one slice (211-225) |
+| `monotonically_increasing_id()` over a range, with a filter, with empty partitions | — | ✓ | same partition prefixes and row numbers as over Spark's leaf (227-243) |
+| `spark_partition_id()` over a range | — | ✓ | `SparkPartitionIdExpr`: the task's partition index, one broadcast fill per batch; the projection over it is ours and the values name the same partitions (227-243) |
+| Joins with a range on both sides: shuffled hash, sort-merge (`mode=merge`), broadcast, join + aggregate | inner, left outer | ✓ | `VectorShuffledHashJoinExec`, `VectorSortMergeJoinExec`, `VectorBroadcastHashJoinExec` (245-267) |
+| **`numSlices < 1`** | planner unit test | **falls back** | `range with 0 slices` -- Spark raises its own execution error (269-290) |
+| **Streaming range** | planner unit test | **falls back** | `streaming range` (269-290) |
+| `spark.vecruntime.exec.range.enabled=false` | switch | Spark's leaf | Spark's `RangeExec` and Spark's partial aggregate stay; only the Final aggregate over the shuffle is ours, behind a `RowToColumnarExec` (269-290) |
