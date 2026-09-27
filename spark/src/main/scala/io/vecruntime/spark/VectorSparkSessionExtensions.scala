@@ -16,7 +16,7 @@
 package io.vecruntime.spark
 
 import org.apache.spark.sql.SparkSessionExtensions
-import org.apache.spark.sql.vecruntime.VectorColumnarRule
+import org.apache.spark.sql.vecruntime.{VectorColumnarRule, VectorWriteDeltaStrategy}
 
 /**
  * Registers the planner rule. Enable with
@@ -26,5 +26,8 @@ import org.apache.spark.sql.vecruntime.VectorColumnarRule
 class VectorSparkSessionExtensions extends (SparkSessionExtensions => Unit) {
   override def apply(extensions: SparkSessionExtensions): Unit = {
     extensions.injectColumnar(session => VectorColumnarRule(session))
+    // The columnar v3 deletion-vector writer (#20): a planner strategy over the logical WriteDelta,
+    // gated on spark.vecruntime.iceberg.dvWriter.enabled and a v3 target; declines to Spark otherwise.
+    extensions.injectPlannerStrategy(session => VectorWriteDeltaStrategy(session))
   }
 }

@@ -522,8 +522,18 @@ these rather than adding special cases to operators.
   bitmap from a deletion vector would need the reader to hand out the index (upstream, #261).
 - The write stays Spark's; rebalance exchanges before an Iceberg write are sized by rows and by our
   shuffle's bytes per row (`spark.vecruntime.shuffle.rebalance.*`, #485, #495, #506).
-- In progress, not on `main`: an Iceberg v3 deletion-vector writer in an optional `iceberg-bridge`
-  module (PR #509). Until it merges, nothing in this repository writes deletion vectors.
+- The v3 deletion-vector writer (#20, `docs/iceberg-dv-writer.md`), off by default
+  (`spark.vecruntime.iceberg.dvWriter.enabled`): `VectorWriteDeltaStrategy` plans `VectorWriteDeltaExec`
+  for DELETE / UPDATE / MERGE on a format-version-3 merge-on-read table. Deletes become one deletion
+  vector per data file (`ColumnarDvWriter` over Iceberg's `BaseDVFileWriter`); the spec id and
+  partition come from the write's *metadata* projection, not the rowId projection; a file's committed
+  DV is merged and replaced through the same `rewritableDeletes` map Iceberg's writer uses; the insert
+  half (INSERT / REINSERT, v3 row lineage included) goes to Iceberg's own `DeltaWriter`, and every
+  task message is committed in one `RowDelta` by Iceberg. The Iceberg-typed code is in the optional
+  `iceberg-bridge` module (reached reflectively through `IcebergDvBridge`; without the jar the writer
+  stays Spark's). Its correctness suite (`VectorDvWriteSuite`) is outside the gate's module list: run
+  `mvn -Piceberg -pl iceberg-bridge verify` after installing the reactor; `DvWriteStrategyFallbackSuite`
+  in the gate pins the declines.
 
 ### 5.13 The Vector Acceleration UI tab (`ui/`)
 
@@ -692,7 +702,7 @@ A change is not done until all of the following that apply have run green, local
 the exit codes are reported.
 
 1. The gate: `mvn -B -Pcomet,iceberg -pl kernels,spark,shuffle,benchmarks install`, exit 0. Last full
-   gate: kernels 204 tests, spark 426 (Comet and Iceberg profiles on), shuffle 54. If a change lowers
+   gate: kernels 204 tests, spark 431 (Comet and Iceberg profiles on), shuffle 54. If a change lowers
    a number, explain why in the commit.
 2. Kernel changes: the kernel suite at 128, 256 and 512 bits (`-Dvecruntime.vectorBits=...`).
 3. Planner or expression changes: the SQL golden suite with no arguments, every case passing and the
@@ -804,6 +814,7 @@ benchmarks/scripts/profile-query.sh - vector q6 --flags-only   # the recording f
   away.
 - Iceberg merge-on-read reads (#261): the delete cost is paid inside Iceberg's reader by both engines,
   so our margin shrinks on deleted tables; equality deletes are the one shape where `vector` loses the
-  pure-merge probe. The v3 deletion-vector writer is in progress (PR #509).
+  pure-merge probe. The v3 deletion-vector writer is off by default: correct, but on a CDC MERGE the
+  write is ~11 % of the statement and its gain (~5 % with the #482 Iceberg patch) does not justify it yet.
 - The AOT class-data cache (`benchmarks/k8s/aot/`) is off by default: it speeds start-up and costs the
   heavy queries 20 % at 1 TB.
