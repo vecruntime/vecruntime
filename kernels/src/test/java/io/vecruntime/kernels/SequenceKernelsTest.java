@@ -40,8 +40,8 @@ class SequenceKernelsTest {
                     SequenceKernels.fillInt(got, n, value);
                     ScalarReference.fillInt(want, n, value);
                     for (int i = 0; i < n; i++) {
-                        assertEquals(want.getAtIndex(VectorBuffers.LE_INT, i), got.getAtIndex(VectorBuffers.LE_INT, i),
-                            "lane " + i + " of " + n + " value " + value);
+                        assertEquals(want.getAtIndex(VectorBuffers.LE_INT, i),
+                                got.getAtIndex(VectorBuffers.LE_INT, i), "lane " + i + " of " + n + " value " + value);
                     }
                 }
             }

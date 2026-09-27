@@ -233,7 +233,11 @@ class VectorRangeSuite extends VectorQuerySuite {
         "SELECT spark_partition_id() AS p, count(*) AS n, min(id) AS mn, max(id) AS mx FROM range(0, 1000, 3, 7) GROUP BY spark_partition_id()",
         Project
       )
-      checkRange("SELECT spark_partition_id() AS p, id FROM range(0, 10, 3, 32) WHERE id > 2", Filter, Project) // empty partitions
+      checkRange(
+        "SELECT spark_partition_id() AS p, id FROM range(0, 10, 3, 32) WHERE id > 2",
+        Filter,
+        Project
+      ) // empty partitions
       checkRange("SELECT monotonically_increasing_id() AS m, id FROM range(0, 1000, 1, 7)", Project)
       checkRange(
         "SELECT monotonically_increasing_id() AS m, id FROM range(1000, 0, -1, 5) WHERE id % 2 = 0",
