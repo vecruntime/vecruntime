@@ -64,15 +64,33 @@ object IcebergDvBridge {
     m.forall(_.invoke(null, table).asInstanceOf[Boolean])
   }
 
-  /** Creates a per-task DV writer handle (reflective wrapper over the bridge's DvDeltaTaskWriter). */
-  def createTaskWriter(table: AnyRef, partitionId: Int, taskId: Long): IcebergDvTaskWriterHandle = {
+  /**
+   * The operation's previously committed deletes per data file (a serialisable `java.util.Map`), as
+   * Iceberg's own writer would merge them, or `null` when there are none. Read on the driver.
+   */
+  def rewritableDeletes(write: AnyRef): AnyRef = commitBridgeClass.map { c =>
+    val m = c.getMethods.find(x => x.getName == "rewritableDeletes" && x.getParameterCount == 1).get
+    m.invoke(null, write)
+  }.orNull
+
+  /**
+   * Creates a per-task DV writer handle (reflective wrapper over the bridge's DvDeltaTaskWriter).
+   * `rewritableDeletes` is the map from [[rewritableDeletes]]: Iceberg's `BaseDVFileWriter.close`
+   * merges each file's previous DV into the new one and reports it as rewritten, so the commit
+   * replaces it (a v3 table allows one DV per data file).
+   */
+  def createTaskWriter(
+      table: AnyRef,
+      partitionId: Int,
+      taskId: Long,
+      rewritableDeletes: AnyRef
+  ): IcebergDvTaskWriterHandle = {
     val c = taskWriterClass.getOrElse(
-      throw new IllegalStateException("spark-vector: iceberg-bridge module not on the classpath")
+      throw new IllegalStateException("vecruntime: iceberg-bridge module not on the classpath")
     )
     val create = c.getMethods.find(m => m.getName == "create" && m.getParameterCount == 4).get
-    // rewritableDeletes = null in this first landing (append-only deletes; previous DVs are merged by
-    // Iceberg's BaseDVFileWriter.close only when a rewrite map is supplied -- slice for repeated merges).
-    val instance = create.invoke(null, table, Integer.valueOf(partitionId), java.lang.Long.valueOf(taskId), null)
+    val instance =
+      create.invoke(null, table, Integer.valueOf(partitionId), java.lang.Long.valueOf(taskId), rewritableDeletes)
     new IcebergDvTaskWriterHandle(instance)
   }
 }

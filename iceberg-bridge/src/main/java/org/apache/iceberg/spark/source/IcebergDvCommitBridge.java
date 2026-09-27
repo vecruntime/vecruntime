@@ -136,6 +136,46 @@ public final class IcebergDvCommitBridge {
     }
 
     /**
+     * The previously committed deletes each data file of this row-level
+     * operation must merge into its new deletion vector, keyed by data file
+     * location, or {@code null} when there are none. This is exactly the map
+     * Iceberg's own {@code PositionDeltaBatchWrite} broadcasts to its writers:
+     * {@code scan.rewritableDeletes(true)} over the operation's scan tasks
+     * (every non-equality delete, since a v3 table allows at most one DV per
+     * data file). The scan is a private field of the package-private {@code
+     * SparkPositionDeltaWrite}, and {@code rewritableDeletes} is protected,
+     * which is why this lives in this same-package bridge. Values are plain
+     * {@link java.util.ArrayList}s so the map serialises to the executors.
+     */
+    public static java.util.Map<String, java.util.List<org.apache.iceberg.DeleteFile>> rewritableDeletes(Object deltaWrite) {
+        if (!(deltaWrite instanceof SparkPositionDeltaWrite)) {
+            return null;
+        }
+        Object scan;
+        try {
+            java.lang.reflect.Field f = SparkPositionDeltaWrite.class.getDeclaredField("scan");
+            f.setAccessible(true);
+            scan = f.get(deltaWrite);
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("cannot read the row-level scan of " + deltaWrite, e);
+        }
+        if (!(scan instanceof SparkRuntimeFilterableScan filterableScan)) {
+            return null;
+        }
+        java.util.Map<String, org.apache.iceberg.util.DeleteFileSet> byFile = filterableScan.rewritableDeletes(true);
+        if (byFile == null || byFile.isEmpty()) {
+            return null;
+        }
+        java.util.Map<String, java.util.List<org.apache.iceberg.DeleteFile>> out = new java.util.HashMap<>();
+        byFile.forEach((path, set) -> {
+            java.util.List<org.apache.iceberg.DeleteFile> files = new java.util.ArrayList<>();
+            set.forEach(files::add);
+            out.put(path, files);
+        });
+        return out;
+    }
+
+    /**
      * Resolves the partition tuple of a delete run as an Iceberg {@link
      * org.apache.iceberg.StructLike} from the row-level operation's {@code
      * specId} and the partition as the Spark {@code InternalRow} Iceberg's

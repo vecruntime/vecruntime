@@ -185,7 +185,7 @@ class VectorDvWriteSuite extends AnyFunSuite with BeforeAndAfterAll {
     assert(count("SELECT count(*) FROM ice.db.dv_v2 WHERE id % 3 = 0") == 0L)
   }
 
-  test("repeated DELETEs on v3: first accelerates, later ones fall back, result correct") {
+  test("repeated DELETEs on v3: every one accelerates, previous DVs merged, one DV per file") {
     createV3("ice.db.dv_rep_on")
     createV3("ice.db.dv_rep_off")
     val hadPlanned = scala.collection.mutable.ArrayBuffer[Boolean]()
@@ -199,11 +199,22 @@ class VectorDvWriteSuite extends AnyFunSuite with BeforeAndAfterAll {
       }
       hadPlanned += had
     }
-    // First DELETE has no prior deletes -> operator runs; the table then carries a DV, so the next
-    // DELETEs decline (repeated-DV merge is a later slice) and Spark's writer keeps them correct.
-    assert(hadPlanned.head, "the first DELETE on a clean v3 table must use the columnar operator")
-    assert(hadPlanned.tail.forall(!_), "DELETEs after the table has deletes must fall back")
+    // Each later DELETE merges the file's committed DV into its new one and replaces it, as Iceberg's
+    // own writer does; without the merge Iceberg rejects the commit ("Can't index multiple DVs").
+    assert(hadPlanned.forall(identity), s"every DELETE must use the columnar operator: $hadPlanned")
     assert(rows("ice.db.dv_rep_on").sameElements(rows("ice.db.dv_rep_off")), "repeated-delete contents differ")
+    val expected = (0L until 2000L).count(i => i % 3 != 0 && i % 4 != 0 && i % 5 != 0).toLong
+    assert(count("SELECT count(*) FROM ice.db.dv_rep_on") == expected, "live row count wrong")
+    // At most one live DV per data file, and the live DVs index as many deleted rows as Spark's.
+    assert(
+      count("SELECT count(*) - count(DISTINCT referenced_data_file) FROM ice.db.dv_rep_on.delete_files") == 0L,
+      "a data file has more than one live DV"
+    )
+    assert(
+      count("SELECT sum(record_count) FROM ice.db.dv_rep_on.delete_files") ==
+        count("SELECT sum(record_count) FROM ice.db.dv_rep_off.delete_files"),
+      "live DV cardinality differs from Spark's"
+    )
   }
 
   test("partitioned v3 DELETE: our operator runs, each DV in its file's partition, result correct") {

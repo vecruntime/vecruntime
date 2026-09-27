@@ -116,25 +116,25 @@ optional artifact.
    private `Context.useDVs()`) decides v3 vs decline, tested (v3 eligible, v2/null decline). The live
    `SparkStrategy` (`injectPlannerStrategy`) matches the logical `WriteDelta` and, when eligible and
    `spark.vecruntime.iceberg.dvWriter.enabled` and the write is **delete-only** (no row/insert
-   projection), on a table that **does not already carry deletes** (partitioned or not), plans a
+   projection), on a v3 table (partitioned or not, with or without earlier deletes), plans a
    `VectorWriteDeltaExec` command; it runs an RDD job over the child's columnar
    batches, builds DVs per `_file` run via the bridge, assembles `DeltaTaskCommit` per task, and
    commits through `deltaWrite.toBatch().commit(...)` (Iceberg's own `RowDelta`). Executor-side
    `OutputFileFactory` is built from `OutputFileFactory.builderFor(table, partId, taskId)` (public) and
    the previous-DV loader from Iceberg's public `DeleteLoader`. Each run's spec id and partition tuple
    come from the write's **metadata** projection (`_spec_id`, `_partition`), as in Iceberg's own
-   `SparkPositionDeltaWrite`; the rowId projection carries only `_file`/`_pos`. Flag off, bridge
-   absent, v2, a write with an insert half, or a table that **already has committed deletes** → `Nil`,
-   so Spark's `DataSourceV2Strategy` plans the ordinary writer. **Repeated deletes on a file that
-   already has a DV** are deliberately left to Spark for now because a half-correct commit is worse
-   than a fallback: Iceberg rejects two DVs for one data file, and merging the prior DV via
-   `rewritableDeletes` is a later slice.
+   `SparkPositionDeltaWrite`; the rowId projection carries only `_file`/`_pos`. A data file's
+   previously committed DV is merged into its new one and replaced in the commit: the driver reads
+   the same `rewritableDeletes` map Iceberg's own writer broadcasts (`scan.rewritableDeletes(true)`),
+   `BaseDVFileWriter.close` merges it and reports the old DV as rewritten, and Iceberg's commit
+   removes it, so a table keeps one DV per data file. Flag off, bridge absent, v2, or a write with an
+   insert half → `Nil`, so Spark's `DataSourceV2Strategy` plans the ordinary writer.
    Correctness is covered by `VectorDvWriteSuite` (bridge module): on/off identical, operator planned
    on the supported path, v2 falls back, DVs readable via Spark metadata tables and the Iceberg API,
    snapshot summary counts match, nulls, empty delete set, a failing task aborts with no snapshot
    committed, a partitioned DELETE accelerates with each DV in its data file's partition (delete files
-   per partition equal to Spark's), and a repeated DELETE accelerates
-   the first and falls back thereafter with a correct result. The decline/fallback paths are also
+   per partition equal to Spark's), and three DELETEs in a row all accelerate with one live DV per
+   data file and the same deleted-row count as Spark's. The decline/fallback paths are also
    covered inside the CI gate by `DvWriteStrategyFallbackSuite` (spark module), where the bridge is by
    construction absent.
 5. **Insert/update path via Iceberg's appender** — *deferred; UPDATE/MERGE fall back, delete-only
@@ -178,5 +178,4 @@ module (the bridge is absent there by construction).
   off, `VectorWriteDeltaExec` in the plan on the supported path, v2 falls back, DVs readable via Spark
   metadata tables and the Iceberg Java API, snapshot summary counts match, nulls, an empty delete set,
   a failing task aborts with nothing committed, a partitioned DELETE accelerates with each DV in its
-  data file's partition, and a repeated DELETE accelerates the first and falls back thereafter with a
-  correct result.
+  data file's partition, and repeated DELETEs all accelerate with one live DV per data file.

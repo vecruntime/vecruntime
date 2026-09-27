@@ -65,10 +65,16 @@ case class VectorWriteDeltaExec(
     val rdd: RDD[InternalRow] = query.execute()
     val proj = projections
     val tbl = table
+    // Read on the driver before the job, as Iceberg's own writer does, and broadcast to the tasks.
+    val previous = session.sparkContext.broadcast(Option(IcebergDvBridge.rewritableDeletes(write)))
     val messages = new mutable.ArrayBuffer[WriterCommitMessage]()
     try {
       val collected: Array[WriterCommitMessage] =
-        rdd.mapPartitions(iter => Iterator.single(VectorWriteDeltaExec.writePartition(tbl, proj, iter))).collect()
+        rdd
+          .mapPartitions { iter =>
+            Iterator.single(VectorWriteDeltaExec.writePartition(tbl, proj, previous.value.orNull, iter))
+          }
+          .collect()
       messages ++= collected.filter(_ != null)
       batchWrite.commit(messages.toArray)
       logInfo(s"spark-vector: columnar v3 DV delete committed ${messages.size} task message(s)")
@@ -92,6 +98,7 @@ object VectorWriteDeltaExec {
   private def writePartition(
       table: AnyRef,
       projections: WriteDeltaProjections,
+      rewritableDeletes: AnyRef,
       rows: Iterator[InternalRow]
   ): WriterCommitMessage = {
     val tc = TaskContext.get()
@@ -119,7 +126,7 @@ object VectorWriteDeltaExec {
       metaSchema.get.fields(o).dataType.asInstanceOf[org.apache.spark.sql.types.StructType].size
     }
 
-    val writer = IcebergDvBridge.createTaskWriter(table, partitionId, taskId)
+    val writer = IcebergDvBridge.createTaskWriter(table, partitionId, taskId, rewritableDeletes)
     try {
       var currentFile: String = null
       var currentSpec: Int = 0

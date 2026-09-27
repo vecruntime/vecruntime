@@ -73,8 +73,10 @@ public final class DvDeltaTaskWriter implements AutoCloseable {
                 .format(org.apache.iceberg.FileFormat.PUFFIN)
                 .operationId(java.util.UUID.randomUUID().toString())
                 .build();
-        FileIO io = table.io();
-        DeleteLoader deleteLoader = new BaseDeleteLoader(deleteFile -> io.newInputFile(deleteFile.location()));
+        // Same loader as Iceberg's own PreviousDeleteLoader: previous delete files are opened through
+        // the table's encryption manager, so an encrypted table's DVs load too.
+        FileIO io = org.apache.iceberg.encryption.EncryptingFileIO.combine(table.io(), table.encryption());
+        DeleteLoader deleteLoader = new BaseDeleteLoader(deleteFile -> io.newInputFile(deleteFile));
         Function<CharSequence, PositionDeleteIndex> previousDeletes = path -> {
             if (rewritableDeletes == null) {
                 return null;
