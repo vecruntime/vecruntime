@@ -154,11 +154,35 @@ optional artifact.
 
 Not in option B: a columnar Parquet **data** writer, and v2 position-delete files (option A).
 
+## Cluster results, and the open question: why no gain
+
+CDC MERGE on `v3.dvmix_20_5` (x86 EKS, 10 % mixed batch, writer off/on interleaved x3, same rows in
+every run; PR #509's comments have the per-run tables):
+
+| Iceberg | writer off | writer on | write stage (off / on) |
+|---|---|---|---|
+| 1.11.0 | 157.5 s | 168.6 s | 17.6 / 17.7 s |
+| 1.11.0 + the #482 equality-delete set cache | 85.3 s | 82.9 s (−2.8 %, within noise) | 19.1 / 18.0 s |
+
+A delete-only batch (`CdcMergeRunner --delete-only`, stock 1.11.0): 146.6 s off vs 143.6 s on, within
+noise. The writer cuts the write stage's **CPU** by ~12 %, but not its **wall time**. That contradicts
+slice 1's estimate (the delete half is 56.9 % of the write work locally, ~27 % of MERGE JFR samples),
+so the reason is **not yet explained** and is the next piece of work on #20. Hypotheses to check,
+with JFR on the executors of an "on" and an "off" run of the patched-Iceberg image:
+
+- The write stage is bound by something both writers share: the shuffle read feeding the REBALANCE,
+  the insert half's Parquet writing (Iceberg's `DeltaWriter` in both), or the upload and commit of
+  the DV Puffin files to S3, so the delete half's CPU saving lands off the critical path.
+- The writer waits on the whole task's rows before writing a file's DV (the per-file bitmap is only
+  handed to `BaseDVFileWriter` when the file changes), so its saving overlaps with idle time.
+- Task skew: the stage's wall time is set by its slowest tasks, which may be insert-heavy.
+- The 27 % JFR share was measured with the per-task equality-delete set rebuild dominating GC; with
+  that gone (#482) the share should be re-measured before it is used as a ceiling.
+
 ## Configuration
 
-`spark.vecruntime.iceberg.dvWriter.enabled` (session `SQLConf`, boolean, default `false`). Off while the
-writer is landed in slices; flips to `true` once every Iceberg merge-on-read suite is byte-identical
-with it on and off. See `docs/configuration.md`.
+`spark.vecruntime.iceberg.dvWriter.enabled` (session `SQLConf`, boolean, default `false`). Off because
+it is correct but brings no measured wall-time gain yet (next section). See `docs/configuration.md`.
 
 ## Running the tests
 
