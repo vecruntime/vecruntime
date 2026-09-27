@@ -15,13 +15,15 @@
  */
 package io.vecruntime.spark.ui
 
-import java.net.{HttpURLConnection, URI}
+import java.net.{HttpURLConnection, URI, URLClassLoader}
+import java.nio.file.Files
 
 import scala.io.Source
 
 import io.vecruntime.spark.VectorPlugin
 import io.vecruntime.spark.test.{SparkVectorFunSuite, TestTables}
-import org.apache.spark.sql.vecruntime.ui.{Engine, PlanAcceleration}
+import org.apache.spark.SparkContext
+import org.apache.spark.sql.vecruntime.ui.{Engine, PlanAcceleration, VectorAccelerationTab}
 import org.apache.spark.sql.vecruntime.{PlanUtils, VectorFilterExec}
 import org.scalatest.concurrent.Eventually
 import org.scalatest.time.{Seconds, Span}
@@ -92,6 +94,25 @@ class VectorAccelerationUiSuite extends SparkVectorFunSuite with Eventually {
   test("static resources are served") {
     assert(get("/static/vector/vector-acceleration.css").contains("sv-engine-vector"))
     assert(get("/static/vector/vector-acceleration.js").contains("graphlibDot"))
+  }
+
+  test("static resources resolve through the plugin's class loader, not Spark's (--packages / --jars)") {
+    // --packages and --jars put the plugin in a child of Spark's loader, which Spark's own static
+    // handler never looked in (the CSS/JS were 404). A directory only a child loader can see:
+    val dir = Files.createTempDirectory("sv-ui-loader")
+    val res = "sv/only/in/child/static"
+    Files.createDirectories(dir.resolve(res))
+    Files.writeString(dir.resolve(s"$res/vector-acceleration.css"), ".only-in-child {}")
+    val child = new URLClassLoader(Array(dir.toUri.toURL), classOf[SparkContext].getClassLoader)
+    try {
+      assert(classOf[SparkContext].getClassLoader.getResource(res) == null)
+      val servlet = new VectorAccelerationTab.StaticServlet(res, child)
+      val ok = ServletProbe.get(servlet, "/vector-acceleration.css")
+      assert(ok.status == 200 && ok.contentType.startsWith("text/css") && ok.body == ".only-in-child {}")
+      assert(ServletProbe.get(servlet, "/vector-acceleration.js").status == 404) // listed, but absent there
+      assert(ServletProbe.get(servlet, "/../../x.css").status == 404) // never a path from the request
+      assert(ServletProbe.get(servlet, "/").status == 404)
+    } finally child.close()
   }
 
   test("a scan plus our operators is fully accelerated") {
