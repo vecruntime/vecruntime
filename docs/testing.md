@@ -106,8 +106,7 @@ Validation the project maintains directly (all on JDK 25):
 
 The TPC-DS (103 queries) and TPC-H (22 queries) benchmark runners are not only timing harnesses:
 every query compares **row counts and a result checksum** against Spark on the same data, so a run
-that is faster but wrong fails. This holds through the 1 TB TPC-DS campaign and the TPC-H runs
-documented in the [results notebook](results.html).
+that is faster but wrong fails. This holds through the 1 TB TPC-DS campaign and the TPC-H runs.
 
 The one recorded exception is **q65**: its `ORDER BY s_store_name, i_item_desc LIMIT 100` has ties at
 scale, so the 100 returned rows follow physical order and the checksum differs across *every* engine —

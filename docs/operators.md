@@ -41,8 +41,7 @@ rows below name the one frame shape that still falls back). An operator whose in
 or `unsupported output type <type> for <name>` (a projection or aggregate result), whatever else is
 true of it. The two exceptions are the operators that forward columns without reading them: a filter
 and a projection pass such a column through as Spark's own vector (borrowed, or viewed through a row-id
-mapping when a selection is applied), so only an expression that *reads* it is refused (#19). This is the single most common reason in real plans (see the decimal measurement in
-[docs/results.md](results.html)).
+mapping when a selection is applied), so only an expression that *reads* it is refused (#19). This is the single most common reason in real plans.
 
 `spark.vecruntime.enabled=false` turns the whole rule off. Every converted operator has its own key,
 listed below; all default to `true`.

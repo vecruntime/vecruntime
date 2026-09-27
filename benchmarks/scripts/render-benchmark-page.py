@@ -222,8 +222,7 @@ Every engine returned Spark's results (two footnoted exceptions).</div>
 <p><b>Methodology.</b> The three engines ran one after another in the same window on the same nodes, each alone on the cluster, over the same
 S3 data with the same Spark settings; only the execution engine and its own memory split differ (every engine has 50 GB per executor; where it
 puts them follows where it allocates). Each query ran once after the plan was compiled; the time is the wall-clock of the query's execution as the
-runner measures it. The result files, event logs and every study behind a number are in
-<a href="{{{{ '/results.html' | relative_url }}}}">Benchmark results</a>.</p>
+runner measures it.</p>
 <h3>Test environment</h3>
 {env}
 <h3>Versions</h3>
@@ -267,7 +266,7 @@ q4 {fmt_s(C["q4"]["medianMs"])} against {fmt_s(V["q4"]["medianMs"])}, q95 {fmt_s
 and off-heap execution (GC {gc["comet"]:.2f} h against Spark's {gc["spark"]:.2f} and vecruntime's {gc["vector"]:.2f}) pay on the queries that are read-bound.
 vecruntime's one heavy loss to Spark is q88 ({fmt_s(V["q88"]["medianMs"])} against {fmt_s(S["q88"]["medianMs"])}; Comet {fmt_s(C["q88"]["medianMs"])}): eight scans of <code>store_sales</code>
 through Spark's own Parquet reader, where the reader's per-file request latency is the cost and the operators have little to add; its other regressions are short queries (2-9 s)
-where the columnar boundary and shuffle set-up outweigh the operator gains. Each is analysed in <a href="{{{{ '/results.html' | relative_url }}}}">Benchmark results</a>.</p>
+where the columnar boundary and shuffle set-up outweigh the operator gains.</p>
 
 <h3>Notes</h3>
 <ul>{notes}</ul>
