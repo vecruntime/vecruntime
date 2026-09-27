@@ -31,6 +31,24 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 class SequenceKernelsTest {
 
     @Test
+    void constantIntFillMatchesTheScalarReference() {
+        try (Arena arena = Arena.ofConfined()) {
+            for (int n : TestData.LENGTHS) {
+                for (int value : new int[] {0, 1, 7, -3, Integer.MAX_VALUE, Integer.MIN_VALUE}) {
+                    MemorySegment got = ArrowLayout.allocateData(arena, VecType.INT32, Math.max(n, 1));
+                    MemorySegment want = ArrowLayout.allocateData(arena, VecType.INT32, Math.max(n, 1));
+                    SequenceKernels.fillInt(got, n, value);
+                    ScalarReference.fillInt(want, n, value);
+                    for (int i = 0; i < n; i++) {
+                        assertEquals(want.getAtIndex(VectorBuffers.LE_INT, i), got.getAtIndex(VectorBuffers.LE_INT, i),
+                            "lane " + i + " of " + n + " value " + value);
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
     void fillsFullLaneBlocksAndTails() {
         try (Arena arena = Arena.ofConfined()) {
             for (int n : new int[] {0, 1, 7, 8, 63, 64,

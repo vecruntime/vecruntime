@@ -188,7 +188,7 @@ Source: [`VectorRangeSuite.scala`](https://github.com/vecruntime/vecruntime/blob
 | Filter, projection, ungrouped and grouped aggregate, a filter dropping every row, `LIMIT` over one slice | — | ✓ | `VectorFilterExec` / `VectorProjectExec` / `VectorHashAggregateExec` directly on the leaf (195-209) |
 | `ORDER BY id` (sort elided by the planner), `GROUP BY id` (no exchange: the leaf is range-partitioned on `id`) | — | ✓ | `outputOrdering` / `outputPartitioning` are Spark's; `RangePartitioning(id, 4)`, `SinglePartition` for one slice (211-225) |
 | `monotonically_increasing_id()` over a range, with a filter, with empty partitions | — | ✓ | same partition prefixes and row numbers as over Spark's leaf (227-243) |
-| `spark_partition_id()` over a range | — | ✓ (leaf) | the expression is not compiled: the projection stays Spark's over a `ColumnarToRow` of our leaf; the values name the same partitions (227-243) |
+| `spark_partition_id()` over a range | — | ✓ | `SparkPartitionIdExpr`: the task's partition index, one broadcast fill per batch; the projection over it is ours and the values name the same partitions (227-243) |
 | Joins with a range on both sides: shuffled hash, sort-merge (`mode=merge`), broadcast, join + aggregate | inner, left outer | ✓ | `VectorShuffledHashJoinExec`, `VectorSortMergeJoinExec`, `VectorBroadcastHashJoinExec` (245-267) |
 | **`numSlices < 1`** | planner unit test | **falls back** | `range with 0 slices` -- Spark raises its own execution error (269-290) |
 | **Streaming range** | planner unit test | **falls back** | `streaming range` (269-290) |

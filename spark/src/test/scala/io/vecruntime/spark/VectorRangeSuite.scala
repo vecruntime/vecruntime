@@ -226,12 +226,14 @@ class VectorRangeSuite extends VectorQuerySuite {
 
   test("spark_partition_id() and monotonically_increasing_id() over a range see Spark's partitions") {
     withConf(SmallBatches) {
-      // spark_partition_id() is not compiled: the projection stays Spark's above a ColumnarToRow of our
-      // leaf; the values still name the same partitions as over Spark's RangeExec.
-      checkRange("SELECT spark_partition_id() AS p, id FROM range(0, 1000, 1, 7)")
+      // spark_partition_id() is compiled (SparkPartitionIdExpr): the projection over it is ours too,
+      // and the values name the same partitions as over Spark's RangeExec.
+      checkRange("SELECT spark_partition_id() AS p, id FROM range(0, 1000, 1, 7)", Project)
       checkRange(
-        "SELECT spark_partition_id() AS p, count(*) AS n, min(id) AS mn, max(id) AS mx FROM range(0, 1000, 3, 7) GROUP BY spark_partition_id()"
+        "SELECT spark_partition_id() AS p, count(*) AS n, min(id) AS mn, max(id) AS mx FROM range(0, 1000, 3, 7) GROUP BY spark_partition_id()",
+        Project
       )
+      checkRange("SELECT spark_partition_id() AS p, id FROM range(0, 10, 3, 32) WHERE id > 2", Filter, Project) // empty partitions
       checkRange("SELECT monotonically_increasing_id() AS m, id FROM range(0, 1000, 1, 7)", Project)
       checkRange(
         "SELECT monotonically_increasing_id() AS m, id FROM range(1000, 0, -1, 5) WHERE id % 2 = 0",

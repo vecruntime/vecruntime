@@ -25,6 +25,8 @@ version may change configuration keys or defaults, always noted here.
   over Spark's row leaf they stayed Spark's until the first exchange. `spark.vecruntime.exec.range.enabled`
   (default `true`). Spark's SQL golden suite gains 105 accelerated executions (4219 -> 4324 of 33856;
   26 cases above the previous floor, now recorded).
+- `spark_partition_id()` is compiled (`SparkPartitionIdExpr`, a constant INT32 column per task written by the
+  new `SequenceKernels.fillInt`), so a projection or filter over it stays columnar.
 - `VectorArrowColumnVector.reusable(...)`: an owned column that ignores the per-batch
   `closeIfFreeable()` Spark 4.1's `ColumnarToRowExec` calls (as Spark's own `WritableColumnVector`s do)
   and is freed by `close()`, for producers that refill one vector across batches.

@@ -163,6 +163,7 @@ import org.apache.spark.sql.catalyst.expressions.{
   Signum,
   Sin,
   Sinh,
+  SparkPartitionID,
   Sqrt,
   StartsWith,
   StringInstr,
@@ -709,6 +710,8 @@ object ExpressionCompiler {
 
     // Per-partition prefix plus a running row number; state lives in the node, per task.
     case _: MonotonicallyIncreasingID => Right(MonotonicIdExpr())
+    // The task's partition index, constant per task.
+    case _: SparkPartitionID => Right(SparkPartitionIdExpr())
 
     case e @ Abs(child, _) if isWideDecimal(child.dataType) =>
       operand(child, input).flatMap {

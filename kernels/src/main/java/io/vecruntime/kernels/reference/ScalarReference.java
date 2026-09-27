@@ -856,6 +856,17 @@ public final class ScalarReference {
         return start + (long) n * step;
     }
 
+    /**
+     * {@code out[i] = value} for {@code i} in {@code [0, n)}, one scalar store
+     * per lane. The oracle of
+     * {@link io.vecruntime.kernels.SequenceKernels#fillInt}.
+     */
+    public static void fillInt(MemorySegment out, int n, int value) {
+        for (int i = 0; i < n; i++) {
+            out.setAtIndex(VectorBuffers.LE_INT, i, value);
+        }
+    }
+
     // ---------------------------------------------------------------- gather
 
     /**

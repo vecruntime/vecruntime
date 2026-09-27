@@ -17,6 +17,7 @@ package io.vecruntime.kernels;
 
 import java.lang.foreign.MemorySegment;
 
+import jdk.incubator.vector.IntVector;
 import jdk.incubator.vector.LongVector;
 import jdk.incubator.vector.VectorSpecies;
 
@@ -33,6 +34,7 @@ import jdk.incubator.vector.VectorSpecies;
  */
 public final class SequenceKernels {
     static final VectorSpecies<Long> L = Species.L;
+    static final VectorSpecies<Integer> I = Species.I;
 
     /**
      * {@code 0, 1, ..., lanes - 1}: the lane offsets of a block, built once (no
@@ -48,6 +50,23 @@ public final class SequenceKernels {
             idx[k] = k;
         }
         return idx;
+    }
+
+    /**
+     * Fills lanes {@code [0, n)} of an INT32 column with {@code value}: one
+     * broadcast, one store per block, a scalar tail. The constant column of
+     * {@code spark_partition_id()}.
+     */
+    public static void fillInt(MemorySegment out, int n, int value) {
+        IntVector v = IntVector.broadcast(I, value);
+        int lanes = I.length();
+        int i = 0;
+        for (; i + lanes <= n; i += lanes) {
+            v.intoMemorySegment(out, (long) i << 2, java.nio.ByteOrder.LITTLE_ENDIAN);
+        }
+        for (; i < n; i++) {
+            out.setAtIndex(VectorBuffers.LE_INT, i, value);
+        }
     }
 
     /**
