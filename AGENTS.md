@@ -702,7 +702,7 @@ A change is not done until all of the following that apply have run green, local
 the exit codes are reported.
 
 1. The gate: `mvn -B -Pcomet,iceberg -pl kernels,spark,shuffle,benchmarks install`, exit 0. Last full
-   gate: kernels 204 tests, spark 426 (Comet and Iceberg profiles on), shuffle 54. If a change lowers
+   gate: kernels 204 tests, spark 431 (Comet and Iceberg profiles on), shuffle 54. If a change lowers
    a number, explain why in the commit.
 2. Kernel changes: the kernel suite at 128, 256 and 512 bits (`-Dvecruntime.vectorBits=...`).
 3. Planner or expression changes: the SQL golden suite with no arguments, every case passing and the
