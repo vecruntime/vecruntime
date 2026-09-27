@@ -58,8 +58,8 @@ Version 0.0.2, a preview release under the Apache License 2.0. The plugin runs t
 (103 queries) and TPC-H (22) with every operator accelerated and returns Spark's results. On the
 1 TB TPC-DS Parquet dataset on EKS, vecruntime finished the 103 queries in 2,557 s against
 Spark's 3,309 s (23% less runtime, faster on 82 of 103 queries), within 2% of Apache DataFusion
-Comet. The per-query tables, configurations, and every study behind the numbers are in the
-[results notebook](results.html).
+Comet. The per-query tables and configurations are on the
+[TPC-DS 1 TB page](benchmarks/tpcds-1tb.html).
 
 ## Benchmarks
 
@@ -69,7 +69,6 @@ Comet. The per-query tables, configurations, and every study behind the numbers 
   the same run on arm64 nodes (Neoverse V2, SVE2), set against the x86 run.
 - [Iceberg merge-on-read: vecruntime vs Apache Spark](benchmarks/iceberg-mor.html) -- the v2
   delete-file and v3 deletion-vector merge cost at TPC-H SF1, against OSS Spark.
-- [results.md](results.html) -- the lab notebook: every run, configuration and study behind the numbers.
 
 ## Reference
 
