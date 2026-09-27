@@ -52,13 +52,19 @@ const MD_PAGES = [
   ["comet.md", "/comet.html"],
   ["iceberg.md", "/iceberg.html"],
   ["flight-shuffle.md", "/flight-shuffle.html"],
-  ["results.md", "/results.html"],
 ];
 const BENCH_PAGES = [
   "tpcds-1tb.html",
   "tpcds-1tb-graviton.html",
   "iceberg-mor.html",
 ];
+
+// Docs kept in the repository but not published on the site. A link to one of them -- from a
+// Markdown page (`results.html`) or a generated benchmark page (Liquid `'/results.html'`) -- points
+// at the file on GitHub instead of a page that does not exist.
+const OFF_SITE = {
+  "results.html": `${REPO_URL}/blob/main/docs/results.md`,
+};
 
 // The set of internal doc targets, for link rewriting.
 const INTERNAL = new Set([
@@ -107,6 +113,7 @@ function rewriteLinks(html) {
   return html.replace(/href="([^":#?]+\.html)(#[^"]*)?"/g, (full, file, frag) => {
     const clean = file.replace(/^\.\//, "");
     if (INTERNAL.has(clean)) return `href="${BASE}/${clean}${frag || ""}"`;
+    if (OFF_SITE[clean]) return `href="${OFF_SITE[clean]}"`;
     return full;
   });
 }
@@ -189,7 +196,7 @@ for (const file of BENCH_PAGES) {
   const { title, description } = stripFrontMatter(src);
   let body = src.replace(/^---\n[\s\S]*?\n---\n/, "");
   // Rewrite the Liquid links Jekyll would resolve.
-  body = body.replace(/\{\{\s*'(\/[^']*)'\s*\|\s*relative_url\s*\}\}/g, (m, p) => BASE + p);
+  body = body.replace(/\{\{\s*'(\/[^']*)'\s*\|\s*relative_url\s*\}\}/g, (m, p) => OFF_SITE[p.slice(1)] || BASE + p);
   // Lift the leading Chart.js <script src> into <head>.
   const heads = [];
   body = body.replace(/^\s*(<script\s+src="[^"]+"><\/script>)\s*/g, (m, tag) => { heads.push(tag); return ""; });
