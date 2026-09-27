@@ -34,8 +34,8 @@ off individually (`io.vecruntime.benchmarks.TpchRunner.CometScanOnly` lists the 
 --conf spark.comet.exec.sort.enabled=false        # ... and so on for the other spark.comet.exec.<op>.enabled keys
 --conf spark.memory.offHeap.enabled=true
 --conf spark.memory.offHeap.size=2g
---conf spark.driver.extraJavaOptions="--add-modules=jdk.incubator.vector --enable-native-access=ALL-UNNAMED"
---conf spark.executor.extraJavaOptions="--add-modules=jdk.incubator.vector --enable-native-access=ALL-UNNAMED"
+--conf spark.driver.extraJavaOptions="--add-modules=jdk.incubator.vector --enable-native-access=ALL-UNNAMED --sun-misc-unsafe-memory-access=allow"
+--conf spark.executor.extraJavaOptions="--add-modules=jdk.incubator.vector --enable-native-access=ALL-UNNAMED --sun-misc-unsafe-memory-access=allow"
 --jars comet-spark-spark4.1_2.13-1.0.0.jar,vecruntime-spark_2.13-0.0.2.jar
 ```
 

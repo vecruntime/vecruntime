@@ -116,8 +116,14 @@ spark-submit \
   --repositories https://raw.githubusercontent.com/vecruntime/vecruntime/maven-repo/ \
   --packages io.github.vecruntime:vecruntime-spark_2.13:0.0.2 \
   --conf spark.plugins=io.vecruntime.spark.VectorPlugin \
+  --conf spark.driver.extraJavaOptions="--add-modules=jdk.incubator.vector --enable-native-access=ALL-UNNAMED --sun-misc-unsafe-memory-access=allow" \
+  --conf spark.executor.extraJavaOptions="--add-modules=jdk.incubator.vector --enable-native-access=ALL-UNNAMED --sun-misc-unsafe-memory-access=allow" \
   ...
 ```
+
+For the columnar shuffle add `io.github.vecruntime:vecruntime-shuffle_2.13:0.0.2` to `--packages`
+(comma-separated) and `--conf spark.shuffle.manager=org.apache.spark.sql.vecruntime.shuffle.VectorShuffleManager`;
+its Arrow Flight and gRPC dependencies come along.
 
 A release is cut
 by pushing a `v<version>` tag: the release workflow builds the jars on JDK 25, attaches them to the
@@ -129,8 +135,8 @@ GitHub release with their checksums, and publishes them to the `maven-repo` bran
 ```bash
 spark-submit \
   --conf spark.plugins=io.vecruntime.spark.VectorPlugin \
-  --conf spark.driver.extraJavaOptions="--add-modules=jdk.incubator.vector --enable-native-access=ALL-UNNAMED" \
-  --conf spark.executor.extraJavaOptions="--add-modules=jdk.incubator.vector --enable-native-access=ALL-UNNAMED" \
+  --conf spark.driver.extraJavaOptions="--add-modules=jdk.incubator.vector --enable-native-access=ALL-UNNAMED --sun-misc-unsafe-memory-access=allow" \
+  --conf spark.executor.extraJavaOptions="--add-modules=jdk.incubator.vector --enable-native-access=ALL-UNNAMED --sun-misc-unsafe-memory-access=allow" \
   --jars vecruntime-spark_2.13-0.0.2.jar \
   ...
 ```
@@ -287,8 +293,9 @@ Spark 4.1 officially supports JDK 17 and 21. Running it on 25 needs two things b
   ([HADOOP-19212](https://issues.apache.org/jira/browse/HADOOP-19212)). Replace
   `hadoop-client-api` and `hadoop-client-runtime` in `$SPARK_HOME/jars` with 3.4.3 (drop-in shaded
   jars; this project's tests do the same through Maven).
-- `--sun-misc-unsafe-memory-access=allow` silences the deprecation warnings from Spark's and Arrow's
-  use of `Unsafe`.
+- `--sun-misc-unsafe-memory-access=allow` on the driver and executors. It is required, not cosmetic:
+  without it Arrow's Netty allocator cannot address direct memory on JDK 25 and the first columnar
+  operator fails (`EmptyByteBuf.memoryAddress`).
 
 ## Requirements and known limitations
 
