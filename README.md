@@ -4,7 +4,7 @@
 
 vecruntime accelerates Spark SQL workloads by executing core operators directly on **Arrow-layout columnar batches** using the **Java Vector API**, bringing SIMD-optimized execution to the JVM without native libraries, JNI, or serialization boundaries.
 
-Inspired by the execution architecture of Apache DataFusion Comet, vecruntime provides a native-style execution path for **Filter, Project, HashAggregate, Sort, and hash joins**, while preserving Spark as the execution fallback for unsupported operators, expressions, and data types.
+Inspired by the execution architecture of Apache DataFusion Comet, vecruntime provides a native-style execution path for **Filter, Project, HashAggregate, Sort, Window (`ROWS` and `RANGE` frames), Range, Expand, Generate, Union and the hash, sort-merge and nested-loop joins**, while preserving Spark as the execution fallback for unsupported operators, expressions, and data types.
 
 The result is a **fully JVM-based execution engine** that combines the performance potential of vectorized execution with the portability and simplicity of the Java ecosystem.
 
