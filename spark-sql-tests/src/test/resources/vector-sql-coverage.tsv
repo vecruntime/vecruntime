@@ -295,11 +295,11 @@ postgreSQL/timestamp.sql	45	13	28
 postgreSQL/timestamp.sql_analyzer_test	15	0	0
 postgreSQL/union.sql	73	54	147
 postgreSQL/union.sql_analyzer_test	3	0	0
-postgreSQL/window_part1.sql	152	101	268
+postgreSQL/window_part1.sql	152	103	271
 postgreSQL/window_part1.sql_analyzer_test	23	0	0
 postgreSQL/window_part2.sql	113	33	57
 postgreSQL/window_part2.sql_analyzer_test	23	0	0
-postgreSQL/window_part3.sql	86	18	42
+postgreSQL/window_part3.sql	86	24	36
 postgreSQL/window_part3.sql_analyzer_test	32	0	0
 postgreSQL/window_part4.sql	119	33	63
 postgreSQL/window_part4.sql_analyzer_test	5	0	0
@@ -548,7 +548,7 @@ udf/udf-udaf.sql - Scala UDF	11	0	0
 udf/udf-udaf.sql - Scala UDF_analyzer_test	5	0	0
 udf/udf-union.sql - Scala UDF	26	0	0
 udf/udf-union.sql - Scala UDF_analyzer_test	10	0	0
-udf/udf-window.sql - Scala UDF	16	5	12
+udf/udf-window.sql - Scala UDF	16	10	22
 udf/udf-window.sql - Scala UDF_analyzer_test	1	0	0
 union-per-child-output-deduplication.sql	20	0	0
 union-per-child-output-deduplication.sql_analyzer_test	6	0	0
@@ -579,7 +579,7 @@ view-schema-type-evolution.sql_analyzer_test	48	0	0
 view-with-default-collation.sql	192	22	32
 view-with-default-collation.sql_analyzer_test	72	0	0
 window-with-aggregates.sql	9	9	28
-window.sql	346	108	204
+window.sql	346	138	234
 window.sql_analyzer_test	40	0	0
 xml-functions.sql	22	0	0
 xml-functions.sql_analyzer_test	3	0	0

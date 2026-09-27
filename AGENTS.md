@@ -398,9 +398,21 @@ Expressions compile to a small `VectorExpr` tree (`expr/VectorExpr.scala`; one f
 - The held path borrows output columns from held copies: a released batch stays until no later
   batch can address its partitions, then until the consumer has moved past its output, and only then
   is closed -- do not shortcut this, `lag` reads earlier batches after they were emitted.
-- Refused with a reason: `RANGE ... n PRECEDING` (value comparisons), `IGNORE NULLS`, decimal
-  aggregates in Complete mode (gate on #28), double keys, two frame kinds or an offset function
-  beside an aggregate in one operator.
+- RANGE frames with value offsets (`RANGE BETWEEN 5 PRECEDING AND CURRENT ROW`, `1 FOLLOWING AND 3
+  FOLLOWING`, one unbounded side): `VectorWindowPlanner.rangeSpec` resolves the single integral or
+  date order key to a `RangeSpec` (width, direction, null ordering, offsets with Spark's sign --
+  `n PRECEDING` is `-n`, negated again under DESC -- and ANSI checking for integral keys; `DateAdd`
+  wraps). `RangeFrames` gathers a partition into primitive scratch reused across partitions and
+  runs `WindowFrameKernels`: `rangeBounds` is Spark's two-pointer `SlidingWindowFunctionFrame` walk
+  (a null key's frame is the null peer group); `frameCount` and the unchecked long sum slide; the
+  double sum and the ANSI long sum re-add in row order (bit-identical to Spark); min/max re-scan with
+  `LongVector`. Results go straight into Arrow buffers, no per-row objects. Oracle:
+  `ScalarReference.rangeBounds` and friends; tests `WindowFrameKernelsTest`, benchmark
+  `WindowFrameBenchmark`. Peer-bounded RANGE frames without an offset also convert.
+- Refused with a reason: decimal and timestamp RANGE keys, constant order keys, min/max over
+  strings or booleans in a RANGE offset frame, `IGNORE NULLS`, decimal aggregates in Complete mode
+  (gate on #28), double keys, two frame kinds or an offset function beside an aggregate in one
+  operator.
 - `VectorWindowGroupLimitExec` replaces Spark's `WindowGroupLimitExec` (Partial and Final) keeping a
   row while its ranking value is at most k -- tighter than Spark's pre-filter, exact because the
   window above computes the real ranks. Spark plans no group limit past

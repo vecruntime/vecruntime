@@ -8,6 +8,15 @@ version may change configuration keys or defaults, always noted here.
 
 ### Added
 
+- `RANGE` window frames with value offsets (`sum(c) OVER (PARTITION BY a ORDER BY b RANGE BETWEEN 5
+  PRECEDING AND CURRENT ROW)`, `RANGE BETWEEN 1 FOLLOWING AND 3 FOLLOWING`, an unbounded side with an
+  offset on the other) for `sum`/`avg`/`count`/`min`/`max` over one integral or date order key, `ASC` or
+  `DESC`, either null ordering -- the last residual of #58. New `WindowFrameKernels` (two-pointer frame
+  bounds replaying Spark's `SlidingWindowFunctionFrame`, frame aggregates over primitive arrays) with
+  scalar twins in `ScalarReference`, a `WindowFrameBenchmark`, and the peer-bounded `RANGE` frames
+  without an offset (`CURRENT ROW AND UNBOUNDED FOLLOWING`, `CURRENT ROW AND CURRENT ROW`) on the row
+  path. Fallback reasons now name the key or input type (`RANGE offsets over a decimal(12,2) order key
+  not supported`) instead of `RANGE frames with value offsets`.
 - `VectorRangeExec`, a columnar replacement for Spark's `RangeExec` (`spark.range(...)`, the `range()`
   table-valued function): Spark's rows in Spark's partitions (the same split, the same clamping at the
   `Long` bounds, the same `outputOrdering` / `outputPartitioning`), written into native INT64 batches

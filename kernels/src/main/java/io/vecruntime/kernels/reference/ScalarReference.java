@@ -950,4 +950,245 @@ public final class ScalarReference {
         }
         outOffsets.set(VectorBuffers.LE_INT, (long) (to - from) << 2, pos);
     }
+
+    // ---------------------------------------------------------------- window frames
+
+    private static boolean frameValid(long[] validity, int i) {
+        return validity == null || ((validity[i >>> 6] >>> (i & 63)) & 1L) != 0L;
+    }
+
+    /**
+     * Spark's {@code Add} / {@code DateAdd} of a bound: wrapped at the key's
+     * width, or an overflow error when checked.
+     */
+    private static long frameBound(long key, long offset, int keyBits,
+            boolean checked) {
+        java.math.BigInteger exact = java.math.BigInteger.valueOf(key).add(java.math.BigInteger.valueOf(offset));
+        java.math.BigInteger wrapped = switch (keyBits) {
+            case 8 -> java.math.BigInteger.valueOf(exact.byteValue());
+            case 16 -> java.math.BigInteger.valueOf(exact.shortValue());
+            case 32 -> java.math.BigInteger.valueOf(exact.intValue());
+            default -> java.math.BigInteger.valueOf(exact.longValue());
+        };
+        if (checked && !wrapped.equals(exact)) {
+            throw new ArithmeticException("overflow");
+        }
+        return wrapped.longValue();
+    }
+
+    /**
+     * The {@code SortOrder} comparison of a nullable key against a nullable
+     * bound.
+     */
+    private static int frameCompare(boolean keyValid, long key, boolean boundValid,
+            long bound, boolean descending, boolean nullsFirst) {
+        if (!keyValid || !boundValid) {
+            if (keyValid == boundValid) {
+                return 0;
+            }
+            int nullFirst = nullsFirst ? -1 : 1;
+            return keyValid ? -nullFirst : nullFirst;
+        }
+        return descending ? Long.compare(bound, key) : Long.compare(key, bound);
+    }
+
+    /**
+     * Spark's sliding-frame buffer, row by row: drop the buffered rows below the
+     * lower bound, then take the following rows up to the upper bound, skipping
+     * those below the lower bound. {@code lo[i]} / {@code hi[i]} are the buffer's
+     * first row and the row after its last.
+     */
+    public static void rangeBounds(
+            long[] keys,
+            long[] validity,
+            int n,
+            boolean descending,
+            boolean nullsFirst,
+            boolean loUnbounded,
+            long loOffset,
+            boolean hiUnbounded,
+            long hiOffset,
+            int keyBits,
+            boolean checked,
+            int[] lo,
+            int[] hi) {
+        int lower = 0;
+        int upper = 0;
+        for (int i = 0; i < n; i++) {
+            boolean kv = frameValid(validity, i);
+            // Spark's projections evaluate a bound only when a comparison needs it (see the kernel).
+            while (lower < upper && !loUnbounded && frameCompare(frameValid(validity, lower), keys[lower], kv,
+                    kv ? frameBound(keys[i], loOffset, keyBits, checked) : 0L, descending, nullsFirst)
+                    < 0) {
+                lower++;
+            }
+            while (upper < n && (hiUnbounded || frameCompare(frameValid(validity, upper), keys[upper], kv,
+                    kv ? frameBound(keys[i], hiOffset, keyBits, checked) : 0L, descending, nullsFirst)
+                    <= 0)) {
+                if (!loUnbounded && frameCompare(frameValid(validity, upper), keys[upper], kv,
+                        kv ? frameBound(keys[i], loOffset, keyBits, checked) : 0L, descending, nullsFirst)
+                        < 0) {
+                    lower++;
+                }
+                upper++;
+            }
+            lo[i] = lower;
+            hi[i] = upper;
+        }
+    }
+
+    /** Spark's {@code AggregateProcessor} re-run over each frame: {@code count}. */
+    public static void frameCount(long[] validity, int[] lo, int[] hi,
+            int n, boolean countAll, long[] out) {
+        for (int i = 0; i < n; i++) {
+            long c = 0;
+            for (int j = lo[i];
+                 j < hi[i];
+                 j++) {
+                if (countAll || frameValid(validity, j)) {
+                    c++;
+                }
+            }
+            out[i] = c;
+        }
+    }
+
+    /**
+     * Spark's {@code Sum} re-run over each frame in row order; null when no row
+     * was valid.
+     */
+    public static void frameSumLong(
+            long[] values,
+            long[] validity,
+            int[] lo,
+            int[] hi,
+            int n,
+            boolean checked,
+            long[] out,
+            long[] outValidity) {
+        java.util.Arrays.fill(outValidity, 0, (n + 63) >>> 6, 0L);
+        for (int i = 0; i < n; i++) {
+            long s = 0;
+            boolean any = false;
+            for (int j = lo[i];
+                 j < hi[i];
+                 j++) {
+                if (frameValid(validity, j)) {
+                    s = checked ? Math.addExact(s, values[j]) : s + values[j];
+                    any = true;
+                }
+            }
+            out[i] = s;
+            if (any) {
+                outValidity[i >>> 6] |= 1L << (i & 63);
+            }
+        }
+    }
+
+    /**
+     * Spark's {@code Sum} / {@code Average} over doubles re-run over each frame
+     * in row order.
+     */
+    public static void frameSumDouble(
+            double[] values,
+            long[] validity,
+            int[] lo,
+            int[] hi,
+            int n,
+            boolean average,
+            double[] out,
+            long[] outValidity) {
+        java.util.Arrays.fill(outValidity, 0, (n + 63) >>> 6, 0L);
+        for (int i = 0; i < n; i++) {
+            double s = 0.0;
+            long c = 0;
+            for (int j = lo[i];
+                 j < hi[i];
+                 j++) {
+                if (frameValid(validity, j)) {
+                    s += values[j];
+                    c++;
+                }
+            }
+            out[i] = c == 0
+                    ? 0.0
+                    : average ? s / c : s;
+            if (c != 0) {
+                outValidity[i >>> 6] |= 1L << (i & 63);
+            }
+        }
+    }
+
+    /**
+     * Spark's {@code Min} / {@code Max} over an integral input re-run over each
+     * frame.
+     */
+    public static void frameMinMaxLong(
+            long[] values,
+            long[] validity,
+            int[] lo,
+            int[] hi,
+            int n,
+            boolean isMin,
+            long[] out,
+            long[] outValidity) {
+        java.util.Arrays.fill(outValidity, 0, (n + 63) >>> 6, 0L);
+        for (int i = 0; i < n; i++) {
+            long best = 0;
+            boolean any = false;
+            for (int j = lo[i];
+                 j < hi[i];
+                 j++) {
+                if (frameValid(validity, j)) {
+                    long v = values[j];
+                    if (!any
+                            || (isMin ? v < best : v > best)) {
+                        best = v;
+                    }
+                    any = true;
+                }
+            }
+            out[i] = best;
+            if (any) {
+                outValidity[i >>> 6] |= 1L << (i & 63);
+            }
+        }
+    }
+
+    /**
+     * Spark's {@code Min} / {@code Max} over doubles ({@code
+     * nanSafeCompareDoubles}, a tie keeps the earlier row).
+     */
+    public static void frameMinMaxDouble(
+            double[] values,
+            long[] validity,
+            int[] lo,
+            int[] hi,
+            int n,
+            boolean isMin,
+            double[] out,
+            long[] outValidity) {
+        java.util.Arrays.fill(outValidity, 0, (n + 63) >>> 6, 0L);
+        for (int i = 0; i < n; i++) {
+            double best = 0.0;
+            boolean any = false;
+            for (int j = lo[i];
+                 j < hi[i];
+                 j++) {
+                if (frameValid(validity, j)) {
+                    double v = values[j];
+                    int c = any ? CompareOp.nanSafeCompare(v, best) : 0;
+                    if (!any
+                            || (isMin ? c < 0 : c > 0)) {
+                        best = v;
+                    }
+                    any = true;
+                }
+            }
+            out[i] = best;
+            if (any) {
+                outValidity[i >>> 6] |= 1L << (i & 63);
+            }
+        }
+    }
 }
