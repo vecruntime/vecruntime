@@ -282,4 +282,106 @@ class VectorDvWriteSuite extends AnyFunSuite with BeforeAndAfterAll {
       "the table must be unchanged after an aborted delete"
     )
   }
+
+  // ---- UPDATE / MERGE: deletes columnar, the insert half through Iceberg's own writer ----
+
+  /** A v3 table in merge-on-read mode for DELETE, UPDATE and MERGE alike, optionally partitioned. */
+  private def createMor(name: String, partitioned: Boolean): Unit = {
+    spark.sql(s"DROP TABLE IF EXISTS $name")
+    val part = if (partitioned) "PARTITIONED BY (p)" else ""
+    spark.sql(
+      s"""CREATE TABLE $name (id BIGINT, p INT, v STRING) USING iceberg $part
+         |TBLPROPERTIES ('format-version'='3', 'write.delete.mode'='merge-on-read',
+         |  'write.update.mode'='merge-on-read', 'write.merge.mode'='merge-on-read',
+         |  'write.target-file-size-bytes'='4096')""".stripMargin
+    )
+    spark.sql(
+      s"""INSERT INTO $name
+         |SELECT id, cast(id % 4 as int) as p, if(id % 10 = 0, null, concat('v', id)) as v
+         |FROM range(2000)""".stripMargin
+    )
+  }
+
+  /** Runs `sql` (with `%s` for the table) on `<base>_off` with the writer off and `<base>_on` with it on. */
+  private def onOff(base: String, sql: String): Boolean = {
+    // Plain substitution, not String.format: the SQL itself uses `%` as the modulo operator.
+    withFlag(on = false)(spark.sql(sql.replace("%s", s"${base}_off")).collect())
+    withFlag(on = true) {
+      val df = spark.sql(sql.replace("%s", s"${base}_on"))
+      val had = planHasVectorWriteDelta(df)
+      df.collect()
+      had
+    }
+  }
+
+  /** Contents, live DV shape and the v3 row lineage of the surviving original rows all match Spark's. */
+  private def assertSame(base: String): Unit = {
+    val (on, off) = (s"${base}_on", s"${base}_off")
+    assert(rows(on).sameElements(rows(off)), s"$base: table contents differ between writer on and off")
+    assert(
+      count(s"SELECT count(*) - count(DISTINCT referenced_data_file) FROM $on.delete_files") == 0L,
+      s"$base: a data file has more than one live DV"
+    )
+    assert(
+      count(s"SELECT coalesce(sum(record_count), 0) FROM $on.delete_files") ==
+        count(s"SELECT coalesce(sum(record_count), 0) FROM $off.delete_files"),
+      s"$base: live DV cardinality differs from Spark's"
+    )
+    // A reinsert keeps the row's lineage: an updated original row keeps its _row_id, as with Spark's writer.
+    def lineage(t: String): Array[Row] =
+      spark.sql(s"SELECT id, _row_id FROM $t WHERE id < 2000 ORDER BY id").collect()
+    assert(lineage(on).sameElements(lineage(off)), s"$base: _row_id of the original rows differs")
+    val sOn = org.apache.iceberg.spark.Spark3Util.loadIcebergTable(spark, on).currentSnapshot().summary()
+    val sOff = org.apache.iceberg.spark.Spark3Util.loadIcebergTable(spark, off).currentSnapshot().summary()
+    for (k <- Seq("added-records", "added-position-deletes", "total-records", "total-position-deletes"))
+      assert(sOn.get(k) == sOff.get(k), s"$base: snapshot summary $k differs: on=${sOn.get(k)} off=${sOff.get(k)}")
+  }
+
+  for (partitioned <- Seq(false, true)) {
+    val kind = if (partitioned) "partitioned" else "unpartitioned"
+
+    test(s"UPDATE on $kind v3: our operator runs, deletes as DVs, reinserts via Iceberg, lineage kept") {
+      val base = s"ice.db.dv_upd_${if (partitioned) "p" else "u"}"
+      createMor(s"${base}_on", partitioned)
+      createMor(s"${base}_off", partitioned)
+      // Twice, so the second UPDATE also merges the DVs the first one committed.
+      assert(onOff(base, "UPDATE %s SET v = concat(coalesce(v, 'n'), '-u') WHERE id % 7 = 0"), "UPDATE not columnar")
+      assert(onOff(base, "UPDATE %s SET v = 'again' WHERE id % 5 = 0"), "second UPDATE not columnar")
+      assertSame(base)
+      assert(count(s"SELECT count(*) FROM ${base}_on WHERE v = 'again'") == 400L)
+    }
+
+    test(s"MERGE on $kind v3: update, delete and insert clauses, identical on/off") {
+      val base = s"ice.db.dv_mrg_${if (partitioned) "p" else "u"}"
+      createMor(s"${base}_on", partitioned)
+      createMor(s"${base}_off", partitioned)
+      spark
+        .sql("SELECT id, cast(id % 4 as int) AS p, concat('s', id) AS v, id % 3 AS op FROM range(1500, 2500)")
+        .createOrReplaceTempView("dv_src")
+      val merge =
+        """MERGE INTO %s t USING dv_src s ON t.id = s.id
+          |WHEN MATCHED AND s.op = 0 THEN DELETE
+          |WHEN MATCHED THEN UPDATE SET t.v = s.v
+          |WHEN NOT MATCHED THEN INSERT (id, p, v) VALUES (s.id, s.p, s.v)""".stripMargin
+      assert(onOff(base, merge), "MERGE not columnar")
+      assertSame(base)
+      // 500 matched: a third deleted, the rest updated; 500 inserted.
+      val deleted = (1500L until 2000L).count(_ % 3 == 0).toLong
+      assert(count(s"SELECT count(*) FROM ${base}_on") == 2000L - deleted + 500L, "live row count wrong")
+      assert(count(s"SELECT count(*) FROM ${base}_on WHERE id >= 2000") == 500L, "inserted rows missing")
+    }
+  }
+
+  test("MERGE with only a NOT MATCHED insert clause leaves no DVs and matches Spark's writer") {
+    val base = "ice.db.dv_mrg_ins"
+    createMor(s"${base}_on", partitioned = false)
+    createMor(s"${base}_off", partitioned = false)
+    spark.sql("SELECT id, 0 AS p, 'x' AS v FROM range(1990, 2010)").createOrReplaceTempView("dv_src_ins")
+    val merge =
+      """MERGE INTO %s t USING dv_src_ins s ON t.id = s.id
+        |WHEN NOT MATCHED THEN INSERT (id, p, v) VALUES (s.id, s.p, s.v)""".stripMargin
+    onOff(base, merge) // An insert-only MERGE may plan as an append; either way the result must match.
+    assert(rows(s"${base}_on").sameElements(rows(s"${base}_off")), "insert-only MERGE contents differ")
+    assert(count(s"SELECT count(*) FROM ${base}_on") == 2010L)
+  }
 }

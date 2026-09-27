@@ -30,8 +30,8 @@ import org.scalatest.Tag
  * `iceberg-bridge` module, which CI's gate (`-pl kernels,spark,shuffle,benchmarks`) does not build, so
  * it is run manually (see docs/iceberg-dv-writer.md). This suite runs INSIDE the gate's spark module,
  * where the bridge is by construction absent from the classpath, and asserts the other half of the
- * contract: whenever the strategy must decline -- the flag is off, the target is a v2 table, the write
- * has an insert half (UPDATE / MERGE, slice 5), or the bridge module is not present -- Spark's own
+ * contract: whenever the strategy must decline -- the flag is off, the target is a v2 table, or the
+ * bridge module is not present -- Spark's own
  * `WriteDeltaExec` plans instead and the DELETE / UPDATE / MERGE result is correct and unchanged.
  *
  * `VectorWriteDeltaExec` must therefore NEVER appear in a plan built in this module. The check is by
@@ -108,7 +108,7 @@ class DvWriteStrategyFallbackSuite extends VectorQuerySuite {
   }
 
   test(
-    "UPDATE and MERGE (insert half, slice 5) fall back to Spark's writer, result correct",
+    "UPDATE and MERGE fall back to Spark's writer without the bridge, result correct",
     DvWriteStrategyFallbackSuite.Tags: _*
   ) {
     createV3("ice.db.fb_update")
@@ -118,7 +118,7 @@ class DvWriteStrategyFallbackSuite extends VectorQuerySuite {
       df.collect()
       h
     }
-    assert(!updHad, "UPDATE has an insert half: VectorWriteDeltaExec must be absent (slice 5)")
+    assert(!updHad, "bridge absent: VectorWriteDeltaExec must be absent for UPDATE")
     assert(liveRows("ice.db.fb_update") == 2000L, "UPDATE keeps the row count")
     assert(
       spark.sql(
@@ -143,7 +143,7 @@ class DvWriteStrategyFallbackSuite extends VectorQuerySuite {
       df.collect()
       h
     }
-    assert(!mergeHad, "MERGE has an insert half: VectorWriteDeltaExec must be absent (slice 5)")
+    assert(!mergeHad, "bridge absent: VectorWriteDeltaExec must be absent for MERGE")
     // Sanity: no duplicated/lost rows -- 2000 original + 500 new (2000..2499) minus matched-and-deleted (id in [1500,2000), id%5==0).
     val deleted = (1500 until 2000).count(_ % 5 == 0)
     assert(liveRows("ice.db.fb_merge") == 2000L + 500L - deleted, "MERGE row count must match Spark's writer")

@@ -44,9 +44,38 @@ case class VectorWriteDeltaStrategy(session: SparkSession) extends SparkStrategy
           Nil
         case None =>
           val icebergTable = VectorWriteDeltaStrategy.icebergTableOf(wd.table)
-          Seq(VectorWriteDeltaExec(icebergTable.get, wd.write.get, wd.projections, planLater(wd.query)))
+          Seq(
+            VectorWriteDeltaExec(
+              icebergTable.get,
+              wd.write.get,
+              wd.projections,
+              planLater(wd.query),
+              refreshCache(wd.originalTable)
+            )
+          )
       }
     case _ => Nil
+  }
+
+  /**
+   * Recaches the target after the commit, as Spark's `DataSourceV2Strategy` does for its own
+   * `WriteDeltaExec`: by catalog name for a catalog table (without time travel), else by plan.
+   */
+  private def refreshCache(original: LogicalPlan): () => Unit = { () =>
+    import org.apache.spark.sql.connector.catalog.CatalogV2Implicits._
+    // The cache manager takes the classic (non-Connect) session, which is what a planner strategy
+    // injected into a running session always receives.
+    val classic = session.asInstanceOf[org.apache.spark.sql.classic.SparkSession]
+    val cacheManager = classic.sharedState.cacheManager
+    original match {
+      case r: org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation =>
+        (r.catalog, r.identifier) match {
+          case (Some(catalog), Some(ident)) =>
+            cacheManager.recacheTableOrView(classic, ident.toQualifiedNameParts(catalog), includeTimeTravel = false)
+          case _ => cacheManager.recacheByPlan(classic, r)
+        }
+      case other => cacheManager.recacheByPlan(classic, other)
+    }
   }
 
   /** Some(reason) to leave the write to Spark; None to take it columnar. */
@@ -54,9 +83,9 @@ case class VectorWriteDeltaStrategy(session: SparkSession) extends SparkStrategy
     if (!VectorConf.icebergDvWriterEnabled(conf)) return Some("spark.vecruntime.iceberg.dvWriter.enabled is off")
     if (!IcebergDvBridge.isAvailable) return Some("iceberg-bridge module is not on the classpath")
     if (wd.write.isEmpty) return Some("the DeltaWrite is not resolved")
-    // Delete-only: no data (insert) rows. UPDATE/MERGE with an insert half is slice 5.
-    if (wd.projections.rowProjection.isDefined)
-      return Some("write has an insert half (data rows); delete-only only for now")
+    // DELETE, UPDATE and MERGE: an insert half (row projection) is written by Iceberg's own writer.
+    if (wd.projections.metadataProjection.isEmpty)
+      return Some("write has no metadata projection (spec id / partition)")
     val table = VectorWriteDeltaStrategy.icebergTableOf(wd.table)
     if (table.isEmpty) return Some("target is not an Iceberg table")
     if (!IcebergDvBridge.isDvEligible(table.get))

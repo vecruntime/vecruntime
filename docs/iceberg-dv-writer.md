@@ -111,12 +111,11 @@ optional artifact.
    mutable `BitmapPositionDeleteIndex`) and drives Iceberg's public `BaseDVFileWriter`. Differential
    test: order-independent, cardinality == distinct positions, membership holds, empty set → empty
    index — passes.
-4. **`VectorWriteDeltaExec` + planner strategy** — *done (DELETE, delete-only).*
+4. **`VectorWriteDeltaExec` + planner strategy** — *done (DELETE; UPDATE/MERGE in 5).*
    `IcebergDvCommitBridge.isDvEligible(table)` (public-API format-version check, the stand-in for the
    private `Context.useDVs()`) decides v3 vs decline, tested (v3 eligible, v2/null decline). The live
    `SparkStrategy` (`injectPlannerStrategy`) matches the logical `WriteDelta` and, when eligible and
-   `spark.vecruntime.iceberg.dvWriter.enabled` and the write is **delete-only** (no row/insert
-   projection), on a v3 table (partitioned or not, with or without earlier deletes), plans a
+   `spark.vecruntime.iceberg.dvWriter.enabled`, on a v3 table (partitioned or not, with or without earlier deletes), plans a
    `VectorWriteDeltaExec` command; it runs an RDD job over the child's columnar
    batches, builds DVs per `_file` run via the bridge, assembles `DeltaTaskCommit` per task, and
    commits through `deltaWrite.toBatch().commit(...)` (Iceberg's own `RowDelta`). Executor-side
@@ -127,8 +126,8 @@ optional artifact.
    previously committed DV is merged into its new one and replaced in the commit: the driver reads
    the same `rewritableDeletes` map Iceberg's own writer broadcasts (`scan.rewritableDeletes(true)`),
    `BaseDVFileWriter.close` merges it and reports the old DV as rewritten, and Iceberg's commit
-   removes it, so a table keeps one DV per data file. Flag off, bridge absent, v2, or a write with an
-   insert half → `Nil`, so Spark's `DataSourceV2Strategy` plans the ordinary writer.
+   removes it, so a table keeps one DV per data file. Flag off, bridge absent, or v2 → `Nil`, so
+   Spark's `DataSourceV2Strategy` plans the ordinary writer.
    Correctness is covered by `VectorDvWriteSuite` (bridge module): on/off identical, operator planned
    on the supported path, v2 falls back, DVs readable via Spark metadata tables and the Iceberg API,
    snapshot summary counts match, nulls, empty delete set, a failing task aborts with no snapshot
@@ -137,14 +136,21 @@ optional artifact.
    data file and the same deleted-row count as Spark's. The decline/fallback paths are also
    covered inside the CI gate by `DvWriteStrategyFallbackSuite` (spark module), where the bridge is by
    construction absent.
-5. **Insert/update path via Iceberg's appender** — *deferred; UPDATE/MERGE fall back, delete-only
-   ships.* A correct MERGE/UPDATE v3 commit needs the insert half to go through Iceberg's own data
-   writer (`SparkFileWriterFactory`/`OutputFileFactory`) and be combined with the DV deletes into one
-   `RowDelta`; rather than ship a half-correct commit path, the strategy stays **delete-only**: any
-   `WriteDelta` carrying a row/insert projection (UPDATE, MERGE with inserts) declines with a printed
-   reason and Spark's own writer handles it, unchanged and correct. The delete half of those
-   statements is not accelerated yet either — only pure `DELETE` is. `DvWriteStrategyFallbackSuite`
-   asserts UPDATE and MERGE fall back and stay correct.
+5. **Insert half of UPDATE/MERGE via Iceberg's own writer** — *done.* The strategy no longer
+   declines a write with a row projection. Each task dispatches on the row's operation id, as Spark's
+   `DeltaWithMetadataWritingSparkTask` does: a `DELETE` goes to the columnar DV path; an `INSERT` or
+   `REINSERT` goes to **Iceberg's own** `DeltaWriter`, created on the driver from
+   `batchWrite.createBatchWriterFactory(...)` exactly as Spark's `WriteDeltaExec` creates it, so data
+   files, their partitioning and sizing, and v3 row lineage (a `REINSERT` passes the row's metadata,
+   which carries `_row_id`) are Iceberg's. Iceberg represents an `UPDATE` as `DELETE` + `REINSERT`
+   (`representUpdateAsDeleteAndInsert`), so an `UPDATE` operation id is rejected, as Iceberg's own
+   writer rejects it. Each task returns two `DeltaTaskCommit`s (our DVs, Iceberg's data files); the
+   commit folds all of them into one `RowDelta`. The MERGE summary Spark hands the commit and the
+   post-commit cache refresh are reproduced from Spark's `WriteDeltaExec`. `VectorDvWriteSuite`
+   covers two UPDATEs in a row and a MERGE with delete, update and insert clauses on unpartitioned
+   and partitioned tables (contents equal to Spark's writer, one live DV per data file, the same DV
+   cardinality, the same `_row_id` for the surviving original rows, and matching snapshot
+   `added-records` / `added-position-deletes` / `total-*`), plus an insert-only MERGE.
 
 Not in option B: a columnar Parquet **data** writer, and v2 position-delete files (option A).
 
