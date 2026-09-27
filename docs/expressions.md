@@ -37,7 +37,7 @@ Anything else -- `float`, `short`, `byte`, `binary`, `array`, `map`, `struct`,
 intervals -- has no lane: a column of such a type records `unsupported type <type> for <name>`, a
 result of such a type `unsupported output type <type> for <name>`, whatever the expression. A wide
 decimal *expression* (arithmetic, a cast) is still refused with its own reason until the rest of #258
-lands (see the TPC-H decimal measurement in [docs/results.md](results.html) and #26 / #27 / #28).
+lands (#26 / #27 / #28).
 
 **Literals** are compiled as operands of a supported type: `int`, `bigint`, `double`, `date`,
 `timestamp`, `decimal(p <= 18)`, `string`. A typed `NULL` literal (`CAST(NULL AS INT)`, the `NULL AS col`
