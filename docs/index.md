@@ -33,25 +33,59 @@ operators, expressions, and types transparently fall back to Spark, always with 
 
 ## Getting started
 
-Add the plugin jar to an existing Spark job -- no code changes:
+vecruntime needs **JDK 25** (the Java Vector API) and Spark 4.1. On JDK 25, Spark 4.1.3's bundled
+Hadoop 3.4.2 fails at start-up (`Subject.getSubject`,
+[HADOOP-19212](https://issues.apache.org/jira/browse/HADOOP-19212)): replace `hadoop-client-api` and
+`hadoop-client-runtime` in `$SPARK_HOME/jars` with their 3.4.3 versions (drop-in jars).
+
+Let Spark download the plugin: `--packages` takes the Maven coordinates and `--repositories` points at
+the Maven repository served from this project's `maven-repo` branch. No code changes:
 
 ```bash
 spark-submit \
+  --repositories https://raw.githubusercontent.com/vecruntime/vecruntime/maven-repo/ \
+  --packages io.github.vecruntime:vecruntime-spark_2.13:0.0.2 \
   --conf spark.plugins=io.vecruntime.spark.VectorPlugin \
-  --conf spark.driver.extraJavaOptions="--add-modules=jdk.incubator.vector --enable-native-access=ALL-UNNAMED" \
-  --conf spark.executor.extraJavaOptions="--add-modules=jdk.incubator.vector --enable-native-access=ALL-UNNAMED" \
-  --jars vecruntime-spark_2.13-0.0.2.jar \
+  --conf spark.driver.extraJavaOptions="--add-modules=jdk.incubator.vector --enable-native-access=ALL-UNNAMED --sun-misc-unsafe-memory-access=allow" \
+  --conf spark.executor.extraJavaOptions="--add-modules=jdk.incubator.vector --enable-native-access=ALL-UNNAMED --sun-misc-unsafe-memory-access=allow" \
   ...
 ```
 
+With the **columnar shuffle** (Arrow IPC map outputs, fetched over Arrow Flight) add its artifact and
+its shuffle manager. Spark's own shuffle keeps serving every exchange the plugin does not produce:
+
+```bash
+spark-submit \
+  --repositories https://raw.githubusercontent.com/vecruntime/vecruntime/maven-repo/ \
+  --packages io.github.vecruntime:vecruntime-spark_2.13:0.0.2,io.github.vecruntime:vecruntime-shuffle_2.13:0.0.2 \
+  --conf spark.plugins=io.vecruntime.spark.VectorPlugin \
+  --conf spark.shuffle.manager=org.apache.spark.sql.vecruntime.shuffle.VectorShuffleManager \
+  --conf spark.driver.extraJavaOptions="--add-modules=jdk.incubator.vector --enable-native-access=ALL-UNNAMED --sun-misc-unsafe-memory-access=allow" \
+  --conf spark.executor.extraJavaOptions="--add-modules=jdk.incubator.vector --enable-native-access=ALL-UNNAMED --sun-misc-unsafe-memory-access=allow" \
+  ...
+```
+
+The same flags work on `spark-shell`, `pyspark` and `spark-sql`.
+
+- `--sun-misc-unsafe-memory-access=allow` is required on JDK 25: without it Arrow's Netty allocator
+  cannot address direct memory and the first columnar operator fails. `--add-modules` enables the
+  Vector API; `--enable-native-access` is for the zstd and Netty native code.
+- The plugin's Spark, Arrow and Scala dependencies are `provided`, so `--packages` downloads the
+  plugin jar alone. The shuffle also pulls Arrow Flight, gRPC and protobuf-java (about 40 jars, none
+  of which Spark bundles apart from versions it already ships).
+- The Flight server has no TLS: where RPC encryption is on, add
+  `--conf spark.vecruntime.shuffle.backend=block` (Spark's block transfer over the same files). See
+  the [Configuration reference](configuration.html#columnar-shuffle-the-vecruntime-shuffle-jar).
+
+Without network access, download the jars from the
+[releases page](https://github.com/vecruntime/vecruntime/releases) (plugin jar, shuffle jar,
+`SHA256SUMS`) and pass them with `--jars vecruntime-spark_2.13-0.0.2.jar` (the shuffle's Flight and
+gRPC jars must then be on the classpath too; `--packages` resolves them for you).
+
 `spark.plugins` registers the session extension automatically; alternatively set
-`spark.sql.extensions=io.vecruntime.spark.VectorSparkSessionExtensions`. Every release, with the
-plugin jar, the columnar shuffle jar and a `SHA256SUMS` file, is on the
-[releases page](https://github.com/vecruntime/vecruntime/releases); the same artifacts are
-published to a Maven repository served from the repository's `maven-repo` branch. See the
-[README](https://github.com/vecruntime/vecruntime#getting-the-jars) for Maven coordinates and
-`--packages` usage, and the [Configuration reference](configuration.html) for every `spark.vecruntime.*`
-key.
+`spark.sql.extensions=io.vecruntime.spark.VectorSparkSessionExtensions`. See the
+[README](https://github.com/vecruntime/vecruntime#getting-the-jars) for the Maven coordinates, and
+the [Configuration reference](configuration.html) for every `spark.vecruntime.*` key.
 
 ## Status
 
