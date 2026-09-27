@@ -86,7 +86,7 @@ under test.
   GC-free structure when it is measured to be faster (JMH for a kernel, TPC-H/TPC-DS plus a JFR
   profile for an operator); if it is not faster, keep the simpler code. A JFR profile with GC pauses
   or allocation sites in our frames near the top is a finding to fix, not noise (for scale: the
-  target-scan stage of the v3 CDC MERGE spent ~38 % of its task time in GC before it was fixed, #20).
+  target-scan stage of the v3 CDC MERGE spends ~38 % of its task time in GC, an open finding, #20).
 - **JFR before any explanation.** A number worse than expected, or better in a way you cannot
   account for, is profiled with Java Flight Recorder before a word is written about its cause
   (section 9). Do not write a hypothesis into the docs or the code; record the run and read the
