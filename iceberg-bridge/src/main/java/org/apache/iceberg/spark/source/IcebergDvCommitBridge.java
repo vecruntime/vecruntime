@@ -1,5 +1,5 @@
 /*
- * Copyright 2025-2026 Angel Conde and the spark-vector contributors
+ * Copyright 2025-2026 Angel Conde and the vecruntime contributors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -114,15 +114,16 @@ public final class IcebergDvCommitBridge {
             // delete totals are either "0" or simply absent -- absent means "none ever committed",
             // NOT "unknown", so it must read as no deletes, or the strategy would wrongly decline
             // every clean table and the columnar DELETE would never run.
-            return positiveCount(summary.get("total-delete-files"))
-                    || positiveCount(summary.get("total-position-deletes"))
-                    || positiveCount(summary.get("total-equality-deletes"));
+            return positiveCount(summary.get("total-delete-files")) || positiveCount(summary.get("total-position-deletes")) || positiveCount(summary.get("total-equality-deletes"));
         } catch (RuntimeException e) {
             return true;
         }
     }
 
-    /** True when a snapshot-summary count string is present and parses to a value &gt; 0. */
+    /**
+     * True when a snapshot-summary count string is present and parses to a
+     * value &gt; 0.
+     */
     private static boolean positiveCount(String value) {
         if (value == null) {
             return false;

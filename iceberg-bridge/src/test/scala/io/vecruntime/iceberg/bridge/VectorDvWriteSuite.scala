@@ -1,5 +1,5 @@
 /*
- * Copyright 2025-2026 Angel Conde and the spark-vector contributors
+ * Copyright 2025-2026 Angel Conde and the vecruntime contributors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,7 +23,7 @@ import org.scalatest.funsuite.AnyFunSuite
 
 /**
  * Integration tests for the columnar v3 deletion-vector writer (#20, slice 4-live), DELETE on v3.
- * They load the plugin's operator, planner strategy and session extensions (spark-vector-spark is a
+ * They load the plugin's operator, planner strategy and session extensions (vecruntime-spark is a
  * test dependency of this module) and assert: the table is identical with the writer on and off, our
  * `VectorWriteDeltaExec` is in the plan when on, a v2 table falls back to Spark's writer, the DV files
  * are readable by Spark's metadata tables and the Iceberg Java API, and the snapshot summary counts
@@ -110,7 +110,10 @@ class VectorDvWriteSuite extends AnyFunSuite with BeforeAndAfterAll {
 
   test("bridge + eligibility preconditions hold on a v3 table") {
     createV3("ice.db.dv_pre")
-    assert(org.apache.spark.sql.vecruntime.IcebergDvBridge.isAvailable, "bridge must be on the classpath in this module")
+    assert(
+      org.apache.spark.sql.vecruntime.IcebergDvBridge.isAvailable,
+      "bridge must be on the classpath in this module"
+    )
     val tbl = org.apache.iceberg.spark.Spark3Util.loadIcebergTable(spark, "ice.db.dv_pre")
     assert(org.apache.spark.sql.vecruntime.IcebergDvBridge.isDvEligible(tbl), "v3 table must be DV-eligible")
     val df = withFlag(on = true)(spark.sql("DELETE FROM ice.db.dv_pre WHERE id % 3 = 0"))
@@ -155,9 +158,14 @@ class VectorDvWriteSuite extends AnyFunSuite with BeforeAndAfterAll {
   test("empty delete set on v3: no-op, identical on/off, our operator still planned") {
     createV3("ice.db.dv_empty_on")
     createV3("ice.db.dv_empty_off")
-    withFlag(on = false)(spark.sql("DELETE FROM ice.db.dv_empty_off WHERE id > 100000").collect())
+    // The condition must match no row yet survive planning. A range past the column's max
+    // (`id > 100000`), or a value outside a column's min/max (`v = 'nonexistent'` -- every v starts
+    // with 'v'), lets Iceberg prove the DELETE empty from file statistics and run it as a metadata
+    // delete, with no row-level writer -- ours or Spark's -- planned. `length(v) > 100` cannot be
+    // pushed to Iceberg's stats, so the row-level plan is kept and runs with zero rows to delete.
+    withFlag(on = false)(spark.sql("DELETE FROM ice.db.dv_empty_off WHERE length(v) > 100").collect())
     withFlag(on = true) {
-      val df = spark.sql("DELETE FROM ice.db.dv_empty_on WHERE id > 100000")
+      val df = spark.sql("DELETE FROM ice.db.dv_empty_on WHERE length(v) > 100")
       assert(planHasVectorWriteDelta(df), "operator should still be planned for an empty delete")
       df.collect()
     }
