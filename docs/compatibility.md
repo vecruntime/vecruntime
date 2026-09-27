@@ -156,8 +156,9 @@ Source: [`VectorPortedCometWindowSuite.scala`](https://github.com/vecruntime/vec
 | `row_number` `rank` `dense_rank` `percent_rank` `ntile` `cume_dist` | with `PARTITION BY` + `ORDER BY` | ✓ | ASC and DESC order keys with ties |
 | `lag` / `lead` | default offset, offset+default, beyond-partition default | ✓ | literal default and default null |
 | `first_value`, `last_value` over a `ROWS` frame, `nth_value` | offset functions | ✓ | |
-| **`RANGE` frame with a value offset** (`RANGE BETWEEN 5 PRECEDING AND CURRENT ROW`) | — | **falls back** | `RANGE frames with value offsets` |
-| **`RANGE` frame, lower bound `FOLLOWING`** | — | **falls back** | `RANGE frames with value offsets` |
+| `RANGE` frame with a value offset (`RANGE BETWEEN 5 PRECEDING AND CURRENT ROW`) | sum/count/avg/min/max | ✓ | ours since the frame kernels (`WindowFrameKernels.rangeBounds`); Comet falls back. [`VectorPortedCometWindowSuite.scala` lines 218-225](https://github.com/vecruntime/vecruntime/blob/main/spark/src/test/scala/io/vecruntime/spark/VectorPortedCometWindowSuite.scala#L218-L225); every bound shape, `ASC`/`DESC`, both null orderings, int/long/date keys, doubles bit-identical, a 20000-row partition: [`VectorWindowSuite.scala` lines 312-402](https://github.com/vecruntime/vecruntime/blob/main/spark/src/test/scala/io/vecruntime/spark/VectorWindowSuite.scala#L312-L402) |
+| `RANGE` frame, lower bound `FOLLOWING` (`RANGE BETWEEN 1 FOLLOWING AND 3 FOLLOWING`) | sum/count/avg/min/max | ✓ | same path; empty frames give a null sum / 0 count, as Spark's |
+| **`RANGE` offset over a decimal or timestamp (interval) order key**, **`min`/`max` over a string in a `RANGE` offset frame** | — | **falls back** | `RANGE offsets over a decimal(12,2) order key not supported`, `integral, date and double inputs are` |
 | **`IGNORE NULLS` on `lag`/`lead`** | — | **falls back** | `IGNORE NULLS not supported` |
 | **`stddev` over a sliding frame** | — | **falls back** | `over a sliding frame not supported` |
 | **Decimal `sum` over a sliding `ROWS` frame** (`1 PRECEDING AND CURRENT ROW`) | — | **falls back** | `over decimals in a sliding frame not supported` |

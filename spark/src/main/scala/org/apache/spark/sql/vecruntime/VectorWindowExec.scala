@@ -59,6 +59,7 @@ import org.apache.spark.sql.catalyst.expressions.{
   NTile,
   NthValue,
   PercentRank,
+  SpecialFrameBoundary,
   UnboundedFollowing => UnboundedFollowingBound
 }
 import org.apache.spark.sql.types.{
@@ -133,8 +134,20 @@ import scala.collection.mutable
  * unbounded-preceding frame is. When such an aggregate shares an operator with a running frame, an
  * offset or a ranking function, all of them take this path.
  *
- * `RANGE` frames with value offsets, `IGNORE NULLS`, decimal aggregates (#28) and the other aggregate
- * functions over sliding frames are refused with a reason naming the function and frame.
+ * `RANGE` frames with value offsets (layer 2d, `RANGE BETWEEN 5 PRECEDING AND CURRENT ROW`, `1 FOLLOWING
+ * AND 3 FOLLOWING`, an unbounded side with an offset on the other): the same five aggregates over one
+ * integral or date order key, computed per partition by `WindowFrameKernels` once the partition is held --
+ * the keys and the input gathered into primitive arrays reused across partitions, the frame of every row
+ * found by Spark's two-pointer walk (`rangeBounds`: the bound is the key plus the offset in the key's own
+ * arithmetic, compared in the `SortOrder`'s direction and null ordering, so a null key's frame is the null
+ * peer group), and the aggregate re-run in row order per frame as Spark's `SlidingWindowFunctionFrame`
+ * does (a frame whose lower bound has not moved continues the previous accumulation; counts and unchecked
+ * bigint sums slide). The peer-bounded `RANGE` frames without an offset (`CURRENT ROW AND UNBOUNDED
+ * FOLLOWING`, `CURRENT ROW AND CURRENT ROW`) take the row path over any key type.
+ *
+ * `IGNORE NULLS`, decimal aggregates (#28), the other aggregate functions over sliding frames, `RANGE`
+ * offsets over decimal, timestamp (interval) and string keys, and `min`/`max` over strings in such a frame
+ * are refused with a reason naming the function and frame.
  */
 case class VectorWindowExec(
     windowExpression: Seq[NamedExpression],
@@ -166,11 +179,12 @@ case class VectorWindowExec(
 
   private def aggregateMode: Boolean = VectorWindowPlanner.aggregateWindows(windowExpression).isDefined
   private def offsetMode: Boolean =
-    !aggregateMode && VectorWindowPlanner.offsetWindows(windowExpression, child.output).isRight
+    !aggregateMode && VectorWindowPlanner.offsetWindows(windowExpression, child.output, orderSpec).isRight
   @transient private lazy val offsets: Array[VectorWindowPlanner.OffsetFunction] =
     VectorWindowPlanner.offsetWindows(
       windowExpression,
-      child.output
+      child.output,
+      orderSpec
     ).getOrElse(throw new IllegalStateException("window expressions are not offset functions")).toArray
 
   @transient private lazy val kinds: Array[Int] = windowExpression.map(e =>
@@ -407,6 +421,7 @@ object VectorWindowPlanner {
    * A window function whose value is one row of the partition, read from the held rows: `kind` says
    * which row, `frame` (an aggregate frame kind) where the frame ends for the position-based ones,
    * `default` (Spark's internal representation) what a shifted row outside the partition yields.
+   * A sliding aggregate over a `RANGE` frame with value offsets carries its [[RangeSpec]] in `range`.
    */
   final case class OffsetFunction(
       kind: Int,
@@ -420,7 +435,27 @@ object VectorWindowPlanner {
       checked: Boolean = false,
       countAll: Boolean = false,
       context: org.apache.spark.QueryContext = null,
-      inputType: DataType = null
+      inputType: DataType = null,
+      range: RangeSpec = null
+  )
+
+  /**
+   * A `RANGE` frame with value offsets over the single order key, as Spark's `createBoundOrdering`
+   * evaluates it: the frame of a row with key `k` holds the rows whose key compares `>= k + lo` and
+   * `<= k + hi` in the `SortOrder`'s comparison (`descending`, `nullsFirst`), `CURRENT ROW` being offset
+   * 0 and the unbounded sides flagged. The offsets carry Spark's sign (`n PRECEDING` is `-n`, negated
+   * again under `DESC`); the bound is `Add` in the key's width (`keyBits`), wrapped, or the ANSI
+   * overflow error when `checked` -- `DateAdd` over a date key wraps and is never checked.
+   */
+  final case class RangeSpec(
+      loUnbounded: Boolean,
+      lo: Long,
+      hiUnbounded: Boolean,
+      hi: Long,
+      keyBits: Int,
+      descending: Boolean,
+      nullsFirst: Boolean,
+      checked: Boolean
   )
 
   /** Sliding-frame aggregates (`ROWS BETWEEN a AND b`, any bounds): re-aggregated per row over the frame's rows, in order, as Spark does. */
@@ -437,6 +472,9 @@ object VectorWindowPlanner {
   /** `frameHi` for the `RANGE ... CURRENT ROW` upper bound: the end of the current peer group. */
   val PeerEndHi = Int.MaxValue - 1
 
+  /** `frameLo` for the `RANGE CURRENT ROW ...` lower bound: the start of the current peer group. */
+  val PeerStartLo = Int.MinValue + 1
+
   private def frameBound(b: Expression, upper: Boolean): Option[Int] = b match {
     case UnboundedPreceding => Some(UnboundedLo)
     case UnboundedFollowingBound => Some(UnboundedHi)
@@ -444,11 +482,86 @@ object VectorWindowPlanner {
     case other => literalInt(other)
   }
 
-  /** A sum/count/avg/min/max over a `ROWS` frame with literal bounds (or a `RANGE` frame's unbounded/current-row bounds). */
+  /** Bits of the integral lane a `RANGE` order key of this type compares in, or None when value offsets over it are not computed. */
+  private def rangeKeyBits(dt: DataType): Option[Int] = dt match {
+    case ByteType => Some(8)
+    case ShortType => Some(16)
+    case IntegerType | DateType => Some(32)
+    case LongType => Some(64)
+    case _ => None
+  }
+
+  /**
+   * The [[RangeSpec]] of a `RANGE` frame with at least one value offset, or why it is not computed: the
+   * order key must be one integral or date column (Spark itself rejects several order keys here) and
+   * each offset a foldable value of the key's type -- an int for a date key, as `DateAdd` takes;
+   * interval offsets over date and timestamp keys and decimal keys are refused.
+   */
+  private def rangeSpec(
+      name: String,
+      frame: SpecifiedWindowFrame,
+      orderSpec: Seq[SortOrder]
+  ): Either[String, RangeSpec] = {
+    if (orderSpec.length != 1)
+      return Left(s"window aggregate $name over frame ${frame.sql}: RANGE offsets need exactly one order key")
+    val order = orderSpec.head
+    val keyType = order.child.dataType
+    if (order.child.foldable)
+      return Left(
+        s"window aggregate $name over frame ${frame.sql}: RANGE offsets over a constant order key not supported"
+      )
+    val bits = rangeKeyBits(keyType) match {
+      case Some(b) => b
+      case None => return Left(
+          s"window aggregate $name over frame ${frame.sql}: RANGE offsets over a ${keyType.simpleString} order key not supported (integral and date keys are)"
+        )
+    }
+    val descending = order.direction == org.apache.spark.sql.catalyst.expressions.Descending
+    // Spark's WindowFrameCoercion cast the offsets to the key's type; a date key keeps an int offset (DateAdd).
+    def offset(b: Expression): Either[String, Option[Long]] = b match {
+      case UnboundedPreceding | UnboundedFollowingBound => Right(None)
+      case CurrentRow => Right(Some(0L))
+      case other
+          if other.foldable && (other.dataType == keyType || (keyType == DateType && other.dataType == IntegerType)) =>
+        other.eval(EmptyRow) match {
+          case null => Left(s"window aggregate $name over frame ${frame.sql}: a null RANGE offset")
+          case v: java.lang.Number =>
+            val signed = if (descending) -v.longValue() else v.longValue() // Spark's UnaryMinus under DESC
+            Right(Some(signed))
+          case _ => Left(s"window aggregate $name over frame ${frame.sql}: RANGE offset ${other.sql} is not integral")
+        }
+      case other => Left(
+          s"window aggregate $name over frame ${frame.sql}: RANGE offset ${other.sql} of type ${other.dataType.simpleString} over a ${keyType.simpleString} key not supported"
+        )
+    }
+    for (lo <- offset(frame.lower); hi <- offset(frame.upper)) yield RangeSpec(
+      loUnbounded = lo.isEmpty,
+      lo = lo.getOrElse(0L),
+      hiUnbounded = hi.isEmpty,
+      hi = hi.getOrElse(0L),
+      keyBits = bits,
+      descending = descending,
+      nullsFirst = order.nullOrdering == org.apache.spark.sql.catalyst.expressions.NullsFirst,
+      // Add in the key's type raises under ANSI; DateAdd never does.
+      checked = keyType != DateType && org.apache.spark.sql.internal.SQLConf.get.ansiEnabled
+    )
+  }
+
+  /** Whether a lane the RANGE kernels read: an integral (int32/int64) or double lane, not a string, boolean or decimal. */
+  private def rangeLane(dt: DataType): Boolean = dt match {
+    case ByteType | ShortType | IntegerType | DateType | LongType | TimestampType | DoubleType => true
+    case _ => false
+  }
+
+  /**
+   * A sum/count/avg/min/max over a `ROWS` frame with literal bounds, a `RANGE` frame whose bounds are
+   * both special (unbounded / the peer group), or a `RANGE` frame with value offsets (a [[RangeSpec]]).
+   */
   private def slidingAggregate(
       a: AggregateExpression,
       frame: Expression,
-      output: Seq[Attribute]
+      output: Seq[Attribute],
+      orderSpec: Seq[SortOrder]
   ): Either[String, OffsetFunction] = {
     val name = a.aggregateFunction.prettyName
     if (a.filter.nonEmpty) return Left(s"window aggregate $name with FILTER not supported")
@@ -459,20 +572,33 @@ object VectorWindowPlanner {
       return Left(
         s"window aggregate $name over decimals in a sliding frame not supported (the sliding kernels are long and double)"
       )
-    val bounds: Either[String, (Int, Int)] = frame match {
+    val bounds: Either[String, (Int, Int, RangeSpec)] = frame match {
       case SpecifiedWindowFrame(RowFrame, lower, upper) =>
         (frameBound(lower, upper = false), frameBound(upper, upper = true)) match {
-          case (Some(lo), Some(hi)) => Right((lo, hi))
+          case (Some(lo), Some(hi)) => Right((lo, hi, null))
           case _ => Left(s"window aggregate $name over frame ${frame.sql}: bounds must be literals")
         }
-      case SpecifiedWindowFrame(RangeFrame, UnboundedPreceding, CurrentRow) => Right((UnboundedLo, PeerEndHi))
-      case SpecifiedWindowFrame(RangeFrame, UnboundedPreceding, UnboundedFollowingBound) =>
-        Right((UnboundedLo, UnboundedHi))
-      case SpecifiedWindowFrame(RangeFrame, _, _) =>
-        Left(s"window aggregate $name over frame ${frame.sql} not supported (RANGE frames with value offsets)")
+      // No value offset: the bounds are the partition's ends or the current peer group's, for any key type.
+      case SpecifiedWindowFrame(RangeFrame, lower: SpecialFrameBoundary, upper: SpecialFrameBoundary) =>
+        ((lower, upper) match {
+          case (UnboundedPreceding, UnboundedFollowingBound) => Some((UnboundedLo, UnboundedHi))
+          case (UnboundedPreceding, CurrentRow) => Some((UnboundedLo, PeerEndHi))
+          case (CurrentRow, UnboundedFollowingBound) => Some((PeerStartLo, UnboundedHi))
+          case (CurrentRow, CurrentRow) => Some((PeerStartLo, PeerEndHi))
+          case _ => None // an analysis error in Spark
+        }).map { case (lo, hi) => (lo, hi, null) }
+          .toRight(s"window aggregate $name over frame ${frame.sql} not supported")
+      case f @ SpecifiedWindowFrame(RangeFrame, _, _) => rangeSpec(name, f, orderSpec).map(spec => (0, 0, spec))
       case other => Left(s"window aggregate $name over frame ${other.sql} not supported")
     }
-    bounds.flatMap { case (lo, hi) =>
+    bounds.flatMap { case (lo, hi, range) =>
+      // The RANGE kernels read integral and double lanes; min/max over another lane stay on Spark.
+      def laneChecked(child: Expression, fn: OffsetFunction): Either[String, OffsetFunction] =
+        if (range != null && !rangeLane(child.dataType))
+          Left(
+            s"window aggregate $name over ${child.dataType.simpleString} in frame ${frame.sql} not supported (integral, date and double inputs are)"
+          )
+        else Right(fn)
       a.aggregateFunction match {
         case sum: Sum if sum.evalContext.evalMode == EvalMode.TRY =>
           Left(s"window aggregate try_sum over a sliding frame not supported")
@@ -489,26 +615,66 @@ object VectorWindowPlanner {
               hi,
               checked = sum.evalContext.evalMode == EvalMode.ANSI,
               context = sum.origin.context,
-              inputType = sum.child.dataType
+              inputType = sum.child.dataType,
+              range = range
             )
           )
         case c: Count => c.children match {
             case Seq(l: Literal) if l.value != null =>
-              Right(OffsetFunction(SlidingCount, -1, LongType, 0, null, WholePartition, lo, hi, countAll = true))
+              Right(OffsetFunction(
+                SlidingCount,
+                -1,
+                LongType,
+                0,
+                null,
+                WholePartition,
+                lo,
+                hi,
+                countAll = true,
+                range = range
+              ))
             case Seq(child) => inputOrdinal(child, output).map(ord =>
-                OffsetFunction(SlidingCount, ord, LongType, 0, null, WholePartition, lo, hi, inputType = child.dataType)
+                OffsetFunction(
+                  SlidingCount,
+                  ord,
+                  LongType,
+                  0,
+                  null,
+                  WholePartition,
+                  lo,
+                  hi,
+                  inputType = child.dataType,
+                  range = range
+                )
               )
             case _ => Left("window count over several columns in a sliding frame not supported")
           }
         case av: Average if av.dataType == DoubleType =>
           inputOrdinal(av.child, output).map(ord =>
-            OffsetFunction(SlidingAvg, ord, DoubleType, 0, null, WholePartition, lo, hi, inputType = av.child.dataType)
+            OffsetFunction(
+              SlidingAvg,
+              ord,
+              DoubleType,
+              0,
+              null,
+              WholePartition,
+              lo,
+              hi,
+              inputType = av.child.dataType,
+              range = range
+            )
           )
-        case m: Min => inputOrdinal(m.child, output).map(ord =>
-            OffsetFunction(SlidingMin, ord, m.dataType, 0, null, WholePartition, lo, hi)
+        case m: Min => inputOrdinal(m.child, output).flatMap(ord =>
+            laneChecked(
+              m.child,
+              OffsetFunction(SlidingMin, ord, m.dataType, 0, null, WholePartition, lo, hi, range = range)
+            )
           )
-        case m: Max => inputOrdinal(m.child, output).map(ord =>
-            OffsetFunction(SlidingMax, ord, m.dataType, 0, null, WholePartition, lo, hi)
+        case m: Max => inputOrdinal(m.child, output).flatMap(ord =>
+            laneChecked(
+              m.child,
+              OffsetFunction(SlidingMax, ord, m.dataType, 0, null, WholePartition, lo, hi, range = range)
+            )
           )
         case other => Left(
             s"window aggregate ${other.prettyName} over a sliding frame not supported (sum, avg, count, min and max are)"
@@ -544,7 +710,11 @@ object VectorWindowPlanner {
   }
 
   /** `e` as an offset-family function, or why it is not one. */
-  private def offsetWindow(e: NamedExpression, output: Seq[Attribute]): Either[String, OffsetFunction] = e match {
+  private def offsetWindow(
+      e: NamedExpression,
+      output: Seq[Attribute],
+      orderSpec: Seq[SortOrder]
+  ): Either[String, OffsetFunction] = e match {
     case Alias(WindowExpression(f: FrameLessOffsetWindowFunction, _), _) =>
       if (f.ignoreNulls) Left(s"${f.prettyName} IGNORE NULLS not supported")
       else literalInt(f.offset) match {
@@ -580,7 +750,7 @@ object VectorWindowPlanner {
           )
       }
     case Alias(WindowExpression(a: AggregateExpression, WindowSpecDefinition(_, _, frame)), _) =>
-      slidingAggregate(a, frame, output)
+      slidingAggregate(a, frame, output, orderSpec)
     case Alias(WindowExpression(_: RowNumber, _), _) =>
       Right(OffsetFunction(RowNumberAt, -1, IntegerType, 0, null, WholePartition))
     case Alias(WindowExpression(_: Rank, _), _) =>
@@ -601,8 +771,12 @@ object VectorWindowPlanner {
   }
 
   /** All of the operator's expressions as offset-family functions, or the first reason one is not. */
-  def offsetWindows(es: Seq[NamedExpression], output: Seq[Attribute]): Either[String, Seq[OffsetFunction]] = {
-    val all = es.map(offsetWindow(_, output))
+  def offsetWindows(
+      es: Seq[NamedExpression],
+      output: Seq[Attribute],
+      orderSpec: Seq[SortOrder]
+  ): Either[String, Seq[OffsetFunction]] = {
+    val all = es.map(offsetWindow(_, output, orderSpec))
     all.collectFirst { case Left(r) => r }.toLeft(all.collect { case Right(f) => f })
   }
 
@@ -704,7 +878,7 @@ object VectorWindowPlanner {
   def runsPartial(a: AggregateExpression): Boolean = prefixFinalizer(a).isDefined
 
   /** Why a window aggregate is not computed: the frame, the function itself, or its scalar wrapper. */
-  private def aggregateReason(e: NamedExpression, input: Seq[Attribute]): Option[String] = {
+  private def aggregateReason(e: NamedExpression, input: Seq[Attribute], orderSpec: Seq[SortOrder]): Option[String] = {
     // The aggregate and frame, from a bare `Alias(WindowExpression(...), _)` or one wrapped in scalar
     // expressions over the result (the decimal-avg `Cast(Divide(...))` rewrite). first_value /
     // last_value are the offset family's, not this path's.
@@ -735,10 +909,10 @@ object VectorWindowPlanner {
         case None => frame match {
             case SpecifiedWindowFrame(RowFrame, lower, upper)
                 if frameBound(lower, upper = false).isDefined && frameBound(upper, upper = true).isDefined =>
-              slidingAggregate(a, frame, input).left.toOption
-            case _ => Some(
-                s"window aggregate ${a.aggregateFunction.prettyName} over frame ${frame.sql} not supported (RANGE frames with value offsets)"
-              )
+              slidingAggregate(a, frame, input, orderSpec).left.toOption
+            // A RANGE frame with value offsets or peer bounds: the sliding path's own reason.
+            case SpecifiedWindowFrame(RangeFrame, _, _) => slidingAggregate(a, frame, input, orderSpec).left.toOption
+            case _ => Some(s"window aggregate ${a.aggregateFunction.prettyName} over frame ${frame.sql} not supported")
           }
       }
       // A scalar wrapper (the decimal-avg cast/divide) must itself compile over the aggregate's result.
@@ -761,7 +935,7 @@ object VectorWindowPlanner {
     }
     aggregateWindows(w.windowExpression) match {
       case Some((aggs, _)) =>
-        val reasons = w.windowExpression.flatMap(aggregateReason(_, w.child.output))
+        val reasons = w.windowExpression.flatMap(aggregateReason(_, w.child.output, w.orderSpec))
         val attrs = aggs.map(_.resultAttribute)
         // The result columns are the window aliases' values (the aggregate result, wrapped in any
         // scalar expressions over it -- Spark's decimal-avg cast/divide). Compile the wrappers, not
@@ -781,7 +955,7 @@ object VectorWindowPlanner {
         val kinds = w.windowExpression.map(rankKind)
         kinds.collectFirst { case Left(reason) => reason } match {
           case Some(reason) =>
-            offsetWindows(w.windowExpression, w.child.output) match {
+            offsetWindows(w.windowExpression, w.child.output, w.orderSpec) match {
               case Right(_) => keyFailures.headOption.toLeft(VectorWindowExec(
                   w.windowExpression,
                   w.partitionSpec,
@@ -805,7 +979,7 @@ object VectorWindowPlanner {
                     })
                   case _ => false
                 }
-                Left(w.windowExpression.flatMap(aggregateReason(_, w.child.output)).headOption.getOrElse(
+                Left(w.windowExpression.flatMap(aggregateReason(_, w.child.output, w.orderSpec)).headOption.getOrElse(
                   if (mixed) "window aggregates over different frames in one operator not supported"
                   else if (offsetLike && !offsetReason.contains("is not an offset function")) offsetReason
                   else if (offsetLike) "offset functions beside other window functions in one operator not supported"
@@ -827,6 +1001,9 @@ private[vecruntime] final class KeyTracker(keys: Array[VectorExpr]) {
   var hasPrevious = false
 
   def startBatch(ctx: io.vecruntime.spark.expr.EvalContext): Unit = lanes = keys.map(_.eval(ctx))
+
+  /** Key `k`'s lane over the current batch. */
+  def lane(k: Int): VectorBuffers = lanes(k)
 
   /** True when row `i` differs from the remembered row (or none is remembered). */
   def changed(i: Int): Boolean = {
@@ -1334,31 +1511,51 @@ private[vecruntime] class VectorWindowOffsetIterator(
     metrics: VectorMetrics
 ) extends Iterator[ColumnarBatch] with AutoCloseable {
 
-  /** A held batch: owned copies of the live rows, each row's partition ordinal, position in it, and peer ordinal. */
+  /**
+   * A held batch: owned copies of the live rows, each row's partition ordinal, position in it, and peer
+   * ordinal; under a `RANGE` frame with value offsets also each row's order key as a long (`keys`, null
+   * rows flagged in the `keyValidity` bitmap words, null when every key is valid).
+   */
   private final class Held(
       val columns: Array[ColumnVector],
       val numRows: Int,
       val firstGlobal: Long,
       val partOf: Array[Int],
       val posOf: Array[Int],
-      val peerOf: Array[Int]
+      val peerOf: Array[Int],
+      val keys: Array[Long],
+      val keyValidity: Array[Long]
   ) {
 
     /** The consumer has moved past this batch's output (whose columns are borrowed from here). */
     var consumed = false
+    private val adapted = new Array[VectorBuffers](columns.length)
+
+    /** Column `c` as a lane (zero-copy over the held Arrow vector). */
+    def buffers(c: Int): VectorBuffers = {
+      if (adapted(c) == null)
+        adapted(c) = io.vecruntime.spark.adapter.ColumnVectorAdapters.adapt(columns(c), numRows, scratchArena)
+      adapted(c)
+    }
     def close(): Unit = columns.foreach(_.close())
   }
 
   private val allocator: BufferAllocator = VectorAllocators.newChild("VectorWindowExec")
+  // Only the adapter's fallback copy would use it, and the held columns are our own Arrow vectors.
+  private val scratchArena = java.lang.foreign.Arena.ofConfined()
   private val partition = new KeyTracker(partitionKeys)
   private val order = new KeyTracker(orderKeys)
+  // A `RANGE` frame with value offsets: the single order key is captured per row for the frame kernels.
+  private val rangeMode = functions.exists(_.range != null)
   private var numPartitions = 0
   private var numPeers = 0
   private var posInPartition = 0
   private var globalRows = 0L
   // Filled when a partition / peer group ends: its length / its last position. Filled when they open:
-  // the peer group's first position and the partition's first peer ordinal (for dense_rank).
+  // the peer group's first position and the partition's first peer ordinal (for dense_rank), and the
+  // global index of the partition's first row.
   private val partitionLength = mutable.ArrayBuffer.empty[Int]
+  private val partitionFirstGlobal = mutable.ArrayBuffer.empty[Long]
   private val peerEnd = mutable.ArrayBuffer.empty[Int]
   private val peerStart = mutable.ArrayBuffer.empty[Int]
   private val partitionFirstPeer = mutable.ArrayBuffer.empty[Int]
@@ -1394,6 +1591,11 @@ private[vecruntime] class VectorWindowOffsetIterator(
       val partOf = new Array[Int](outRows)
       val posOf = new Array[Int](outRows)
       val peerOf = new Array[Int](outRows)
+      val keys = if (rangeMode) new Array[Long](outRows) else null
+      val keyValidity = if (rangeMode) new Array[Long]((outRows + 63) >>> 6) else null
+      val keyLane = if (rangeMode) order.lane(0) else null
+      val keyIsInt = rangeMode && keyLane.`type`() == io.vecruntime.kernels.VecType.INT32
+      var anyNullKey = false
       var out = 0
       var i = 0
       while (i < n) {
@@ -1403,6 +1605,7 @@ private[vecruntime] class VectorWindowOffsetIterator(
             endPeer(); endPartition()
             numPartitions += 1; numPeers += 1; posInPartition = 0
             partitionFirstPeer += numPeers - 1
+            partitionFirstGlobal += globalRows + out
             peerStart += 0
           } else if (order.changed(i)) {
             endPeer(); numPeers += 1
@@ -1413,6 +1616,12 @@ private[vecruntime] class VectorWindowOffsetIterator(
           partOf(out) = numPartitions - 1
           posOf(out) = posInPartition
           peerOf(out) = numPeers - 1
+          if (rangeMode) {
+            if (Rows.valid(keyLane, i)) {
+              keys(out) = if (keyIsInt) keyLane.getInt(i).toLong else keyLane.getLong(i)
+              keyValidity(out >>> 6) |= 1L << (out & 63)
+            } else anyNullKey = true
+          }
           posInPartition += 1
           out += 1
         }
@@ -1426,7 +1635,16 @@ private[vecruntime] class VectorWindowOffsetIterator(
         else ArrowOutput.compact(name, dt, ctx.input(c), live, outRows, allocator)
         c += 1
       }
-      held.enqueue(new Held(columns, outRows, globalRows, partOf, posOf, peerOf))
+      held.enqueue(new Held(
+        columns,
+        outRows,
+        globalRows,
+        partOf,
+        posOf,
+        peerOf,
+        keys,
+        if (anyNullKey) keyValidity else null
+      ))
       globalRows += outRows
     }
   }
@@ -1573,13 +1791,225 @@ private[vecruntime] class VectorWindowOffsetIterator(
       while (runningEnd(f) < hi) { runningEnd(f) += 1; st.add(inputAt(fn, h, r, pos, runningEnd(f))) }
       st.result
     } else {
-      val lo = math.max(0, pos + fn.frameLo)
+      val lo = fn.frameLo match {
+        case VectorWindowPlanner.PeerStartLo => peerStart(h.peerOf(r))
+        case d => math.max(0, pos + d)
+      }
       val st = newState(fn)
       var t = lo
       while (t <= hi) { st.add(inputAt(fn, h, r, pos, t)); t += 1 }
       st.result
     }
   }
+
+  /**
+   * A `RANGE` frame with value offsets (the kernels of `WindowFrameKernels`): the partition's order keys
+   * and the function's input are gathered from the held batches into primitive arrays reused across
+   * partitions, the two-pointer walk yields every row's frame, and the aggregate is computed for the
+   * whole partition at once; the results are cached until the partition's last batch has been written.
+   * No per-row objects: the output column is written straight into its Arrow buffers.
+   */
+  private final class RangeFrames(fn: VectorWindowPlanner.OffsetFunction) {
+    private val spec = fn.range
+    private val inputLane: io.vecruntime.kernels.VecType =
+      if (fn.inputOrdinal < 0) null
+      else TypeMapping.vecTypeOf(if (fn.inputType != null) fn.inputType else fn.dataType)
+    // The aggregate's lane: doubles for a double sum / min / max and every average, longs otherwise.
+    private val doubles = fn.kind == VectorWindowPlanner.SlidingAvg ||
+      (fn.kind != VectorWindowPlanner.SlidingCount && inputLane == io.vecruntime.kernels.VecType.FLOAT64)
+    private var capacity = 0
+    private var keys: Array[Long] = _
+    private var keyValidity: Array[Long] = _
+    private var lo: Array[Int] = _
+    private var hi: Array[Int] = _
+    private var longs: Array[Long] = _
+    private var dbls: Array[Double] = _
+    private var validity: Array[Long] = _
+    private var outLongs: Array[Long] = _
+    private var outDoubles: Array[Double] = _
+    private var outValidity: Array[Long] = _
+    private var computedPart = -1
+
+    private def ensure(len: Int): Unit = if (len > capacity) {
+      capacity = math.max(len, math.max(1024, capacity * 2))
+      val words = (capacity + 63) >>> 6
+      keys = new Array[Long](capacity)
+      keyValidity = new Array[Long](words)
+      lo = new Array[Int](capacity)
+      hi = new Array[Int](capacity)
+      validity = new Array[Long](words)
+      outValidity = new Array[Long](words)
+      if (fn.inputOrdinal >= 0) {
+        if (doubles) dbls = new Array[Double](capacity) else longs = new Array[Long](capacity)
+      }
+      if (doubles) outDoubles = new Array[Double](capacity) else outLongs = new Array[Long](capacity)
+    }
+
+    /** Computes the partition's values into the `out*` arrays (by position in the partition). */
+    private def compute(part: Int): Unit = {
+      val len = partitionLength(part)
+      val start = partitionFirstGlobal(part)
+      ensure(len)
+      java.util.Arrays.fill(keyValidity, 0, (len + 63) >>> 6, 0L)
+      java.util.Arrays.fill(validity, 0, (len + 63) >>> 6, 0L)
+      var anyNullKey = false
+      var anyNullValue = false
+      // The partition's rows, batch by batch, in global order (released batches first, then the held ones).
+      val it = released.iterator ++ held.iterator
+      while (it.hasNext) {
+        val h = it.next()
+        val from = math.max(start, h.firstGlobal)
+        val to = math.min(start + len, h.firstGlobal + h.numRows)
+        if (from < to) {
+          val o = (from - start).toInt
+          val r0 = (from - h.firstGlobal).toInt
+          val count = (to - from).toInt
+          System.arraycopy(h.keys, r0, keys, o, count)
+          if (h.keyValidity != null) {
+            anyNullKey = true
+            var j = 0
+            while (j < count) {
+              if (((h.keyValidity((r0 + j) >>> 6) >>> ((r0 + j) & 63)) & 1L) != 0L)
+                keyValidity((o + j) >>> 6) |= 1L << ((o + j) & 63)
+              j += 1
+            }
+          } else {
+            var j = 0
+            while (j < count) { keyValidity((o + j) >>> 6) |= 1L << ((o + j) & 63); j += 1 }
+          }
+          if (fn.inputOrdinal >= 0) {
+            val v = h.buffers(fn.inputOrdinal)
+            var j = 0
+            while (j < count) {
+              val r = r0 + j
+              if (Rows.valid(v, r)) {
+                validity((o + j) >>> 6) |= 1L << ((o + j) & 63)
+                if (fn.kind != VectorWindowPlanner.SlidingCount) {
+                  inputLane match {
+                    case io.vecruntime.kernels.VecType.INT32 =>
+                      if (doubles) dbls(o + j) = v.getInt(r).toDouble else longs(o + j) = v.getInt(r).toLong
+                    case io.vecruntime.kernels.VecType.INT64 =>
+                      if (doubles) dbls(o + j) = v.getLong(r).toDouble else longs(o + j) = v.getLong(r)
+                    case _ => dbls(o + j) = v.getDouble(r)
+                  }
+                }
+              } else anyNullValue = true
+              j += 1
+            }
+          }
+        }
+      }
+      val kv = if (anyNullKey) keyValidity else null
+      val vv = if (anyNullValue) validity else null
+      try {
+        io.vecruntime.kernels.WindowFrameKernels.rangeBounds(
+          keys,
+          kv,
+          len,
+          spec.descending,
+          spec.nullsFirst,
+          spec.loUnbounded,
+          spec.lo,
+          spec.hiUnbounded,
+          spec.hi,
+          spec.keyBits,
+          spec.checked,
+          lo,
+          hi
+        )
+      } catch {
+        case _: ArithmeticException =>
+          throw VectorErrors.arithmeticOverflow(
+            if (spec.keyBits == 64) "long overflow" else "integer overflow",
+            "try_add",
+            fn.context
+          )
+      }
+      fn.kind match {
+        case VectorWindowPlanner.SlidingCount =>
+          io.vecruntime.kernels.WindowFrameKernels.frameCount(vv, lo, hi, len, fn.countAll, outLongs)
+          java.util.Arrays.fill(outValidity, 0, (len + 63) >>> 6, -1L)
+        case VectorWindowPlanner.SlidingSum if !doubles =>
+          try io.vecruntime.kernels.WindowFrameKernels.frameSumLong(
+              longs,
+              vv,
+              lo,
+              hi,
+              len,
+              fn.checked,
+              outLongs,
+              outValidity
+            )
+          catch {
+            case _: ArithmeticException => throw VectorErrors.arithmeticOverflow("long overflow", "try_sum", fn.context)
+          }
+        case VectorWindowPlanner.SlidingSum | VectorWindowPlanner.SlidingAvg =>
+          io.vecruntime.kernels.WindowFrameKernels.frameSumDouble(
+            dbls,
+            vv,
+            lo,
+            hi,
+            len,
+            fn.kind == VectorWindowPlanner.SlidingAvg,
+            outDoubles,
+            outValidity
+          )
+        case k =>
+          val isMin = k == VectorWindowPlanner.SlidingMin
+          if (doubles) io.vecruntime.kernels.WindowFrameKernels.frameMinMaxDouble(
+            dbls,
+            vv,
+            lo,
+            hi,
+            len,
+            isMin,
+            outDoubles,
+            outValidity
+          )
+          else io.vecruntime.kernels.WindowFrameKernels.frameMinMaxLong(
+            longs,
+            vv,
+            lo,
+            hi,
+            len,
+            isMin,
+            outLongs,
+            outValidity
+          )
+      }
+      computedPart = part
+    }
+
+    /** The function's column over held batch `h`, computing each of its partitions once. */
+    def column(h: Held, name: String, dt: DataType): ColumnVector = {
+      val out = ArrowOutput.allocateFixed(name, dt, h.numRows, allocator)
+      val data = out.data()
+      val validityOut = out.validity()
+      val outLane = TypeMapping.vecTypeOf(dt)
+      var allValid = true
+      var r = 0
+      while (r < h.numRows) {
+        val part = h.partOf(r)
+        if (computedPart != part) compute(part)
+        val pos = h.posOf(r)
+        val valid = ((outValidity(pos >>> 6) >>> (pos & 63)) & 1L) != 0L
+        Bitmap.setTo(validityOut, r, valid)
+        if (!valid) allValid = false
+        outLane match {
+          case io.vecruntime.kernels.VecType.INT32 =>
+            data.setAtIndex(VectorBuffers.LE_INT, r, if (valid) outLongs(pos).toInt else 0)
+          case io.vecruntime.kernels.VecType.INT64 =>
+            data.setAtIndex(VectorBuffers.LE_LONG, r, if (valid) outLongs(pos) else 0L)
+          case _ => data.setAtIndex(VectorBuffers.LE_DOUBLE, r, if (valid) outDoubles(pos) else 0.0)
+        }
+        r += 1
+      }
+      ArrowOutput.finish(out, h.numRows, allValid)
+    }
+  }
+
+  private val rangeFrames: Array[RangeFrames] =
+    functions.map(fn => if (fn.range != null) new RangeFrames(fn) else null)
 
   /** Emits every held batch whose partitions have all ended; keeps released batches readable while needed. */
   private def release(): Unit = metrics.timed {
@@ -1598,7 +2028,8 @@ private[vecruntime] class VectorWindowOffsetIterator(
       while (f < functions.length) {
         val fn = functions(f)
         val (name, dt) = windowAttrs(f)
-        columns(childAttrs.length + f) = AggBufferColumns.values(
+        columns(childAttrs.length + f) = if (rangeFrames(f) != null) rangeFrames(f).column(h, name, dt)
+        else AggBufferColumns.values(
           name,
           dt,
           h.numRows,
@@ -1675,6 +2106,7 @@ private[vecruntime] class VectorWindowOffsetIterator(
       held.foreach(_.close()); held.clear()
       released.foreach(_.close()); released.clear()
       retired.foreach(_.close()); retired.clear()
+      scratchArena.close()
       allocator.close()
     }
   }

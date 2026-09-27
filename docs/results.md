@@ -181,6 +181,42 @@ What the numbers say:
 
 Run it with `"WideDecimal"` as the benchmark filter.
 
+### `RANGE` window frames with value offsets: the frame kernels (#58, layer 2d)
+
+`WindowFrameBenchmark`, one sorted partition of 65536 rows, one thread, same flags as above
+(Xeon Platinum 8488C, AVX-512; rows per microsecond). The key is a random walk with steps in
+`[0, 4)`, so `frameRows` (8, 256) is about how many rows a `RANGE BETWEEN 2*frameRows PRECEDING AND
+CURRENT ROW` frame spans; `nulls` is the share of null input values. `reference` is
+`ScalarReference`: Spark's own shape -- the sliding buffer replayed row by row and every frame
+re-aggregated from scratch; `boxed row path` is a per-row re-aggregation over pre-boxed `Long`s,
+standing for (and flattering: no `newState` object, no `valueAt` boxing, no `batchOf` lookup per read)
+what the held-partition row path would have done for these frames. Three measured iterations of one
+second give wide error bars on the fastest rows; the ratios below are the medians' and hold across
+the two runs taken.
+
+| kernel | frame rows | nulls | reference | kernel | ratio | note |
+|---|---:|---:|---:|---:|---:|---|
+| `rangeBounds` (the two-pointer walk) | 8 / 256 | – | 8.4 | 80 | 9.5x | the reference re-derives each bound through `BigInteger`; 12 ns a row for the kernel, flat in the frame width |
+| `frameCount` | 8 | 10% | 34 | 77 | 2.3x | slides: subtract the leaving rows, add the entering ones |
+| `frameCount` | 256 | 10% | 2.9 | 79 | 27x | O(1) a row whatever the frame width |
+| `frameSumLong` (unchecked) | 256 | 0% | 10.6 (boxed row path 8.7) | 83 | 7.8x (9.5x) | slides under wrapping arithmetic |
+| `frameSumLong` (unchecked) | 256 | 10% | 2.5 (boxed 4.8) | 60 | 24x (12.5x) | |
+| `frameSumLong` (unchecked) | 8 | 0% | 92 (boxed 84) | 78 | 0.85x | a frame of 8 rows is as cheap to re-add as to slide; within the run-to-run noise |
+| `frameSumLong` (ANSI, `addExact` in order) | 256 | 0% | 10.6 | 8.1 | 0.8x | Spark's work: the overflow is a property of the partial sums |
+| `frameSumDouble` | 256 | 0% | 5.9 | 9.3 | 1.6x | in row order (bit-identical); a lower bound that has not moved continues the previous frame |
+| `frameMinMaxLong` (`max`) | 256 | 0% | 7.2 | 20.7 | 2.9x | `LongVector` MAX over the re-scanned frame when the column has no nulls |
+| `frameMinMaxLong` (`max`) | 256 | 10% | 2.0 | 3.1 | 1.6x | scalar under nulls |
+
+What this says: the bound search and the order-independent reductions (`count`, an unchecked bigint
+`sum`) are linear in the partition whatever the frame width, which is what the operator needed to
+stop being O(n x frame) for the common `sum`/`count` moving windows; the order-dependent ones
+(double sums, ANSI sums, min/max) keep Spark's re-aggregation cost by design -- bit-identical double
+sums need Spark's addition order -- and gain only what the primitive arrays and the vector re-scan
+give. In the profile of a 4M-row local job (`sum`, `count`, `avg`, `max` over `RANGE` frames of 30 to
+40 keys, plugin on) the frame kernels together are under 5% of the samples; Spark's row sort below
+the window and the row-to-columnar transition are the cost, and the only allocation of ours is the
+scratch arrays grown once per task.
+
 ### The index sort: radix passes versus one comparison sort per pass (#285)
 
 `SortBenchmark`, one thread, `-wi 1 -i 2 -w 1 -r 1`, x86 build host (8 threads, JDK 25), ms per sort
