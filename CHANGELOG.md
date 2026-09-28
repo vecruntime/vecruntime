@@ -6,6 +6,20 @@ version may change configuration keys or defaults, always noted here.
 
 ## Unreleased
 
+### Added
+
+- A columnar broadcast exchange for the hash joins (#325, `spark.vecruntime.exec.broadcastExchange.enabled`,
+  default on): `VectorBroadcastExchangeExec` broadcasts the build side's batches as Arrow IPC streams and
+  `VectorBroadcastHashJoinExec` builds its table from them, so a broadcast join over one of our plans
+  (or a columnar scan) no longer converts the build side to rows and back. A Spark consumer of the same
+  exchange (a reused exchange, dynamic partition pruning) still gets Spark's relation, built from the
+  batches on first use; dynamic partition pruning keeps its filter.
+
+### Fixed
+
+- A `tinyint`/`smallint` column could not be written by the aggregate's and the join's spills (the narrow
+  lanes' column wrapper was not recognised).
+
 ## 0.0.3 -- 2026-09-27
 
 Window `RANGE` frames with value offsets, a columnar `range()`, `spark_partition_id()`, an opt-in

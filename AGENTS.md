@@ -423,8 +423,17 @@ Expressions compile to a small `VectorExpr` tree (`expr/VectorExpr.scala`; one f
 ### 5.9 Joins (`VectorHashJoinExec.scala`, `VectorSortMergeJoinExec.scala`, `GraceHashJoin.scala`)
 
 - `VectorBroadcastHashJoinExec` replaces `BroadcastHashJoinExec` when the streamed side is columnar
-  or an exchange; the build side stays Spark's `BroadcastExchangeExec` / `HashedRelation`, read once
-  per task into a `GroupKeyTable` (`HashedRelationAccess` in `org.apache.spark.sql.execution.vector`,
+  or an exchange. Its build side is our `VectorBroadcastExchangeExec` (#325) wherever the exchange's
+  child is ours or a columnar source with lane types: Arrow IPC batches per partition, broadcast as
+  they are, and `BuildTable.sharedFromBroadcast` builds one `GroupKeyTable` per (broadcast, join,
+  executor) from them. Spark's `HashedRelation` is a sealed trait, so the exchange cannot hand a Spark
+  consumer a relation of ours: `doExecuteBroadcast` builds Spark's relation from the batches on the
+  driver on first use (a Spark join over a reused exchange, DPP's `SubqueryBroadcastExec`), and our
+  join calls `executeVectorBroadcast` instead. The node is columnar *and* row-based so the transitions
+  keep its child columnar and put nothing above it; `postColumnarTransitions` drops a `ColumnarToRow`
+  over it (a reused exchange mirrors only its child's columnar flag). Otherwise the build side is
+  Spark's `BroadcastExchangeExec` / `HashedRelation`, read once
+  per executor into a `GroupKeyTable` (`HashedRelationAccess` in `org.apache.spark.sql.execution.vector`,
   the relation being `private[execution]`). `VectorBroadcastNestedLoopJoinExec` runs the same
   `VectorHashJoinIterator` with "every build row" as the candidate step, in bounded pair chunks.
   `VectorShuffledHashJoinExec` replaces `ShuffledHashJoinExec`, `ClusteredDistribution` on both
@@ -456,7 +465,8 @@ Expressions compile to a small `VectorExpr` tree (`expr/VectorExpr.scala`; one f
   to Spark was removed in #416 once the sort spills (at 1 TB it had sent 70 of 101 TPC-DS queries to
   Spark's operator). `VectorSortMergeJoinSuite` compares row order, the hash suites row sets.
 - Both joins are `VectorBinaryExec`; `VectorPlan` is the base the rule, selection marking, Comet
-  bridging and the UI classify on. A columnar broadcast exchange of our own is a listed gap (#325).
+  bridging and the UI classify on. The nested-loop join's identity broadcast is still Spark's rows
+  (its value is the rows themselves, with no relation to bridge through).
 
 ### 5.10 The Arrow compatibility layer
 
@@ -806,8 +816,8 @@ benchmarks/scripts/profile-query.sh - vector q6 --flags-only   # the recording f
   reducer; both backends assume executors that stay up for the job -- a push-based service is future
   work through the backend seam.
 - The window operator holds its whole partition in memory (the aggregate, the sort and the shuffled
-  hash join spill). The build side of a broadcast join is Spark's `HashedRelation`, read into columns
-  once per task; a columnar broadcast exchange would read it once per job (#325).
+  hash join spill). The nested-loop join's build side is Spark's identity broadcast of rows, read into
+  columns once per task; the hash joins' is our columnar broadcast (#325).
 - Not converted (falls back with the reason recorded): `ObjectHashAggregateExec` functions
   (`collect_*`, `percentile_*`, #57); cached tables over non-primitive schemas (#55); nested-type
   accessors and constructors, the lambda families (#50); Python UDFs (#65); the Parquet write path

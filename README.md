@@ -833,9 +833,14 @@ read; Spark converts it below us as for the shuffled hash join),
 and `BroadcastNestedLoopJoinExec` (a join with no equi-keys) becomes `VectorBroadcastNestedLoopJoinExec`:
 the same iterator with every broadcast row a candidate, the streamed rows chunked to a fixed pair
 budget so the condition is evaluated over gathered pairs and the product is never materialised.
-The build side is left exactly as Spark planned it, a `BroadcastExchangeExec` producing a
-`HashedRelation`: each task reads its rows once into columns and builds a `GroupKeyTable` over the
-keys (with a lookup-only probe), so no exchange of our own is needed and a Spark join over the same
+The build side of the hash join is our `VectorBroadcastExchangeExec` (#325) when its input is one of
+our operators or a columnar source: the build side's batches travel as Arrow IPC streams and are
+broadcast as they are, and the join builds its `GroupKeyTable` from them once per executor, with no
+row conversion below the exchange. A Spark join over the same (reused) exchange, or dynamic partition
+pruning, still gets Spark's own relation, built from the batches on first use. Otherwise the build
+side is left as Spark planned it, a `BroadcastExchangeExec` producing a
+`HashedRelation`: each executor reads its rows once into columns and builds a `GroupKeyTable` over the
+keys (with a lookup-only probe), and a Spark join over the same
 broadcast keeps working. `ShuffledHashJoinExec` becomes `VectorShuffledHashJoinExec`; like the
 Final aggregate it accepts exchanges as inputs, so it runs over Spark's row shuffle (a
 `RowToColumnarExec` on each side) as well as over Comet's. Probing evaluates the streamed keys with
@@ -914,7 +919,6 @@ own operators, not ours).
 ## Not in scope (yet)
 
 - A Parquet-to-Arrow reader of our own; Comet's reader covers the zero-copy case.
-- A columnar broadcast exchange of our own (the build side of a broadcast join is read from Spark's
-  `HashedRelation` once per executor, #325), a spilling window, TLS for the Flight shuffle server,
+- A columnar identity broadcast for the nested-loop join (the hash joins' is ours, #325), a spilling window, TLS for the Flight shuffle server,
   and a push-based shuffle service for disposable executors (the `VectorShuffleBackend` seam is
   where it plugs in).
