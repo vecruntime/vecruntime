@@ -93,6 +93,27 @@ statement, so it stays opt-in until a released Iceberg shows a clear gain). The 
 reflection), and the slice-1 profile split that gates the work are in
 [`docs/iceberg-dv-writer.md`](iceberg-dv-writer.md).
 
+### Write-stage parallelism: the advisory partition size
+
+In a `MERGE` / `UPDATE` the delta write runs its two halves in separate tasks: the deletes are
+clustered by data file, while the inserted rows (updated rows' new versions and inserts) have no
+file and land together in their own partitions, which AQE splits to Iceberg's advisory partition
+size. Those insert tasks are the stage's critical path, since they write Parquet and are CPU-bound. On
+the cluster CDC `MERGE` (`v3.dvmix_20_5`, a 10 % change batch of 57.6 M rows, 8 executors / 112
+slots), the default 384 MiB target split the insert half into 14 tasks and left most slots idle:
+
+| `spark.sql.iceberg.advisory-partition-size` | insert tasks | write stage | MERGE |
+|---|---|---|---|
+| default (384 MiB) | 14 | ~18 s | ~84 s |
+| 128 MiB | 23-24 | 12-13 s | ~76 s |
+
+A smaller target writes more, smaller data files (here ~1.6x as many), which costs at read time
+(planning and per-file overhead) what it saves at write time. So it is a per-workload choice: set it
+for a session with `spark.sql.iceberg.advisory-partition-size` (bytes), or on the table with
+`write.spark.advisory-partition-size-bytes`, when write latency matters more than file size.
+Neither the DV writer nor our shuffle changes this trade-off; the numbers are the same with the
+writer on and off (#20).
+
 ## Limitations
 
 - The `MERGE INTO`'s row-level operator, `MergeRows`, has a columnar form (`VectorMergeRowsExec`, #21:
