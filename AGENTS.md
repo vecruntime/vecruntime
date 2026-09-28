@@ -90,7 +90,8 @@ under test.
 - **JFR before any explanation.** A number worse than expected, or better in a way you cannot
   account for, is profiled with Java Flight Recorder before a word is written about its cause
   (section 9). Do not write a hypothesis into the docs or the code; record the run and read the
-  profile first.
+  profile first, including its deoptimisations (`jdk.Deoptimization`: the Vector API can cause
+  deoptimisation storms, section 9).
 - **Testing conventions.** Correctness first, by comparison with an oracle: the scalar reference for
   kernels, Spark itself for SQL (`checkVectorized` / `checkFallback`), byte-for-byte results for
   shuffle and Iceberg writes. Every change runs the gate above, exit 0; planner or expression changes
@@ -737,6 +738,17 @@ benchmarks/scripts/profile-query.sh - vector q6 --flags-only   # the recording f
   `isAlignedForElement` near the top mean a segment access the JIT did not hoist: a megamorphic call
   site, a segment from a different session per call, or `mismatch` on tiny ranges); our own frames by
   self time; allocation sites; GC pauses; waits; native methods (Comet's JVM side). Needs `JAVA_HOME`.
+- **Always check deoptimisations (`jdk.Deoptimization`).** Vector API code can trigger deoptimisation
+  storms: a kernel whose intrinsic or speculation fails is compiled, thrown back to the interpreter,
+  recompiled and thrown back again, and the time goes there while the hot-methods view still looks
+  plausible. Read `jfr view deoptimizations-by-reason <file>` and `jfr view deoptimizations-by-site
+  <file>` on every profile; `jfr print --events jdk.Deoptimization <file>` gives the method, bci,
+  reason and action of each one. A few hundred spread over JDK and Spark frames during warm-up is
+  normal; thousands, or a count that keeps rising in the measured iterations, or a site in our kernels
+  or `jdk.incubator.vector` frames (reasons `class_check`, `unstable_if`, `bimorphic` on a vector
+  species or a shape the call site was not profiled with) is a finding to fix before any other
+  explanation. `settings=profile` records the stack trace of each event; `settings=default` records
+  the events without it.
 - By hand: `JVM_EXTRA="-XX:StartFlightRecording=filename=/tmp/x.jfr,settings=profile,dumponexit=true"
   RESULTS_DIR=/tmp/profiling benchmarks/scripts/run-tpch.sh ...`; `JVM_EXTRA` applies to the benchmark
   JVMs only. Compare two configurations by recording both.
