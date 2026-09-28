@@ -41,9 +41,10 @@ import org.openjdk.jmh.annotations.TearDown;
 import org.openjdk.jmh.annotations.Warmup;
 
 /**
- * {@link SelectKernels#select}, the {@code CASE WHEN} blend: two branches and an {@code ELSE} over 8192
- * rows, with branch masks either random per row ({@code mixed}) or taking long runs of rows
- * ({@code runs}, 1024 rows each in turn), and branch values with or without nulls (#541).
+ * {@link SelectKernels#select}, the {@code CASE WHEN} blend: two branches and
+ * an {@code ELSE} over 8192 rows, with branch masks either random per row
+ * ({@code mixed}) or taking long runs of rows ({@code runs}, 1024 rows each in
+ * turn), and branch values with or without nulls (#541).
  */
 @BenchmarkMode(Mode.Throughput)
 @OutputTimeUnit(TimeUnit.MILLISECONDS)
@@ -117,7 +118,8 @@ public class SelectBenchmark {
     @Benchmark
     public VectorBuffers select() {
         try (Arena a = Arena.ofConfined()) {
-            VectorBuffers v = SelectKernels.select(vecType, N, wins, branches, otherwise, null, a);
+            VectorBuffers v = SelectKernels.select(vecType, N, wins, branches, otherwise, null,
+                    a);
             return v.length() == N ? null : v;
         }
     }
