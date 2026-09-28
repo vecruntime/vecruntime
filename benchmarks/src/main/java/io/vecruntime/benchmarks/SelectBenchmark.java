@@ -116,11 +116,12 @@ public class SelectBenchmark {
     }
 
     @Benchmark
-    public VectorBuffers select() {
+    public long select() {
         try (Arena a = Arena.ofConfined()) {
             VectorBuffers v = SelectKernels.select(vecType, N, wins, branches, otherwise, null,
                     a);
-            return v.length() == N ? null : v;
+            // Consume the result: the valid rows and one word of the values, so none of the work can be dropped.
+            return Bitmap.popcount(v.validity(), N) + v.data().get(ValueLayout.JAVA_LONG_UNALIGNED, 64L);
         }
     }
 }
