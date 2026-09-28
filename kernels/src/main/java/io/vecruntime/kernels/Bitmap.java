@@ -95,24 +95,29 @@ public final class Bitmap {
             boolean value) {
         int i = from;
         int end = from + count;
-        // Leading partial byte, whole bytes, trailing partial byte.
-        while (i < end && (i & 7) != 0) {
-            setTo(bm, i++, value);
+        // Leading partial byte, whole bytes, trailing partial byte; the partial ones a word write each.
+        int head = Math.min(end - i, (8 - (i & 7)) & 7);
+        if (head > 0) {
+            putBits(bm, i, value ? -1L : 0L, head);
+            i += head;
         }
         byte b = (byte) (value ? 0xFF : 0);
-        while (i + 8 <= end) {
-            bm.set(BYTE, i >>> 3, b);
-            i += 8;
+        int bytes = (end - i) >>> 3;
+        if (bytes > 0) {
+            bm.asSlice(i >>> 3, bytes).fill(b);
+            i += bytes << 3;
         }
-        while (i < end) {
-            setTo(bm, i++, value);
+        if (i < end) {
+            putBits(bm, i, value ? -1L : 0L,
+                    end - i);
         }
     }
 
     /**
      * Copies bits {@code [0, count)} of {@code src} to {@code dst} at bit
      * offset {@code dstFrom} -- the append of a compacted validity or BOOL
-     * slice at a row offset (#351).
+     * slice at a row offset (#351). Word at a time at any offset (#541): a bit
+     * at a time paid a checked byte read and write per row.
      */
     public static void copyBits(MemorySegment src, MemorySegment dst, int dstFrom,
             int count) {
@@ -121,14 +126,84 @@ public final class Bitmap {
             if (whole > 0) {
                 MemorySegment.copy(src, 0, dst, dstFrom >>> 3, whole);
             }
-            for (int i = whole << 3; i < count; i++) {
-                setTo(dst, dstFrom + i, isSet(src, i));
+            int rest = count & 7;
+            if (rest != 0) {
+                putBits(dst, dstFrom + (whole << 3), wordAt(src, whole >>> 3, count) >>> ((whole & 7) << 3),
+                        rest);
             }
             return;
         }
-        for (int i = 0; i < count; i++) {
-            setTo(dst, dstFrom + i, isSet(src, i));
+        for (int w = 0, words = wordsFor(count);
+             w < words;
+             w++) {
+            int n = Math.min(64, count - (w << 6));
+            putBits(dst, dstFrom + (w << 6), wordAt(src, w, count), n);
         }
+    }
+
+    /**
+     * Writes the low {@code n} bits ({@code 1 <= n <= 64}) of {@code bits} to
+     * bits {@code [dstBit, dstBit + n)} of {@code dst}, leaving every other bit
+     * as it is: at most two read-modify-writes of a 64-bit word (#541).
+     */
+    public static void putBits(MemorySegment dst, long dstBit, long bits,
+            int n) {
+        long mask = lowBits(n);
+        bits &= mask;
+        int shift = (int) (dstBit & 63);
+        long wordByte = (dstBit >>> 6) << 3;
+        putMasked(dst, wordByte, bits << shift, mask << shift);
+        if (shift + n > 64) {
+            putMasked(dst, wordByte + 8, bits >>> (64 - shift),
+                    mask >>> (64 - shift));
+        }
+    }
+
+    /**
+     * {@code word = (word & ~mask) | (bits & mask)} at byte offset {@code at},
+     * byte-wise past the end.
+     */
+    private static void putMasked(MemorySegment dst, long at, long bits,
+            long mask) {
+        if (at + 8 <= dst.byteSize()) {
+            long old = dst.get(LE_LONG, at);
+            dst.set(LE_LONG, at, (old & ~mask) | (bits & mask));
+            return;
+        }
+        for (int b = 0;
+             b < 8 && mask >>> (b << 3) != 0L;
+             b++) {
+            int m = (int) (mask >>> (b << 3)) & 0xFF;
+            if (m != 0) {
+                long off = at + b;
+                byte old = dst.get(BYTE, off);
+                dst.set(BYTE, off, (byte) ((old & ~m) | ((int) (bits >>> (b << 3)) & m)));
+            }
+        }
+    }
+
+    /**
+     * Appends to {@code dst} at bit {@code dstFrom} the bits of {@code src} at
+     * the positions set in {@code selection} (its first {@code srcLen} bits),
+     * in order; returns how many were written. Per 64 rows: one word of each,
+     * {@link Long#compress} (a single instruction where the JIT has one) and one
+     * {@link #putBits} (#541).
+     */
+    public static int appendSelectedBits(MemorySegment src, MemorySegment selection, int srcLen,
+            MemorySegment dst, int dstFrom) {
+        int o = dstFrom;
+        for (int w = 0, words = wordsFor(srcLen);
+             w < words;
+             w++) {
+            long sel = wordAt(selection, w, srcLen);
+            if (sel == 0L) {
+                continue;
+            }
+            int n = Long.bitCount(sel);
+            putBits(dst, o, Long.compress(wordAt(src, w, srcLen), sel), n);
+            o += n;
+        }
+        return o - dstFrom;
     }
 
     /**
@@ -152,9 +227,7 @@ public final class Bitmap {
             int shift = s & 63;
             long word = wordAt(src, s >>> 6, end) >>> shift;
             int take = Math.min(64 - shift, count - o);
-            for (int j = 0; j < take; j++) {
-                setTo(dst, dstFrom + o + j, ((word >>> j) & 1L) != 0);
-            }
+            putBits(dst, dstFrom + o, word, take);
             o += take;
         }
     }

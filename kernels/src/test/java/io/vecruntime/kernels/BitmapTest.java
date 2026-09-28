@@ -121,4 +121,124 @@ class BitmapTest {
             assertEquals(99, Bitmap.popcount(bm, 100));
         }
     }
+
+    // #541: the word-level writers against a bit-by-bit reference, at every offset and length that
+    // crosses a byte and a word boundary, into destinations of exactly bytesFor(end) bytes (so the tail
+    // takes the byte-wise path) and padded ones, with the bits around the written range random.
+
+    private static MemorySegment randomBits(Arena a, Random r, long bytes) {
+        MemorySegment s = a.allocate(Math.max(1, bytes));
+        for (long i = 0; i < s.byteSize(); i++) {
+            s.set(Bitmap.BYTE, i, (byte) r.nextInt());
+        }
+        return s;
+    }
+
+    private static MemorySegment copyOf(Arena a, MemorySegment s) {
+        MemorySegment c = a.allocate(s.byteSize());
+        c.copyFrom(s);
+        return c;
+    }
+
+    private static void assertSameBits(MemorySegment expected, MemorySegment actual, int bits,
+            String what) {
+        for (int i = 0; i < bits; i++) {
+            assertEquals(Bitmap.isSet(expected, i), Bitmap.isSet(actual, i), what + ": bit " + i);
+        }
+    }
+
+    @Test
+    void copyBitsMatchesBitByBitAtAnyOffset() {
+        Random r = new Random(541);
+        try (Arena a = Arena.ofConfined()) {
+            for (int from = 0; from < 80; from++) {
+                for (int count : new int[] {
+                    0,
+                    1,
+                    7,
+                    8,
+                    9,
+                    63,
+                    64,
+                    65,
+                    127,
+                    128,
+                    129,
+                    200
+                }) {
+                    for (boolean exact : new boolean[] {true, false}) {
+                        int end = from + count;
+                        long bytes = exact ? Bitmap.bytesFor(end) : Bitmap.bytesFor(end) + 16;
+                        MemorySegment src = randomBits(a, r, Bitmap.bytesFor(count));
+                        MemorySegment dst = randomBits(a, r, bytes);
+                        MemorySegment ref = copyOf(a, dst);
+                        for (int i = 0; i < count; i++) {
+                            Bitmap.setTo(ref, from + i, Bitmap.isSet(src, i));
+                        }
+                        Bitmap.copyBits(src, dst, from, count);
+                        assertSameBits(ref, dst, (int) (bytes * 8), "copyBits from=" + from + " count=" + count);
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
+    void fillRangeMatchesBitByBit() {
+        Random r = new Random(5411);
+        try (Arena a = Arena.ofConfined()) {
+            for (int from = 0; from < 70; from++) {
+                for (int count : new int[] {0, 1, 5, 8, 13, 64,
+                        70, 150}) {
+                    for (boolean value : new boolean[] {true, false}) {
+                        long bytes = Bitmap.bytesFor(from + count);
+                        MemorySegment dst = randomBits(a, r, bytes);
+                        MemorySegment ref = copyOf(a, dst);
+                        for (int i = 0; i < count; i++) {
+                            Bitmap.setTo(ref, from + i, value);
+                        }
+                        Bitmap.fillRange(dst, from, count, value);
+                        assertSameBits(ref, dst, (int) (bytes * 8), "fillRange from=" + from + " count=" + count);
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
+    void copyBitsFromAndAppendSelectedBitsMatchBitByBit() {
+        Random r = new Random(5412);
+        try (Arena a = Arena.ofConfined()) {
+            for (int trial = 0; trial < 400; trial++) {
+                int srcLen = r.nextInt(300);
+                int srcFrom = srcLen == 0 ? 0 : r.nextInt(srcLen);
+                int count = srcLen - srcFrom;
+                int dstFrom = r.nextInt(130);
+                MemorySegment src = randomBits(a, r, Bitmap.bytesFor(srcLen));
+                // copyBitsFrom: bits [srcFrom, srcLen) of src to dstFrom.
+                long bytes = Bitmap.bytesFor(dstFrom + count);
+                MemorySegment dst = randomBits(a, r, bytes);
+                MemorySegment ref = copyOf(a, dst);
+                for (int i = 0; i < count; i++) {
+                    Bitmap.setTo(ref, dstFrom + i, Bitmap.isSet(src, srcFrom + i));
+                }
+                Bitmap.copyBitsFrom(src, srcFrom, dst, dstFrom, count);
+                assertSameBits(ref, dst, (int) (bytes * 8), "copyBitsFrom trial " + trial);
+                // appendSelectedBits: the bits of src at the set positions of a random selection, in order.
+                MemorySegment sel = randomBits(a, r, Bitmap.bytesFor(srcLen));
+                int selected = Bitmap.popcount(sel, srcLen);
+                long sbytes = Bitmap.bytesFor(dstFrom + selected);
+                MemorySegment sdst = randomBits(a, r, sbytes);
+                MemorySegment sref = copyOf(a, sdst);
+                int o = dstFrom;
+                for (int i = 0; i < srcLen; i++) {
+                    if (Bitmap.isSet(sel, i)) {
+                        Bitmap.setTo(sref, o++, Bitmap.isSet(src, i));
+                    }
+                }
+                assertEquals(selected, Bitmap.appendSelectedBits(src, sel, srcLen, sdst, dstFrom));
+                assertSameBits(sref, sdst, (int) (sbytes * 8), "appendSelectedBits trial " + trial);
+            }
+        }
+    }
 }
