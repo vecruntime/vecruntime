@@ -16,6 +16,9 @@ version may change configuration keys or defaults, always noted here.
 
 - The nested-loop join over Spark's row broadcast reads it into columns once per executor, shared by
   the executor's tasks, instead of once per task.
+- Column builders (the joins' build and gather, the sort-merge join's runs) append validity bitmaps and
+  BOOL values a 64-bit word at a time instead of a bit at a time (#541): 1.7-2.2x on a nullable INT64
+  append, 3.3-4.8x on BOOL.
 
 ### Added
 
