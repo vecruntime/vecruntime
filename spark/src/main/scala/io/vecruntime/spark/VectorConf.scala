@@ -61,6 +61,7 @@ object VectorConf {
   val WindowEnabled = "spark.vecruntime.exec.window.enabled"
   val LocalTableScanEnabled = "spark.vecruntime.exec.localTableScan.enabled"
   val RangeEnabled = "spark.vecruntime.exec.range.enabled"
+  val BroadcastExchangeEnabled = "spark.vecruntime.exec.broadcastExchange.enabled"
   val BroadcastHashJoinEnabled = "spark.vecruntime.exec.broadcastHashJoin.enabled"
   val BroadcastNestedLoopJoinEnabled = "spark.vecruntime.exec.broadcastNestedLoopJoin.enabled"
   val ShuffledHashJoinEnabled = "spark.vecruntime.exec.shuffledHashJoin.enabled"
@@ -170,6 +171,13 @@ object VectorConf {
 
   /** Convert RangeExec (`spark.range`, the `range()` table function) into native INT64 batches, so the chain above is ours from the leaf. */
   def rangeEnabled(conf: SQLConf): Boolean = bool(conf, RangeEnabled, default = true)
+
+  /**
+   * Replace a hash-join broadcast exchange over one of our plans by our columnar one (#325): the
+   * build side travels as Arrow batches and our broadcast join builds its table from them. A Spark
+   * consumer of the same exchange still gets Spark's relation, built from the batches on first use.
+   */
+  def broadcastExchangeEnabled(conf: SQLConf): Boolean = bool(conf, BroadcastExchangeEnabled, default = true)
 
   /** Convert BroadcastHashJoinExec over a columnar streamed side (the build side stays Spark's broadcast). */
   def broadcastHashJoinEnabled(conf: SQLConf): Boolean = bool(conf, BroadcastHashJoinEnabled, default = true)
