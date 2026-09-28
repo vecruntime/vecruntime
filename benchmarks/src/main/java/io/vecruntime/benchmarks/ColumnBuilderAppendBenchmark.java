@@ -90,7 +90,7 @@ public class ColumnBuilderAppendBenchmark {
         long dataBytes = vecType == VecType.BOOL ? Bitmap.bytesFor(ROWS) : (long) ROWS * vecType.byteWidth();
         MemorySegment validity = nulls ? random(arena, Bitmap.bytesFor(ROWS), r) : null;
         batch = SegmentVectorBuffers.fixedWidth(vecType, ROWS, validity, random(arena, dataBytes, r));
-        head = SegmentVectorBuffers.fixedWidth(vecType, 3, null, random(arena, 8, r));
+        head = SegmentVectorBuffers.fixedWidth(vecType, 3, null, random(arena, 3L * 16, r));
         selection = selected ? random(arena, Bitmap.bytesFor(ROWS), r) : null;
         selectedCount = selected ? Bitmap.popcount(selection, ROWS) : ROWS;
     }
