@@ -108,14 +108,16 @@ function stripFrontMatter(src) {
   return { title, description, body: src };
 }
 
-// Rewrite href="foo.html" / "benchmarks/foo.html" (and .html#frag) to BASE-prefixed absolute URLs.
+// Rewrite href="foo.html" / "benchmarks/foo.html" (and .html#frag) to BASE-prefixed absolute URLs, and the
+// repository's images (src="../images/x.png", the path that also works when GitHub renders docs/*.md) to
+// the copy under BASE/images.
 function rewriteLinks(html) {
   return html.replace(/href="([^":#?]+\.html)(#[^"]*)?"/g, (full, file, frag) => {
     const clean = file.replace(/^\.\//, "");
     if (INTERNAL.has(clean)) return `href="${BASE}/${clean}${frag || ""}"`;
     if (OFF_SITE[clean]) return `href="${OFF_SITE[clean]}"`;
     return full;
-  });
+  }).replace(/src="\.\.\/images\/([^"]+)"/g, (full, file) => `src="${BASE}/images/${file}"`);
 }
 
 function renderSidebar(activeUrl) {
