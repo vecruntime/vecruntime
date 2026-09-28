@@ -253,9 +253,20 @@ case class VectorBroadcastNestedLoopJoinExec(
   override protected def doExecuteColumnar(): RDD[ColumnarBatch] = {
     val spec = joinSpec
     val m = vectorMetrics
+    buildPlan match {
+      case VectorBroadcastExchangeExec(e) =>
+        // Our columnar identity broadcast (#325): the table is built from its batches, once per executor.
+        val batches = e.executeVectorBroadcast()
+        return streamedPlan.executeColumnar().mapPartitionsInternal { iter =>
+          val build = BuildTable.sharedFromBroadcast(batches.value, spec)
+          new VectorHashJoinIterator(iter, build, spec, m)
+        }
+      case _ =>
+    }
     val relation = buildPlan.executeBroadcast[Array[InternalRow]]()
     streamedPlan.executeColumnar().mapPartitionsInternal { iter =>
-      val build = BuildTable.fromRelation(relation.value.iterator, spec)
+      // Spark's identity broadcast of the rows, read into columns once per executor like a hash join's relation.
+      val build = BuildTable.sharedFromRows(relation.value, spec)
       new VectorHashJoinIterator(iter, build, spec, m)
     }
   }
@@ -496,6 +507,10 @@ object BuildTable {
   /** The same, from our columnar broadcast (#325): the table is built from its batches, no row pass. */
   def sharedFromBroadcast(relation: VectorBroadcastBatches, spec: JoinSpec): BuildTable =
     shared(relation, spec)(fromBatches(relation.batches(), spec, shared = true))
+
+  /** The same, from Spark's identity broadcast of the rows (the nested-loop join's build side). */
+  def sharedFromRows(relation: Array[InternalRow], spec: JoinSpec): BuildTable =
+    shared(relation, spec)(fromRelation(relation.iterator, spec, shared = true))
 
   private def shared(relation: AnyRef, spec: JoinSpec)(make: => BuildTable): BuildTable = {
     val perRelation = sharedTables.synchronized {

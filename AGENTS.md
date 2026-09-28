@@ -465,8 +465,9 @@ Expressions compile to a small `VectorExpr` tree (`expr/VectorExpr.scala`; one f
   to Spark was removed in #416 once the sort spills (at 1 TB it had sent 70 of 101 TPC-DS queries to
   Spark's operator). `VectorSortMergeJoinSuite` compares row order, the hash suites row sets.
 - Both joins are `VectorBinaryExec`; `VectorPlan` is the base the rule, selection marking, Comet
-  bridging and the UI classify on. The nested-loop join's identity broadcast is still Spark's rows
-  (its value is the rows themselves, with no relation to bridge through).
+  bridging and the UI classify on. The nested-loop join reads our exchange too (its identity
+  broadcast; a Spark consumer gets `IdentityBroadcastMode.transform`'s rows through the same bridge),
+  and over Spark's row broadcast builds its table once per executor (`BuildTable.sharedFromRows`).
 
 ### 5.10 The Arrow compatibility layer
 
@@ -816,8 +817,8 @@ benchmarks/scripts/profile-query.sh - vector q6 --flags-only   # the recording f
   reducer; both backends assume executors that stay up for the job -- a push-based service is future
   work through the backend seam.
 - The window operator holds its whole partition in memory (the aggregate, the sort and the shuffled
-  hash join spill). The nested-loop join's build side is Spark's identity broadcast of rows, read into
-  columns once per task; the hash joins' is our columnar broadcast (#325).
+  hash join spill). The broadcast joins' build sides are our columnar broadcast (#325), or Spark's
+  broadcast read into columns once per executor.
 - Not converted (falls back with the reason recorded): `ObjectHashAggregateExec` functions
   (`collect_*`, `percentile_*`, #57); cached tables over non-primitive schemas (#55); nested-type
   accessors and constructors, the lambda families (#50); Python UDFs (#65); the Parquet write path
