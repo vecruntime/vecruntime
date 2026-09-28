@@ -41,9 +41,10 @@ import org.openjdk.jmh.annotations.TearDown;
 import org.openjdk.jmh.annotations.Warmup;
 
 /**
- * {@link SparkColumnVectorBuffers#copy} of a 4096-row BIGINT vector from Spark's Parquet scan into our
- * layout, on heap and off heap, with a share of null rows (#541): the null bytes become a validity bitmap,
- * the values one bulk copy.
+ * {@link SparkColumnVectorBuffers#copy} of a 4096-row BIGINT vector from
+ * Spark's Parquet scan into our layout, on heap and off heap, with a share of
+ * null rows (#541): the null bytes become a validity bitmap, the values one
+ * bulk copy.
  */
 @BenchmarkMode(Mode.Throughput)
 @OutputTimeUnit(TimeUnit.MILLISECONDS)
