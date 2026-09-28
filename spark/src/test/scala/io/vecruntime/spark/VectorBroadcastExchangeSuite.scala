@@ -19,8 +19,13 @@ import io.vecruntime.spark.test.{TestTables, VectorQuerySuite}
 import org.apache.spark.sql.DataFrame
 import org.apache.spark.sql.execution.{ColumnarToRowExec, SparkPlan}
 import org.apache.spark.sql.execution.exchange.BroadcastExchangeExec
-import org.apache.spark.sql.execution.joins.BroadcastHashJoinExec
-import org.apache.spark.sql.vecruntime.{PlanUtils, VectorBroadcastExchangeExec, VectorBroadcastHashJoinExec}
+import org.apache.spark.sql.execution.joins.{BroadcastHashJoinExec, BroadcastNestedLoopJoinExec}
+import org.apache.spark.sql.vecruntime.{
+  PlanUtils,
+  VectorBroadcastExchangeExec,
+  VectorBroadcastHashJoinExec,
+  VectorBroadcastNestedLoopJoinExec
+}
 
 /**
  * The columnar broadcast exchange (#325): a hash-join broadcast over one of our plans travels as
@@ -171,5 +176,39 @@ class VectorBroadcastExchangeSuite extends VectorQuerySuite {
       nodesOf[VectorBroadcastExchangeExec](df).nonEmpty,
       s"the exchange over the aggregate is ours\n${finalPlan(df).treeString}"
     )
+  }
+
+  private val nestedLoopQueries = Seq(
+    "SELECT tk.i, dim.name FROM tk JOIN dim ON tk.i50 < dim.di AND tk.i < 200",
+    "SELECT tk.i, dim.name FROM tk LEFT JOIN dim ON tk.i50 > dim.di + 40 WHERE tk.i < 300",
+    "SELECT i FROM tk WHERE EXISTS (SELECT 1 FROM dim WHERE dim.di > tk.i50 + 45)",
+    "SELECT i FROM tk WHERE NOT EXISTS (SELECT 1 FROM dim WHERE dim.di > tk.i50 + 45)",
+    // The build side pruned to no columns: only its row count matters.
+    "SELECT tk.i FROM tk CROSS JOIN (SELECT di FROM dim WHERE di < 3) d WHERE tk.i < 50"
+  )
+
+  test("a nested-loop join's identity broadcast over our plan is ours, with and without adaptive execution") {
+    Seq(true, false).foreach { aqe =>
+      withConf("spark.sql.adaptive.enabled" -> aqe.toString) {
+        nestedLoopQueries.foreach { q =>
+          val df = checkVectorized(q, Seq(classOf[VectorBroadcastNestedLoopJoinExec], VBX))
+          assert(
+            nodesOf[BroadcastExchangeExec](df).isEmpty,
+            s"a Spark broadcast exchange left (aqe=$aqe): $q\n${finalPlan(df).treeString}"
+          )
+        }
+      }
+    }
+  }
+
+  test("a Spark nested-loop join over our identity broadcast gets Spark's rows (the bridge)") {
+    Seq(true, false).foreach { aqe =>
+      withConf("spark.sql.adaptive.enabled" -> aqe.toString, VectorConf.BroadcastNestedLoopJoinEnabled -> "false") {
+        nestedLoopQueries.foreach { q =>
+          val df = checkVectorized(q, Seq(VBX, classOf[BroadcastNestedLoopJoinExec]))
+          assert(nodesOf[VectorBroadcastNestedLoopJoinExec](df).isEmpty, finalPlan(df).treeString)
+        }
+      }
+    }
   }
 }

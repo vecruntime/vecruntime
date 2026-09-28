@@ -8,6 +8,17 @@ version may change configuration keys or defaults, always noted here.
 
 ### Added
 
+- The columnar broadcast exchange also carries the nested-loop join's broadcast (#325, slice 2):
+  `VectorBroadcastNestedLoopJoinExec` builds its table from the batches, and a Spark nested-loop join
+  over the same exchange gets Spark's array of rows, built from the batches on first use.
+
+### Changed
+
+- The nested-loop join over Spark's row broadcast reads it into columns once per executor, shared by
+  the executor's tasks, instead of once per task.
+
+### Added
+
 - A columnar broadcast exchange for the hash joins (#325, `spark.vecruntime.exec.broadcastExchange.enabled`,
   default on): `VectorBroadcastExchangeExec` broadcasts the build side's batches as Arrow IPC streams and
   `VectorBroadcastHashJoinExec` builds its table from them, so a broadcast join over one of our plans

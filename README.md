@@ -919,6 +919,6 @@ own operators, not ours).
 ## Not in scope (yet)
 
 - A Parquet-to-Arrow reader of our own; Comet's reader covers the zero-copy case.
-- A columnar identity broadcast for the nested-loop join (the hash joins' is ours, #325), a spilling window, TLS for the Flight shuffle server,
+- A spilling window, TLS for the Flight shuffle server,
   and a push-based shuffle service for disposable executors (the `VectorShuffleBackend` seam is
   where it plugs in).
