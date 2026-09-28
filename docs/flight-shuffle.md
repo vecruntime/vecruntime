@@ -31,21 +31,7 @@ messages straight into Arrow vectors the operators read in place. Nothing is a r
 
 ## 2. The pieces
 
-```
- map task (executor A)                                   reduce task (executor B)
- ───────────────────────                                 ─────────────────────────
- VectorShuffleExchangeExec                               VectorShuffleReader.read()
-   │ partition ids (PartitionKernels)                      │ mapOutputTracker: blocks by executor
-   ▼                                                       ├─ local map outputs: file segments
- VectorShuffleWriter                                       │    (dictionary section + range)
-   └─ PartitionedIpcWriter ──► data file + index file      └─ remote executors: one DoGet each
-        [p0 stream][p1 stream]…[dict section][trailer]           │
-                                                                 ▼
- FlightShuffle.Service (one per executor)  ◄──── ticket ── FlightBlockStream (per executor)
-   Producer.getStream:                                       ChunkChannel ─► StreamReader
-     for each mapId: blockData(shuffle, map, [start,end))         decode units ─► ColumnarBatch
-       dictionary section, then the range, in 4 MB chunks
-```
+![The Flight shuffle: on executor A the map task's VectorShuffleExchangeExec computes partition ids, VectorShuffleWriter and PartitionedIpcWriter write one data file (one stream per partition, a dictionary section and a trailer) and an index file; FlightShuffle.Service serves requested ranges in 4 MB chunks. On executor B, VectorShuffleReader.read() asks the mapOutputTracker for the blocks, reads local map outputs straight from disk and sends one Flight DoGet ticket per remote executor; FlightBlockStream feeds the chunks through ChunkChannel and StreamReader into ColumnarBatches](../images/shuffle-diagram.png)
 
 The location of every executor's server travels through Spark's plugin: the executor plugin starts
 the server on the block manager's host and an ephemeral port and registers `executorId -> host:port`
