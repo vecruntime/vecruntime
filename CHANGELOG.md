@@ -19,6 +19,9 @@ version may change configuration keys or defaults, always noted here.
 - Column builders (the joins' build and gather, the sort-merge join's runs) append validity bitmaps and
   BOOL values a 64-bit word at a time instead of a bit at a time (#541): 1.7-2.2x on a nullable INT64
   append, 3.3-4.8x on BOOL.
+- `CASE WHEN` blends its branches a 64-row word at a time (#541): each branch takes the undecided rows
+  its mask wins as one word, validity and BOOL values are whole words, fixed-width values one bulk
+  copy when a branch takes all 64 rows. 8-15x on INT64, 51-80x on BOOL.
 
 ### Added
 
