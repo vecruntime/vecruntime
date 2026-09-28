@@ -259,6 +259,8 @@ object AggregateSpill {
   private[vecruntime] def vectorOf(col: ColumnVector): FieldVector = col match {
     case v: VectorArrowColumnVector => v.getValueVector.asInstanceOf[FieldVector]
     case d: VectorDecimalColumnVector => d.vector()
+    // A tinyint/smallint column rides an INT32 lane in an IntVector (#327).
+    case n: io.vecruntime.spark.arrow.VectorNarrowIntColumnVector => n.vector()
     case other =>
       throw new IllegalStateException(s"a spilled column must be a plain vector, not ${other.getClass.getSimpleName}")
   }
