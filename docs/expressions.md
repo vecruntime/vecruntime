@@ -5,12 +5,12 @@ title: Supported expressions
 
 # Spark expression support
 
-One row per Spark expression: whether vecruntime compiles it, which lane types it accepts, and the
+One row per Spark expression: whether VecRuntime compiles it, which lane types it accepts, and the
 incompatibility that still makes it fall back where one exists. Modelled on Comet's
 [Spark Expression Support](https://datafusion.apache.org/comet/user-guide/latest/expressions.html)
 page; the companion for operators is [docs/operators.md](operators.html).
 
-For the tested-against-Spark subset — the exact cases that run on vecruntime versus fall back, taken
+For the tested-against-Spark subset — the exact cases that run on VecRuntime versus fall back, taken
 from the ported Comet suites — see the [Compatibility matrix](compatibility.html), and
 [Testing & correctness](testing.html) for how it is all validated.
 
