@@ -84,6 +84,33 @@ class SparkColumnVectorBuffersSuite extends SparkVectorFunSuite {
     }
   }
 
+  test("validity is converted eight null bytes at a time on both heap kinds, at any length (#541)") {
+    val rnd = new scala.util.Random(5411)
+    for {
+      rows <- Seq(1, 7, 8, 63, 64, 65, 127, 128, 200, 4096, 4101)
+      density <- Seq(0.0, 0.03, 0.5, 1.0)
+      onHeap <- Seq(true, false)
+    } {
+      val cv: WritableColumnVector =
+        if (onHeap) new OnHeapColumnVector(rows, LongType) else new OffHeapColumnVector(rows, LongType)
+      try {
+        (0 until rows).foreach { i =>
+          if (rnd.nextDouble() < density) cv.putNull(i) else cv.putLong(i, i.toLong)
+        }
+        // A null outside [0, rows): hasNull() is true, every row in range is valid.
+        if (density == 0.0) { cv.putNull(rows - 1); cv.putNotNull(rows - 1) }
+        val arena = Arena.ofConfined()
+        try {
+          val vb = SparkColumnVectorBuffers.copy(cv, rows, arena)
+          val nulls = (0 until rows).count(cv.isNullAt)
+          val where = s"rows=$rows density=$density onHeap=$onHeap"
+          if (nulls == 0) assert(vb.validity() === null, where)
+          (0 until rows).foreach(i => assert(vb.isNull(i) === cv.isNullAt(i), s"$where row $i"))
+        } finally arena.close()
+      } finally cv.close()
+    }
+  }
+
   test("dictionary-encoded string vectors copy as indices plus the referenced dictionary values") {
     val values = Array("A", "N", "R", "unused")
     val dictionary = new org.apache.spark.sql.execution.vectorized.Dictionary {
