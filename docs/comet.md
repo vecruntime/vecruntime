@@ -5,7 +5,7 @@ title: Comet as the scan
 
 # Using Comet as the scan
 
-vecruntime accelerates Filter, Project and HashAggregate. It does not read Parquet itself: it
+VecRuntime accelerates Filter, Project and HashAggregate. It does not read Parquet itself: it
 consumes whatever columnar batches sit below it. Two sources work out of the box:
 
 | Source | How batches are read | Notes |
@@ -14,7 +14,7 @@ consumes whatever columnar batches sit below it. Two sources work out of the box
 | Apache DataFusion Comet scan (`CometScanExec` / `CometBatchScanExec`) | zero copy: the Arrow buffers Comet's native reader produced are wrapped as `MemorySegment`s | dictionary-encoded strings stay encoded, so `GROUP BY` string keys hash the dictionary once per batch |
 
 Comet is used in *scan-only* mode: its native Parquet-to-Arrow reader replaces Spark's, its native
-operators stay off, and vecruntime's JVM SIMD operators run above the scan. Optionally Comet's
+operators stay off, and VecRuntime's JVM SIMD operators run above the scan. Optionally Comet's
 native shuffle carries the partial aggregates too (see below). Comet 1.0 only ships
 the fully native DataFusion scan (`CometNativeScanExec`), which needs `spark.comet.exec.enabled=true`
 and off-heap memory; "scan-only" therefore means enabling exec and switching every Comet operator
@@ -39,7 +39,7 @@ off individually (`io.vecruntime.benchmarks.TpchRunner.CometScanOnly` lists the 
 --jars comet-spark-spark4.1_2.13-1.0.0.jar,vecruntime-spark_2.13-0.0.3.jar
 ```
 
-List Comet's plugin first: session extensions run in registration order, and vecruntime's
+List Comet's plugin first: session extensions run in registration order, and VecRuntime's
 planner rule needs to see `CometScanExec` already in place. Nothing else is Comet-specific: the rule
 treats any child with `supportsColumnar = true` and supported column types as an input, and the
 Comet vector adapter (`io.vecruntime.spark.comet.CometVectorAdapter`) registers itself on first
@@ -57,7 +57,7 @@ Add to the configuration above:
 ```
 
 Comet's planner will not hand a Comet shuffle to a columnar child it does not recognise, and its
-row-based "columnar" shuffle would convert our batches to rows and back. vecruntime's rule
+row-based "columnar" shuffle would convert our batches to rows and back. VecRuntime's rule
 therefore rewrites any exchange (Spark's, or the one Comet chose) sitting on one of its operators
 into Comet's *native* shuffle over `VectorToCometExec`, which is the one piece of glue: each column
 of our batch is exported through the Arrow C Data Interface and imported by Comet's Arrow.
@@ -89,7 +89,7 @@ still take the copy path.
 
 The Comet jars on Maven Central bundle native libraries for Linux only. On macOS build Comet from
 source once (Rust toolchain, `protoc` and JDK 17 needed for the build; the resulting jar runs on
-JDK 25 with vecruntime):
+JDK 25 with VecRuntime):
 
 ```bash
 brew install protobuf
@@ -267,7 +267,7 @@ by more than twice the crossing of the columns it touches.
 - Comet's `LargeVarCharVector` (64-bit offsets) is not adapted zero-copy; such columns fall back to
   the copying adapter.
 - Batch lifecycle follows Spark's columnar contract: Comet may reuse or release a batch as soon as
-  the next one is requested, so vecruntime operators finish with a batch (or copy what they
+  the next one is requested, so VecRuntime operators finish with a batch (or copy what they
   keep, as the aggregate does) before pulling the next.
 - Comet's native operators other than the scan and the shuffle are not combined with ours: a Comet
   Final aggregate would need Comet's own partial buffers (its `missingCometProducer` guard), and our

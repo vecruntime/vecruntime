@@ -1,12 +1,12 @@
 ---
 layout: default
 title: Testing & correctness
-description: How vecruntime's correctness is established — Spark's SQL golden suite and its coverage floor, the ported Comet matrices, the project's own suites, and the benchmark checksums.
+description: How VecRuntime's correctness is established — Spark's SQL golden suite and its coverage floor, the ported Comet matrices, the project's own suites, and the benchmark checksums.
 ---
 
 # Testing & correctness
 
-vecruntime accelerates Spark by replacing operators, so "correct" means one thing: **the accelerated
+VecRuntime accelerates Spark by replacing operators, so "correct" means one thing: **the accelerated
 query returns Spark's result.** Every layer below establishes that by running the same query with the
 plugin on and off (or against Spark's own golden files) and comparing. There is no silent fallback —
 an operator that cannot be accelerated stays on Spark with a recorded reason, and the suites assert on
@@ -15,7 +15,7 @@ those reasons too.
 ## 1. Spark's own SQL golden-file suite
 
 The `spark-sql-tests` module runs Apache Spark's `SQLQueryTestSuite` — the `.sql` inputs and
-`.sql.out` golden files unpacked from the `spark-sql` tests jar — with vecruntime's session extension
+`.sql.out` golden files unpacked from the `spark-sql` tests jar — with VecRuntime's session extension
 injected (`VectorSQLQueryTestSuite`). Every golden result must still match, whether an operator was
 converted or left to Spark. This is Comet's own self-validation strategy applied here.
 
@@ -37,11 +37,11 @@ demand through `benchmarks/scripts/run-spark-sql-tests.sh`.
   `SQL_TESTS_EXCLUDE='^$'` runs the excluded files anyway.
 - **The coverage floor.** Passing is the low bar — a file passes just as well when *every* operator
   falls back. So the run also records, per test case, how many query executions ran at least one
-  vecruntime operator, and a **full run compares those counts with the checked-in floor**,
+  VecRuntime operator, and a **full run compares those counts with the checked-in floor**,
   `spark-sql-tests/src/test/resources/vector-sql-coverage.tsv` (#17). A case whose accelerated count
   dropped **fails the suite**, naming the case, because a fallback introduced by a planner change is
   otherwise invisible. Cases above the floor are listed; `SQL_TESTS_UPDATE_BASELINE=true` rewrites it.
-  The checked-in floor covers 584 test cases: 164 run at least one vecruntime operator (4,219
+  The checked-in floor covers 584 test cases: 164 run at least one VecRuntime operator (4,219
   accelerated executions in total; the full run on 0.0.2 measured 4,231 of 33,856), and 420 never can
   (analyzer-only cases, DDL, files with no supported operator). A filtered run
   (a name regex as the first argument) skips the floor comparison.
@@ -67,8 +67,8 @@ Requires `JAVA_HOME` on a JDK 25 and the plugin installed in `~/.m2`.
 ## 2. Ported DataFusion Comet test matrices
 
 Five suites port DataFusion Comet's own expression, cast, aggregate, join and window test matrices to
-vecruntime's plugin-on/off comparison model. Each case runs the query twice on one session with
-`spark.vecruntime.enabled` toggled, compares the rows against Spark, and asserts either the vecruntime
+VecRuntime's plugin-on/off comparison model. Each case runs the query twice on one session with
+`spark.vecruntime.enabled` toggled, compares the rows against Spark, and asserts either the VecRuntime
 operator's presence (`checkVectorized`) or the fallback and its recorded reason (`checkFallback`):
 
 - `VectorPortedCometExprSuite` — expressions (#497)
@@ -80,7 +80,7 @@ operator's presence (`checkVectorized`) or the fallback and its recorded reason 
 The full row-by-row result — what is accelerated and what falls back with which reason — is the
 [Compatibility matrix](compatibility.html).
 
-## 3. vecruntime's own suites
+## 3. VecRuntime's own suites
 
 Validation the project maintains directly (all on JDK 25):
 
@@ -110,7 +110,7 @@ that is faster but wrong fails. This holds through the 1 TB TPC-DS campaign and 
 
 The one recorded exception is **q65**: its `ORDER BY s_store_name, i_item_desc LIMIT 100` has ties at
 scale, so the 100 returned rows follow physical order and the checksum differs across *every* engine —
-Spark against Comet included — not a vecruntime discrepancy. (q64's zero-row result is a separate,
+Spark against Comet included — not a VecRuntime discrepancy. (q64's zero-row result is a separate,
 intermittent dynamic-partition-pruning timing issue, also documented there.)
 
 ## 5. Running everything locally

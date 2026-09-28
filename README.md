@@ -1,14 +1,14 @@
-# vecruntime
+# VecRuntime
 
 **A vectorized execution runtime for Apache Spark using Java**
 
-vecruntime accelerates Spark SQL workloads by executing core operators directly on **Arrow-layout columnar batches** using the **Java Vector API**, bringing SIMD-optimized execution to the JVM without native libraries, JNI, or serialization boundaries.
+VecRuntime accelerates Spark SQL workloads by executing core operators directly on **Arrow-layout columnar batches** using the **Java Vector API**, bringing SIMD-optimized execution to the JVM without native libraries, JNI, or serialization boundaries.
 
-Inspired by the execution architecture of Apache DataFusion Comet, vecruntime provides a native-style execution path for **Filter, Project, HashAggregate, Sort, Window (`ROWS` and `RANGE` frames), Range, Expand, Generate, Union and the hash, sort-merge and nested-loop joins**, while preserving Spark as the execution fallback for unsupported operators, expressions, and data types.
+Inspired by the execution architecture of Apache DataFusion Comet, VecRuntime provides a native-style execution path for **Filter, Project, HashAggregate, Sort, Window (`ROWS` and `RANGE` frames), Range, Expand, Generate, Union and the hash, sort-merge and nested-loop joins**, while preserving Spark as the execution fallback for unsupported operators, expressions, and data types.
 
 The result is a **fully JVM-based execution engine** that combines the performance potential of vectorized execution with the portability and simplicity of the Java ecosystem.
 
-vecruntime can also integrate with native accelerators such as **Apache DataFusion Comet**: Comet can provide native Parquet decoding and shuffle, while vecruntime performs the intermediate SQL execution directly over the same columnar representation, enabling a **zero-copy execution pipeline** across the stack.
+VecRuntime can also integrate with native accelerators such as **Apache DataFusion Comet**: Comet can provide native Parquet decoding and shuffle, while VecRuntime performs the intermediate SQL execution directly over the same columnar representation, enabling a **zero-copy execution pipeline** across the stack.
 
 ### Key characteristics
 
@@ -20,7 +20,7 @@ vecruntime can also integrate with native accelerators such as **Apache DataFusi
 * **Zero-copy integration:** designed to interoperate with columnar native components such as Comet without serialization between execution stages.
 * **Incremental adoption:** operators can be accelerated individually while the rest of the Spark plan continues to execute normally.
 
-In essence, **vecruntime brings a DataFusion-Comet/Velox-style vectorized execution model to the JVM, using the Java Vector API instead of native code.**
+In essence, **VecRuntime brings a DataFusion-Comet/Velox-style vectorized execution model to the JVM, using the Java Vector API instead of native code.**
 
 ## Status
 
@@ -36,7 +36,7 @@ window per engine, all queries once, the median of the measured iteration
 | Spark 4.1.3 | 3309 s | -- | 20 GB heap / 30 GB overhead; the reference |
 | Apache DataFusion Comet 1.0 | 2514 s | 90 | native scan, operators and shuffle |
 | Comet's scan + our operators and shuffle | 2706 s | 67 | `spark.comet.scan.impl=native_datafusion` |
-| **vecruntime** (Spark's scan, our operators, our Flight shuffle) | **2557 s** | **82** | 30 GB heap / 20 GB overhead; 23% under Spark, 2% over Comet |
+| **VecRuntime** (Spark's scan, our operators, our Flight shuffle) | **2557 s** | **82** | 30 GB heap / 20 GB overhead; 23% under Spark, 2% over Comet |
 
 Where the plugin wins it is the joins and aggregates (q23a 118 s against Spark's 211 and Comet's
 132; q23b 125 against 291 and 153; q93 66 against 137 and 85; q64 51 against 93 and 56). Where it
@@ -44,11 +44,11 @@ loses it is the scan-bound queries (q88 142 against Spark's 126) and a handful o
 (q99, q36, q12, q57), each with its cause named in `docs/results.md`. Every checksum equals Spark's
 except q65, whose result has ties that every engine orders differently.
 
-The same comparison as a page with per-query charts: [Apache Spark vs vecruntime vs DataFusion Comet on
+The same comparison as a page with per-query charts: [Apache Spark vs VecRuntime vs DataFusion Comet on
 TPC-DS 1 TB](https://vecruntime.github.io/vecruntime/benchmarks/tpcds-1tb.html) (rendered from the result
 files by `benchmarks/scripts/render-benchmark-page.py`; the source is `docs/benchmarks/tpcds-1tb.html`).
 On AWS Graviton4 (arm64), with AQE at its defaults for both engines, the TPC-DS 1 TB comparison against Spark is 1.23x (x86 at the earlier 128m settings: 1.29x):
-[Apache Spark vs vecruntime on TPC-DS 1 TB, AWS Graviton4](https://vecruntime.github.io/vecruntime/benchmarks/tpcds-1tb-graviton.html).
+[Apache Spark vs VecRuntime on TPC-DS 1 TB, AWS Graviton4](https://vecruntime.github.io/vecruntime/benchmarks/tpcds-1tb-graviton.html).
 
 Requirements and the things it does not do yet are listed under
 [Requirements and known limitations](#requirements-and-known-limitations); every configuration key
@@ -109,7 +109,7 @@ account or token needed:
 ```
 
 The same coordinates work with `--packages` on `spark-submit`, `spark-shell`, `pyspark` and `spark-sql`,
-together with `--repositories` (only the vecruntime jars are downloaded; everything else is `provided`):
+together with `--repositories` (only the VecRuntime jars are downloaded; everything else is `provided`):
 
 ```bash
 spark-submit \
@@ -376,7 +376,7 @@ ShuffleExchange   -> CometShuffleExchange        Arrow C Data export -> CometVec
 
 `VectorColumnarRule` runs in Spark's `preColumnarTransitions`, bottom-up. An operator is converted
 when its child is already columnar with supported types (a vectorized Parquet scan, a Comet scan, or
-another vecruntime operator) and every expression compiles to the kernel IR. Otherwise the reason
+another VecRuntime operator) and every expression compiles to the kernel IR. Otherwise the reason
 is stored as a tree-node tag; `VectorFallback.reasons(plan)` lists them.
 
 ### The Vector Acceleration tab
@@ -881,7 +881,7 @@ converted or not. Run it on demand, whole or by a regex over test-case names:
 The site documents this end to end: [Testing & correctness](https://vecruntime.github.io/vecruntime/testing.html)
 covers the golden suite, the ported Comet matrices and the benchmark checksums, and the
 [Compatibility matrix](https://vecruntime.github.io/vecruntime/compatibility.html) lists what runs on
-vecruntime versus falls back, row by row.
+VecRuntime versus falls back, row by row.
 
 ```bash
 benchmarks/scripts/run-spark-sql-tests.sh                 # everything
@@ -895,7 +895,7 @@ whose golden output is Spark's own physical plan, the DataSketches files (`hll`,
 `thetasketch`), whose library refuses to start on any JDK newer than 21, and `udtf/udtf.sql`, which
 needs `pyspark` installed (the Python UDF variants skip themselves without it and count as ignored).
 Everything else passes: 642 test cases, 111 ignored, with 4231 of the 33856 query executions running
-at least one vecruntime operator. Passing is the low bar -- a file passes just as well when every
+at least one VecRuntime operator. Passing is the low bar -- a file passes just as well when every
 operator falls back -- so the run also prints a per-test-case table (executions, executions that ran
 one of our operators, operators) split into the 164 cases that run our operators and the 420 that never
 can (analyzer-only cases, DDL, files with no supported operator), and a full run compares every case

@@ -1,15 +1,15 @@
 ---
 layout: default
 title: Compatibility matrix (tested against Spark)
-description: What runs on vecruntime and what falls back, taken row by row from the ported DataFusion Comet test matrices.
+description: What runs on VecRuntime and what falls back, taken row by row from the ported DataFusion Comet test matrices.
 ---
 
 # Compatibility matrix (tested against Spark)
 
-Each row is a test that runs the same query **with vecruntime on and off** and compares the results
+Each row is a test that runs the same query **with VecRuntime on and off** and compares the results
 with Spark's — identical rows (doubles at tolerance `1e-9`, since SIMD reductions reorder
-floating-point additions), and the expected vecruntime operator asserted in the final post-AQE plan.
-A row marked **✓** means the query ran on a vecruntime operator and matched Spark; a row marked
+floating-point additions), and the expected VecRuntime operator asserted in the final post-AQE plan.
+A row marked **✓** means the query ran on a VecRuntime operator and matched Spark; a row marked
 **falls back** means the planner declined it, the query stayed on Spark, and the test asserts the
 recorded fallback reason. A **known gap** is a case the suite marks `ignore`.
 
