@@ -22,6 +22,8 @@ version may change configuration keys or defaults, always noted here.
 - `CASE WHEN` blends its branches a 64-row word at a time (#541): each branch takes the undecided rows
   its mask wins as one word, validity and BOOL values are whole words, fixed-width values one bulk
   copy when a branch takes all 64 rows. 8-15x on INT64, 51-80x on BOOL.
+- Adapting a Spark column turns its null bytes into the validity bitmap eight bytes per read and one
+  bitmap word per 64 rows, straight into the bitmap (#541): 1.6-3.7x on a 4096-row BIGINT vector.
 
 ### Added
 

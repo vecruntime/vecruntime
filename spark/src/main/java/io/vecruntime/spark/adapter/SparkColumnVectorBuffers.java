@@ -18,8 +18,11 @@ package io.vecruntime.spark.adapter;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
 import java.lang.reflect.Field;
 import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.util.Arrays;
 
 import io.vecruntime.kernels.ArrowLayout;
@@ -259,55 +262,100 @@ public final class SparkColumnVectorBuffers {
         return SegmentVectorBuffers.fixedWidth(VecType.DECIMAL128, numRows, validity, data);
     }
 
+    // Spark keeps one null byte per row; the bitmap takes one bit. Converting eight bytes per read and
+    // writing one bitmap word per 64 rows replaced a byte-per-row loop into a heap byte[] plus a copy
+    // (#398), and on the off-heap path a checked read and a Bitmap.set per row: ~2.7% of executor
+    // samples at 1 TB (#541).
+    private static final VarHandle LONGS_OF_BYTES = MethodHandles.byteArrayViewVarHandle(long[].class, ByteOrder.LITTLE_ENDIAN);
+
+    /**
+     * Validity bits of eight rows from their eight null bytes (little-endian,
+     * byte {@code j} = row {@code j}): bit {@code j} is set when byte {@code j}
+     * is zero, i.e. the row is not null. Any non-zero byte counts as null, not
+     * just 1.
+     */
+    static int validByte(long nullBytes) {
+        long nz = nullBytes | (nullBytes >>> 4);
+        nz |= nz >>> 2;
+        nz |= nz >>> 1;
+        long valid = ~nz & 0x0101010101010101L;
+        // Gathers bit 0 of byte j into bit 56 + j.
+        return (int) ((valid * 0x0102040810204080L) >>> 56);
+    }
+
+    /**
+     * The validity word of rows {@code [base, base + 64)} from a heap null
+     * array, all 64 present.
+     */
+    private static long heapWord(byte[] nulls, int base) {
+        long w = 0L;
+        for (int j = 0; j < 8; j++) {
+            w |= (long) validByte((long) LONGS_OF_BYTES.get(nulls, base + (j << 3))) << (j << 3);
+        }
+        return w;
+    }
+
+    /** The same from native null bytes. */
+    private static long nativeWord(MemorySegment nulls, int base) {
+        long w = 0L;
+        for (int j = 0; j < 8; j++) {
+            w |= (long) validByte(nulls.get(ValueLayout.JAVA_LONG_UNALIGNED, base + (j << 3))) << (j << 3);
+        }
+        return w;
+    }
+
     private static MemorySegment copyValidity(ColumnVector cv, int numRows, Arena arena) {
         if (!cv.hasNull()) {
             return null;
         }
-        MemorySegment validity = ArrowLayout.allocateBitmap(arena, numRows);
-        boolean any = false;
-        byte[] nulls = heapNulls(cv, numRows);
-        if (nulls != null && nulls.length >= numRows) {
-            // The bitmap is built on the heap, eight rows per byte, and copied out once: one Bitmap.set
-            // per row -- a segment read-modify-write with its checks -- was 18% of an executor's time in
-            // q8 at SF10 (#398).
-            byte[] bits = new byte[(numRows + 7) >>> 3];
-            int nullCount = 0;
-            int i = 0;
-            for (; i + 8 <= numRows; i += 8) {
-                int b = 0;
-                for (int j = 0; j < 8; j++) {
-                    if (nulls[i + j] == 0) {
-                        b |= 1 << j;
-                    } else {
-                        nullCount++;
-                    }
-                }
-                bits[i >>> 3] = (byte) b;
-            }
-            for (; i < numRows; i++) {
-                if (nulls[i] == 0) {
-                    bits[i >>> 3] |= (byte) (1 << (i & 7));
-                } else {
-                    nullCount++;
-                }
-            }
-            if (nullCount == 0) {
-                return null;
-            }
-            MemorySegment.copy(bits, 0, validity, ValueLayout.JAVA_BYTE, 0, bits.length);
-            return validity;
+        byte[] heap = heapNulls(cv, numRows);
+        if (heap != null && heap.length < numRows) {
+            heap = null;
         }
-        MemorySegment nativeNulls = cv instanceof OffHeapColumnVector ? nativeSegment(OFFHEAP_NULLS, cv, numRows) : null;
-        for (int i = 0; i < numRows; i++) {
-            boolean isNull = nativeNulls != null ? nativeNulls.get(ValueLayout.JAVA_BYTE, i) != 0 : cv.isNullAt(i);
-            if (isNull) {
-                any = true;
-            } else {
-                Bitmap.set(validity, i);
+        MemorySegment nativeNulls = heap == null && cv instanceof OffHeapColumnVector
+                ? nativeSegment(OFFHEAP_NULLS, cv, numRows)
+                : null;
+        MemorySegment validity = ArrowLayout.allocateBitmap(arena, numRows);
+        int full = numRows >>> 6;
+        long nulls = 0L;
+        for (int w = 0; w < full; w++) {
+            long word = heap != null
+                    ? heapWord(heap, w << 6)
+                    : nativeNulls != null ? nativeWord(nativeNulls, w << 6) : rowWord(cv, w << 6, 64);
+            nulls += 64 - Long.bitCount(word);
+            validity.setAtIndex(ValueLayout.JAVA_LONG_UNALIGNED, w, word);
+        }
+        int tail = numRows & 63;
+        if (tail != 0) {
+            int base = full << 6;
+            long word = 0L;
+            for (int i = 0; i < tail; i++) {
+                boolean isNull = heap != null
+                        ? heap[base + i] != 0
+                        : nativeNulls != null ? nativeNulls.get(ValueLayout.JAVA_BYTE, base + i) != 0 : cv.isNullAt(base + i);
+                if (!isNull) {
+                    word |= 1L << i;
+                }
             }
+            nulls += tail - Long.bitCount(word);
+            Bitmap.setWord(validity, full, numRows, word);
         }
         // hasNull() may be conservative (e.g. nulls outside [0, numRows)); drop an all-valid bitmap.
-        return any ? validity : null;
+        return nulls == 0 ? null : validity;
+    }
+
+    /**
+     * A validity word through {@code isNullAt}, for vectors whose null storage
+     * we cannot read.
+     */
+    private static long rowWord(ColumnVector cv, int base, int count) {
+        long word = 0L;
+        for (int i = 0; i < count; i++) {
+            if (!cv.isNullAt(base + i)) {
+                word |= 1L << i;
+            }
+        }
+        return word;
     }
 
     /**
