@@ -94,6 +94,21 @@ object VectorFallback {
 /** Registered through SparkSessionExtensions.injectColumnar. */
 case class VectorColumnarRule(session: SparkSession) extends ColumnarRule {
   override def preColumnarTransitions: Rule[SparkPlan] = VectorExecRule(session)
+
+  /**
+   * A `ColumnarToRow` over our columnar broadcast is never valid: a broadcast is read with
+   * `executeBroadcast`, not row by row. The transitions insert one when a Spark join reads our
+   * exchange through a node that does not report row-based support (a reused exchange, which
+   * mirrors its child's columnar flag only); dropping it leaves the join calling `executeBroadcast`,
+   * which our exchange answers with Spark's relation (#325).
+   */
+  override def postColumnarTransitions: Rule[SparkPlan] = new Rule[SparkPlan] {
+    override def apply(plan: SparkPlan): SparkPlan = plan.transformUp {
+      case c: org.apache.spark.sql.execution.ColumnarToRowExec
+          if VectorBroadcastExchangeExec.unapply(c.child).isDefined =>
+        c.child
+    }
+  }
 }
 
 /**
@@ -205,6 +220,19 @@ case class VectorExecRule(session: SparkSession) extends Rule[SparkPlan] with Lo
         // batches, so the operators above convert from the source (over Spark's row leaf they could not).
         case r: RangeExec if VectorConf.rangeEnabled(conf) =>
           VectorRangePlanner.plan(r).fold(reason => fallback(r, reason), v => v)
+
+        // The hash-join broadcast over one of our plans (#325): its batches are broadcast as they are.
+        // An identity broadcast (the nested-loop join's rows) stays Spark's: its value is an array of
+        // rows every consumer reads directly, with nothing to bridge a Spark consumer through. Under the
+        // Comet mixed pass the exchange stays Spark's too: that pass offers Comet the join above it
+        // together with a Spark broadcast exchange, the only kind Comet converts.
+        case b: BroadcastExchangeExec
+            if VectorConf.broadcastExchangeEnabled(conf) && !VectorConf.cometMixedEnabled(conf) &&
+              b.mode.isInstanceOf[org.apache.spark.sql.execution.joins.HashedRelationBroadcastMode] &&
+              (ours(b.child) || b.child.supportsColumnar) && laneTypeReason(b.child).isEmpty =>
+          // Over our plan, or a columnar source (Spark's vectorized scan): its batches are read through the
+          // adapter seam as any input of ours is; every column needs a lane, as the join's build side does.
+          VectorBroadcastExchangeExec(b.mode, b.child)
 
         case l: LocalLimitExec if VectorConf.limitEnabled(conf) =>
           laneInputReason(l.child) match {

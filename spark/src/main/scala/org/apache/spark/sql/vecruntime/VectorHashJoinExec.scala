@@ -145,9 +145,10 @@ final case class JoinSpec(
 )
 
 /**
- * Columnar replacement for BroadcastHashJoinExec. The build side is Spark's own broadcast
- * `HashedRelation` (the exchange stays Spark's), read once per task into columns; the streamed side
- * must be columnar.
+ * Columnar replacement for BroadcastHashJoinExec; the streamed side must be columnar. The build side
+ * is our columnar broadcast when the exchange below is ours ([[VectorBroadcastExchangeExec]], #325):
+ * the table is built from its batches, once per executor. Otherwise it is Spark's own broadcast
+ * `HashedRelation`, read once per executor into columns.
  */
 case class VectorBroadcastHashJoinExec(
     leftKeys: Seq[Expression],
@@ -181,6 +182,21 @@ case class VectorBroadcastHashJoinExec(
   override protected def doExecuteColumnar(): RDD[ColumnarBatch] = {
     val spec = joinSpec
     val m = vectorMetrics
+    buildPlan match {
+      case VectorBroadcastExchangeExec(e) =>
+        val batches = e.executeVectorBroadcast()
+        val nullAware = isNullAwareAntiJoin
+        return streamedPlan.executeColumnar().mapPartitionsInternal { iter =>
+          // The broadcast value stays referenced by this closure for the task's lifetime, which keeps
+          // the shared table (keyed on it) alive; see BuildTable.sharedFromBroadcast.
+          val build = BuildTable.sharedFromBroadcast(batches.value, spec)
+          // Spark's null-aware relation is a singleton with no rows when the build side holds a null
+          // key: `x NOT IN (..., NULL)` is never true, so the anti join keeps nothing.
+          if (nullAware && build.anyNullKey) Iterator.empty
+          else new VectorHashJoinIterator(iter, build, spec, m)
+        }
+      case _ =>
+    }
     val relation = buildPlan.executeBroadcast[Any]()
     streamedPlan.executeColumnar().mapPartitionsInternal { iter =>
       // A null-aware anti join whose build side held a null key keeps nothing: `x NOT IN (..., NULL)`
@@ -312,6 +328,9 @@ final class BuildTable(
   /** First build row of each key, -1 for none. */
   var head: Array[Int] = new Array[Int](0)
 
+  /** Whether some build row has a null key (the null-aware anti join's empty regime). */
+  var anyNullKey: Boolean = false
+
   /** Next build row with the same key, -1 at the end. */
   val next: Array[Int] = new Array[Int](numRows)
 
@@ -357,7 +376,9 @@ final class BuildTable(
       val ctx = new EvalContext(arena, numRows, c => columns(c))
       val keys = spec.buildKeys.map(_.eval(ctx))
       val ids = new Array[Int](numRows)
-      val groups = table.assign(keys, numRows, ids, BuildTable.nonNullKeys(ctx, keys))
+      val valid = BuildTable.nonNullKeys(ctx, keys)
+      anyNullKey = valid != null && BuildTable.popCount(valid, numRows) < numRows
+      val groups = table.assign(keys, numRows, ids, valid)
       head = Array.fill(groups)(-1)
       // Walk backwards so chains list rows in build order, like Spark's relation does.
       var i = numRows - 1
@@ -385,7 +406,10 @@ final class BuildTable(
   }
 
   /** A shared table (a broadcast relation's, used by every task of the executor) outlives its tasks. */
-  override def close(): Unit = if (!shared) {
+  override def close(): Unit = if (!shared) release()
+
+  /** Frees the table's memory: `close()` for a task's own table, the owner's cleaner for a shared one. */
+  def release(): Unit = {
     arena.close()
     if (builders != null) builders.foreach(_.close())
   }
@@ -407,8 +431,16 @@ object BuildTable {
     mask
   }
 
-  /** The build side from columnar batches (shuffled hash join). */
-  def fromBatches(batches: Iterator[ColumnarBatch], spec: JoinSpec): BuildTable = {
+  /** The number of set bits among the first `n` of `bitmap`. */
+  private[vecruntime] def popCount(bitmap: MemorySegment, n: Int): Int = {
+    var c = 0
+    var i = 0
+    while (i < n) { if (io.vecruntime.kernels.Bitmap.isSet(bitmap, i)) c += 1; i += 1 }
+    c
+  }
+
+  /** The build side from columnar batches (shuffled hash join; a columnar broadcast, shared). */
+  def fromBatches(batches: Iterator[ColumnarBatch], spec: JoinSpec, shared: Boolean = false): BuildTable = {
     val arena = Arena.ofShared()
     // Owning builders: a grown-out buffer is released at once, not with the arena (#416).
     val builders = spec.buildTypes.map(dt => ColumnBuilder.owning(TypeMapping.vecTypeOf(dt), 4096))
@@ -423,7 +455,7 @@ object BuildTable {
         }
       }
     }
-    new BuildTable(arena, builders.map(_.view()), total, spec, builders = builders).build()
+    new BuildTable(arena, builders.map(_.view()), total, spec, shared, builders).build()
   }
 
   /**
@@ -458,7 +490,14 @@ object BuildTable {
   private val sharedTables = new java.util.WeakHashMap[AnyRef, java.util.HashMap[String, BuildTable]]()
   private val cleaner = java.lang.ref.Cleaner.create()
 
-  def sharedFromRelation(relation: AnyRef, spec: JoinSpec): BuildTable = {
+  def sharedFromRelation(relation: AnyRef, spec: JoinSpec): BuildTable =
+    shared(relation, spec)(fromRelation(HashedRelationAccess.rows(relation), spec, shared = true))
+
+  /** The same, from our columnar broadcast (#325): the table is built from its batches, no row pass. */
+  def sharedFromBroadcast(relation: VectorBroadcastBatches, spec: JoinSpec): BuildTable =
+    shared(relation, spec)(fromBatches(relation.batches(), spec, shared = true))
+
+  private def shared(relation: AnyRef, spec: JoinSpec)(make: => BuildTable): BuildTable = {
     val perRelation = sharedTables.synchronized {
       var m = sharedTables.get(relation)
       if (m == null) { m = new java.util.HashMap[String, BuildTable](); sharedTables.put(relation, m) }
@@ -469,9 +508,9 @@ object BuildTable {
     perRelation.synchronized {
       var t = perRelation.get(key)
       if (t == null) {
-        t = fromRelation(HashedRelationAccess.rows(relation), spec, shared = true)
-        val arena = t.arena
-        cleaner.register(relation, () => arena.close())
+        t = make
+        val table = t
+        cleaner.register(relation, () => table.release())
         perRelation.put(key, t)
       }
       t
