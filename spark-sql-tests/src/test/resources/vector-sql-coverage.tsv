@@ -422,7 +422,7 @@ subquery/scalar-subquery/scalar-subquery-group-by.sql	26	7	41
 subquery/scalar-subquery/scalar-subquery-group-by.sql_analyzer_test	8	0	0
 subquery/scalar-subquery/scalar-subquery-predicate.sql	67	39	303
 subquery/scalar-subquery/scalar-subquery-predicate.sql_analyzer_test	8	0	0
-subquery/scalar-subquery/scalar-subquery-select.sql	55	22	91
+subquery/scalar-subquery/scalar-subquery-select.sql	55	22	92
 subquery/scalar-subquery/scalar-subquery-select.sql_analyzer_test	11	0	0
 subquery/scalar-subquery/scalar-subquery-set-op.sql	56	33	404
 subquery/scalar-subquery/scalar-subquery-set-op.sql_analyzer_test	3	0	0
