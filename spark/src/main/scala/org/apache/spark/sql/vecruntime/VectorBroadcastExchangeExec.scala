@@ -139,11 +139,17 @@ object VectorBroadcastBatches {
             if (n > 0) {
               var c = 0
               while (c < types.length) {
-                val col =
-                  if (ctx.selection == null) ArrowOutput.copy(names(c), types(c), ctx.input(c), allocator)
-                  else ArrowOutput.compact(names(c), types(c), ctx.input(c), ctx.selection, n, allocator)
-                try AggregateSpill.vectorOf(col).makeTransferPair(root.getVector(c)).transfer()
-                finally col.close()
+                // A dictionary-encoded string column is decoded first: the stream carries plain vectors.
+                val raw = ctx.input(c)
+                val arena = if (raw.isDictionaryEncoded) java.lang.foreign.Arena.ofConfined() else null
+                try {
+                  val in = if (arena == null) raw else ArrowOutput.decodeDictionary(raw, arena)
+                  val col =
+                    if (ctx.selection == null) ArrowOutput.copy(names(c), types(c), in, allocator)
+                    else ArrowOutput.compact(names(c), types(c), in, ctx.selection, n, allocator)
+                  try AggregateSpill.vectorOf(col).makeTransferPair(root.getVector(c)).transfer()
+                  finally col.close()
+                } finally if (arena != null) arena.close()
                 c += 1
               }
               root.setRowCount(n)

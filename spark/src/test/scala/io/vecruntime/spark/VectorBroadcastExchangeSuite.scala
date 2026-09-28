@@ -161,4 +161,15 @@ class VectorBroadcastExchangeSuite extends VectorQuerySuite {
       Seq()
     )
   }
+
+  test("a dictionary-encoded string build side (an aggregate's keys, #377) is decoded into the broadcast") {
+    val q = "SELECT tk.i, a.s, a.n FROM tk JOIN (SELECT s, count(*) AS n FROM tk GROUP BY s) a ON tk.s = a.s"
+    checkVectorized(q, Seq())
+    val df = spark.sql(q)
+    df.collect()
+    assert(
+      nodesOf[VectorBroadcastExchangeExec](df).nonEmpty,
+      s"the exchange over the aggregate is ours\n${finalPlan(df).treeString}"
+    )
+  }
 }
