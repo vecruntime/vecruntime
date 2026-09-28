@@ -237,22 +237,12 @@ public final class ColumnBuilder implements AutoCloseable {
         switch (type) {
             case UTF8 -> appendUtf8(in, selection, start);
             case BOOL -> {
+                // The values are a bitmap too: appended word at a time, as the validity (#541).
                 if (selection == null) {
-                    for (int i = 0; i < count; i++) {
-                        Bitmap.setTo(data, start + i, in.getBoolean(i));
-                    }
+                    Bitmap.copyBits(in.data(), data, start, count);
                 } else {
-                    int o = start;
-                    for (int w = 0, words = Bitmap.wordsFor(in.length());
-                         w < words;
-                         w++) {
-                        long bits = Bitmap.wordAt(selection, w, in.length());
-                        while (bits != 0L) {
-                            int i = (w << 6) + Long.numberOfTrailingZeros(bits);
-                            bits &= bits - 1;
-                            Bitmap.setTo(data, o++, in.getBoolean(i));
-                        }
-                    }
+                    Bitmap.appendSelectedBits(in.data(), selection, in.length(), data,
+                            start);
                 }
             }
             default -> {
@@ -279,29 +269,16 @@ public final class ColumnBuilder implements AutoCloseable {
         if (validity == null) {
             return;
         }
+        // Word at a time (#541): bit by bit, every row paid a checked byte read and write.
         if (!in.hasNulls()) {
-            for (int i = 0; i < count; i++) {
-                Bitmap.set(validity, start + i);
-            }
+            Bitmap.fillRange(validity, start, count, true);
             return;
         }
         MemorySegment v = in.validity();
         if (selection == null) {
-            for (int i = 0; i < count; i++) {
-                Bitmap.setTo(validity, start + i, Bitmap.isSet(v, i));
-            }
+            Bitmap.copyBits(v, validity, start, count);
         } else {
-            int o = start;
-            for (int w = 0, words = Bitmap.wordsFor(in.length());
-                 w < words;
-                 w++) {
-                long bits = Bitmap.wordAt(selection, w, in.length());
-                while (bits != 0L) {
-                    int i = (w << 6) + Long.numberOfTrailingZeros(bits);
-                    bits &= bits - 1;
-                    Bitmap.setTo(validity, o++, Bitmap.isSet(v, i));
-                }
-            }
+            Bitmap.appendSelectedBits(v, selection, in.length(), validity, start);
         }
     }
 
