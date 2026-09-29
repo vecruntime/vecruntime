@@ -44,6 +44,13 @@ final class EvalContext(
   /** Rows whose values matter for the sub-expression under evaluation (null = all). */
   var active: java.lang.foreign.MemorySegment = selection
 
+  /**
+   * The (normalized) batch this context reads, for the object aggregates (#57) that drive Spark's own
+   * `TypedImperativeAggregate` per row through `ColumnarBatch.getRow`. Null for a context not built
+   * over a batch. Set by [[org.apache.spark.sql.vecruntime.EvalContexts.withBatch]].
+   */
+  var batch: org.apache.spark.sql.vectorized.ColumnarBatch = _
+
   def this(
       arena: Arena,
       numRows: Int,

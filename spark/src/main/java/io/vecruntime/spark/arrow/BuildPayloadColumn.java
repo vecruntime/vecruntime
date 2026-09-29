@@ -143,6 +143,17 @@ public final class BuildPayloadColumn implements AutoCloseable {
     }
 
     /**
+     * The underlying vector as a Spark column over exactly the {@code
+     * numRows()} appended rows, no null-padding row (#57): the aggregate output
+     * of {@code collect_list} / {@code collect_set} / {@code bloom_filter_agg},
+     * read back as its declared array or binary type. Not sealed -- this view
+     * is not the broadcast join's, which needs the trailing null row.
+     */
+    public ColumnVector plain() {
+        return vector;
+    }
+
+    /**
      * The column over build rows {@code buildRows[from, to)}, in that order; a
      * row id of {@code -1} reads as null.
      */

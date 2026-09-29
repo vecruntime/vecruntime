@@ -187,6 +187,11 @@ case class VectorHashAggregateExec(
    */
   private def spillPolicy(aggs: Array[VectorAggFunction]): AggSpillPolicy = {
     val conf = org.apache.spark.sql.internal.SQLConf.get
+    // Object aggregates (#57) hold Spark buffer objects on the heap, not the lane accumulators the
+    // memory estimate below models, so the grace-hash / emit-and-reset budget cannot bound them: they
+    // stay in memory (as Spark's own ObjectHashAggregate falls back to a sort-based spill we do not
+    // reproduce). collect_list / collect_set of a whole partition are the known unbounded case.
+    if (aggs.exists(_.isInstanceOf[io.vecruntime.spark.agg.SparkObjectAgg])) return AggSpillPolicy.InMemory
     val threshold = org.apache.spark.network.util.JavaUtils.byteStringAsBytes(conf.getConfString(
       AggSpillPolicy.ThresholdKey,
       AggSpillPolicy.DefaultThreshold
@@ -352,7 +357,14 @@ private[vecruntime] class VectorUngroupedAggregateIterator(
     while (c < columns.length) {
       val (name, dt) = outputAttrs(c)
       columns(c) = layout(c) match {
-        case BufferSlot(aggIdx, slot) => ArrowOutput.scalarColumn(name, dt, buffers(aggIdx)(slot), allocator)
+        case BufferSlot(aggIdx, slot) =>
+          val v = buffers(aggIdx)(slot)
+          dt match {
+            case _: org.apache.spark.sql.types.BinaryType | _: org.apache.spark.sql.types.ArrayType =>
+              // bloom_filter_agg / collect_list / collect_set (#57): one boxed object row.
+              ObjectAggColumns.column(dt, 1, _ => v)
+            case _ => ArrowOutput.scalarColumn(name, dt, v, allocator)
+          }
         case KeySlot(_) => throw new IllegalStateException("key slot in ungrouped aggregate")
       }
       c += 1
@@ -782,28 +794,53 @@ object VectorAggregatePlanner {
           case _ => Nil
         }
       }.toMap
+    // An object aggregate (bloom_filter_agg, collect_list, collect_set, #57) is not declarative: its
+    // Final buffer slot already carries the result (`SparkObjectAgg` emits `eval` there, typed as the
+    // result), so its result attribute is forwarded as that column rather than recompiled.
+    val objectResults: Map[org.apache.spark.sql.catalyst.expressions.ExprId, (Int, DataType)] = {
+      val bufferOrdinalOf = aggregateExpressions.scanLeft(groupingExpressions.length)((off, agg) =>
+        off + agg.aggregateFunction.aggBufferAttributes.length
+      )
+      aggregateExpressions.zip(aggregateAttributes).zipWithIndex.flatMap { case ((agg, attr), i) =>
+        agg.aggregateFunction match {
+          case f: org.apache.spark.sql.catalyst.expressions.aggregate.TypedImperativeAggregate[_]
+              if io.vecruntime.spark.agg.SparkObjectAgg.carries(f) =>
+            val slot = (bufferOrdinalOf(i), f.dataType)
+            Seq(attr.exprId -> slot, agg.resultAttribute.exprId -> slot)
+          case _ => Nil
+        }
+      }.toMap
+    }
     val compiled = resultExpressions.map { e =>
       val substituted = e.transform { case a: AttributeReference if evaluate.contains(a.exprId) => evaluate(a.exprId) }
-      (wideResult(substituted, input) match {
-        // The merge already applied isEmpty / the count test and the overflow rule at emission: forward the column.
-        case Some(ordinal) => Right(ColumnRef(ordinal, e.dataType))
-        // A literal result (`'store' AS channel` beside the aggregates) is a constant column the
-        // result projection materialises like any other.
-        case None =>
-          // A wide sum or average inside a larger expression (`sum(x) / 7.0`, `0.5 * sum(x)`,
-          // `sum(a) - sum(b)`, #259): each emitted result stands in for its sub-expression as a column
-          // typed as the result (the slot's attribute carries the buffer type, the emitted column the
-          // result's), and the arithmetic around it compiles through the wide kernels (#258).
-          val forwarded = substituted.transform {
-            case sub if sub.isInstanceOf[If] && wideResult(sub, input).isDefined =>
-              val a = input(wideResult(sub, input).get)
-              AttributeReference(a.name, sub.dataType, sub.nullable, a.metadata)(a.exprId, a.qualifier)
-          }
-          val body = forwarded match { case Alias(c, _) => c; case other => other }
-          ExpressionCompiler.compileLaneColumn(body, input).flatMap {
-            case v if !TypeMapping.isSupported(e.dataType) && !TypeMapping.hasLane(e.dataType) =>
-              Left(s"unsupported result type ${e.dataType.simpleString} for ${e.name}")
-            case v => Right(v)
+      val objectForward = substituted match {
+        case a: AttributeReference => objectResults.get(a.exprId)
+        case Alias(a: AttributeReference, _) => objectResults.get(a.exprId)
+        case _ => None
+      }
+      (objectForward match {
+        case Some((ordinal, dt)) => Right(ColumnRef(ordinal, dt))
+        case None => wideResult(substituted, input) match {
+            // The merge already applied isEmpty / the count test and the overflow rule at emission: forward the column.
+            case Some(ordinal) => Right(ColumnRef(ordinal, e.dataType))
+            // A literal result (`'store' AS channel` beside the aggregates) is a constant column the
+            // result projection materialises like any other.
+            case None =>
+              // A wide sum or average inside a larger expression (`sum(x) / 7.0`, `0.5 * sum(x)`,
+              // `sum(a) - sum(b)`, #259): each emitted result stands in for its sub-expression as a column
+              // typed as the result (the slot's attribute carries the buffer type, the emitted column the
+              // result's), and the arithmetic around it compiles through the wide kernels (#258).
+              val forwarded = substituted.transform {
+                case sub if sub.isInstanceOf[If] && wideResult(sub, input).isDefined =>
+                  val a = input(wideResult(sub, input).get)
+                  AttributeReference(a.name, sub.dataType, sub.nullable, a.metadata)(a.exprId, a.qualifier)
+              }
+              val body = forwarded match { case Alias(c, _) => c; case other => other }
+              ExpressionCompiler.compileLaneColumn(body, input).flatMap {
+                case v if !TypeMapping.isSupported(e.dataType) && !TypeMapping.hasLane(e.dataType) =>
+                  Left(s"unsupported result type ${e.dataType.simpleString} for ${e.name}")
+                case v => Right(v)
+              }
           }
       }).left.map(r => s"${e.sql}: $r")
     }
@@ -977,8 +1014,28 @@ object VectorAggregatePlanner {
           )).collect {
             case attr if attr.dataType.isInstanceOf[DecimalType] => attr.exprId
           }.toSet
+        // The object aggregates' outputs (#57) have no lane: a binary buffer at Partial / PartialMerge,
+        // an array<T> or binary result at Final / Complete. `SparkObjectAgg` produces them as Spark's
+        // own on-heap columns, so they are accepted here even though no kernel computes on them.
+        val objectOutputs: Set[org.apache.spark.sql.catalyst.expressions.ExprId] = {
+          val fns = a.aggregateExpressions.map(_.aggregateFunction).collect {
+            case f: org.apache.spark.sql.catalyst.expressions.aggregate.TypedImperativeAggregate[_]
+                if io.vecruntime.spark.agg.SparkObjectAgg.carries(f) => f
+          }
+          if (fns.isEmpty) Set.empty
+          else if (results)
+            a.aggregateExpressions.zip(a.aggregateAttributes).collect {
+              case (agg, attr)
+                  if agg.aggregateFunction
+                    .isInstanceOf[org.apache.spark.sql.catalyst.expressions.aggregate.TypedImperativeAggregate[_]] &&
+                    io.vecruntime.spark.agg.SparkObjectAgg.carries(agg.aggregateFunction) =>
+                Seq(attr.exprId, agg.resultAttribute.exprId)
+            }.flatten.toSet
+          else fns.flatMap(_.inputAggBufferAttributes.map(_.exprId)).toSet
+        }
         a.resultExpressions.map(_.toAttribute).find(attr =>
-          !TypeMapping.isSupported(attr.dataType) && !wideOutputs.contains(attr.exprId)
+          !TypeMapping.isSupported(attr.dataType) && !wideOutputs.contains(attr.exprId) &&
+            !objectOutputs.contains(attr.exprId)
         ) match {
           case Some(attr) => Left(s"unsupported output type ${attr.dataType.simpleString} for ${attr.name}")
           case None =>
@@ -1008,8 +1065,13 @@ object AggBufferColumns {
       to: Int,
       allocator: BufferAllocator
   ): ColumnVector = {
-    // A state that can write its lane directly does (#416); the rest go value by value, boxed.
-    if (dt != org.apache.spark.sql.types.StringType) {
+    // A state that can write its lane directly does (#416); the rest go value by value, boxed. Binary
+    // and array outputs (the object aggregates, #57) have no lane and no direct writer -- straight to
+    // the boxed path, which routes them to Spark's on-heap column store.
+    if (
+      dt != org.apache.spark.sql.types.StringType && !dt.isInstanceOf[org.apache.spark.sql.types.BinaryType] &&
+      !dt.isInstanceOf[org.apache.spark.sql.types.ArrayType]
+    ) {
       val out = ArrowOutput.allocateFixed(name, dt, to - from, allocator)
       if (state.writeBuffer(slot, from, to, out)) return ArrowOutput.finish(out, to - from, false)
       out.vector().close()
@@ -1057,6 +1119,14 @@ object AggBufferColumns {
           o += 1
         }
         return ArrowOutput.utf8Column(name, values, allocator)
+      case _: org.apache.spark.sql.types.BinaryType =>
+        // bloom_filter_agg (#57): the serialized filter, or the final's own binary (null when no bit
+        // is set). Held in Spark's own on-heap column so Spark reads the BinaryType natively.
+        return ObjectAggColumns.column(dt, count, get)
+      case _: org.apache.spark.sql.types.ArrayType =>
+        // collect_list / collect_set (#57): a GenericArrayData per group, or an empty array; the
+        // element type is a lane. Built in Spark's on-heap column, read back as array<T>.
+        return ObjectAggColumns.column(dt, count, get)
       case _ =>
     }
     val out: ArrowVectorBuffers = ArrowOutput.allocateFixed(name, dt, count, allocator)

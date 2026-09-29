@@ -148,6 +148,7 @@ object EvalContexts {
             c => batch.column(c)
           )
       }
+      ctx.batch = batch
       f(ctx)
     } finally {
       arena.close()

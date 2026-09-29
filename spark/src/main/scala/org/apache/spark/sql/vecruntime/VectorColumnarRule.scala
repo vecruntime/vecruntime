@@ -437,6 +437,15 @@ case class VectorExecRule(session: SparkSession) extends Rule[SparkPlan] with Lo
 
         case a: HashAggregateExec if VectorConf.aggregateEnabled(conf) => planAggregate(a, a, conf)
 
+        case o: ObjectHashAggregateExec
+            if VectorConf.aggregateEnabled(conf) && VectorConf.objectAggregateEnabled(conf) =>
+          // The object aggregates whose buffer we can carry (#57): bloom_filter_agg, collect_list,
+          // collect_set. The child is required columnar only -- the buffer column (a merge stage) and
+          // an aggregated value without a lane are read row by row through Spark's own function object;
+          // the grouping keys and the functions are checked by the planner, which declines the rest
+          // (percentile*, collect_top_k, ...) with `unsupported aggregate function <Class>: <sql>`.
+          planObjectAggregate(o, conf)
+
         case s: SortAggregateExec if VectorConf.aggregateEnabled(conf) =>
           // Spark plans a SortAggregate when an aggregation buffer holds a string (min/max/first/last
           // over strings): not mutable in an UnsafeRow, so no hash aggregate for Spark. Our group table
@@ -777,6 +786,25 @@ case class VectorExecRule(session: SparkSession) extends Rule[SparkPlan] with Lo
         }
     }
   }
+
+  /**
+   * Convert an `ObjectHashAggregateExec` (#57). Only the columnar contract is required of the child:
+   * the object aggregates read the buffer column (a merge stage) and any aggregated value without a
+   * lane row by row through Spark's own function object, so a non-lane input column is fine here --
+   * the grouping keys and the functions are gated by [[VectorAggregatePlanner.plan]], which declines
+   * an unsupported key or an object aggregate we do not carry with its own reason. `RollupRewrite` is
+   * not applied: Spark does not plan an ObjectHashAggregate under our `Expand`.
+   */
+  private def planObjectAggregate(o: ObjectHashAggregateExec, conf: SQLConf): SparkPlan =
+    if (!columnarChild(o.child)) fallback(o, s"child ${o.child.nodeName} is not columnar")
+    else VectorAggregatePlanner.plan(
+      o,
+      VectorConf.finalAggregateEnabled(conf),
+      VectorConf.strictFloatingPoint(conf)
+    ) match {
+      case Right(v) => v
+      case Left(reason) => fallback(o, reason)
+    }
 
   private def sameOrder(
       a: Seq[org.apache.spark.sql.catalyst.expressions.SortOrder],

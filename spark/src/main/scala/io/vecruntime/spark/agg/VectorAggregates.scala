@@ -1178,6 +1178,15 @@ object VectorAggregates {
         momentBuffers(buffers.indices.map(ref)).map(MomentsAgg(_, MomentsAgg.Correlation, merge = true))
       case _: RegrSlope | _: RegrIntercept if buffers.length == 7 =>
         momentBuffers(buffers.indices.map(ref)).map(MomentsAgg(_, MomentsAgg.Regression, merge = true))
+      case f: TypedImperativeAggregate[_] if SparkObjectAgg.carries(f) =>
+        // bloom_filter_agg / collect_list / collect_set: merge Spark's serialized partial buffers
+        // through its own object, byte-identical to Spark's Final (#57).
+        SparkObjectAgg.compileMerge(
+          f.asInstanceOf[TypedImperativeAggregate[AnyRef]],
+          input,
+          finalResult = finalResult,
+          if (bufferOffset >= 0) bufferOffset else -1
+        )
       case other => Left(s"unsupported aggregate function ${other.getClass.getSimpleName}: ${other.sql}")
     }
   }
@@ -1364,6 +1373,11 @@ object VectorAggregates {
         case e => Right(FirstAgg(e, f.dataType, f.ignoreNulls))
       }
     case f: First => Left(s"first over ${f.dataType.simpleString} not supported")
+
+    case f: TypedImperativeAggregate[_] if SparkObjectAgg.carries(f) =>
+      // bloom_filter_agg / collect_list / collect_set: driven through Spark's own object per group so
+      // the partial buffer and result are byte-identical (#57). `complete` emits the result here.
+      SparkObjectAgg.compileUpdate(f.asInstanceOf[TypedImperativeAggregate[AnyRef]], input, finalResult = complete)
 
     case other => Left(s"unsupported aggregate function ${other.getClass.getSimpleName}: ${other.sql}")
   }
