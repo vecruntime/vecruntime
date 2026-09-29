@@ -15,8 +15,13 @@ version may change configuration keys or defaults, always noted here.
   `TypedImperativeAggregate` object per group -- the partial buffer is byte-identical to Spark's (a
   Spark Final or the bloom probe reads it unchanged), `collect_set` dedups and nulls are ignored as
   Spark does, and the `array<T>` / `binary` output is held in Spark's on-heap column vector. All four
-  modes, grouped and ungrouped, mixed with ordinary aggregates in one node. These stay in memory (no
-  spill). Other object aggregates (`percentile*`, `collect_top_k`, ...) keep the fallback reason.
+  modes, grouped and ungrouped, mixed with ordinary aggregates in one node. Their buffers are counted
+  against the task memory budget and spill past `spark.vecruntime.agg.spillThreshold`: a buffer stage
+  emits its partial binary buffers and starts over, a Final spills its groups' serialized buffers
+  (UTF8-carried through the grace-hash path) and merges them back a bucket at a time, so a grouped
+  `collect_*` over many keys is bounded instead of pinning memory (a streaming `Complete` stage, which
+  Spark 4.1's batch planner never emits, stays in memory). Other object aggregates (`percentile*`,
+  `collect_top_k`, ...) keep the fallback reason.
 - A broadcast hash join converts when its build side carries array, map or struct payload columns
   (#547, `spark.vecruntime.join.buildPayload`, default on): they are copied into a row store and read
   as views over the build row ids; keys and the condition still need lanes. Adaptive execution's

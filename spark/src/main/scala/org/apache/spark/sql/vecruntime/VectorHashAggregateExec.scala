@@ -187,17 +187,20 @@ case class VectorHashAggregateExec(
    */
   private def spillPolicy(aggs: Array[VectorAggFunction]): AggSpillPolicy = {
     val conf = org.apache.spark.sql.internal.SQLConf.get
-    // Object aggregates (#57) hold Spark buffer objects on the heap, not the lane accumulators the
-    // memory estimate below models, so the grace-hash / emit-and-reset budget cannot bound them: they
-    // stay in memory (as Spark's own ObjectHashAggregate falls back to a sort-based spill we do not
-    // reproduce). collect_list / collect_set of a whole partition are the known unbounded case.
-    if (aggs.exists(_.isInstanceOf[io.vecruntime.spark.agg.SparkObjectAgg])) return AggSpillPolicy.InMemory
     val threshold = org.apache.spark.network.util.JavaUtils.byteStringAsBytes(conf.getConfString(
       AggSpillPolicy.ThresholdKey,
       AggSpillPolicy.DefaultThreshold
     ))
     val passThrough =
       conf.getConfString(AggSpillPolicy.PassThroughKey, AggSpillPolicy.DefaultPassThroughRatio.toString).toDouble
+    // Object aggregates (#57): a Complete stage (single-pass, streaming only -- Spark 4.1's batch
+    // planner never emits it) has no mergeable buffer input to reload, so it stays in memory; a Final
+    // or a buffer-emitting stage spills its groups as serialized binary buffers and merges them back.
+    def objectComplete =
+      aggs.zipWithIndex.exists { case (a, i) =>
+        a.isInstanceOf[io.vecruntime.spark.agg.SparkObjectAgg] && aggregateExpressions(i).mode == Complete
+      }
+    if (objectComplete) return AggSpillPolicy.InMemory
     if (threshold <= 0 || groupingExpressions.isEmpty) AggSpillPolicy.InMemory
     else if (aggregateExpressions.isEmpty) {
       // Keys only (a distinct): before the exchange it emits keys, after it it merges them -- either way re-readable.
@@ -213,7 +216,11 @@ case class VectorHashAggregateExec(
     else if (
       VectorAggregatePlanner.mergesBuffers(modes) && AggregateSpill.supportsKeys(groupingExpressions.map(_.dataType)) &&
       aggregateExpressions.zip(aggs).forall { case (a, f) =>
-        val d = a.aggregateFunction.aggBufferAttributes.map(_.dataType); f.emittedTypes(d) == d
+        // An object aggregate is re-mergeable through its serialized binary buffer (#57), whatever its
+        // emitted result type; a lane accumulator must emit the buffer it merges (emittedTypes == declared).
+        f.isInstanceOf[io.vecruntime.spark.agg.SparkObjectAgg] || {
+          val d = a.aggregateFunction.aggBufferAttributes.map(_.dataType); f.emittedTypes(d) == d
+        }
       }
     ) {
       val buckets = conf.getConfString(AggSpillPolicy.BucketsKey, AggSpillPolicy.DefaultBuckets.toString).toInt
@@ -437,7 +444,25 @@ private[vecruntime] class VectorGroupedAggregateIterator(
     while (capacity < groups) capacity <<= 1
     val accumulators = capacity * accumulatorBytesPerGroup
     val growth = if (groups * 8L >= capacity * 7L) 2L * accumulators else 0L
-    table.memoryBytes() + accumulators + growth
+    table.memoryBytes() + accumulators + growth + objectBytes
+  }
+
+  // The heap held by object-aggregate buffers (#57), summed over the live groups: 0 unless a state
+  // reports it (the lane accumulators do not). This is what makes a grouped collect_* / bloom_filter_agg
+  // visible to the budget so it spills rather than pinning memory.
+  private val hasObjectState: Boolean = aggs.exists(_.isInstanceOf[io.vecruntime.spark.agg.SparkObjectAgg])
+  private def objectBytes: Long = {
+    if (!hasObjectState) return 0L
+    var total = 0L
+    val n = table.size()
+    var s = 0
+    while (s < states.length) {
+      val st = states(s)
+      var g = 0
+      while (g < n) { total += st.groupBytes(g); g += 1 }
+      s += 1
+    }
+    total
   }
 
   // Spark's execution memory as the arbiter (#367): the estimate is acquired from the task's share of the
@@ -512,16 +537,16 @@ private[vecruntime] class VectorGroupedAggregateIterator(
     fillRows = 0L
   }
 
-  /** The whole table into the spill, as the batches the operator would emit. */
+  /** The whole table into the spill, as re-mergeable buffer batches (object aggs as serialized binary). */
   private def spillTable(buckets: Int): Unit = {
     if (spill == null) {
       val keyOrdinals = layout.zipWithIndex.collect { case (KeySlot(_), i) => i }
-      spill = new AggregateSpill(buckets, outputAttrs, keyOrdinals, allocator)
+      spill = new AggregateSpill(buckets, spillAttrs, keyOrdinals, allocator)
     }
     var from = 0
     while (from < table.size()) {
       val to = math.min(table.size(), from + OutputBatchSize)
-      val b = buildBatch(from, to)
+      val b = buildSpillBatch(from, to)
       try spill.write(b)
       finally b.close()
       from = to
@@ -629,6 +654,44 @@ private[vecruntime] class VectorGroupedAggregateIterator(
       columns(c) = layout(c) match {
         case KeySlot(k) => keyColumn(name, dt, k, from, to)
         case BufferSlot(aggIdx, slot) => bufferColumn(name, dt, states(aggIdx), slot, from, to)
+      }
+      c += 1
+    }
+    new ColumnarBatch(columns, count)
+  }
+
+  /**
+   * The spill layout (#57): identical to the output layout except that an object aggregate's buffer
+   * slot is carried as a `StringType` column holding its `serialize`d state bytes -- not its emitted
+   * `array<T>` / `binary` result. Arrow's varchar store is a length-prefixed byte buffer that does
+   * not validate UTF-8, so the serialized filter / collect bytes round-trip losslessly through the
+   * existing UTF8 spill path (compact, IPC, bucketing, reload) with no new binary lane. The phase-2
+   * reload reads the bytes back and merges them, byte-identical to a merge over the real binary buffer.
+   */
+  private val spillAttrs: Array[(String, DataType)] = layout.zipWithIndex.map {
+    case (BufferSlot(aggIdx, _), i)
+        if aggs(aggIdx).isInstanceOf[io.vecruntime.spark.agg.SparkObjectAgg] =>
+      (outputAttrs(i)._1, org.apache.spark.sql.types.StringType: DataType)
+    case (_, i) => outputAttrs(i)
+  }
+
+  /** A spill batch of groups [from, to): keys, ordinary buffers, and object aggs as UTF8-carried serialized bytes. */
+  private def buildSpillBatch(from: Int, to: Int): ColumnarBatch = {
+    val count = to - from
+    val columns = new Array[ColumnVector](layout.length)
+    var c = 0
+    while (c < columns.length) {
+      val (name, dt) = spillAttrs(c)
+      columns(c) = layout(c) match {
+        case KeySlot(k) => keyColumn(name, dt, k, from, to)
+        case BufferSlot(aggIdx, slot) =>
+          if (aggs(aggIdx).isInstanceOf[io.vecruntime.spark.agg.SparkObjectAgg]) {
+            val st = states(aggIdx)
+            val values = new Array[Array[Byte]](count)
+            var o = 0
+            while (o < count) { values(o) = st.spillValue(from + o, slot).asInstanceOf[Array[Byte]]; o += 1 }
+            ArrowOutput.utf8Column(name, values, allocator)
+          } else bufferColumn(name, dt, states(aggIdx), slot, from, to)
       }
       c += 1
     }
@@ -1017,21 +1080,28 @@ object VectorAggregatePlanner {
         // The object aggregates' outputs (#57) have no lane: a binary buffer at Partial / PartialMerge,
         // an array<T> or binary result at Final / Complete. `SparkObjectAgg` produces them as Spark's
         // own on-heap columns, so they are accepted here even though no kernel computes on them.
+        // The object aggregates' outputs (#57) have no lane: a binary buffer at Partial / PartialMerge,
+        // an array<T> or binary result at Final / Complete. They are accepted when the layout produced
+        // a real column for them -- a forwarded object result (a `ColumnRef` from `compileFinalResults`)
+        // in a result stage, or a buffer slot in a buffer stage -- even though no kernel computes on them.
         val objectOutputs: Set[org.apache.spark.sql.catalyst.expressions.ExprId] = {
-          val fns = a.aggregateExpressions.map(_.aggregateFunction).collect {
-            case f: org.apache.spark.sql.catalyst.expressions.aggregate.TypedImperativeAggregate[_]
-                if io.vecruntime.spark.agg.SparkObjectAgg.carries(f) => f
-          }
-          if (fns.isEmpty) Set.empty
+          val hasObject = a.aggregateExpressions.map(_.aggregateFunction).exists(f =>
+            f.isInstanceOf[org.apache.spark.sql.catalyst.expressions.aggregate.TypedImperativeAggregate[_]] &&
+              io.vecruntime.spark.agg.SparkObjectAgg.carries(f)
+          )
+          if (!hasObject) Set.empty
           else if (results)
-            a.aggregateExpressions.zip(a.aggregateAttributes).collect {
-              case (agg, attr)
-                  if agg.aggregateFunction
-                    .isInstanceOf[org.apache.spark.sql.catalyst.expressions.aggregate.TypedImperativeAggregate[_]] &&
-                    io.vecruntime.spark.agg.SparkObjectAgg.carries(agg.aggregateFunction) =>
-                Seq(attr.exprId, agg.resultAttribute.exprId)
+            // A result stage: an output attribute whose compiled expression forwarded a column
+            // (`ColumnRef`) is produced ready-made, whatever its type; accept exactly those.
+            a.resultExpressions.zip(compiled).collect {
+              case (e, _: ColumnRef) if !TypeMapping.isSupported(e.dataType) => e.toAttribute.exprId
+            }.toSet
+          else
+            // A buffer stage: the object aggregates' binary buffer attributes.
+            a.aggregateExpressions.map(_.aggregateFunction).collect {
+              case f: org.apache.spark.sql.catalyst.expressions.aggregate.TypedImperativeAggregate[_]
+                  if io.vecruntime.spark.agg.SparkObjectAgg.carries(f) => f.inputAggBufferAttributes.map(_.exprId)
             }.flatten.toSet
-          else fns.flatMap(_.inputAggBufferAttributes.map(_.exprId)).toSet
         }
         a.resultExpressions.map(_.toAttribute).find(attr =>
           !TypeMapping.isSupported(attr.dataType) && !wideOutputs.contains(attr.exprId) &&

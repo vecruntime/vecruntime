@@ -64,6 +64,23 @@ trait GroupedAggState {
 
   /** Buffer slot value of group `g` in Spark's internal representation, or `null`. */
   def bufferValue(g: Int, slot: Int): Any
+
+  /**
+   * An estimate of the heap this state holds for group `g`, for the memory budget (#57): 0 for the
+   * lane accumulators, whose fixed per-group footprint the operator models directly; an object
+   * aggregate (a bloom filter's bit array, a collect buffer) returns the bytes its buffer object
+   * holds, so a grouped `collect_*` or `bloom_filter_agg` is bounded and spills instead of pinning
+   * memory. Called only when the operator needs a live estimate, not per row.
+   */
+  def groupBytes(g: Int): Long = 0L
+
+  /**
+   * The value written for group `g`, slot `slot`, when the operator is SPILLING rather than emitting
+   * its output (#57): an object aggregate emits its `serialize`d buffer (the mergeable `BinaryType`
+   * bytes) here even in a result stage, where [[bufferValue]] would emit the final `eval` result;
+   * the lane accumulators spill the same buffer they emit, so the default forwards to [[bufferValue]].
+   */
+  def spillValue(g: Int, slot: Int): Any = bufferValue(g, slot)
 }
 
 /** Serializable description of a supported aggregate function; states are created per task. */

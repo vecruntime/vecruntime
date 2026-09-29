@@ -18,6 +18,7 @@ package io.vecruntime.spark
 import io.vecruntime.spark.test.{TestTables, VectorQuerySuite}
 import org.apache.spark.sql.execution.aggregate.ObjectHashAggregateExec
 import org.apache.spark.sql.vecruntime.VectorHashAggregateExec
+import org.apache.spark.sql.vecruntime.VectorFallback
 
 /**
  * `ObjectHashAggregateExec` for the object aggregates we carry (#57): `collect_list`, `collect_set`
@@ -124,6 +125,48 @@ class VectorObjectAggregateSuite extends VectorQuerySuite {
       // into, so we assert on the results, which is the interoperability guarantee that matters.)
       assertRowsEqual(expected, actual, 1e-9, sql)
     }
+  }
+
+  test("grouped collect spills under a tiny memory budget and matches Spark") {
+    // Force the aggregate's budget to 1 byte so the object buffers spill through the grace-hash path
+    // (#57): groups are written as UTF8-carried serialized buffers and merged back. Results must
+    // equal Spark's (collected order is non-deterministic, so compared as sorted arrays).
+    withConf(
+      "spark.sql.execution.useObjectHashAggregateExec" -> "true",
+      "spark.vecruntime.agg.spillThreshold" -> "1",
+      "spark.vecruntime.agg.spillBuckets" -> "4",
+      "spark.sql.adaptive.enabled" -> "false"
+    ) {
+      assertCollectSpill("SELECT i AS g, collect_list(l) AS c FROM t GROUP BY i")
+      assertCollectSpill("SELECT i % 64 AS g, collect_set(s) AS c FROM t GROUP BY i % 64")
+    }
+  }
+
+  /**
+   * Runs a grouped `collect_*` with the plugin on and off, compares each group's collected values as
+   * a sorted multiset (the collected order is non-deterministic), asserts the aggregate is ours and
+   * that it actually spilled.
+   */
+  private def assertCollectSpill(sql: String): Unit = {
+    def collected(rows: Array[org.apache.spark.sql.Row]): Map[Any, Seq[Any]] =
+      rows.map(r => r.get(0) -> r.getSeq[Any](1).sortBy(_.toString)).toMap
+    val expected = collected(withPlugin(enabled = false)(spark.sql(sql).collect()))
+    val df = withPlugin(enabled = true) { val d = spark.sql(sql); d.collect(); d }
+    val actual = collected(df.collect())
+    assert(actual == expected, s"collect result differs for: $sql")
+    assert(
+      nodesOf[VectorHashAggregateExec](df).exists(_.aggregateExpressions.exists(_.aggregateFunction
+        .isInstanceOf[org.apache.spark.sql.catalyst.expressions.aggregate.TypedImperativeAggregate[_]])),
+      s"expected our aggregate to build the collect:\n${finalPlan(df).treeString}\n" +
+        s"fallbacks: ${VectorFallback.reasons(finalPlan(df)).map(_._2).mkString("; ")}"
+    )
+    assertSpilled(df)
+  }
+
+  /** Asserts at least one of our aggregates actually spilled (the grace-hash / emit-and-reset counter). */
+  private def assertSpilled(df: org.apache.spark.sql.DataFrame): Unit = {
+    val spills = nodesOf[VectorHashAggregateExec](df).map(_.metrics("spills").value).sum
+    assert(spills > 0, s"expected a spill, got $spills:\n${finalPlan(df).treeString}")
   }
 
   test("percentile and other object aggregates still fall back with a reason") {
