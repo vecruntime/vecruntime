@@ -42,6 +42,8 @@ nav:
         url: /iceberg.html
       - title: Flight shuffle
         url: /flight-shuffle.html
+      - title: S3 reads over the AWS CRT
+        url: /s3-crt-stream.html
   - section: Testing
     items:
       - title: Testing & correctness

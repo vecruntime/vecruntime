@@ -8,6 +8,11 @@ version may change configuration keys or defaults, always noted here.
 
 ### Added
 
+- An optional S3A input stream for the benchmark image, `io.vecruntime.s3.CrtAnalyticsStreamFactory`
+  (`s3-crt-stream`, `-Ps3-crt`): S3A's Analytics Accelerator stream over the AWS CRT S3 client instead
+  of S3A's synchronous SDK client, with `fs.s3a.vecruntime.crt.max-concurrency` (default 600). Off
+  unless a run sets `fs.s3a.input.stream.type=custom`; the image now ships `aws-crt` 0.38.9. See
+  `docs/s3-crt-stream.md`.
 - The columnar broadcast exchange also carries the nested-loop join's broadcast (#325, slice 2):
   `VectorBroadcastNestedLoopJoinExec` builds its table from the batches, and a Spark nested-loop join
   over the same exchange gets Spark's array of rows, built from the batches on first use.

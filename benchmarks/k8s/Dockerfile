@@ -19,6 +19,9 @@ ARG AWS_SDK_V2_VERSION=2.35.4
 # The S3A Analytics Accelerator stream (Hadoop 3.4.3 reads through it by default); the version hadoop-aws is
 # built against, and the one the Iceberg AWS bundle carries -- pinned here so S3A does not depend on that bundle.
 ARG AAL_VERSION=1.3.1
+# The AWS CRT (a JNI library with glibc builds for x86-64 and aarch64) for the optional CRT-backed analytics
+# stream; the release SDK 2.35.4 is built against. Unused unless a run selects that stream.
+ARG AWS_CRT_VERSION=0.38.9
 ARG COMET_VERSION=1.0.0
 ARG ICEBERG_VERSION=1.11.0
 
@@ -35,6 +38,10 @@ RUN mvn -B -q -Pcomet,iceberg -DskipTests -pl benchmarks -am install
 # iceberg-spark-runtime the image provides; without it on the class path the writer stays Spark's.
 RUN mvn -B -q -Piceberg -DskipTests -pl iceberg-bridge package \
  && cp iceberg-bridge/target/vecruntime-iceberg-bridge_2.13-*.jar /src/iceberg-bridge.jar
+# The optional S3A input stream over the AWS CRT client (docs/s3-crt-stream.md): off unless a run sets
+# fs.s3a.input.stream.type=custom, so the image's default read path is unchanged.
+RUN mvn -B -q -Ps3-crt -DskipTests -pl s3-crt-stream package \
+ && cp s3-crt-stream/target/vecruntime-s3-crt-stream-*.jar /src/s3-crt-stream.jar
 # The Flight shuffle's runtime jars: the shaded benchmarks.jar carries only io.github.vecruntime:*, and Spark's
 # distribution has Arrow and guava but no flight-core, gRPC or protobuf-java (the Netty classes are Spark's).
 RUN mvn -B -q -pl shuffle dependency:copy-dependencies -DincludeScope=runtime -DoutputDirectory=/src/flight-jars \
@@ -94,6 +101,7 @@ ARG SPARK_VERSION
 ARG HADOOP_VERSION
 ARG AWS_SDK_V2_VERSION
 ARG AAL_VERSION
+ARG AWS_CRT_VERSION
 ARG COMET_VERSION
 ARG ICEBERG_VERSION
 
@@ -136,6 +144,7 @@ RUN cd /opt/spark/jars \
     && curl -fsSLO "https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/${HADOOP_VERSION}/hadoop-aws-${HADOOP_VERSION}.jar" \
     && curl -fsSLO "https://repo1.maven.org/maven2/software/amazon/awssdk/bundle/${AWS_SDK_V2_VERSION}/bundle-${AWS_SDK_V2_VERSION}.jar" \
     && curl -fsSLO "https://repo1.maven.org/maven2/software/amazon/s3/analyticsaccelerator/analyticsaccelerator-s3/${AAL_VERSION}/analyticsaccelerator-s3-${AAL_VERSION}.jar" \
+    && curl -fsSLO "https://repo1.maven.org/maven2/software/amazon/awssdk/crt/aws-crt/${AWS_CRT_VERSION}/aws-crt-${AWS_CRT_VERSION}.jar" \
     && curl -fsSLO "https://repo1.maven.org/maven2/org/apache/datafusion/comet-spark-spark4.1_2.13/${COMET_VERSION}/comet-spark-spark4.1_2.13-${COMET_VERSION}.jar" \
     && curl -fsSLO "https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-spark-runtime-4.1_2.13/${ICEBERG_VERSION}/iceberg-spark-runtime-4.1_2.13-${ICEBERG_VERSION}.jar" \
     && curl -fsSLO "https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-aws-bundle/${ICEBERG_VERSION}/iceberg-aws-bundle-${ICEBERG_VERSION}.jar" \
@@ -144,6 +153,7 @@ RUN cd /opt/spark/jars \
 
 COPY --from=build /src/benchmarks/target/benchmarks.jar /opt/spark/jars/benchmarks.jar
 COPY --from=build /src/iceberg-bridge.jar /opt/spark/jars/vecruntime-iceberg-bridge.jar
+COPY --from=build /src/s3-crt-stream.jar /opt/spark/jars/vecruntime-s3-crt-stream.jar
 COPY --from=build /src/flight-jars/*.jar /opt/spark/jars/
 COPY --from=build /opt/tpcds-kit/tools/dsdgen /opt/tpcds-kit/tools/tpcds.idx /opt/tpcds-kit/tools/
 

@@ -506,5 +506,17 @@
         <module>iceberg-bridge</module>
       </modules>
     </profile>
+    <profile>
+      <!--
+        The optional S3A input stream factory for the benchmark image: the Analytics Accelerator stream
+        over the AWS CRT S3 client (docs/s3-crt-stream.md). Built only for the image; the engine never
+        depends on it, and it compiles against hadoop-aws and the AWS SDK, which the default reactor
+        does not otherwise need.
+      -->
+      <id>s3-crt</id>
+      <modules>
+        <module>s3-crt-stream</module>
+      </modules>
+    </profile>
   </profiles>
 </project>
