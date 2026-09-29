@@ -108,7 +108,8 @@ trait VectorHashJoinLike extends VectorBinaryExec {
     joinedOutput.map(a => (a.name, a.dataType)).toArray,
     buildPlan.output.map(_.dataType).toArray,
     streamedPlan.output.length,
-    dropNullStreamedKeys = isNullAwareAntiJoin
+    dropNullStreamedKeys = isNullAwareAntiJoin,
+    denseKeys = io.vecruntime.spark.VectorConf.joinDenseKeys(conf)
   )
 
   override def verboseStringWithOperatorId(): String = {
@@ -141,7 +142,9 @@ final case class JoinSpec(
      * null is dropped like a matched one (`x NOT IN (...)` is unknown, never true, for a null `x`).
      * The two other regimes of the null-aware join never reach the probe (see the broadcast exec).
      */
-    dropNullStreamedKeys: Boolean = false
+    dropNullStreamedKeys: Boolean = false,
+    /** Probe a single small-range integer key through a [[io.vecruntime.kernels.DenseKeyIndex]] (#546). */
+    denseKeys: Boolean = true
 )
 
 /**
@@ -339,6 +342,12 @@ final class BuildTable(
   /** First build row of each key, -1 for none. */
   var head: Array[Int] = new Array[Int](0)
 
+  /**
+   * The table's dense form, when the join has one INT32/INT64 key whose build values span a small
+   * range (#546): the probe reads the group id at `key - min` instead of hashing. Null otherwise.
+   */
+  var dense: io.vecruntime.kernels.DenseKeyIndex = null
+
   /** Whether some build row has a null key (the null-aware anti join's empty regime). */
   var anyNullKey: Boolean = false
 
@@ -390,6 +399,8 @@ final class BuildTable(
       val valid = BuildTable.nonNullKeys(ctx, keys)
       anyNullKey = valid != null && BuildTable.popCount(valid, numRows) < numRows
       val groups = table.assign(keys, numRows, ids, valid)
+      if (spec.denseKeys && keys.length == 1)
+        dense = io.vecruntime.kernels.DenseKeyIndex.tryBuild(keys.head, numRows, ids, groups)
       head = Array.fill(groups)(-1)
       // Walk backwards so chains list rows in build order, like Spark's relation does.
       var i = numRows - 1
@@ -679,6 +690,7 @@ private[vecruntime] class VectorHashJoinIterator(
   private var rowMatched = new Array[Boolean](0)
   private var idScratch = new Array[Int](0)
   private var hashScratch = new Array[Int](0)
+  private val denseScratch = new io.vecruntime.kernels.DenseKeyIndex.Scratch
 
   /** The streamed rows of the current batch whose keys are all non-null (null when every key is). */
   private var nonNullKeys: MemorySegment = _
@@ -750,8 +762,11 @@ private[vecruntime] class VectorHashJoinIterator(
         val candidates = BuildTable.nonNullKeys(ctx, keys)
         nonNullKeys = candidates
         if (idScratch.length < n) { idScratch = new Array[Int](n); hashScratch = new Array[Int](n) }
-        if (build.numRows > 0) build.table.lookup(keys, n, idScratch, candidates, hashScratch)
-        else java.util.Arrays.fill(idScratch, 0, n, -1)
+        if (build.numRows > 0) {
+          val d = build.dense
+          if (d != null && d.accepts(keys.head)) d.lookup(keys.head, n, idScratch, candidates, denseScratch)
+          else build.table.lookup(keys, n, idScratch, candidates, hashScratch)
+        } else java.util.Arrays.fill(idScratch, 0, n, -1)
       }
       // A hash join's candidates are few per row: one chunk. A nested loop's are the whole build
       // side, so the streamed rows go in chunks that keep the pairs in flight under the budget.

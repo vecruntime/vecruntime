@@ -14,6 +14,11 @@ version may change configuration keys or defaults, always noted here.
 
 ### Changed
 
+- A hash join on a single INT32/INT64 key whose build values span a small range (at most 10x the
+  distinct keys, as Spark's dense `LongHashedRelation`) probes through an array indexed by the key
+  instead of the hash table (#546, `spark.vecruntime.join.denseKeys`, default on): 22.7x the hash
+  probe on INT32 and 18.1x on INT64 in `JoinProbeBenchmark` (q88's shape: 27% of the keys 1..7,200).
+  Joins on other keys keep the hash table unchanged.
 - The nested-loop join over Spark's row broadcast reads it into columns once per executor, shared by
   the executor's tasks, instead of once per task.
 - Column builders (the joins' build and gather, the sort-merge join's runs) append validity bitmaps and

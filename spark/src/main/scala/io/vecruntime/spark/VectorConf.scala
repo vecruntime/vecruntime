@@ -71,6 +71,7 @@ object VectorConf {
   val JoinHashMaxBuildSize = "spark.vecruntime.join.hashMaxBuildSize"
   val JoinSpillBuckets = "spark.vecruntime.join.spillBuckets"
   val JoinSpillBytes = "spark.vecruntime.join.spillBytes"
+  val JoinDenseKeys = "spark.vecruntime.join.denseKeys"
   val CometRangeShuffleEnabled = "spark.vecruntime.comet.shuffle.range.enabled"
 
   /** The scan-side prefetching converter (#403, lever 2): the queue depth, `0` off. */
@@ -181,6 +182,13 @@ object VectorConf {
 
   /** Convert BroadcastHashJoinExec over a columnar streamed side (the build side stays Spark's broadcast). */
   def broadcastHashJoinEnabled(conf: SQLConf): Boolean = bool(conf, BroadcastHashJoinEnabled, default = true)
+
+  /**
+   * A hash join on one INT32/INT64 key whose build values span a small range (at most 10x the
+   * distinct keys, as Spark's own dense `LongHashedRelation`) is probed through an array indexed by
+   * the key instead of the hash table (#546): a range check and one load per row.
+   */
+  def joinDenseKeys(conf: SQLConf): Boolean = bool(conf, JoinDenseKeys, default = true)
 
   /** Convert BroadcastNestedLoopJoinExec (non-equi joins) when the streamed side is columnar. */
   def broadcastNestedLoopJoinEnabled(conf: SQLConf): Boolean =
