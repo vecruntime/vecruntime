@@ -32,6 +32,12 @@ version may change configuration keys or defaults, always noted here.
 
 ### Changed
 
+- The scan adapter decodes a dictionary-encoded numeric Parquet column without staging (#551): with
+  off-heap reader vectors (`spark.sql.columnVector.offheap.enabled`) the ids and null flags are read in
+  native memory instead of being copied into a fresh `int[]`/`byte[]` per column per batch, and for a
+  Parquet dictionary -- decoded whole once per column chunk -- the pass for the largest id is skipped
+  on both heap kinds. `DictionaryDecodeBenchmark` (4096-row batches, 7,200-entry dictionary): 3.3x
+  INT32 / 2.4x INT64 off heap, 2.1x / 1.9x on heap, about 1.6-2x with 5% nulls. Output is unchanged.
 - A hash join on a single INT32/INT64 key whose build values span a small range (at most 10x the
   distinct keys, as Spark's dense `LongHashedRelation`) probes through an array indexed by the key
   instead of the hash table (#546, `spark.vecruntime.join.denseKeys`, default on): 22.7x the hash
