@@ -2759,7 +2759,7 @@ The page is [benchmarks/tpcds-1tb-graviton.html](benchmarks/tpcds-1tb-graviton.h
 
 #### Rerun with AQE's defaults (2026-09-26)
 
-The page now shows this run. Changes from the one above:
+The page showed this run until 2026-09-29. Changes from the one above:
 
 - **AQE settings:** the advisory size is left at Spark's default (64 MB), and `minPartitionNum` is unset.
 - **Our build:** main d50d3e9, plus AQE map-size scaling from #514 (`spark.vecruntime.shuffle.aqe.mapSizeScaling=true`, `sparkCompressionRatio=0`).
@@ -2787,3 +2787,26 @@ The page now shows this run. Changes from the one above:
   - **With it:** 300 tasks, no spill, 39 s.
   - **The larger compression-2.5 factor:** it stops AQE merging the short queries' small partitions, which is why it loses on the geomean.
 - **The x86 comparison on the page mixes settings:** its reference is still the published 128m run.
+
+#### Rerun in one cluster session on main c3f9848 (2026-09-29)
+
+The page now shows this run: both engines back to back in a single cluster session, on main c3f9848
+(#325's columnar broadcast exchange and #541's word-at-a-time validity), image `main-c3f9848-arm64`. The
+settings are the 2026-09-26 run's: AQE's defaults (64 MB advisory, no `minPartitionNum`), map-size
+scaling with compression ratio 0.
+
+| | Spark (s) | ours (s) | speedup | geomean |
+|---|---|---|---|---|
+| Graviton4, one session, main c3f9848 (2026-09-29) | 2,667.6 | 2,122.8 | 1.26x | 1.26x |
+| Graviton4, AQE defaults, d50d3e9 + #514 (2026-09-26) | 2,207.3 | 1,800.5 | 1.23x | 1.21x |
+
+- **This cluster session was slower for both engines:** Spark took 21% longer than on 2026-09-26 with the
+  same image and settings, and ours 18% longer. When the 2026-09-28 ours-only run's event logs were set
+  against 2026-09-26's, task CPU time was equal and the extra time was off CPU, waiting on S3. That's why a
+  run is only compared with the other engine in the same session.
+- **An earlier ours-only run on c3f9848 (2026-09-28, 2,176.7 s)** set against the 2026-09-26 Spark
+  looked like 1.01x. That was the same session effect, and is why this run repeats both engines together.
+- **Correctness:** row counts are equal on every query. Checksums are equal except q65 (ties). All
+  5,008 operators ran on ours.
+- **Speed:** we are faster than Spark on 90 of 103 queries (77 on 2026-09-26). Executor time is 52.2 h
+  against 66.1 h, and shuffle read 0.47 TB against 0.94 TB.
