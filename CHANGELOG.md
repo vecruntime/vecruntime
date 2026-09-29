@@ -8,6 +8,10 @@ version may change configuration keys or defaults, always noted here.
 
 ### Added
 
+- A broadcast hash join converts when its build side carries array, map or struct payload columns
+  (#547, `spark.vecruntime.join.buildPayload`, default on): they are copied into a row store and read
+  as views over the build row ids; keys and the condition still need lanes. Adaptive execution's
+  choice of broadcast side no longer decides whether such a join is ours (`postgreSQL/with.sql`).
 - The columnar broadcast exchange also carries the nested-loop join's broadcast (#325, slice 2):
   `VectorBroadcastNestedLoopJoinExec` builds its table from the batches, and a Spark nested-loop join
   over the same exchange gets Spark's array of rows, built from the batches on first use.

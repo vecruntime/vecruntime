@@ -72,6 +72,7 @@ object VectorConf {
   val JoinSpillBuckets = "spark.vecruntime.join.spillBuckets"
   val JoinSpillBytes = "spark.vecruntime.join.spillBytes"
   val JoinDenseKeys = "spark.vecruntime.join.denseKeys"
+  val JoinBuildPayload = "spark.vecruntime.join.buildPayload"
   val CometRangeShuffleEnabled = "spark.vecruntime.comet.shuffle.range.enabled"
 
   /** The scan-side prefetching converter (#403, lever 2): the queue depth, `0` off. */
@@ -189,6 +190,13 @@ object VectorConf {
    * the key instead of the hash table (#546): a range check and one load per row.
    */
   def joinDenseKeys(conf: SQLConf): Boolean = bool(conf, JoinDenseKeys, default = true)
+
+  /**
+   * A broadcast hash join whose build side carries payload columns without a lane (arrays, maps,
+   * structs) keeps them in a row store next to the lane columns (#547) instead of staying Spark's.
+   * Keys and the condition must still read lane columns only.
+   */
+  def joinBuildPayload(conf: SQLConf): Boolean = bool(conf, JoinBuildPayload, default = true)
 
   /** Convert BroadcastNestedLoopJoinExec (non-equi joins) when the streamed side is columnar. */
   def broadcastNestedLoopJoinEnabled(conf: SQLConf): Boolean =
