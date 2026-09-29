@@ -26,6 +26,7 @@ object VectorConf {
   val ProjectEnabled = "spark.vecruntime.exec.project.enabled"
   val AggregateEnabled = "spark.vecruntime.exec.aggregate.enabled"
   val FinalAggregateEnabled = "spark.vecruntime.exec.aggregate.final.enabled"
+  val ObjectAggregateEnabled = "spark.vecruntime.exec.objectAggregate.enabled"
   val SelectionEnabled = "spark.vecruntime.exec.selection.enabled"
   val CometShuffleEnabled = "spark.vecruntime.comet.shuffle.enabled"
 
@@ -96,6 +97,15 @@ object VectorConf {
 
   /** Convert Final-mode aggregates too (their input is a shuffle, converted to columnar by Spark). */
   def finalAggregateEnabled(conf: SQLConf): Boolean = bool(conf, FinalAggregateEnabled, default = true)
+
+  /**
+   * Convert `ObjectHashAggregateExec` for the object aggregates whose buffer we can carry (#57):
+   * `bloom_filter_agg` (the runtime filter's build side), `collect_list`, `collect_set`. Driven
+   * through Spark's own function object per group so the partial buffer and result are byte-identical;
+   * the other object aggregates (`percentile*`, `collect_top_k`, ...) keep the fallback reason. Needs
+   * `aggregate.enabled` (and, for the merge modes, `aggregate.final.enabled`).
+   */
+  def objectAggregateEnabled(conf: SQLConf): Boolean = bool(conf, ObjectAggregateEnabled, default = true)
 
   /** Feed Comet's native shuffle from spark-vector operators when Comet's shuffle is configured. */
   def cometShuffleEnabled(conf: SQLConf): Boolean = bool(conf, CometShuffleEnabled, default = true)
