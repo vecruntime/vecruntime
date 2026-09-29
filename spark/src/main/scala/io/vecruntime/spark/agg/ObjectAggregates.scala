@@ -68,7 +68,7 @@ final case class SparkObjectAgg(
   private def mergeRow(buffer: AnyRef, ctx: EvalContext, i: Int): AnyRef = {
     val col = ctx.column(bufferOrdinal)
     if (col.isNullAt(i)) buffer // Spark emits no partial buffer for a group with no non-null input
-    else function.merge(buffer, function.deserialize(col.getBinary(i)))
+    else function.merge(buffer, function.deserialize(SparkObjectAgg.bytesOf(col, i)))
   }
 
   override def newState(): AggState = new AggState {
@@ -89,12 +89,17 @@ final case class SparkObjectAgg(
 
   override def newGroupedState(): GroupedAggState = new GroupedAggState {
     private var buffers = new Array[AnyRef](0)
+    // A running heap estimate per group (#57), so the operator's budget sees the object buffers and
+    // spills instead of pinning memory: a bloom filter's bit array is a fixed size known once it
+    // exists; a collect buffer grows by an estimated element width per appended row.
+    private var bytes = new Array[Long](0)
     private def ensure(g: Int): Unit = if (g >= buffers.length) {
       val next = math.max(g + 1, buffers.length * 2)
       val grown = java.util.Arrays.copyOf(buffers, next)
       var k = buffers.length
       while (k < next) { grown(k) = function.createAggregationBuffer(); k += 1 }
       buffers = grown
+      bytes = java.util.Arrays.copyOf(bytes, next)
     }
     override def update(ctx: EvalContext, groups: GroupAssignment): Unit = {
       val ids = groups.ids()
@@ -106,17 +111,33 @@ final case class SparkObjectAgg(
           val g = ids(i)
           if (g >= 0) {
             ensure(g)
-            buffers(g) = if (merge) mergeRow(buffers(g), ctx, i) else function.update(buffers(g), ctx.batch.getRow(i))
+            if (merge) buffers(g) = mergeRow(buffers(g), ctx, i)
+            else buffers(g) = function.update(buffers(g), ctx.batch.getRow(i))
+            bytes(g) = SparkObjectAgg.estimateBytes(function, buffers(g), bytes(g), grew = !merge)
           }
         }
         i += 1
       }
     }
     override def bufferValue(g: Int, slot: Int): Any = { ensure(g); emit(buffers(g)) }
+    // Spilling always emits the mergeable serialized buffer, even in a result stage (finalResult).
+    override def spillValue(g: Int, slot: Int): Any = { ensure(g); function.serialize(buffers(g)) }
+    override def groupBytes(g: Int): Long = if (g < bytes.length) bytes(g) else 0L
   }
 }
 
 object SparkObjectAgg {
+
+  /**
+   * The serialized buffer bytes at row `i`, whether the column is a real `BinaryType` (the child's
+   * partial buffer, from the exchange) or a `StringType` carrier (a spilled buffer, #57): a spilled
+   * object-agg buffer travels as UTF8-carried bytes to reuse the existing UTF8 spill path, and Spark's
+   * varchar accessor gives them back unchanged. `getBinary` works for the binary column; the varchar
+   * accessor does not implement it, so we fall back to the UTF8 bytes there.
+   */
+  def bytesOf(col: org.apache.spark.sql.vectorized.ColumnVector, i: Int): Array[Byte] =
+    try col.getBinary(i)
+    catch { case _: UnsupportedOperationException => col.getUTF8String(i).getBytes }
 
   /** Whether `f` is one of the object aggregates this path carries. */
   def carries(f: org.apache.spark.sql.catalyst.expressions.aggregate.AggregateFunction): Boolean = f match {
@@ -124,6 +145,44 @@ object SparkObjectAgg {
     case _: org.apache.spark.sql.catalyst.expressions.aggregate.CollectList => true
     case _: org.apache.spark.sql.catalyst.expressions.aggregate.CollectSet => true
     case _ => false
+  }
+
+  /**
+   * A cheap per-group heap estimate for the memory budget (#57), without serializing every group on
+   * every budget check. A bloom filter's footprint is its bit array, a fixed size read from
+   * `bitSize()`; a collect buffer grows by an estimated element width per appended row (`grew`),
+   * added to the previous estimate. Deliberately an upper-ish bound: over-counting spills a little
+   * early, which is safe; under-counting an object buffer is what OOMs an executor.
+   */
+  def estimateBytes(
+      function: TypedImperativeAggregate[AnyRef],
+      buffer: AnyRef,
+      previous: Long,
+      grew: Boolean
+  ): Long = buffer match {
+    case bf: org.apache.spark.util.sketch.BloomFilter =>
+      // The serialized size BloomFilterAggregate.serialize would write: bitSize/8 + 8, plus object overhead.
+      (bf.bitSize() / 8L) + 32L
+    case _ =>
+      // A collect_list/collect_set buffer: previous estimate plus one element on an append (merge
+      // recomputes from the merged buffer's own updates on the other side, so only update grows here).
+      val base = if (previous == 0L) 48L else previous // ArrayBuffer/HashSet object overhead
+      if (grew) base + collectElementWidth(function) else base
+  }
+
+  /** A rough per-element width for a collect buffer, by the collected element type. */
+  private def collectElementWidth(function: TypedImperativeAggregate[AnyRef]): Long = {
+    val dt = (function: org.apache.spark.sql.catalyst.expressions.aggregate.AggregateFunction) match {
+      case c: org.apache.spark.sql.catalyst.expressions.aggregate.CollectList => c.child.dataType
+      case c: org.apache.spark.sql.catalyst.expressions.aggregate.CollectSet => c.child.dataType
+      case _ => org.apache.spark.sql.types.LongType
+    }
+    dt match {
+      case _: org.apache.spark.sql.types.StringType => 48L // a UTF8String plus a boxed reference
+      case _: org.apache.spark.sql.types.BinaryType => 48L
+      case _: org.apache.spark.sql.types.DecimalType => 40L
+      case _ => 24L // a boxed primitive plus a slot
+    }
   }
 
   /**

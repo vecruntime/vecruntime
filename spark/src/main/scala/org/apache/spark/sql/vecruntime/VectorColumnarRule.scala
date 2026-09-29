@@ -795,8 +795,13 @@ case class VectorExecRule(session: SparkSession) extends Rule[SparkPlan] with Lo
    * an unsupported key or an object aggregate we do not carry with its own reason. `RollupRewrite` is
    * not applied: Spark does not plan an ObjectHashAggregate under our `Expand`.
    */
-  private def planObjectAggregate(o: ObjectHashAggregateExec, conf: SQLConf): SparkPlan =
-    if (!columnarChild(o.child)) fallback(o, s"child ${o.child.nodeName} is not columnar")
+  private def planObjectAggregate(o: ObjectHashAggregateExec, conf: SQLConf): SparkPlan = {
+    // A merging stage (Final / PartialMerge) reads an exchange: Spark inserts RowToColumnarExec below
+    // us for its row shuffle, so the child need not already be columnar (the buffer is read row by row
+    // through getBinary regardless). An update stage (Partial / Complete) reads the scan's batches, so
+    // it does require a columnar child. Keys and functions are gated by VectorAggregatePlanner.plan.
+    val readsExchange = VectorAggregatePlanner.readsExchange(o)
+    if (!readsExchange && !columnarChild(o.child)) fallback(o, s"child ${o.child.nodeName} is not columnar")
     else VectorAggregatePlanner.plan(
       o,
       VectorConf.finalAggregateEnabled(conf),
@@ -805,6 +810,7 @@ case class VectorExecRule(session: SparkSession) extends Rule[SparkPlan] with Lo
       case Right(v) => v
       case Left(reason) => fallback(o, reason)
     }
+  }
 
   private def sameOrder(
       a: Seq[org.apache.spark.sql.catalyst.expressions.SortOrder],
