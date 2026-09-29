@@ -80,6 +80,7 @@ of the plan stays columnar.
 | `spark.vecruntime.join.spillBuckets` | `32` | int | Buckets a split shuffled hash join writes each side into and joins one at a time (#416); `1` or less turns the split off. |
 | `spark.vecruntime.join.hashMaxBuildSize` | `spillBuckets x spillBytes` (8 GiB) | size, `0` = no cap | The most a sort-merge join's build side may weigh per task, by statistics, for `mode=auto` to make it the hash join: within `spark.vecruntime.join.spillBytes` it builds in memory, within this cap it splits into buckets once, past it -- or without an estimate -- the merge join over the spilling sort takes it (#416). |
 | `spark.vecruntime.join.denseKeys` | `true` | boolean | A hash join on one INT32/INT64 key whose build values span at most 10x the distinct keys (and at most 4 M values) is probed through an array indexed by the key, not the hash table (#546): a range check and one load per row, 18-23x the hash probe in `JoinProbeBenchmark`. Spark's own `LongHashedRelation` switches to a dense array under the same rule. |
+| `spark.vecruntime.join.buildPayload` | `true` | boolean | A broadcast hash join whose build side carries payload columns without a lane (arrays, maps, structs) keeps them in a row store beside the lane columns and converts (#547); keys and the join condition must still read lane columns only. Off: every build column needs a lane, as before. The shuffled hash join's build side still needs lanes. |
 
 ## Scan
 

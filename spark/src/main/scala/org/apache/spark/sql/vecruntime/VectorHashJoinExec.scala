@@ -20,7 +20,7 @@ import java.util.ArrayDeque
 
 import io.vecruntime.kernels._
 import io.vecruntime.spark.adapter.TypeMapping
-import io.vecruntime.spark.arrow.{ArrowOutput, RemappedColumnVector, VectorAllocators}
+import io.vecruntime.spark.arrow.{ArrowOutput, BuildPayloadColumn, RemappedColumnVector, VectorAllocators}
 import io.vecruntime.spark.expr.{EvalContext, ExpressionCompiler, LiteralExpr, VectorExpr}
 import org.apache.arrow.memory.BufferAllocator
 import org.apache.spark.TaskContext
@@ -328,8 +328,17 @@ final class BuildTable(
     spec: JoinSpec,
     val shared: Boolean = false,
     /** The owning builders `columns` are the views of, when they are (closed with the table; #416). */
-    builders: Array[ColumnBuilder] = null
+    builders: Array[ColumnBuilder] = null,
+    /**
+     * Per build column, the row store of a payload column without a lane (an array, map or struct,
+     * #547) -- its `columns` entry is then null -- or null for a lane column; null when every column
+     * has a lane. Keys and the condition never read such a column: the planner checks it.
+     */
+    val payload: Array[BuildPayloadColumn] = null
 ) extends AutoCloseable {
+
+  /** The row store of build column `c`, or null when the column has a lane. */
+  def payloadAt(c: Int): BuildPayloadColumn = if (payload == null) null else payload(c)
 
   /**
    * The key table of an equi-join; a nested loop join (no keys) never builds one. String keys by
@@ -371,7 +380,7 @@ final class BuildTable(
   /** The heap mirror of column `c`, or null when the column is not one a mirror covers. A shared table may race to make it; the result is the same. */
   def mirror(c: Int): io.vecruntime.kernels.HeapMirror = {
     var m = mirrors(c)
-    if (m == null && io.vecruntime.kernels.HeapMirror.mirrors(columns(c))) {
+    if (m == null && columns(c) != null && io.vecruntime.kernels.HeapMirror.mirrors(columns(c))) {
       m = io.vecruntime.kernels.HeapMirror.of(columns(c))
       mirrors(c) = m
     }
@@ -433,7 +442,8 @@ final class BuildTable(
   /** Frees the table's memory: `close()` for a task's own table, the owner's cleaner for a shared one. */
   def release(): Unit = {
     arena.close()
-    if (builders != null) builders.foreach(_.close())
+    if (builders != null) builders.foreach(b => if (b != null) b.close())
+    if (payload != null) payload.foreach(p => if (p != null) p.close())
   }
 }
 
@@ -464,20 +474,55 @@ object BuildTable {
   /** The build side from columnar batches (shuffled hash join; a columnar broadcast, shared). */
   def fromBatches(batches: Iterator[ColumnarBatch], spec: JoinSpec, shared: Boolean = false): BuildTable = {
     val arena = Arena.ofShared()
-    // Owning builders: a grown-out buffer is released at once, not with the arena (#416).
-    val builders = spec.buildTypes.map(dt => ColumnBuilder.owning(TypeMapping.vecTypeOf(dt), 4096))
+    // Owning builders: a grown-out buffer is released at once, not with the arena (#416). A payload
+    // column without a lane goes to a row store instead (#547), read through the batch's rows.
+    val types = spec.buildTypes
+    val payload = BuildTable.payloadColumns(types)
+    val builders = types.map(dt =>
+      if (TypeMapping.hasLane(dt)) ColumnBuilder.owning(TypeMapping.vecTypeOf(dt), 4096) else null
+    )
     var total = 0
     while (batches.hasNext) {
       val batch = batches.next()
       if (batch.numRows() > 0) {
         EvalContexts.withBatch(batch) { ctx =>
           var c = 0
-          while (c < builders.length) { builders(c).append(ctx.input(c), ctx.selection, ctx.selectedCount); c += 1 }
+          while (c < builders.length) {
+            if (builders(c) != null) builders(c).append(ctx.input(c), ctx.selection, ctx.selectedCount)
+            c += 1
+          }
+          if (payload != null) BuildTable.appendPayload(payload, ctx)
           total += ctx.selectedCount
         }
       }
     }
-    new BuildTable(arena, builders.map(_.view()), total, spec, shared, builders).build()
+    if (payload != null) payload.foreach(p => if (p != null) p.seal())
+    new BuildTable(arena, builders.map(b => if (b == null) null else b.view()), total, spec, shared, builders, payload)
+      .build()
+  }
+
+  /** A row store per build column without a lane (#547), null entries for the lane columns; null when all have one. */
+  private[vecruntime] def payloadColumns(types: Array[DataType]): Array[BuildPayloadColumn] =
+    if (types.forall(TypeMapping.hasLane)) null
+    else types.map(dt => if (TypeMapping.hasLane(dt)) null else new BuildPayloadColumn(dt, 1024))
+
+  /** Appends the selected rows of the batch in `ctx` to the row stores, each column read as a Spark array over its rows. */
+  private def appendPayload(payload: Array[BuildPayloadColumn], ctx: EvalContext): Unit = {
+    val n = ctx.numRows
+    val selection = ctx.selection
+    var c = 0
+    while (c < payload.length) {
+      val p = payload(c)
+      if (p != null) {
+        val rows = new org.apache.spark.sql.vectorized.ColumnarArray(ctx.column(c), 0, n)
+        var i = 0
+        while (i < n) {
+          if (selection == null || io.vecruntime.kernels.Bitmap.isSet(selection, i)) p.add(rows, i)
+          i += 1
+        }
+      }
+      c += 1
+    }
   }
 
   /**
@@ -487,18 +532,24 @@ object BuildTable {
   def fromRelation(rows: Iterator[InternalRow], spec: JoinSpec, shared: Boolean = false): BuildTable = {
     val arena = Arena.ofShared()
     val types = spec.buildTypes
-    val builders = types.map(dt => new RowColumnBuilder(dt))
+    // A payload column without a lane (#547) is copied out of the row into a row store.
+    val payload = payloadColumns(types)
+    val builders = types.map(dt => if (TypeMapping.hasLane(dt)) new RowColumnBuilder(dt) else null)
     var numRows = 0
     while (rows.hasNext) {
       val row = rows.next()
       var c = 0
-      while (c < builders.length) { builders(c).add(row, c); c += 1 }
+      while (c < builders.length) {
+        if (builders(c) != null) builders(c).add(row, c) else payload(c).add(row, c)
+        c += 1
+      }
       numRows += 1
     }
+    if (payload != null) payload.foreach(p => if (p != null) p.seal())
     // The build side may have been pruned to no columns at all (a cross join that projects only
     // the streamed side): the row count must not come from a column.
-    val columns = builders.map(_.build(arena))
-    new BuildTable(arena, columns, numRows, spec, shared).build()
+    val columns = builders.map(b => if (b == null) null else b.build(arena))
+    new BuildTable(arena, columns, numRows, spec, shared, payload = payload).build()
   }
 
   /**
@@ -1163,7 +1214,9 @@ private[vecruntime] class VectorHashJoinIterator(
       while (c < columns.length) {
         val (name, dt) = spec.outputAttrs(c)
         columns(c) =
-          if (isBuildColumn(c))
+          if (isBuildColumn(c) && build.payloadAt(buildOrdinal(c)) != null)
+            build.payloadAt(buildOrdinal(c)).view(buildIdx, from, to)
+          else if (isBuildColumn(c))
             ArrowOutput.gather(name, dt, build.columns(buildOrdinal(c)), buildIdx, from, to, allocator)
           else if (TypeMapping.hasLane(dt)) ArrowOutput.nulls(name, dt, to - from, allocator)
           else nullsWithoutLane(dt, to - from)
@@ -1229,6 +1282,8 @@ private[vecruntime] class VectorHashJoinIterator(
       val (name, dt) = attrs(c)
       columns(c) =
         if (only != null && !only(c)) PlaceholderColumn
+        else if (isBuildColumn(c) && build.payloadAt(buildOrdinal(c)) != null)
+          build.payloadAt(buildOrdinal(c)).view(bld, from, to)
         else if (isBuildColumn(c) && build.mirror(buildOrdinal(c)) != null)
           ArrowOutput.gatherHeap(name, dt, build.mirror(buildOrdinal(c)), bld, from, to, allocator, gatherScratch)
         else if (!isBuildColumn(c) && TypeMapping.hasLane(dt) && streamedMirror(ctx, streamedOrdinal(c)) != null)

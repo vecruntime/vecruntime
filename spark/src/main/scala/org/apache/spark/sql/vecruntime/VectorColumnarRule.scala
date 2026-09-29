@@ -17,7 +17,7 @@ package org.apache.spark.sql.vecruntime
 
 import io.vecruntime.spark.VectorConf
 import io.vecruntime.spark.adapter.TypeMapping
-import org.apache.spark.sql.catalyst.expressions.{Alias, Attribute}
+import org.apache.spark.sql.catalyst.expressions.{Alias, Attribute, AttributeSet}
 import io.vecruntime.spark.expr.ExpressionCompiler
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.SparkSession
@@ -309,7 +309,11 @@ case class VectorExecRule(session: SparkSession) extends Rule[SparkPlan] with Lo
             case org.apache.spark.sql.catalyst.optimizer.BuildLeft => (j.left, j.right)
             case org.apache.spark.sql.catalyst.optimizer.BuildRight => (j.right, j.left)
           }
-          streamedInputReason(streamedPlan).orElse(laneTypeReason(buildPlan)).orElse(VectorJoinPlanner.buildSizeReason(
+          streamedInputReason(streamedPlan).orElse(broadcastBuildReason(
+            j,
+            buildPlan,
+            VectorConf.joinBuildPayload(conf)
+          )).orElse(VectorJoinPlanner.buildSizeReason(
             buildPlan,
             maxBuildSize
           )) match {
@@ -1066,6 +1070,25 @@ case class VectorExecRule(session: SparkSession) extends Rule[SparkPlan] with Lo
     plan.output.find(a => !TypeMapping.hasLane(a.dataType)).map(a =>
       s"unsupported column type ${a.dataType.simpleString} for ${a.name}"
     )
+
+  /**
+   * The build side of a broadcast hash join (#547): a column without a lane is carried in a row store
+   * when it is payload -- neither a key nor the condition reads it -- and its type is one the store
+   * holds. Without `spark.vecruntime.join.buildPayload` every build column needs a lane, as before.
+   */
+  private def broadcastBuildReason(j: BroadcastHashJoinExec, buildPlan: SparkPlan, payload: Boolean): Option[String] =
+    if (!payload) laneTypeReason(buildPlan)
+    else {
+      val keys = j.buildSide match {
+        case org.apache.spark.sql.catalyst.optimizer.BuildLeft => j.leftKeys
+        case org.apache.spark.sql.catalyst.optimizer.BuildRight => j.rightKeys
+      }
+      val read = AttributeSet(keys.flatMap(_.references)) ++ j.condition.map(_.references).getOrElse(AttributeSet.empty)
+      buildPlan.output.find(a =>
+        !TypeMapping.hasLane(a.dataType) &&
+          (read.contains(a) || !io.vecruntime.spark.arrow.BuildPayloadColumn.carries(a.dataType))
+      ).map(a => s"unsupported column type ${a.dataType.simpleString} for ${a.name}")
+    }
 
   private def typeReason(
       plan: SparkPlan,

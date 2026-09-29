@@ -725,12 +725,8 @@ class VectorJoinSuite extends VectorQuerySuite {
       "SELECT /*+ SHUFFLE_HASH(dim) */ dim.name, nk.i, nk.st FROM dim FULL OUTER JOIN nk ON dim.di = nk.i50 AND nk.i < 3000",
       Seq(SHJ)
     )
-    // The build side is laid out in lanes: a struct there is still refused, with its reason.
-    checkFallback(
-      "SELECT /*+ BROADCAST(nk) */ nk.i, nk.st, dim.name FROM dim JOIN nk ON dim.di = nk.i50 WHERE dim.di < 10",
-      Seq(BHJ),
-      "unsupported column type struct"
-    )
+    // A broadcast build side carries such a payload in a row store (#547, its own test below); the
+    // shuffled join's build side is still laid out in lanes only, and refuses it with its reason.
     checkFallback(
       "SELECT /*+ SHUFFLE_HASH(nk) */ nk.i, nk.st, dim.name FROM dim JOIN nk ON dim.di = nk.i50 WHERE dim.di < 10",
       Seq(SHJ),
@@ -810,5 +806,69 @@ class VectorJoinSuite extends VectorQuerySuite {
       "SELECT /*+ SHUFFLE_HASH(dim) */ tk.i, dim.dl FROM tk RIGHT JOIN dim ON tk.l = dim.dl AND tk.i < 40",
       Seq(SHJ)
     )
+  }
+
+  test("payload columns without a lane on the broadcast build side are carried in a row store (#547)") {
+    // A dimension with every nested shape: arrays of ints and strings (null, empty, null elements),
+    // a map, a struct nested two levels with an array and a wide decimal inside, null at each level.
+    // Ten keys appear twice (dim's di), so a streamed row can take several build payloads.
+    val dp = newTempPath("join/dp")
+    spark.sql(
+      "SELECT di, dl, name, " +
+        "if(di % 7 = 3, null, if(di % 4 = 0, array(), array(di, di + 1, if(di % 3 = 0, null, di * 2)))) AS ai, " +
+        "if(di % 9 = 5, null, array(name, concat(name, '-x'), if(di % 5 = 0, null, 'z'))) AS astr, " +
+        "if(di % 8 = 1, null, map(concat('k', di), di, 'kk', if(di % 2 = 0, null, di * 10))) AS mp, " +
+        "if(di % 11 = 2, null, named_struct('a', di, 'b', name, " +
+        "'c', if(di % 6 = 0, null, named_struct('d', dl, 'e', array(weight, weight * 2), " +
+        "'f', cast(dl as decimal(30, 4)))))) AS st FROM dim"
+    )
+      .write.mode("overwrite").parquet(dp)
+    spark.read.parquet(dp).createOrReplaceTempView("dp")
+    val payloads = "dp.ai, dp.astr, dp.mp, dp.st"
+    // Inner join, multiple matches per streamed row, every payload out.
+    checkVectorized(s"SELECT /*+ BROADCAST(dp) */ tk.i, dp.name, $payloads FROM tk JOIN dp ON tk.i50 = dp.di", Seq(BHJ))
+    // Left outer with the build on the right: unmatched streamed rows pad every payload with null.
+    checkVectorized(
+      s"SELECT /*+ BROADCAST(dp) */ tk.i, $payloads FROM tk LEFT JOIN dp ON tk.i50 = dp.di AND dp.di < 20 WHERE tk.i < 4000",
+      Seq(BHJ)
+    )
+    // Right outer with the build on the left (Spark broadcasts the non-preserved side).
+    checkVectorized(
+      s"SELECT /*+ BROADCAST(dp) */ tk.i, $payloads FROM dp RIGHT JOIN tk ON dp.di = tk.i50 AND dp.di > 35 WHERE tk.i < 4000",
+      Seq(BHJ)
+    )
+    // A condition on lane columns of both sides; the payload rides along with the surviving pairs.
+    checkVectorized(
+      s"SELECT /*+ BROADCAST(dp) */ tk.i, $payloads FROM tk JOIN dp ON tk.i50 = dp.di AND tk.l > dp.dl",
+      Seq(BHJ)
+    )
+    // A long key with nulls (null keys never match), and fields read above the join.
+    checkVectorized(
+      "SELECT /*+ BROADCAST(dp) */ tk.i, dp.st.a AS a, dp.st.c.e AS e, dp.mp['kk'] AS kk, size(dp.ai) AS n FROM tk JOIN dp ON tk.l = dp.dl",
+      Seq(BHJ)
+    )
+    // Both sides carry payloads: the streamed one passes through (#273), the build one from the store.
+    val nk2 = newTempPath("join/nk2")
+    spark.sql("SELECT i, i50, array(i, l) AS sarr, named_struct('p', s) AS sst FROM tk WHERE i < 5000")
+      .write.mode("overwrite").parquet(nk2)
+    spark.read.parquet(nk2).createOrReplaceTempView("nk2")
+    checkVectorized(
+      s"SELECT /*+ BROADCAST(dp) */ nk2.i, nk2.sarr, nk2.sst, $payloads FROM nk2 LEFT JOIN dp ON nk2.i50 = dp.di AND dp.di % 3 = 1",
+      Seq(BHJ)
+    )
+    // A condition that reads a payload column keeps the join with Spark, with the reason.
+    checkFallback(
+      "SELECT /*+ BROADCAST(dp) */ tk.i, dp.ai FROM tk JOIN dp ON tk.i50 = dp.di AND size(dp.ai) > tk.i50 WHERE tk.i < 100",
+      Seq(BHJ),
+      "unsupported column type array"
+    )
+    // With the switch off, the build side needs lanes again.
+    withConf(VectorConf.JoinBuildPayload -> "false") {
+      checkFallback(
+        "SELECT /*+ BROADCAST(dp) */ tk.i, dp.ai FROM tk JOIN dp ON tk.i50 = dp.di WHERE tk.i < 100",
+        Seq(BHJ),
+        "unsupported column type array"
+      )
+    }
   }
 }
