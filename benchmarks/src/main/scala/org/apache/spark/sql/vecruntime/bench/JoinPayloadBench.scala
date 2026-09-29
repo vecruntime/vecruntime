@@ -65,14 +65,18 @@ final class JoinPayloadBench(
 
   private val rnd = new java.util.Random(seed)
 
-  private val table: BuildTable = {
-    val rows = (0 until buildRows).map { i =>
-      val k = i * 7 + 1 // spread keys; half of the probe keys match
-      if (arrayPayload) InternalRow(k, i, new GenericArrayData(Array[Any](i, i + 1, i + 2, i + 3)))
-      else InternalRow(k, i)
-    }
-    BuildTable.sharedFromRows(rows.toArray, spec)
-  }
+  /**
+   * The broadcast relation the shared table is keyed on. Held for the benchmark's life, as the
+   * operator's closure holds Spark's relation for a task's: once it is collected, the table's
+   * cleaner frees the table.
+   */
+  private val relation: Array[InternalRow] = (0 until buildRows).map { i =>
+    val k = i * 7 + 1 // spread keys; half of the probe keys match
+    if (arrayPayload) InternalRow(k, i, new GenericArrayData(Array[Any](i, i + 1, i + 2, i + 3)))
+    else InternalRow(k, i)
+  }.toArray
+
+  private val table: BuildTable = BuildTable.sharedFromRows(relation, spec)
 
   private val probes: Array[ColumnarBatch] = Array.fill(batches) {
     val rows: Array[InternalRow] = Array.fill(rowsPerBatch)(InternalRow(rnd.nextInt(buildRows * 14) + 1))
