@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <parent>
+    <groupId>io.github.vecruntime</groupId>
+    <artifactId>vecruntime-parent</artifactId>
+    <version>0.0.4-SNAPSHOT</version>
+  </parent>
+  <artifactId>vecruntime-s3-crt-stream</artifactId>
+  <name>vecruntime-s3-crt-stream</name>
+  <description>Optional S3A input stream factory for the benchmark image: the Analytics Accelerator stream S3A 3.4.3
+    uses by default, but served by the AWS CRT S3 client instead of the synchronous SDK client S3A hands it.
+    Selected with fs.s3a.input.stream.type=custom; the engine itself never depends on it.</description>
+
+  <properties>
+    <!-- The versions the benchmark image ships (benchmarks/k8s/Dockerfile); all provided by the image. -->
+    <s3crt.hadoop.version>3.4.3</s3crt.hadoop.version>
+    <s3crt.awssdk.version>2.35.4</s3crt.awssdk.version>
+    <s3crt.aal.version>1.3.1</s3crt.aal.version>
+    <!-- The aws-crt release SDK 2.35.4 is built against (its awscrt.version). -->
+    <s3crt.awscrt.version>0.38.9</s3crt.awscrt.version>
+  </properties>
+
+  <dependencies>
+    <dependency>
+      <groupId>org.apache.hadoop</groupId>
+      <artifactId>hadoop-aws</artifactId>
+      <version>${s3crt.hadoop.version}</version>
+      <scope>provided</scope>
+      <exclusions>
+        <exclusion>
+          <groupId>*</groupId>
+          <artifactId>*</artifactId>
+        </exclusion>
+      </exclusions>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.hadoop</groupId>
+      <artifactId>hadoop-common</artifactId>
+      <version>${s3crt.hadoop.version}</version>
+      <scope>provided</scope>
+      <exclusions>
+        <exclusion>
+          <groupId>*</groupId>
+          <artifactId>*</artifactId>
+        </exclusion>
+      </exclusions>
+    </dependency>
+    <dependency>
+      <groupId>org.slf4j</groupId>
+      <artifactId>slf4j-api</artifactId>
+      <version>2.0.17</version>
+      <scope>provided</scope>
+    </dependency>
+    <dependency>
+      <groupId>software.amazon.awssdk</groupId>
+      <artifactId>bundle</artifactId>
+      <version>${s3crt.awssdk.version}</version>
+      <scope>provided</scope>
+    </dependency>
+    <dependency>
+      <groupId>software.amazon.s3.analyticsaccelerator</groupId>
+      <artifactId>analyticsaccelerator-s3</artifactId>
+      <version>${s3crt.aal.version}</version>
+      <scope>provided</scope>
+      <exclusions>
+        <exclusion>
+          <groupId>*</groupId>
+          <artifactId>*</artifactId>
+        </exclusion>
+      </exclusions>
+    </dependency>
+  </dependencies>
+</project>
