@@ -50,6 +50,12 @@ public final class RleBitPackingReader {
     private final int byteWidthOfValue; // ceil(bitWidth / 8), for an RLE run's repeated value
     private final int mask;
 
+    // Optional fast group unpacker (parquet-java's BytePacker) over the same bytes as a byte[]; null
+    // means use the built-in scalar unpack. `pageArray` is `page` as an array (segment offset == array
+    // index) so the unpacker reads a whole group at `pos` directly.
+    private final GroupUnpacker unpacker;
+    private final byte[] pageArray;
+
     private long pos;
 
     // Current RLE run.
@@ -69,10 +75,30 @@ public final class RleBitPackingReader {
      */
     public RleBitPackingReader(MemorySegment page, long offset, long length,
             int bitWidth) {
+        this(page, null, null, offset, length, bitWidth);
+    }
+
+    /**
+     * A reader over a {@code byte[]} with an injected fast group unpacker
+     * (parquet-java's {@code BytePacker}). The array is wrapped as a segment for
+     * the header, RLE-value and scalar paths; whole bit-packed groups in
+     * {@link #readInts} go through {@code unpacker}. A {@code null} unpacker
+     * falls back to the built-in scalar unpack (identical result).
+     */
+    public static RleBitPackingReader overArray(byte[] page, int offset, int length,
+            int bitWidth, GroupUnpacker unpacker) {
+        return new RleBitPackingReader(MemorySegment.ofArray(page), page, unpacker, offset, length,
+                bitWidth);
+    }
+
+    private RleBitPackingReader(MemorySegment page, byte[] pageArray, GroupUnpacker unpacker,
+            long offset, long length, int bitWidth) {
         if (bitWidth < 0 || bitWidth > 32) {
             throw new IllegalArgumentException("bit width out of range: " + bitWidth);
         }
         this.page = page;
+        this.pageArray = pageArray;
+        this.unpacker = unpacker;
         this.pos = offset;
         this.end = offset + length;
         this.bitWidth = bitWidth;
@@ -97,6 +123,106 @@ public final class RleBitPackingReader {
         }
         packedRemaining--;
         return packed[packedIndex++];
+    }
+
+    /**
+     * Reads {@code n} values into {@code dst[off .. off+n)}. The batch path of
+     * {@link #readInt}: RLE runs are a bulk {@link java.util.Arrays#fill}, and
+     * bit-packed groups are unpacked eight at a time straight into {@code dst}
+     * (no per-value dispatch, no {@code packed}/{@code packedIndex} bookkeeping),
+     * so a call costs one word read per 64 bits of packed data plus the masks,
+     * as parquet-java's generated {@code BytePacker} does. Leaves the reader
+     * positioned exactly as {@code n} calls to {@link #readInt} would.
+     */
+    public void readInts(int[] dst, int off, int n) {
+        if (bitWidth == 0) {
+            java.util.Arrays.fill(dst, off, off + n, 0);
+            return;
+        }
+        int remaining = n;
+        int o = off;
+        // Drain any partial bit-packed group left in `packed` first (from an earlier readInt).
+        while (remaining > 0 && packedRemaining > 0 && packedIndex < 8) {
+            dst[o++] = packed[packedIndex++];
+            packedRemaining--;
+            remaining--;
+        }
+        while (remaining > 0) {
+            if (rleRemaining == 0 && packedRemaining == 0) {
+                readRunHeader();
+            }
+            if (rleRemaining > 0) {
+                int take = Math.min(remaining, rleRemaining);
+                java.util.Arrays.fill(dst, o, o + take, rleValue);
+                o += take;
+                rleRemaining -= take;
+                remaining -= take;
+            } else {
+                // Whole groups of 8 straight into dst.
+                while (remaining >= 8 && packedRemaining >= 8) {
+                    unpackGroup(dst, o);
+                    o += 8;
+                    packedRemaining -= 8;
+                    remaining -= 8;
+                }
+                if (remaining > 0 && packedRemaining > 0) {
+                    // A tail shorter than 8, or fewer than 8 left in the run: fall back to the buffered group.
+                    refillPackedGroup();
+                    int take = Math.min(remaining, Math.min(8, packedRemaining));
+                    for (int i = 0; i < take; i++) {
+                        dst[o++] = packed[packedIndex++];
+                    }
+                    packedRemaining -= take;
+                    remaining -= take;
+                }
+            }
+        }
+    }
+
+    /**
+     * Unpacks the 8 values of one bit-packed group at {@code pos} directly into
+     * {@code dst[o .. o+8)} and advances {@code pos} by {@code bitWidth} bytes.
+     * For {@code bitWidth <= 8} the whole group is {@code <= 64} bits, so it is
+     * read as one little-endian {@code long} and the eight values fall out with
+     * shifts -- no per-byte inner loop.
+     */
+    private void unpackGroup(int[] dst, int o) {
+        long m = mask & 0xFFFFFFFFL;
+        if (unpacker != null) {
+            // parquet-java's generated BytePacker over the byte[] at the current position.
+            unpacker.unpack8(pageArray, (int) pos, dst, o);
+            pos += bitWidth;
+            return;
+        }
+        if (bitWidth <= 8) {
+            int nbytes = bitWidth; // 8 * bitWidth bits / 8
+            long w = 0;
+            for (int b = 0; b < nbytes; b++) {
+                w |= ((long) (page.get(BYTE, pos + b) & 0xFF)) << (8 * b);
+            }
+            pos += nbytes;
+            dst[o] = (int) (w & m);
+            dst[o + 1] = (int) ((w >>> bitWidth) & m);
+            dst[o + 2] = (int) ((w >>> (2 * bitWidth)) & m);
+            dst[o + 3] = (int) ((w >>> (3 * bitWidth)) & m);
+            dst[o + 4] = (int) ((w >>> (4 * bitWidth)) & m);
+            dst[o + 5] = (int) ((w >>> (5 * bitWidth)) & m);
+            dst[o + 6] = (int) ((w >>> (6 * bitWidth)) & m);
+            dst[o + 7] = (int) ((w >>> (7 * bitWidth)) & m);
+            return;
+        }
+        long bitBuffer = 0;
+        int bitsInBuffer = 0;
+        for (int i = 0; i < 8; i++) {
+            while (bitsInBuffer < bitWidth) {
+                int b = page.get(BYTE, pos++) & 0xFF;
+                bitBuffer |= ((long) b) << bitsInBuffer;
+                bitsInBuffer += 8;
+            }
+            dst[o + i] = (int) (bitBuffer & m);
+            bitBuffer >>>= bitWidth;
+            bitsInBuffer -= bitWidth;
+        }
     }
 
     private void readRunHeader() {

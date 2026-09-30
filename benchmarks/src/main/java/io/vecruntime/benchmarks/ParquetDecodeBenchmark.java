@@ -22,6 +22,8 @@ import java.util.Random;
 import java.util.concurrent.TimeUnit;
 
 import io.vecruntime.kernels.parquet.RleBitPackingReader;
+import org.apache.parquet.column.values.bitpacking.BytePacker;
+import org.apache.parquet.column.values.bitpacking.Packer;
 import org.openjdk.jmh.annotations.Benchmark;
 import org.openjdk.jmh.annotations.BenchmarkMode;
 import org.openjdk.jmh.annotations.Fork;
@@ -68,6 +70,10 @@ public class ParquetDecodeBenchmark {
     private Arena arena;
     private MemorySegment page;
     private long length;
+    private byte[] packedBytes; // bit-packed group bytes without the ULEB128 header (BytePacker path)
+    private byte[] pageBytesFull; // the whole hybrid stream as a byte[] (injected-reader path)
+    private int paddedN;
+    private int[] idOut;
 
     @Setup(Level.Trial)
     public void setup() {
@@ -83,8 +89,17 @@ public class ParquetDecodeBenchmark {
         }
         byte[] bytes = encode(values, bitWidth);
         length = bytes.length;
+        pageBytesFull = bytes;
         page = arena.allocate(bytes.length + 8L);
         MemorySegment.copy(MemorySegment.ofArray(bytes), 0, page, 0, bytes.length);
+        paddedN = ((n + 7) / 8) * 8;
+        idOut = new int[paddedN];
+        int header = (((n + 7) / 8) << 1) | 1;
+        int headerLen = header < 0x80
+                ? 1
+                : (header < 0x4000 ? 2 : 3);
+        packedBytes = new byte[bytes.length - headerLen];
+        System.arraycopy(bytes, headerLen, packedBytes, 0, packedBytes.length);
     }
 
     @TearDown(Level.Trial)
@@ -92,13 +107,67 @@ public class ParquetDecodeBenchmark {
         arena.close();
     }
 
-    /** Decodes every value; sums them so nothing is dead-code-eliminated. */
+    /** Ours, value-at-a-time. */
     @Benchmark
-    public long decode() {
+    public long readIntScalar() {
         RleBitPackingReader r = new RleBitPackingReader(page, 0, length, bitWidth);
         long sum = 0;
         for (int i = 0; i < n; i++) {
             sum += r.readInt();
+        }
+        return sum;
+    }
+
+    /** Ours, batch. */
+    @Benchmark
+    public long readIntsBatch() {
+        RleBitPackingReader r = new RleBitPackingReader(page, 0, length, bitWidth);
+        r.readInts(idOut, 0, n);
+        long sum = 0;
+        for (int i = 0; i < n; i++) {
+            sum += idOut[i];
+        }
+        return sum;
+    }
+
+    /**
+     * Ours, batch, with parquet-java's BytePacker injected for bit-packed
+     * groups (the node's path).
+     */
+    @Benchmark
+    public long readIntsBatchInjected() {
+        if (bitWidth == 0) {
+            return 0;
+        }
+        BytePacker packer = Packer.LITTLE_ENDIAN.newBytePacker(bitWidth);
+        RleBitPackingReader r = RleBitPackingReader.overArray(pageBytesFull, 0, pageBytesFull.length, bitWidth, packer::unpack8Values);
+        r.readInts(idOut, 0, n);
+        long sum = 0;
+        for (int i = 0; i < n; i++) {
+            sum += idOut[i];
+        }
+        return sum;
+    }
+
+    /**
+     * parquet-java's generated unrolled BytePacker, group by group (Spark's
+     * reference path).
+     */
+    @Benchmark
+    public long parquetBytePacker() {
+        if (bitWidth == 0) {
+            return 0;
+        }
+        BytePacker packer = Packer.LITTLE_ENDIAN.newBytePacker(bitWidth);
+        int bytesPerGroup = bitWidth;
+        int pos = 0;
+        for (int g = 0; g < paddedN; g += 8) {
+            packer.unpack8Values(packedBytes, pos, idOut, g);
+            pos += bytesPerGroup;
+        }
+        long sum = 0;
+        for (int i = 0; i < n; i++) {
+            sum += idOut[i];
         }
         return sum;
     }

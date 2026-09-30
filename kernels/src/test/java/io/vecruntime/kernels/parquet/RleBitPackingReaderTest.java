@@ -22,6 +22,7 @@ import java.util.Random;
 
 import org.junit.jupiter.api.Test;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
 /**
@@ -184,5 +185,104 @@ class RleBitPackingReaderTest {
             v[i] = 7;
         }
         check(v, 6, false);
+    }
+
+    /**
+     * The batch API must return exactly what value-at-a-time reads would, at
+     * every width and chunking.
+     */
+    @Test
+    void readIntsMatchesReadIntAllWidths() {
+        Random rnd = new Random(1234);
+        for (int bitWidth = 0; bitWidth <= 32; bitWidth++) {
+            long max = bitWidth == 0 ? 0 : mask(bitWidth);
+            for (int len : new int[] {0, 1, 3, 8, 15, 16,
+                    100, 257}) {
+                int[] v = new int[len];
+                for (int i = 0; i < len; i++) {
+                    v[i] = bitWidth == 0 ? 0 : (int) Math.floorMod(rnd.nextLong(), max + 1);
+                }
+                byte[] bytes = encode(v, bitWidth, false);
+                // Whole-batch read.
+                try (Arena arena = Arena.ofConfined()) {
+                    MemorySegment seg = seg(bytes, arena);
+                    RleBitPackingReader r = new RleBitPackingReader(seg, 0, bytes.length, bitWidth);
+                    int[] out = new int[len];
+                    r.readInts(out, 0, len);
+                    assertArrayEquals(v, out, "batch width " + bitWidth + " len " + len);
+                }
+                // Chunked reads of varying sizes, and a mid-stream single readInt to leave a partial group.
+                try (Arena arena = Arena.ofConfined()) {
+                    MemorySegment seg = seg(bytes, arena);
+                    RleBitPackingReader r = new RleBitPackingReader(seg, 0, bytes.length, bitWidth);
+                    int[] out = new int[len];
+                    int o = 0;
+                    int[] chunks = {1, 7, 3, 8, 5, 13};
+                    int c = 0;
+                    while (o < len) {
+                        int take = Math.min(chunks[c++ % chunks.length], len - o);
+                        if (take == 1) {
+                            out[o] = r.readInt();
+                        } else {
+                            r.readInts(out, o, take);
+                        }
+                        o += take;
+                    }
+                    assertArrayEquals(v, out, "chunked width " + bitWidth + " len " + len);
+                }
+            }
+        }
+    }
+
+    private static MemorySegment seg(byte[] bytes, Arena arena) {
+        MemorySegment s = arena.allocate(Math.max(bytes.length, 1) + 8L);
+        MemorySegment.copy(MemorySegment.ofArray(bytes), 0, s, 0, bytes.length);
+        return s;
+    }
+
+    /**
+     * A reference LSB-first group unpacker (parquet LITTLE_ENDIAN semantics),
+     * for the injected-seam test.
+     */
+    private static void refUnpack8(byte[] src, int srcPos, int[] dst,
+            int dstPos, int bitWidth) {
+        long buf = 0;
+        int bits = 0;
+        int p = srcPos;
+        long mask = bitWidth == 32 ? 0xFFFFFFFFL : ((1L << bitWidth) - 1);
+        for (int i = 0; i < 8; i++) {
+            while (bits < bitWidth) {
+                buf |= ((long) (src[p++] & 0xFF)) << bits;
+                bits += 8;
+            }
+            dst[dstPos + i] = (int) (buf & mask);
+            buf >>>= bitWidth;
+            bits -= bitWidth;
+        }
+    }
+
+    /**
+     * The injected-unpacker path (overArray + GroupUnpacker) must equal the
+     * scalar path.
+     */
+    @Test
+    void injectedUnpackerMatchesScalar() {
+        Random rnd = new Random(99);
+        for (int bitWidth = 1; bitWidth <= 32; bitWidth++) {
+            long max = mask(bitWidth);
+            for (int len : new int[] {1, 8, 15, 100, 257}) {
+                int[] v = new int[len];
+                for (int i = 0; i < len; i++) {
+                    v[i] = (int) Math.floorMod(rnd.nextLong(), max + 1);
+                }
+                byte[] bytes = encode(v, bitWidth, true); // pure bit-packed so the injected path is exercised
+                final int bw = bitWidth;
+                RleBitPackingReader r = RleBitPackingReader.overArray(bytes, 0, bytes.length, bitWidth,
+                        (src, sp, dst, dp) -> refUnpack8(src, sp, dst, dp, bw));
+                int[] out = new int[len];
+                r.readInts(out, 0, len);
+                assertArrayEquals(v, out, "injected width " + bitWidth + " len " + len);
+            }
+        }
     }
 }

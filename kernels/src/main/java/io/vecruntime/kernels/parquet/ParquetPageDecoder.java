@@ -218,9 +218,10 @@ public final class ParquetPageDecoder {
             validity = ArrowLayout.allocateBitmap(arena, n);
             present = new int[n];
             presentCount = 0;
+            int[] levelBuf = new int[n];
+            levels.readInts(levelBuf, 0, n);
             for (int i = 0; i < n; i++) {
-                int d = levels.readInt();
-                boolean set = d == page.maxDefLevel;
+                boolean set = levelBuf[i] == page.maxDefLevel;
                 Bitmap.setTo(validity, i, set);
                 if (set) {
                     present[presentCount++] = i;
@@ -252,15 +253,19 @@ public final class ParquetPageDecoder {
         MemorySegment data = ArrowLayout.allocateData(arena, type, n);
         if (page.encoding == Encoding.RLE_DICTIONARY) {
             RleBitPackingReader ids = dictionaryIds(page, valuesStart);
+            int[] idBuf = new int[presentCount];
+            ids.readInts(idBuf, 0, presentCount);
             for (int k = 0; k < presentCount; k++) {
                 int slot = present == null ? k : present[k];
-                int id = ids.readInt();
-                copyFixedFromDict(dictionary, id, data, slot, type);
+                copyFixedFromDict(dictionary, idBuf[k], data, slot, type);
             }
-        } else { // PLAIN: values are packed contiguously, present values only.
+        } else if (present == null) {
+            // PLAIN, no nulls: the values are exactly the output, one contiguous copy.
+            MemorySegment.copy(page.data, valuesStart, data, 0L, (long) n * width);
+        } else { // PLAIN with nulls: values are packed, scatter into present slots.
             long src = valuesStart;
             for (int k = 0; k < presentCount; k++) {
-                int slot = present == null ? k : present[k];
+                int slot = present[k];
                 switch (type) {
                     case INT32 -> data.set(LE_INT, (long) slot << 2, page.data.get(LE_INT, src));
                     case INT64 -> data.set(LE_LONG, (long) slot << 3, page.data.get(LE_LONG, src));
@@ -302,9 +307,9 @@ public final class ParquetPageDecoder {
         if (page.encoding == Encoding.RLE_DICTIONARY) {
             RleBitPackingReader ids = dictionaryIds(page, valuesStart);
             int[] resolvedIds = new int[presentCount];
+            ids.readInts(resolvedIds, 0, presentCount);
             for (int k = 0; k < presentCount; k++) {
-                int id = ids.readInt();
-                resolvedIds[k] = id;
+                int id = resolvedIds[k];
                 int len = utf8Length(dictionary, id);
                 lengths[k] = len;
                 total += len;
