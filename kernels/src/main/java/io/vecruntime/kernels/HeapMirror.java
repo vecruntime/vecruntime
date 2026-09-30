@@ -112,8 +112,20 @@ public final class HeapMirror {
      * on the executors (#555).
      */
     static long[] copyWords(MemorySegment bm, int numBits) {
+        return copyWords(bm, numBits, null);
+    }
+
+    /**
+     * {@link #copyWords(MemorySegment, int)} into {@code reuse} when it holds
+     * {@code wordsFor(numBits)} words (a larger one is not cleared past them),
+     * else into a new array; returns the array written. For a caller mirroring
+     * one bitmap per batch without allocating (the hash join's selection, #555).
+     */
+    public static long[] copyWords(MemorySegment bm, int numBits, long[] reuse) {
         int words = Bitmap.wordsFor(numBits);
-        long[] out = new long[words];
+        long[] out = reuse != null && reuse.length >= words
+                ? reuse
+                : new long[words];
         int bulk = (int) Math.min(numBits >>> 6, bm.byteSize() >>> 3);
         if (bulk > 0) {
             MemorySegment.copy(bm, VectorBuffers.LE_LONG, 0L, out, 0, bulk);

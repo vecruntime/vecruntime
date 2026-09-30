@@ -842,7 +842,25 @@ private[vecruntime] class VectorHashJoinIterator(
     }
   }
 
-  private def selected(ctx: EvalContext, i: Int): Boolean = ctx.selection == null || Bitmap.isSet(ctx.selection, i)
+  /**
+   * The streamed batch's selection as heap words, refreshed by `mirrorSelection` at the start of each
+   * emit path; `null` when every row is selected. `selected` runs once per probe row, and a
+   * `Bitmap.isSet` on the segment there paid a liveness check per row on the executors (#555: 4.1% of
+   * q88's executor samples at 1 TB); one bulk copy per call replaces them.
+   */
+  private var selectionWords: Array[Long] = null
+  private var selectionScratch: Array[Long] = new Array[Long](0)
+
+  private def mirrorSelection(ctx: EvalContext): Unit =
+    selectionWords =
+      if (ctx.selection == null) null
+      else {
+        selectionScratch = HeapMirror.copyWords(ctx.selection, ctx.numRows, selectionScratch)
+        selectionScratch
+      }
+
+  private def selected(i: Int): Boolean =
+    selectionWords == null || ((selectionWords(i >>> 6) >>> (i & 63)) & 1L) != 0L
 
   /** Whether a key of streamed row `i` is null (`nonNullKeys` folds the selection in; `null` means none is). */
   private def nullKeyAt(i: Int): Boolean = nonNullKeys != null && !Bitmap.isSet(nonNullKeys, i)
@@ -861,9 +879,10 @@ private[vecruntime] class VectorHashJoinIterator(
     val n = ctx.numRows
     val sel = ctx.bitmap()
     val wantMatch = spec.joinType == LeftSemi
+    mirrorSelection(ctx)
     var i = 0
     while (i < n) {
-      if (selected(ctx, i) && matchedAt(i) == wantMatch) Bitmap.set(sel, i)
+      if (selected(i) && matchedAt(i) == wantMatch) Bitmap.set(sel, i)
       i += 1
     }
     compactStreamed(ctx, sel)
@@ -898,10 +917,11 @@ private[vecruntime] class VectorHashJoinIterator(
     // When exactly one side of it is a build lane, the test runs as one array scan over the key's
     // clustered build rows instead of a walk of the chain with a call per pair (q72).
     val ranged = if (fused != null && !nestedLoop && fused.rangeable) fused else null
+    mirrorSelection(ctx)
     var count = 0
     var i = from
     while (i < until) {
-      if (selected(ctx, i)) {
+      if (selected(i)) {
         if (ranged != null) {
           val g = idScratch(i)
           if (g >= 0) count = scanRange(ranged, i, build.rangeStart(g), build.rangeStart(g + 1), count)
@@ -1097,10 +1117,11 @@ private[vecruntime] class VectorHashJoinIterator(
    * candidate. Rows with no candidate at all have no pair here and stay unmatched.
    */
   private def emitConditional(ctx: EvalContext, cond: VectorExpr, from: Int, until: Int): Unit = {
+    mirrorSelection(ctx)
     var count = 0
     var i = from
     while (i < until) {
-      if (selected(ctx, i)) {
+      if (selected(i)) {
         var r = firstCandidate(i)
         while (r >= 0) { count = append(count, i, r); r = nextCandidate(r) }
       }
@@ -1173,7 +1194,7 @@ private[vecruntime] class VectorHashJoinIterator(
     var p = 0
     var i = from
     while (i < until) {
-      if (selected(ctx, i)) {
+      if (selected(i)) {
         if (rowMatched(i)) {
           while (p < count && probeIdx(p) == i) {
             if (passed(p)) {

@@ -32,6 +32,19 @@ version may change configuration keys or defaults, always noted here.
 
 ### Changed
 
+- Two per-row `MemorySegment` reads that paid a liveness check per call on the executors now read
+  heap words filled by one bulk `MemorySegment.copy` (#555; q88 at 1 TB had 6.3% of executor
+  samples in `checkValidStateRaw` under these two paths):
+  - the broadcast hash join tests each probe row against the streamed batch's selection through a
+    heap mirror of the bitmap, refreshed once per emit call, instead of a `Bitmap.isSet` per row
+    (4.1%);
+  - `HeapMirror` (the heap copy of a join's residual-condition columns, #332) moves a column's
+    validity bitmap in and out with one copy each, instead of a `Bitmap.wordAt` / `Bitmap.setWord`
+    per 64-row word (2.2%). A partial tail word keeps the per-word path.
+
+  Output is unchanged. In JMH, `HeapMirror.of` is unchanged and the bitmap store 1.14x. JMH hoists
+  those checks out of its warm loop, so the effect is judged at 1 TB.
+
 - The scan adapter decodes a dictionary-encoded numeric Parquet column without per-batch staging
   (#551): with off-heap reader vectors (`spark.sql.columnVector.offheap.enabled`) the ids and null
   flags come out of native memory in one bulk `MemorySegment.copy` each, into per-thread scratch

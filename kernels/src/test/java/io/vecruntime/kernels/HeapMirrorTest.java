@@ -25,6 +25,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertSame;
 
 /**
  * The bulk validity copies of {@link HeapMirror} (#555) against the per-word
@@ -106,6 +107,26 @@ class HeapMirrorTest {
                 assertEquals(-1L, ours.mismatch(theirs));
                 assertEquals((byte) 0x5A, backing.get(ValueLayout.JAVA_BYTE, size));
             }
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {1, 63, 64, 65, 4096, 4097})
+    void copyWordsReusesAScratchArrayLargeEnough(int numBits) {
+        Random rnd = new Random(7L * numBits);
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment bm = Bitmap.allocate(arena, numBits);
+            for (long b = 0; b < bm.byteSize(); b++) {
+                bm.set(ValueLayout.JAVA_BYTE, b, (byte) rnd.nextInt());
+            }
+            long[] expected = HeapMirror.copyWords(bm, numBits);
+            long[] big = new long[expected.length + 5];
+            java.util.Arrays.fill(big, -1L);
+            long[] got = HeapMirror.copyWords(bm, numBits, big);
+            assertSame(big, got, "a large enough scratch array is reused");
+            assertArrayEquals(expected, java.util.Arrays.copyOf(got, expected.length));
+            long[] small = new long[expected.length - 1];
+            assertArrayEquals(expected, HeapMirror.copyWords(bm, numBits, small));
         }
     }
 }
