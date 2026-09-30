@@ -40,16 +40,7 @@ import org.apache.spark.sql.execution.datasources.parquet.{
 }
 import org.apache.spark.sql.execution.metric.{SQLMetric, SQLMetrics}
 import org.apache.spark.sql.internal.SQLConf
-import org.apache.spark.sql.types.{
-  ArrayType,
-  AtomicType,
-  BinaryType,
-  DateType,
-  DecimalType,
-  MapType,
-  StructType,
-  TimestampType
-}
+import org.apache.spark.sql.types.{AtomicType, DateType, StructType}
 import org.apache.spark.sql.vectorized.{ColumnarBatch, ColumnVector}
 import org.apache.spark.util.SerializableConfiguration
 
@@ -123,7 +114,9 @@ case class VectorParquetScanExec(scan: FileSourceScanExec) extends LeafExecNode 
     hadoopConf.set(ParquetWriteSupport.SPARK_ROW_SCHEMA, requiredSchema.json)
     val confBroadcast = session.sparkContext.broadcast(new SerializableConfiguration(hadoopConf))
 
-    val batchSize = sqlConf.parquetVectorizedReaderBatchSize
+    // Batch size, rounded DOWN to a multiple of 64 (min 64) so every batch offset into a row group is a
+    // multiple of 64 -- the alignment VectorBuffers.slice requires when the adapter slices a batch view.
+    val batchSize = math.max(64, sqlConf.parquetVectorizedReaderBatchSize / 64 * 64)
     val caseSensitive = sqlConf.caseSensitiveAnalysis
     val useFieldId = sqlConf.parquetFieldIdReadEnabled
     val pushDownDate = sqlConf.parquetFilterPushDownDate
@@ -268,6 +261,7 @@ private[vecruntime] final class VectorParquetPartitionReader(
   private var blocks: java.util.List[BlockMetaData] = _
   private var rowGroupIndex = 0
   private var partitionColumns: Array[ColumnVector] = _ // constant columns for the current file
+  private var partitionColumnRows = 0 // the length the partition constant columns were sized to
 
   // Current row group state (the reused vectors + how far we have emitted).
   private var rgVectors: Array[org.apache.arrow.vector.FieldVector] = _
@@ -328,13 +322,13 @@ private[vecruntime] final class VectorParquetPartitionReader(
     val columns = new Array[ColumnVector](attrs.length)
     var c = 0
     while (c < dataColumnCount) {
-      columns(c) = SlicedColumnVector.of(rgColumns(c), rgOffset, n)
+      columns(c) = SlicedColumnVector.of(rgColumns(c), rgOffset, n, rgRows)
       c += 1
     }
     // Partition-value constant columns follow the data columns, ordered to the output.
     var p = 0
     while (p < partitionColumns.length) {
-      columns(dataColumnCount + p) = SlicedColumnVector.of(partitionColumns(p), rgOffset, n)
+      columns(dataColumnCount + p) = SlicedColumnVector.of(partitionColumns(p), rgOffset, n, partitionColumnRows)
       p += 1
     }
     rgOffset += n
@@ -382,13 +376,17 @@ private[vecruntime] final class VectorParquetPartitionReader(
   /** Constant columns for the partition values of this file, sized to the file's largest row group. */
   private def buildPartitionColumns(file: PartitionedFile): Unit = {
     partitionColumns = new Array[ColumnVector](partitionSchema.length)
-    if (partitionSchema.isEmpty) return
+    if (partitionSchema.isEmpty) {
+      partitionColumnRows = 0
+      return
+    }
     var maxRg = 0
     var b = 0
     while (b < blocks.size()) {
       maxRg = math.max(maxRg, blocks.get(b).getRowCount.toInt)
       b += 1
     }
+    partitionColumnRows = maxRg
     val values = file.partitionValues
     var p = 0
     while (p < partitionSchema.length) {
@@ -589,27 +587,26 @@ object VectorParquetScanPlanner {
     // Nested / complex required columns are not supported (flat only).
     val nested = scan.requiredSchema.fields.find(f => !f.dataType.isInstanceOf[AtomicType])
     nested.foreach(f => return Some(s"nested or complex column ${f.name}:${f.dataType.simpleString}"))
-    // Every required column must be a supported lane (INT32/INT64/DOUBLE/DATE/DECIMAL p<=18/UTF8).
+    // Every required column must be a type the native reader actually decodes -- ONE shared source of truth
+    // (NativeParquetSupport) so the plan-time check and the runtime decoder cannot drift. Excludes BOOLEAN,
+    // TINYINT/SMALLINT, TIMESTAMP/TIMESTAMP_NTZ, BINARY, wide decimals and collated strings.
     scan.requiredSchema.fields.foreach { f =>
-      if (!isSupportedType(f.dataType)) {
+      if (!io.vecruntime.spark.parquet.NativeParquetSupport.isReadable(f.dataType)) {
         return Some(s"unsupported column type ${f.name}:${f.dataType.simpleString}")
       }
     }
-    // INT96 timestamps and non-CORRECTED date/timestamp rebase are refused (read as Spark's).
-    if (
-      scan.requiredSchema.fields.exists(_.dataType.isInstanceOf[TimestampType])
-      && conf.isParquetINT96AsTimestamp
-    ) {
-      return Some("INT96 timestamp")
+    // Partition columns become constant columns via ArrowOutput.constant; they must be a type it can emit.
+    relation.partitionSchema.fields.foreach { f =>
+      if (!io.vecruntime.spark.parquet.NativeParquetSupport.isReadable(f.dataType)) {
+        return Some(s"unsupported partition column type ${f.name}:${f.dataType.simpleString}")
+      }
     }
-    if (
-      scan.requiredSchema.fields.exists(f =>
-        f.dataType.isInstanceOf[DateType] || f.dataType.isInstanceOf[TimestampType]
-      )
-    ) {
+    // Non-CORRECTED date rebase is refused (read as Spark's). Timestamps are not a supported type at all
+    // (NativeParquetSupport excludes them), so only DATE reaches here.
+    if (scan.requiredSchema.fields.exists(_.dataType.isInstanceOf[DateType])) {
       val mode = conf.getConf(SQLConf.PARQUET_REBASE_MODE_IN_READ).toString
       if (mode != "CORRECTED") {
-        return Some(s"date/timestamp rebase mode $mode (only CORRECTED)")
+        return Some(s"date rebase mode $mode (only CORRECTED)")
       }
     }
     // Bucketed scans: leave to Spark unless bucketing is disabled for this scan (reproducing Spark's
@@ -618,12 +615,5 @@ object VectorParquetScanPlanner {
       return Some("bucketed scan")
     }
     None
-  }
-
-  private def isSupportedType(dt: org.apache.spark.sql.types.DataType): Boolean = dt match {
-    case _: BinaryType => false // binary has a lane but is not a computed/read type in slice 1
-    case d: DecimalType => d.precision <= TypeMapping.MAX_DECIMAL_PRECISION
-    case _: ArrayType | _: MapType | _: StructType => false
-    case other => TypeMapping.isSupported(other)
   }
 }

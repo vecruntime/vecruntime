@@ -151,6 +151,104 @@ class VectorParquetScanSuite extends VectorQuerySuite {
     checkVectorized("SELECT allnull FROM t_edge", Seq(node)) // all-null column
   }
 
+  test("tiny table with nulls (conditional-functions.sql regression): nanvl over c1 double, c2 int") {
+    val path = newTempPath("t_tiny")
+    withPlugin(enabled = false) {
+      spark.sql(
+        "SELECT c1, c2 FROM VALUES(1d, 0),(2d, 1),(CAST(NULL AS DOUBLE), 1),(CAST('NaN' AS DOUBLE), 0) AS t(c1, c2)"
+      )
+        .write.mode("overwrite").parquet(path)
+      spark.read.parquet(path).createOrReplaceTempView("t_tiny")
+    }
+    checkVectorized("SELECT c1, c2 FROM t_tiny", Seq(node))
+    checkVectorized("SELECT nanvl(c2, c1/c2 + c1/c2) FROM t_tiny", Seq(node))
+  }
+
+  test("fallback: a boolean column is not decoded in slice 1 (shared support source of truth)") {
+    val path = newTempPath("t_bool")
+    withPlugin(enabled = false) {
+      spark.sql("SELECT CAST(id AS INT) AS i, (id % 2 = 0) AS b FROM range(0, 2000)")
+        .write.mode("overwrite").parquet(path)
+      spark.read.parquet(path).createOrReplaceTempView("t_bool")
+    }
+    checkFallback("SELECT i, b FROM t_bool", Seq(node), reasonContains = "unsupported column type")
+  }
+
+  test("fallback: a timestamp column is not decoded in slice 1") {
+    val path = newTempPath("t_ts")
+    withPlugin(enabled = false) {
+      spark.sql(
+        "SELECT CAST(id AS INT) AS i, TIMESTAMP'2020-01-01 00:00:00' + MAKE_INTERVAL(0,0,0,0,0,0,id) AS ts FROM range(0, 1000)"
+      )
+        .write.mode("overwrite").parquet(path)
+      spark.read.parquet(path).createOrReplaceTempView("t_ts")
+    }
+    checkFallback("SELECT i, ts FROM t_ts", Seq(node), reasonContains = "unsupported column type")
+  }
+
+  test("early termination (LIMIT) does not leak the reused vectors") {
+    // A file large enough to span several row groups; a small LIMIT abandons the iterator mid-file, so the
+    // task-completion listener must close the reused vectors and the allocator exactly once (no Arrow leak).
+    val path = newTempPath("t_limit")
+    withPlugin(enabled = false) {
+      spark.sql("SELECT CAST(id AS INT) AS i, CONCAT('s', CAST(id % 100 AS STRING)) AS s FROM range(0, 60000)")
+        .write.mode("overwrite").parquet(path)
+      spark.read.parquet(path).createOrReplaceTempView("t_limit")
+    }
+    checkVectorized("SELECT i, s FROM t_limit LIMIT 10", Seq(node))
+    checkVectorized("SELECT i FROM t_limit WHERE i >= 0 LIMIT 5000", Seq(node))
+  }
+
+  test("scan -> filter(IsNotNull) -> project over nulls does NOT take the adapter copy path") {
+    val path = newTempPath("t_nocopy")
+    withPlugin(enabled = false) {
+      spark.sql(
+        """SELECT
+          |  CASE WHEN id % 4 = 0 THEN NULL ELSE CAST(id AS INT) END AS i,
+          |  CASE WHEN id % 5 = 0 THEN NULL ELSE CAST(id * 3 AS BIGINT) END AS l,
+          |  CASE WHEN id % 6 = 0 THEN NULL ELSE CAST(id * 1.5 AS DOUBLE) END AS d,
+          |  CASE WHEN id % 7 = 0 THEN NULL ELSE CONCAT('s', CAST(id % 30 AS STRING)) END AS s
+          |FROM range(0, 30000)""".stripMargin
+      )
+        .write.mode("overwrite").parquet(path)
+      spark.read.parquet(path).createOrReplaceTempView("t_nocopy")
+    }
+    // The scan feeds our filter and project directly; the adapter must take every column zero-copy
+    // (SparkColumnVectorBuffers.copy would bulk-read Arrow null slots and throw). Assert the copy counter
+    // did not advance while our operators consumed the node's batches.
+    val before = io.vecruntime.spark.adapter.ColumnVectorAdapters.copiedColumns()
+    checkVectorized(
+      "SELECT i, l, d, s FROM t_nocopy WHERE i IS NOT NULL AND s IS NOT NULL",
+      Seq(node, classOf[org.apache.spark.sql.vecruntime.VectorFilterExec])
+    )
+    val after = io.vecruntime.spark.adapter.ColumnVectorAdapters.copiedColumns()
+    assert(
+      after == before,
+      s"the adapter copy path was taken ${after - before} times; the scan's batches must adapt zero-copy"
+    )
+  }
+
+  test("Spark consumer (ColumnarToRow) over the node's batches with nulls, per type") {
+    val path = newTempPath("t_sparkcons")
+    withPlugin(enabled = false) {
+      spark.sql(
+        """SELECT
+          |  CASE WHEN id % 3 = 0 THEN NULL ELSE CAST(id AS INT) END AS i,
+          |  CASE WHEN id % 4 = 0 THEN NULL ELSE CAST(id AS BIGINT) END AS l,
+          |  CASE WHEN id % 5 = 0 THEN NULL ELSE CAST(id AS DOUBLE) END AS d,
+          |  CASE WHEN id % 6 = 0 THEN NULL ELSE CAST((id % 100000)/100.0 AS DECIMAL(9,2)) END AS dec,
+          |  CASE WHEN id % 7 = 0 THEN NULL ELSE DATE_ADD(DATE'2001-01-01', CAST(id % 500 AS INT)) END AS dt,
+          |  CASE WHEN id % 8 = 0 THEN NULL ELSE CONCAT('v', CAST(id % 40 AS STRING)) END AS s
+          |FROM range(0, 20000)""".stripMargin
+      )
+        .write.mode("overwrite").parquet(path)
+      spark.read.parquet(path).createOrReplaceTempView("t_sparkcons")
+    }
+    // A bare SELECT * with no operator of ours above the scan: the node's batches go straight to
+    // ColumnarToRowExec (a Spark consumer), which must read null slots without Arrow's get() throwing.
+    checkVectorized("SELECT i, l, d, dec, dt, s FROM t_sparkcons", Seq(node))
+  }
+
   // ---------------------------------------------------------------- fallbacks
 
   test("fallback: a nested (struct) column keeps Spark's scan with a recorded reason") {

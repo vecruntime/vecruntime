@@ -38,29 +38,48 @@ public final class SlicedColumnVector extends ColumnVector {
 
     private final ColumnVector inner;
     private final int offset;
+    private final int innerLength;
 
-    private SlicedColumnVector(ColumnVector inner, int offset) {
+    private SlicedColumnVector(ColumnVector inner, int offset, int innerLength) {
         super(inner.dataType());
         this.inner = inner;
         this.offset = offset;
+        this.innerLength = innerLength;
     }
 
-    /** A view of {@code length} rows of {@code inner} starting at {@code offset}. */
-    public static ColumnVector of(ColumnVector inner, int offset, int length) {
-        if (offset == 0) {
-            // A whole-row-group batch (or the first slice): no wrapper needed when length spans from 0,
-            // but the caller may still slice a suffix, so only skip the wrapper at offset 0.
-            return inner instanceof SlicedColumnVector s ? new SlicedColumnVector(s.inner, s.offset) : new SlicedColumnVector(inner, 0);
-        }
+    /**
+     * A view of {@code length} rows of {@code inner} (whose full length is
+     * {@code innerLength}) at {@code offset}.
+     */
+    public static ColumnVector of(ColumnVector inner, int offset, int length,
+            int innerLength) {
         if (inner instanceof SlicedColumnVector s) {
-            return new SlicedColumnVector(s.inner, s.offset + offset);
+            return new SlicedColumnVector(s.inner, s.offset + offset, s.innerLength);
         }
-        return new SlicedColumnVector(inner, offset);
+        return new SlicedColumnVector(inner, offset, innerLength);
     }
 
     @Override
     public void close() {
         // No-op: the producer owns and recycles the underlying vector.
+    }
+
+    /** The wrapped (row-group) column this is a view of. */
+    public ColumnVector inner() {
+        return inner;
+    }
+
+    /** The row offset of this view into {@link #inner()}. */
+    public int offset() {
+        return offset;
+    }
+
+    /**
+     * The wrapped column's full length (row-group rows), for adapting the
+     * underlying vector.
+     */
+    public int innerLength() {
+        return innerLength;
     }
 
     @Override
