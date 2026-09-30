@@ -62,6 +62,10 @@ DEFAULT_META = {
     "results_doc": "https://github.com/vecruntime/vecruntime/blob/main/docs/results.md",
     "repo": "https://github.com/vecruntime/vecruntime",
     "run_doc": "https://github.com/vecruntime/vecruntime/blob/main/benchmarks/k8s/README.md",
+    # Appended to "Between the two, VecRuntime is faster on N of M queries": the per-run reading of where each leads.
+    "vector_vs_comet": " and leads on the heavy joins; Comet leads on the scan- and aggregate-bound ones",
+    # The closing sentence of the TL;DR: how the engines' results compare with Spark's in this run.
+    "results_line": "Every engine returned Spark's results (two footnoted exceptions).",
 }
 
 ENGINES = [("spark", "Apache Spark 4.1.3", "#6b7280"), ("vector", "VecRuntime (plugin + Flight shuffle)", "#2563eb"), ("comet", "DataFusion Comet 1.0.0", "#f59e0b")]
@@ -116,6 +120,10 @@ def main():
     meta = dict(DEFAULT_META)
     if a.meta:
         meta.update(json.loads(Path(a.meta).read_text()))
+    # The Comet build is named by the meta (a release, or a source build with unmerged fixes); the ENGINES
+    # label is the default, so pages rendered without the key are unchanged.
+    comet_label = meta.get("comet_label", dict((e, l) for e, l, _ in ENGINES)["comet"])
+    engines = [(e, comet_label if e == "comet" else l, c) for e, l, c in ENGINES]
     data = {"spark": load(a.spark), "vector": load(a.vector), "comet": load(a.comet)}
     queries = sorted(set(data["spark"]) & set(data["vector"]) & set(data["comet"]), key=qkey)
     if not queries:
@@ -147,7 +155,7 @@ def main():
     chart_data = {
         "queries": queries,
         "series": {e: [round(data[e][q]["medianMs"] / 1000, 2) for q in queries] for e, _, _ in ENGINES},
-        "labels": {e: label for e, label, _ in ENGINES},
+        "labels": {e: label for e, label, _ in engines},
         "colors": {e: color for e, _, color in ENGINES},
         "totals": {e: round(tot[e], 1) for e, _, _ in ENGINES},
     }
@@ -201,20 +209,20 @@ compares both against plain Apache Spark on the TPC-DS 1 TB workload on Amazon E
 (best {best_v}: {speed("vector", best_v):.2f}x; largest regression {worst_v}: {100 / speed("vector", worst_v) - 100:.0f}%).
 <b>Comet</b> finished in {tot["comet"]:,.0f} s -- {tot["spark"] / tot["comet"]:.2f}x, {100 - 100 * tot["comet"] / tot["spark"]:.0f}% less, faster on {faster["comet"]} of {n}
 (best {best_c}: {speed("comet", best_c):.2f}x; largest regression {worst_c}: {100 / speed("comet", worst_c) - 100:.0f}%).
-Between the two, VecRuntime is faster on {v_lt_c} of {n} queries and leads on the heavy joins; Comet leads on the scan- and aggregate-bound ones.
-Every engine returned Spark's results (two footnoted exceptions).</div>
+Between the two, VecRuntime is faster on {v_lt_c} of {n} queries{html.escape(meta["vector_vs_comet"])}.
+{html.escape(meta["results_line"], quote=False)}</div>
 
 <div class="cards">
 <div class="card"><div class="l">Apache Spark 4.1.3</div><div class="n">{tot["spark"]:,.0f} s</div><div class="l">baseline, 103 queries</div></div>
 <div class="card"><div class="l">VecRuntime</div><div class="n">{tot["vector"]:,.0f} s</div><div class="l">{tot["spark"] / tot["vector"]:.2f}x · {100 - 100 * tot["vector"] / tot["spark"]:.0f}% less runtime</div></div>
-<div class="card"><div class="l">DataFusion Comet 1.0.0</div><div class="n">{tot["comet"]:,.0f} s</div><div class="l">{tot["spark"] / tot["comet"]:.2f}x · {100 - 100 * tot["comet"] / tot["spark"]:.0f}% less runtime</div></div>
+<div class="card"><div class="l">{html.escape(comet_label)}</div><div class="n">{tot["comet"]:,.0f} s</div><div class="l">{tot["spark"] / tot["comet"]:.2f}x · {100 - 100 * tot["comet"] / tot["spark"]:.0f}% less runtime</div></div>
 </div>
 
 <h2 id="summary">Summary</h2>
 {table(["Engine", "Completion time (s)", "Speedup", "Faster than Spark on", "Executor time (h)", "GC (h)", "Shuffle read (TB)"], [
     ("Apache Spark 4.1.3", f"{tot['spark']:,.1f}", "baseline", "--", f"{exe['spark']:.1f}", f"{gc['spark']:.2f}", f"{shuf['spark']:.2f}"),
     ("VecRuntime", f"{tot['vector']:,.1f}", f"<b>{tot['spark'] / tot['vector']:.2f}x</b> ({100 - 100 * tot['vector'] / tot['spark']:.0f}% less)", f"{faster['vector']} / {n}", f"{exe['vector']:.1f}", f"{gc['vector']:.2f}", f"{shuf['vector']:.2f}"),
-    ("DataFusion Comet 1.0.0", f"{tot['comet']:,.1f}", f"<b>{tot['spark'] / tot['comet']:.2f}x</b> ({100 - 100 * tot['comet'] / tot['spark']:.0f}% less)", f"{faster['comet']} / {n}", f"{exe['comet']:.1f}", f"{gc['comet']:.2f}", f"{shuf['comet']:.2f}"),
+    (html.escape(comet_label), f"{tot['comet']:,.1f}", f"<b>{tot['spark'] / tot['comet']:.2f}x</b> ({100 - 100 * tot['comet'] / tot['spark']:.0f}% less)", f"{faster['comet']} / {n}", f"{exe['comet']:.1f}", f"{gc['comet']:.2f}", f"{shuf['comet']:.2f}"),
 ])}
 <div class="chart"><canvas id="totals"></canvas></div>
 
