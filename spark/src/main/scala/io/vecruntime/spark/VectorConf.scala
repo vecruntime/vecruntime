@@ -79,6 +79,9 @@ object VectorConf {
   /** The scan-side prefetching converter (#403, lever 2): the queue depth, `0` off. */
   val ScanPrefetch = "spark.vecruntime.scan.prefetch"
 
+  /** Our own Java Parquet page decoder behind a VectorParquetScanExec (#559), default off. */
+  val ScanNativeParquet = "spark.vecruntime.scan.nativeParquet.enabled"
+
   /** Mixed chains (#280): Comet's native operators above ours through the sink leaf. Off until #281 decides an allowlist. */
   val CometMixedEnabled = "spark.vecruntime.comet.mixed.enabled"
 
@@ -317,6 +320,9 @@ object VectorConf {
       8
     )).getOrElse(0)
   def cometMixedEnabled(conf: SQLConf): Boolean = bool(conf, CometMixedEnabled, default = false)
+
+  /** Plan our own VectorParquetScanExec in place of a supported Parquet FileSourceScanExec (#559). */
+  def scanNativeParquet(conf: SQLConf): Boolean = bool(conf, ScanNativeParquet, default = false)
   def cometPreferComet(conf: SQLConf): String = conf.getConfString(CometPreferComet, "")
 
   /**

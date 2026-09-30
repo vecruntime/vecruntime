@@ -6,6 +6,24 @@ version may change configuration keys or defaults, always noted here.
 
 ## Unreleased
 
+### Added
+
+- Our own Parquet scan behind `spark.vecruntime.scan.nativeParquet.enabled` (default off), #559 slice 1:
+  `VectorParquetScanExec` replaces a supported flat-schema Parquet `FileSourceScanExec` and decodes pages
+  straight into our Arrow vectors through `NativeParquetColumnReader` (reused vectors across row groups,
+  the parquet-java `BytePacker` injected into the `ColumnChunkDecoder`), one pass, no Spark `ColumnVector`
+  in between -- the chain above is ours from the leaf. It reuses Spark's dynamically selected partitions
+  (DPP), file splitting, bucketing, pushed data filters (row-group / page skipping) and the required +
+  partition schema; batches are `spark.sql.parquet.columnarReaderBatchSize` rows, emitted as offset views
+  with no copy. Slice 1 decodes `PLAIN` and dictionary encodings only: a file whose column-chunk metadata
+  shows another encoding (`DELTA_*`, `BYTE_STREAM_SPLIT`) falls that file over to Spark's own vectorized
+  reader at open time (correct results, no mid-decode failure). An unsupported type, nested column,
+  `INT96`, non-`CORRECTED` date/timestamp rebase or a bucketed scan keeps Spark's scan with a recorded
+  reason. End-to-end decode of a 4M-row file was at parity with Spark's reader and ~17% faster than the
+  production Spark-reader-plus-adapter path (`docs/results.md`, `butterfly-keep`). `VectorParquetScanSuite`
+  compares results row-for-row with Spark across type x encoding x page v1/v2 x nulls, several row groups
+  and pages, partition columns, a pushed filter and a DPP query; `VectorParquetScanPlanSuite` pins planning.
+
 ## 0.0.4 -- 2026-09-30
 
 `ObjectHashAggregateExec` for `bloom_filter_agg`, `collect_list` and `collect_set`, with spill; a

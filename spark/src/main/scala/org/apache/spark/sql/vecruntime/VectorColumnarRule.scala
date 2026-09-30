@@ -30,6 +30,7 @@ import org.apache.spark.sql.execution.{
   CollectLimitExec,
   ColumnarRule,
   ExpandExec,
+  FileSourceScanExec,
   FilterExec,
   GenerateExec,
   GlobalLimitExec,
@@ -215,6 +216,15 @@ case class VectorExecRule(session: SparkSession) extends Rule[SparkPlan] with Lo
 
         case l: LocalTableScanExec if VectorConf.localTableScanEnabled(conf) =>
           VectorSamplePlanner.planLocalTableScan(l).fold(reason => fallback(l, reason), v => v)
+
+        // Our own Parquet scan (#559), behind spark.vecruntime.scan.nativeParquet.enabled (default off):
+        // decode pages straight into our Arrow vectors, so the chain above is ours from the leaf. Only a
+        // supported flat Parquet scan converts; anything else keeps Spark's scan with a recorded reason.
+        case s: FileSourceScanExec if VectorConf.scanNativeParquet(conf) =>
+          VectorParquetScanPlanner.reason(s, conf) match {
+            case Some(reason) => fallback(s, reason)
+            case None => VectorParquetScanExec(s)
+          }
 
         // The range leaf: the same rows in the same partitions as Spark's, written as native INT64
         // batches, so the operators above convert from the source (over Spark's row leaf they could not).
