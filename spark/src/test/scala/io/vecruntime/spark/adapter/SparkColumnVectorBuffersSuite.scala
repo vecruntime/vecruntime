@@ -180,6 +180,122 @@ class SparkColumnVectorBuffersSuite extends SparkVectorFunSuite {
     }
   }
 
+  test("off-heap ids over a Parquet dictionary decode in place, batch after batch (#551)") {
+    // The reader's native id and null arrays are read where they are; the chunk's Parquet dictionary is
+    // decoded whole once and reused by the next batch of the same chunk.
+    val maxId = 49
+    val parquetDictionary =
+      new org.apache.parquet.column.Dictionary(org.apache.parquet.column.Encoding.PLAIN_DICTIONARY) {
+        override def getMaxId: Int = maxId
+        override def decodeToInt(id: Int): Int = id * 13 - 5
+        override def decodeToLong(id: Int): Long = id.toLong * 1234567891L + 7
+        override def decodeToDouble(id: Int): Double = id * 0.25 - 1.0
+      }
+    val dictionary =
+      new org.apache.spark.sql.execution.datasources.parquet.ParquetDictionary(parquetDictionary, false)
+    for (dt <- Seq(IntegerType, LongType, DoubleType); offHeap <- Seq(false, true); withNulls <- Seq(true, false)) {
+      val cv: WritableColumnVector = if (offHeap) new OffHeapColumnVector(n, dt) else new OnHeapColumnVector(n, dt)
+      try {
+        cv.setDictionary(dictionary)
+        val ids = cv.reserveDictionaryIds(n)
+        for (batch <- 0 until 2) {
+          cv.reset()
+          (0 until n).foreach { i =>
+            if (withNulls && i % 7 == 3 + batch) cv.putNull(i) else ids.putInt(i, (i * 7 + batch * 11) % (maxId + 1))
+          }
+          val arena = Arena.ofConfined()
+          try {
+            val vb = SparkColumnVectorBuffers.copy(cv, n, arena)
+            assert(!vb.isDictionaryEncoded, s"$dt offHeap=$offHeap")
+            assert(vb.hasNulls === withNulls, s"$dt offHeap=$offHeap batch $batch")
+            (0 until n).foreach { i =>
+              val where = s"$dt offHeap=$offHeap batch $batch row $i"
+              assert(vb.isNull(i) === cv.isNullAt(i), where)
+              if (!cv.isNullAt(i)) dt match {
+                case IntegerType => assert(vb.getInt(i) === cv.getInt(i), where)
+                case LongType => assert(vb.getLong(i) === cv.getLong(i), where)
+                case _ => assert(vb.getDouble(i) === cv.getDouble(i), where)
+              }
+            }
+          } finally arena.close()
+        }
+      } finally cv.close()
+    }
+  }
+
+  test("an all-null off-heap batch over an empty Parquet dictionary decodes to zero lanes (#551)") {
+    val empty = new org.apache.parquet.column.Dictionary(org.apache.parquet.column.Encoding.PLAIN_DICTIONARY) {
+      override def getMaxId: Int = -1
+      override def decodeToInt(id: Int): Int = fail(s"id $id decoded from an empty dictionary")
+    }
+    val cv = new OffHeapColumnVector(n, IntegerType)
+    try {
+      cv.setDictionary(new org.apache.spark.sql.execution.datasources.parquet.ParquetDictionary(empty, false))
+      cv.reserveDictionaryIds(n)
+      (0 until n).foreach(cv.putNull)
+      val arena = Arena.ofConfined()
+      try {
+        val vb = SparkColumnVectorBuffers.copy(cv, n, arena)
+        (0 until n).foreach(i => assert(vb.isNull(i), s"row $i"))
+      } finally arena.close()
+    } finally cv.close()
+  }
+
+  test("dictionary-encoded Parquet columns adapt from off-heap reader vectors (#551)") {
+    val path = newTempPath("adapter/parquet-dict-offheap")
+    spark
+      .range(0, 20000)
+      .selectExpr(
+        "if(id % 9 = 0, null, cast(id % 17 as int)) as i",
+        "cast(id % 23 as bigint) * 100000007 as l",
+        "if(id % 5 = 0, null, cast(id % 11 as double) / 4) as d"
+      )
+      .write
+      .parquet(path)
+    val key = "spark.sql.columnVector.offheap.enabled"
+    val previous = spark.conf.getOption(key)
+    spark.conf.set(key, "true")
+    try {
+      val df = spark.read.parquet(path)
+      val scan = df.queryExecution.executedPlan.collect { case s: FileSourceScanExec => s }.head
+      val rows = scan
+        .executeColumnar()
+        .mapPartitions { batches =>
+          batches.flatMap { batch =>
+            val arena = Arena.ofConfined()
+            try {
+              (0 until batch.numCols()).flatMap { c =>
+                val cv = batch.column(c)
+                val encoded = cv match {
+                  case w: WritableColumnVector => w.isInstanceOf[OffHeapColumnVector] && w.hasDictionary
+                  case _ => false
+                }
+                val vb = ColumnVectorAdapters.adapt(cv, batch.numRows(), arena)
+                (0 until batch.numRows()).map { i =>
+                  val same =
+                    vb.isNull(i) == cv.isNullAt(i) && (cv.isNullAt(i) || (vb.`type`() match {
+                      case VecType.INT32 => vb.getInt(i) == cv.getInt(i)
+                      case VecType.INT64 => vb.getLong(i) == cv.getLong(i)
+                      case _ => vb.getDouble(i) == cv.getDouble(i)
+                    }))
+                  (c, encoded, same)
+                }
+              }
+            } finally arena.close()
+          }
+        }
+        .collect()
+      assert(rows.length === 3 * 20000)
+      assert(rows.forall(_._3), "every adapted value equals the reader's own")
+      (0 until 3).foreach { c =>
+        assert(rows.exists(r => r._1 == c && r._2), s"column $c reached the adapter dictionary-encoded and off heap")
+      }
+    } finally previous match {
+        case Some(v) => spark.conf.set(key, v)
+        case None => spark.conf.unset(key)
+      }
+  }
+
   test("unsupported Spark types are rejected") {
     val cv = new OnHeapColumnVector(4, FloatType)
     try {

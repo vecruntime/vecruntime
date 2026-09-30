@@ -32,6 +32,15 @@ version may change configuration keys or defaults, always noted here.
 
 ### Changed
 
+- The scan adapter decodes a dictionary-encoded numeric Parquet column without per-batch staging
+  (#551): with off-heap reader vectors (`spark.sql.columnVector.offheap.enabled`) the ids and null
+  flags come out of native memory in one bulk `MemorySegment.copy` each, into per-thread scratch
+  arrays that are reused, instead of a fresh `int[]`/`byte[]` per column per batch; and for a Parquet
+  dictionary -- decoded whole once per column chunk -- the pass for the largest id is skipped on both
+  heap kinds. The bulk copy was chosen over reading the native buffers row by row, which JMH favours
+  but whose per-row segment checks were not inlined on the executors: at 1 TB it cut wall time a
+  further 5-7% on q88/q28/q96. `DictionaryDecodeBenchmark` (4096-row batches, 7,200-entry
+  dictionary): 2.4x INT32 / 2.1x INT64 off heap, 2.1x / 1.9x on heap versus main. Output is unchanged.
 - A hash join on a single INT32/INT64 key whose build values span a small range (at most 10x the
   distinct keys, as Spark's dense `LongHashedRelation`) probes through an array indexed by the key
   instead of the hash table (#546, `spark.vecruntime.join.denseKeys`, default on): 22.7x the hash

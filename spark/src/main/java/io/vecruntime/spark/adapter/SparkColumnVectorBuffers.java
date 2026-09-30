@@ -535,6 +535,12 @@ public final class SparkColumnVectorBuffers {
             return false;
         }
         WritableColumnVector ids = cv.getDictionaryIds();
+        if (ids instanceof OffHeapColumnVector
+                && (validity == null || cv instanceof OffHeapColumnVector)
+                && decodeOffHeapDictionaryInto(cv, ids, dict, type, numRows,
+                        validity != null, data, widenToLong)) {
+            return true;
+        }
         int[] idArray = heapIds(ids, numRows);
         byte[] nulls = validity != null ? heapNulls(cv, numRows) : null;
         if (idArray == null
@@ -544,19 +550,26 @@ public final class SparkColumnVectorBuffers {
         }
         // The reader's own arrays, a heap staging array and one copy out (#398): the per-row virtual
         // getInt, Bitmap.isSet and setAtIndex were 7% of an executor's time in q8 at SF10.
-        int maxId = -1;
-        for (int i = 0; i < numRows; i++) {
-            if (nulls == null || nulls[i] == 0) {
-                maxId = Math.max(maxId, idArray[i]);
+        // The dictionary decoded once per column chunk, not once per batch (#416); a Parquet one is
+        // decoded whole, so its size bounds every id and the maxId pass is skipped (#551).
+        DecodedDictionary decoded = decodedDictionary(dict, type);
+        long[] table;
+        if (decoded.key instanceof org.apache.parquet.column.Dictionary parquet && parquet.getMaxId() >= 0) {
+            table = decoded.upTo(dict, 0, type);
+        } else {
+            int maxId = -1;
+            for (int i = 0; i < numRows; i++) {
+                if (nulls == null || nulls[i] == 0) {
+                    maxId = Math.max(maxId, idArray[i]);
+                }
             }
+            if (maxId < 0) {
+                // Every row null: the lanes are zero, nothing to decode.
+                data.asSlice(0, (long) numRows * (widenToLong ? 8 : type.byteWidth())).fill((byte) 0);
+                return true;
+            }
+            table = decoded.upTo(dict, maxId, type);
         }
-        if (maxId < 0) {
-            // Every row null: the lanes are zero, nothing to decode.
-            data.asSlice(0, (long) numRows * type.byteWidth()).fill((byte) 0);
-            return true;
-        }
-        // The dictionary decoded once per column chunk, not once per batch (#416).
-        long[] table = decodedDictionary(dict, type).upTo(dict, maxId, type);
         // Two loops per lane width, one without nulls and one with, the latter without a branch: a null
         // row reads table entry 0 and is masked to zero (#416, see GatherKernels.gatherFixed).
         if (type == VecType.INT32 && !widenToLong) {
@@ -587,6 +600,122 @@ public final class SparkColumnVectorBuffers {
             MemorySegment.copy(out, 0, data, VectorBuffers.LE_LONG, 0, numRows);
         }
         return true;
+    }
+
+    /**
+     * {@link #decodeDictionaryInto} for the reader's off-heap vectors (#551):
+     * the ids and null flags are copied out of native memory in one bulk copy
+     * each, into the thread's reusable scratch arrays, instead of into a fresh
+     * {@code int[]} and {@code byte[]} per column per batch -- that staging,
+     * with the {@code maxId} pass, was most of the adapter's cost in q88 at 1
+     * TB (17% of executor samples). A Parquet dictionary is decoded whole for
+     * its column chunk, so its size bounds every id and no {@code maxId} pass
+     * is needed; any other dictionary is still scanned for its largest id. The
+     * values are gathered into the thread's heap scratch and copied out once,
+     * as the heap path does (#398).
+     *
+     * @return false when the vectors' native addresses are not readable, for
+     *     the caller's heap path
+     */
+    private static boolean decodeOffHeapDictionaryInto(
+            WritableColumnVector cv,
+            WritableColumnVector ids,
+            Dictionary dict,
+            VecType type,
+            int numRows,
+            boolean nullable,
+            MemorySegment data,
+            boolean widenToLong) {
+        MemorySegment idSeg = nativeSegment(OFFHEAP_DATA, ids, 4L * numRows);
+        MemorySegment nullSeg = nullable ? nativeSegment(OFFHEAP_NULLS, cv, numRows) : null;
+        if (idSeg == null || (nullable && nullSeg == null)) {
+            return false;
+        }
+        // One bulk copy each out of native memory into the thread's reusable scratch (#551): read row
+        // by row, the native segments cost liveness checks and non-inlined scoped accesses on the
+        // executors (8.1% + 4.3% of q88's samples at 1 TB) that took back most of what dropping the
+        // per-batch arrays saved.
+        int[] idArray = idScratch(numRows);
+        MemorySegment.copy(idSeg, ValueLayout.JAVA_INT_UNALIGNED,
+                0, idArray, 0, numRows);
+        byte[] nulls = null;
+        if (nullSeg != null) {
+            nulls = nullScratch(numRows);
+            MemorySegment.copy(nullSeg, ValueLayout.JAVA_BYTE, 0, nulls, 0, numRows);
+        }
+        DecodedDictionary decoded = decodedDictionary(dict, type);
+        long[] table;
+        if (decoded.key instanceof org.apache.parquet.column.Dictionary parquet && parquet.getMaxId() >= 0) {
+            table = decoded.upTo(dict, 0, type); // the whole chunk dictionary, decoded once
+        } else {
+            int maxId = -1;
+            for (int i = 0; i < numRows; i++) {
+                if (nulls == null || nulls[i] == 0) {
+                    maxId = Math.max(maxId, idArray[i]);
+                }
+            }
+            if (maxId < 0) {
+                // Every row null: the lanes are zero, nothing to decode.
+                data.asSlice(0, (long) numRows * (widenToLong ? 8 : type.byteWidth())).fill((byte) 0);
+                return true;
+            }
+            table = decoded.upTo(dict, maxId, type);
+        }
+        // A null row reads table entry 0 and is masked to zero, without a branch (#416).
+        if (type == VecType.INT32 && !widenToLong) {
+            int[] out = intScratch(numRows);
+            if (nulls == null) {
+                for (int i = 0; i < numRows; i++) {
+                    out[i] = (int) table[idArray[i]];
+                }
+            } else {
+                for (int i = 0; i < numRows; i++) {
+                    int keep = ((nulls[i] & 0xFF) - 1) >> 31;
+                    out[i] = (int) table[idArray[i] & keep] & keep;
+                }
+            }
+            MemorySegment.copy(out, 0, data, VectorBuffers.LE_INT, 0, numRows);
+        } else {
+            long[] out = longScratch(numRows);
+            if (nulls == null) {
+                for (int i = 0; i < numRows; i++) {
+                    out[i] = table[idArray[i]];
+                }
+            } else {
+                for (int i = 0; i < numRows; i++) {
+                    int keep = ((nulls[i] & 0xFF) - 1) >> 31;
+                    out[i] = table[idArray[i] & keep] & keep;
+                }
+            }
+            MemorySegment.copy(out, 0, data, VectorBuffers.LE_LONG, 0, numRows);
+        }
+        return true;
+    }
+
+    private static final ThreadLocal<int[]> ID_SCRATCH = ThreadLocal.withInitial(() -> new int[4096]);
+    private static final ThreadLocal<byte[]> NULL_SCRATCH = ThreadLocal.withInitial(() -> new byte[4096]);
+
+    /**
+     * The thread's reusable array for a batch's dictionary ids, apart from the
+     * output scratch.
+     */
+    private static int[] idScratch(int n) {
+        int[] s = ID_SCRATCH.get();
+        if (s.length < n) {
+            s = new int[Integer.highestOneBit(n) << 1];
+            ID_SCRATCH.set(s);
+        }
+        return s;
+    }
+
+    /** The thread's reusable array for a batch's null bytes. */
+    private static byte[] nullScratch(int n) {
+        byte[] s = NULL_SCRATCH.get();
+        if (s.length < n) {
+            s = new byte[Integer.highestOneBit(n) << 1];
+            NULL_SCRATCH.set(s);
+        }
+        return s;
     }
 
     private static final ThreadLocal<int[]> INT_SCRATCH = ThreadLocal.withInitial(() -> new int[4096]);
