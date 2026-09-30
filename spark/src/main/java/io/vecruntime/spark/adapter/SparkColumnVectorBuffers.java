@@ -604,18 +604,18 @@ public final class SparkColumnVectorBuffers {
 
     /**
      * {@link #decodeDictionaryInto} for the reader's off-heap vectors (#551):
-     * the ids and null flags are read where the reader wrote them, in native
-     * memory, instead of being copied into a fresh {@code int[]} and
-     * {@code byte[]} per column per batch first -- that staging, with the
-     * {@code maxId} pass, was most of the adapter's cost in q88 at 1 TB (17% of
-     * executor samples). A Parquet dictionary is decoded whole for its column
-     * chunk, so its size bounds every id and no {@code maxId} pass is needed;
-     * any other dictionary is still scanned for its largest id. The values are
-     * gathered into the thread's heap scratch and copied out once, as the heap
-     * path does (#398).
+     * the ids and null flags are copied out of native memory in one bulk copy
+     * each, into the thread's reusable scratch arrays, instead of into a fresh
+     * {@code int[]} and {@code byte[]} per column per batch -- that staging,
+     * with the {@code maxId} pass, was most of the adapter's cost in q88 at 1
+     * TB (17% of executor samples). A Parquet dictionary is decoded whole for
+     * its column chunk, so its size bounds every id and no {@code maxId} pass
+     * is needed; any other dictionary is still scanned for its largest id. The
+     * values are gathered into the thread's heap scratch and copied out once,
+     * as the heap path does (#398).
      *
      * @return false when the vectors' native addresses are not readable, for
-     *         the caller's heap path
+     *     the caller's heap path
      */
     private static boolean decodeOffHeapDictionaryInto(
             WritableColumnVector cv,
@@ -631,6 +631,18 @@ public final class SparkColumnVectorBuffers {
         if (idSeg == null || (nullable && nullSeg == null)) {
             return false;
         }
+        // One bulk copy each out of native memory into the thread's reusable scratch (#551): read row
+        // by row, the native segments cost liveness checks and non-inlined scoped accesses on the
+        // executors (8.1% + 4.3% of q88's samples at 1 TB) that took back most of what dropping the
+        // per-batch arrays saved.
+        int[] idArray = idScratch(numRows);
+        MemorySegment.copy(idSeg, ValueLayout.JAVA_INT_UNALIGNED,
+                0, idArray, 0, numRows);
+        byte[] nulls = null;
+        if (nullSeg != null) {
+            nulls = nullScratch(numRows);
+            MemorySegment.copy(nullSeg, ValueLayout.JAVA_BYTE, 0, nulls, 0, numRows);
+        }
         DecodedDictionary decoded = decodedDictionary(dict, type);
         long[] table;
         if (decoded.key instanceof org.apache.parquet.column.Dictionary parquet && parquet.getMaxId() >= 0) {
@@ -638,8 +650,8 @@ public final class SparkColumnVectorBuffers {
         } else {
             int maxId = -1;
             for (int i = 0; i < numRows; i++) {
-                if (nullSeg == null || nullSeg.get(ValueLayout.JAVA_BYTE, i) == 0) {
-                    maxId = Math.max(maxId, idSeg.getAtIndex(ValueLayout.JAVA_INT_UNALIGNED, i));
+                if (nulls == null || nulls[i] == 0) {
+                    maxId = Math.max(maxId, idArray[i]);
                 }
             }
             if (maxId < 0) {
@@ -652,32 +664,58 @@ public final class SparkColumnVectorBuffers {
         // A null row reads table entry 0 and is masked to zero, without a branch (#416).
         if (type == VecType.INT32 && !widenToLong) {
             int[] out = intScratch(numRows);
-            if (nullSeg == null) {
+            if (nulls == null) {
                 for (int i = 0; i < numRows; i++) {
-                    out[i] = (int) table[idSeg.getAtIndex(ValueLayout.JAVA_INT_UNALIGNED, i)];
+                    out[i] = (int) table[idArray[i]];
                 }
             } else {
                 for (int i = 0; i < numRows; i++) {
-                    int keep = ((nullSeg.get(ValueLayout.JAVA_BYTE, i) & 0xFF) - 1) >> 31;
-                    out[i] = (int) table[idSeg.getAtIndex(ValueLayout.JAVA_INT_UNALIGNED, i) & keep] & keep;
+                    int keep = ((nulls[i] & 0xFF) - 1) >> 31;
+                    out[i] = (int) table[idArray[i] & keep] & keep;
                 }
             }
             MemorySegment.copy(out, 0, data, VectorBuffers.LE_INT, 0, numRows);
         } else {
             long[] out = longScratch(numRows);
-            if (nullSeg == null) {
+            if (nulls == null) {
                 for (int i = 0; i < numRows; i++) {
-                    out[i] = table[idSeg.getAtIndex(ValueLayout.JAVA_INT_UNALIGNED, i)];
+                    out[i] = table[idArray[i]];
                 }
             } else {
                 for (int i = 0; i < numRows; i++) {
-                    int keep = ((nullSeg.get(ValueLayout.JAVA_BYTE, i) & 0xFF) - 1) >> 31;
-                    out[i] = table[idSeg.getAtIndex(ValueLayout.JAVA_INT_UNALIGNED, i) & keep] & keep;
+                    int keep = ((nulls[i] & 0xFF) - 1) >> 31;
+                    out[i] = table[idArray[i] & keep] & keep;
                 }
             }
             MemorySegment.copy(out, 0, data, VectorBuffers.LE_LONG, 0, numRows);
         }
         return true;
+    }
+
+    private static final ThreadLocal<int[]> ID_SCRATCH = ThreadLocal.withInitial(() -> new int[4096]);
+    private static final ThreadLocal<byte[]> NULL_SCRATCH = ThreadLocal.withInitial(() -> new byte[4096]);
+
+    /**
+     * The thread's reusable array for a batch's dictionary ids, apart from the
+     * output scratch.
+     */
+    private static int[] idScratch(int n) {
+        int[] s = ID_SCRATCH.get();
+        if (s.length < n) {
+            s = new int[Integer.highestOneBit(n) << 1];
+            ID_SCRATCH.set(s);
+        }
+        return s;
+    }
+
+    /** The thread's reusable array for a batch's null bytes. */
+    private static byte[] nullScratch(int n) {
+        byte[] s = NULL_SCRATCH.get();
+        if (s.length < n) {
+            s = new byte[Integer.highestOneBit(n) << 1];
+            NULL_SCRATCH.set(s);
+        }
+        return s;
     }
 
     private static final ThreadLocal<int[]> INT_SCRATCH = ThreadLocal.withInitial(() -> new int[4096]);
