@@ -98,13 +98,47 @@ public final class HeapMirror {
         }
         long[] validity = null;
         if (in.hasNulls()) {
-            int words = Bitmap.wordsFor(n);
-            validity = new long[words];
-            for (int w = 0; w < words; w++) {
-                validity[w] = Bitmap.wordAt(in.validity(), w, n);
-            }
+            validity = copyWords(in.validity(), n);
         }
         return new HeapMirror(t, n, ints, longs, validity);
+    }
+
+    /**
+     * The bitmap's {@code numBits} bits as 64-row words, bits at or beyond
+     * {@code numBits} cleared: every whole word the segment holds in one bulk
+     * copy, the rest (a partial tail word, or a word past a segment sized to
+     * {@code bytesFor(numBits)}) through {@link Bitmap#wordAt}. Reading the
+     * words one {@code wordAt} at a time paid a segment liveness check per word
+     * on the executors (#555).
+     */
+    static long[] copyWords(MemorySegment bm, int numBits) {
+        int words = Bitmap.wordsFor(numBits);
+        long[] out = new long[words];
+        int bulk = (int) Math.min(numBits >>> 6, bm.byteSize() >>> 3);
+        if (bulk > 0) {
+            MemorySegment.copy(bm, VectorBuffers.LE_LONG, 0L, out, 0, bulk);
+        }
+        for (int w = bulk; w < words; w++) {
+            out[w] = Bitmap.wordAt(bm, w, numBits);
+        }
+        return out;
+    }
+
+    /**
+     * Writes {@code words[0..wordsFor(numBits))} into {@code bm}: every word
+     * the segment has room for in one bulk copy, the rest through {@link
+     * Bitmap#setWord} (which writes only the tail's bytes). Same bytes as a
+     * {@code setWord} per word.
+     */
+    static void storeWords(MemorySegment bm, int numBits, long[] words) {
+        int n = Bitmap.wordsFor(numBits);
+        int bulk = (int) Math.min(n, bm.byteSize() >>> 3);
+        if (bulk > 0) {
+            MemorySegment.copy(words, 0, bm, VectorBuffers.LE_LONG, 0L, bulk);
+        }
+        for (int w = bulk; w < n; w++) {
+            Bitmap.setWord(bm, w, numBits, words[w]);
+        }
     }
 
     /** Whether row {@code i} is valid. */
@@ -151,9 +185,7 @@ public final class HeapMirror {
                 }
                 bits[w] = word;
             }
-            for (int w = 0; w < words; w++) {
-                Bitmap.setWord(outValidity, w, count, bits[w]);
-            }
+            storeWords(outValidity, count, bits);
         }
     }
 
