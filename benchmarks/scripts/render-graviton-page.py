@@ -187,7 +187,7 @@ title: {json.dumps(meta["title"])}
 .bench table td:nth-child(n+2):not(:last-child) {{ font-variant-numeric: tabular-nums; }}
 .bench table.kv td:first-child {{ font-weight: 600; white-space: nowrap; }}
 .bench .chart {{ position: relative; height: 340px; margin: 1em 0 2em; }} .bench .chart.tall {{ height: 420px; }}
-.bench .two {{ display:grid; grid-template-columns: 1fr 1fr; gap: 24px; }} @media (max-width: 860px) {{ .bench .two {{ grid-template-columns: 1fr; }} }}
+.bench .two {{ display:grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 24px; }} .bench .two > * {{ min-width: 0; }} @media (max-width: 860px) {{ .bench .two {{ grid-template-columns: minmax(0, 1fr); }} }}
 .bench details summary {{ cursor: pointer; font-weight: 600; margin: 1em 0; }}
 .bench .foot {{ color: var(--muted); font-size: .85rem; margin-top: 3em; }}
 </style>
