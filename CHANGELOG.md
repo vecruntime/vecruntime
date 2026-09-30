@@ -17,6 +17,17 @@ word at a time; and the scan adapter decoding dictionary ids in place. TPC-DS 1 
 
 ### Added
 
+- The value-decoding core of a native Parquet scan (#559, slice 1): a dependency-free Java page
+  decoder in `kernels` that turns a decompressed Parquet data page straight into Arrow-layout
+  `VectorBuffers`, one pass, no Spark `ColumnVector` in between. `RleBitPackingReader` decodes the
+  RLE / bit-packed hybrid encoding (definition levels and `RLE_DICTIONARY` ids, bit widths 0..32);
+  `ParquetPageDecoder` decodes definition-level nulls, `RLE_DICTIONARY` ids (dictionary decoded into
+  the output) and `PLAIN` values for INT32, INT64, DOUBLE, DATE, DECIMAL(p&le;18) over their int32 /
+  int64 physical type, and BINARY/UTF8, for data page v1 (length-prefixed inline levels) and v2
+  (header-sized level and value slices), flat columns only. Verified by a scalar-oracle kernel suite
+  and cross-checked against parquet-java's own `PlainValuesWriter` / `RunLengthBitPackingHybridEncoder`
+  in `spark`. The `VectorParquetScanExec` node and the `spark.vecruntime.scan.nativeParquet.enabled`
+  planner switch that use it are a following slice; nothing changes in planning yet.
 - `ObjectHashAggregateExec` is converted for the object aggregates whose buffer we can carry (#57,
   `spark.vecruntime.exec.objectAggregate.enabled`, default on): `bloom_filter_agg` (the runtime
   filter's build side), `collect_list` and `collect_set`. Spark carries their state between the
