@@ -24,7 +24,7 @@ In essence, **VecRuntime brings a DataFusion-Comet/Velox-style vectorized execut
 
 ## Status
 
-Version 0.0.3, a preview release under the Apache License 2.0 (see `LICENSE` and `NOTICE`). The
+Version 0.0.4, a preview release under the Apache License 2.0 (see `LICENSE` and `NOTICE`). The
 plugin runs the whole of TPC-DS (103 queries) and TPC-H (22) with every operator accelerated and
 returns Spark's results; what it does not convert falls back to Spark, always with a recorded reason.
 Measured on the 1 TB TPC-DS Parquet dataset on EKS, eight 13-core executors with 50 GB each, all
@@ -99,13 +99,13 @@ account or token needed:
   <dependency>
     <groupId>io.github.vecruntime</groupId>
     <artifactId>vecruntime-spark_2.13</artifactId>
-    <version>0.0.3</version>
+    <version>0.0.4</version>
   </dependency>
   <!-- the columnar shuffle, if you run with spark.shuffle.manager=...VectorShuffleManager -->
   <dependency>
     <groupId>io.github.vecruntime</groupId>
     <artifactId>vecruntime-shuffle_2.13</artifactId>
-    <version>0.0.3</version>
+    <version>0.0.4</version>
   </dependency>
 </dependencies>
 ```
@@ -116,14 +116,14 @@ together with `--repositories` (only the VecRuntime jars are downloaded; everyth
 ```bash
 spark-submit \
   --repositories https://raw.githubusercontent.com/vecruntime/vecruntime/maven-repo/ \
-  --packages io.github.vecruntime:vecruntime-spark_2.13:0.0.3 \
+  --packages io.github.vecruntime:vecruntime-spark_2.13:0.0.4 \
   --conf spark.plugins=io.vecruntime.spark.VectorPlugin \
   --conf spark.driver.extraJavaOptions="--add-modules=jdk.incubator.vector --enable-native-access=ALL-UNNAMED --sun-misc-unsafe-memory-access=allow" \
   --conf spark.executor.extraJavaOptions="--add-modules=jdk.incubator.vector --enable-native-access=ALL-UNNAMED --sun-misc-unsafe-memory-access=allow" \
   ...
 ```
 
-For the columnar shuffle add `io.github.vecruntime:vecruntime-shuffle_2.13:0.0.3` to `--packages`
+For the columnar shuffle add `io.github.vecruntime:vecruntime-shuffle_2.13:0.0.4` to `--packages`
 (comma-separated) and `--conf spark.shuffle.manager=org.apache.spark.sql.vecruntime.shuffle.VectorShuffleManager`;
 its Arrow Flight and gRPC dependencies come along.
 
@@ -139,7 +139,7 @@ spark-submit \
   --conf spark.plugins=io.vecruntime.spark.VectorPlugin \
   --conf spark.driver.extraJavaOptions="--add-modules=jdk.incubator.vector --enable-native-access=ALL-UNNAMED --sun-misc-unsafe-memory-access=allow" \
   --conf spark.executor.extraJavaOptions="--add-modules=jdk.incubator.vector --enable-native-access=ALL-UNNAMED --sun-misc-unsafe-memory-access=allow" \
-  --jars vecruntime-spark_2.13-0.0.3.jar \
+  --jars vecruntime-spark_2.13-0.0.4.jar \
   ...
 ```
 
