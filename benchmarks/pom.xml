@@ -5,7 +5,7 @@
   <parent>
     <groupId>io.github.vecruntime</groupId>
     <artifactId>vecruntime-parent</artifactId>
-    <version>0.0.4</version>
+    <version>0.0.5-SNAPSHOT</version>
   </parent>
 
   <artifactId>vecruntime-benchmarks</artifactId>
