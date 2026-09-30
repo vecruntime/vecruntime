@@ -249,6 +249,27 @@ class VectorParquetScanSuite extends VectorQuerySuite {
     checkVectorized("SELECT i, l, d, dec, dt, s FROM t_sparkcons", Seq(node))
   }
 
+  test("a scalar-subquery partition filter is awaited (ReusedSubquery has-not-finished regression)") {
+    // The scan's partition pruning uses a scalar subquery in the partition predicate. VectorParquetScanExec
+    // wraps the scan and reads its selected partitions directly, so it must WAIT for the scan's subqueries
+    // (not just DPP) -- else the subquery is "started but not finished" and reading the partitions throws an
+    // IllegalArgumentException that awaitResult wraps in a null-condition SparkException (which broke a
+    // SQL-scripting golden case). Two forms: an equality on a scalar subquery, and IN a scalar subquery.
+    val factPath = newTempPath("sub_fact")
+    val dimPath = newTempPath("sub_dim")
+    withPlugin(enabled = false) {
+      spark.sql("SELECT CAST(id AS INT) AS v, CAST(id % 8 AS INT) AS pk FROM range(0, 40000)")
+        .write.partitionBy("pk").mode("overwrite").parquet(factPath)
+      spark.read.parquet(factPath).createOrReplaceTempView("sub_fact")
+      spark.sql("SELECT CAST(id AS INT) AS k FROM range(3, 5)").write.mode("overwrite").parquet(dimPath)
+      spark.read.parquet(dimPath).createOrReplaceTempView("sub_dim")
+    }
+    withConf("spark.sql.optimizer.dynamicPartitionPruning.enabled" -> "false") {
+      checkVectorized("SELECT v FROM sub_fact WHERE pk = (SELECT MIN(k) FROM sub_dim)", Seq(node))
+      checkVectorized("SELECT v FROM sub_fact WHERE pk IN (SELECT k FROM sub_dim)", Seq(node))
+    }
+  }
+
   // ---------------------------------------------------------------- fallbacks
 
   test("fallback: a nested (struct) column keeps Spark's scan with a recorded reason") {

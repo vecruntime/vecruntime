@@ -42,4 +42,21 @@ object FileScanAccess {
       case _: Throwable => Seq.empty
     }
   }
+
+  /**
+   * Start and WAIT for all of the scan's subqueries (dynamic-partition-pruning, scalar, and REUSED
+   * subqueries in its partition filters). `SparkPlan.prepareSubqueries` / `waitForSubqueries` are
+   * `protected`, so a wrapping node cannot call them directly; invoked reflectively here. Without waiting,
+   * reading the scan's selected partitions throws "... has not finished" for a subquery that was started but
+   * never awaited. Idempotent.
+   */
+  def prepareAndWaitForSubqueries(scan: FileSourceScanExec): Unit = {
+    val cls = classOf[org.apache.spark.sql.execution.SparkPlan]
+    val prepare = cls.getDeclaredMethod("prepareSubqueries")
+    prepare.setAccessible(true)
+    prepare.invoke(scan)
+    val wait = cls.getDeclaredMethod("waitForSubqueries")
+    wait.setAccessible(true)
+    wait.invoke(scan)
+  }
 }

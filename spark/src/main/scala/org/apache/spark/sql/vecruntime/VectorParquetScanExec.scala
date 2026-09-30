@@ -80,21 +80,18 @@ case class VectorParquetScanExec(scan: FileSourceScanExec) extends LeafExecNode 
 
   override def doCanonicalize(): SparkPlan = VectorParquetScanExec(scan.canonicalized.asInstanceOf[FileSourceScanExec])
 
-  // Prepare the wrapped scan and run its dynamic-partition-pruning subqueries before this node's RDD reads
-  // `scan.inputRDD.partitions` (which evaluates the selected partitions); without this, accessing the
-  // partitions throws "dynamicpruning ... has not finished". The scan owns the DPP subqueries (in its
-  // partitionFilters), so we resolve them here -- Spark's own scan does this via the framework when it is
-  // the executed node, which it is not once we wrap it.
+  // Prepare the wrapped scan and WAIT for ALL its subqueries before this node's RDD reads
+  // `scan.inputRDD.partitions` (which evaluates the selected partitions and reads the partition filters).
+  // The scan owns its subqueries -- dynamic-partition-pruning InSubqueryExec, but also scalar and REUSED
+  // subqueries in its partition filters -- and Spark normally starts them (prepareSubqueries) and waits on
+  // them (waitForSubqueries, from executeQuery) when the scan is the executed node. We wrap it and never call
+  // its executeQuery, so we must do both ourselves; otherwise reading the partitions throws "... has not
+  // finished" for a subquery that was started but never awaited (e.g. a ReusedSubquery in a partition
+  // filter). Both are public on SparkPlan and idempotent.
   override protected def doPrepare(): Unit = {
     super.doPrepare()
     scan.prepare()
-    scan.partitionFilters.foreach(_.foreach {
-      case org.apache.spark.sql.catalyst.expressions.DynamicPruningExpression(
-            in: org.apache.spark.sql.execution.InSubqueryExec
-          ) =>
-        in.updateResult()
-      case _ =>
-    })
+    org.apache.spark.sql.execution.vector.FileScanAccess.prepareAndWaitForSubqueries(scan)
   }
 
   override def simpleString(maxFields: Int): String =
