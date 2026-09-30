@@ -20,8 +20,6 @@ import java.io.UncheckedIOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 
-import io.vecruntime.kernels.ArrowLayout;
-import io.vecruntime.kernels.Bitmap;
 import io.vecruntime.kernels.SegmentVectorBuffers;
 import io.vecruntime.kernels.VecType;
 import io.vecruntime.kernels.VectorBuffers;
@@ -34,6 +32,7 @@ import io.vecruntime.spark.arrow.ArrowVectorBuffers;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.VarCharVector;
+import org.apache.parquet.bytes.BytesInput;
 import org.apache.parquet.column.ColumnDescriptor;
 import org.apache.parquet.column.Encoding;
 import org.apache.parquet.column.page.DataPage;
@@ -46,23 +45,24 @@ import org.apache.spark.sql.types.DataType;
 
 /**
  * Reads one Parquet column chunk of a row group -- its dictionary page and every
- * data page -- straight into a single Arrow {@link FieldVector} sized for the
- * whole row group, through {@link ColumnChunkDecoder} (the kernels' dependency-
- * free page decoder). The node ({@code VectorParquetScanExec}) then emits
- * {@code columnBatchSize} batches as offset views over this vector, so no
- * per-batch copy happens (STATUS-1b binding contract).
+ * data page -- into a single Arrow {@link FieldVector} sized for the whole row
+ * group, through {@link ColumnChunkDecoder}. The decoder stages values into
+ * reused heap primitive arrays with plain stores and this reader flushes the
+ * finished row group into the Arrow buffers with ONE bulk {@code MemorySegment.copy}
+ * per buffer (the write-path rewrite: per-value FFM segment writes were the
+ * measured e2e cost). The node ({@code VectorParquetScanExec}) then emits
+ * {@code columnBatchSize} batches as offset views over the finished vector.
  *
  * <p>parquet-java hands us the decompressed page bytes ({@link DataPage}); the
- * definition levels and the {@code RLE_DICTIONARY} ids are decoded through
- * parquet-java's generated {@code BytePacker}, injected into the decoder as a
- * {@link GroupUnpacker} cached per bit width (requirement 1: no scalar/{@code
- * MemorySegment} reader on this path). The id/level scratch (inside the decoder)
- * and the UTF8 sink are reused for the reader lifetime (requirement 3).
+ * definition levels and the dictionary ids are decoded through parquet-java's
+ * generated {@code BytePacker}, injected as a {@link GroupUnpacker} cached per
+ * bit width. The page bytes are read into a reused {@link ReusableByteOut} (no
+ * per-page {@code toByteArray}); the level/id/value staging and the dictionary
+ * are reused for the reader lifetime.
  *
  * <p>Not thread safe: one reader per column per task. Slice 1 supports {@code
  * PLAIN} and {@code RLE_DICTIONARY}/{@code PLAIN_DICTIONARY} value encodings and
- * throws on any other (delta, byte-stream-split); the planner keeps the flag off
- * by default and the column-index page filter still applies.
+ * throws on any other; the planner keeps the flag off by default.
  */
 public final class NativeParquetColumnReader {
 
@@ -80,12 +80,14 @@ public final class NativeParquetColumnReader {
      */
     private final GroupUnpacker[] unpackers = new GroupUnpacker[33];
 
-    /** Reused UTF8 sink + offsets scratch across row groups (UTF8 columns only). */
+    /**
+     * Reused decoder + decompression buffer + dictionary scratch across row
+     * groups.
+     */
     private final Arena scratch;
 
-    private NativeUtf8Sink utf8Sink;
-    private MemorySegment utf8Offsets;
-    private int utf8OffsetsCapacity;
+    private ColumnChunkDecoder decoder;
+    private final ReusableByteOut pageOut = new ReusableByteOut(1 << 16);
 
     public NativeParquetColumnReader(ColumnDescriptor column, VecType type, DataType sparkType,
             String name, BufferAllocator allocator) {
@@ -117,12 +119,10 @@ public final class NativeParquetColumnReader {
             case BINARY:
                 return VecType.UTF8;
             default:
-                // FLOAT, INT96, FIXED_LEN_BYTE_ARRAY, BOOLEAN: not reached (the planner refuses the column).
                 return lane;
         }
     }
 
-    /** The BytePacker factory the decoder injects, cached per bit width. */
     @SuppressWarnings("deprecation") // BytePacker.unpack8Values(byte[]...) is the byte[] path the seam needs
     private GroupUnpacker unpackerFor(int bitWidth) {
         if (bitWidth == 0) {
@@ -142,65 +142,36 @@ public final class NativeParquetColumnReader {
      * returned vector and closes it when the row group's batches are done.
      */
     public FieldVector readRowGroup(PageReader pages, int rowGroupRows) {
-        VectorBuffers dictionary = decodeDictionary(pages);
-        if (type == VecType.UTF8) {
-            return readUtf8RowGroup(pages, rowGroupRows, dictionary);
+        if (decoder == null) {
+            decoder = new ColumnChunkDecoder(physicalType, type, maxDefLevel, rowGroupRows, this::unpackerFor);
+        } else {
+            decoder.reset(rowGroupRows);
         }
-        return readFixedRowGroup(pages, rowGroupRows, dictionary);
+        // The dictionary is per COLUMN CHUNK (per row group), not per file: decode it fresh each row group.
+        VectorBuffers dict = decodeDictionary(pages);
+        if (dict != null) {
+            decoder.setDictionary(dict);
+        }
+        drivePages(pages, rowGroupRows);
+        if (type == VecType.UTF8) {
+            return flushUtf8(rowGroupRows);
+        }
+        return flushFixed(rowGroupRows);
     }
 
-    // ------------------------------------------------------------------ fixed
-
-    private FieldVector readFixedRowGroup(PageReader pages, int rowGroupRows, VectorBuffers dictionary) {
+    private FieldVector flushFixed(int rowGroupRows) {
         ArrowVectorBuffers out = ArrowOutput.allocateFixed(name, sparkType, rowGroupRows, allocator);
-        ColumnChunkDecoder decoder = new ColumnChunkDecoder(
-                physicalType,
-                type,
-                maxDefLevel,
-                rowGroupRows,
-                out.data(),
-                out.validity(),
-                null,
-                null,
-                this::unpackerFor);
-        if (dictionary != null) {
-            decoder.setDictionary(dictionary);
-        }
-        drivePages(pages, decoder, rowGroupRows);
-        // allValid when the column has no null definition levels: the validity buffer is already all ones.
+        decoder.flushFixed(out.data(), out.validity());
         ArrowOutput.finish(out, rowGroupRows, maxDefLevel == 0);
         return (FieldVector) out.vector();
     }
 
-    // ------------------------------------------------------------------ utf8
-
-    private FieldVector readUtf8RowGroup(PageReader pages, int rowGroupRows, VectorBuffers dictionary) {
-        // The output byte total is unknown up front (as it is for Spark's reader): decode into a reusable
-        // native sink + offsets scratch, then size the VarCharVector exactly and copy once.
-        NativeUtf8Sink sink = utf8Sink();
-        sink.reset();
-        MemorySegment offsets = utf8Offsets(rowGroupRows);
-        MemorySegment validity = ArrowLayout.allocateBitmap(scratch, rowGroupRows);
-        ColumnChunkDecoder decoder = new ColumnChunkDecoder(VecType.UTF8, maxDefLevel, rowGroupRows, sink.segment(), validity,
-                offsets, sink, this::unpackerFor);
-        if (dictionary != null) {
-            decoder.setDictionary(dictionary);
-        }
-        drivePages(pages, decoder, rowGroupRows);
-        long bytes = sink.length();
+    private FieldVector flushUtf8(int rowGroupRows) {
+        long bytes = decoder.utf8Bytes();
         VarCharVector v = (VarCharVector) ArrowOutput.newVector(name, sparkType, allocator);
         v.allocateNew(Math.max(bytes, 1L), rowGroupRows);
         ArrowVectorBuffers vb = ArrowVectorBuffers.forWrite(v, rowGroupRows);
-        MemorySegment.copy(offsets, 0L, vb.offsets(), 0L,
-                ((long) rowGroupRows + 1) << 2);
-        MemorySegment.copy(sink.segment(), 0L, vb.data(), 0L,
-                bytes);
-        if (maxDefLevel == 0) {
-            Bitmap.fill(vb.validity(), rowGroupRows, true);
-        } else {
-            MemorySegment.copy(validity, 0L, vb.validity(), 0L,
-                    Bitmap.bytesFor(rowGroupRows));
-        }
+        decoder.flushUtf8(vb.offsets(), vb.data(), vb.validity());
         v.setLastSet(rowGroupRows - 1);
         v.setValueCount(rowGroupRows);
         return v;
@@ -208,7 +179,7 @@ public final class NativeParquetColumnReader {
 
     // ------------------------------------------------------------------ page loop
 
-    private void drivePages(PageReader pages, ColumnChunkDecoder decoder, int rowGroupRows) {
+    private void drivePages(PageReader pages, int rowGroupRows) {
         while (decoder.rowsWritten() < rowGroupRows) {
             DataPage page = pages.readPage();
             if (page == null) {
@@ -225,18 +196,18 @@ public final class NativeParquetColumnReader {
 
     private ColumnChunkDecoder.Page toKernelPage(DataPage page) {
         if (page instanceof DataPageV1 v1) {
-            byte[] data = bytes(v1.getBytes());
-            return ColumnChunkDecoder.Page.v1(data, v1.getValueCount(), encoding(v1.getValueEncoding()));
+            pageOut.reset();
+            writeInto(v1.getBytes(), pageOut);
+            return ColumnChunkDecoder.Page.v1(pageOut.array(), v1.getValueCount(), encoding(v1.getValueEncoding()));
         }
         DataPageV2 v2 = (DataPageV2) page;
-        byte[] levels = bytes(v2.getDefinitionLevels());
-        byte[] values = bytes(v2.getData());
-        // Lay the definition-level slice and the value slice end to end into one buffer for the reader
-        // offsets (repetition levels are absent on a flat column).
-        byte[] data = new byte[levels.length + values.length];
-        System.arraycopy(levels, 0, data, 0, levels.length);
-        System.arraycopy(values, 0, data, levels.length, values.length);
-        return ColumnChunkDecoder.Page.v2(data, levels.length, v2.getValueCount(), encoding(v2.getDataEncoding()));
+        // Levels then values, back to back into the reused buffer -- no per-page toByteArray, no concat alloc.
+        pageOut.reset();
+        writeInto(v2.getDefinitionLevels(), pageOut);
+        int levelsLength = pageOut.size();
+        writeInto(v2.getData(), pageOut);
+        return ColumnChunkDecoder.Page.v2(pageOut.array(), levelsLength, v2.getValueCount(),
+                encoding(v2.getDataEncoding()));
     }
 
     @SuppressWarnings("deprecation") // PLAIN_DICTIONARY is the legacy data-page dictionary encoding
@@ -257,6 +228,7 @@ public final class NativeParquetColumnReader {
         if (dp == null) {
             return null;
         }
+        // The dictionary is decoded ONCE per chunk; a plain toByteArray here is not a hot path.
         byte[] data = bytes(dp.getBytes());
         int numValues = dp.getDictionarySize();
         return ParquetPageDecoder.decodeDictionary(MemorySegment.ofArray(data), 0L, data.length, numValues, physicalType,
@@ -265,23 +237,16 @@ public final class NativeParquetColumnReader {
 
     // ------------------------------------------------------------------ helpers
 
-    private NativeUtf8Sink utf8Sink() {
-        if (utf8Sink == null) {
-            utf8Sink = new NativeUtf8Sink(scratch);
+    private static void writeInto(BytesInput in, ReusableByteOut out) {
+        try {
+            in.writeAllTo(out);
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
         }
-        return utf8Sink;
     }
 
-    private MemorySegment utf8Offsets(int rowGroupRows) {
-        if (utf8OffsetsCapacity < rowGroupRows + 1) {
-            utf8OffsetsCapacity = Math.max(rowGroupRows + 1, 2 * utf8OffsetsCapacity);
-            utf8Offsets = scratch.allocate((long) utf8OffsetsCapacity << 2, 8);
-        }
-        return utf8Offsets;
-    }
-
-    @SuppressWarnings("deprecation") // BytesInput.toByteArray(): the decoder needs a byte[] for the injected unpacker
-    private static byte[] bytes(org.apache.parquet.bytes.BytesInput in) {
+    @SuppressWarnings("deprecation") // BytesInput.toByteArray(): dictionary page only, decoded once
+    private static byte[] bytes(BytesInput in) {
         try {
             return in.toByteArray();
         } catch (IOException e) {
@@ -289,10 +254,7 @@ public final class NativeParquetColumnReader {
         }
     }
 
-    /**
-     * Releases the reader's scratch arena (UTF8 sink, offsets, dictionary).
-     * Call at task end.
-     */
+    /** Releases the reader's scratch arena (dictionary). Call at task end. */
     public void close() {
         scratch.close();
     }

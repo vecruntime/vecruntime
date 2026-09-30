@@ -213,6 +213,47 @@ public class ParquetScanE2EBenchmark {
         bh.consume(acc.get());
     }
 
+    /**
+     * Decode-only: the whole file through our reader, consuming only the
+     * vectors and their row counts (no per-value read). This times the DECODE,
+     * not our Arrow output format -- the per-value checksum reads Arrow
+     * segments through FFM and inflated {@code oursDecode} relative to {@code
+     * sparkDecode}, which reads Spark's on-heap columns.
+     */
+    @Benchmark
+    public void oursDecodeOnly(Blackhole bh) throws Exception {
+        Path path = new Path(filePath);
+        try (ParquetFileReader reader = ParquetFileReader.open(hadoopConf, path)) {
+            List<ColumnDescriptor> columns = reader.getFooter()
+                    .getFileMetaData()
+                    .getSchema()
+                    .getColumns();
+            NativeParquetColumnReader[] readers = new NativeParquetColumnReader[columns.size()];
+            for (int c = 0; c < columns.size(); c++) {
+                ColumnDescriptor cd = columns.get(c);
+                readers[c] = new NativeParquetColumnReader(cd, TypeMapping.vecTypeOf(schema.fields()[c].dataType()), schema.fields()[c].dataType(), cd.getPath()[0],
+                        allocator);
+            }
+            long rows = 0;
+            PageReadStore rg;
+            List<BlockMetaData> blocks = reader.getFooter().getBlocks();
+            int rgIndex = 0;
+            while ((rg = reader.readNextRowGroup()) != null) {
+                int rgRows = (int) blocks.get(rgIndex++).getRowCount();
+                for (int c = 0; c < columns.size(); c++) {
+                    FieldVector v = readers[c].readRowGroup(rg.getPageReader(columns.get(c)), rgRows);
+                    bh.consume(v);
+                    rows += v.getValueCount();
+                    v.close();
+                }
+            }
+            for (NativeParquetColumnReader r : readers) {
+                r.close();
+            }
+            bh.consume(rows);
+        }
+    }
+
     private void oursDecodeInto(java.util.concurrent.atomic.AtomicLong acc) throws Exception {
         Path path = new Path(filePath);
         try (ParquetFileReader reader = ParquetFileReader.open(hadoopConf, path)) {
@@ -293,6 +334,29 @@ public class ParquetScanE2EBenchmark {
     @Benchmark
     public void sparkDecode(Blackhole bh) throws Exception {
         bh.consume(sparkChecksum());
+    }
+
+    /**
+     * Decode-only counterpart of {@link #oursDecodeOnly}: batches consumed, row
+     * counts summed, no per-value read.
+     */
+    @Benchmark
+    public void sparkDecodeOnly(Blackhole bh) throws Exception {
+        VectorizedParquetRecordReader reader = new VectorizedParquetRecordReader(true, BATCH);
+        try {
+            reader.initialize(filePath, columnNames());
+            reader.initBatch(new StructType(), org.apache.spark.sql.catalyst.InternalRow.empty());
+            reader.enableReturningBatches();
+            long rows = 0;
+            while (reader.nextBatch()) {
+                ColumnarBatch batch = reader.resultBatch();
+                bh.consume(batch);
+                rows += batch.numRows();
+            }
+            bh.consume(rows);
+        } finally {
+            reader.close();
+        }
     }
 
     private static long checksumSpark(ColumnVector col, DataType dt, int rows) {

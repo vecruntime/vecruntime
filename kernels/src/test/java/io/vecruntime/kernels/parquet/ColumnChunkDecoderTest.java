@@ -37,12 +37,14 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * Scalar-oracle tests for {@link ColumnChunkDecoder}: several data pages of a
- * flat column are decoded into one row-group output at a running offset and
- * compared value-by-value against the input arrays. Covers INT32/INT64/FLOAT64/
- * UTF8, PLAIN and RLE_DICTIONARY, page v1 and v2, no-null / with-null /
- * all-null pages, a row group of many pages, and the injected-GroupUnpacker
- * requirement: a counting unpacker wired through the decoder must observe
- * {@code > 0} calls on a bit-packed level or id stream (STATUS-1b requirement 1).
+ * flat column are decoded into reused heap staging arrays and flushed into
+ * Arrow buffers with one bulk copy each, then compared value-by-value against
+ * the input arrays. Covers INT32/INT64/FLOAT64/UTF8, PLAIN and RLE_DICTIONARY,
+ * page v1 and v2, no-null / with-null / all-null pages, a multi-page row group,
+ * the validity word builder (all-null, all-valid, lengths not a multiple of 64,
+ * a page boundary mid-word), the string gather, and the injected-GroupUnpacker
+ * requirement (a counting unpacker observes {@code > 0} calls on a bit-packed
+ * stream).
  */
 class ColumnChunkDecoderTest {
 
@@ -53,18 +55,15 @@ class ColumnChunkDecoderTest {
 
     @Test
     void injectedUnpackerIsUsedOnBitPackedStreams() {
-        // A column with nulls (bit-packed def levels) AND a dictionary (bit-packed ids): both level and id
-        // streams go through the injected unpacker, so it MUST be called. The test fails if any decode path
-        // constructs a scalar reader instead of using the injected one.
         Random rnd = new Random(559);
         int rows = 3000;
         Integer[] values = new Integer[rows];
         for (int i = 0; i < rows; i++) {
-            values[i] = rnd.nextInt(5) == 0 ? null : rnd.nextInt(200); // 200-entry dictionary domain, ~20% null
+            values[i] = rnd.nextInt(5) == 0 ? null : rnd.nextInt(200);
         }
         AtomicInteger calls = new AtomicInteger();
         try (Arena arena = Arena.ofConfined()) {
-            DecodeResult r = decodeDictInt32(values, arena, 1, // one page, dictionary-encoded
+            DecodeResult r = decodeDictInt32(values, arena, 1,
                     bw -> (src, sp, dst, dp) -> {
                         calls.incrementAndGet();
                         refUnpack8(src, sp, dst, dp, bw);
@@ -85,8 +84,8 @@ class ColumnChunkDecoderTest {
             v[i] = rnd.nextInt(7) == 0 ? null : rnd.nextInt();
         }
         try (Arena arena = Arena.ofConfined()) {
-            assertInt32(v, decodePlainInt32(v, arena, 4, false)); // 4 v1 pages
-            assertInt32(v, decodePlainInt32(v, arena, 4, true)); // 4 v2 pages
+            assertInt32(v, decodePlainInt32(v, arena, 4, false));
+            assertInt32(v, decodePlainInt32(v, arena, 4, true));
         }
     }
 
@@ -98,7 +97,8 @@ class ColumnChunkDecoderTest {
             v[i] = i * 3 - 7;
         }
         try (Arena arena = Arena.ofConfined()) {
-            DecodeResult r = decodePlainInt32(v, arena, 3, false);
+            // maxDef 0: a required column, no level bytes, no validity buffer.
+            DecodeResult r = decodePlainRequiredInt32(v, arena, 3);
             assertNull(r.buffers.validity(), "no-null column must have no validity buffer");
             assertInt32(v, r);
         }
@@ -107,7 +107,6 @@ class ColumnChunkDecoderTest {
     @Test
     void int32AllNullPage() {
         Integer[] v = new Integer[1000];
-        // First page all-null, second all-present.
         try (Arena arena = Arena.ofConfined()) {
             for (int i = 0; i < 500; i++) {
                 v[i] = null;
@@ -165,7 +164,29 @@ class ColumnChunkDecoderTest {
         }
     }
 
-    // ---------------------------------------------------------------- utf8
+    /** Narrow decimal: INT32 physical, INT64 lane (sign-extended). */
+    @Test
+    void narrowDecimalInt32PhysicalIntoLongLane() {
+        Random rnd = new Random(7);
+        int rows = 3000;
+        Integer[] v = new Integer[rows]; // the int32 unscaled values (may be negative)
+        for (int i = 0; i < rows; i++) {
+            v[i] = rnd.nextInt(9) == 0 ? null : rnd.nextInt(200_000) - 100_000;
+        }
+        try (Arena arena = Arena.ofConfined()) {
+            // physical INT32, lane INT64.
+            DecodeResult r = decodePlainWiden(v, arena, 3);
+            for (int i = 0; i < rows; i++) {
+                if (v[i] == null) {
+                    assertTrue(r.buffers.isNull(i), "row " + i);
+                } else {
+                    assertEquals(v[i].longValue(), r.buffers.getLong(i), "row " + i);
+                }
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------- utf8 / string gather
 
     @Test
     void utf8PlainAndDictionary() {
@@ -177,9 +198,58 @@ class ColumnChunkDecoderTest {
             v[i] = rnd.nextInt(9) == 0 ? null : domain[rnd.nextInt(domain.length)];
         }
         try (Arena arena = Arena.ofConfined()) {
-            assertUtf8(v, decodeUtf8(v, arena, 4, false, false)); // PLAIN v1
-            assertUtf8(v, decodeUtf8(v, arena, 4, false, true)); // PLAIN v2
-            assertUtf8(v, decodeUtf8(v, arena, 4, true, false)); // dictionary v1
+            assertUtf8(v, decodeUtf8(v, arena, 4, false, false));
+            assertUtf8(v, decodeUtf8(v, arena, 4, false, true));
+            assertUtf8(v, decodeUtf8(v, arena, 4, true, false));
+        }
+    }
+
+    // ---------------------------------------------------------------- validity word builder
+
+    @Test
+    void validityAllValid() {
+        int rows = 200; // not a multiple of 64
+        Integer[] v = new Integer[rows];
+        for (int i = 0; i < rows; i++) {
+            v[i] = i;
+        }
+        // maxDef 1 but no nulls: every validity word is -1 over the valid range.
+        long[] words = decodeAndGetValidityWords(v, rows);
+        int wholeWords = rows >>> 6;
+        for (int w = 0; w < wholeWords; w++) {
+            assertEquals(-1L, words[w], "whole word " + w + " must be all-valid");
+        }
+        long tailMask = (1L << (rows & 63)) - 1;
+        assertEquals(tailMask, words[wholeWords] & tailMask, "tail bits must be all-valid");
+    }
+
+    @Test
+    void validityAllNull() {
+        int rows = 130;
+        Integer[] v = new Integer[rows]; // all null
+        long[] words = decodeAndGetValidityWords(v, rows);
+        for (int i = 0; i < rows; i++) {
+            assertEquals(0L, (words[i >>> 6] >>> (i & 63)) & 1L, "row " + i + " must be null");
+        }
+    }
+
+    @Test
+    void validityLengthNotMultipleOf64AndPageBoundaryMidWord() {
+        // Two pages splitting at 100, so the second page starts at row 100 = mid of word 1 (64..127);
+        // rows total 150 (not a multiple of 64). A scattered null pattern.
+        int rows = 150;
+        Integer[] v = new Integer[rows];
+        boolean[] expectNull = new boolean[rows];
+        Random rnd = new Random(11);
+        for (int i = 0; i < rows; i++) {
+            boolean isNull = rnd.nextInt(3) == 0;
+            expectNull[i] = isNull;
+            v[i] = isNull ? null : i + 1;
+        }
+        long[] words = decodeAndGetValidityWords(v, rows, splitAt(rows, 100));
+        for (int i = 0; i < rows; i++) {
+            boolean valid = ((words[i >>> 6] >>> (i & 63)) & 1L) != 0;
+            assertEquals(!expectNull[i], valid, "row " + i + " validity");
         }
     }
 
@@ -197,50 +267,85 @@ class ColumnChunkDecoderTest {
         }
     }
 
-    private DecodeResult decodePlainInt32(Integer[] v, Arena arena, int pageSplits,
+    private DecodeResult decodePlainInt32(Integer[] v, Arena arena, int pages,
             boolean v2) {
-        return decodePlainFixed(v, VecType.INT32, arena, pageSplits, v2,
+        return decodePlainFixed(v, VecType.INT32, arena, pages, v2,
                 (i, seg, off) -> seg.set(LE_INT, off, v[i]));
     }
 
     private DecodeResult decodePlainInt32(Integer[] v, Arena arena, int[] splits,
             boolean v2) {
-        return decodePlainFixedSplits(v, VecType.INT32, arena, splits, v2,
+        return decodePlainFixedSplits(v, VecType.INT32, VecType.INT32, arena, splits, v2,
                 (i, seg, off) -> seg.set(LE_INT, off, v[i]));
     }
 
     private <T> DecodeResult decodePlainFixed(T[] v, VecType type, Arena arena,
             int pages, boolean v2, FixedStore store) {
-        return decodePlainFixedSplits(v, type, arena, evenSplits(v.length, pages), v2,
-                store);
+        return decodePlainFixedSplits(v, type, type, arena, evenSplits(v.length, pages),
+                v2, store);
     }
 
-    private <T> DecodeResult decodePlainFixedSplits(T[] v, VecType type, Arena arena,
-            int[] splits, boolean v2, FixedStore store) {
+    /** INT32 physical values written into an INT64 lane (narrow decimal). */
+    private DecodeResult decodePlainWiden(Integer[] v, Arena arena, int pages) {
+        return decodePlainFixedSplits(
+                v,
+                VecType.INT32,
+                VecType.INT64,
+                arena,
+                evenSplits(v.length, pages),
+                false,
+                (i, seg, off) -> seg.set(LE_INT, off, v[i]));
+    }
+
+    private <T> DecodeResult decodePlainFixedSplits(
+            T[] v,
+            VecType physical,
+            VecType lane,
+            Arena arena,
+            int[] splits,
+            boolean v2,
+            FixedStore store) {
         int rows = v.length;
         int maxDef = 1;
-        MemorySegment outData = ArrowLayout.allocateData(arena, type, rows);
-        MemorySegment outValidity = ArrowLayout.allocateBitmap(arena, rows);
-        ColumnChunkDecoder d = new ColumnChunkDecoder(type, maxDef, rows, outData, outValidity, null,
-                null, scalarFactory());
+        ColumnChunkDecoder d = new ColumnChunkDecoder(physical, lane, maxDef, rows, scalarFactory());
         int start = 0;
         for (int end : splits) {
-            byte[] page = plainFixedPage(v, type, start, end, maxDef, v2,
+            byte[] page = plainFixedPage(v, physical, start, end, maxDef, v2,
                     store);
             d.decodePage(v2 ? ColumnChunkDecoder.Page.v2(page, v2LevelLen(v, start, end, maxDef), end - start, ParquetPageDecoder.Encoding.PLAIN) : ColumnChunkDecoder.Page.v1(page, end - start, ParquetPageDecoder.Encoding.PLAIN));
             start = end;
         }
         assertEquals(rows, d.rowsWritten());
-        VectorBuffers b = SegmentVectorBuffers.fixedWidth(type, rows, anyNull(v) ? outValidity : null,
-                outData);
-        return new DecodeResult(b);
+        // maxDef > 0 => the decoder always produces validity; give flush a segment. The view reports nulls
+        // only when there actually are some (all-ones validity otherwise, harmless).
+        MemorySegment outData = ArrowLayout.allocateData(arena, lane, rows);
+        MemorySegment outValidity = ArrowLayout.allocateBitmap(arena, rows);
+        d.flushFixed(outData, outValidity);
+        MemorySegment viewValidity = anyNull(v) ? outValidity : null;
+        return new DecodeResult(SegmentVectorBuffers.fixedWidth(lane, rows, viewValidity, outData));
+    }
+
+    /** A required (maxDef 0) INT32 column: no level bytes, no validity. */
+    private DecodeResult decodePlainRequiredInt32(Integer[] v, Arena arena, int pages) {
+        int rows = v.length;
+        int maxDef = 0;
+        ColumnChunkDecoder d = new ColumnChunkDecoder(VecType.INT32, VecType.INT32, maxDef, rows, scalarFactory());
+        int start = 0;
+        for (int end : evenSplits(rows, pages)) {
+            byte[] page = plainFixedPage(v, VecType.INT32, start, end, maxDef, false,
+                    (i, seg, off) -> seg.set(LE_INT, off, v[i]));
+            d.decodePage(ColumnChunkDecoder.Page.v1(page, end - start, ParquetPageDecoder.Encoding.PLAIN));
+            start = end;
+        }
+        MemorySegment outData = ArrowLayout.allocateData(arena, VecType.INT32, rows);
+        d.flushFixed(outData, null);
+        return new DecodeResult(SegmentVectorBuffers.fixedWidth(VecType.INT32, rows, null, outData));
     }
 
     private DecodeResult decodeDictInt32(Integer[] v, Arena arena, int pages,
             java.util.function.IntFunction<GroupUnpacker> factory) {
         int rows = v.length;
         int maxDef = 1;
-        // Build the dictionary (distinct present values, in first-seen order).
         List<Integer> dict = new ArrayList<>();
         java.util.Map<Integer, Integer> idOf = new java.util.HashMap<>();
         int[] ids = new int[rows];
@@ -256,16 +361,13 @@ class ColumnChunkDecoderTest {
             }
             ids[i] = id;
         }
-        MemorySegment dictData = ArrowLayout.allocateData(arena, VecType.INT32, dict.size());
+        MemorySegment dictData = ArrowLayout.allocateData(arena, VecType.INT32, Math.max(dict.size(), 1));
         for (int i = 0; i < dict.size(); i++) {
             dictData.set(LE_INT, (long) i << 2, dict.get(i));
         }
         VectorBuffers dictionary = SegmentVectorBuffers.fixedWidth(VecType.INT32, dict.size(), null, dictData);
 
-        MemorySegment outData = ArrowLayout.allocateData(arena, VecType.INT32, rows);
-        MemorySegment outValidity = ArrowLayout.allocateBitmap(arena, rows);
-        ColumnChunkDecoder d = new ColumnChunkDecoder(VecType.INT32, maxDef, rows, outData, outValidity, null,
-                null, factory);
+        ColumnChunkDecoder d = new ColumnChunkDecoder(VecType.INT32, maxDef, rows, factory);
         d.setDictionary(dictionary);
         int start = 0;
         for (int end : evenSplits(rows, pages)) {
@@ -273,18 +375,17 @@ class ColumnChunkDecoderTest {
             d.decodePage(ColumnChunkDecoder.Page.v1(page, end - start, ParquetPageDecoder.Encoding.RLE_DICTIONARY));
             start = end;
         }
-        VectorBuffers b = SegmentVectorBuffers.fixedWidth(VecType.INT32, rows, anyNull(v) ? outValidity : null,
-                outData);
-        return new DecodeResult(b);
+        boolean hasNulls = anyNull(v);
+        MemorySegment outData = ArrowLayout.allocateData(arena, VecType.INT32, rows);
+        MemorySegment outValidity = ArrowLayout.allocateBitmap(arena, rows);
+        d.flushFixed(outData, outValidity);
+        return new DecodeResult(SegmentVectorBuffers.fixedWidth(VecType.INT32, rows, hasNulls ? outValidity : null, outData));
     }
 
     private DecodeResult decodeUtf8(String[] v, Arena arena, int pages,
             boolean dict, boolean v2) {
         int rows = v.length;
         int maxDef = 1;
-        MemorySegment outOffsets = ArrowLayout.allocateOffsets(arena, rows);
-        MemorySegment outValidity = ArrowLayout.allocateBitmap(arena, rows);
-        HeapUtf8Sink sink = new HeapUtf8Sink(arena);
         VectorBuffers dictionary = null;
         int[] ids = new int[rows];
         if (dict) {
@@ -304,8 +405,7 @@ class ColumnChunkDecoderTest {
             }
             dictionary = utf8Buffers(dl.toArray(new String[0]), arena);
         }
-        ColumnChunkDecoder d = new ColumnChunkDecoder(VecType.UTF8, maxDef, rows, sink.segment(), outValidity,
-                outOffsets, sink, scalarFactory());
+        ColumnChunkDecoder d = new ColumnChunkDecoder(VecType.UTF8, maxDef, rows, scalarFactory());
         if (dict) {
             d.setDictionary(dictionary);
         }
@@ -317,22 +417,43 @@ class ColumnChunkDecoderTest {
                     : ColumnChunkDecoder.Page.v1(page, end - start, dict ? ParquetPageDecoder.Encoding.RLE_DICTIONARY : ParquetPageDecoder.Encoding.PLAIN));
             start = end;
         }
-        VectorBuffers b = SegmentVectorBuffers.utf8(rows, anyNull(v) ? outValidity : null, outOffsets,
-                sink.segment());
-        return new DecodeResult(b);
+        boolean hasNulls = anyNull(v);
+        long bytes = d.utf8Bytes();
+        MemorySegment outOffsets = ArrowLayout.allocateOffsets(arena, rows);
+        MemorySegment outData = ArrowLayout.allocateBytes(arena, Math.max(bytes, 1));
+        MemorySegment outValidity = ArrowLayout.allocateBitmap(arena, rows);
+        d.flushUtf8(outOffsets, outData, outValidity);
+        return new DecodeResult(SegmentVectorBuffers.utf8(rows, hasNulls ? outValidity : null, outOffsets, outData));
+    }
+
+    private long[] decodeAndGetValidityWords(Integer[] v, int rows) {
+        return decodeAndGetValidityWords(v, rows, new int[] {rows});
+    }
+
+    private long[] decodeAndGetValidityWords(Integer[] v, int rows, int[] splits) {
+        int maxDef = 1;
+        ColumnChunkDecoder d = new ColumnChunkDecoder(VecType.INT32, maxDef, rows, scalarFactory());
+        int start = 0;
+        for (int end : splits) {
+            byte[] page = plainFixedPage(v, VecType.INT32, start, end, maxDef, false,
+                    (i, seg, off) -> seg.set(LE_INT, off, v[i]));
+            d.decodePage(ColumnChunkDecoder.Page.v1(page, end - start, ParquetPageDecoder.Encoding.PLAIN));
+            start = end;
+        }
+        return d.validityWordArray();
     }
 
     // ================================================================ page builders
 
     private <T> byte[] plainFixedPage(
             T[] v,
-            VecType type,
+            VecType physical,
             int start,
             int end,
             int maxDef,
             boolean v2,
             FixedStore store) {
-        int width = type.byteWidth();
+        int width = physical.byteWidth();
         byte[] levels = levelBytes(v, start, end, maxDef);
         int present = presentCount(v, start, end);
         MemorySegment vals = MemorySegment.ofArray(new byte[present * width]);
@@ -384,10 +505,6 @@ class ColumnChunkDecoderTest {
         return assemble(levels, vals, maxDef, false);
     }
 
-    /**
-     * v1: int32-LE level byte length, the levels, then the values. v2: the levels
-     * then the values, laid out end to end (the header carries the level length).
-     */
     private byte[] assemble(byte[] levels, byte[] values, int maxDef,
                             boolean v2) {
         ByteArrayOutputStream out = new ByteArrayOutputStream();
@@ -411,10 +528,6 @@ class ColumnChunkDecoderTest {
         return levelBytes(v, start, end, maxDef).length;
     }
 
-    /**
-     * Definition levels (1 present, 0 null) as an RLE/bit-packed hybrid at the
-     * max-def bit width.
-     */
     private <T> byte[] levelBytes(T[] v, int start, int end,
             int maxDef) {
         int n = end - start;
@@ -553,47 +666,5 @@ class ColumnChunkDecoderTest {
         MemorySegment dseg = ArrowLayout.allocateBytes(arena, Math.max(db.length, 1));
         MemorySegment.copy(MemorySegment.ofArray(db), 0, dseg, 0, db.length);
         return SegmentVectorBuffers.utf8(n, null, offsets, dseg);
-    }
-
-    /**
-     * A growable native UTF8 sink for the tests (the node has its own reusable
-     * one).
-     */
-    private static final class HeapUtf8Sink implements ColumnChunkDecoder.Utf8Sink {
-        private final Arena arena;
-        private MemorySegment buf;
-        private long len;
-
-        HeapUtf8Sink(Arena arena) {
-            this.arena = arena;
-            this.buf = arena.allocate(1 << 16);
-        }
-
-        @Override
-        public void append(MemorySegment src, long srcOffset, int n) {
-            if (len + n > buf.byteSize()) {
-                long cap = Math.max(len + n, buf.byteSize() * 2);
-                MemorySegment bigger = arena.allocate(cap);
-                MemorySegment.copy(buf, 0, bigger, 0, len);
-                buf = bigger;
-            }
-            MemorySegment.copy(src, srcOffset, buf, len, n);
-            len += n;
-        }
-
-        @Override
-        public long length() {
-            return len;
-        }
-
-        @Override
-        public MemorySegment segment() {
-            return buf;
-        }
-
-        @Override
-        public void reset() {
-            len = 0;
-        }
     }
 }
