@@ -4,7 +4,14 @@ All notable changes to vecruntime. The format follows [Keep a Changelog](https:/
 the project uses [semantic versioning](https://semver.org/) once it reaches 1.0 -- until then a minor
 version may change configuration keys or defaults, always noted here.
 
-## Unreleased
+## 0.0.4 -- 2026-09-30
+
+`ObjectHashAggregateExec` for `bloom_filter_agg`, `collect_list` and `collect_set`, with spill; a
+columnar broadcast exchange for the hash and nested-loop joins; array, map and struct payloads on a
+broadcast build side; a dense-key probe for small-range integer join keys; validity handled a 64-row
+word at a time; and the scan adapter decoding dictionary ids in place. TPC-DS 1 TB against Spark:
+1.37x on x86 and 1.31x on Graviton4, both measured on 2026-09-30 in one availability zone
+(`docs/results.md`).
 
 ### Added
 

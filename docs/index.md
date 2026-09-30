@@ -44,7 +44,7 @@ the Maven repository served from this project's `maven-repo` branch. No code cha
 ```bash
 spark-submit \
   --repositories https://raw.githubusercontent.com/vecruntime/vecruntime/maven-repo/ \
-  --packages io.github.vecruntime:vecruntime-spark_2.13:0.0.3 \
+  --packages io.github.vecruntime:vecruntime-spark_2.13:0.0.4 \
   --conf spark.plugins=io.vecruntime.spark.VectorPlugin \
   --conf spark.driver.extraJavaOptions="--add-modules=jdk.incubator.vector --enable-native-access=ALL-UNNAMED --sun-misc-unsafe-memory-access=allow" \
   --conf spark.executor.extraJavaOptions="--add-modules=jdk.incubator.vector --enable-native-access=ALL-UNNAMED --sun-misc-unsafe-memory-access=allow" \
@@ -57,7 +57,7 @@ its shuffle manager. Spark's own shuffle keeps serving every exchange the plugin
 ```bash
 spark-submit \
   --repositories https://raw.githubusercontent.com/vecruntime/vecruntime/maven-repo/ \
-  --packages io.github.vecruntime:vecruntime-spark_2.13:0.0.3,io.github.vecruntime:vecruntime-shuffle_2.13:0.0.3 \
+  --packages io.github.vecruntime:vecruntime-spark_2.13:0.0.4,io.github.vecruntime:vecruntime-shuffle_2.13:0.0.4 \
   --conf spark.plugins=io.vecruntime.spark.VectorPlugin \
   --conf spark.shuffle.manager=org.apache.spark.sql.vecruntime.shuffle.VectorShuffleManager \
   --conf spark.driver.extraJavaOptions="--add-modules=jdk.incubator.vector --enable-native-access=ALL-UNNAMED --sun-misc-unsafe-memory-access=allow" \
@@ -79,7 +79,7 @@ The same flags work on `spark-shell`, `pyspark` and `spark-sql`.
 
 Without network access, download the jars from the
 [releases page](https://github.com/vecruntime/vecruntime/releases) (plugin jar, shuffle jar,
-`SHA256SUMS`) and pass them with `--jars vecruntime-spark_2.13-0.0.3.jar` (the shuffle's Flight and
+`SHA256SUMS`) and pass them with `--jars vecruntime-spark_2.13-0.0.4.jar` (the shuffle's Flight and
 gRPC jars must then be on the classpath too; `--packages` resolves them for you).
 
 `spark.plugins` registers the session extension automatically; alternatively set
@@ -89,7 +89,7 @@ the [Configuration reference](configuration.html) for every `spark.vecruntime.*`
 
 ## Status
 
-Version 0.0.3, a preview release under the Apache License 2.0. The plugin runs the whole of TPC-DS
+Version 0.0.4, a preview release under the Apache License 2.0. The plugin runs the whole of TPC-DS
 (103 queries) and TPC-H (22) with every operator accelerated and returns Spark's results. On the
 1 TB TPC-DS Parquet dataset on EKS, VecRuntime finished the 103 queries in 2,557 s against
 Spark's 3,309 s (23% less runtime, faster on 82 of 103 queries), within 2% of Apache DataFusion
