@@ -92,11 +92,24 @@ under test.
   (section 9). Do not write a hypothesis into the docs or the code; record the run and read the
   profile first, including its deoptimisations (`jdk.Deoptimization`: the Vector API can cause
   deoptimisation storms, section 9).
+- **JMH is not the verdict; the executors are.** A microbenchmark runs one warm thread over one
+  call shape, so C2 inlines what it can and hoists `MemorySegment` liveness and bounds checks out of
+  the loop. On a real executor (13 task threads, many operators sharing the same kernels, mixed
+  native and heap segments, deeper call chains from Scala closures and iterators) the same code can
+  stay a call per row that pays a `checkValidStateRaw` or `ScopedMemoryAccess` each time. JMH can
+  therefore rank two versions the opposite way from production: in #551 / PR #554 the per-row
+  native read was ~20 % faster in JMH than a bulk `MemorySegment.copy`, and 5-7 % slower at 1 TB,
+  where the executor JFR showed its per-row checks. Use JMH to check a kernel is not broken and to
+  compare shapes, but decide a performance change on a same-session A/B on real executors (1 TB on
+  the cluster, alternating legs) with executor JFR, and look in that profile for the frames JMH hid
+  (`checkValidStateRaw`, `ScopedMemoryAccess.*`, non-inlined accessors). The A/B must include
+  queries the change should not help (q67, q18), so a regression elsewhere shows up.
 - **Testing conventions.** Correctness first, by comparison with an oracle: the scalar reference for
   kernels, Spark itself for SQL (`checkVectorized` / `checkFallback`), byte-for-byte results for
   shuffle and Iceberg writes. Every change runs the gate above, exit 0; planner or expression changes
   also run the SQL golden suite with no arguments and must hold its coverage floor (section 7.2). A
-  performance claim needs a measurement (JMH, or a benchmark run with matching checksums); a
+  performance claim needs a measurement (JMH for the kernel itself; a run on real executors, with
+  matching checksums, for any claim about queries -- see the JMH rule above); a
   benchmark whose checksums differ is a correctness bug. Report exit codes and numbers, not
   impressions; never claim a run that did not happen.
 - **No silent fallback.** An operator or expression that cannot be converted stays on Spark with a
