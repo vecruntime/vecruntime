@@ -30,6 +30,7 @@ import io.vecruntime.spark.arrow.ArrowOutput;
 import io.vecruntime.spark.arrow.ArrowSegments;
 import io.vecruntime.spark.arrow.ArrowVectorBuffers;
 import org.apache.arrow.memory.BufferAllocator;
+import org.apache.arrow.vector.BaseFixedWidthVector;
 import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.VarCharVector;
 import org.apache.parquet.bytes.BytesInput;
@@ -48,17 +49,28 @@ import org.apache.spark.sql.types.DataType;
  * data page -- into a single Arrow {@link FieldVector} sized for the whole row
  * group, through {@link ColumnChunkDecoder}. The decoder stages values into
  * reused heap primitive arrays with plain stores and this reader flushes the
- * finished row group into the Arrow buffers with ONE bulk {@code MemorySegment.copy}
- * per buffer (the write-path rewrite: per-value FFM segment writes were the
- * measured e2e cost). The node ({@code VectorParquetScanExec}) then emits
- * {@code columnBatchSize} batches as offset views over the finished vector.
+ * finished row group into the Arrow buffers with one bulk {@code MemorySegment.copy}
+ * per buffer.
+ *
+ * <h2>Vector reuse across row groups (decode in place)</h2>
+ * The reader OWNS one {@link FieldVector} per column for the life of the file
+ * and reuses it for every row group, the way Spark recycles one
+ * {@code ColumnarBatch}: a row group whose size fits the current capacity is
+ * decoded in place with {@code setValueCount(0)} + overwrite -- no
+ * {@code allocateNew()} and no buffer zeroing (the value/offset buffers are
+ * fully overwritten; validity is written word by word for exactly the emitted
+ * rows and the tail word is masked). The vector is (re)allocated only when a row
+ * group is larger than any seen so far, or when a UTF8 row group's data outgrows
+ * the data buffer. Because the vector is reused, the caller must consume a row
+ * group's batches before requesting the next -- exactly Spark's columnar batch
+ * contract, which the node already follows.
  *
  * <p>parquet-java hands us the decompressed page bytes ({@link DataPage}); the
  * definition levels and the dictionary ids are decoded through parquet-java's
  * generated {@code BytePacker}, injected as a {@link GroupUnpacker} cached per
- * bit width. The page bytes are read into a reused {@link ReusableByteOut} (no
- * per-page {@code toByteArray}); the level/id/value staging and the dictionary
- * are reused for the reader lifetime.
+ * bit width. Page bytes are read into a reused {@link ReusableByteOut} (no
+ * per-page {@code toByteArray}); the staging arrays, the dictionary and the
+ * output vector are reused for the reader lifetime.
  *
  * <p>Not thread safe: one reader per column per task. Slice 1 supports {@code
  * PLAIN} and {@code RLE_DICTIONARY}/{@code PLAIN_DICTIONARY} value encodings and
@@ -74,20 +86,15 @@ public final class NativeParquetColumnReader {
     private final int maxDefLevel;
     private final BufferAllocator allocator;
 
-    /**
-     * Cached per bit width for the lifetime of the reader (levels + every id
-     * width seen).
-     */
     private final GroupUnpacker[] unpackers = new GroupUnpacker[33];
-
-    /**
-     * Reused decoder + decompression buffer + dictionary scratch across row
-     * groups.
-     */
     private final Arena scratch;
-
     private ColumnChunkDecoder decoder;
     private final ReusableByteOut pageOut = new ReusableByteOut(1 << 16);
+
+    // The reused output vector and the capacities it is currently allocated for.
+    private FieldVector vector;
+    private int rowCapacity;
+    private long byteCapacity; // UTF8 data buffer capacity
 
     public NativeParquetColumnReader(ColumnDescriptor column, VecType type, DataType sparkType,
             String name, BufferAllocator allocator) {
@@ -101,13 +108,6 @@ public final class NativeParquetColumnReader {
         this.scratch = Arena.ofShared();
     }
 
-    /**
-     * The Parquet <em>physical</em> read type. It equals the output lane except
-     * for a narrow decimal whose Parquet physical type is {@code INT32}
-     * (precision at most 9) while its output lane is the {@code INT64} unscaled
-     * value: those values are read as ints and sign-extended into the long
-     * lane.
-     */
     private static VecType physicalTypeOf(ColumnDescriptor column, VecType lane) {
         switch (column.getPrimitiveType().getPrimitiveTypeName()) {
             case INT32:
@@ -138,8 +138,10 @@ public final class NativeParquetColumnReader {
 
     /**
      * Decodes the whole column chunk of {@code pages} ({@code rowGroupRows}
-     * rows) into one finished Arrow {@link FieldVector}. The caller owns the
-     * returned vector and closes it when the row group's batches are done.
+     * rows) into the reader's REUSED Arrow {@link FieldVector} and returns it.
+     * Valid until the next {@link #readRowGroup} call on this reader (the vector
+     * is recycled); the caller consumes the row group's batches before advancing,
+     * as the columnar batch contract requires.
      */
     public FieldVector readRowGroup(PageReader pages, int rowGroupRows) {
         if (decoder == null) {
@@ -160,20 +162,59 @@ public final class NativeParquetColumnReader {
     }
 
     private FieldVector flushFixed(int rowGroupRows) {
-        ArrowVectorBuffers out = ArrowOutput.allocateFixed(name, sparkType, rowGroupRows, allocator);
+        BaseFixedWidthVector v = (BaseFixedWidthVector) ensureFixedVector(rowGroupRows);
+        ArrowVectorBuffers out = ArrowVectorBuffers.forWrite(v, rowGroupRows, sparkType);
         decoder.flushFixed(out.data(), out.validity());
         ArrowOutput.finish(out, rowGroupRows, maxDefLevel == 0);
-        return (FieldVector) out.vector();
+        return v;
     }
 
     private FieldVector flushUtf8(int rowGroupRows) {
         long bytes = decoder.utf8Bytes();
-        VarCharVector v = (VarCharVector) ArrowOutput.newVector(name, sparkType, allocator);
-        v.allocateNew(Math.max(bytes, 1L), rowGroupRows);
+        VarCharVector v = (VarCharVector) ensureUtf8Vector(rowGroupRows, bytes);
         ArrowVectorBuffers vb = ArrowVectorBuffers.forWrite(v, rowGroupRows);
         decoder.flushUtf8(vb.offsets(), vb.data(), vb.validity());
         v.setLastSet(rowGroupRows - 1);
         v.setValueCount(rowGroupRows);
+        return v;
+    }
+
+    /**
+     * The reused fixed-width vector, (re)allocated only when this row group is
+     * larger than any so far. {@code allocateNew} zeroes the buffers, so a reused
+     * vector pays that cost once (largest row group), not per row group -- the
+     * value buffer is fully overwritten and the validity is written word by word.
+     */
+    private FieldVector ensureFixedVector(int rowGroupRows) {
+        long needValidity = io.vecruntime.kernels.Bitmap.bytesFor(rowGroupRows);
+        boolean fits = vector != null
+                && rowGroupRows <= rowCapacity
+                && vector.getValidityBuffer().capacity() >= needValidity
+                && vector.getDataBuffer().capacity() >= (long) rowGroupRows * ((BaseFixedWidthVector) vector).getTypeWidth();
+        if (!fits) {
+            if (vector != null) {
+                vector.close();
+            }
+            BaseFixedWidthVector v = (BaseFixedWidthVector) ArrowOutput.newVector(name, sparkType, allocator);
+            v.allocateNew(rowGroupRows); // sizes BOTH the data and the validity buffer for >= rowGroupRows
+            vector = v;
+            rowCapacity = v.getValueCapacity();
+        }
+        return vector;
+    }
+
+    private FieldVector ensureUtf8Vector(int rowGroupRows, long bytes) {
+        VarCharVector v = (VarCharVector) vector;
+        if (v == null || rowGroupRows > rowCapacity || bytes > byteCapacity) {
+            if (v != null) {
+                v.close();
+            }
+            v = (VarCharVector) ArrowOutput.newVector(name, sparkType, allocator);
+            v.allocateNew(Math.max(bytes, 1L), rowGroupRows);
+            vector = v;
+            rowCapacity = v.getValueCapacity();
+            byteCapacity = v.getDataBuffer().capacity();
+        }
         return v;
     }
 
@@ -254,8 +295,15 @@ public final class NativeParquetColumnReader {
         }
     }
 
-    /** Releases the reader's scratch arena (dictionary). Call at task end. */
+    /**
+     * Releases the reused output vector and the reader's scratch arena. Call at
+     * task end.
+     */
     public void close() {
+        if (vector != null) {
+            vector.close();
+            vector = null;
+        }
         scratch.close();
     }
 

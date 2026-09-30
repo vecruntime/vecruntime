@@ -244,7 +244,7 @@ public class ParquetScanE2EBenchmark {
                     FieldVector v = readers[c].readRowGroup(rg.getPageReader(columns.get(c)), rgRows);
                     bh.consume(v);
                     rows += v.getValueCount();
-                    v.close();
+                    // The reader OWNS and recycles v across row groups; freed by reader.close().
                 }
             }
             for (NativeParquetColumnReader r : readers) {
@@ -280,7 +280,7 @@ public class ParquetScanE2EBenchmark {
                     VecType vt = TypeMapping.vecTypeOf(dt);
                     FieldVector v = readers[c].readRowGroup(pr, rgRows);
                     checksum += checksum(v, vt, dt, rgRows);
-                    v.close();
+                    // The reader OWNS and recycles v across row groups; do NOT close it here.
                 }
             }
             for (NativeParquetColumnReader r : readers) {
@@ -338,11 +338,23 @@ public class ParquetScanE2EBenchmark {
 
     /**
      * Decode-only counterpart of {@link #oursDecodeOnly}: batches consumed, row
-     * counts summed, no per-value read.
+     * counts summed, no per-value read. OFF-HEAP ({@code useOffHeap = true} ->
+     * {@code OffHeapColumnVector}), the production vector kind our engine sets
+     * via {@code spark.sql.columnVector.offheap.enabled=true}.
      */
     @Benchmark
     public void sparkDecodeOnly(Blackhole bh) throws Exception {
-        VectorizedParquetRecordReader reader = new VectorizedParquetRecordReader(true, BATCH);
+        sparkDecodeOnly(bh, true);
+    }
+
+    /** The on-heap number, for reference (OnHeapColumnVector). */
+    @Benchmark
+    public void sparkDecodeOnlyOnHeap(Blackhole bh) throws Exception {
+        sparkDecodeOnly(bh, false);
+    }
+
+    private void sparkDecodeOnly(Blackhole bh, boolean offHeap) throws Exception {
+        VectorizedParquetRecordReader reader = new VectorizedParquetRecordReader(offHeap, BATCH);
         try {
             reader.initialize(filePath, columnNames());
             reader.initBatch(new StructType(), org.apache.spark.sql.catalyst.InternalRow.empty());
@@ -352,6 +364,42 @@ public class ParquetScanE2EBenchmark {
                 ColumnarBatch batch = reader.resultBatch();
                 bh.consume(batch);
                 rows += batch.numRows();
+            }
+            bh.consume(rows);
+        } finally {
+            reader.close();
+        }
+    }
+
+    /**
+     * Our PRODUCTION scan today: Spark's off-heap vectorized reader into a
+     * {@link ColumnarBatch}, then the exact adaptation our planner applies after
+     * a {@code FileSourceScanExec} -- {@link ColumnVectorAdapters#adapt} per
+     * column (a plain Spark {@code OffHeapColumnVector} has no zero-copy adapter,
+     * so it takes {@code SparkColumnVectorBuffers.copy}, including #554's
+     * dictionary-id bulk copy). The adapted batch is consumed the same cheap way
+     * as {@link #oursDecodeOnly}. This is what our native reader must beat to be
+     * worth wiring.
+     */
+    @Benchmark
+    public void sparkPlusAdapterDecodeOnly(Blackhole bh) throws Exception {
+        VectorizedParquetRecordReader reader = new VectorizedParquetRecordReader(true, BATCH);
+        try {
+            reader.initialize(filePath, columnNames());
+            reader.initBatch(new StructType(), org.apache.spark.sql.catalyst.InternalRow.empty());
+            reader.enableReturningBatches();
+            long rows = 0;
+            int nCols = schema.fields().length;
+            while (reader.nextBatch()) {
+                ColumnarBatch batch = reader.resultBatch();
+                int n = batch.numRows();
+                try (java.lang.foreign.Arena arena = java.lang.foreign.Arena.ofConfined()) {
+                    for (int c = 0; c < nCols; c++) {
+                        io.vecruntime.kernels.VectorBuffers vb = io.vecruntime.spark.adapter.ColumnVectorAdapters.adapt(batch.column(c), n, arena);
+                        bh.consume(vb);
+                    }
+                }
+                rows += n;
             }
             bh.consume(rows);
         } finally {
