@@ -22,8 +22,13 @@ import java.util.Random;
 import java.util.concurrent.TimeUnit;
 
 import io.vecruntime.kernels.parquet.RleBitPackingReader;
+import org.apache.parquet.bytes.ByteBufferInputStream;
 import org.apache.parquet.column.values.bitpacking.BytePacker;
 import org.apache.parquet.column.values.bitpacking.Packer;
+import org.apache.spark.sql.execution.datasources.parquet.VectorizedRleValuesReader;
+import org.apache.spark.sql.execution.vectorized.OnHeapColumnVector;
+import org.apache.spark.sql.execution.vectorized.WritableColumnVector;
+import org.apache.spark.sql.types.DataTypes;
 import org.openjdk.jmh.annotations.Benchmark;
 import org.openjdk.jmh.annotations.BenchmarkMode;
 import org.openjdk.jmh.annotations.Fork;
@@ -72,6 +77,7 @@ public class ParquetDecodeBenchmark {
     private long length;
     private byte[] packedBytes; // bit-packed group bytes without the ULEB128 header (BytePacker path)
     private byte[] pageBytesFull; // the whole hybrid stream as a byte[] (injected-reader path)
+    private byte[] sparkPageBytes; // int32-LE length prefix + hybrid stream (Spark VectorizedRleValuesReader path)
     private int paddedN;
     private int[] idOut;
 
@@ -100,6 +106,14 @@ public class ParquetDecodeBenchmark {
                 : (header < 0x4000 ? 2 : 3);
         packedBytes = new byte[bytes.length - headerLen];
         System.arraycopy(bytes, headerLen, packedBytes, 0, packedBytes.length);
+        // Spark's VectorizedRleValuesReader.initFromPage expects a 4-byte little-endian length prefix
+        // before the RLE/bit-packed hybrid stream (the page framing Spark uses for levels/ids).
+        sparkPageBytes = new byte[4 + bytes.length];
+        int len = bytes.length;
+        for (int b = 0; b < 4; b++) {
+            sparkPageBytes[b] = (byte) ((len >>> (8 * b)) & 0xFF);
+        }
+        System.arraycopy(bytes, 0, sparkPageBytes, 4, bytes.length);
     }
 
     @TearDown(Level.Trial)
@@ -169,6 +183,30 @@ public class ParquetDecodeBenchmark {
         for (int i = 0; i < n; i++) {
             sum += idOut[i];
         }
+        return sum;
+    }
+
+    /**
+     * Spark's OWN general reader over the same hybrid page: the honest end-to-end
+     * baseline (it parses the RLE/bit-packed framing and writes a column, exactly
+     * as our injected path does). {@link VectorizedRleValuesReader#initFromPage}
+     * consumes the hybrid stream (bit width is the ctor arg), then
+     * {@code readIntegers} fills an {@link OnHeapColumnVector}.
+     */
+    @Benchmark
+    public long sparkVectorizedRle() throws java.io.IOException {
+        if (bitWidth == 0) {
+            return 0;
+        }
+        VectorizedRleValuesReader reader = new VectorizedRleValuesReader(bitWidth);
+        reader.initFromPage(n, ByteBufferInputStream.wrap(java.nio.ByteBuffer.wrap(sparkPageBytes)));
+        WritableColumnVector col = new OnHeapColumnVector(n, DataTypes.IntegerType);
+        reader.readIntegers(n, col, 0);
+        long sum = 0;
+        for (int i = 0; i < n; i++) {
+            sum += col.getInt(i);
+        }
+        col.close();
         return sum;
     }
 
