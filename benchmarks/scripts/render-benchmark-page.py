@@ -64,6 +64,8 @@ DEFAULT_META = {
     "run_doc": "https://github.com/vecruntime/vecruntime/blob/main/benchmarks/k8s/README.md",
     # Appended to "Between the two, VecRuntime is faster on N of M queries": the per-run reading of where each leads.
     "vector_vs_comet": " and leads on the heavy joins; Comet leads on the scan- and aggregate-bound ones",
+    # The closing sentence of the TL;DR: how the engines' results compare with Spark's in this run.
+    "results_line": "Every engine returned Spark's results (two footnoted exceptions).",
 }
 
 ENGINES = [("spark", "Apache Spark 4.1.3", "#6b7280"), ("vector", "VecRuntime (plugin + Flight shuffle)", "#2563eb"), ("comet", "DataFusion Comet 1.0.0", "#f59e0b")]
@@ -208,7 +210,7 @@ compares both against plain Apache Spark on the TPC-DS 1 TB workload on Amazon E
 <b>Comet</b> finished in {tot["comet"]:,.0f} s -- {tot["spark"] / tot["comet"]:.2f}x, {100 - 100 * tot["comet"] / tot["spark"]:.0f}% less, faster on {faster["comet"]} of {n}
 (best {best_c}: {speed("comet", best_c):.2f}x; largest regression {worst_c}: {100 / speed("comet", worst_c) - 100:.0f}%).
 Between the two, VecRuntime is faster on {v_lt_c} of {n} queries{html.escape(meta["vector_vs_comet"])}.
-Every engine returned Spark's results (two footnoted exceptions).</div>
+{html.escape(meta["results_line"], quote=False)}</div>
 
 <div class="cards">
 <div class="card"><div class="l">Apache Spark 4.1.3</div><div class="n">{tot["spark"]:,.0f} s</div><div class="l">baseline, 103 queries</div></div>

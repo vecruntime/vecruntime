@@ -2810,3 +2810,77 @@ scaling with compression ratio 0.
   5,008 operators ran on ours.
 - **Speed:** we are faster than Spark on 90 of 103 queries (77 on 2026-09-26). Executor time is 52.2 h
   against 66.1 h, and shuffle read 0.47 TB against 0.94 TB.
+
+#### One availability zone, main cb755d1 (2026-09-30)
+
+The page now shows this run. The changes from 2026-09-29:
+- **Topology:** all nine nodes are in one availability zone (node group `bench-g4-1b`, us-east-1b; the earlier node groups spread 5/4 over two zones).
+- **Storage path:** S3 goes through a gateway VPC endpoint.
+- **Build:** main cb755d1 (#554, dictionary ids decoded in place), image `main-cb755d1-arm64`.
+- **Unchanged:** the settings (AQE defaults, map-size scaling with ratio 0, AOT off); both engines back to back in one session.
+
+| | Spark (s) | ours (s) | speedup | geomean |
+|---|---|---|---|---|
+| Graviton4, one AZ, main cb755d1 (2026-09-30) | 2,470.2 | 1,892.7 | 1.31x | 1.31x |
+| Graviton4, two AZs, main c3f9848 (2026-09-29) | 2,667.6 | 2,122.8 | 1.26x | 1.26x |
+
+- **Correctness:** row counts are equal on every query. Checksums are equal except q65 (ties).
+- **Speed:** we are faster than Spark on 96 of 103 queries. Executor time is 46.5 h against 60.5 h.
+- **Largest queries:**
+
+  | query | speedup |
+  |---|---|
+  | q23b | 1.98x |
+  | q93 | 1.87x |
+  | q67 | 1.77x |
+  | q64 | 1.75x |
+  | q23a | 1.68x |
+
+- **Slower than Spark:** q92 (1.5 -> 3.0 s), q99 (7.6 -> 9.5 s), q36, q58, q89, q90 and q88 (101.9 -> 104.6 s, scan-bound).
+
+## x86 TPC-DS 1 TB in one availability zone, with Comet's q5/q64 fixes (2026-09-30)
+
+The x86 page (`docs/benchmarks/tpcds-1tb.html`) now shows this run.
+
+**Setup:**
+- **Order:** Spark, ours and Comet back to back in one cluster session, each alone on the cluster.
+- **Cluster:** nine m5.4xlarge in one availability zone (node group `bench-xl-1b`, us-east-1b, 300 GB root volumes), with S3 through the gateway VPC endpoint.
+- **Settings:** AQE defaults (300 partitions, 64 MB advisory, no `minPartitionNum`). Ours has map-size scaling with ratio 0; AOT is off.
+- **Build:** ours is main cb755d1.
+- **Comet:** a source build of apache/datafusion-comet main `b58b2f3a`, with the unmerged #6268 (`588c029f`, q5 fails with native scans at 1 TB without it) and #6270 (`b3f4f058`, q64 loses rows without it, #6264).
+- **Image:** `main-cb755d1-cometp`, the cb755d1 image with the Comet jar replaced; the commits are recorded in `/opt/spark/comet-patched-versions.txt`.
+
+| engine | total (s) | speedup vs Spark | geomean | faster than Spark on | executor time |
+|---|---|---|---|---|---|
+| Spark 4.1.3 | 3,313.2 | -- | -- | -- | 80.6 h |
+| ours (Spark's scan, our operators and shuffle) | 2,419.7 | 1.37x | 1.31x | 88 | 58.5 h |
+| Comet (+ #6268, #6270) | 2,177.9 | 1.52x | 1.50x | 95 | 53.0 h |
+
+- **Correctness:** both engines return Spark's row counts on all 103 queries and Spark's checksums on all but q65 (ties). Comet's q5 now completes (100 rows, 23.1 s, 77/77 operators native) and its q64 returns 12,185 rows with Spark's checksum (63.8 s, 249/249 operators native).
+- **Ours against Comet:** we are faster on 25 of 103 queries, Comet 1.11x faster in total.
+
+  Where we lead (s, Comet -> ours):
+
+  | query | Comet | ours |
+  |---|---|---|
+  | q93 | 85.9 | 57.0 |
+  | q64 | 63.8 | 48.6 |
+  | q29 | 15.6 | 9.8 |
+  | q50 | 47.4 | 38.4 |
+  | q23b | 123.5 | 117.7 |
+
+  Where Comet leads (s, Comet -> ours):
+
+  | query | Comet | ours | kind |
+  |---|---|---|---|
+  | q9 | 60.1 | 87.1 | scan-bound |
+  | q28 | 84.6 | 115.6 | scan-bound |
+  | q88 | 96.5 | 111.2 | scan-bound |
+  | q4 | 46.4 | 86.4 | aggregate-heavy |
+  | q11 | 27.4 | 48.2 | aggregate-heavy |
+  | q67 | 55.0 | 66.8 | aggregate-heavy |
+  | q18 | 4.7 | 12.4 | cold, #558 |
+
+  The scan-bound ones are the queries where both our engine and Spark pay Spark's Parquet reader; #559 is the work on that.
+- **Ours slower than Spark:** q18 (9.2 -> 12.4 s, cold), q99 (10.1 -> 12.3 s), q11 (42.2 -> 48.2 s), q28 (110.6 -> 115.6 s), q24b (100.6 -> 105.6 s), and small ones (q12, q36, q3, q7).
+- **Against the earlier x86 run:** that run used a 128m advisory size and `minPartitionNum=208`, with Comet 1.0.0 failing q64. It measured Spark 3,309 s, ours 2,557 s (1.29x) and Comet 2,514 s.

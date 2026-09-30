@@ -27,27 +27,28 @@ In essence, **VecRuntime brings a DataFusion-Comet/Velox-style vectorized execut
 Version 0.0.3, a preview release under the Apache License 2.0 (see `LICENSE` and `NOTICE`). The
 plugin runs the whole of TPC-DS (103 queries) and TPC-H (22) with every operator accelerated and
 returns Spark's results; what it does not convert falls back to Spark, always with a recorded reason.
-Measured on the 1 TB TPC-DS Parquet dataset on EKS, eight 13-core executors with 50 GB each, one
-window per engine, all queries once, the median of the measured iteration
+Measured on the 1 TB TPC-DS Parquet dataset on EKS, eight 13-core executors with 50 GB each, all
+three engines back to back in one cluster session in one availability zone (2026-09-30), all queries
+once, the median of the measured iteration
 (`docs/results.md` has the per-query tables, the configurations and every study behind them):
 
 | engine | total, 103 queries | faster than Spark on | notes |
 |---|---:|---:|---|
-| Spark 4.1.3 | 3309 s | -- | 20 GB heap / 30 GB overhead; the reference |
-| Apache DataFusion Comet 1.0 | 2514 s | 90 | native scan, operators and shuffle |
-| Comet's scan + our operators and shuffle | 2706 s | 67 | `spark.comet.scan.impl=native_datafusion` |
-| **VecRuntime** (Spark's scan, our operators, our Flight shuffle) | **2557 s** | **82** | 30 GB heap / 20 GB overhead; 23% under Spark, 2% over Comet |
+| Spark 4.1.3 | 3313 s | -- | 20 GB heap / 30 GB overhead; the reference |
+| Apache DataFusion Comet (main + #6268, #6270) | 2178 s | 95 | native scan, operators and shuffle; a source build with two unmerged fixes (q5, q64) |
+| **VecRuntime** (Spark's scan, our operators, our Flight shuffle) | **2420 s** | **88** | 30 GB heap / 20 GB overhead; 1.37x Spark, Comet 1.11x ahead |
 
-Where the plugin wins it is the joins and aggregates (q23a 118 s against Spark's 211 and Comet's
-132; q23b 125 against 291 and 153; q93 66 against 137 and 85; q64 51 against 93 and 56). Where it
-loses it is the scan-bound queries (q88 142 against Spark's 126) and a handful of small ones
-(q99, q36, q12, q57), each with its cause named in `docs/results.md`. Every checksum equals Spark's
-except q65, whose result has ties that every engine orders differently.
+Where the plugin wins it is the joins (q93 57 s against Spark's 139 and Comet's 86; q64 49 against 93
+and 64; q23b 118 against 282 and 124; q29 10 against 34 and 16). Where it loses to Comet it is the
+scan-bound queries, where it pays Spark's Parquet reader like Spark does (q9 87 against Comet's 60,
+q28 116 against 85, q88 111 against 97), and a few aggregate-heavy ones (q4, q11, q67); against Spark it
+is slower on q18 (cold, #558), q99, q11 and the scan-bound q28 and q24b, each in `docs/results.md`.
+Every checksum equals Spark's except q65, whose result has ties that every engine orders differently.
 
 The same comparison as a page with per-query charts: [Apache Spark vs VecRuntime vs DataFusion Comet on
 TPC-DS 1 TB](https://vecruntime.github.io/vecruntime/benchmarks/tpcds-1tb.html) (rendered from the result
 files by `benchmarks/scripts/render-benchmark-page.py`; the source is `docs/benchmarks/tpcds-1tb.html`).
-On AWS Graviton4 (arm64), with AQE at its defaults for both engines and both run in the same cluster session, the TPC-DS 1 TB comparison against Spark is 1.26x (x86 at the earlier 128m settings: 1.29x):
+On AWS Graviton4 (arm64), with the same settings and both engines in one cluster session in one availability zone, the TPC-DS 1 TB comparison against Spark is 1.31x (x86 the same day: 1.37x):
 [Apache Spark vs VecRuntime on TPC-DS 1 TB, AWS Graviton4](https://vecruntime.github.io/vecruntime/benchmarks/tpcds-1tb-graviton.html).
 
 Requirements and the things it does not do yet are listed under
