@@ -16,9 +16,11 @@
 package io.vecruntime.spark.parquet
 
 import io.vecruntime.spark.VectorConf
+import io.vecruntime.spark.arrow.VectorAllocators
 import io.vecruntime.spark.test.VectorQuerySuite
 import org.apache.spark.sql.Row
-import org.apache.spark.sql.vecruntime.VectorParquetScanExec
+import org.apache.spark.sql.vectorized.ColumnVector
+import org.apache.spark.sql.vecruntime.{PlanUtils, VectorBroadcastBatches, VectorParquetScanExec}
 
 /**
  * Compares our native Parquet scan ([[VectorParquetScanExec]]) with Spark's own reader row for row, and
@@ -267,6 +269,99 @@ class VectorParquetScanSuite extends VectorQuerySuite {
     withConf("spark.sql.optimizer.dynamicPartitionPruning.enabled" -> "false") {
       checkVectorized("SELECT v FROM sub_fact WHERE pk = (SELECT MIN(k) FROM sub_dim)", Seq(node))
       checkVectorized("SELECT v FROM sub_fact WHERE pk IN (SELECT k FROM sub_dim)", Seq(node))
+    }
+  }
+
+  test("a file split into several PartitionedFiles reads each row group once (no duplicates)") {
+    // Write ONE parquet file with many small row groups, then force Spark to split it into >= 2
+    // PartitionedFiles (small maxPartitionBytes). Each split must read only the row groups whose midpoint
+    // falls in its byte range; without the range, every split reads the whole file -> duplicate rows.
+    val path = newTempPath("t_split")
+    withConf("parquet.block.size" -> (64 * 1024).toString, "parquet.page.size" -> (4 * 1024).toString) {
+      withPlugin(enabled = false) {
+        spark.sql("SELECT CAST(id AS INT) AS i, CAST(id * 7 AS BIGINT) AS l FROM range(0, 200000)")
+          .coalesce(1).write.mode("overwrite").parquet(path)
+        spark.read.parquet(path).createOrReplaceTempView("t_split")
+      }
+    }
+    withConf("spark.sql.files.maxPartitionBytes" -> (256 * 1024).toString) {
+      // Confirm the read actually splits (more than one partition), else the test proves nothing.
+      val parts = withPlugin(enabled = true)(spark.sql("SELECT i FROM t_split").rdd.getNumPartitions)
+      assert(parts >= 2, s"expected the file to split into >= 2 partitions, got $parts")
+      checkVectorized("SELECT count(*) AS c FROM t_split", Seq(node))
+      checkVectorized("SELECT count(*) AS c, sum(l) AS s, min(i) AS mn, max(i) AS mx FROM t_split", Seq(node))
+      // Row-for-row (ordered) equality across splits, flag on vs off.
+      checkVectorized("SELECT i, l FROM t_split ORDER BY i", Seq(node))
+    }
+  }
+
+  test("a SlicedColumnVector over a large row-group vector adapts and serializes to only its slice rows") {
+    // Regression for the 1 TB driver OOM: a batch is a SlicedColumnVector over a reused row-group vector of
+    // (say) 1,000,000 rows; when adapted/serialized only the slice's rows must travel, not the whole vector.
+    val allocator = VectorAllocators.newChild("slice-ser")
+    try {
+      val rgRows = 1000000
+      val v = new org.apache.arrow.vector.IntVector("i", allocator)
+      v.allocateNew(rgRows)
+      var k = 0
+      while (k < rgRows) { v.set(k, k); k += 1 }
+      v.setValueCount(rgRows)
+      val whole = new io.vecruntime.spark.arrow.VectorArrowColumnVector(v)
+      val batchN = 4096
+      val sliced = io.vecruntime.spark.arrow.SlicedColumnVector.of(whole, 512000, batchN, rgRows)
+      val arena = java.lang.foreign.Arena.ofConfined()
+      try {
+        val vb = io.vecruntime.spark.adapter.ColumnVectorAdapters.adapt(sliced, batchN, arena)
+        assert(vb.length() == batchN, s"adapted length ${vb.length()} should be the slice's $batchN, not $rgRows")
+        assert(vb.getInt(0) == 512000 && vb.getInt(batchN - 1) == 512000 + batchN - 1, "slice reads the right rows")
+        val batch = new org.apache.spark.sql.vectorized.ColumnarBatch(Array[ColumnVector](sliced), batchN)
+        val (rows, bytes) = VectorBroadcastBatches.write(
+          Iterator.single(batch),
+          Array("i"),
+          Array[org.apache.spark.sql.types.DataType](org.apache.spark.sql.types.IntegerType)
+        )
+        assert(rows == batchN, s"serialized $rows rows, expected $batchN")
+        assert(
+          bytes.length <= batchN.toLong * 8 + 8192,
+          s"serialized ${bytes.length} bytes for $batchN rows: the row group leaked"
+        )
+      } finally arena.close()
+      v.close()
+    } finally {
+      allocator.close()
+    }
+  }
+
+  test("broadcast hash join with our multi-row-group scan as the build side: correct rows, bounded bytes") {
+    // q24a shape in miniature: a large fact scanned by our node joined to a small dimension broadcast. The
+    // build side (dimension) is our scan of a multi-row-group table; the broadcast relation must ship only
+    // the dimension's rows, not a row group per emitted batch (the 1 TB driver OOM). Owned-buffer batches
+    // guarantee that.
+    val factPath = newTempPath("bj_fact")
+    val dimPath = newTempPath("bj_dim")
+    withConf("parquet.block.size" -> (1 << 20).toString, "parquet.page.size" -> (16 * 1024).toString) {
+      withPlugin(enabled = false) {
+        spark.sql(
+          "SELECT CAST(id AS INT) AS f_id, CAST(id % 500 AS INT) AS d_id, CAST(id AS BIGINT) AS amt FROM range(0, 300000)"
+        )
+          .coalesce(1).write.mode("overwrite").parquet(factPath)
+        spark.read.parquet(factPath).createOrReplaceTempView("bj_fact")
+        // A dimension of 500 rows written into many small row groups (so a per-row-group broadcast would blow up).
+        spark.sql("SELECT CAST(id AS INT) AS d_id, CONCAT('name', CAST(id AS STRING)) AS d_name FROM range(0, 500)")
+          .coalesce(1).write.mode("overwrite").parquet(dimPath)
+        spark.read.parquet(dimPath).createOrReplaceTempView("bj_dim")
+      }
+    }
+    withConf(
+      VectorConf.ScanNativeParquet -> "true",
+      "spark.sql.autoBroadcastJoinThreshold" -> (10 * 1024 * 1024).toString,
+      "spark.sql.parquet.columnarReaderBatchSize" -> "4096"
+    ) {
+      checkVectorized(
+        "SELECT d.d_name, count(*) AS c, sum(f.amt) AS s FROM bj_fact f JOIN bj_dim d ON f.d_id = d.d_id " +
+          "GROUP BY d.d_name HAVING sum(f.amt) > (SELECT min(amt) FROM bj_fact) ORDER BY d.d_name",
+        Seq(node)
+      )
     }
   }
 

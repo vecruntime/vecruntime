@@ -17,7 +17,7 @@ package org.apache.spark.sql.vecruntime
 
 import scala.jdk.CollectionConverters._
 
-import io.vecruntime.spark.adapter.TypeMapping
+import io.vecruntime.spark.adapter.{ColumnVectorAdapters, TypeMapping}
 import io.vecruntime.spark.arrow.{ArrowOutput, SlicedColumnVector, VectorAllocators, VectorArrowColumnVector}
 import io.vecruntime.spark.parquet.NativeParquetColumnReader
 import org.apache.hadoop.conf.Configuration
@@ -317,16 +317,40 @@ private[vecruntime] final class VectorParquetPartitionReader(
     releaseEmitted()
     val n = math.min(batchSize, rgRows - rgOffset)
     val columns = new Array[ColumnVector](attrs.length)
-    var c = 0
-    while (c < dataColumnCount) {
-      columns(c) = SlicedColumnVector.of(rgColumns(c), rgOffset, n, rgRows)
-      c += 1
-    }
-    // Partition-value constant columns follow the data columns, ordered to the output.
-    var p = 0
-    while (p < partitionColumns.length) {
-      columns(dataColumnCount + p) = SlicedColumnVector.of(partitionColumns(p), rgOffset, n, partitionColumnRows)
-      p += 1
+    val arena = java.lang.foreign.Arena.ofConfined()
+    try {
+      var c = 0
+      while (c < dataColumnCount) {
+        // Copy this batch's slice out of the reused row-group vector into a fresh vector the batch OWNS.
+        // The emitted batch is then self-contained: it survives the reader recycling the row-group vector
+        // for the next row group (no use-after-reuse), and when it is retained or serialized (a broadcast
+        // build, the shuffle writer) only its own rows travel -- a SlicedColumnVector view over the whole
+        // (million-row) row-group vector risked shipping the row group many times and OOMed the 1 TB driver.
+        val (_, dt) = attrs(c)
+        val sliced = SlicedColumnVector.of(rgColumns(c), rgOffset, n, rgRows)
+        val vb = ColumnVectorAdapters.adapt(sliced, n, arena)
+        columns(c) = ArrowOutput.copy(attrs(c)._1, dt, vb, allocator)
+        c += 1
+      }
+      // Partition-value constant columns follow the data columns, ordered to the output (owned copies too).
+      var p = 0
+      while (p < partitionColumns.length) {
+        val (_, dt) = attrs(dataColumnCount + p)
+        val sliced = SlicedColumnVector.of(partitionColumns(p), rgOffset, n, partitionColumnRows)
+        val vb = ColumnVectorAdapters.adapt(sliced, n, arena)
+        columns(dataColumnCount + p) = ArrowOutput.copy(attrs(dataColumnCount + p)._1, dt, vb, allocator)
+        p += 1
+      }
+    } catch {
+      case t: Throwable =>
+        var k = 0
+        while (k < columns.length) {
+          if (columns(k) != null) columns(k).close()
+          k += 1
+        }
+        throw t
+    } finally {
+      arena.close()
     }
     rgOffset += n
     emitted = new ColumnarBatch(columns, n)
@@ -337,12 +361,24 @@ private[vecruntime] final class VectorParquetPartitionReader(
 
   private def openFile(file: PartitionedFile): Unit = {
     if (context != null) context.killTaskIfInterrupted()
-    reader = ParquetFileReader.open(org.apache.parquet.hadoop.util.HadoopInputFile.fromPath(file.toPath, hadoopConf))
+    // Honor the split's byte range (file.start .. file.start+file.length): parquet-java keeps the row
+    // groups whose midpoint falls in the range. Without this, a file Spark split into several
+    // PartitionedFiles would read the WHOLE file in every split -> duplicate rows and duplicate I/O
+    // (8 TPC-DS store_sales files exceed the 128 MB default split). Open once with the range to read the
+    // footer/schema, then reopen with the range PLUS the pushed row-group/column-index filter.
+    val inputFile = org.apache.parquet.hadoop.util.HadoopInputFile.fromPath(file.toPath, hadoopConf)
+    val start = file.start
+    val end = file.start + file.length
+    reader = ParquetFileReader.open(
+      inputFile,
+      org.apache.parquet.HadoopReadOptions.builder(hadoopConf, file.toPath).withRange(start, end).build()
+    )
     val fileSchema = reader.getFileMetaData.getSchema
     val clipped = ParquetReadSupport.clipParquetSchema(fileSchema, requiredSchema, caseSensitive, useFieldId, false)
     // Encoding is only knowable at read time (slice 1). If any required column chunk uses an encoding we
     // do not decode (DELTA_*, BYTE_STREAM_SPLIT, ...), fall the WHOLE FILE over to Spark's vectorized
-    // reader, adapting nothing further -- correct results, no mid-decode crash.
+    // reader, adapting nothing further -- correct results, no mid-decode crash. (Spark's reader honors the
+    // split range itself from the PartitionedFile, so the fallback is not double-counted either.)
     if (hasUnsupportedEncoding(reader, clipped)) {
       reader.close()
       reader = null
@@ -350,8 +386,17 @@ private[vecruntime] final class VectorParquetPartitionReader(
       metrics.numFiles += 1
       return
     }
+    // Reopen with the range AND the pushed filter so readNextFilteredRowGroup skips row groups / pages.
+    reader.close()
+    reader = ParquetFileReader.open(
+      inputFile,
+      org.apache.parquet.HadoopReadOptions
+        .builder(hadoopConf, file.toPath)
+        .withRange(start, end)
+        .withRecordFilter(rowGroupFilter(clipped))
+        .build()
+    )
     reader.setRequestedSchema(clipped)
-    setRowGroupFilter(clipped)
     blocks = reader.getFooter.getBlocks
     rowGroupIndex = 0
     val columns = clipped.getColumns
@@ -450,9 +495,9 @@ private[vecruntime] final class VectorParquetPartitionReader(
     false
   }
 
-  private def setRowGroupFilter(clipped: MessageType): Unit = {
+  private def rowGroupFilter(clipped: MessageType): FilterCompat.Filter = {
     if (pushedFilters.isEmpty) {
-      return
+      return FilterCompat.NOOP
     }
     val rebaseSpec = org.apache.spark.sql.catalyst.util.RebaseDateTime.RebaseSpec(
       org.apache.spark.sql.internal.LegacyBehaviorPolicy.withName(datetimeRebase)
@@ -468,18 +513,15 @@ private[vecruntime] final class VectorParquetPartitionReader(
       rebaseSpec
     )
     val predicates = pushedFilters.flatMap(f => parquetFilters.createFilter(f))
-    if (predicates.nonEmpty) {
-      val combined = predicates.reduce((a, b) => org.apache.parquet.filter2.predicate.FilterApi.and(a, b))
-      reader.setRequestedSchema(clipped) // already set; keep before applying the filter
-      org.apache.parquet.hadoop.ParquetInputFormat.setFilterPredicate(hadoopConf, combined)
-      filterCompat = FilterCompat.get(combined)
+    if (predicates.isEmpty) {
+      FilterCompat.NOOP
+    } else {
+      FilterCompat.get(predicates.reduce((a, b) => org.apache.parquet.filter2.predicate.FilterApi.and(a, b)))
     }
   }
 
-  private var filterCompat: FilterCompat.Filter = FilterCompat.NOOP
-
   private def releaseEmitted(): Unit = if (emitted != null) {
-    emitted.close() // SlicedColumnVector.close() is a no-op; the row-group vectors are reader-owned
+    emitted.close() // the emitted batch owns its column copies (from `allocator`); free them
     emitted = null
   }
 
@@ -540,18 +582,30 @@ private[vecruntime] final class SparkFallbackFileReader(
 ) extends Iterator[ColumnarBatch]
     with AutoCloseable {
 
-  private val reader =
-    new org.apache.spark.sql.execution.datasources.parquet.VectorizedParquetRecordReader(true, batchSize)
+  // A file we cannot decode natively falls back to Spark's own vectorized reader. That reader's simple
+  // initialize(path, columns) reads the WHOLE file with no split range, so to avoid duplicate rows when the
+  // file was split into several PartitionedFiles we read it on the FIRST split only (start == 0) and emit
+  // nothing for later splits. Correct: the whole-file read returns every row exactly once.
+  private val readsFile: Boolean = file.start == 0L
 
-  reader.initialize(file.toPath.toString, java.util.Arrays.asList(requiredSchema.fieldNames: _*))
-  reader.initBatch(partitionSchema, file.partitionValues)
-  reader.enableReturningBatches()
+  private val reader =
+    if (readsFile) new org.apache.spark.sql.execution.datasources.parquet.VectorizedParquetRecordReader(true, batchSize)
+    else null
+
+  if (readsFile) {
+    reader.initialize(file.toPath.toString, java.util.Arrays.asList(requiredSchema.fieldNames: _*))
+    reader.initBatch(partitionSchema, file.partitionValues)
+    reader.enableReturningBatches()
+  }
   if (context != null) context.addTaskCompletionListener[Unit](_ => close())
 
   private var advanced = false
   private var hasRow = false
 
   override def hasNext: Boolean = {
+    if (reader == null) {
+      return false
+    }
     if (!advanced) {
       hasRow = reader.nextBatch()
       advanced = true
@@ -565,7 +619,7 @@ private[vecruntime] final class SparkFallbackFileReader(
     reader.resultBatch()
   }
 
-  override def close(): Unit = reader.close()
+  override def close(): Unit = if (reader != null) reader.close()
 }
 
 /**
