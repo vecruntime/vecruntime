@@ -36,6 +36,7 @@ once, the median of the measured iteration
 |---|---:|---:|---|
 | Spark 4.1.3 | 3313 s | -- | 20 GB heap / 30 GB overhead; the reference |
 | Apache DataFusion Comet (main + #6268, #6270) | 2178 s | 95 | native scan, operators and shuffle; a source build with two unmerged fixes (q5, q64) |
+| Comet Native Scan + VecRuntime (Comet's native Parquet reader, our operators and shuffle) | 2324 s | 87 | a second cluster session the same day; the scan-bound queries at Comet's level |
 | **VecRuntime** (Spark's scan, our operators, our Flight shuffle) | **2420 s** | **88** | 30 GB heap / 20 GB overhead; 1.37x Spark, Comet 1.11x ahead |
 
 Where the plugin wins it is the joins (q93 57 s against Spark's 139 and Comet's 86; q64 49 against 93

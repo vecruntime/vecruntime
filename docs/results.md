@@ -2883,4 +2883,29 @@ The x86 page (`docs/benchmarks/tpcds-1tb.html`) now shows this run.
 
   The scan-bound ones are the queries where both our engine and Spark pay Spark's Parquet reader; #559 is the work on that.
 - **Ours slower than Spark:** q18 (9.2 -> 12.4 s, cold), q99 (10.1 -> 12.3 s), q11 (42.2 -> 48.2 s), q28 (110.6 -> 115.6 s), q24b (100.6 -> 105.6 s), and small ones (q12, q36, q3, q7).
+- **Comet's native scan feeding our operators and shuffle** (`comet-scan-vector-ourshuffle`, the page's fourth engine,
+  "Comet Native Scan + VecRuntime"): run the same afternoon in a second cluster session on the same node group, image and
+  settings, executors at 22 GB heap / 18 GB overhead / 10 GB off-heap. Every scan is `CometNativeScanExec`
+  (DataFusion's Rust Parquet reader with its own S3 I/O), and every other operator is ours.
+
+  | | total (s) | vs Spark | vs ours on Spark's reader | vs Comet |
+  |---|---|---|---|---|
+  | Comet Native Scan + VecRuntime | 2,324.2 | 1.43x (geomean 1.33x) | 1.04x (geomean 1.02x), faster on 56 | 0.94x, faster on 33 |
+
+  - **Correctness:** Spark's row counts on all 103, Spark's checksums on all but q65.
+  - **The scan-bound queries drop to Comet's level:**
+
+    | query | ours on Spark's reader (s) | Comet Native Scan + VecRuntime (s) | Comet (s) |
+    |---|---|---|---|
+    | q28 | 115.6 | 82.5 | 84.6 |
+    | q9 | 87.1 | 65.4 | 60.1 |
+    | q88 | 111.2 | 97.1 | 96.5 |
+    | q44 | 33.9 | 26.5 | 26.9 |
+    | q50 | 38.4 | 27.9 | 47.4 |
+    | q93 | 57.0 | 52.4 | 85.9 |
+
+  - **The aggregates barely move** (q4 86.4 -> 84.1 s, q11 48.2 -> 46.3, q67 66.8 -> 68.2), so what is left of Comet's lead there is in our operators.
+  - **Small queries pay a fixed cost per scan:** q83 1.4 -> 4.5 s, q66 9.8 -> 13.1 s.
+  - **Caveat:** the comparison crosses two cluster sessions. A same-session baseline leg (ours on Spark's reader) was started and cancelled at the owner's request.
+  - **What it means for #559:** Spark's Parquet reader accounts for the scan-bound gap to Comet. A faster reader of our own would recover it without the native crossing's fixed cost.
 - **Against the earlier x86 run:** that run used a 128m advisory size and `minPartitionNum=208`, with Comet 1.0.0 failing q64. It measured Spark 3,309 s, ours 2,557 s (1.29x) and Comet 2,514 s.
