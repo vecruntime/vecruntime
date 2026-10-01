@@ -302,8 +302,8 @@ private[vecruntime] final class VectorParquetPartitionReader(
         }
       }
       if (reader == null && fallback == null) {
-        if (!files.hasNext) return false
-        openFile(files.next())
+        if (!files.hasNext && ahead.isEmpty) return false
+        openNextFile()
         if (fallback != null && fallback.hasNext) return true
       }
     }
@@ -372,8 +372,76 @@ private[vecruntime] final class VectorParquetPartitionReader(
     emitted
   }
 
-  private def openFile(file: PartitionedFile): Unit = {
+  /**
+   * A file opened ahead of use: its reader (which owns the stream), its clipped schema and, when read ahead,
+   * its first row group -- or a marker that the file must fall over to Spark's reader.
+   */
+  private final class Prepared(
+      val file: PartitionedFile,
+      val reader: ParquetFileReader,
+      val clipped: MessageType,
+      val firstRead: Boolean,
+      val firstStore: org.apache.parquet.column.page.PageReadStore,
+      val needsFallback: Boolean
+  )
+
+  // EXPERIMENT (#559/#566, not for merge; -Dvecruntime.exp.prefetchFiles=N): the next N files of the split
+  // are opened -- HEAD, footer, first row group -- on background threads while the current one decodes.
+  // TPC-DS store_sales at 1 TB is 14.6k files of ~7 MB (mostly one row group each), so a split is a run of
+  // small files and the per-file open + footer + first-group latency is serialized on the task thread.
+  // Each Prepared is built entirely by ONE background thread and handed over through its Future, so no
+  // ParquetFileReader is ever used by two threads at once.
+  private val ahead = new java.util.ArrayDeque[java.util.concurrent.Future[Prepared]]()
+  private var installedFirst: org.apache.parquet.column.page.PageReadStore = _
+  private var installedFirstPending = false
+
+  private def openNextFile(): Unit = {
     if (context != null) context.killTaskIfInterrupted()
+    val depth = VectorParquetPartitionReader.ExpPrefetchFiles
+    if (depth <= 0) {
+      install(prepare(files.next(), readFirst = false))
+      return
+    }
+    topUp(depth)
+    val f = ahead.poll()
+    val p =
+      try f.get()
+      catch { case e: java.util.concurrent.ExecutionException => throw e.getCause }
+    topUp(depth)
+    install(p)
+  }
+
+  /** Keeps `depth + 1` files (the one about to be used plus `depth` more) opening in the background. */
+  private def topUp(depth: Int): Unit = {
+    while (ahead.size() < depth + 1 && files.hasNext) {
+      val file = files.next()
+      ahead.add(VectorParquetPartitionReader.prefetchPool.submit(new java.util.concurrent.Callable[Prepared] {
+        // The open runs for this task: carry its TaskContext onto the (reused) pool thread and clear it after.
+        override def call(): Prepared = {
+          TaskContext.setTaskContext(context)
+          try prepare(file, readFirst = true)
+          finally TaskContext.unset()
+        }
+      }))
+    }
+  }
+
+  /** Closes every file opened ahead and not used (task end, limit). */
+  private def drainAhead(): Unit = {
+    while (!ahead.isEmpty) {
+      val f = ahead.poll()
+      try {
+        val p = f.get()
+        if (p.reader != null) p.reader.close()
+      } catch { case _: Throwable => () }
+    }
+  }
+
+  /**
+   * Opens one file: touches no reader state, so it may run on a prefetch thread. Returns the reader built
+   * over a single stream from the footer just read (the reader owns the stream), or a fallback marker.
+   */
+  private def prepare(file: PartitionedFile, readFirst: Boolean): Prepared = {
     val path = file.toPath
     val start = file.start
     val end = file.start + file.length
@@ -385,15 +453,12 @@ private[vecruntime] final class VectorParquetPartitionReader(
     // (status) with the Parquet read policy, so the open itself issues no second HEAD.
     val inputFile = HadoopInputFile.fromPath(path, hadoopConf)
     // Open the file ONCE: a single SeekableInputStream, read the footer from it with the split range, then
-    // build the reader from THAT footer + the SAME stream (ParquetFileReader(InputFile, ParquetMetadata,
-    // options, stream)) -- no reopen, no second footer read. The split range (file.start ..
-    // file.start+file.length) keeps the row groups whose midpoint falls in the range, so a file Spark split
-    // into several PartitionedFiles reads each row group in exactly one split (no duplicate rows, no
-    // duplicate I/O; 8 TPC-DS store_sales files exceed the 128 MB default split). The previous code opened
-    // the file twice (footer+schema, then reopened with the filter) -> two opens and two footer reads per
-    // split, on top of AAL's own footer parse.
+    // build the reader from THAT footer + the SAME stream -- no reopen, no second footer read. The split
+    // range keeps the row groups whose midpoint falls in the range, so a file Spark split into several
+    // PartitionedFiles reads each row group in exactly one split.
     val rangeOpts = HadoopReadOptions.builder(hadoopConf, path).withRange(start, end).build()
     var stream: SeekableInputStream = null
+    var r: ParquetFileReader = null
     try {
       stream = inputFile.newStream()
       val footer: ParquetMetadata = ParquetFileReader.readFooter(inputFile, rangeOpts, stream)
@@ -401,54 +466,63 @@ private[vecruntime] final class VectorParquetPartitionReader(
       val clipped = ParquetReadSupport.clipParquetSchema(fileSchema, requiredSchema, caseSensitive, useFieldId, false)
       // Encoding is only knowable at read time (slice 1). If any required column chunk uses an encoding we
       // do not decode (DELTA_*, BYTE_STREAM_SPLIT, ...), fall the WHOLE FILE over to Spark's vectorized
-      // reader, adapting nothing further -- correct results, no mid-decode crash. (Spark's reader honors the
-      // split range itself from the PartitionedFile, so the fallback is not double-counted either.)
+      // reader -- correct results, no mid-decode crash.
       if (hasUnsupportedEncodingInFooter(footer, clipped)) {
         stream.close()
         stream = null
-        fallback = new SparkFallbackFileReader(file, hadoopConf, requiredSchema, partitionSchema, batchSize, context)
-        metrics.numFiles += 1
-        return
+        return new Prepared(file, null, clipped, false, null, needsFallback = true)
       }
-      // Build the reader from the footer we already read, over the SAME stream, with the range AND the
-      // pushed filter so readNextFilteredRowGroup skips row groups / pages. The reader now owns the stream
-      // (closed by reader.close()); clear our local handle so the finally below does not double-close it.
+      // The reader owns the stream from here (closed by reader.close()); clear our handle.
       val readOpts = HadoopReadOptions
         .builder(hadoopConf, path)
         .withRange(start, end)
         .withRecordFilter(rowGroupFilter(clipped))
         .build()
-      reader = ParquetFileReader.open(inputFile, footer, readOpts, stream)
+      r = ParquetFileReader.open(inputFile, footer, readOpts, stream)
       stream = null
-      reader.setRequestedSchema(clipped)
-      rowGroupIndex = 0
-      val columns = clipped.getColumns
-      columnReaders = new Array[NativeParquetColumnReader](dataColumnCount)
-      // Map each required data column to its clipped ColumnDescriptor by leaf name (flat schema only).
-      var i = 0
-      while (i < dataColumnCount) {
-        val field = requiredSchema.fields(i)
-        val cd = columns.asScala.find(_.getPath()(0).equalsIgnoreCase(field.name))
-          .getOrElse(throw new IllegalStateException(s"column ${field.name} missing from clipped schema"))
-        columnReaders(i) =
-          new NativeParquetColumnReader(
-            cd,
-            TypeMapping.vecTypeOf(field.dataType),
-            field.dataType,
-            field.name,
-            batchSize,
-            allocator
-          )
-        i += 1
-      }
-      buildPartitionColumns(file)
-      metrics.numFiles += 1
+      r.setRequestedSchema(clipped)
+      val first = if (readFirst) r.readNextFilteredRowGroup() else null
+      val p = new Prepared(file, r, clipped, readFirst, first, needsFallback = false)
+      r = null
+      p
     } finally {
-      // Reached only when the reader was NOT built from the stream (an exception, or a path that returns
-      // early without taking ownership). The success path and the fallback path both null `stream` out
-      // after handing it over / closing it, so this never double-closes.
       if (stream != null) stream.close()
+      if (r != null) r.close()
     }
+  }
+
+  /** Makes a prepared file the current one (task thread): column readers, partition values, metrics. */
+  private def install(p: Prepared): Unit = {
+    if (p.needsFallback) {
+      fallback = new SparkFallbackFileReader(p.file, hadoopConf, requiredSchema, partitionSchema, batchSize, context)
+      metrics.numFiles += 1
+      return
+    }
+    reader = p.reader
+    rowGroupIndex = 0
+    installedFirst = p.firstStore
+    installedFirstPending = p.firstRead
+    val columns = p.clipped.getColumns
+    columnReaders = new Array[NativeParquetColumnReader](dataColumnCount)
+    // Map each required data column to its clipped ColumnDescriptor by leaf name (flat schema only).
+    var i = 0
+    while (i < dataColumnCount) {
+      val field = requiredSchema.fields(i)
+      val cd = columns.asScala.find(_.getPath()(0).equalsIgnoreCase(field.name))
+        .getOrElse(throw new IllegalStateException(s"column ${field.name} missing from clipped schema"))
+      columnReaders(i) =
+        new NativeParquetColumnReader(
+          cd,
+          TypeMapping.vecTypeOf(field.dataType),
+          field.dataType,
+          field.name,
+          batchSize,
+          allocator
+        )
+      i += 1
+    }
+    buildPartitionColumns(p.file)
+    metrics.numFiles += 1
   }
 
   /** Record this file's partition values; per-batch constant columns are built from them in next(). */
@@ -466,7 +540,13 @@ private[vecruntime] final class VectorParquetPartitionReader(
 
   private def readNextFilteredRowGroup(): org.apache.parquet.column.page.PageReadStore = {
     val store =
-      if (pending != null) {
+      if (installedFirstPending) {
+        // The first row group was read when the file was opened ahead.
+        installedFirstPending = false
+        val s = installedFirst
+        installedFirst = null
+        s
+      } else if (pending != null) {
         val f = pending
         pending = null
         try f.get()
@@ -483,7 +563,11 @@ private[vecruntime] final class VectorParquetPartitionReader(
       val r = reader
       pending = VectorParquetPartitionReader.prefetchPool.submit(
         new java.util.concurrent.Callable[org.apache.parquet.column.page.PageReadStore] {
-          override def call(): org.apache.parquet.column.page.PageReadStore = r.readNextFilteredRowGroup()
+          override def call(): org.apache.parquet.column.page.PageReadStore = {
+            TaskContext.setTaskContext(context)
+            try r.readNextFilteredRowGroup()
+            finally TaskContext.unset()
+          }
         }
       )
     }
@@ -599,6 +683,8 @@ private[vecruntime] final class VectorParquetPartitionReader(
       reader.close()
       reader = null
     }
+    installedFirst = null
+    installedFirstPending = false
     rgRows = 0
     rgOffset = 0
   }
@@ -606,11 +692,20 @@ private[vecruntime] final class VectorParquetPartitionReader(
   override def close(): Unit = {
     releaseEmitted()
     closeFile()
+    drainAhead()
     allocator.close()
   }
 }
 
 private[vecruntime] object VectorParquetPartitionReader {
+
+  /** EXPERIMENT (#559/#566): -Dvecruntime.exp.prefetchFiles=N opens the next N files of a split ahead. */
+  val ExpPrefetchFiles: Int = {
+    val s = Option(
+      System.getProperty("vecruntime.exp.prefetchFiles")
+    ).orElse(Option(System.getenv("VECRUNTIME_EXP_PREFETCH_FILES")))
+    s.map(_.trim.toInt).getOrElse(0)
+  }
 
   /** EXPERIMENT (#559/#566): -Dvecruntime.exp.prefetch=true fetches the next row group while one decodes. */
   val ExpPrefetch: Boolean =
