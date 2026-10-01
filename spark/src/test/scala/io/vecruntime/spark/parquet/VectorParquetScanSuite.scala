@@ -319,6 +319,66 @@ class VectorParquetScanSuite extends VectorQuerySuite {
     }
   }
 
+  test("task input metrics count the scan's records and bytes, also those read on prefetch threads") {
+    // Spark's FileScanRDD reports inputMetrics.recordsRead / bytesRead per task; the node did not, and the
+    // read-ahead moves FileSystem reads onto prefetch threads that the task thread's per-thread FileSystem
+    // byte count cannot see. Both must show up in the task metrics, close to what Spark's reader reports.
+    val path = newTempPath("t_inmetrics")
+    withPlugin(enabled = false) {
+      spark.sql(
+        "SELECT CAST(id AS INT) AS i, CAST(id * 7 AS BIGINT) AS l, CAST(id % 23 AS INT) AS p FROM range(0, 60000)"
+      )
+        .repartition(23).write.mode("overwrite").partitionBy("p").parquet(path)
+      spark.read.parquet(path).createOrReplaceTempView("t_inmetrics")
+    }
+    def readMetrics(plugin: Boolean): (Long, Long) = {
+      val records = new java.util.concurrent.atomic.AtomicLong()
+      val bytes = new java.util.concurrent.atomic.AtomicLong()
+      val tasks = new java.util.concurrent.atomic.AtomicLong()
+      val listener = new org.apache.spark.scheduler.SparkListener {
+        override def onTaskEnd(e: org.apache.spark.scheduler.SparkListenerTaskEnd): Unit =
+          if (e.taskMetrics != null) {
+            records.addAndGet(e.taskMetrics.inputMetrics.recordsRead)
+            bytes.addAndGet(e.taskMetrics.inputMetrics.bytesRead)
+            tasks.incrementAndGet()
+          }
+      }
+      spark.sparkContext.addSparkListener(listener)
+      try {
+        withPlugin(enabled = plugin) {
+          spark.sql("SELECT i, l FROM t_inmetrics").collect()
+        }
+        // The listener bus is asynchronous: wait until the task count stops moving.
+        var last = -1L
+        var stable = 0
+        while (stable < 5) {
+          Thread.sleep(100)
+          val now = tasks.get()
+          if (now == last && now > 0) stable += 1 else stable = 0
+          last = now
+        }
+      } finally spark.sparkContext.removeSparkListener(listener)
+      (records.get(), bytes.get())
+    }
+    val (sparkRecords, sparkBytes) = readMetrics(plugin = false)
+    assert(sparkRecords == 60000, s"Spark's reader reported $sparkRecords records")
+    assert(sparkBytes > 0, "Spark's reader reported no bytes")
+    for ((files, rowGroups) <- Seq("0" -> "0", "6" -> "2")) {
+      withConf(
+        VectorConf.ScanNativeParquetPrefetchFiles -> files,
+        VectorConf.ScanNativeParquetPrefetchRowGroups -> rowGroups
+      ) {
+        val (records, bytes) = readMetrics(plugin = true)
+        assert(records == 60000, s"prefetch $files/$rowGroups: $records records, expected 60000")
+        // Same files, same columns: the byte counts agree up to the readers' different footer / page reads.
+        assert(
+          bytes > sparkBytes / 2 && bytes < sparkBytes * 2,
+          s"prefetch $files/$rowGroups: $bytes bytes against Spark's $sparkBytes"
+        )
+      }
+    }
+  }
+
   test("a file split into several PartitionedFiles reads each row group once (no duplicates)") {
     // Write ONE parquet file with many small row groups, then force Spark to split it into >= 2
     // PartitionedFiles (small maxPartitionBytes). Each split must read only the row groups whose midpoint

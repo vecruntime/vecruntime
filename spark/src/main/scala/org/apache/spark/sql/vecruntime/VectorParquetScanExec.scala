@@ -29,6 +29,7 @@ import org.apache.parquet.hadoop.util.HadoopInputFile
 import org.apache.parquet.io.SeekableInputStream
 import org.apache.parquet.schema.MessageType
 import org.apache.spark.{Partition, TaskContext}
+import org.apache.spark.deploy.SparkHadoopUtil
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.Attribute
@@ -378,6 +379,8 @@ private[vecruntime] final class VectorParquetPartitionReader(
     emittedPartitionVectors = partitionVectors
     metrics.numOutputBatches += 1
     metrics.numOutputRows += n
+    if (inputMetrics != null) inputMetrics.incRecordsRead(n)
+    updateBytesRead()
     emitted
   }
 
@@ -426,9 +429,7 @@ private[vecruntime] final class VectorParquetPartitionReader(
         java.util.concurrent.CompletableFuture.supplyAsync(
           () => {
             // The open runs for this task: carry its TaskContext onto the prefetch thread.
-            TaskContext.setTaskContext(context)
-            try prepare(file, readFirst = true)
-            finally TaskContext.unset()
+            onPrefetchThread(prepare(file, readFirst = true))
           },
           VectorParquetPartitionReader.prefetchPool
         )
@@ -603,11 +604,33 @@ private[vecruntime] final class VectorParquetPartitionReader(
     }
   }
 
-  private def readWithTask(r: ParquetFileReader): org.apache.parquet.column.page.PageReadStore = {
+  private def readWithTask(r: ParquetFileReader): org.apache.parquet.column.page.PageReadStore =
+    onPrefetchThread(r.readNextFilteredRowGroup())
+
+  /**
+   * Runs one prefetched step for this task on a prefetch thread: the task's TaskContext is set for it, and
+   * the FileSystem bytes it reads (Hadoop counts them per thread, so the task thread's own callback cannot
+   * see them) are added to the task's input metrics.
+   */
+  private def onPrefetchThread[T](step: => T): T = {
     TaskContext.setTaskContext(context)
-    try r.readNextFilteredRowGroup()
-    finally TaskContext.unset()
+    val bytesOnThisThread = SparkHadoopUtil.get.getFSBytesReadOnThreadCallback()
+    try step
+    finally {
+      prefetchedBytes.addAndGet(bytesOnThisThread())
+      TaskContext.unset()
+    }
   }
+
+  // The task's input metrics, kept the way FileScanRDD keeps them: records per batch, and bytes as the task
+  // thread's FileSystem read count plus what the prefetch threads read for this task.
+  private val inputMetrics = if (context != null) context.taskMetrics().inputMetrics else null
+  private val existingBytesRead = if (inputMetrics != null) inputMetrics.bytesRead else 0L
+  private val taskThreadBytes: () => Long = SparkHadoopUtil.get.getFSBytesReadOnThreadCallback()
+  private val prefetchedBytes = new java.util.concurrent.atomic.AtomicLong()
+
+  private def updateBytesRead(): Unit =
+    if (inputMetrics != null) inputMetrics.setBytesRead(existingBytesRead + taskThreadBytes() + prefetchedBytes.get())
 
   /** Waits for every row-group read in flight (results dropped) so the reader can be closed safely. */
   private def drainRowGroups(): Unit = {
@@ -731,6 +754,7 @@ private[vecruntime] final class VectorParquetPartitionReader(
     releaseEmitted()
     closeFile()
     drainAhead()
+    updateBytesRead()
     allocator.close()
   }
 }
