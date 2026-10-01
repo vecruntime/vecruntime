@@ -148,6 +148,9 @@ private[vecruntime] class VectorSortIterator(
   private var permutation: Array[Int] = _
   private var merge: RunMerge = _
   private var runColumns: Array[Array[VectorBuffers]] = _
+  // One heap mirror of the runs' offsets and validity per output column (#565), rebound per batch.
+  private var runMirrors: Array[io.vecruntime.kernels.RunMirrors] = _
+  private var offsetScratch: Array[Int] = _
   private var runOf: Array[Int] = _
   private var rowOf: Array[Int] = _
   private var total = 0
@@ -333,6 +336,8 @@ private[vecruntime] class VectorSortIterator(
         runColumns = Array.tabulate(numColumns)(c => runs.map(_.columns(c)).toArray)
         runOf = new Array[Int](OutputBatchSize)
         rowOf = new Array[Int](OutputBatchSize)
+        runMirrors = Array.fill(numColumns)(new io.vecruntime.kernels.RunMirrors)
+        offsetScratch = new Array[Int](OutputBatchSize + 1)
       }
       // A top-N emits only the head of the order (every run was still sorted whole).
       total = math.min(total, limit)
@@ -367,7 +372,17 @@ private[vecruntime] class VectorSortIterator(
         var c = 0
         while (c < numColumns) {
           val (name, dt) = outputAttrs(c)
-          out(c) = ArrowOutput.gatherRuns(name, dt, runColumns(c), runOf, rowOf, count, allocator)
+          out(c) = ArrowOutput.gatherRuns(
+            name,
+            dt,
+            runColumns(c),
+            runOf,
+            rowOf,
+            count,
+            allocator,
+            runMirrors(c),
+            offsetScratch
+          )
           c += 1
         }
         val ex = merge.exhausted()
