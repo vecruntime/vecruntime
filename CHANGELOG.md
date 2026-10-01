@@ -23,6 +23,17 @@ version may change configuration keys or defaults, always noted here.
   production Spark-reader-plus-adapter path (`docs/results.md`, `butterfly-keep`). `VectorParquetScanSuite`
   compares results row-for-row with Spark across type x encoding x page v1/v2 x nulls, several row groups
   and pages, partition columns, a pushed filter and a DPP query; `VectorParquetScanPlanSuite` pins planning.
+- `spark.vecruntime.scan.nativeParquet.prefetchFiles` (default `6`) and
+  `spark.vecruntime.scan.nativeParquet.prefetchRowGroups` (default `2`), `0` off, capped at 16: how far
+  `VectorParquetScanExec` reads ahead (#559/#566). The next N files of a split are opened (status, footer,
+  first row group), and the next M row groups of the current file are read, on virtual threads while the
+  task thread decodes; the row-group reads are a chained `CompletableFuture` pipeline, so a file's
+  `ParquetFileReader` is used by one thread at a time and in order. At 1 TB TPC-DS (store_sales is ~14.6k
+  files of ~7 MB, mostly one row group each) task threads were parked on S3 at least 66% of the time; same
+  session, flag on, checksums equal, against no read-ahead (experiment build: N files + one row group
+  ahead): N = 2 q88 -27%, q28 -56%, q9 -60%, q44 -50%; N = 6 q28 -57%, q9 -64%, q44 -59% (q88 varied
+  57-115 s per iteration at both depths). Memory per task grows by up to N opened files plus
+  M row groups (compressed pages).
 
 ## 0.0.4 -- 2026-09-30
 

@@ -276,6 +276,49 @@ class VectorParquetScanSuite extends VectorQuerySuite {
     }
   }
 
+  test("prefetch (#559/#566): many small files and multi-row-group files read identically at every depth") {
+    // A split of many small files (the 1 TB store_sales shape: ~7 MB files, one row group each) exercises the
+    // files opened ahead; one big file with many row groups exercises the chained row-group read-ahead.
+    val small = newTempPath("t_pf_small")
+    val big = newTempPath("t_pf_big")
+    withPlugin(enabled = false) {
+      spark.sql(
+        """SELECT CAST(id AS INT) AS i, CAST(id * 7 AS BIGINT) AS l,
+          |  CASE WHEN id % 9 = 0 THEN NULL ELSE CONCAT('s', CAST(id % 40 AS STRING)) END AS s,
+          |  CAST(id % 37 AS INT) AS p
+          |FROM range(0, 40000)""".stripMargin
+      ).repartition(37).write.mode("overwrite").partitionBy("p").parquet(small)
+      spark.read.parquet(small).createOrReplaceTempView("t_pf_small")
+    }
+    withConf("parquet.block.size" -> (64 * 1024).toString) {
+      withPlugin(enabled = false) {
+        spark.sql("SELECT CAST(id AS INT) AS i, CAST(id * 3 AS BIGINT) AS l FROM range(0, 150000)")
+          .coalesce(1).write.mode("overwrite").parquet(big)
+        spark.read.parquet(big).createOrReplaceTempView("t_pf_big")
+      }
+    }
+    // One partition over all the small files, so a single reader walks a long run of files.
+    withConf(
+      "spark.sql.files.maxPartitionBytes" -> (512L * 1024 * 1024).toString,
+      "spark.sql.files.openCostInBytes" -> "0"
+    ) {
+      for ((files, rowGroups) <- Seq("0" -> "0", "1" -> "0", "0" -> "1", "2" -> "2", "8" -> "8")) {
+        withConf(
+          VectorConf.ScanNativeParquetPrefetchFiles -> files,
+          VectorConf.ScanNativeParquetPrefetchRowGroups -> rowGroups
+        ) {
+          checkVectorized("SELECT p, count(*) AS c, sum(l) AS s, count(s) AS cs FROM t_pf_small GROUP BY p", Seq(node))
+          checkVectorized("SELECT i, l, s, p FROM t_pf_small ORDER BY i", Seq(node))
+          checkVectorized("SELECT i, l FROM t_pf_big ORDER BY i", Seq(node))
+          checkVectorized("SELECT count(*) AS c, sum(l) AS s FROM t_pf_big WHERE i % 3 = 0", Seq(node))
+          // Early termination with files and row groups still in flight: the task end drains and closes them.
+          checkVectorized("SELECT i FROM t_pf_small LIMIT 7", Seq(node))
+          checkVectorized("SELECT i FROM t_pf_big LIMIT 5", Seq(node))
+        }
+      }
+    }
+  }
+
   test("a file split into several PartitionedFiles reads each row group once (no duplicates)") {
     // Write ONE parquet file with many small row groups, then force Spark to split it into >= 2
     // PartitionedFiles (small maxPartitionBytes). Each split must read only the row groups whose midpoint

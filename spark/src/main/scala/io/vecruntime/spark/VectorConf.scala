@@ -82,6 +82,12 @@ object VectorConf {
   /** Our own Java Parquet page decoder behind a VectorParquetScanExec (#559), default off. */
   val ScanNativeParquet = "spark.vecruntime.scan.nativeParquet.enabled"
 
+  /** VectorParquetScanExec read-ahead (#559/#566): files of a split opened ahead, `0` off. */
+  val ScanNativeParquetPrefetchFiles = "spark.vecruntime.scan.nativeParquet.prefetchFiles"
+
+  /** VectorParquetScanExec read-ahead (#559/#566): row groups of the current file read ahead, `0` off. */
+  val ScanNativeParquetPrefetchRowGroups = "spark.vecruntime.scan.nativeParquet.prefetchRowGroups"
+
   /** Mixed chains (#280): Comet's native operators above ours through the sink leaf. Off until #281 decides an allowlist. */
   val CometMixedEnabled = "spark.vecruntime.comet.mixed.enabled"
 
@@ -323,6 +329,28 @@ object VectorConf {
 
   /** Plan our own VectorParquetScanExec in place of a supported Parquet FileSourceScanExec (#559). */
   def scanNativeParquet(conf: SQLConf): Boolean = bool(conf, ScanNativeParquet, default = false)
+
+  /**
+   * How many files of a split `VectorParquetScanExec` opens ahead (#559/#566): status, footer and first row
+   * group, on virtual threads while the task thread decodes. Pays off on splits made of many small files
+   * (1 TB TPC-DS store_sales is ~14.6k files of ~7 MB). `0` opens each file on the task thread. Memory per
+   * task grows by up to N opened files and their first row groups (compressed pages). Capped at 16.
+   */
+  def scanNativeParquetPrefetchFiles(conf: SQLConf): Int = intIn(conf, ScanNativeParquetPrefetchFiles, 6, 16)
+
+  /**
+   * How many row groups of the current file `VectorParquetScanExec` reads ahead (#559/#566), on virtual
+   * threads, chained so a file's reader is used by one thread at a time and in order. Pays off on files with
+   * several row groups. `0` reads each row group on the task thread. Memory per task grows by up to N row
+   * groups (compressed pages), so it scales with the row-group size. Capped at 16.
+   */
+  def scanNativeParquetPrefetchRowGroups(conf: SQLConf): Int =
+    intIn(conf, ScanNativeParquetPrefetchRowGroups, 2, 16)
+
+  private def intIn(conf: SQLConf, key: String, default: Int, max: Int): Int =
+    scala.util.Try(conf.getConfString(key, default.toString).trim.toInt).toOption.map(n =>
+      math.max(0, math.min(n, max))
+    ).getOrElse(default)
   def cometPreferComet(conf: SQLConf): String = conf.getConfString(CometPreferComet, "")
 
   /**
