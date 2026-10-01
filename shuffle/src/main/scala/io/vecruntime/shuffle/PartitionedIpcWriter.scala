@@ -26,6 +26,7 @@ import io.vecruntime.kernels.{
   Bitmap,
   CompactKernels,
   GatherKernels,
+  HeapMirror,
   PartitionKernels,
   ScatterKernels,
   SegmentVectorBuffers,
@@ -307,8 +308,20 @@ final class PartitionedIpcWriter(
       count.toLong * math.max(width, 1)
     }
 
-    /** Appends rows `idx(from until to)` of `in` (the index-list path, #353). */
-    def appendIndexed(in: VectorBuffers, idx: Array[Int], from: Int, to: Int, scratch: Arena): Long = {
+    /**
+     * Appends rows `idx(from until to)` of `in` (the index-list path, #353). `mirror`, when given, is `in`
+     * as heap arrays (a fixed-width column mirrored once per batch by the writer, #565): the gather then
+     * reads arrays, not the batch's segments, for every partition.
+     */
+    def appendIndexed(
+        in: VectorBuffers,
+        idx: Array[Int],
+        from: Int,
+        to: Int,
+        scratch: Arena,
+        mirror: HeapMirror = null,
+        gatherScratch: HeapMirror.GatherScratch = null
+    ): Long = {
       settle(in)
       val count = to - from
       val bytes = if (isString) GatherKernels.gatherUtf8Bytes(in, idx, from, to) else 0L
@@ -331,6 +344,8 @@ final class PartitionedIpcWriter(
         val bits = Bitmap.allocate(scratch, count)
         GatherKernels.gatherFixed(in, idx, from, to, bits, validityScratch)
         Bitmap.copyBits(bits, buffers.data(), rows, count)
+      } else if (mirror != null) {
+        mirror.gather(idx, from, to, buffers.data().asSlice(rows.toLong * width), validityScratch, gatherScratch)
       } else {
         GatherKernels.gatherFixed(in, idx, from, to, buffers.data().asSlice(rows.toLong * width), validityScratch)
       }
@@ -785,6 +800,16 @@ final class PartitionedIpcWriter(
       // rows into that partition's builders (#353).
       if (order.length < n) order = new Array[Int](n)
       PartitionKernels.partitionOrder(ids, n, numPartitions, starts, order)
+      // Fixed-width columns are mirrored into heap arrays once for the batch (#565): every partition's
+      // gather then reads arrays, where reading the batch's segments per row paid a liveness and a bounds
+      // check each (11 % of q67's FFM check samples at 1 TB were this gather).
+      var mc = 0
+      while (mc < plain.length) {
+        mirrored(mc) = if (HeapMirror.mirrors(plain(mc))) {
+          mirrorPool(mc) = HeapMirror.reuse(plain(mc), mirrorPool(mc)); mirrorPool(mc)
+        } else null
+        mc += 1
+      }
       var p = 0
       while (p < numPartitions) {
         if (starts(p + 1) > starts(p)) appendIndexed(segments(p), plain, order, starts(p), starts(p + 1), scratch)
@@ -866,6 +891,11 @@ final class PartitionedIpcWriter(
   private val starts = new Array[Int](numPartitions + 1)
   private var order = new Array[Int](0)
   private var dest = new Array[Int](0)
+  // Per column: the batch's heap mirror for the per-partition gathers (null when not mirrored), and the
+  // arrays kept across batches (#565).
+  private val mirrored = new Array[HeapMirror](schema.fields.length)
+  private val mirrorPool = new Array[HeapMirror](schema.fields.length)
+  private val mirrorGather = new HeapMirror.GatherScratch
 
   private def appendIndexed(
       seg: Segment,
@@ -878,7 +908,7 @@ final class PartitionedIpcWriter(
     var size = 0L
     var c = 0
     while (c < buffers.length) {
-      size += seg.builders(c).appendIndexed(buffers(c), idx, from, to, scratch)
+      size += seg.builders(c).appendIndexed(buffers(c), idx, from, to, scratch, mirrored(c), mirrorGather)
       c += 1
     }
     seg.pendingRows += to - from
