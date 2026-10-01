@@ -324,7 +324,12 @@ public final class ColumnBuilder implements AutoCloseable {
             MemorySegment.copy(in.data(), VectorBuffers.LE_INT, 0L, ids, 0,
                     n);
             int entries = dict.length();
-            if (entries > DICTIONARY_COPY_FACTOR * n) {
+            if (entries == 0) {
+                // No entry at all: every row is null (or not selected) and nothing is read; the dictionary's
+                // offsets buffer may be empty, so it is not copied.
+                off = intScratch(0, 1);
+                off[0] = 0;
+            } else if (entries > DICTIONARY_COPY_FACTOR * n) {
                 off = null;
                 offSeg = dict.offsets();
             } else {
