@@ -109,7 +109,10 @@ public final class NativeParquetColumnReader {
         this.name = name;
         this.maxDefLevel = column.getMaxDefinitionLevel();
         this.allocator = allocator;
-        this.scratch = Arena.ofShared();
+        // Dictionary scratch is GC-managed: closing a shared Arena runs a JVM-wide handshake that walks every
+        // thread's stack, and a reader is made per column per file -- on 1 TB TPC-DS (14,594 store_sales
+        // files) those handshakes were 8-9% of executor CPU in q88. An automatic arena has no close.
+        this.scratch = Arena.ofAuto();
         this.decoder = new ColumnChunkDecoder(physicalType, type, maxDefLevel, batchRows, this::unpackerFor);
     }
 
@@ -391,13 +394,15 @@ public final class NativeParquetColumnReader {
         }
     }
 
-    /** Releases the pool and the reader's scratch arena. Call at task end. */
+    /**
+     * Releases the pool. The scratch arena is automatic: the GC frees it once
+     * the reader is unreachable.
+     */
     public void close() {
         for (FieldVector v : pool) {
             v.close();
         }
         pool.clear();
-        scratch.close();
     }
 
     public ColumnDescriptor column() {
