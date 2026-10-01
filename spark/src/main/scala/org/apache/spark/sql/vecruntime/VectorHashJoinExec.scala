@@ -40,7 +40,7 @@ import org.apache.spark.sql.execution.joins.{
   SortMergeJoinExec
 }
 import org.apache.spark.sql.execution.vector.HashedRelationAccess
-import org.apache.spark.sql.types.{DataType, DecimalType}
+import org.apache.spark.sql.types.{DataType, DecimalType, StringType}
 import org.apache.spark.sql.vectorized.{ColumnarBatch, ColumnVector}
 
 /**
@@ -387,6 +387,25 @@ final class BuildTable(
     m
   }
 
+  /**
+   * Heap mirrors of the plain UTF8 columns the output gathers (#565), made on first use: the build side
+   * is gathered once per output batch of every probe batch, and through its segments each row's offsets,
+   * validity bit and bytes were checked reads. Null for a column `Utf8Mirror` does not cover (dictionary
+   * encoded, or more than `Utf8Mirror.MAX_BYTES`). A shared table may race to make one; the result is the same.
+   */
+  private val utf8Mirrors = new Array[io.vecruntime.kernels.Utf8Mirror](columns.length)
+  private val utf8MirrorTried = new Array[Boolean](columns.length)
+
+  def utf8Mirror(c: Int): io.vecruntime.kernels.Utf8Mirror = {
+    if (!utf8MirrorTried(c)) {
+      val col = columns(c)
+      if (col != null && io.vecruntime.kernels.Utf8Mirror.mirrors(col))
+        utf8Mirrors(c) = io.vecruntime.kernels.Utf8Mirror.of(col)
+      utf8MirrorTried(c) = true
+    }
+    utf8Mirrors(c)
+  }
+
   /** The mirror of column `c` in key-clustered order, or null when the column has no mirror. Same race note as `mirror`. */
   def clusteredMirror(c: Int): io.vecruntime.kernels.HeapMirror = {
     var m = clustered(c)
@@ -704,6 +723,7 @@ private[vecruntime] class VectorHashJoinIterator(
   private var survProbeIdx = new Array[Int](0)
   private var survBuildIdx = new Array[Int](0)
   private val gatherScratch = new io.vecruntime.kernels.HeapMirror.GatherScratch
+  private val utf8Scratch = new io.vecruntime.kernels.Utf8Mirror.Scratch
 
   /** Heap mirrors of the streamed columns the condition reads, for the current batch (#332). */
   private val streamedMirrors = new Array[io.vecruntime.kernels.HeapMirror](spec.streamedWidth)
@@ -1308,6 +1328,8 @@ private[vecruntime] class VectorHashJoinIterator(
           build.payloadAt(buildOrdinal(c)).view(bld, from, to)
         else if (isBuildColumn(c) && build.mirror(buildOrdinal(c)) != null)
           ArrowOutput.gatherHeap(name, dt, build.mirror(buildOrdinal(c)), bld, from, to, allocator, gatherScratch)
+        else if (isBuildColumn(c) && dt.isInstanceOf[StringType] && build.utf8Mirror(buildOrdinal(c)) != null)
+          ArrowOutput.gatherUtf8Heap(name, build.utf8Mirror(buildOrdinal(c)), bld, from, to, allocator, utf8Scratch)
         else if (!isBuildColumn(c) && TypeMapping.hasLane(dt) && streamedMirror(ctx, streamedOrdinal(c)) != null)
           ArrowOutput.gatherHeap(
             name,
