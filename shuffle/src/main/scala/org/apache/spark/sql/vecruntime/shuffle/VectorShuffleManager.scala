@@ -257,6 +257,7 @@ final class VectorShuffleWriter(
   private var stopped = false
   private var rows = 0L
   private var stringBytes = 0L
+  private lazy val stringBytesScratch = new io.vecruntime.kernels.Utf8Sizes.Scratch
   private val recordCounts: Array[Long] =
     if (dep.recordsByPartition.isDefined) new Array[Long](numPartitions) else null
   private var roundRobinNext = VectorShuffleWriter.roundRobinStart(context, numPartitions)
@@ -298,7 +299,8 @@ final class VectorShuffleWriter(
               while (i < n) { recordCounts(ids(i)) += 1; i += 1 }
             }
             val out = if (flat.length > dep.schema.fields.length) flat.take(dep.schema.fields.length) else flat
-            if (dep.stringBytes.isDefined) stringBytes += RebalanceAdvisory.unsafeStringBytes(out, n)
+            if (dep.stringBytes.isDefined)
+              stringBytes += RebalanceAdvisory.unsafeStringBytes(out, n, stringBytesScratch)
             writer.write(
               out,
               n,
