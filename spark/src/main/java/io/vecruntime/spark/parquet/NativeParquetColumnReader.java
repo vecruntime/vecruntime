@@ -188,8 +188,25 @@ public final class NativeParquetColumnReader {
             }
             return flushUtf8(n, decoder.batchNullCount() > 0);
         }
+        // EXPERIMENT (#559, not for merge): pick the fixed-width write path per JVM so one image can A/B
+        // the hoisted-MemorySegment write (A), the ByteBuffer LE view (B) and heap staging + bulk copy.
+        if ("B".equals(EXP_FIXED_WRITE)) {
+            return fillFixed(n, /* modeA= */ false);
+        }
+        if ("staging".equals(EXP_FIXED_WRITE)) {
+            int filled = 0;
+            while (filled < n) {
+                if (decoder.needsPage()) {
+                    decoder.feedPage(toKernelPage(requirePage()));
+                }
+                filled += decoder.readBatch(n - filled, filled);
+            }
+            return flushFixed(n, decoder.batchNullCount() > 0);
+        }
         return fillFixed(n, /* modeA= */ true);
     }
+
+    private static final String EXP_FIXED_WRITE = System.getProperty("vecruntime.exp.fixedWrite", "A");
 
     private DataPage requirePage() {
         DataPage page = pages.readPage();
