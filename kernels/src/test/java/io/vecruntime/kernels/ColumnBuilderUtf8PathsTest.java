@@ -140,4 +140,46 @@ class ColumnBuilderUtf8PathsTest {
             }
         }
     }
+
+    /**
+     * An all-null batch over a dictionary with no entries and an empty offsets
+     * buffer (what an all-null dictionary column arrives as in a sort): nothing
+     * is read from the dictionary. A first version copied its offsets
+     * regardless and failed out of bounds on TPC-DS q67 at SF10.
+     */
+    @Test
+    void allNullBatchOverAnEmptyDictionary() {
+        try (Arena arena = Arena.ofConfined()) {
+            ColumnBuilder b = new ColumnBuilder(arena, VecType.UTF8, 4);
+            b.append(ArrowLayout.ofStrings(arena, new String[] {"x", null}), null, 2);
+            for (boolean withSelection : new boolean[] {false, true}) {
+                int n = 70;
+                int[] ids = new int[n];
+                boolean[] nulls = new boolean[n];
+                java.util.Arrays.fill(nulls, true);
+                VectorBuffers idx = ArrowLayout.ofInts(arena, ids, nulls);
+                VectorBuffers empty = SegmentVectorBuffers.utf8(0, null, MemorySegment.NULL, MemorySegment.NULL);
+                VectorBuffers col = SegmentVectorBuffers.dictionaryUtf8(n, idx.validity(), idx.data(), empty);
+                MemorySegment selection = null;
+                int count = n;
+                if (withSelection) {
+                    selection = ArrowLayout.allocateBitmap(arena, n);
+                    count = 0;
+                    for (int i = 0; i < n; i += 3) {
+                        Bitmap.set(selection, i);
+                        count++;
+                    }
+                }
+                int before = b.view().length();
+                b.append(col, selection, count);
+                VectorBuffers v = b.view();
+                assertEquals(before + count, v.length());
+                for (int i = before; i < v.length(); i++) {
+                    assertEquals(true, v.isNull(i), "null @" + i);
+                }
+            }
+            assertEquals("x", b.view()
+                               .getString(0));
+        }
+    }
 }
