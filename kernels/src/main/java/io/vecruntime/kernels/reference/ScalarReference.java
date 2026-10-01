@@ -1202,4 +1202,26 @@ public final class ScalarReference {
             }
         }
     }
+
+    /**
+     * Oracle for {@code Utf8Sizes.paddedBytes}: per row through the segment
+     * accessors, each non-null value's UTF-8 length rounded up to a word.
+     */
+    public static long paddedUtf8Bytes(VectorBuffers col, int n) {
+        if (col.type() != VecType.UTF8) {
+            return 0L;
+        }
+        MemorySegment validity = col.validity();
+        VectorBuffers dict = col.dictionary();
+        MemorySegment off = dict != null ? dict.offsets() : col.offsets();
+        long total = 0L;
+        for (int i = 0; i < n; i++) {
+            if (validity == null || Bitmap.isSet(validity, i)) {
+                int e = dict != null ? col.data().get(VectorBuffers.LE_INT, (long) i << 2) : i;
+                int len = off.get(VectorBuffers.LE_INT, (long) (e + 1) << 2) - off.get(VectorBuffers.LE_INT, (long) e << 2);
+                total += (len + 7) & ~7;
+            }
+        }
+        return total;
+    }
 }

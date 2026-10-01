@@ -90,29 +90,19 @@ object RebalanceAdvisory {
   /**
    * The bytes `UnsafeRow` gives the string values of these written columns over `n` rows: each non-null
    * value's UTF-8 bytes rounded up to a word, dictionary-encoded columns resolved through their
-   * dictionary. Non-string columns count nothing.
+   * dictionary. Non-string columns count nothing. The per-row work is the `Utf8Sizes` kernel, over
+   * heap copies the caller's `scratch` holds across batches (#565).
    */
-  def unsafeStringBytes(columns: Array[io.vecruntime.kernels.VectorBuffers], n: Int): Long = {
-    import io.vecruntime.kernels.{Bitmap, VecType, VectorBuffers}
+  def unsafeStringBytes(
+      columns: Array[io.vecruntime.kernels.VectorBuffers],
+      n: Int,
+      scratch: io.vecruntime.kernels.Utf8Sizes.Scratch
+  ): Long = {
     var total = 0L
     var c = 0
     while (c < columns.length) {
       val b = columns(c)
-      if (b != null && b.`type`() == VecType.UTF8) {
-        val validity = b.validity()
-        val dict = b.dictionary()
-        val off = if (dict != null) dict.offsets() else b.offsets()
-        val ids = if (dict != null) b.data() else null
-        var i = 0
-        while (i < n) {
-          if (validity == null || Bitmap.isSet(validity, i)) {
-            val e = if (ids != null) ids.get(VectorBuffers.LE_INT, i.toLong << 2) else i
-            val len = off.get(VectorBuffers.LE_INT, (e + 1).toLong << 2) - off.get(VectorBuffers.LE_INT, e.toLong << 2)
-            total += (len + 7) & ~7
-          }
-          i += 1
-        }
-      }
+      if (b != null) total += io.vecruntime.kernels.Utf8Sizes.paddedBytes(b, n, scratch)
       c += 1
     }
     total
