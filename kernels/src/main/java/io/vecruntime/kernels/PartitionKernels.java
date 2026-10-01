@@ -227,12 +227,60 @@ public final class PartitionKernels {
     }
 
     /**
-     * All ones when row {@code i} is valid, zero when it is null: the blend
-     * mask for a null-keeping update.
+     * Per-thread arrays for the mixing loops (#565): a column's validity as
+     * 64-row words, and a UTF8 column's offsets and dictionary indices, each
+     * filled with one bulk move per call. Per-row reads of those through the
+     * segments were 7 % of q67's FFM check samples at 1 TB ({@code validMask}
+     * 4.6 %, {@code mixUtf8}'s offsets 2.4 %): one shared accessor for every
+     * column of every shape, so its receiver profile is mixed and each read
+     * pays its liveness and bounds check as a call.
      */
-    private static int validMask(MemorySegment validity, int i) {
-        return -((validity.get(ValueLayout.JAVA_BYTE, i >>> 3) >>> (i & 7)) & 1);
+    private static final class MixScratch {
+        long[] words = new long[0];
+        int[] offsets = new int[0];
+        int[] ids = new int[0];
+
+        private static final ThreadLocal<MixScratch> SCRATCH = ThreadLocal.withInitial(MixScratch::new);
+
+        long[] words(MemorySegment validity, int n) {
+            int w = Bitmap.wordsFor(n);
+            if (words.length < w) {
+                words = new long[Math.max(w, words.length * 2)];
+            }
+            for (int i = 0; i < w; i++) {
+                words[i] = Bitmap.wordAt(validity, i, n);
+            }
+            return words;
+        }
+
+        int[] offsets(int n) {
+            if (offsets.length < n) {
+                offsets = new int[Math.max(n, offsets.length * 2)];
+            }
+            return offsets;
+        }
+
+        int[] ids(int n) {
+            if (ids.length < n) {
+                ids = new int[Math.max(n, ids.length * 2)];
+            }
+            return ids;
+        }
     }
+
+    /**
+     * All ones when row {@code i} is valid, zero when it is null: the blend
+     * mask for a null-keeping update, from the validity words.
+     */
+    private static int validMask(long[] words, int i) {
+        return -(int) ((words[i >>> 6] >>> i) & 1L);
+    }
+
+    /**
+     * A dictionary more than this many times the rows has its offsets read per
+     * row rather than copied whole.
+     */
+    static final int DICTIONARY_COPY_FACTOR = 2;
 
     private static void mixInt(MemorySegment d, int[] hashes, int n) {
         for (int i = 0; i < n; i++) {
@@ -242,10 +290,11 @@ public final class PartitionKernels {
 
     private static void mixInt(MemorySegment d, MemorySegment validity, int[] hashes,
             int n) {
+        long[] words = MixScratch.SCRATCH.get().words(validity, n);
         for (int i = 0; i < n; i++) {
             int old = hashes[i];
             int h = hashInt(d.get(VectorBuffers.LE_INT, (long) i << 2), old);
-            int m = validMask(validity, i);
+            int m = validMask(words, i);
             hashes[i] = (h & m) | (old & ~m);
         }
     }
@@ -258,10 +307,11 @@ public final class PartitionKernels {
 
     private static void mixLong(MemorySegment d, MemorySegment validity, int[] hashes,
             int n) {
+        long[] words = MixScratch.SCRATCH.get().words(validity, n);
         for (int i = 0; i < n; i++) {
             int old = hashes[i];
             int h = hashLong(d.get(VectorBuffers.LE_LONG, (long) i << 3), old);
-            int m = validMask(validity, i);
+            int m = validMask(words, i);
             hashes[i] = (h & m) | (old & ~m);
         }
     }
@@ -274,66 +324,98 @@ public final class PartitionKernels {
 
     private static void mixDouble(MemorySegment d, MemorySegment validity, int[] hashes,
             int n) {
+        long[] words = MixScratch.SCRATCH.get().words(validity, n);
         for (int i = 0; i < n; i++) {
             int old = hashes[i];
             int h = hashLong(doubleBits(d.get(VectorBuffers.LE_DOUBLE, (long) i << 3)), old);
-            int m = validMask(validity, i);
+            int m = validMask(words, i);
             hashes[i] = (h & m) | (old & ~m);
         }
     }
 
     private static void mixUtf8(VectorBuffers col, int[] hashes, int n,
             MemorySegment validity) {
+        if (n <= 0) {
+            return;
+        }
+        MixScratch s = MixScratch.SCRATCH.get();
+        long[] words = validity == null ? null : s.words(validity, n);
         VectorBuffers dict = col.dictionary();
         if (dict != null) {
             // The seed differs per row (it is the running hash), so an entry is hashed per row; the win is
             // the offsets/data locality of the dictionary.
-            MemorySegment ids = col.data();
-            MemorySegment off = dict.offsets();
+            int entries = dict.length();
+            if (validity != null && entries == 0) {
+                // A null row's id is whatever the encoder left there; no entry at all means every row is
+                // null, and nothing changes.
+                return;
+            }
+            int[] ids = s.ids(n);
+            MemorySegment.copy(col.data(), VectorBuffers.LE_INT, 0L, ids, 0,
+                    n);
             MemorySegment data = dict.data();
-            if (validity == null) {
+            if (entries > DICTIONARY_COPY_FACTOR * n) {
+                mixDictionaryPerRow(ids, dict.offsets(), data, words, hashes,
+                        n);
+                return;
+            }
+            int[] off = s.offsets(entries + 1);
+            MemorySegment.copy(dict.offsets(), VectorBuffers.LE_INT, 0L, off, 0,
+                    entries + 1);
+            if (words == null) {
                 for (int i = 0; i < n; i++) {
-                    int id = ids.get(VectorBuffers.LE_INT, (long) i << 2);
-                    int start = off.get(VectorBuffers.LE_INT, (long) id << 2);
-                    int end = off.get(VectorBuffers.LE_INT, (long) (id + 1) << 2);
-                    hashes[i] = hashUnsafeBytes(data, start, end - start, hashes[i]);
+                    int id = ids[i];
+                    int start = off[id];
+                    hashes[i] = hashUnsafeBytes(data, start, off[id + 1] - start, hashes[i]);
                 }
             } else {
-                // A null row's id is whatever the encoder left there: read entry 0 for it and blend the hash
-                // away. No entry at all means every row is null, and nothing changes.
-                if (dict.length() == 0) {
-                    return;
-                }
+                // A null row's id reads entry 0 and its hash is blended away.
                 for (int i = 0; i < n; i++) {
                     int old = hashes[i];
-                    int m = validMask(validity, i);
-                    int id = ids.get(VectorBuffers.LE_INT, (long) i << 2) & m;
-                    int start = off.get(VectorBuffers.LE_INT, (long) id << 2);
-                    int end = off.get(VectorBuffers.LE_INT, (long) (id + 1) << 2);
-                    int h = hashUnsafeBytes(data, start, end - start, old);
+                    int m = validMask(words, i);
+                    int id = ids[i] & m;
+                    int start = off[id];
+                    int h = hashUnsafeBytes(data, start, off[id + 1] - start, old);
                     hashes[i] = (h & m) | (old & ~m);
                 }
             }
             return;
         }
-        MemorySegment off = col.offsets();
+        int[] off = s.offsets(n + 1);
+        MemorySegment.copy(col.offsets(), VectorBuffers.LE_INT, 0L, off, 0,
+                n + 1);
         MemorySegment data = col.data();
-        if (validity == null) {
+        if (words == null) {
             for (int i = 0; i < n; i++) {
-                int start = off.get(VectorBuffers.LE_INT, (long) i << 2);
-                int end = off.get(VectorBuffers.LE_INT, (long) (i + 1) << 2);
-                hashes[i] = hashUnsafeBytes(data, start, end - start, hashes[i]);
+                int start = off[i];
+                hashes[i] = hashUnsafeBytes(data, start, off[i + 1] - start, hashes[i]);
             }
         } else {
             // A null row spans no bytes (its offsets are equal), so hashing it is a seed-only fmix; blended away.
             for (int i = 0; i < n; i++) {
                 int old = hashes[i];
-                int start = off.get(VectorBuffers.LE_INT, (long) i << 2);
-                int end = off.get(VectorBuffers.LE_INT, (long) (i + 1) << 2);
-                int h = hashUnsafeBytes(data, start, end - start, old);
-                int m = validMask(validity, i);
+                int start = off[i];
+                int h = hashUnsafeBytes(data, start, off[i + 1] - start, old);
+                int m = validMask(words, i);
                 hashes[i] = (h & m) | (old & ~m);
             }
+        }
+    }
+
+    /**
+     * {@link #mixUtf8} over a dictionary too large to copy: its offsets read
+     * per row.
+     */
+    private static void mixDictionaryPerRow(int[] ids, MemorySegment off, MemorySegment data,
+            long[] words, int[] hashes, int n) {
+        for (int i = 0; i < n; i++) {
+            int old = hashes[i];
+            int m = words == null ? -1 : validMask(words, i);
+            int id = ids[i] & m;
+            int start = off.get(VectorBuffers.LE_INT, (long) id << 2);
+            int end = off.get(VectorBuffers.LE_INT, (long) (id + 1) << 2);
+            int h = hashUnsafeBytes(data, start, end - start, old);
+            hashes[i] = (h & m) | (old & ~m);
         }
     }
 
