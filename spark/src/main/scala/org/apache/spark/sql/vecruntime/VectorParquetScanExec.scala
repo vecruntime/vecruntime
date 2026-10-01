@@ -262,6 +262,7 @@ private[vecruntime] final class VectorParquetPartitionReader(
   private var reader: ParquetFileReader = _
   private var columnReaders: Array[NativeParquetColumnReader] = _
   private var rowGroupIndex = 0
+  private var pending: java.util.concurrent.Future[org.apache.parquet.column.page.PageReadStore] = _
   private var partitionValues: InternalRow = _ // this file's partition values (for constant columns)
 
   // Current row group state.
@@ -464,9 +465,37 @@ private[vecruntime] final class VectorParquetPartitionReader(
   }
 
   private def readNextFilteredRowGroup(): org.apache.parquet.column.page.PageReadStore = {
-    val store = reader.readNextFilteredRowGroup()
+    val store =
+      if (pending != null) {
+        val f = pending
+        pending = null
+        try f.get()
+        catch { case e: java.util.concurrent.ExecutionException => throw e.getCause }
+      } else {
+        reader.readNextFilteredRowGroup()
+      }
     rowGroupIndex += 1
+    // EXPERIMENT (#559/#566, not for merge): fetch the NEXT row group on a background thread while this one
+    // decodes. readNextFilteredRowGroup returns an in-memory store (compressed pages; decompression is lazy
+    // and happens on the task thread), and the reader is only ever touched by one thread at a time: the task
+    // thread waits for the pending read before it calls the reader again, and closeFile waits for it too.
+    if (store != null && VectorParquetPartitionReader.ExpPrefetch) {
+      val r = reader
+      pending = VectorParquetPartitionReader.prefetchPool.submit(
+        new java.util.concurrent.Callable[org.apache.parquet.column.page.PageReadStore] {
+          override def call(): org.apache.parquet.column.page.PageReadStore = r.readNextFilteredRowGroup()
+        }
+      )
+    }
     store
+  }
+
+  /** Waits for an in-flight prefetch (its result is dropped) so the reader can be closed safely. */
+  private def drainPending(): Unit = if (pending != null) {
+    val f = pending
+    pending = null
+    try f.get()
+    catch { case _: Throwable => () }
   }
 
   /**
@@ -566,6 +595,7 @@ private[vecruntime] final class VectorParquetPartitionReader(
       columnReaders = null
     }
     if (reader != null) {
+      drainPending()
       reader.close()
       reader = null
     }
@@ -578,6 +608,24 @@ private[vecruntime] final class VectorParquetPartitionReader(
     closeFile()
     allocator.close()
   }
+}
+
+private[vecruntime] object VectorParquetPartitionReader {
+
+  /** EXPERIMENT (#559/#566): -Dvecruntime.exp.prefetch=true fetches the next row group while one decodes. */
+  val ExpPrefetch: Boolean =
+    java.lang.Boolean.getBoolean("vecruntime.exp.prefetch") || "true" == System.getenv("VECRUNTIME_EXP_PREFETCH")
+
+  /** Daemon threads for row-group prefetch; each reader has at most one read in flight. */
+  lazy val prefetchPool: java.util.concurrent.ExecutorService =
+    java.util.concurrent.Executors.newCachedThreadPool(new java.util.concurrent.ThreadFactory {
+      private val n = new java.util.concurrent.atomic.AtomicInteger()
+      override def newThread(r: Runnable): Thread = {
+        val t = new Thread(r, "vecruntime-parquet-prefetch-" + n.incrementAndGet())
+        t.setDaemon(true)
+        t
+      }
+    })
 }
 
 object VectorParquetScanExec {
