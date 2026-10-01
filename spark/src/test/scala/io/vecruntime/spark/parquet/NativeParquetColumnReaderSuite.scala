@@ -17,6 +17,8 @@ package io.vecruntime.spark.parquet
 
 import java.nio.charset.StandardCharsets
 
+import scala.collection.mutable.ArrayBuffer
+
 import io.vecruntime.kernels.VecType
 import io.vecruntime.kernels.parquet.ParquetPageDecoder
 import io.vecruntime.spark.arrow.VectorAllocators
@@ -32,14 +34,15 @@ import org.apache.spark.sql.types.DataTypes
 import org.scalatest.funsuite.AnyFunSuite
 
 /**
- * Reader-level tests for [[NativeParquetColumnReader]]'s vector reuse across row groups: the reader owns
- * one Arrow FieldVector per column for the life of the file and recycles it (grow-only), the way Spark
- * recycles one ColumnarBatch. Drives the reader with a fake [[PageReader]] feeding pages built by
- * parquet-java's own writers (the bytes the real scan feeds it), across row groups of different sizes.
+ * Reader-level tests for [[NativeParquetColumnReader]]'s STREAMING decode: {@code startRowGroup} then a
+ * sequence of {@code readBatch(n)} calls that each decode the next n rows straight into a batch-owned Arrow
+ * vector, spanning pages, resuming mid-run, with the null count from the definition levels; released
+ * vectors are pooled and reused. Drives the reader with a fake [[PageReader]] feeding pages built by
+ * parquet-java's own writers (the bytes the real scan feeds it), across many pages per row group.
  *
- * Covered: reuse across bigger -> smaller -> bigger row groups (same vector instance, no allocateNew);
- * a with-nulls row group followed by a no-nulls one (stale validity tail must not leak); a UTF8 column
- * whose data buffer grows; and the validity tail beyond valueCount masked / not read.
+ * Covered: a row group split into several pages consumed by batches whose size does not divide the page
+ * size (page-spanning batches); a with-nulls batch followed by a no-nulls batch (no stale validity, no
+ * getNullCount); UTF8 batches; and pool reuse (a released vector instance is handed back on the next batch).
  */
 class NativeParquetColumnReaderSuite extends AnyFunSuite {
 
@@ -84,12 +87,12 @@ class NativeParquetColumnReaderSuite extends AnyFunSuite {
   private def dataPageV1(body: Array[Byte], valueCount: Int): DataPageV1 =
     new DataPageV1(BytesInput.from(body), valueCount, body.length, null, Encoding.RLE, Encoding.RLE, Encoding.PLAIN)
 
-  /** A PageReader that hands out one data page then nulls; no dictionary. */
-  private def singlePage(page: DataPage, valueCount: Int): PageReader = new PageReader {
-    private var served = false
+  /** A PageReader that hands out a queue of data pages then nulls; no dictionary. */
+  private def pagesOf(pages: Seq[DataPage], totalValues: Int): PageReader = new PageReader {
+    private val it = pages.iterator
     override def readDictionaryPage(): DictionaryPage = null
-    override def getTotalValueCount: Long = valueCount.toLong
-    override def readPage(): DataPage = if (served) null else { served = true; page }
+    override def getTotalValueCount: Long = totalValues.toLong
+    override def readPage(): DataPage = if (it.hasNext) it.next() else null
   }
 
   private def descriptor(name: String, tpe: PrimitiveTypeName, maxDef: Int): ColumnDescriptor = {
@@ -98,169 +101,206 @@ class NativeParquetColumnReaderSuite extends AnyFunSuite {
     new ColumnDescriptor(Array(name), prim, 0, maxDef)
   }
 
-  private def readIntRowGroup(reader: NativeParquetColumnReader, values: Array[Int], present: Array[Boolean]) = {
-    // The column is optional (maxDef 1): Parquet writes def levels for every row even when all are present.
-    val body = v1Body(plainInts(values, present), present, 1)
-    reader.readRowGroup(singlePage(dataPageV1(body, values.length), values.length), values.length)
+  /** Split [0,n) into `pageCount` contiguous int32 pages (parquet-java bodies), and drive readBatch. */
+  private def intPages(values: Array[Int], present: Array[Boolean], pageCount: Int): Seq[DataPage] = {
+    val n = values.length
+    val bounds = (0 to pageCount).map(p => (n.toLong * p / pageCount).toInt)
+    (0 until pageCount).map { p =>
+      val s = bounds(p)
+      val e = bounds(p + 1)
+      val body = v1Body(plainInts(values.slice(s, e), present.slice(s, e)), present.slice(s, e), 1)
+      dataPageV1(body, e - s)
+    }
+  }
+
+  /** Read the whole row group in batches of `batchRows`, collecting (releasing) each batch vector. */
+  private def readAllInt(
+      reader: NativeParquetColumnReader,
+      pages: Seq[DataPage],
+      rows: Int,
+      batchRows: Int
+  ): (Array[Int], Array[Boolean], ArrayBuffer[org.apache.arrow.vector.FieldVector]) = {
+    reader.startRowGroup(pagesOf(pages, rows), rows)
+    val gotValues = new Array[Int](rows)
+    val gotPresent = new Array[Boolean](rows)
+    val seen = ArrayBuffer.empty[org.apache.arrow.vector.FieldVector]
+    var done = 0
+    while (done < rows) {
+      val n = math.min(batchRows, rows - done)
+      val fv = reader.readBatch(n)
+      seen += fv
+      val iv = fv.asInstanceOf[org.apache.arrow.vector.IntVector]
+      assert(fv.getValueCount == n)
+      for (i <- 0 until n) {
+        gotPresent(done + i) = !iv.isNull(i)
+        if (!iv.isNull(i)) gotValues(done + i) = iv.get(i)
+      }
+      reader.release(fv)
+      done += n
+    }
+    (gotValues, gotPresent, seen)
   }
 
   // ------------------------------------------------------------------- tests
 
-  test("INT32 vector reused across bigger -> smaller -> bigger row groups") {
-    val allocator = VectorAllocators.newChild("reader-reuse-i32")
+  test("INT32 batches span pages when the batch size does not divide the page size") {
+    val allocator = VectorAllocators.newChild("reader-stream-i32")
     val reader = new NativeParquetColumnReader(
       descriptor("i", PrimitiveTypeName.INT32, 1),
       VecType.INT32,
       DataTypes.IntegerType,
       "i",
+      384,
       allocator
     )
     try {
-      def rg(n: Int, base: Int): (org.apache.arrow.vector.FieldVector, Array[Int], Array[Boolean]) = {
-        val v = Array.tabulate(n)(k => base + k * 7 - 3)
-        val p = Array.tabulate(n)(k => k % 5 != 0) // ~20% null
-        (readIntRowGroup(reader, v, p), v, p)
+      val rows = 5000
+      val values = Array.tabulate(rows)(k => k * 7 - 3)
+      val present = Array.tabulate(rows)(k => k % 5 != 0)
+      val (gotV, gotP, _) = readAllInt(reader, intPages(values, present, 5), rows, 384)
+      for (i <- 0 until rows) {
+        assert(gotP(i) == present(i), s"row $i null flag")
+        if (present(i)) assert(gotV(i) == values(i), s"row $i value")
       }
-      val (v1, vals1, pres1) = rg(3000, 100)
-      assertIntColumn(v1, vals1, pres1)
-      val (v2, vals2, pres2) = rg(500, 9000) // smaller: same buffers, no realloc
-      assert(v2 eq v1, "smaller row group must reuse the same vector instance")
-      assertIntColumn(v2, vals2, pres2)
-      val (v3, vals3, pres3) = rg(4000, 50000) // bigger: may realloc, still correct
-      assertIntColumn(v3, vals3, pres3)
     } finally {
       reader.close()
       allocator.close()
     }
   }
 
-  test("with-nulls row group then no-nulls: stale validity tail does not leak") {
-    val allocator = VectorAllocators.newChild("reader-reuse-nulls")
+  test("released batch vectors are pooled and reused") {
+    val allocator = VectorAllocators.newChild("reader-stream-pool")
     val reader = new NativeParquetColumnReader(
       descriptor("i", PrimitiveTypeName.INT32, 1),
       VecType.INT32,
       DataTypes.IntegerType,
       "i",
+      512,
       allocator
     )
     try {
-      val vNull = Array.tabulate(2000)(k => k)
-      val pNull = Array.tabulate(2000)(k => k % 3 != 0)
-      assertIntColumn(readIntRowGroup(reader, vNull, pNull), vNull, pNull)
-      // A no-null, SMALLER row group: reuses the vector; every row must read as valid despite the prior nulls.
-      val vFull = Array.tabulate(700)(k => k * 2)
-      val pFull = Array.fill(700)(true)
-      val out = readIntRowGroup(reader, vFull, pFull)
-      assert(out.getValueCount == 700)
-      assert(out.getNullCount == 0, "no-null row group must report zero nulls after a with-null one")
-      assertIntColumn(out, vFull, pFull)
+      val rows = 4096
+      val values = Array.tabulate(rows)(k => k)
+      val present = Array.fill(rows)(true)
+      val (_, _, seen) = readAllInt(reader, intPages(values, present, 4), rows, 512)
+      // With release-after-each-batch and equal-sized batches, the pool hands the same instance back.
+      assert(seen.size > 1)
+      assert(seen.toSet.size < seen.size, "a released vector instance must be reused from the pool")
     } finally {
       reader.close()
       allocator.close()
     }
   }
 
-  test("validity tail beyond valueCount is masked (a smaller all-present group after a larger nulls group)") {
-    val allocator = VectorAllocators.newChild("reader-tail")
+  test("with-nulls batch then no-nulls batch: no stale validity, null count from def levels") {
+    val allocator = VectorAllocators.newChild("reader-stream-nulls")
     val reader = new NativeParquetColumnReader(
       descriptor("i", PrimitiveTypeName.INT32, 1),
       VecType.INT32,
       DataTypes.IntegerType,
       "i",
+      2000,
       allocator
     )
     try {
-      // First a large group with nulls near the end so the tail words carry cleared bits.
-      val big = Array.tabulate(4096)(k => k)
-      val bigP = Array.tabulate(4096)(k => k < 4000) // last 96 null
-      assertIntColumn(readIntRowGroup(reader, big, bigP), big, bigP)
-      // Then a small all-present group whose row count is not a multiple of 64 (130): its own validity
-      // words are all-ones over [0,130); Arrow reads only valueCount rows, so nullCount must be 0.
-      val small = Array.tabulate(130)(k => k + 1)
-      val smallP = Array.fill(130)(true)
-      val out = readIntRowGroup(reader, small, smallP)
-      assert(out.getValueCount == 130)
-      assert(out.getNullCount == 0)
+      // One row group: first 2000 rows have nulls, next 700 have none. Batches of 2000 then 700.
+      val rows = 2700
+      val values = Array.tabulate(rows)(k => k)
+      val present = Array.tabulate(rows)(k => if (k < 2000) k % 3 != 0 else true)
+      reader.startRowGroup(pagesOf(intPages(values, present, 3), rows), rows)
+      val b1 = reader.readBatch(2000)
+      assert(b1.getValueCount == 2000)
+      assert(b1.getNullCount > 0)
+      reader.release(b1)
+      val b2 = reader.readBatch(700)
+      assert(b2.getValueCount == 700)
+      assert(b2.getNullCount == 0, "no-null batch must report zero nulls after a with-null one")
+      val iv = b2.asInstanceOf[org.apache.arrow.vector.IntVector]
+      for (i <- 0 until 700) {
+        assert(!iv.isNull(i))
+        assert(iv.get(i) == values(2000 + i))
+      }
+      reader.release(b2)
     } finally {
       reader.close()
       allocator.close()
     }
   }
 
-  test("INT64 reuse across row groups") {
-    val allocator = VectorAllocators.newChild("reader-reuse-i64")
+  test("INT64 streaming across pages") {
+    val allocator = VectorAllocators.newChild("reader-stream-i64")
     val reader = new NativeParquetColumnReader(
       descriptor("l", PrimitiveTypeName.INT64, 1),
       VecType.INT64,
       DataTypes.LongType,
       "l",
+      333,
       allocator
     )
     try {
-      def rg(n: Int, base: Long) = {
-        val v = Array.tabulate(n)(k => base + k.toLong * 1000003L)
-        val p = Array.tabulate(n)(k => k % 4 != 0)
-        val body = v1Body(plainLongs(v, p), p, 1)
-        val out = reader.readRowGroup(singlePage(dataPageV1(body, n), n), n)
-        for (i <- 0 until n) {
-          assert(out.isNull(i) == !p(i))
-          if (p(i)) assert(out.asInstanceOf[org.apache.arrow.vector.BigIntVector].get(i) == v(i))
-        }
-        out
+      val rows = 2500
+      val v = Array.tabulate(rows)(k => 10L + k.toLong * 1000003L)
+      val p = Array.tabulate(rows)(k => k % 4 != 0)
+      val bounds = (0 to 4).map(x => (rows.toLong * x / 4).toInt)
+      val pages = (0 until 4).map { x =>
+        val s = bounds(x)
+        val e = bounds(x + 1)
+        dataPageV1(v1Body(plainLongs(v.slice(s, e), p.slice(s, e)), p.slice(s, e), 1), e - s)
       }
-      val a = rg(2500, 10L)
-      val b = rg(400, 999L)
-      assert(b eq a, "smaller INT64 row group reuses the vector")
-      rg(3000, 5L)
+      reader.startRowGroup(pagesOf(pages, rows), rows)
+      var done = 0
+      while (done < rows) {
+        val n = math.min(333, rows - done)
+        val fv = reader.readBatch(n).asInstanceOf[org.apache.arrow.vector.BigIntVector]
+        for (i <- 0 until n) {
+          assert(fv.isNull(i) == !p(done + i))
+          if (p(done + i)) assert(fv.get(i) == v(done + i))
+        }
+        reader.release(fv)
+        done += n
+      }
     } finally {
       reader.close()
       allocator.close()
     }
   }
 
-  test("UTF8 reuse; the data buffer grows for a larger row group") {
-    val allocator = VectorAllocators.newChild("reader-reuse-utf8")
+  test("UTF8 streaming across pages") {
+    val allocator = VectorAllocators.newChild("reader-stream-utf8")
     val reader = new NativeParquetColumnReader(
       descriptor("s", PrimitiveTypeName.BINARY, 1),
       VecType.UTF8,
       DataTypes.StringType,
       "s",
+      200,
       allocator
     )
     try {
-      def rg(strings: Array[String]): org.apache.arrow.vector.VarCharVector = {
-        val p = strings.map(_ != null)
-        val bytes = strings.map(s => if (s == null) Array.emptyByteArray else s.getBytes(StandardCharsets.UTF_8))
-        val body = v1Body(plainBinaries(bytes, p), p, 1)
-        val out = reader.readRowGroup(singlePage(dataPageV1(body, strings.length), strings.length), strings.length)
-          .asInstanceOf[org.apache.arrow.vector.VarCharVector]
-        for (i <- strings.indices) {
-          assert(out.isNull(i) == (strings(i) == null))
-          if (strings(i) != null) assert(new String(out.get(i), StandardCharsets.UTF_8) == strings(i))
-        }
-        out
+      val rows = 1500
+      val strings = Array.tabulate(rows)(k => if (k % 7 == 0) null else ("value-" + k) * (1 + k % 3))
+      val p = strings.map(_ != null)
+      val bytes = strings.map(s => if (s == null) Array.emptyByteArray else s.getBytes(StandardCharsets.UTF_8))
+      val bounds = (0 to 5).map(x => (rows.toLong * x / 5).toInt)
+      val pages = (0 until 5).map { x =>
+        val s = bounds(x)
+        val e = bounds(x + 1)
+        dataPageV1(v1Body(plainBinaries(bytes.slice(s, e), p.slice(s, e)), p.slice(s, e), 1), e - s)
       }
-      // Small group of short strings, then a group whose total bytes are much larger (grows the data buffer).
-      rg(Array("a", "bb", null, "ccc", "dddd"))
-      val big = Array.tabulate(3000)(k => if (k % 7 == 0) null else ("value-" + k) * (1 + k % 4))
-      rg(big)
-      rg(Array("x", null, "y")) // smaller again: reuse
+      reader.startRowGroup(pagesOf(pages, rows), rows)
+      var done = 0
+      while (done < rows) {
+        val n = math.min(200, rows - done)
+        val fv = reader.readBatch(n).asInstanceOf[org.apache.arrow.vector.VarCharVector]
+        for (i <- 0 until n) {
+          assert(fv.isNull(i) == (strings(done + i) == null))
+          if (strings(done + i) != null) assert(new String(fv.get(i), StandardCharsets.UTF_8) == strings(done + i))
+        }
+        reader.release(fv)
+        done += n
+      }
     } finally {
       reader.close()
       allocator.close()
-    }
-  }
-
-  private def assertIntColumn(
-      v: org.apache.arrow.vector.FieldVector,
-      values: Array[Int],
-      present: Array[Boolean]
-  ): Unit = {
-    assert(v.getValueCount == values.length)
-    val iv = v.asInstanceOf[org.apache.arrow.vector.IntVector]
-    for (i <- values.indices) {
-      assert(iv.isNull(i) == !present(i), s"row $i null flag")
-      if (present(i)) assert(iv.get(i) == values(i), s"row $i value")
     }
   }
 }

@@ -19,15 +19,15 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
+import java.util.ArrayDeque;
+import java.util.Deque;
 
-import io.vecruntime.kernels.SegmentVectorBuffers;
 import io.vecruntime.kernels.VecType;
 import io.vecruntime.kernels.VectorBuffers;
 import io.vecruntime.kernels.parquet.ColumnChunkDecoder;
 import io.vecruntime.kernels.parquet.GroupUnpacker;
 import io.vecruntime.kernels.parquet.ParquetPageDecoder;
 import io.vecruntime.spark.arrow.ArrowOutput;
-import io.vecruntime.spark.arrow.ArrowSegments;
 import io.vecruntime.spark.arrow.ArrowVectorBuffers;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.BaseFixedWidthVector;
@@ -45,36 +45,37 @@ import org.apache.parquet.column.values.bitpacking.Packer;
 import org.apache.spark.sql.types.DataType;
 
 /**
- * Reads one Parquet column chunk of a row group -- its dictionary page and every
- * data page -- into a single Arrow {@link FieldVector} sized for the whole row
- * group, through {@link ColumnChunkDecoder}. The decoder stages values into
- * reused heap primitive arrays with plain stores and this reader flushes the
- * finished row group into the Arrow buffers with one bulk {@code MemorySegment.copy}
- * per buffer.
+ * Streaming reader for one Parquet column chunk: {@link #readBatch} decodes the
+ * next {@code n} rows of the current row group STRAIGHT into a fresh (or pooled)
+ * batch-sized Arrow {@link FieldVector} that the emitted batch owns -- no
+ * row-group-sized vector is ever materialised and there is no per-batch copy of
+ * the row group. This is #559 slice 1's scan decode core (the streaming rewrite;
+ * the earlier row-group-at-a-time version staged the whole group and the node
+ * sliced+copied each batch out, which walked the group's null count per batch --
+ * 32% of the 1 TB CPU -- and copied twice).
  *
- * <h2>Vector reuse across row groups (decode in place)</h2>
- * The reader OWNS one {@link FieldVector} per column for the life of the file
- * and reuses it for every row group, the way Spark recycles one
- * {@code ColumnarBatch}: a row group whose size fits the current capacity is
- * decoded in place with {@code setValueCount(0)} + overwrite -- no
- * {@code allocateNew()} and no buffer zeroing (the value/offset buffers are
- * fully overwritten; validity is written word by word for exactly the emitted
- * rows and the tail word is masked). The vector is (re)allocated only when a row
- * group is larger than any seen so far, or when a UTF8 row group's data outgrows
- * the data buffer. Because the vector is reused, the caller must consume a row
- * group's batches before requesting the next -- exactly Spark's columnar batch
- * contract, which the node already follows.
+ * <h2>How a batch is produced</h2>
+ * The reader holds the chunk's {@link PageReader}, a resumable {@link
+ * ColumnChunkDecoder}, and the once-decoded dictionary. {@link #readBatch}
+ * borrows a batch-sized vector from a small pool (or allocates one), then loops:
+ * whenever the decoder {@linkplain ColumnChunkDecoder#needsPage() needs a page}
+ * it pulls and decompresses the next {@link DataPage} lazily and feeds it, and
+ * the decoder fills the batch staging arrays for as many rows as the current
+ * page holds. A batch therefore spans any number of pages and resumes mid-run
+ * (the decoder keeps the RLE/bit-packed id-reader state). The finished batch
+ * staging copies into the vector's Arrow buffers in one bulk {@code
+ * MemorySegment.copy} per buffer; the null count comes from the definition-level
+ * pass, so validity is written (and the buffer kept) only when the batch has
+ * nulls -- Arrow's {@code getNullCount} is never called.
  *
- * <p>parquet-java hands us the decompressed page bytes ({@link DataPage}); the
- * definition levels and the dictionary ids are decoded through parquet-java's
- * generated {@code BytePacker}, injected as a {@link GroupUnpacker} cached per
- * bit width. Page bytes are read into a reused {@link ReusableByteOut} (no
- * per-page {@code toByteArray}); the staging arrays, the dictionary and the
- * output vector are reused for the reader lifetime.
+ * <h2>Batch ownership and the pool</h2>
+ * Each emitted batch OWNS its vector; the consumer releases it (which returns the
+ * vector to this reader's pool for reuse) on batch release / close. Nothing is
+ * shared across batches, so a retained or serialized batch (a broadcast build,
+ * the shuffle writer) ships only its own rows.
  *
  * <p>Not thread safe: one reader per column per task. Slice 1 supports {@code
- * PLAIN} and {@code RLE_DICTIONARY}/{@code PLAIN_DICTIONARY} value encodings and
- * throws on any other; the planner keeps the flag off by default.
+ * PLAIN} and {@code RLE_DICTIONARY}/{@code PLAIN_DICTIONARY} value encodings.
  */
 public final class NativeParquetColumnReader {
 
@@ -88,16 +89,19 @@ public final class NativeParquetColumnReader {
 
     private final GroupUnpacker[] unpackers = new GroupUnpacker[33];
     private final Arena scratch;
-    private ColumnChunkDecoder decoder;
+    private final ColumnChunkDecoder decoder;
     private final ReusableByteOut pageOut = new ReusableByteOut(1 << 16);
 
-    // The reused output vector and the capacities it is currently allocated for.
-    private FieldVector vector;
-    private int rowCapacity;
-    private long byteCapacity; // UTF8 data buffer capacity
+    // Per-chunk (row-group) state.
+    private PageReader pages;
+    private int rowGroupRows;
+
+    // A small pool of released batch vectors to reuse (bounded; extras are closed).
+    private final Deque<FieldVector> pool = new ArrayDeque<>();
+    private static final int MAX_POOL = 4;
 
     public NativeParquetColumnReader(ColumnDescriptor column, VecType type, DataType sparkType,
-            String name, BufferAllocator allocator) {
+            String name, int batchRows, BufferAllocator allocator) {
         this.column = column;
         this.type = type;
         this.physicalType = physicalTypeOf(column, type);
@@ -106,6 +110,7 @@ public final class NativeParquetColumnReader {
         this.maxDefLevel = column.getMaxDefinitionLevel();
         this.allocator = allocator;
         this.scratch = Arena.ofShared();
+        this.decoder = new ColumnChunkDecoder(physicalType, type, maxDefLevel, batchRows, this::unpackerFor);
     }
 
     private static VecType physicalTypeOf(ColumnDescriptor column, VecType lane) {
@@ -137,101 +142,124 @@ public final class NativeParquetColumnReader {
     }
 
     /**
-     * Decodes the whole column chunk of {@code pages} ({@code rowGroupRows}
-     * rows) into the reader's REUSED Arrow {@link FieldVector} and returns it.
-     * Valid until the next {@link #readRowGroup} call on this reader (the vector
-     * is recycled); the caller consumes the row group's batches before advancing,
-     * as the columnar batch contract requires.
+     * Begin a new row group of {@code rowGroupRows} rows on this column's {@code
+     * pages}. Decodes the chunk's dictionary page once (if present) and resets the
+     * decoder; {@link #readBatch} then streams the pages.
      */
-    public FieldVector readRowGroup(PageReader pages, int rowGroupRows) {
-        if (decoder == null) {
-            decoder = new ColumnChunkDecoder(physicalType, type, maxDefLevel, rowGroupRows, this::unpackerFor);
-        } else {
-            decoder.reset(rowGroupRows);
-        }
-        // The dictionary is per COLUMN CHUNK (per row group), not per file: decode it fresh each row group.
+    public void startRowGroup(PageReader pages, int rowGroupRows) {
+        this.pages = pages;
+        this.rowGroupRows = rowGroupRows;
+        decoder.startChunk(rowGroupRows);
         VectorBuffers dict = decodeDictionary(pages);
         if (dict != null) {
             decoder.setDictionary(dict);
         }
-        drivePages(pages, rowGroupRows);
-        if (type == VecType.UTF8) {
-            return flushUtf8(rowGroupRows);
-        }
-        return flushFixed(rowGroupRows);
     }
 
-    private FieldVector flushFixed(int rowGroupRows) {
-        BaseFixedWidthVector v = (BaseFixedWidthVector) ensureFixedVector(rowGroupRows);
-        ArrowVectorBuffers out = ArrowVectorBuffers.forWrite(v, rowGroupRows, sparkType);
-        decoder.flushFixed(out.data(), out.validity());
-        ArrowOutput.finish(out, rowGroupRows, maxDefLevel == 0);
-        return v;
-    }
-
-    private FieldVector flushUtf8(int rowGroupRows) {
-        long bytes = decoder.utf8Bytes();
-        VarCharVector v = (VarCharVector) ensureUtf8Vector(rowGroupRows, bytes);
-        ArrowVectorBuffers vb = ArrowVectorBuffers.forWrite(v, rowGroupRows);
-        decoder.flushUtf8(vb.offsets(), vb.data(), vb.validity());
-        v.setLastSet(rowGroupRows - 1);
-        v.setValueCount(rowGroupRows);
-        return v;
+    /** Rows still unemitted in the current row group. */
+    public int rowsRemaining() {
+        return rowGroupRows - decoder.rowsDone();
     }
 
     /**
-     * The reused fixed-width vector, (re)allocated only when this row group is
-     * larger than any so far. {@code allocateNew} zeroes the buffers, so a reused
-     * vector pays that cost once (largest row group), not per row group -- the
-     * value buffer is fully overwritten and the validity is written word by word.
+     * Decode the next {@code n} rows of the current row group into a fresh (or
+     * pooled) batch-owned Arrow vector and return it. The caller owns the vector
+     * and releases it with {@link #release}. {@code n} must be <= the rows
+     * remaining in the row group.
      */
-    private FieldVector ensureFixedVector(int rowGroupRows) {
-        long needValidity = io.vecruntime.kernels.Bitmap.bytesFor(rowGroupRows);
-        boolean fits = vector != null
-                && rowGroupRows <= rowCapacity
-                && vector.getValidityBuffer().capacity() >= needValidity
-                && vector.getDataBuffer().capacity() >= (long) rowGroupRows * ((BaseFixedWidthVector) vector).getTypeWidth();
-        if (!fits) {
-            if (vector != null) {
-                vector.close();
+    public FieldVector readBatch(int n) {
+        decoder.startBatch(n);
+        int filled = 0;
+        while (filled < n) {
+            if (decoder.needsPage()) {
+                DataPage page = pages.readPage();
+                if (page == null) {
+                    throw new IllegalStateException("ran out of pages at "
+                            + decoder.rowsDone()
+                            + " of "
+                            + rowGroupRows
+                            + " for "
+                            + java.util.Arrays.toString(column.getPath()));
+                }
+                decoder.feedPage(toKernelPage(page));
             }
-            BaseFixedWidthVector v = (BaseFixedWidthVector) ArrowOutput.newVector(name, sparkType, allocator);
-            v.allocateNew(rowGroupRows); // sizes BOTH the data and the validity buffer for >= rowGroupRows
-            vector = v;
-            rowCapacity = v.getValueCapacity();
+            filled += decoder.readBatch(n - filled, filled);
         }
-        return vector;
+        boolean hasNulls = decoder.batchNullCount() > 0;
+        return type == VecType.UTF8 ? flushUtf8(n, hasNulls) : flushFixed(n, hasNulls);
     }
 
-    private FieldVector ensureUtf8Vector(int rowGroupRows, long bytes) {
-        VarCharVector v = (VarCharVector) vector;
-        if (v == null || rowGroupRows > rowCapacity || bytes > byteCapacity) {
-            if (v != null) {
-                v.close();
-            }
-            v = (VarCharVector) ArrowOutput.newVector(name, sparkType, allocator);
-            v.allocateNew(Math.max(bytes, 1L), rowGroupRows);
-            vector = v;
-            rowCapacity = v.getValueCapacity();
-            byteCapacity = v.getDataBuffer().capacity();
-        }
+    private FieldVector flushFixed(int rows, boolean hasNulls) {
+        BaseFixedWidthVector v = (BaseFixedWidthVector) borrowFixed(rows);
+        ArrowVectorBuffers out = ArrowVectorBuffers.forWrite(v, rows, sparkType);
+        decoder.flushFixed(rows, out.data(),
+                hasNulls ? out.validity() : null);
+        // finish: set the Arrow value count and (when no nulls) mark all valid without a validity scan.
+        ArrowOutput.finish(out, rows, !hasNulls);
         return v;
     }
 
-    // ------------------------------------------------------------------ page loop
+    private FieldVector flushUtf8(int rows, boolean hasNulls) {
+        long bytes = decoder.utf8Bytes();
+        VarCharVector v = (VarCharVector) borrowUtf8(rows, bytes);
+        ArrowVectorBuffers vb = ArrowVectorBuffers.forWrite(v, rows);
+        decoder.flushUtf8(rows, vb.offsets(), vb.data(),
+                hasNulls ? vb.validity() : null);
+        if (!hasNulls) {
+            io.vecruntime.kernels.Bitmap.fill(vb.validity(), rows, true);
+        }
+        v.setLastSet(rows - 1);
+        v.setValueCount(rows);
+        return v;
+    }
 
-    private void drivePages(PageReader pages, int rowGroupRows) {
-        while (decoder.rowsWritten() < rowGroupRows) {
-            DataPage page = pages.readPage();
-            if (page == null) {
-                throw new IllegalStateException("ran out of pages at "
-                        + decoder.rowsWritten()
-                        + " of "
-                        + rowGroupRows
-                        + " for "
-                        + java.util.Arrays.toString(column.getPath()));
+    // ------------------------------------------------------------------ batch vector pool
+
+    private FieldVector borrowFixed(int rows) {
+        long needValidity = io.vecruntime.kernels.Bitmap.bytesFor(rows);
+        FieldVector v = pool.pollFirst();
+        while (v != null) {
+            BaseFixedWidthVector fv = (BaseFixedWidthVector) v;
+            long needData = (long) rows * fv.getTypeWidth();
+            if (v.getDataBuffer().capacity() >= needData && v.getValidityBuffer().capacity() >= needValidity) {
+                fv.setValueCount(0);
+                return v;
             }
-            decoder.decodePage(toKernelPage(page));
+            v.close();
+            v = pool.pollFirst();
+        }
+        BaseFixedWidthVector nv = (BaseFixedWidthVector) ArrowOutput.newVector(name, sparkType, allocator);
+        nv.allocateNew(rows);
+        return nv;
+    }
+
+    private FieldVector borrowUtf8(int rows, long bytes) {
+        FieldVector v = pool.pollFirst();
+        while (v != null) {
+            if (v.getValidityBuffer().capacity() >= io.vecruntime.kernels.Bitmap.bytesFor(rows) && v.getOffsetBuffer().capacity() >= (long) (rows + 1) * 4 && v.getDataBuffer().capacity() >= Math.max(bytes, 1L)) {
+                ((VarCharVector) v).setValueCount(0);
+                return v;
+            }
+            v.close();
+            v = pool.pollFirst();
+        }
+        VarCharVector nv = (VarCharVector) ArrowOutput.newVector(name, sparkType, allocator);
+        nv.allocateNew(Math.max(bytes, 1L), rows);
+        return nv;
+    }
+
+    /**
+     * Return a batch vector to the pool for reuse (or close it if the pool is
+     * full).
+     */
+    public void release(FieldVector v) {
+        if (v == null) {
+            return;
+        }
+        if (pool.size() < MAX_POOL) {
+            pool.addLast(v);
+        } else {
+            v.close();
         }
     }
 
@@ -242,7 +270,6 @@ public final class NativeParquetColumnReader {
             return ColumnChunkDecoder.Page.v1(pageOut.array(), v1.getValueCount(), encoding(v1.getValueEncoding()));
         }
         DataPageV2 v2 = (DataPageV2) page;
-        // Levels then values, back to back into the reused buffer -- no per-page toByteArray, no concat alloc.
         pageOut.reset();
         writeInto(v2.getDefinitionLevels(), pageOut);
         int levelsLength = pageOut.size();
@@ -262,21 +289,16 @@ public final class NativeParquetColumnReader {
         throw new UnsupportedOperationException("unsupported Parquet value encoding " + e + " (slice 1 decodes PLAIN and dictionary only)");
     }
 
-    // ------------------------------------------------------------------ dictionary
-
     private VectorBuffers decodeDictionary(PageReader pages) {
         DictionaryPage dp = pages.readDictionaryPage();
         if (dp == null) {
             return null;
         }
-        // The dictionary is decoded ONCE per chunk; a plain toByteArray here is not a hot path.
         byte[] data = bytes(dp.getBytes());
         int numValues = dp.getDictionarySize();
         return ParquetPageDecoder.decodeDictionary(MemorySegment.ofArray(data), 0L, data.length, numValues, physicalType,
                 scratch);
     }
-
-    // ------------------------------------------------------------------ helpers
 
     private static void writeInto(BytesInput in, ReusableByteOut out) {
         try {
@@ -295,34 +317,16 @@ public final class NativeParquetColumnReader {
         }
     }
 
-    /**
-     * Releases the reused output vector and the reader's scratch arena. Call at
-     * task end.
-     */
+    /** Releases the pool and the reader's scratch arena. Call at task end. */
     public void close() {
-        if (vector != null) {
-            vector.close();
-            vector = null;
+        for (FieldVector v : pool) {
+            v.close();
         }
+        pool.clear();
         scratch.close();
     }
 
-    /** The descriptor this reader was built for. */
     public ColumnDescriptor column() {
         return column;
-    }
-
-    /**
-     * A trivially-correct {@link VectorBuffers} over the finished vector, for
-     * tests.
-     */
-    static VectorBuffers viewOf(FieldVector v, VecType type, int rows,
-            boolean hasNulls) {
-        MemorySegment validity = hasNulls ? ArrowSegments.of(v.getValidityBuffer()) : null;
-        MemorySegment data = ArrowSegments.of(v.getDataBuffer());
-        if (type == VecType.UTF8) {
-            return SegmentVectorBuffers.utf8(rows, validity, ArrowSegments.of(v.getOffsetBuffer()), data);
-        }
-        return SegmentVectorBuffers.fixedWidth(type, rows, validity, data);
     }
 }

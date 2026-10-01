@@ -34,7 +34,6 @@ import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.Path;
 import org.apache.parquet.column.ColumnDescriptor;
 import org.apache.parquet.column.page.PageReadStore;
-import org.apache.parquet.column.page.PageReader;
 import org.apache.parquet.hadoop.ParquetFileReader;
 import org.apache.parquet.hadoop.metadata.BlockMetaData;
 import org.apache.parquet.schema.MessageType;
@@ -100,6 +99,12 @@ public class ParquetScanE2EBenchmark {
     private StructType schema;
     private Configuration hadoopConf;
     private BufferAllocator allocator;
+
+    /**
+     * Batch size for the streaming decode (matches Spark's default columnar
+     * batch, a multiple of 64).
+     */
+    private static final int BATCH_ROWS = 4096;
 
     @Setup(Level.Trial)
     public void setup() throws Exception {
@@ -232,7 +237,7 @@ public class ParquetScanE2EBenchmark {
             for (int c = 0; c < columns.size(); c++) {
                 ColumnDescriptor cd = columns.get(c);
                 readers[c] = new NativeParquetColumnReader(cd, TypeMapping.vecTypeOf(schema.fields()[c].dataType()), schema.fields()[c].dataType(), cd.getPath()[0],
-                        allocator);
+                        BATCH_ROWS, allocator);
             }
             long rows = 0;
             PageReadStore rg;
@@ -241,10 +246,16 @@ public class ParquetScanE2EBenchmark {
             while ((rg = reader.readNextRowGroup()) != null) {
                 int rgRows = (int) blocks.get(rgIndex++).getRowCount();
                 for (int c = 0; c < columns.size(); c++) {
-                    FieldVector v = readers[c].readRowGroup(rg.getPageReader(columns.get(c)), rgRows);
-                    bh.consume(v);
-                    rows += v.getValueCount();
-                    // The reader OWNS and recycles v across row groups; freed by reader.close().
+                    readers[c].startRowGroup(rg.getPageReader(columns.get(c)), rgRows);
+                    int done = 0;
+                    while (done < rgRows) {
+                        int n = Math.min(BATCH_ROWS, rgRows - done);
+                        FieldVector v = readers[c].readBatch(n); // batch-owned, streamed straight from pages
+                        bh.consume(v);
+                        rows += v.getValueCount();
+                        readers[c].release(v);
+                        done += n;
+                    }
                 }
             }
             for (NativeParquetColumnReader r : readers) {
@@ -266,7 +277,7 @@ public class ParquetScanE2EBenchmark {
                 ColumnDescriptor cd = columns.get(c);
                 DataType dt = schema.fields()[c].dataType();
                 VecType vt = TypeMapping.vecTypeOf(dt);
-                readers[c] = new NativeParquetColumnReader(cd, vt, dt, cd.getPath()[0], allocator);
+                readers[c] = new NativeParquetColumnReader(cd, vt, dt, cd.getPath()[0], BATCH_ROWS, allocator);
             }
             long checksum = 0;
             PageReadStore rg;
@@ -275,12 +286,17 @@ public class ParquetScanE2EBenchmark {
             while ((rg = reader.readNextRowGroup()) != null) {
                 int rgRows = (int) blocks.get(rgIndex++).getRowCount();
                 for (int c = 0; c < columns.size(); c++) {
-                    PageReader pr = rg.getPageReader(columns.get(c));
                     DataType dt = schema.fields()[c].dataType();
                     VecType vt = TypeMapping.vecTypeOf(dt);
-                    FieldVector v = readers[c].readRowGroup(pr, rgRows);
-                    checksum += checksum(v, vt, dt, rgRows);
-                    // The reader OWNS and recycles v across row groups; do NOT close it here.
+                    readers[c].startRowGroup(rg.getPageReader(columns.get(c)), rgRows);
+                    int done = 0;
+                    while (done < rgRows) {
+                        int n = Math.min(BATCH_ROWS, rgRows - done);
+                        FieldVector v = readers[c].readBatch(n);
+                        checksum += checksum(v, vt, dt, n);
+                        readers[c].release(v);
+                        done += n;
+                    }
                 }
             }
             for (NativeParquetColumnReader r : readers) {

@@ -17,13 +17,12 @@ package org.apache.spark.sql.vecruntime
 
 import scala.jdk.CollectionConverters._
 
-import io.vecruntime.spark.adapter.{ColumnVectorAdapters, TypeMapping}
-import io.vecruntime.spark.arrow.{ArrowOutput, SlicedColumnVector, VectorAllocators, VectorArrowColumnVector}
+import io.vecruntime.spark.adapter.TypeMapping
+import io.vecruntime.spark.arrow.{ArrowOutput, VectorAllocators}
 import io.vecruntime.spark.parquet.NativeParquetColumnReader
 import org.apache.hadoop.conf.Configuration
 import org.apache.parquet.filter2.compat.FilterCompat
 import org.apache.parquet.hadoop.ParquetFileReader
-import org.apache.parquet.hadoop.metadata.BlockMetaData
 import org.apache.parquet.schema.MessageType
 import org.apache.spark.{Partition, TaskContext}
 import org.apache.spark.rdd.RDD
@@ -58,7 +57,7 @@ import org.apache.spark.util.SerializableConfiguration
  * filters so `readNextFilteredRowGroup` does row-group and column-index page skipping, and drives one
  * [[NativeParquetColumnReader]] per column. Partition-value columns are constant columns
  * ([[ArrowOutput.constant]]); a row group larger than `spark.sql.parquet.columnarReaderBatchSize` is
- * emitted as batch-sized offset views ([[SlicedColumnVector]]) with no copy.
+ * streamed as `batchSize`-row batches decoded straight into batch-owned Arrow vectors (no copy).
  *
  * `doExecute` = `ColumnarToRowExec(this).doExecute()` (via [[VectorPlan]]). Reports `scan.output` /
  * `outputPartitioning` / `outputOrdering` verbatim, so `EnsureRequirements` (which ran before this
@@ -223,9 +222,10 @@ private[vecruntime] final class VectorParquetRDD(
 /**
  * Reads one [[FilePartition]] as a stream of columnar batches. Per `PartitionedFile`: opens a
  * `ParquetFileReader`, clips the requested schema, sets the row-group filter, and drives one
- * [[NativeParquetColumnReader]] per data column. A row group is decoded into the readers' reused vectors
- * and then emitted as `batchSize`-row offset views ([[SlicedColumnVector]]) with the partition-value
- * constant columns appended; the whole row group is kept alive until its last batch is consumed.
+ * [[NativeParquetColumnReader]] per data column. Each `batchSize`-row batch is decoded straight into
+ * batch-owned Arrow vectors ([[NativeParquetColumnReader.readBatch]], streaming across pages) with the
+ * partition-value constant columns appended; the batch owns its vectors and releases them on the next
+ * batch / close (data vectors return to the reader's pool).
  */
 private[vecruntime] final class VectorParquetPartitionReader(
     partition: FilePartition,
@@ -255,17 +255,15 @@ private[vecruntime] final class VectorParquetPartitionReader(
   // Per-file state.
   private var reader: ParquetFileReader = _
   private var columnReaders: Array[NativeParquetColumnReader] = _
-  private var blocks: java.util.List[BlockMetaData] = _
   private var rowGroupIndex = 0
-  private var partitionColumns: Array[ColumnVector] = _ // constant columns for the current file
-  private var partitionColumnRows = 0 // the length the partition constant columns were sized to
+  private var partitionValues: InternalRow = _ // this file's partition values (for constant columns)
 
-  // Current row group state (the reused vectors + how far we have emitted).
-  private var rgVectors: Array[org.apache.arrow.vector.FieldVector] = _
-  private var rgColumns: Array[ColumnVector] = _
+  // Current row group state.
   private var rgRows = 0
   private var rgOffset = 0
   private var emitted: ColumnarBatch = _
+  private var emittedVectors: Array[org.apache.arrow.vector.FieldVector] = _ // batch-owned data vectors to release
+  private var emittedPartitionVectors: Array[ColumnVector] = _ // batch-owned partition constant columns to close
   private var fallback: Iterator[ColumnarBatch] = _ // Spark's reader for a file we cannot decode
 
   if (context != null) context.addTaskCompletionListener[Unit](_ => close())
@@ -277,7 +275,7 @@ private[vecruntime] final class VectorParquetPartitionReader(
       closeFile()
     }
     // Rows left in the current row group?
-    if (rgVectors != null && rgOffset < rgRows) return true
+    if (rgRows > 0 && rgOffset < rgRows) return true
     // Next row group in the current file, or advance files.
     while (true) {
       if (reader != null) {
@@ -285,7 +283,7 @@ private[vecruntime] final class VectorParquetPartitionReader(
         val store = readNextFilteredRowGroup()
         if (store != null) {
           val rgRowCount = store.getRowCount.toInt
-          decodeRowGroup(store, rgRowCount)
+          startRowGroup(store, rgRowCount)
           metrics.scanTime += (System.nanoTime() - t0) / 1000000L
           metrics.numRowGroups += 1
           rgRows = rgRowCount
@@ -317,43 +315,51 @@ private[vecruntime] final class VectorParquetPartitionReader(
     releaseEmitted()
     val n = math.min(batchSize, rgRows - rgOffset)
     val columns = new Array[ColumnVector](attrs.length)
-    val arena = java.lang.foreign.Arena.ofConfined()
+    val dataVectors = new Array[org.apache.arrow.vector.FieldVector](dataColumnCount)
+    val partitionVectors = new Array[ColumnVector](partitionSchema.length)
     try {
       var c = 0
       while (c < dataColumnCount) {
-        // Copy this batch's slice out of the reused row-group vector into a fresh vector the batch OWNS.
-        // The emitted batch is then self-contained: it survives the reader recycling the row-group vector
-        // for the next row group (no use-after-reuse), and when it is retained or serialized (a broadcast
-        // build, the shuffle writer) only its own rows travel -- a SlicedColumnVector view over the whole
-        // (million-row) row-group vector risked shipping the row group many times and OOMed the 1 TB driver.
-        val (_, dt) = attrs(c)
-        val sliced = SlicedColumnVector.of(rgColumns(c), rgOffset, n, rgRows)
-        val vb = ColumnVectorAdapters.adapt(sliced, n, arena)
-        columns(c) = ArrowOutput.copy(attrs(c)._1, dt, vb, allocator)
+        // Decode this batch's rows STRAIGHT into a fresh batch-owned Arrow vector (no row-group vector, no
+        // copy of the group, no Arrow getNullCount): the reader streams pages and resumes mid-run. The
+        // batch owns the vector; released to the reader's pool on the next batch / close. Self-contained,
+        // so a retained or serialized batch ships only its own rows.
+        val fv = columnReaders(c).readBatch(n)
+        dataVectors(c) = fv
+        columns(c) = ArrowOutput.wrap(fv, attrs(c)._2)
         c += 1
       }
-      // Partition-value constant columns follow the data columns, ordered to the output (owned copies too).
+      // Partition-value constant columns follow the data columns, ordered to the output: a constant vector
+      // of batch length n, owned by the batch (closed on release). They are tiny.
       var p = 0
-      while (p < partitionColumns.length) {
-        val (_, dt) = attrs(dataColumnCount + p)
-        val sliced = SlicedColumnVector.of(partitionColumns(p), rgOffset, n, partitionColumnRows)
-        val vb = ColumnVectorAdapters.adapt(sliced, n, arena)
-        columns(dataColumnCount + p) = ArrowOutput.copy(attrs(dataColumnCount + p)._1, dt, vb, allocator)
+      while (p < partitionSchema.length) {
+        val f = partitionSchema.fields(p)
+        val v = partitionValues.get(p, f.dataType)
+        val col =
+          if (v == null) ArrowOutput.nulls(f.name, f.dataType, n, allocator)
+          else ArrowOutput.constant(f.name, f.dataType, v, n, allocator)
+        columns(dataColumnCount + p) = col
+        partitionVectors(p) = col
         p += 1
       }
     } catch {
       case t: Throwable =>
         var k = 0
-        while (k < columns.length) {
-          if (columns(k) != null) columns(k).close()
+        while (k < dataColumnCount) {
+          if (dataVectors(k) != null) columnReaders(k).release(dataVectors(k))
           k += 1
         }
+        var pp = 0
+        while (pp < partitionVectors.length) {
+          if (partitionVectors(pp) != null) partitionVectors(pp).close()
+          pp += 1
+        }
         throw t
-    } finally {
-      arena.close()
     }
     rgOffset += n
     emitted = new ColumnarBatch(columns, n)
+    emittedVectors = dataVectors
+    emittedPartitionVectors = partitionVectors
     metrics.numOutputBatches += 1
     metrics.numOutputRows += n
     emitted
@@ -397,7 +403,6 @@ private[vecruntime] final class VectorParquetPartitionReader(
         .build()
     )
     reader.setRequestedSchema(clipped)
-    blocks = reader.getFooter.getBlocks
     rowGroupIndex = 0
     val columns = clipped.getColumns
     columnReaders = new Array[NativeParquetColumnReader](dataColumnCount)
@@ -408,51 +413,29 @@ private[vecruntime] final class VectorParquetPartitionReader(
       val cd = columns.asScala.find(_.getPath()(0).equalsIgnoreCase(field.name))
         .getOrElse(throw new IllegalStateException(s"column ${field.name} missing from clipped schema"))
       columnReaders(i) =
-        new NativeParquetColumnReader(cd, TypeMapping.vecTypeOf(field.dataType), field.dataType, field.name, allocator)
+        new NativeParquetColumnReader(
+          cd,
+          TypeMapping.vecTypeOf(field.dataType),
+          field.dataType,
+          field.name,
+          batchSize,
+          allocator
+        )
       i += 1
     }
     buildPartitionColumns(file)
     metrics.numFiles += 1
   }
 
-  /** Constant columns for the partition values of this file, sized to the file's largest row group. */
+  /** Record this file's partition values; per-batch constant columns are built from them in next(). */
   private def buildPartitionColumns(file: PartitionedFile): Unit = {
-    partitionColumns = new Array[ColumnVector](partitionSchema.length)
-    if (partitionSchema.isEmpty) {
-      partitionColumnRows = 0
-      return
-    }
-    var maxRg = 0
-    var b = 0
-    while (b < blocks.size()) {
-      maxRg = math.max(maxRg, blocks.get(b).getRowCount.toInt)
-      b += 1
-    }
-    partitionColumnRows = maxRg
-    val values = file.partitionValues
-    var p = 0
-    while (p < partitionSchema.length) {
-      val f = partitionSchema.fields(p)
-      val v = values.get(p, f.dataType)
-      partitionColumns(p) =
-        if (v == null) ArrowOutput.nulls(f.name, f.dataType, maxRg, allocator)
-        else ArrowOutput.constant(f.name, f.dataType, v, maxRg, allocator)
-      p += 1
-    }
+    partitionValues = file.partitionValues
   }
 
-  private def decodeRowGroup(store: org.apache.parquet.column.page.PageReadStore, rowCount: Int): Unit = {
-    rgVectors = new Array[org.apache.arrow.vector.FieldVector](dataColumnCount)
-    rgColumns = new Array[ColumnVector](dataColumnCount)
+  private def startRowGroup(store: org.apache.parquet.column.page.PageReadStore, rowCount: Int): Unit = {
     var c = 0
     while (c < dataColumnCount) {
-      val fv = columnReaders(c).readRowGroup(store.getPageReader(columnReaders(c).column()), rowCount)
-      rgVectors(c) = fv
-      // Borrowed wrapper (the reader owns and recycles fv); SlicedColumnVector views it per batch.
-      rgColumns(c) = ArrowOutput.wrap(fv, attrs(c)._2) match {
-        case v: VectorArrowColumnVector => v.borrow()
-        case other => other
-      }
+      columnReaders(c).startRowGroup(store.getPageReader(columnReaders(c).column()), rowCount)
       c += 1
     }
   }
@@ -521,7 +504,29 @@ private[vecruntime] final class VectorParquetPartitionReader(
   }
 
   private def releaseEmitted(): Unit = if (emitted != null) {
-    emitted.close() // the emitted batch owns its column copies (from `allocator`); free them
+    // Return the batch's owned data vectors to their reader's pool for reuse. Do NOT close the ColumnarBatch
+    // (that would also close the file-owned partition constant columns / their views); the data vectors are
+    // released here, the partition constants live until closeFile.
+    if (emittedVectors != null) {
+      var c = 0
+      while (c < dataColumnCount) {
+        if (emittedVectors(c) != null) {
+          // Return to the reader's pool if the reader is still open; otherwise (file already closed) close.
+          if (columnReaders != null && columnReaders(c) != null) columnReaders(c).release(emittedVectors(c))
+          else emittedVectors(c).close()
+        }
+        c += 1
+      }
+      emittedVectors = null
+    }
+    if (emittedPartitionVectors != null) {
+      var p = 0
+      while (p < emittedPartitionVectors.length) {
+        if (emittedPartitionVectors(p) != null) emittedPartitionVectors(p).close()
+        p += 1
+      }
+      emittedPartitionVectors = null
+    }
     emitted = null
   }
 
@@ -537,15 +542,10 @@ private[vecruntime] final class VectorParquetPartitionReader(
       columnReaders.foreach(r => if (r != null) r.close())
       columnReaders = null
     }
-    if (partitionColumns != null) {
-      partitionColumns.foreach(v => if (v != null) v.close())
-      partitionColumns = null
-    }
     if (reader != null) {
       reader.close()
       reader = null
     }
-    rgVectors = null
     rgRows = 0
     rgOffset = 0
   }
