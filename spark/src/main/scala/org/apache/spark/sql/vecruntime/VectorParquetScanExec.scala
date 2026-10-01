@@ -21,7 +21,6 @@ import io.vecruntime.spark.adapter.TypeMapping
 import io.vecruntime.spark.arrow.{ArrowOutput, VectorAllocators}
 import io.vecruntime.spark.parquet.NativeParquetColumnReader
 import org.apache.hadoop.conf.Configuration
-import org.apache.hadoop.fs.FileStatus
 import org.apache.parquet.HadoopReadOptions
 import org.apache.parquet.filter2.compat.FilterCompat
 import org.apache.parquet.hadoop.ParquetFileReader
@@ -381,8 +380,9 @@ private[vecruntime] final class VectorParquetPartitionReader(
     // PartitionedFile, instead of HadoopInputFile.fromPath -> fs.getFileStatus (one S3AStoreImpl.headObject
     // -> network round trip per split before any read). HadoopInputFile.fromStatus trusts the status as
     // given and never re-stats, so the open path makes zero getFileStatus calls.
-    val status = new FileStatus(file.fileSize, false, 0, 0L, file.modificationTime, path)
-    val inputFile = HadoopInputFile.fromStatus(status, hadoopConf)
+    // BISECT VARIANT C (#559, not for merge): fromPath -> getFileStatus HEAD -> S3AFileStatus with etag and
+    // version id, keeping the single open. Separates "no etag" (H1) from "no warm-up open" (H2).
+    val inputFile = HadoopInputFile.fromPath(path, hadoopConf)
     // Open the file ONCE: a single SeekableInputStream, read the footer from it with the split range, then
     // build the reader from THAT footer + the SAME stream (ParquetFileReader(InputFile, ParquetMetadata,
     // options, stream)) -- no reopen, no second footer read. The split range (file.start ..
