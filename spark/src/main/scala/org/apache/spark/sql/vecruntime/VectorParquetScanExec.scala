@@ -21,7 +21,6 @@ import io.vecruntime.spark.adapter.TypeMapping
 import io.vecruntime.spark.arrow.{ArrowOutput, VectorAllocators}
 import io.vecruntime.spark.parquet.NativeParquetColumnReader
 import org.apache.hadoop.conf.Configuration
-import org.apache.hadoop.fs.FileStatus
 import org.apache.parquet.HadoopReadOptions
 import org.apache.parquet.filter2.compat.FilterCompat
 import org.apache.parquet.hadoop.ParquetFileReader
@@ -57,8 +56,8 @@ import org.apache.spark.util.SerializableConfiguration
  * It wraps the `FileSourceScanExec` Spark planned and reuses everything Spark already computed: the
  * dynamically selected partitions (DPP applied), the file splitting (`FileScanRDD` partitions:
  * maxSplitBytes / openCostBytes / bucketing), the pushed data filters and the required + partition schema.
- * Per `PartitionedFile` it opens a `ParquetFileReader` ONCE -- no `getFileStatus` HEAD (the InputFile is
- * built from the `PartitionedFile`'s length + modification time) and the footer is read once and the reader
+ * Per `PartitionedFile` it opens a `ParquetFileReader` ONCE -- one `getFileStatus` (so the store's status,
+ * with its etag on S3A, reaches the stream) and the footer is read once and the reader
  * built from it over the same stream -- clips the requested columns exactly as Spark's
  * `ParquetReadSupport` does (case sensitivity, field ids), sets a `FilterCompat` filter from the pushed
  * filters so `readNextFilteredRowGroup` does row-group and column-index page skipping, and drives one
@@ -377,12 +376,13 @@ private[vecruntime] final class VectorParquetPartitionReader(
     val path = file.toPath
     val start = file.start
     val end = file.start + file.length
-    // No HEAD: build the InputFile from the length and modification time Spark already put in the
-    // PartitionedFile, instead of HadoopInputFile.fromPath -> fs.getFileStatus (one S3AStoreImpl.headObject
-    // -> network round trip per split before any read). HadoopInputFile.fromStatus trusts the status as
-    // given and never re-stats, so the open path makes zero getFileStatus calls.
-    val status = new FileStatus(file.fileSize, false, 0, 0L, file.modificationTime, path)
-    val inputFile = HadoopInputFile.fromStatus(status, hadoopConf)
+    // One getFileStatus per split, on purpose: the store's own status carries what a status built from the
+    // PartitionedFile's length + modification time cannot -- on S3A the etag and version id. Without them
+    // the S3 Analytics Accelerator stream (S3A's default) issues its own HEAD per open from its metadata
+    // store and does not get the object metadata it keys its reads on: at 1 TB that made q88 131 s against
+    // 103 s with this HEAD (bisect on #559). newStream() then opens through fs.openFile(...).withFileStatus
+    // (status) with the Parquet read policy, so the open itself issues no second HEAD.
+    val inputFile = HadoopInputFile.fromPath(path, hadoopConf)
     // Open the file ONCE: a single SeekableInputStream, read the footer from it with the split range, then
     // build the reader from THAT footer + the SAME stream (ParquetFileReader(InputFile, ParquetMetadata,
     // options, stream)) -- no reopen, no second footer read. The split range (file.start ..
