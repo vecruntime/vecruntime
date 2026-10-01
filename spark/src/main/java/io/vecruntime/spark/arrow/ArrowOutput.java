@@ -23,6 +23,7 @@ import io.vecruntime.kernels.CompactKernels;
 import io.vecruntime.kernels.GatherKernels;
 import io.vecruntime.kernels.HeapMirror;
 import io.vecruntime.kernels.RunMerge;
+import io.vecruntime.kernels.RunMirrors;
 import io.vecruntime.kernels.VecType;
 import io.vecruntime.kernels.VectorBuffers;
 import io.vecruntime.spark.adapter.TypeMapping;
@@ -512,6 +513,49 @@ public final class ArrowOutput {
         ArrowVectorBuffers out = allocateFixed(name, dt, count, allocator);
         RunMerge.gatherFixed(runs, runOf, rowOf, count, out.data(),
                 nulls ? out.validity() : null);
+        return finish(out, count, !nulls);
+    }
+
+    /**
+     * {@link #gatherRuns(String, DataType, VectorBuffers[], int[], int[], int, BufferAllocator)}
+     * reading the runs' offsets and validity from {@code mirrors} (bound here
+     * to {@code runs}; one per output column, kept by the caller across
+     * batches) and building the output offsets in {@code offsetScratch} (at
+     * least {@code count + 1} long), #565.
+     */
+    public static ColumnVector gatherRuns(
+            String name,
+            DataType dt,
+            VectorBuffers[] runs,
+            int[] runOf,
+            int[] rowOf,
+            int count,
+            BufferAllocator allocator,
+            RunMirrors mirrors,
+            int[] offsetScratch) {
+        mirrors.bind(runs);
+        boolean nulls = false;
+        for (VectorBuffers run : runs) {
+            nulls |= run.hasNulls();
+        }
+        if (runs[0].type() == VecType.UTF8) {
+            long bytes = RunMerge.gatherUtf8Bytes(mirrors, runOf, rowOf, count);
+            ArrowVectorBuffers out = allocateUtf8(name, count, bytes, allocator);
+            RunMerge.gatherUtf8(
+                    runs,
+                    mirrors,
+                    runOf,
+                    rowOf,
+                    count,
+                    offsetScratch,
+                    out.offsets(),
+                    out.data(),
+                    nulls ? out.validity() : null);
+            return finish(out, count, !nulls);
+        }
+        ArrowVectorBuffers out = allocateFixed(name, dt, count, allocator);
+        RunMerge.gatherFixed(runs, mirrors, runOf, rowOf, count,
+                out.data(), nulls ? out.validity() : null);
         return finish(out, count, !nulls);
     }
 
