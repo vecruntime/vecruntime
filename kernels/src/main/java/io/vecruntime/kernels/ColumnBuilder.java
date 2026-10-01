@@ -283,73 +283,134 @@ public final class ColumnBuilder implements AutoCloseable {
     }
 
     private void appendUtf8(VectorBuffers in, MemorySegment selection, int start) {
+        int n = in.length();
         if (selection == null && !in.isDictionaryEncoded()) {
             // A plain Arrow string vector's values are one contiguous range of its data buffer, so the
             // whole batch is one copy and the offsets move by a constant (#394: one MemorySegment.copy
             // per value -- with its bounds, alignment and liveness checks -- was 29% of an executor's
             // time in the sort stage of q67 at 1 TB). Nulls need nothing: a null value has zero length.
-            int n = in.length();
-            MemorySegment off = in.offsets();
-            int first = off.get(VectorBuffers.LE_INT, 0L);
-            int last = off.get(VectorBuffers.LE_INT, (long) n << 2);
-            long bytes = (long) last - first;
+            // The offsets move through a heap array too, one bulk copy each way (#565).
+            int[] off = intScratch(0, n + 1);
+            MemorySegment.copy(in.offsets(), VectorBuffers.LE_INT, 0L, off, 0,
+                    n + 1);
+            int first = off[0];
+            long bytes = (long) off[n] - first;
             ensureBytes(bytesUsed + bytes);
             MemorySegment.copy(in.data(), ValueLayout.JAVA_BYTE, first, data, ValueLayout.JAVA_BYTE,
                     bytesUsed, bytes);
             int delta = (int) bytesUsed - first;
             for (int i = 0; i <= n; i++) {
-                offsets.set(VectorBuffers.LE_INT, (long) (start + i) << 2, off.get(VectorBuffers.LE_INT, (long) i << 2) + delta);
+                off[i] += delta;
             }
+            MemorySegment.copy(off, 0, offsets, VectorBuffers.LE_INT, (long) start << 2,
+                    n + 1);
             bytesUsed += bytes;
             return;
         }
-        long bytes;
-        if (in.isDictionaryEncoded()) {
-            bytes = 0;
-            VectorBuffers dict = in.dictionary();
-            int n = in.length();
-            for (int i = 0; i < n; i++) {
-                if ((selection == null || Bitmap.isSet(selection, i)) && !in.isNull(i)) {
-                    bytes += utf8Length(dict, in.getInt(i));
-                }
+        // Rows by selection, or a dictionary to resolve (#565): the indices, the offsets (the input's, or
+        // the dictionary's when it is not much larger than the batch), the validity and the selection are
+        // copied into reused arrays once, so the per-row work reads arrays only. Through the segments it
+        // was an interface call or a checked read per row each (getInt, isNull, offsets(), isSet: 6.7 % of
+        // q67's FFM check samples at 1 TB).
+        long[] valid = in.validity() == null ? null : words(0, in.validity(), n);
+        long[] sel = selection == null ? null : words(1, selection, n);
+        VectorBuffers dict = in.dictionary();
+        MemorySegment src = dict != null ? dict.data() : in.data();
+        int[] ids = null;
+        int[] off;
+        MemorySegment offSeg = null; // a large dictionary's offsets, read per row
+        if (dict != null) {
+            ids = intScratch(1, n);
+            MemorySegment.copy(in.data(), VectorBuffers.LE_INT, 0L, ids, 0,
+                    n);
+            int entries = dict.length();
+            if (entries > DICTIONARY_COPY_FACTOR * n) {
+                off = null;
+                offSeg = dict.offsets();
+            } else {
+                off = intScratch(0, entries + 1);
+                MemorySegment.copy(dict.offsets(), VectorBuffers.LE_INT, 0L, off, 0,
+                        entries + 1);
             }
-        } else if (selection == null) {
-            bytes = in.offsets().get(VectorBuffers.LE_INT, (long) in.length() << 2);
         } else {
-            bytes = CompactKernels.selectedUtf8Bytes(in, selection);
+            off = intScratch(0, n + 1);
+            MemorySegment.copy(in.offsets(), VectorBuffers.LE_INT, 0L, off, 0,
+                    n + 1);
         }
-        ensureBytes(bytesUsed + bytes);
-        int o = start;
-        long pos = bytesUsed;
-        int n = in.length();
+        long bytes = 0;
+        int count = 0;
         for (int i = 0; i < n; i++) {
-            if (selection != null && !Bitmap.isSet(selection, i)) {
+            if (sel != null && ((sel[i >>> 6] >>> i) & 1L) == 0L) {
                 continue;
             }
-            offsets.set(VectorBuffers.LE_INT, (long) o << 2, (int) pos);
-            if (!in.isNull(i)) {
-                MemorySegment src;
-                int srcStart;
-                int len;
-                if (in.isDictionaryEncoded()) {
-                    VectorBuffers dict = in.dictionary();
-                    int k = in.getInt(i);
-                    src = dict.data();
-                    srcStart = dict.offsets().get(VectorBuffers.LE_INT, (long) k << 2);
-                    len = utf8Length(dict, k);
-                } else {
-                    src = in.data();
-                    srcStart = in.offsets().get(VectorBuffers.LE_INT, (long) i << 2);
-                    len = in.offsets().get(VectorBuffers.LE_INT, (long) (i + 1) << 2) - srcStart;
-                }
-                MemorySegment.copy(src, ValueLayout.JAVA_BYTE, srcStart, data, ValueLayout.JAVA_BYTE, pos,
-                        len);
-                pos += len;
+            count++;
+            if (valid != null && ((valid[i >>> 6] >>> i) & 1L) == 0L) {
+                continue;
             }
-            o++;
+            int k = ids != null ? ids[i] : i;
+            bytes += off != null ? off[k + 1] - off[k] : entryLength(offSeg, k);
         }
-        offsets.set(VectorBuffers.LE_INT, (long) o << 2, (int) pos);
+        ensureBytes(bytesUsed + bytes);
+        int[] outOff = intScratch(2, count + 1);
+        int o = 0;
+        long pos = bytesUsed;
+        for (int i = 0; i < n; i++) {
+            if (sel != null && ((sel[i >>> 6] >>> i) & 1L) == 0L) {
+                continue;
+            }
+            outOff[o++] = (int) pos;
+            if (valid != null && ((valid[i >>> 6] >>> i) & 1L) == 0L) {
+                continue;
+            }
+            int k = ids != null ? ids[i] : i;
+            int srcStart;
+            int len;
+            if (off != null) {
+                srcStart = off[k];
+                len = off[k + 1] - srcStart;
+            } else {
+                srcStart = offSeg.get(VectorBuffers.LE_INT, (long) k << 2);
+                len = entryLength(offSeg, k);
+            }
+            ByteCopy.copy(src, srcStart, data, pos, len);
+            pos += len;
+        }
+        outOff[o] = (int) pos;
+        MemorySegment.copy(outOff, 0, offsets, VectorBuffers.LE_INT, (long) start << 2,
+                o + 1);
         bytesUsed = pos;
+    }
+
+    /**
+     * A dictionary larger than this many times the batch's rows has its offsets
+     * read per row instead of copied whole.
+     */
+    static final int DICTIONARY_COPY_FACTOR = 2;
+
+    private static int entryLength(MemorySegment off, int k) {
+        return off.get(VectorBuffers.LE_INT, (long) (k + 1) << 2) - off.get(VectorBuffers.LE_INT, (long) k << 2);
+    }
+
+    private final int[][] intScratch = new int[3][0];
+    private final long[][] wordScratch = new long[2][0];
+
+    private int[] intScratch(int slot, int n) {
+        if (intScratch[slot].length < n) {
+            intScratch[slot] = new int[Math.max(n, intScratch[slot].length * 2)];
+        }
+        return intScratch[slot];
+    }
+
+    private long[] words(int slot, MemorySegment bits, int n) {
+        int w = Bitmap.wordsFor(n);
+        if (wordScratch[slot].length < w) {
+            wordScratch[slot] = new long[Math.max(w, wordScratch[slot].length * 2)];
+        }
+        long[] a = wordScratch[slot];
+        for (int i = 0; i < w; i++) {
+            a[i] = Bitmap.wordAt(bits, i, n);
+        }
+        return a;
     }
 
     private static int utf8Length(VectorBuffers dict, int k) {
