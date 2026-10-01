@@ -230,6 +230,10 @@ public final class GatherKernels {
     /** Gathers bits; a negative index yields {@code padValue}. */
     static void gatherBits(MemorySegment bits, int[] idx, int from,
                            int to, MemorySegment out, boolean padValue) {
+        if (bits.isNative() && out.isNative()) {
+            gatherBitsNative(bits, idx, from, to, out, padValue);
+            return;
+        }
         int count = to - from;
         int pad = padValue ? 1 : 0;
         for (int base = 0; base < count; base += 64) {
@@ -247,6 +251,39 @@ public final class GatherKernels {
     }
 
     /**
+     * {@link #gatherBits} over native segments, in its own body so the reads
+     * and the word stores bind statically (#565; {@link Bitmap#setWord} is
+     * shared by every bitmap writer). The store is {@code setWord}'s: a whole
+     * word where the segment holds one, else the tail bytes.
+     */
+    private static void gatherBitsNative(MemorySegment bits, int[] idx, int from,
+            int to, MemorySegment out, boolean padValue) {
+        int count = to - from;
+        int pad = padValue ? 1 : 0;
+        long outBytes = out.byteSize();
+        for (int base = 0; base < count; base += 64) {
+            int limit = Math.min(64, count - base);
+            long word = 0L;
+            for (int j = 0; j < limit; j++) {
+                int i = idx[from + base + j];
+                int neg = i >>> 31; // 1 for a padded index
+                int ci = i & ~(i >> 31);
+                int bit = ((bits.get(ValueLayout.JAVA_BYTE, ci >>> 3) >>> (ci & 7)) & 1 & (neg ^ 1)) | (neg & pad);
+                word |= (long) bit << j;
+            }
+            long byteOffset = (long) base >>> 3;
+            if (limit == 64 || byteOffset + 8 <= outBytes) {
+                out.set(VectorBuffers.LE_LONG, byteOffset, word);
+            } else {
+                long bytes = Bitmap.bytesFor(limit);
+                for (int b = 0; b < bytes; b++) {
+                    out.set(ValueLayout.JAVA_BYTE, byteOffset + b, (byte) (word >>> (b << 3)));
+                }
+            }
+        }
+    }
+
+    /**
      * Bytes needed by {@link #gatherUtf8} for the given rows of a plain UTF8
      * column.
      */
@@ -257,10 +294,33 @@ public final class GatherKernels {
         }
         MemorySegment off = in.offsets();
         MemorySegment validity = in.validity();
+        if (off.isNative() && (validity == null || validity.isNative())) {
+            return gatherUtf8BytesNative(off, validity, idx, from, to);
+        }
         long total = 0;
         for (int o = from; o < to; o++) {
             int i = idx[o];
-            if (i >= 0 && (validity == null || Bitmap.isSet(validity, i))) {
+            if (i >= 0 && (validity == null || ((validity.get(ValueLayout.JAVA_BYTE, i >>> 3) >>> (i & 7)) & 1) != 0)) {
+                total += off.get(VectorBuffers.LE_INT, (long) (i + 1) << 2) - off.get(VectorBuffers.LE_INT, (long) i << 2);
+            }
+        }
+        return total;
+    }
+
+    /**
+     * {@link #gatherUtf8Bytes} over native segments: the same loop in its own
+     * body, so its accessors see one receiver type and bind statically (#565:
+     * 6.6 % of q67's FFM check samples at 1 TB were this loop, reached from the
+     * sort's and the joins' output gathers with native and heap columns alike).
+     * The validity bit is read inline rather than through {@link Bitmap#isSet},
+     * whose profile every caller shares.
+     */
+    private static long gatherUtf8BytesNative(MemorySegment off, MemorySegment validity, int[] idx,
+            int from, int to) {
+        long total = 0;
+        for (int o = from; o < to; o++) {
+            int i = idx[o];
+            if (i >= 0 && (validity == null || ((validity.get(ValueLayout.JAVA_BYTE, i >>> 3) >>> (i & 7)) & 1) != 0)) {
                 total += off.get(VectorBuffers.LE_INT, (long) (i + 1) << 2) - off.get(VectorBuffers.LE_INT, (long) i << 2);
             }
         }
@@ -288,21 +348,59 @@ public final class GatherKernels {
         // profile mixes every buffer implementation, so it stays virtual and repeats the segment checks
         // (#377: 3.5x on this loop at SF10).
         MemorySegment validity = in.validity();
+        if (off.isNative()
+                && data.isNative()
+                && (validity == null || validity.isNative())
+                && outOffsets.isNative()
+                && outData.isNative()) {
+            gatherUtf8Native(off, data, validity, idx, from, to,
+                    outOffsets, outData);
+        } else {
+            int count = to - from;
+            int pos = 0;
+            for (int o = 0; o < count; o++) {
+                int i = idx[from + o];
+                outOffsets.set(VectorBuffers.LE_INT, (long) o << 2, pos);
+                if (i >= 0 && (validity == null || ((validity.get(ValueLayout.JAVA_BYTE, i >>> 3) >>> (i & 7)) & 1) != 0)) {
+                    int start = off.get(VectorBuffers.LE_INT, (long) i << 2);
+                    int len = off.get(VectorBuffers.LE_INT, (long) (i + 1) << 2) - start;
+                    ByteCopy.copy(data, start, outData, pos, len);
+                    pos += len;
+                }
+            }
+            outOffsets.set(VectorBuffers.LE_INT, (long) count << 2, pos);
+        }
+        if (outValidity != null) {
+            gatherValidity(in.validity(), idx, from, to, outValidity);
+        }
+    }
+
+    /**
+     * {@link #gatherUtf8}'s loop over native segments only; see {@link
+     * #gatherUtf8BytesNative}. The strings move through {@link
+     * ByteCopy#copyNative} for the same reason.
+     */
+    private static void gatherUtf8Native(
+            MemorySegment off,
+            MemorySegment data,
+            MemorySegment validity,
+            int[] idx,
+            int from,
+            int to,
+            MemorySegment outOffsets,
+            MemorySegment outData) {
         int count = to - from;
         int pos = 0;
         for (int o = 0; o < count; o++) {
             int i = idx[from + o];
             outOffsets.set(VectorBuffers.LE_INT, (long) o << 2, pos);
-            if (i >= 0 && (validity == null || Bitmap.isSet(validity, i))) {
+            if (i >= 0 && (validity == null || ((validity.get(ValueLayout.JAVA_BYTE, i >>> 3) >>> (i & 7)) & 1) != 0)) {
                 int start = off.get(VectorBuffers.LE_INT, (long) i << 2);
                 int len = off.get(VectorBuffers.LE_INT, (long) (i + 1) << 2) - start;
-                ByteCopy.copy(data, start, outData, pos, len);
+                ByteCopy.copyNative(data, start, outData, pos, len);
                 pos += len;
             }
         }
         outOffsets.set(VectorBuffers.LE_INT, (long) count << 2, pos);
-        if (outValidity != null) {
-            gatherValidity(in.validity(), idx, from, to, outValidity);
-        }
     }
 }

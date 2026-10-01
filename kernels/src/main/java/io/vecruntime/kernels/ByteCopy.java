@@ -58,4 +58,34 @@ public final class ByteCopy {
             }
         }
     }
+
+    /**
+     * {@link #copy} for callers that know both segments are native. The same
+     * body on purpose (#565): {@link #copy}'s accessors are shared by every
+     * caller, so their receiver profile mixes native and heap segments, they
+     * stop binding statically, and each move pays the session and bounds checks
+     * as a call -- 7 % of q67's FFM check samples at 1 TB were in {@link #copy}.
+     * A body only native segments reach keeps a monomorphic profile.
+     */
+    public static void copyNative(MemorySegment src, long srcPos, MemorySegment dst,
+            long dstPos, int len) {
+        if (len > SHORT) {
+            MemorySegment.copy(src, ValueLayout.JAVA_BYTE, srcPos, dst, ValueLayout.JAVA_BYTE, dstPos,
+                    len);
+        } else if (len >= 8) {
+            long head = src.get(VectorBuffers.LE_LONG, srcPos);
+            long tail = src.get(VectorBuffers.LE_LONG, srcPos + len - 8);
+            dst.set(VectorBuffers.LE_LONG, dstPos, head);
+            dst.set(VectorBuffers.LE_LONG, dstPos + len - 8, tail);
+        } else if (len >= 4) {
+            int head = src.get(VectorBuffers.LE_INT, srcPos);
+            int tail = src.get(VectorBuffers.LE_INT, srcPos + len - 4);
+            dst.set(VectorBuffers.LE_INT, dstPos, head);
+            dst.set(VectorBuffers.LE_INT, dstPos + len - 4, tail);
+        } else {
+            for (int k = 0; k < len; k++) {
+                dst.set(ValueLayout.JAVA_BYTE, dstPos + k, src.get(ValueLayout.JAVA_BYTE, srcPos + k));
+            }
+        }
+    }
 }
