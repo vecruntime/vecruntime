@@ -21,8 +21,13 @@ import io.vecruntime.spark.adapter.TypeMapping
 import io.vecruntime.spark.arrow.{ArrowOutput, VectorAllocators}
 import io.vecruntime.spark.parquet.NativeParquetColumnReader
 import org.apache.hadoop.conf.Configuration
+import org.apache.hadoop.fs.FileStatus
+import org.apache.parquet.HadoopReadOptions
 import org.apache.parquet.filter2.compat.FilterCompat
 import org.apache.parquet.hadoop.ParquetFileReader
+import org.apache.parquet.hadoop.metadata.ParquetMetadata
+import org.apache.parquet.hadoop.util.HadoopInputFile
+import org.apache.parquet.io.SeekableInputStream
 import org.apache.parquet.schema.MessageType
 import org.apache.spark.{Partition, TaskContext}
 import org.apache.spark.rdd.RDD
@@ -52,7 +57,9 @@ import org.apache.spark.util.SerializableConfiguration
  * It wraps the `FileSourceScanExec` Spark planned and reuses everything Spark already computed: the
  * dynamically selected partitions (DPP applied), the file splitting (`FileScanRDD` partitions:
  * maxSplitBytes / openCostBytes / bucketing), the pushed data filters and the required + partition schema.
- * Per `PartitionedFile` it opens a `ParquetFileReader`, clips the requested columns exactly as Spark's
+ * Per `PartitionedFile` it opens a `ParquetFileReader` ONCE -- no `getFileStatus` HEAD (the InputFile is
+ * built from the `PartitionedFile`'s length + modification time) and the footer is read once and the reader
+ * built from it over the same stream -- clips the requested columns exactly as Spark's
  * `ParquetReadSupport` does (case sensitivity, field ids), sets a `FilterCompat` filter from the pushed
  * filters so `readNextFilteredRowGroup` does row-group and column-index page skipping, and drives one
  * [[NativeParquetColumnReader]] per column. Partition-value columns are constant columns
@@ -367,64 +374,80 @@ private[vecruntime] final class VectorParquetPartitionReader(
 
   private def openFile(file: PartitionedFile): Unit = {
     if (context != null) context.killTaskIfInterrupted()
-    // Honor the split's byte range (file.start .. file.start+file.length): parquet-java keeps the row
-    // groups whose midpoint falls in the range. Without this, a file Spark split into several
-    // PartitionedFiles would read the WHOLE file in every split -> duplicate rows and duplicate I/O
-    // (8 TPC-DS store_sales files exceed the 128 MB default split). Open once with the range to read the
-    // footer/schema, then reopen with the range PLUS the pushed row-group/column-index filter.
-    val inputFile = org.apache.parquet.hadoop.util.HadoopInputFile.fromPath(file.toPath, hadoopConf)
+    val path = file.toPath
     val start = file.start
     val end = file.start + file.length
-    reader = ParquetFileReader.open(
-      inputFile,
-      org.apache.parquet.HadoopReadOptions.builder(hadoopConf, file.toPath).withRange(start, end).build()
-    )
-    val fileSchema = reader.getFileMetaData.getSchema
-    val clipped = ParquetReadSupport.clipParquetSchema(fileSchema, requiredSchema, caseSensitive, useFieldId, false)
-    // Encoding is only knowable at read time (slice 1). If any required column chunk uses an encoding we
-    // do not decode (DELTA_*, BYTE_STREAM_SPLIT, ...), fall the WHOLE FILE over to Spark's vectorized
-    // reader, adapting nothing further -- correct results, no mid-decode crash. (Spark's reader honors the
-    // split range itself from the PartitionedFile, so the fallback is not double-counted either.)
-    if (hasUnsupportedEncoding(reader, clipped)) {
-      reader.close()
-      reader = null
-      fallback = new SparkFallbackFileReader(file, hadoopConf, requiredSchema, partitionSchema, batchSize, context)
-      metrics.numFiles += 1
-      return
-    }
-    // Reopen with the range AND the pushed filter so readNextFilteredRowGroup skips row groups / pages.
-    reader.close()
-    reader = ParquetFileReader.open(
-      inputFile,
-      org.apache.parquet.HadoopReadOptions
-        .builder(hadoopConf, file.toPath)
+    // No HEAD: build the InputFile from the length and modification time Spark already put in the
+    // PartitionedFile, instead of HadoopInputFile.fromPath -> fs.getFileStatus (one S3AStoreImpl.headObject
+    // -> network round trip per split before any read). HadoopInputFile.fromStatus trusts the status as
+    // given and never re-stats, so the open path makes zero getFileStatus calls.
+    val status = new FileStatus(file.fileSize, false, 0, 0L, file.modificationTime, path)
+    val inputFile = HadoopInputFile.fromStatus(status, hadoopConf)
+    // Open the file ONCE: a single SeekableInputStream, read the footer from it with the split range, then
+    // build the reader from THAT footer + the SAME stream (ParquetFileReader(InputFile, ParquetMetadata,
+    // options, stream)) -- no reopen, no second footer read. The split range (file.start ..
+    // file.start+file.length) keeps the row groups whose midpoint falls in the range, so a file Spark split
+    // into several PartitionedFiles reads each row group in exactly one split (no duplicate rows, no
+    // duplicate I/O; 8 TPC-DS store_sales files exceed the 128 MB default split). The previous code opened
+    // the file twice (footer+schema, then reopened with the filter) -> two opens and two footer reads per
+    // split, on top of AAL's own footer parse.
+    val rangeOpts = HadoopReadOptions.builder(hadoopConf, path).withRange(start, end).build()
+    var stream: SeekableInputStream = null
+    try {
+      stream = inputFile.newStream()
+      val footer: ParquetMetadata = ParquetFileReader.readFooter(inputFile, rangeOpts, stream)
+      val fileSchema = footer.getFileMetaData.getSchema
+      val clipped = ParquetReadSupport.clipParquetSchema(fileSchema, requiredSchema, caseSensitive, useFieldId, false)
+      // Encoding is only knowable at read time (slice 1). If any required column chunk uses an encoding we
+      // do not decode (DELTA_*, BYTE_STREAM_SPLIT, ...), fall the WHOLE FILE over to Spark's vectorized
+      // reader, adapting nothing further -- correct results, no mid-decode crash. (Spark's reader honors the
+      // split range itself from the PartitionedFile, so the fallback is not double-counted either.)
+      if (hasUnsupportedEncodingInFooter(footer, clipped)) {
+        stream.close()
+        stream = null
+        fallback = new SparkFallbackFileReader(file, hadoopConf, requiredSchema, partitionSchema, batchSize, context)
+        metrics.numFiles += 1
+        return
+      }
+      // Build the reader from the footer we already read, over the SAME stream, with the range AND the
+      // pushed filter so readNextFilteredRowGroup skips row groups / pages. The reader now owns the stream
+      // (closed by reader.close()); clear our local handle so the finally below does not double-close it.
+      val readOpts = HadoopReadOptions
+        .builder(hadoopConf, path)
         .withRange(start, end)
         .withRecordFilter(rowGroupFilter(clipped))
         .build()
-    )
-    reader.setRequestedSchema(clipped)
-    rowGroupIndex = 0
-    val columns = clipped.getColumns
-    columnReaders = new Array[NativeParquetColumnReader](dataColumnCount)
-    // Map each required data column to its clipped ColumnDescriptor by leaf name (flat schema only).
-    var i = 0
-    while (i < dataColumnCount) {
-      val field = requiredSchema.fields(i)
-      val cd = columns.asScala.find(_.getPath()(0).equalsIgnoreCase(field.name))
-        .getOrElse(throw new IllegalStateException(s"column ${field.name} missing from clipped schema"))
-      columnReaders(i) =
-        new NativeParquetColumnReader(
-          cd,
-          TypeMapping.vecTypeOf(field.dataType),
-          field.dataType,
-          field.name,
-          batchSize,
-          allocator
-        )
-      i += 1
+      reader = ParquetFileReader.open(inputFile, footer, readOpts, stream)
+      stream = null
+      reader.setRequestedSchema(clipped)
+      rowGroupIndex = 0
+      val columns = clipped.getColumns
+      columnReaders = new Array[NativeParquetColumnReader](dataColumnCount)
+      // Map each required data column to its clipped ColumnDescriptor by leaf name (flat schema only).
+      var i = 0
+      while (i < dataColumnCount) {
+        val field = requiredSchema.fields(i)
+        val cd = columns.asScala.find(_.getPath()(0).equalsIgnoreCase(field.name))
+          .getOrElse(throw new IllegalStateException(s"column ${field.name} missing from clipped schema"))
+        columnReaders(i) =
+          new NativeParquetColumnReader(
+            cd,
+            TypeMapping.vecTypeOf(field.dataType),
+            field.dataType,
+            field.name,
+            batchSize,
+            allocator
+          )
+        i += 1
+      }
+      buildPartitionColumns(file)
+      metrics.numFiles += 1
+    } finally {
+      // Reached only when the reader was NOT built from the stream (an exception, or a path that returns
+      // early without taking ownership). The success path and the fallback path both null `stream` out
+      // after handing it over / closing it, so this never double-closes.
+      if (stream != null) stream.close()
     }
-    buildPartitionColumns(file)
-    metrics.numFiles += 1
   }
 
   /** Record this file's partition values; per-batch constant columns are built from them in next(). */
@@ -452,10 +475,10 @@ private[vecruntime] final class VectorParquetPartitionReader(
    * the decision is made once per file at open time -- a DELTA_* / BYTE_STREAM_SPLIT column falls the file
    * over to Spark's reader with no mid-decode failure.
    */
-  private def hasUnsupportedEncoding(rdr: ParquetFileReader, clipped: MessageType): Boolean = {
+  private def hasUnsupportedEncodingInFooter(footer: ParquetMetadata, clipped: MessageType): Boolean = {
     val wanted = new java.util.HashSet[String]()
     clipped.getColumns.forEach(cd => wanted.add(cd.getPath()(0).toLowerCase(java.util.Locale.ROOT)))
-    val blocks = rdr.getFooter.getBlocks
+    val blocks = footer.getBlocks
     var b = 0
     while (b < blocks.size()) {
       val cols = blocks.get(b).getColumns

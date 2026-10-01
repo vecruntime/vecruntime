@@ -38,7 +38,11 @@ class VectorParquetScanSuite extends VectorQuerySuite {
       // Small blocks/pages so a table spans several row groups and pages.
       "parquet.block.size" -> (128 * 1024).toString,
       "parquet.page.size" -> (4 * 1024).toString,
-      "spark.sql.parquet.columnarReaderBatchSize" -> "1024"
+      "spark.sql.parquet.columnarReaderBatchSize" -> "1024",
+      // A local FileSystem that counts open() and getFileStatus() per path, under scheme `countfs`, for the
+      // I/O-shape test below (one open, zero getFileStatus per split).
+      "spark.hadoop.fs.countfs.impl" -> classOf[CountingLocalFileSystem].getName,
+      "spark.hadoop.fs.countfs.impl.disable.cache" -> "true"
     )
 
   private val node = classOf[VectorParquetScanExec]
@@ -385,5 +389,121 @@ class VectorParquetScanSuite extends VectorQuerySuite {
       spark.read.parquet(path).createOrReplaceTempView("t_bin")
     }
     checkFallback("SELECT i, b FROM t_bin", Seq(node), reasonContains = "unsupported column type")
+  }
+
+  test("the open path makes one open and zero getFileStatus per split") {
+    // The node must open each split's file ONCE (no reopen for footer-then-filter) and build the InputFile
+    // without a getFileStatus HEAD -- on S3 that HEAD is a network round trip per split before any read.
+    // A counting local FileSystem under scheme `countfs` wraps RawLocalFileSystem and tallies open() and
+    // getFileStatus() against our one data file, counting ONLY calls made inside a Spark task (the node's
+    // openFile runs in a task; Spark's driver-side planning I/O has no TaskContext and is excluded). We scan
+    // with the flag on and assert the node's open path: one open and zero getFileStatus per split.
+    val dir = newTempPath("t_io_shape")
+    withConf("parquet.block.size" -> (64 * 1024).toString, "parquet.page.size" -> (4 * 1024).toString) {
+      withPlugin(enabled = false) {
+        spark.sql("SELECT CAST(id AS INT) AS i, CAST(id * 7 AS BIGINT) AS l FROM range(0, 200000)")
+          .coalesce(1).write.mode("overwrite").parquet(dir)
+      }
+    }
+    // The single parquet part file Spark wrote, addressed through the counting FS (same bytes on disk, a
+    // scheme that routes through CountingLocalFileSystem). A `file:`-scheme path would bypass the counter.
+    val localDir = new java.io.File(new java.net.URI(dir).getPath)
+    val part = localDir.listFiles((_, nm) => nm.endsWith(".parquet"))
+      .sortBy(_.getName).head.getAbsolutePath
+    val countPath = "countfs://" + part
+
+    def scanCounting(maxPartitionBytes: Long): (Long, Int, Int, Int) = {
+      CountingLocalFileSystem.reset(part)
+      val (rows, splits) = withConf("spark.sql.files.maxPartitionBytes" -> maxPartitionBytes.toString) {
+        withPlugin(enabled = true) {
+          val df = spark.read.schema("i INT, l BIGINT").parquet(countPath)
+          val n = df.count()
+          assert(
+            PlanUtils.allNodes(finalPlan(df)).exists(node.isInstance),
+            s"expected ${node.getSimpleName} in plan\n${finalPlan(df).treeString}"
+          )
+          (n, df.rdd.getNumPartitions)
+        }
+      }
+      (rows, splits, CountingLocalFileSystem.opens(part), CountingLocalFileSystem.getFileStatus(part))
+    }
+
+    // The counting FS tallies only calls made inside a Spark task (the node's openFile), excluding Spark's
+    // driver-side planning I/O, and counts only STANDALONE getFileStatus (a HEAD), not the existence check
+    // RawLocalFileSystem.open does internally. So the node's open path is measured directly: one open per
+    // split, zero standalone getFileStatus (the InputFile is built from the PartitionedFile's length + mtime).
+    val (rows1, splits1, opens1, stat1) = scanCounting(maxPartitionBytes = 256L * 1024 * 1024)
+    assert(rows1 == 200000, s"expected 200000 rows, got $rows1")
+    assert(splits1 == 1, s"expected a single split, got $splits1")
+    assert(opens1 == 1, s"expected exactly 1 open for 1 split, got $opens1")
+    assert(stat1 == 0, s"expected 0 standalone getFileStatus (HEAD) in the node's open path, got $stat1")
+
+    val (rowsN, splitsN, opensN, statN) = scanCounting(maxPartitionBytes = 256L * 1024)
+    assert(rowsN == 200000, s"expected 200000 rows across splits, got $rowsN (duplicates?)")
+    assert(splitsN >= 2, s"expected >= 2 splits, got $splitsN")
+    assert(opensN == splitsN, s"expected exactly one open per split ($splitsN), got $opensN")
+    assert(statN == 0, s"expected 0 standalone getFileStatus (HEAD) across splits, got $statN")
+  }
+}
+
+/**
+ * A local [[org.apache.hadoop.fs.RawLocalFileSystem]] under the `countfs` scheme that tallies `open` and
+ * `getFileStatus` per absolute local path, so a test can assert the native scan's open path makes one
+ * `open` and zero `getFileStatus` per split (the no-HEAD, single-open shape of #559). It only counts; all
+ * I/O delegates to the raw local FS. A `countfs:///<abs>` URI maps to the local file at `/<abs>`.
+ */
+object CountingLocalFileSystem {
+  private val openCounts =
+    new java.util.concurrent.ConcurrentHashMap[String, java.util.concurrent.atomic.AtomicInteger]()
+  private val statCounts =
+    new java.util.concurrent.ConcurrentHashMap[String, java.util.concurrent.atomic.AtomicInteger]()
+
+  private def counter(
+      m: java.util.concurrent.ConcurrentHashMap[String, java.util.concurrent.atomic.AtomicInteger],
+      key: String
+  ) =
+    m.computeIfAbsent(key, _ => new java.util.concurrent.atomic.AtomicInteger())
+
+  def reset(absPath: String): Unit = {
+    counter(openCounts, absPath).set(0)
+    counter(statCounts, absPath).set(0)
+  }
+  def opens(absPath: String): Int = counter(openCounts, absPath).get()
+  def getFileStatus(absPath: String): Int = counter(statCounts, absPath).get()
+
+  private[parquet] def countOpen(absPath: String): Unit = counter(openCounts, absPath).incrementAndGet()
+  private[parquet] def countStat(absPath: String): Unit = counter(statCounts, absPath).incrementAndGet()
+}
+
+class CountingLocalFileSystem extends org.apache.hadoop.fs.RawLocalFileSystem {
+  import org.apache.hadoop.fs.{FSDataInputStream, FileStatus, Path => HPath}
+
+  override def getScheme: String = "countfs"
+  override def getUri: java.net.URI = java.net.URI.create("countfs:///")
+
+  private def key(p: HPath): String = pathToFile(p).getAbsolutePath
+
+  // Count only calls made from inside a Spark TASK (an executor), which is where the node's openFile runs.
+  // Spark's own driver-side planning (file listing, stats) also touches this file but runs with no
+  // TaskContext, so it is excluded -- the assertions then measure the NODE's open path, not Spark's.
+  private def inTask: Boolean = org.apache.spark.TaskContext.get() != null
+
+  // RawLocalFileSystem.open() itself calls getFileStatus() for an existence check; that is an artifact of
+  // this FS, not a HEAD the node issues. We count only STANDALONE getFileStatus (the HEAD-before-open the
+  // fix removed), by suppressing the count while inside our own open().
+  private val insideOpen = new ThreadLocal[java.lang.Boolean] {
+    override def initialValue(): java.lang.Boolean = java.lang.Boolean.FALSE
+  }
+
+  override def open(f: HPath, bufferSize: Int): FSDataInputStream = {
+    if (inTask) CountingLocalFileSystem.countOpen(key(f))
+    insideOpen.set(java.lang.Boolean.TRUE)
+    try super.open(f, bufferSize)
+    finally insideOpen.set(java.lang.Boolean.FALSE)
+  }
+
+  override def getFileStatus(f: HPath): FileStatus = {
+    if (inTask && !insideOpen.get()) CountingLocalFileSystem.countStat(key(f))
+    super.getFileStatus(f)
   }
 }
