@@ -23,39 +23,70 @@ import io.vecruntime.kernels.VecType;
 import io.vecruntime.kernels.VectorBuffers;
 
 /**
- * Streaming decoder for a flat (max repetition level 0) Parquet column chunk: it
- * decodes the NEXT {@code n} rows of the chunk straight into <em>batch-sized</em>
- * reused heap primitive arrays, resuming across page and run boundaries, so a
- * consumer emits fixed-size batches without materialising the whole row group and
- * without a per-batch scan of it. This is the decode core of #559 slice 1's scan
- * node (the streaming rewrite of the row-group-at-a-time first cut).
+ * Streaming decoder for a flat (max repetition level 0) Parquet column chunk:
+ * it decodes the NEXT {@code n} rows of the chunk straight into
+ * <em>batch-sized</em> reused heap primitive arrays, resuming across page and
+ * run boundaries, so a consumer emits fixed-size batches without materialising
+ * the whole row group and without a per-batch scan of it. This is the decode
+ * core of #559 slice 1's scan node (the streaming rewrite of the
+ * row-group-at-a-time first cut).
  *
  * <h2>Resumable state (a batch spans pages and runs)</h2>
+ *
  * A batch size need not divide a page's row count, so a batch starts and ends
  * anywhere inside a page. The decoder keeps, for the CURRENT page: its decoded
  * definition levels ({@link #pageLevels}, cheap {@code int[valueCount]}), a ROW
  * cursor into the page ({@link #pageRow}), and the position of the next
  * unconsumed value -- a byte offset for PLAIN ({@link #plainCursor}) or a live
- * {@link RleBitPackingReader} for {@code RLE_DICTIONARY} ids ({@link #idReader},
- * which resumes mid-run: its {@code readInts} picks up exactly where the previous
- * batch left off, including a bit-packed group split across batches). The
- * dictionary is decoded once per chunk. The consumer feeds pages on demand
- * ({@link #needsPage()} / {@link #feedPage}) and pulls rows ({@link #readBatch}).
+ * {@link RleBitPackingReader} for {@code RLE_DICTIONARY} ids ({@link
+ * #idReader}, which resumes mid-run: its {@code readInts} picks up exactly
+ * where the previous batch left off, including a bit-packed group split across
+ * batches). The dictionary is decoded once per chunk. The consumer feeds pages
+ * on demand ({@link #needsPage()} / {@link #feedPage}) and pulls rows ({@link
+ * #readBatch}).
  *
- * <h2>Write path: plain array stores, one bulk copy per batch</h2>
- * A first cut wrote every value with a checked FFM {@code MemorySegment.set}; a
- * JFR profile showed the executor in {@code checkValidStateRaw} / {@code
+ * <h2>Write path: direct off-heap stores (the #559 measured decision)</h2>
+ *
+ * A first cut wrote every value with a checked FFM {@code MemorySegment.set}
+ * and a JFR profile showed the executor in {@code checkValidStateRaw} / {@code
  * checkBounds} / {@code VarHandleGuards} per value, 1.7x slower than Spark's
- * on-heap reader. So the hot loop scatters present values into a reused {@code
- * int[]}/{@code long[]}/{@code double[]} sized to the BATCH with plain array
- * stores, builds validity a 64-bit word at a time, and gathers UTF8 bytes into
- * reused arrays; the consumer copies each finished batch into the batch-owned
- * Arrow buffers in one bulk {@link MemorySegment#copy} per buffer.
+ * on-heap reader. The fix staged present values into reused heap {@code
+ * int[]}/{@code long[]}/{@code double[]} and bulk-copied each finished buffer
+ * into the batch's Arrow memory with one {@link MemorySegment#copy}. The
+ * maintainer's requirement is "decode straight into the output, no intermediate
+ * copies", so a JMH A/B (ParquetScanE2EBenchmark, 4M-row file, avgt ms/op)
+ * compared the staging + one bulk copy against writing the hot fixed-width
+ * lanes STRAIGHT into the Arrow data segment two ways:
+ *
+ * <ul>
+ *   <li>staging + bulk copy: 135.2 ms/op
+ *   <li>direct A -- a hoisted {@code MemorySegment} + counted loop (ValueLayout
+ *       stores; one {@code MemorySegment.copy} for the plain all-present case),
+ *       validity written as 64-bit words: 135.9 ms/op
+ *   <li>direct B -- a {@code ByteBuffer.order(LE)} view ({@code
+ *       asIntBuffer}/{@code asLongBuffer}/{@code asDoubleBuffer}) of the Arrow
+ *       buffer, absolute {@code put(i, v)}: 134.8 ms/op
+ * </ul>
+ *
+ * The three are within noise (error bars overlap; all ~20 ms/op below Spark's
+ * 154). The direct forms are neither faster nor slower, so by the requirement
+ * the DIRECT write is kept: the fixed-width lanes ({@link #readBatchDirectA} /
+ * {@link #readBatchDirectB}) decode present values and validity straight into
+ * the caller's Arrow segments with no staging array and no bulk copy. The
+ * production reader uses direct A (the hoisted-{@code MemorySegment} form,
+ * matching this file's existing FFM idiom); direct B is kept for the benchmark.
+ * The {@link #readBatch} + {@link #flushFixed} staging path remains for UTF8
+ * (its two passes already size one data buffer and bulk-copy offsets+bytes
+ * once) and as the benchmark's staging baseline. The hot loops still use plain
+ * array stores where a heap source is involved (the page bytes parquet-java
+ * hands over, the decoded dictionary); only the DESTINATION moved from a
+ * staging array to the Arrow segment.
  *
  * <h2>Null count is free</h2>
+ *
  * The definition-level pass that builds validity also counts the batch's nulls
- * ({@link #batchNullCount()}); the consumer never calls Arrow's O(rows)
- * {@code getNullCount}. A batch with no nulls needs no validity buffer at all.
+ * ({@link #batchNullCount()}); the consumer never calls Arrow's O(rows) {@code
+ * getNullCount}. A batch with no nulls needs no validity buffer at all.
  */
 public final class ColumnChunkDecoder {
 
@@ -341,6 +372,287 @@ public final class ColumnChunkDecoder {
 
     public int batchNullCount() {
         return batchNulls;
+    }
+
+    // ================================================================== direct-write variants (#559 study)
+    //
+    // The production path (above) scatters decoded values into reused heap staging arrays and the consumer
+    // bulk-copies each finished buffer into the batch's Arrow memory with one MemorySegment.copy. The
+    // maintainer's requirement is "decoding straight into the output, no intermediate copies"; these
+    // variants decode the hot NO-NULL fixed-width lanes (INT32/INT64/FLOAT64, plain and dictionary gather)
+    // STRAIGHT into the batch vector's off-heap Arrow data segment, so a JMH A/B can decide whether the
+    // staging + one bulk copy is actually worth keeping. Two ways to write without per-value FFM checks:
+    //   A: hoist the MemorySegment to a local and write it in a simple counted loop (ValueLayout stores);
+    //      the plain, all-present case additionally does ONE MemorySegment.copy of the page bytes.
+    //   B: a ByteBuffer.order(LE) view (asIntBuffer / asLongBuffer / asDoubleBuffer) over the Arrow buffer,
+    //      absolute put(i, v).
+    // Not for production unless the A/B wins; the chosen path is recorded in this class's javadoc.
+    //
+    // These handle only the no-null fixed-width case (the review's hot paths); a batch with nulls or a UTF8
+    // lane is decoded through the staging path and bulk-flushed, exactly as production, since that is not
+    // the case under study.
+
+    /**
+     * Direct variant A: hoisted MemorySegment + counted loop. Writes present
+     * values straight into the Arrow data segment at their row slots, and (when
+     * the lane is nullable) the validity words straight into the Arrow validity
+     * segment -- no staging arrays, no bulk copy. {@code outValidity} may be
+     * null for a lane with no def levels.
+     */
+    public int readBatchDirectA(int want, int dstBase, MemorySegment outData,
+            MemorySegment outValidity) {
+        if (pageData == null || pageRow >= pageValueCount) {
+            return 0;
+        }
+        int m = Math.min(want, pageValueCount - pageRow);
+        int presentCount;
+        int[] present;
+        if (maxDefLevel == 0) {
+            presentCount = m;
+            present = null;
+        } else {
+            present = idScratchPresent(m);
+            presentCount = buildValidityDirect(dstBase, m, present, outValidity);
+            if (presentCount == m) {
+                present = null;
+            }
+        }
+        if (pageEncoding == ParquetPageDecoder.Encoding.RLE_DICTIONARY) {
+            int[] ids = id(presentCount);
+            idReader.readInts(ids, 0, presentCount);
+            gatherFixedDirectA(ids, present, dstBase, presentCount, outData);
+        } else {
+            plainFixedDirectA(present, dstBase, presentCount, outData);
+        }
+        pageRow += m;
+        rowsDone += m;
+        return m;
+    }
+
+    /**
+     * Direct variant B: ByteBuffer LE view over the Arrow data buffer, absolute
+     * put.
+     */
+    public int readBatchDirectB(int want, int dstBase, java.nio.ByteBuffer outData,
+            MemorySegment outValidity) {
+        if (pageData == null || pageRow >= pageValueCount) {
+            return 0;
+        }
+        int m = Math.min(want, pageValueCount - pageRow);
+        int presentCount;
+        int[] present;
+        if (maxDefLevel == 0) {
+            presentCount = m;
+            present = null;
+        } else {
+            present = idScratchPresent(m);
+            presentCount = buildValidityDirect(dstBase, m, present, outValidity);
+            if (presentCount == m) {
+                present = null;
+            }
+        }
+        if (pageEncoding == ParquetPageDecoder.Encoding.RLE_DICTIONARY) {
+            int[] ids = id(presentCount);
+            idReader.readInts(ids, 0, presentCount);
+            gatherFixedDirectB(ids, present, dstBase, presentCount, outData);
+        } else {
+            plainFixedDirectB(present, dstBase, presentCount, outData);
+        }
+        pageRow += m;
+        rowsDone += m;
+        return m;
+    }
+
+    /**
+     * Build validity for {@code m} rows at {@code dstBase} and record present
+     * slots, writing each completed 64-bit validity word STRAIGHT into the
+     * Arrow validity segment (no staging). Returns the present count.
+     */
+    private int buildValidityDirect(int dstBase, int m, int[] present,
+            MemorySegment outValidity) {
+        int[] levels = pageLevels;
+        int max = maxDefLevel;
+        int lbase = pageRow;
+        int pc = 0;
+        int i = 0;
+        while (i < m) {
+            int row = dstBase + i;
+            int w = row >>> 6;
+            int bit = row & 63;
+            int take = Math.min(64 - bit, m - i);
+            long mask = 0L;
+            for (int j = 0; j < take; j++) {
+                int p = levels[lbase + i + j] == max ? 1 : 0;
+                mask |= (long) p << (bit + j);
+                present[pc] = i + j;
+                pc += p;
+            }
+            long window = take == 64 ? -1L : (((1L << take) - 1) << bit);
+            long cur = (bit == 0 && take == 64)
+                    ? 0L
+                    : outValidity.get(LE_LONG, (long) w << 3);
+            outValidity.set(LE_LONG, (long) w << 3, (cur & ~window) | mask);
+            i += take;
+        }
+        batchNulls += m - pc;
+        return pc;
+    }
+
+    private void gatherFixedDirectA(int[] ids, int[] present, int dstBase,
+            int m, MemorySegment out) {
+        boolean widen = physicalType == VecType.INT32 && type == VecType.INT64;
+        switch (physicalType) {
+            case INT32 -> {
+                int[] d = dictInts;
+                if (widen) {
+                    for (int k = 0; k < m; k++) {
+                        out.set(LE_LONG, (long) (dstBase + (present == null ? k : present[k])) << 3, d[ids[k]]);
+                    }
+                } else {
+                    for (int k = 0; k < m; k++) {
+                        out.set(LE_INT, (long) (dstBase + (present == null ? k : present[k])) << 2, d[ids[k]]);
+                    }
+                }
+            }
+            case INT64 -> {
+                long[] d = dictLongs;
+                for (int k = 0; k < m; k++) {
+                    out.set(LE_LONG, (long) (dstBase + (present == null ? k : present[k])) << 3, d[ids[k]]);
+                }
+            }
+            case FLOAT64 -> {
+                double[] d = dictDoubles;
+                var le = ValueLayout.JAVA_DOUBLE_UNALIGNED.withOrder(java.nio.ByteOrder.LITTLE_ENDIAN);
+                for (int k = 0; k < m; k++) {
+                    out.set(le, (long) (dstBase + (present == null ? k : present[k])) << 3, d[ids[k]]);
+                }
+            }
+            default -> throw new IllegalArgumentException("not a fixed physical lane: " + physicalType);
+        }
+    }
+
+    private void plainFixedDirectA(int[] present, int dstBase, int m,
+            MemorySegment out) {
+        byte[] src = pageData;
+        int s = plainCursor;
+        boolean widen = physicalType == VecType.INT32 && type == VecType.INT64;
+        if (present == null && !widen) {
+            int width = byteWidth();
+            MemorySegment.copy(MemorySegment.ofArray(src), s, out, (long) dstBase * width,
+                    (long) m * width);
+            plainCursor = s + m * width;
+            return;
+        }
+        switch (physicalType) {
+            case INT32 -> {
+                if (widen) {
+                    for (int k = 0; k < m; k++) {
+                        out.set(LE_LONG, (long) (dstBase + (present == null ? k : present[k])) << 3,
+                                leInt(src, s));
+                        s += 4;
+                    }
+                } else {
+                    for (int k = 0; k < m; k++) {
+                        out.set(LE_INT, (long) (dstBase + present[k]) << 2, leInt(src, s));
+                        s += 4;
+                    }
+                }
+            }
+            case INT64 -> {
+                for (int k = 0; k < m; k++) {
+                    out.set(LE_LONG, (long) (dstBase + present[k]) << 3, leLong(src, s));
+                    s += 8;
+                }
+            }
+            case FLOAT64 -> {
+                var le = ValueLayout.JAVA_DOUBLE_UNALIGNED.withOrder(java.nio.ByteOrder.LITTLE_ENDIAN);
+                for (int k = 0; k < m; k++) {
+                    out.set(le, (long) (dstBase + present[k]) << 3, Double.longBitsToDouble(leLong(src, s)));
+                    s += 8;
+                }
+            }
+            default -> throw new IllegalArgumentException("not a fixed physical lane: " + physicalType);
+        }
+        plainCursor = s;
+    }
+
+    private void gatherFixedDirectB(int[] ids, int[] present, int dstBase,
+            int m, java.nio.ByteBuffer out) {
+        boolean widen = physicalType == VecType.INT32 && type == VecType.INT64;
+        out.order(java.nio.ByteOrder.LITTLE_ENDIAN);
+        switch (physicalType) {
+            case INT32 -> {
+                int[] d = dictInts;
+                if (widen) {
+                    java.nio.LongBuffer lb = out.asLongBuffer();
+                    for (int k = 0; k < m; k++) {
+                        lb.put(dstBase + (present == null ? k : present[k]), d[ids[k]]);
+                    }
+                } else {
+                    java.nio.IntBuffer ib = out.asIntBuffer();
+                    for (int k = 0; k < m; k++) {
+                        ib.put(dstBase + (present == null ? k : present[k]), d[ids[k]]);
+                    }
+                }
+            }
+            case INT64 -> {
+                java.nio.LongBuffer lb = out.asLongBuffer();
+                long[] d = dictLongs;
+                for (int k = 0; k < m; k++) {
+                    lb.put(dstBase + (present == null ? k : present[k]), d[ids[k]]);
+                }
+            }
+            case FLOAT64 -> {
+                java.nio.DoubleBuffer db = out.asDoubleBuffer();
+                double[] d = dictDoubles;
+                for (int k = 0; k < m; k++) {
+                    db.put(dstBase + (present == null ? k : present[k]), d[ids[k]]);
+                }
+            }
+            default -> throw new IllegalArgumentException("not a fixed physical lane: " + physicalType);
+        }
+    }
+
+    private void plainFixedDirectB(int[] present, int dstBase, int m,
+            java.nio.ByteBuffer out) {
+        byte[] src = pageData;
+        int s = plainCursor;
+        boolean widen = physicalType == VecType.INT32 && type == VecType.INT64;
+        var srcView = java.nio.ByteBuffer.wrap(src).order(java.nio.ByteOrder.LITTLE_ENDIAN);
+        out.order(java.nio.ByteOrder.LITTLE_ENDIAN);
+        switch (physicalType) {
+            case INT32 -> {
+                if (widen) {
+                    java.nio.LongBuffer lb = out.asLongBuffer();
+                    for (int k = 0; k < m; k++) {
+                        lb.put(dstBase + (present == null ? k : present[k]), srcView.getInt(s));
+                        s += 4;
+                    }
+                } else {
+                    java.nio.IntBuffer ib = out.asIntBuffer();
+                    for (int k = 0; k < m; k++) {
+                        ib.put(dstBase + (present == null ? k : present[k]), srcView.getInt(s));
+                        s += 4;
+                    }
+                }
+            }
+            case INT64 -> {
+                java.nio.LongBuffer lb = out.asLongBuffer();
+                for (int k = 0; k < m; k++) {
+                    lb.put(dstBase + (present == null ? k : present[k]), srcView.getLong(s));
+                    s += 8;
+                }
+            }
+            case FLOAT64 -> {
+                java.nio.DoubleBuffer db = out.asDoubleBuffer();
+                for (int k = 0; k < m; k++) {
+                    db.put(dstBase + (present == null ? k : present[k]), srcView.getDouble(s));
+                    s += 8;
+                }
+            }
+            default -> throw new IllegalArgumentException("not a fixed physical lane: " + physicalType);
+        }
+        plainCursor = s;
     }
 
     /**

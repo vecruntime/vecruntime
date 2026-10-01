@@ -166,27 +166,101 @@ public final class NativeParquetColumnReader {
      * pooled) batch-owned Arrow vector and return it. The caller owns the vector
      * and releases it with {@link #release}. {@code n} must be <= the rows
      * remaining in the row group.
+     *
+     * <p>Fixed-width lanes (INT32/INT64/FLOAT64) are decoded STRAIGHT into the
+     * vector's off-heap Arrow data and validity buffers -- no heap staging, no
+     * bulk copy ({@link #fillFixed}, decoder's {@code readBatchDirectA}). The
+     * #559 JMH A/B (ParquetScanE2EBenchmark) measured this direct write within
+     * noise of the earlier staging + one bulk copy (135.9 vs 135.2 ms/op), so the
+     * direct form is kept to meet the "decode straight into the output, no
+     * intermediate copies" requirement. UTF8 stays on the staging path (its two
+     * passes already size one data buffer and bulk-copy offsets+bytes once).
      */
     public FieldVector readBatch(int n) {
+        decoder.startBatch(n);
+        if (type == VecType.UTF8) {
+            int filled = 0;
+            while (filled < n) {
+                if (decoder.needsPage()) {
+                    decoder.feedPage(toKernelPage(requirePage()));
+                }
+                filled += decoder.readBatch(n - filled, filled);
+            }
+            return flushUtf8(n, decoder.batchNullCount() > 0);
+        }
+        return fillFixed(n, /* modeA= */ true);
+    }
+
+    private DataPage requirePage() {
+        DataPage page = pages.readPage();
+        if (page == null) {
+            throw new IllegalStateException("ran out of pages at "
+                    + decoder.rowsDone()
+                    + " of "
+                    + rowGroupRows
+                    + " for "
+                    + java.util.Arrays.toString(column.getPath()));
+        }
+        return page;
+    }
+
+    /**
+     * Decode a fixed-width batch straight into the borrowed vector's off-heap
+     * buffers. {@code modeA}: hoisted {@code MemorySegment} + counted loop (the
+     * production write); otherwise a {@code ByteBuffer} LE view -- the #559 A/B's
+     * second variant, kept only for the benchmark.
+     */
+    private FieldVector fillFixed(int n, boolean modeA) {
+        BaseFixedWidthVector v = (BaseFixedWidthVector) borrowFixed(n);
+        ArrowVectorBuffers out = ArrowVectorBuffers.forWrite(v, n, sparkType);
+        java.lang.foreign.MemorySegment data = out.data();
+        java.lang.foreign.MemorySegment validity = maxDefLevel > 0 ? out.validity() : null;
+        if (validity != null) {
+            // The decoder read-modify-writes each 64-bit validity word; zero the words it will touch first.
+            int words = (n + 63) >>> 6;
+            validity.asSlice(0L, (long) words * 8).fill((byte) 0);
+        }
+        java.nio.ByteBuffer nio = modeA ? null : v.getDataBuffer().nioBuffer(0L, n * v.getTypeWidth());
+        int filled = 0;
+        while (filled < n) {
+            if (decoder.needsPage()) {
+                decoder.feedPage(toKernelPage(requirePage()));
+            }
+            filled += modeA ? decoder.readBatchDirectA(n - filled, filled, data, validity) : decoder.readBatchDirectB(n - filled, filled, nio, validity);
+        }
+        boolean hasNulls = decoder.batchNullCount() > 0;
+        io.vecruntime.spark.arrow.ArrowOutput.finish(out, n, !hasNulls);
+        return v;
+    }
+
+    // ----- #559 JMH A/B entry points (ParquetScanE2EBenchmark only) -----
+    // readBatchStaging: the earlier path (heap staging arrays + one bulk MemorySegment.copy per buffer).
+    // readBatchDirectA: production (hoisted MemorySegment + counted loop). readBatchDirectB: ByteBuffer LE
+    // view. All three decode identically; the benchmark compares their ms/op. Not for production callers.
+
+    public FieldVector readBatchStaging(int n) {
         decoder.startBatch(n);
         int filled = 0;
         while (filled < n) {
             if (decoder.needsPage()) {
-                DataPage page = pages.readPage();
-                if (page == null) {
-                    throw new IllegalStateException("ran out of pages at "
-                            + decoder.rowsDone()
-                            + " of "
-                            + rowGroupRows
-                            + " for "
-                            + java.util.Arrays.toString(column.getPath()));
-                }
-                decoder.feedPage(toKernelPage(page));
+                decoder.feedPage(toKernelPage(requirePage()));
             }
             filled += decoder.readBatch(n - filled, filled);
         }
         boolean hasNulls = decoder.batchNullCount() > 0;
         return type == VecType.UTF8 ? flushUtf8(n, hasNulls) : flushFixed(n, hasNulls);
+    }
+
+    public FieldVector readBatchDirectA(int n) {
+        return readBatch(n);
+    }
+
+    public FieldVector readBatchDirectB(int n) {
+        decoder.startBatch(n);
+        if (type == VecType.UTF8) {
+            return readBatchStaging(n);
+        }
+        return fillFixed(n, /* modeA= */ false);
     }
 
     private FieldVector flushFixed(int rows, boolean hasNulls) {

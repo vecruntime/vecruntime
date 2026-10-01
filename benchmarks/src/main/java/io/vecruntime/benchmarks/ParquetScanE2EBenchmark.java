@@ -145,6 +145,54 @@ public class ParquetScanE2EBenchmark {
         if (ours != theirs) {
             throw new IllegalStateException("decode mismatch: ours=" + ours + " spark=" + theirs);
         }
+        // The direct-write study variants must decode identically to staging (same values, same nulls), or a
+        // fast-but-wrong direct path could look like a win.
+        long directA = oursDirectChecksum(DecodeMode.DIRECT_A);
+        long directB = oursDirectChecksum(DecodeMode.DIRECT_B);
+        if (directA != theirs || directB != theirs) {
+            throw new IllegalStateException("direct decode mismatch: A=" + directA + " B=" + directB + " spark=" + theirs);
+        }
+    }
+
+    private long oursDirectChecksum(DecodeMode mode) throws Exception {
+        Path path = new Path(filePath);
+        try (ParquetFileReader reader = ParquetFileReader.open(hadoopConf, path)) {
+            List<ColumnDescriptor> columns = reader.getFooter()
+                    .getFileMetaData()
+                    .getSchema()
+                    .getColumns();
+            NativeParquetColumnReader[] readers = new NativeParquetColumnReader[columns.size()];
+            VecType[] vts = new VecType[columns.size()];
+            DataType[] dts = new DataType[columns.size()];
+            for (int c = 0; c < columns.size(); c++) {
+                ColumnDescriptor cd = columns.get(c);
+                dts[c] = schema.fields()[c].dataType();
+                vts[c] = TypeMapping.vecTypeOf(dts[c]);
+                readers[c] = new NativeParquetColumnReader(cd, vts[c], dts[c], cd.getPath()[0], BATCH_ROWS, allocator);
+            }
+            long checksum = 0;
+            PageReadStore rg;
+            List<BlockMetaData> blocks = reader.getFooter().getBlocks();
+            int rgIndex = 0;
+            while ((rg = reader.readNextRowGroup()) != null) {
+                int rgRows = (int) blocks.get(rgIndex++).getRowCount();
+                for (int c = 0; c < columns.size(); c++) {
+                    readers[c].startRowGroup(rg.getPageReader(columns.get(c)), rgRows);
+                    int done = 0;
+                    while (done < rgRows) {
+                        int n = Math.min(BATCH_ROWS, rgRows - done);
+                        FieldVector v = mode == DecodeMode.DIRECT_A ? readers[c].readBatchDirectA(n) : readers[c].readBatchDirectB(n);
+                        checksum += checksum(v, vts[c], dts[c], n);
+                        readers[c].release(v);
+                        done += n;
+                    }
+                }
+            }
+            for (NativeParquetColumnReader r : readers) {
+                r.close();
+            }
+            return checksum;
+        }
     }
 
     private long oursChecksum() throws Exception {
@@ -251,6 +299,84 @@ public class ParquetScanE2EBenchmark {
                     while (done < rgRows) {
                         int n = Math.min(BATCH_ROWS, rgRows - done);
                         FieldVector v = readers[c].readBatch(n); // batch-owned, streamed straight from pages
+                        bh.consume(v);
+                        rows += v.getValueCount();
+                        readers[c].release(v);
+                        done += n;
+                    }
+                }
+            }
+            for (NativeParquetColumnReader r : readers) {
+                r.close();
+            }
+            bh.consume(rows);
+        }
+    }
+
+    /**
+     * Direct-write variant A (#559 study): the hot fixed-width lanes
+     * (INT32/INT64/FLOAT64, plain and dictionary gather, plus validity) are
+     * decoded STRAIGHT into the batch vector's off-heap Arrow memory through a
+     * hoisted {@code MemorySegment} + counted loop, with no heap staging arrays
+     * and no bulk copy. UTF8 takes the production staging path. Same file, same
+     * consume pattern as {@link #oursDecodeOnly}.
+     */
+    @Benchmark
+    public void oursDecodeOnlyDirectA(Blackhole bh) throws Exception {
+        decodeOnly(bh, DecodeMode.DIRECT_A);
+    }
+
+    /**
+     * Direct-write variant B (#559 study): the same hot lanes written through a
+     * {@code ByteBuffer.order(LE)} view ({@code asIntBuffer}/{@code
+     * asLongBuffer}/{@code asDoubleBuffer}) of the Arrow data buffer with
+     * absolute {@code put(i, v)}; validity written directly as 64-bit words.
+     * UTF8 takes staging.
+     */
+    @Benchmark
+    public void oursDecodeOnlyDirectB(Blackhole bh) throws Exception {
+        decodeOnly(bh, DecodeMode.DIRECT_B);
+    }
+
+    private enum DecodeMode {
+        STAGING,
+        DIRECT_A,
+        DIRECT_B
+    }
+
+    /**
+     * Shared decode-only driver; the mode selects which readBatch path each
+     * column uses.
+     */
+    private void decodeOnly(Blackhole bh, DecodeMode mode) throws Exception {
+        Path path = new Path(filePath);
+        try (ParquetFileReader reader = ParquetFileReader.open(hadoopConf, path)) {
+            List<ColumnDescriptor> columns = reader.getFooter()
+                    .getFileMetaData()
+                    .getSchema()
+                    .getColumns();
+            NativeParquetColumnReader[] readers = new NativeParquetColumnReader[columns.size()];
+            for (int c = 0; c < columns.size(); c++) {
+                ColumnDescriptor cd = columns.get(c);
+                readers[c] = new NativeParquetColumnReader(cd, TypeMapping.vecTypeOf(schema.fields()[c].dataType()), schema.fields()[c].dataType(), cd.getPath()[0],
+                        BATCH_ROWS, allocator);
+            }
+            long rows = 0;
+            PageReadStore rg;
+            List<BlockMetaData> blocks = reader.getFooter().getBlocks();
+            int rgIndex = 0;
+            while ((rg = reader.readNextRowGroup()) != null) {
+                int rgRows = (int) blocks.get(rgIndex++).getRowCount();
+                for (int c = 0; c < columns.size(); c++) {
+                    readers[c].startRowGroup(rg.getPageReader(columns.get(c)), rgRows);
+                    int done = 0;
+                    while (done < rgRows) {
+                        int n = Math.min(BATCH_ROWS, rgRows - done);
+                        FieldVector v = switch (mode) {
+                            case STAGING -> readers[c].readBatchStaging(n);
+                            case DIRECT_A -> readers[c].readBatchDirectA(n);
+                            case DIRECT_B -> readers[c].readBatchDirectB(n);
+                        };
                         bh.consume(v);
                         rows += v.getValueCount();
                         readers[c].release(v);

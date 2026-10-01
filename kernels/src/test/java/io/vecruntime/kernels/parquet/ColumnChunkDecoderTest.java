@@ -421,6 +421,191 @@ class ColumnChunkDecoderTest {
     /** One prepared page: its kernel Page plus its value count, ready to feed. */
     private record PreparedPage(ColumnChunkDecoder.Page page, int valueCount) {}
 
+    // ---------------------------------------------------------------- direct-write variants (#559 study)
+
+    @Test
+    void directWriteMatchesInputPlainAndDictWithNullsAcrossPages() {
+        // The direct-write paths (readBatchDirectA / readBatchDirectB) must decode identically to the
+        // staging path: present values straight into the Arrow data segment at their row slots, validity
+        // written as 64-bit words. Batch size 384 does not divide the 1000-row pages, so batches span pages.
+        Random rnd = new Random(5591);
+        int rows = 4096;
+        Integer[] plain = new Integer[rows];
+        Integer[] dict = new Integer[rows];
+        int[] domain = {7, 11, 13, 42, 100, 256,
+                999};
+        for (int i = 0; i < rows; i++) {
+            plain[i] = rnd.nextInt(8) == 0 ? null : rnd.nextInt();
+            dict[i] = rnd.nextInt(8) == 0 ? null : domain[rnd.nextInt(domain.length)];
+        }
+        for (boolean modeA : new boolean[] {true, false}) {
+            try (Arena arena = Arena.ofConfined()) {
+                assertInt32(plain, decodePlainInt32Direct(plain, arena, 4, 384, modeA));
+            }
+            try (Arena arena = Arena.ofConfined()) {
+                assertInt32(dict, decodeDictInt32Direct(dict, arena, 4, 384, modeA));
+            }
+        }
+    }
+
+    @Test
+    void directWriteNoNullLaneWritesNoValidity() {
+        // A lane with no nulls (maxDefLevel 0) must take the no-validity fast path in both direct modes.
+        int rows = 2048;
+        Long[] v = new Long[rows];
+        for (int i = 0; i < rows; i++) {
+            v[i] = (long) i * 2654435761L;
+        }
+        for (boolean modeA : new boolean[] {true, false}) {
+            try (Arena arena = Arena.ofConfined()) {
+                DecodeResult r = decodePlainFixedDirect(v, VecType.INT64, arena, 3, 500, modeA);
+                assertEquals(0, r.nullCount, "no-null lane should report zero nulls");
+                assertNull(r.buffers.validity(), "no-null lane should expose no validity segment");
+                for (int i = 0; i < rows; i++) {
+                    assertEquals(v[i].longValue(), r.buffers.getLong(i), "row " + i);
+                }
+            }
+        }
+    }
+
+    private DecodeResult decodePlainInt32Direct(Integer[] v, Arena arena, int pages,
+            int batchRows, boolean modeA) {
+        return decodePlainFixedDirect(v, VecType.INT32, arena, pages, batchRows, modeA,
+                (i, seg, off) -> seg.set(LE_INT, off, v[i]));
+    }
+
+    private <T> DecodeResult decodePlainFixedDirect(T[] v, VecType type, Arena arena,
+            int pages, int batchRows, boolean modeA) {
+        FixedStore store = switch (type) {
+            case INT32 -> (i, seg, off) -> seg.set(LE_INT, off, (Integer) v[i]);
+            case INT64 -> (i, seg, off) -> seg.set(LE_LONG, off, (Long) v[i]);
+            default -> throw new IllegalArgumentException("unsupported direct test lane " + type);
+        };
+        return decodePlainFixedDirect(v, type, arena, pages, batchRows, modeA,
+                store);
+    }
+
+    private <T> DecodeResult decodePlainFixedDirect(
+            T[] v,
+            VecType type,
+            Arena arena,
+            int pages,
+            int batchRows,
+            boolean modeA,
+            FixedStore store) {
+        int rows = v.length;
+        boolean hasNulls = anyNull(v);
+        int maxDef = hasNulls ? 1 : 0;
+        ColumnChunkDecoder d = new ColumnChunkDecoder(type, type, maxDef, batchRows, scalarFactory());
+        List<PreparedPage> prepared = new ArrayList<>();
+        int start = 0;
+        for (int end : evenSplits(rows, pages)) {
+            byte[] page = plainFixedPage(v, type, start, end, maxDef, false,
+                    store);
+            prepared.add(
+                    new PreparedPage(ColumnChunkDecoder.Page.v1(page, end - start, ParquetPageDecoder.Encoding.PLAIN), end - start));
+            start = end;
+        }
+        return runStreamingDirect(d, prepared, type, rows, batchRows, hasNulls,
+                modeA, arena);
+    }
+
+    private DecodeResult decodeDictInt32Direct(Integer[] v, Arena arena, int pages,
+            int batchRows, boolean modeA) {
+        int rows = v.length;
+        List<Integer> dict = new ArrayList<>();
+        java.util.Map<Integer, Integer> idOf = new java.util.HashMap<>();
+        int[] ids = new int[rows];
+        for (int i = 0; i < rows; i++) {
+            if (v[i] == null) {
+                continue;
+            }
+            Integer id = idOf.computeIfAbsent(v[i], k -> {
+                dict.add(k);
+                return dict.size() - 1;
+            });
+            ids[i] = id;
+        }
+        MemorySegment dictData = ArrowLayout.allocateData(arena, VecType.INT32, Math.max(dict.size(), 1));
+        for (int i = 0; i < dict.size(); i++) {
+            dictData.set(LE_INT, (long) i << 2, dict.get(i));
+        }
+        VectorBuffers dictionary = SegmentVectorBuffers.fixedWidth(VecType.INT32, dict.size(), null, dictData);
+        ColumnChunkDecoder d = new ColumnChunkDecoder(VecType.INT32, 1, batchRows, scalarFactory());
+        d.startChunk(rows);
+        d.setDictionary(dictionary);
+        List<PreparedPage> prepared = new ArrayList<>();
+        int start = 0;
+        for (int end : evenSplits(rows, pages)) {
+            byte[] page = dictPage(v, ids, start, end, 1);
+            prepared.add(
+                    new PreparedPage(ColumnChunkDecoder.Page.v1(page, end - start, ParquetPageDecoder.Encoding.RLE_DICTIONARY), end - start));
+            start = end;
+        }
+        return runStreamingDirectInner(d, prepared, VecType.INT32, rows, batchRows, true,
+                modeA, arena);
+    }
+
+    /**
+     * Drives the direct-write loop as the reader does: each batch's present
+     * values and validity words are written STRAIGHT into the full-column Arrow
+     * segments at the batch's row offset ({@code dstBase = done}), via {@link
+     * ColumnChunkDecoder#readBatchDirectA} / {@link
+     * ColumnChunkDecoder#readBatchDirectB}. No staging, no per-batch copy.
+     */
+    private DecodeResult runStreamingDirect(
+            ColumnChunkDecoder d,
+            List<PreparedPage> pages,
+            VecType lane,
+            int rows,
+            int batchRows,
+            boolean hasNulls,
+            boolean modeA,
+            Arena arena) {
+        d.startChunk(rows);
+        return runStreamingDirectInner(d, pages, lane, rows, batchRows, hasNulls,
+                modeA, arena);
+    }
+
+    private DecodeResult runStreamingDirectInner(
+            ColumnChunkDecoder d,
+            List<PreparedPage> pages,
+            VecType lane,
+            int rows,
+            int batchRows,
+            boolean hasNulls,
+            boolean modeA,
+            Arena arena) {
+        MemorySegment outData = ArrowLayout.allocateData(arena, lane, Math.max(rows, 1));
+        MemorySegment outValidity = ArrowLayout.allocateBitmap(arena, Math.max(rows, 1));
+        if (hasNulls) {
+            outValidity.asSlice(0L, ((long) ((rows + 63) >>> 6)) * 8).fill((byte) 0);
+        }
+        java.nio.ByteBuffer nio = modeA ? null : outData.asByteBuffer();
+        int done = 0;
+        int pageIdx = 0;
+        int totalNulls = 0;
+        while (done < rows) {
+            int want = Math.min(batchRows, rows - done);
+            d.startBatch(want);
+            int filled = 0;
+            while (filled < want) {
+                if (d.needsPage()) {
+                    d.feedPage(pages.get(pageIdx++)
+                                    .page());
+                }
+                filled += modeA ? d.readBatchDirectA(want - filled, done + filled, outData,
+                        hasNulls ? outValidity : null)
+                        : d.readBatchDirectB(want - filled, done + filled, nio,
+                        hasNulls ? outValidity : null);
+            }
+            totalNulls += d.batchNullCount();
+            done += want;
+        }
+        MemorySegment viewValidity = hasNulls ? outValidity : null;
+        return new DecodeResult(SegmentVectorBuffers.fixedWidth(lane, rows, viewValidity, outData), totalNulls);
+    }
+
     /**
      * The streaming decode loop, exactly as the reader drives it: it fills batches
      * of {@code batchRows} rows, feeding a prepared page whenever the decoder
