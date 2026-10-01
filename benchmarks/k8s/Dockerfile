@@ -21,6 +21,9 @@ ARG AWS_SDK_V2_VERSION=2.35.4
 ARG AAL_VERSION=1.3.1
 ARG COMET_VERSION=1.0.0
 ARG ICEBERG_VERSION=1.11.0
+# Amazon Corretto Crypto Provider (#566): native AES-GCM / SHA-2 / HMAC for the S3 TLS + SigV4 path. On the
+# class path only; a run opts in with -Djava.security.properties=/opt/spark/accp/accp.security.
+ARG ACCP_VERSION=2.5.0
 
 # ---- build: our jars from this repository, dsdgen from tpcds-kit ------------------------------------
 FROM eclipse-temurin:25-jdk AS build
@@ -96,6 +99,7 @@ ARG AWS_SDK_V2_VERSION
 ARG AAL_VERSION
 ARG COMET_VERSION
 ARG ICEBERG_VERSION
+ARG ACCP_VERSION
 
 # The packages Spark's own Kubernetes Dockerfile installs (tini for PID 1, gosu for the entrypoint's
 # user switch, krb5/nss for the Hadoop client, procps/net-tools for diagnostics).
@@ -140,7 +144,10 @@ RUN cd /opt/spark/jars \
     && curl -fsSLO "https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-spark-runtime-4.1_2.13/${ICEBERG_VERSION}/iceberg-spark-runtime-4.1_2.13-${ICEBERG_VERSION}.jar" \
     && curl -fsSLO "https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-aws-bundle/${ICEBERG_VERSION}/iceberg-aws-bundle-${ICEBERG_VERSION}.jar" \
     && curl -fsSLO "https://repo1.maven.org/maven2/org/apache/spark/spark-sql_2.13/${SPARK_VERSION}/spark-sql_2.13-${SPARK_VERSION}-tests.jar" \
-    && curl -fsSLO "https://repo1.maven.org/maven2/org/apache/spark/spark-hadoop-cloud_2.13/${SPARK_VERSION}/spark-hadoop-cloud_2.13-${SPARK_VERSION}.jar"
+    && curl -fsSLO "https://repo1.maven.org/maven2/org/apache/spark/spark-hadoop-cloud_2.13/${SPARK_VERSION}/spark-hadoop-cloud_2.13-${SPARK_VERSION}.jar" \
+    && case "$(uname -m)" in aarch64) ACCP_ARCH=linux-aarch_64 ;; *) ACCP_ARCH=linux-x86_64 ;; esac \
+    && curl -fsSLO "https://repo1.maven.org/maven2/software/amazon/cryptools/AmazonCorrettoCryptoProvider/${ACCP_VERSION}/AmazonCorrettoCryptoProvider-${ACCP_VERSION}-${ACCP_ARCH}.jar"
+COPY benchmarks/k8s/accp.security /opt/spark/accp/accp.security
 
 COPY --from=build /src/benchmarks/target/benchmarks.jar /opt/spark/jars/benchmarks.jar
 COPY --from=build /src/iceberg-bridge.jar /opt/spark/jars/vecruntime-iceberg-bridge.jar
