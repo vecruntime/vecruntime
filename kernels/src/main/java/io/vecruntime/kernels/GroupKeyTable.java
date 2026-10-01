@@ -350,6 +350,22 @@ public final class GroupKeyTable {
         MemorySegment[] dictData = new MemorySegment[0];
         MemorySegment[] dictOffsets = new MemorySegment[0];
 
+        /*
+         * Heap mirrors (#565): INT32 lanes (and the indices of a dictionary-encoded UTF8 column in record
+         * mode) in ints, INT64 / FLOAT64 raw bits in longs, validity as 64-row words; null when the column
+         * has none. Reading the segments above per row still paid a liveness and a bounds check each --
+         * Bound.getInt was 7.5 % of q67's FFM check samples at 1 TB, Bound.isNull 1.8 %, getLong 1.8 % --
+         * because the receiver profile mixes the native batch columns with the heap id columns of
+         * toIds, so the accessors stay calls. One bulk copy per column per batch instead; the pools keep
+         * the arrays across batches.
+         */
+        int[][] ints = new int[0][];
+        long[][] longs = new long[0][];
+        long[][] validWords = new long[0][];
+        int[][] intPool = new int[0][];
+        long[][] longPool = new long[0][];
+        long[][] wordPool = new long[0][];
+
         private static final ThreadLocal<Bound> SCRATCH = ThreadLocal.withInitial(Bound::new);
 
         static Bound of(VectorBuffers[] keys, IdScratch idScratch) {
@@ -366,6 +382,14 @@ public final class GroupKeyTable {
                 b.dictData = new MemorySegment[n];
                 b.dictOffsets = new MemorySegment[n];
             }
+            if (b.ints.length < n) {
+                b.ints = new int[n][];
+                b.longs = new long[n][];
+                b.validWords = new long[n][];
+                b.intPool = Arrays.copyOf(b.intPool, n);
+                b.longPool = Arrays.copyOf(b.longPool, n);
+                b.wordPool = Arrays.copyOf(b.wordPool, n);
+            }
             for (int c = 0; c < n; c++) {
                 VectorBuffers k = keys[c];
                 b.keys[c] = k;
@@ -378,8 +402,53 @@ public final class GroupKeyTable {
                 VectorBuffers d = dict ? k.dictionary() : null;
                 b.dictData[c] = d == null ? null : d.data();
                 b.dictOffsets[c] = d == null ? null : d.offsets();
+                b.mirror(c, k, dict);
             }
             return b;
+        }
+
+        /** Fills column {@code c}'s heap mirrors (see the fields). */
+        private void mirror(int c, VectorBuffers k, boolean dict) {
+            int rows = k.length();
+            VecType t = k.type();
+            ints[c] = null;
+            longs[c] = null;
+            if (t == VecType.INT32 && ids[c] != null) {
+                ints[c] = ids[c]; // toIds' column: its data segment is a view of this very array
+            } else if (t == VecType.INT32 || dict) {
+                int[] a = intPool[c];
+                if (a == null || a.length < rows) {
+                    a = new int[Math.max(rows, a == null ? 4096 : a.length * 2)];
+                    intPool[c] = a;
+                }
+                MemorySegment.copy(k.data(), VectorBuffers.LE_INT, 0L, a, 0,
+                        rows);
+                ints[c] = a;
+            } else if (t == VecType.INT64 || t == VecType.FLOAT64) {
+                long[] a = longPool[c];
+                if (a == null || a.length < rows) {
+                    a = new long[Math.max(rows, a == null ? 4096 : a.length * 2)];
+                    longPool[c] = a;
+                }
+                MemorySegment.copy(k.data(), VectorBuffers.LE_LONG, 0L, a, 0,
+                        rows);
+                longs[c] = a;
+            }
+            MemorySegment v = k.validity();
+            if (v == null) {
+                validWords[c] = null;
+            } else {
+                int words = Bitmap.wordsFor(rows);
+                long[] w = wordPool[c];
+                if (w == null || w.length < words) {
+                    w = new long[Math.max(words, w == null ? 64 : w.length * 2)];
+                    wordPool[c] = w;
+                }
+                for (int i = 0; i < words; i++) {
+                    w[i] = Bitmap.wordAt(v, i, rows);
+                }
+                validWords[c] = w;
+            }
         }
 
         int getId(int c, int row) {
@@ -387,20 +456,20 @@ public final class GroupKeyTable {
         }
 
         boolean isNull(int c, int row) {
-            MemorySegment v = validity[c];
-            return v != null && !Bitmap.isSet(v, row);
+            long[] v = validWords[c];
+            return v != null && ((v[row >>> 6] >>> row) & 1L) == 0L;
         }
 
         int getInt(int c, int row) {
-            return data[c].get(VectorBuffers.LE_INT, (long) row << 2);
+            return ints[c][row];
         }
 
         long getLong(int c, int row) {
-            return data[c].get(VectorBuffers.LE_LONG, (long) row << 3);
+            return longs[c][row];
         }
 
         double getDouble(int c, int row) {
-            return data[c].get(VectorBuffers.LE_DOUBLE, (long) row << 3);
+            return Double.longBitsToDouble(longs[c][row]);
         }
 
         boolean getBoolean(int c, int row) {
@@ -556,7 +625,24 @@ public final class GroupKeyTable {
         VectorBuffers[] lastDict = new VectorBuffers[0];
         int[] offs = new int[0];
         byte[] bytes = new byte[0];
+        long[] wordScratch = new long[0];
         final StringDictionary.Scratch entryBytes = new StringDictionary.Scratch();
+
+        /**
+         * The first {@code n} bits of {@code validity} as words, in an array
+         * reused by every column of the call (each column reads its words
+         * before the next one fills it).
+         */
+        long[] words(MemorySegment validity, int n) {
+            int words = Bitmap.wordsFor(n);
+            if (wordScratch.length < words) {
+                wordScratch = new long[Math.max(words, wordScratch.length * 2)];
+            }
+            for (int w = 0; w < words; w++) {
+                wordScratch[w] = Bitmap.wordAt(validity, w, n);
+            }
+            return wordScratch;
+        }
 
         private static final ThreadLocal<IdScratch> SCRATCH = ThreadLocal.withInitial(IdScratch::new);
 
@@ -643,13 +729,18 @@ public final class GroupKeyTable {
                 MemorySegment dOff = d.offsets();
                 MemorySegment dData = d.data();
                 MemorySegment dValidity = d.validity();
-                MemorySegment idx = key.data();
+                // The rows' dictionary indices land in ids first and are replaced in place by the group
+                // dictionary's ids; the validity is read as words. One bulk move each instead of an index
+                // and a bit through the segments per row (#565: 2.1 % + 0.9 % of q67's FFM check samples).
+                MemorySegment.copy(key.data(), VectorBuffers.LE_INT, 0L, ids, 0,
+                        n);
+                long[] valid = validity == null ? null : s.words(validity, n);
                 for (int i = 0; i < n; i++) {
-                    if (validity != null && !Bitmap.isSet(validity, i)) {
+                    if (valid != null && ((valid[i >>> 6] >>> i) & 1L) == 0L) {
                         ids[i] = 0;
                         continue;
                     }
-                    int e = idx.get(VectorBuffers.LE_INT, (long) i << 2);
+                    int e = ids[i];
                     if (entryGen[e] != gen) {
                         int id;
                         if (dValidity != null && !Bitmap.isSet(dValidity, e)) {
@@ -676,8 +767,9 @@ public final class GroupKeyTable {
                 byte[] bytes = s.bytes;
                 MemorySegment.copy(key.data(), ValueLayout.JAVA_BYTE, first, bytes, 0,
                         total);
+                long[] valid = validity == null ? null : s.words(validity, n);
                 for (int i = 0; i < n; i++) {
-                    if (validity != null && !Bitmap.isSet(validity, i)) {
+                    if (valid != null && ((valid[i >>> 6] >>> i) & 1L) == 0L) {
                         ids[i] = 0;
                         continue;
                     }
