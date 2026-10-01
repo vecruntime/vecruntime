@@ -24,6 +24,7 @@ import io.vecruntime.kernels.GatherKernels;
 import io.vecruntime.kernels.HeapMirror;
 import io.vecruntime.kernels.RunMerge;
 import io.vecruntime.kernels.RunMirrors;
+import io.vecruntime.kernels.Utf8Mirror;
 import io.vecruntime.kernels.VecType;
 import io.vecruntime.kernels.VectorBuffers;
 import io.vecruntime.spark.adapter.TypeMapping;
@@ -448,6 +449,41 @@ public final class ArrowOutput {
         ArrowVectorBuffers out = allocateFixed(name, dt, count, allocator);
         GatherKernels.gatherFixed(in, idx, from, to, out.data(),
                 nulls ? out.validity() : null);
+        return finish(out, count, !nulls);
+    }
+
+    /**
+     * Gathers rows {@code idx[from..to)} of a heap-mirrored plain UTF8 column
+     * into a new Arrow vector (#565): the per-row reads and the byte moves are on
+     * heap arrays, the result two bulk copies. A negative index pads a null row.
+     */
+    public static ColumnVector gatherUtf8Heap(
+            String name,
+            Utf8Mirror in,
+            int[] idx,
+            int from,
+            int to,
+            BufferAllocator allocator,
+            Utf8Mirror.Scratch scratch) {
+        int count = to - from;
+        boolean padded = false;
+        for (int o = from;
+             o < to && !padded;
+             o++) {
+            padded = idx[o] < 0;
+        }
+        boolean nulls = in.hasNulls() || padded;
+        long bytes = in.bytes(idx, from, to);
+        ArrowVectorBuffers out = allocateUtf8(name, count, bytes, allocator);
+        in.gather(
+                idx,
+                from,
+                to,
+                bytes,
+                out.offsets(),
+                out.data(),
+                nulls ? out.validity() : null,
+                scratch);
         return finish(out, count, !nulls);
     }
 
