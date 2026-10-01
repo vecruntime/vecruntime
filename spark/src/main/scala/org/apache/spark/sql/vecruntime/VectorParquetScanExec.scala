@@ -762,15 +762,24 @@ private[vecruntime] final class VectorParquetPartitionReader(
 private[vecruntime] object VectorParquetPartitionReader {
 
   /**
-   * The prefetch threads (`prefetchFiles` or `prefetchRowGroups` > 0): virtual threads, one per
-   * file open / row-group read in flight. Every prefetched step is a blocking S3 read (S3A and the Analytics
-   * Accelerator are blocking APIs), so a virtual thread parks for free while it waits, and the number in
-   * flight is bounded by each reader's depth, not by a pool size.
+   * The prefetch threads (`prefetchFiles` or `prefetchRowGroups` > 0): daemon platform threads, cached and
+   * reused, one per file open / row-group read in flight, so the number alive is bounded by the executor's
+   * task slots times each reader's depth rather than by a pool size.
+   *
+   * Not virtual threads: a file open runs Parquet's and the S3 client's class initializers and loggers, and on
+   * JDK 25 a virtual thread blocked in a class initializer (or waiting on one) still pins its carrier. On
+   * 1 TB TPC-DS q88 every carrier of one executor ended up pinned behind `BloomFilterImpl.<clinit>`, which
+   * waited for a log4j lock held by an unmounted virtual thread that could no longer get a carrier: the
+   * executor's 13 tasks hung with no CPU use. Platform threads cannot starve that way.
    */
-  lazy val prefetchPool: java.util.concurrent.ExecutorService =
-    java.util.concurrent.Executors.newThreadPerTaskExecutor(
-      Thread.ofVirtual().name("vecruntime-parquet-prefetch-", 0).factory()
-    )
+  lazy val prefetchPool: java.util.concurrent.ExecutorService = {
+    val count = new java.util.concurrent.atomic.AtomicInteger()
+    java.util.concurrent.Executors.newCachedThreadPool { (r: Runnable) =>
+      val t = new Thread(r, s"vecruntime-parquet-prefetch-${count.getAndIncrement()}")
+      t.setDaemon(true)
+      t
+    }
+  }
 
   /** The value of a prefetched step; its failure is rethrown as the original exception. */
   def await[T](f: java.util.concurrent.Future[T]): T =

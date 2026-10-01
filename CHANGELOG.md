@@ -26,7 +26,7 @@ version may change configuration keys or defaults, always noted here.
 - `spark.vecruntime.scan.nativeParquet.prefetchFiles` (default `6`) and
   `spark.vecruntime.scan.nativeParquet.prefetchRowGroups` (default `2`), `0` off, capped at 16: how far
   `VectorParquetScanExec` reads ahead (#559/#566). The next N files of a split are opened (status, footer,
-  first row group), and the next M row groups of the current file are read, on virtual threads while the
+  first row group), and the next M row groups of the current file are read, on background threads while the
   task thread decodes; the row-group reads are a chained `CompletableFuture` pipeline, so a file's
   `ParquetFileReader` is used by one thread at a time and in order. At 1 TB TPC-DS (store_sales is ~14.6k
   files of ~7 MB, mostly one row group each) task threads were parked on S3 at least 66% of the time; same

@@ -332,7 +332,7 @@ object VectorConf {
 
   /**
    * How many files of a split `VectorParquetScanExec` opens ahead (#559/#566): status, footer and first row
-   * group, on virtual threads while the task thread decodes. Pays off on splits made of many small files
+   * group, on background threads while the task thread decodes. Pays off on splits made of many small files
    * (1 TB TPC-DS store_sales is ~14.6k files of ~7 MB). `0` opens each file on the task thread. Memory per
    * task grows by up to N opened files and their first row groups (compressed pages). Capped at 16.
    */
