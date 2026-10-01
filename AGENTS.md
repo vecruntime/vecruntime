@@ -785,6 +785,45 @@ benchmarks/scripts/profile-query.sh - vector q6 --flags-only   # the recording f
   frame before blaming a kernel.
 - Only when the profile is understood do the fix, the doc entry and the rerun follow, in that order.
 
+### async-profiler, alongside JFR
+
+[async-profiler](https://github.com/async-profiler/async-profiler) (4.5, Apache-2.0) complements JFR
+for the cases where JFR's `jdk.ExecutionSample` cannot answer. Use JFR for what it records best (GC,
+allocation, `jdk.Deoptimization`, `jdk.SocketRead`, `jdk.ThreadPark`, per-event stacks); reach for
+async-profiler when:
+
+- **Native code matters.** JFR samples Java frames only (`jdk.NativeMethodSample` shows that a thread is
+  in native, not where). async-profiler walks native and kernel frames: Comet's Rust scan behind
+  `Native.executePlan`, zstd/snappy in JNI, `memcpy`, page faults, syscalls. Comparing our engine with
+  Comet needs this; a JFR of a Comet run cannot see Comet's own threads.
+- **Time is not CPU.** `-e wall` samples every thread whether running or blocked, so a query that is
+  slower with the same CPU (stalls, stragglers, waits on S3 or on a lock) shows where the time goes.
+  The q67 investigation of #559 had two runs with equal CPU samples and a 17 s gap that the CPU profile
+  could not explain.
+- **Hardware counters.** `-e cache-misses`, `-e cycles`, `-e branch-misses` (perf_events): for kernel
+  work, e.g. whether a hash probe or a gather is memory-bound.
+- **Inlining and the FFM checks.** Flame graphs show inlined frames per call path, so a
+  `checkValidStateRaw` / `checkBounds` hot spot is attributed to the exact loop (see #565).
+
+Usage (the launcher `asprof`, or as an agent at JVM start):
+
+```bash
+asprof -e cpu  -d 60 -f /tmp/cpu.html  <pid>     # CPU flame graph (perf_events, falls back to itimer)
+asprof -e wall -t -d 60 -f /tmp/wall.html <pid>  # wall clock, per thread: stalls and waits
+asprof -e cpu,alloc,lock -d 60 -f /tmp/p.jfr <pid>   # several events into one .jfr (jfr / JMC readable)
+# executor JVM at start, e.g. via EXEC_JAVA_OPTS:
+-agentpath:/opt/async-profiler/lib/libasyncProfiler.so=start,event=cpu,interval=10ms,file=/tmp/exec-%p.jfr
+```
+
+- In containers perf_events usually needs `kernel.perf_event_paranoid<=1` and `CAP_PERFMON` /
+  `CAP_SYS_ADMIN`; without them use `-e itimer` (CPU only, no kernel frames, still native frames) or
+  `-e ctimer`. The executor image must carry the `linux-x64` / `linux-arm64` build for its
+  architecture; copy the output out of the pod while the application runs, as for JFR.
+- `-XX:+UnlockDiagnosticVMOptions -XX:+DebugNonSafepoints` gives accurate line attribution of inlined
+  frames (JFR benefits from it too).
+- Same rule as JFR: profile first, explain after, and record which tool and event mode the evidence
+  came from.
+
 ## 10. Benchmarking protocol
 
 - Locally: one JVM per configuration, `local[8]`, 8 GB heap, `spark.sql.shuffle.partitions=8`; SF1
