@@ -43,6 +43,7 @@ import java.lang.foreign.ValueLayout;
 public final class RleBitPackingReader {
 
     private static final ValueLayout.OfByte BYTE = ValueLayout.JAVA_BYTE;
+    private static final ValueLayout.OfLong LE_LONG = ValueLayout.JAVA_LONG_UNALIGNED.withOrder(java.nio.ByteOrder.LITTLE_ENDIAN);
 
     private final MemorySegment page;
     private final long end;
@@ -177,6 +178,111 @@ public final class RleBitPackingReader {
                 }
             }
         }
+    }
+
+    /**
+     * The width-1 batch path, for BOOLEAN pages: ORs the next {@code n} values
+     * into the LSB-first bitmap {@code words} at bits {@code [dstBit, dstBit +
+     * n)}, which must be zero. An RLE run of 1s sets its bit range a word at a
+     * time (a run of 0s writes nothing), and a bit-packed run at width 1 is
+     * already such a bitmap -- one byte per group of 8 -- so it moves 64 bits
+     * per step instead of one value per {@code int}. Leaves the reader
+     * positioned exactly as {@code n} calls to {@link #readInt} would.
+     */
+    public void readBits(long[] words, int dstBit, int n) {
+        if (bitWidth != 1) {
+            throw new IllegalStateException("readBits needs bit width 1, not " + bitWidth);
+        }
+        int remaining = n;
+        int d = dstBit;
+        // Drain any partial bit-packed group left in `packed` first (from an earlier readInt).
+        while (remaining > 0 && packedRemaining > 0 && packedIndex < 8) {
+            words[d >>> 6] |= (long) packed[packedIndex++] << (d & 63);
+            d++;
+            packedRemaining--;
+            remaining--;
+        }
+        while (remaining > 0) {
+            if (rleRemaining == 0 && packedRemaining == 0) {
+                readRunHeader();
+            }
+            if (rleRemaining > 0) {
+                int take = Math.min(remaining, rleRemaining);
+                if ((rleValue & 1) != 0) {
+                    setBits(words, d, take);
+                }
+                d += take;
+                rleRemaining -= take;
+                remaining -= take;
+            } else {
+                // Whole groups: each is one byte of 8 values, LSB first -- copy up to 8 bytes (64 values) a step.
+                int bytes = Math.min(remaining, packedRemaining) >>> 3;
+                while (bytes > 0) {
+                    int k = Math.min(bytes, 8);
+                    if (pos + k > end) {
+                        throw new IllegalStateException("RLE/bit-packed stream ended inside a bit-packed run");
+                    }
+                    long v = loadLittleEndian(pos, k);
+                    int bits = k << 3;
+                    int w = d >>> 6;
+                    int s = d & 63;
+                    words[w] |= v << s;
+                    if (s != 0 && s + bits > 64) {
+                        words[w + 1] |= v >>> (64 - s);
+                    }
+                    pos += k;
+                    d += bits;
+                    bytes -= k;
+                    packedRemaining -= bits;
+                    remaining -= bits;
+                }
+                if (remaining > 0 && packedRemaining > 0) {
+                    // A tail shorter than a group: fall back to the buffered group.
+                    refillPackedGroup();
+                    int take = Math.min(remaining, Math.min(8, packedRemaining));
+                    for (int i = 0; i < take; i++) {
+                        words[d >>> 6] |= (long) packed[packedIndex++] << (d & 63);
+                        d++;
+                    }
+                    packedRemaining -= take;
+                    remaining -= take;
+                }
+            }
+        }
+    }
+
+    /**
+     * Sets bits {@code [from, from + len)} of the LSB-first bitmap {@code
+     * words}; {@code len > 0}.
+     */
+    private static void setBits(long[] words, int from, int len) {
+        int last = from + len - 1;
+        int w0 = from >>> 6;
+        int w1 = last >>> 6;
+        long head = -1L << (from & 63);
+        long tail = -1L >>> (63 - (last & 63));
+        if (w0 == w1) {
+            words[w0] |= head & tail;
+            return;
+        }
+        words[w0] |= head;
+        java.util.Arrays.fill(words, w0 + 1, w1, -1L);
+        words[w1] |= tail;
+    }
+
+    /**
+     * {@code k} (1..8) little-endian bytes at {@code at}, as the low bytes of a
+     * long.
+     */
+    private long loadLittleEndian(long at, int k) {
+        if (k == 8 && at + 8 <= page.byteSize()) {
+            return page.get(LE_LONG, at);
+        }
+        long v = 0L;
+        for (int i = 0; i < k; i++) {
+            v |= ((long) (page.get(BYTE, at + i) & 0xFF)) << (8 * i);
+        }
+        return v;
     }
 
     /**

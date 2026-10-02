@@ -1135,27 +1135,16 @@ public final class ColumnChunkDecoder {
     private void decodeBool(int dstBase, int[] present, int presentCount) {
         long[] words = boolWords;
         if (boolReader != null) {
+            if (present == null) {
+                // Straight into the bitmap: RLE runs as bit ranges, bit-packed runs 64 bits a step.
+                boolReader.readBits(words, dstBase, presentCount);
+                return;
+            }
             int[] v = id(presentCount);
             boolReader.readInts(v, 0, presentCount);
-            if (present == null) {
-                // Pack 64 values per word: one branch-free OR per value.
-                int k = 0;
-                while (k < presentCount) {
-                    int row = dstBase + k;
-                    int bit = row & 63;
-                    int take = Math.min(64 - bit, presentCount - k);
-                    long w = 0L;
-                    for (int j = 0; j < take; j++) {
-                        w |= (long) (v[k + j] & 1) << (bit + j);
-                    }
-                    words[row >>> 6] |= w;
-                    k += take;
-                }
-            } else {
-                for (int k = 0; k < presentCount; k++) {
-                    int row = dstBase + present[k];
-                    words[row >>> 6] |= (long) (v[k] & 1) << (row & 63);
-                }
+            for (int k = 0; k < presentCount; k++) {
+                int row = dstBase + present[k];
+                words[row >>> 6] |= (long) (v[k] & 1) << (row & 63);
             }
             return;
         }
