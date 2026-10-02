@@ -40,6 +40,15 @@ version may change configuration keys or defaults, always noted here.
   `fs.s3a.connection.maximum` 200 -> 1000, `fs.s3a.threads.max` 256, `fs.s3a.max.total.tasks` 128 and the
   Analytics Accelerator's `physicalio.thread.pool.size` 192 (the values every 1 TB #559 A/B round ran with).
 
+### Fixed
+
+- String sorts no longer fall into a C2 deoptimization storm (#559). The sort comparators now have their own
+  byte comparison (`StringCompareKernels.compareBytesForSort`), whose branch profile is warmed at class
+  initialization over every path. Before, a JVM whose first sorts never ran the 8-byte word loop out got
+  that exit compiled as an `unstable_if` trap with action `none`. On 1 TB TPC-DS with q67 after the
+  scan-heavy queries in one app, 1-3 of 8 executors then ran q67's sort stage at ~2.3x CPU for the rest of
+  the app; the deoptimization log showed 411k-832k such traps per executor.
+
 ## 0.0.4 -- 2026-09-30
 
 `ObjectHashAggregateExec` for `bloom_filter_agg`, `collect_list` and `collect_set`, with spill; a

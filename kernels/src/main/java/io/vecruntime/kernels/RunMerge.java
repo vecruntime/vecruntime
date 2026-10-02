@@ -454,7 +454,7 @@ public final class RunMerge {
         int ea = offA.get(VectorBuffers.LE_INT, (long) (i + 1) << 2);
         int sb = offB.get(VectorBuffers.LE_INT, (long) j << 2);
         int eb = offB.get(VectorBuffers.LE_INT, (long) (j + 1) << 2);
-        return Integer.signum(StringCompareKernels.compareBytes(a.data(), sa, ea, b.data(),
+        return Integer.signum(StringCompareKernels.compareBytesForSort(a.data(), sa, ea, b.data(),
                 sb, eb));
     }
 
