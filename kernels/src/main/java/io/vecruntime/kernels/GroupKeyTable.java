@@ -624,7 +624,7 @@ public final class GroupKeyTable {
         int[] gen = new int[0];
         VectorBuffers[] lastDict = new VectorBuffers[0];
         GroupKeyTable[] lastTable = new GroupKeyTable[0]; // per column: the table the entry map is for
-        boolean[] lastInsert = new boolean[0]; // per column: whether the map was made by an insert
+        boolean[] lastInsert = new boolean[0]; // per column: whether only inserts used the map (no -1 cached)
         int[] offs = new int[0];
         byte[] bytes = new byte[0];
         long[] wordScratch = new long[0];
@@ -737,6 +737,11 @@ public final class GroupKeyTable {
                         Arrays.fill(entryGen, 0);
                         s.gen[c] = 1;
                     }
+                }
+                if (!insert) {
+                    // A lookup that reuses an insert's map still caches its misses as -1 in it (#593), so the
+                    // map no longer counts as an insert's: the next insert must rebuild it.
+                    s.lastInsert[c] = false;
                 }
                 int gen = s.gen[c];
                 MemorySegment dOff = d.offsets();
