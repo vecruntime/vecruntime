@@ -73,6 +73,11 @@ public final class ParquetPageDecoder {
         PLAIN,
         RLE_DICTIONARY,
         /**
+         * BOOLEAN values as an RLE/bit-packed hybrid at width 1, 4-byte length
+         * prefixed (#559). {@link ColumnChunkDecoder} only.
+         */
+        RLE,
+        /**
          * INT32/INT64 deltas (#559 slice 2). Decoded by {@link ColumnChunkDecoder}
          * through {@link DeltaBinaryPackedReader}; not by this one-shot decoder.
          */

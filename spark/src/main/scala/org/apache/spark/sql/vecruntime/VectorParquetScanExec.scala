@@ -652,6 +652,19 @@ private[vecruntime] final class VectorParquetPartitionReader(
   private def hasUnsupportedEncodingInFooter(footer: ParquetMetadata, clipped: MessageType): Boolean = {
     val wanted = new java.util.HashSet[String]()
     clipped.getColumns.forEach(cd => wanted.add(cd.getPath()(0).toLowerCase(java.util.Locale.ROOT)))
+    // The planner admits a column by its Spark type; the file decides how it is stored. A decimal(p <= 18) may
+    // be INT32, INT64, FIXED_LEN_BYTE_ARRAY or BYTE_ARRAY in a given file, and only the first two have a
+    // decode path today -- the bytes of the others are not an INT64 lane. Check every requested column's
+    // physical type against its lane, per file, before any decode.
+    var f = 0
+    while (f < requiredSchema.length) {
+      val field = requiredSchema.fields(f)
+      val cd = clipped.getColumns.asScala.find(_.getPath()(0).equalsIgnoreCase(field.name))
+      if (cd.isDefined && !VectorParquetScanExec.physicalMatches(field.dataType, cd.get.getPrimitiveType)) {
+        return true
+      }
+      f += 1
+    }
     val blocks = footer.getBlocks
     var b = 0
     while (b < blocks.size()) {
@@ -806,6 +819,34 @@ object VectorParquetScanExec {
     "DELTA_BYTE_ARRAY" -> Set(BINARY),
     "BYTE_STREAM_SPLIT" -> Set(INT32, INT64, DOUBLE)
   )
+
+  /**
+   * True if a file column stored as `physical` decodes into the lane of the Spark type `dt`: INT32 for int and
+   * date (and widened into a bigint lane); INT64 for bigint; DOUBLE; BOOLEAN; BINARY for string; INT32 / INT64
+   * for a decimal with precision <= 18 (a FIXED_LEN_BYTE_ARRAY or BYTE_ARRAY decimal is not an INT64 lane).
+   * Any other pairing makes the file fall over to Spark's reader.
+   */
+  def physicalMatches(dt: org.apache.spark.sql.types.DataType, physical: PrimitiveType): Boolean = {
+    import org.apache.spark.sql.types._
+    val p = physical.getPrimitiveTypeName
+    dt match {
+      case IntegerType | DateType => p == INT32
+      case LongType =>
+        // INT32 widens by sign extension, so an unsigned INT32 (Spark reads UINT_32 as a long) does not match.
+        p == INT64 || (p == INT32 && !isUnsigned(physical))
+      case DoubleType => p == DOUBLE
+      case BooleanType => p == PrimitiveType.PrimitiveTypeName.BOOLEAN
+      case _: StringType => p == BINARY
+      case d: DecimalType =>
+        (p == INT32 && d.precision <= 9) || (p == INT64 && d.precision <= 18)
+      case _ => false
+    }
+  }
+
+  private def isUnsigned(physical: PrimitiveType): Boolean = physical.getLogicalTypeAnnotation match {
+    case i: org.apache.parquet.schema.LogicalTypeAnnotation.IntLogicalTypeAnnotation => !i.isSigned
+    case _ => false
+  }
 
   /** True if a column chunk of physical type `physical` using `encoding` can be decoded natively. */
   def supportsEncoding(encoding: String, physical: PrimitiveType.PrimitiveTypeName): Boolean =
