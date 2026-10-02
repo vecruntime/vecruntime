@@ -36,6 +36,51 @@ class HeapMirrorReuseTest {
 
     @Test
     void reusedMirrorsGatherLikeTheSegments() {
+        runStream(false);
+    }
+
+    /**
+     * The same stream with every batch's mirror handed to the thread's
+     * {@link HeapMirror.Stash} and the next one built with no {@code prev}, as
+     * across two map tasks' writers: the stashed arrays come back dirty and
+     * longer than the batch.
+     */
+    @Test
+    void stashedArraysGatherLikeTheSegments() {
+        runStream(true);
+    }
+
+    /** The stash holds no more than its budget, and hands an array out only once. */
+    @Test
+    void stashIsBoundedAndHandsOutOnce() throws Exception {
+        java.util.concurrent.atomic.AtomicReference<Throwable> err = new java.util.concurrent.atomic.AtomicReference<>();
+        Thread worker = new Thread(
+                () -> {
+                    HeapMirror.Stash s = HeapMirror.Stash.local();
+                    int big = (int) (HeapMirror.Stash.MAX_BYTES / 8 / 3);
+                    HeapMirror[] ms = new HeapMirror[5];
+                    try (Arena arena = Arena.ofConfined()) {
+                        Random rnd = new Random(1);
+                        for (int i = 0; i < ms.length; i++) {
+                            ms[i] = HeapMirror.reuse(TestData.longs(arena, rnd, big, null), null);
+                        }
+                    }
+                    s.give(ms);
+                    assertTrue(s.bytes() <= HeapMirror.Stash.MAX_BYTES, "bytes " + s.bytes());
+                    long[] a = s.takeLongs(big);
+                    long[] b = s.takeLongs(big);
+                    org.junit.jupiter.api.Assertions.assertNotSame(a, b, "same array handed out twice");
+                    assertTrue(a.length >= big && b.length >= big);
+                });
+        worker.setUncaughtExceptionHandler((th, e) -> err.set(e));
+        worker.start();
+        worker.join();
+        if (err.get() != null) {
+            throw new AssertionError(err.get());
+        }
+    }
+
+    private static void runStream(boolean viaStash) {
         Random rnd = new Random(565);
         int[] sizes = {4097, 10, 1000, 64, 65, 5000,
                 3, 4097};
@@ -53,7 +98,15 @@ class HeapMirrorReuseTest {
                 };
                 assertTrue(HeapMirror.mirrorsForGather(in),
                         in.type().toString());
-                HeapMirror m = HeapMirror.reuse(in, prev);
+                HeapMirror m;
+                if (viaStash) {
+                    if (prev != null) {
+                        HeapMirror.Stash.local().give(new HeapMirror[] {prev});
+                    }
+                    m = HeapMirror.reuse(in, null);
+                } else {
+                    m = HeapMirror.reuse(in, prev);
+                }
                 prev = m;
                 int count = rnd.nextInt(2 * n + 1);
                 int[] idx = new int[count];
