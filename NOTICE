@@ -16,5 +16,10 @@ This product depends on, but does not bundle, the following software, each under
 The `upstream/` directory carries a standalone reproduction and issue write-up for an Apache Spark
 bug (SPARK-55679); it contains no Apache Spark source.
 
+The test resources under `spark/src/test/resources/parquet-testing/` are Parquet files from the
+Apache Parquet project's `apache/parquet-testing` repository (Apache License 2.0; the source commit
+is in `SOURCE_SHA` there). They are used by the tests only and are not part of any built artifact.
+Apache Parquet, Copyright The Apache Software Foundation.
+
 The benchmarks use the TPC-H and TPC-DS specifications and dsdgen/dbgen from the TPC (Transaction
 Processing Performance Council); results are not audited TPC results and are labeled as such.

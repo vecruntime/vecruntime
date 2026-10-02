@@ -34,6 +34,8 @@ version may change configuration keys or defaults, always noted here.
 
 ### Added
 
+- BOOLEAN columns in the native Parquet scan (#559): v1 `PLAIN` (bit-packed) and v2 `RLE` pages, decoded into a bit-packed lane. JMH on x86, one 20,000-value page: `PLAIN` at 837 pages per ms against 10.7 for parquet-java's reader, `RLE` at 212 against 11.2. `RLE` is decoded straight into the bitmap: runs set as bit ranges, bit-packed runs moved 64 bits a step.
+- `ParquetTestingCorpusSuite`: 27 files from the Apache Parquet conformance corpus (`apache/parquet-testing`, Apache-2.0, vendored for tests) read column by column against Spark's reader, plus 3 corrupt files that must be refused.
 - The native Parquet scan (`spark.vecruntime.scan.nativeParquet.enabled`) decodes `DELTA_BINARY_PACKED`
   INT32 and INT64 columns, #559 slice 2: ints, bigints, dates and decimals with precision <= 18. This is the
   encoding parquet-java writes for those columns when `parquet.writer.version=v2` and the column is not

@@ -243,6 +243,54 @@ class DeltaBinaryPackedCrossCheckSuite extends AnyFunSuite {
     }
   }
 
+  test("BOOLEAN pages from parquet-java's PLAIN and RLE writers decode identically, also against its readers") {
+    // PLAIN: BooleanPlainValuesWriter (bit-packed); RLE: RunLengthBitPackingHybridValuesWriter at width 1,
+    // which writes the 4-byte length prefix itself. Both checked against the input and parquet-java's own
+    // readers over the same bytes.
+    val rnd = new Random(55920)
+    for (n <- lengths; batch <- Seq(7, 64, 1000); rle <- Seq(false, true)) {
+      val v = Array.tabulate(n)(i => if ((i / 50) % 2 == 0) rnd.nextBoolean() else (i / 130) % 2 == 0)
+      val alloc = HeapByteBufferAllocator.getInstance()
+      val bytes =
+        if (rle) {
+          val w = new org.apache.parquet.column.values.rle.RunLengthBitPackingHybridValuesWriter(1, 64, 1 << 20, alloc)
+          v.foreach(w.writeBoolean)
+          w.getBytes.toByteArray
+        } else {
+          val w = new org.apache.parquet.column.values.plain.BooleanPlainValuesWriter()
+          v.foreach(w.writeBoolean)
+          w.getBytes.toByteArray
+        }
+      val ref: org.apache.parquet.column.values.ValuesReader =
+        if (rle) new org.apache.parquet.column.values.rle.RunLengthBitPackingHybridValuesReader(1)
+        else new org.apache.parquet.column.values.plain.BooleanPlainValuesReader()
+      ref.initFromPage(n, org.apache.parquet.bytes.ByteBufferInputStream.wrap(java.nio.ByteBuffer.wrap(bytes)))
+      val refValues = Array.fill(n)(ref.readBoolean())
+      assert(refValues.sameElements(v), s"parquet-java's own reader disagrees with its writer (n=$n rle=$rle)")
+      val enc = if (rle) ParquetPageDecoder.Encoding.RLE else ParquetPageDecoder.Encoding.PLAIN
+      val d = new ColumnChunkDecoder(VecType.BOOL, 0, batch, bytePackers)
+      d.startChunk(n)
+      var row = 0
+      while (row < n) {
+        val want = math.min(batch, n - row)
+        d.startBatch(want)
+        var filled = 0
+        while (filled < want) {
+          if (d.needsPage()) d.feedPage(ColumnChunkDecoder.Page.v1(bytes, bytes.length, n, enc))
+          filled += d.readBatch(want - filled, filled)
+        }
+        val arena = Arena.ofConfined()
+        try {
+          val data = ArrowLayout.allocateBitmap(arena, want)
+          d.flushBool(want, data, null)
+          val col = SegmentVectorBuffers.fixedWidth(VecType.BOOL, want, null, data)
+          for (k <- 0 until want) assert(col.getBoolean(k) == v(row + k), s"n=$n batch=$batch rle=$rle row ${row + k}")
+        } finally arena.close()
+        row += want
+      }
+    }
+  }
+
   test("BYTE_STREAM_SPLIT pages from parquet-java's writers decode identically (INT32, INT64, DOUBLE)") {
     val rnd = new Random(55913)
     val alloc = HeapByteBufferAllocator.getInstance()

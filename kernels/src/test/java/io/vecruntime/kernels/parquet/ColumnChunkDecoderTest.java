@@ -568,6 +568,146 @@ class ColumnChunkDecoderTest {
         }
     }
 
+    // ---------------------------------------------------------------- BOOLEAN (#559)
+
+    @Test
+    void booleanPagesDecodePlainAndRleWithNullsAcrossPages() {
+        // PLAIN: one bit per present value, LSB first. RLE: a 4-byte length, then a width-1 hybrid stream
+        // (long runs and bit-packed groups). Nulls, v1 and v2, batch sizes that put batches and pages at odd
+        // bit offsets (64-row words split across pages and batches).
+        Random rnd = new Random(55919);
+        int rows = 5000;
+        for (ParquetPageDecoder.Encoding enc : new ParquetPageDecoder.Encoding[] {ParquetPageDecoder.Encoding.PLAIN, ParquetPageDecoder.Encoding.RLE}) {
+            for (boolean nulls : new boolean[] {false, true}) {
+                for (boolean v2 : new boolean[] {false, true}) {
+                    for (int batch : new int[] {1024, 333, 64, 7}) {
+                        for (boolean forceBitPacked : enc == ParquetPageDecoder.Encoding.RLE ? new boolean[] {false, true} : new boolean[] {false}) {
+                            Boolean[] v = new Boolean[rows];
+                            for (int i = 0; i < rows; i++) {
+                                // Runs (so RLE emits run headers) mixed with random stretches.
+                                boolean x = (i / 97) % 3 == 0 ? rnd.nextBoolean() : ((i / 211) % 2 == 0);
+                                v[i] = (nulls && rnd.nextInt(5) == 0) ? null : x;
+                            }
+                            int maxDef = nulls ? 1 : 0;
+                            List<PreparedPage> pages = new ArrayList<>();
+                            int start = 0;
+                            for (int end : new int[] {1, 1000, 1777, 3001, 5000}) {
+                                byte[] levels = levelBytes(v, start, end, maxDef);
+                                List<Integer> present = new ArrayList<>();
+                                for (int i = start; i < end; i++) {
+                                    if (v[i] != null) {
+                                        present.add(v[i] ? 1 : 0);
+                                    }
+                                }
+                                int[] bits = present.stream()
+                                        .mapToInt(Integer::intValue)
+                                        .toArray();
+                                byte[] vals;
+                                if (enc == ParquetPageDecoder.Encoding.PLAIN) {
+                                    vals = new byte[(bits.length + 7) / 8];
+                                    for (int k = 0; k < bits.length; k++) {
+                                        vals[k >>> 3] |= (byte) (bits[k] << (k & 7));
+                                    }
+                                } else {
+                                    byte[] stream = RleBitPackingReaderTest.encode(bits, 1, forceBitPacked);
+                                    ByteArrayOutputStream o = new ByteArrayOutputStream();
+                                    writeLeInt(o, stream.length);
+                                    o.writeBytes(stream);
+                                    vals = o.toByteArray();
+                                }
+                                byte[] page = assemble(levels, vals, maxDef, v2);
+                                pages.add(
+                                        new PreparedPage(
+                                                kernelPage(page, levels.length, maxDef, v2, end - start,
+                                                        enc),
+                                                end - start));
+                                start = end;
+                            }
+                            String what = enc
+                                    + " nulls="
+                                    + nulls
+                                    + " v2="
+                                    + v2
+                                    + " batch="
+                                    + batch
+                                    + " bitPacked="
+                                    + forceBitPacked;
+                            try (Arena arena = Arena.ofConfined()) {
+                                ColumnChunkDecoder d = new ColumnChunkDecoder(VecType.BOOL, maxDef, batch, scalarFactory());
+                                VectorBuffers col = runStreamingBool(d, pages, rows, batch, nulls, arena);
+                                for (int i = 0; i < rows; i++) {
+                                    if (v[i] == null) {
+                                        assertTrue(col.isNull(i), what + " row " + i + " should be null");
+                                    } else {
+                                        assertTrue(!col.isNull(i), what + " row " + i + " should not be null");
+                                        assertEquals(v[i], col.getBoolean(i), what + " row " + i);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
+    void booleanPagesRejectValuesPastThePageEnd() {
+        // A PLAIN page claiming 20 present values with 2 bytes (16 bits) of values, and an RLE page whose length
+        // prefix runs past the page.
+        ColumnChunkDecoder d = new ColumnChunkDecoder(VecType.BOOL, 0, 32, scalarFactory());
+        d.startChunk(20);
+        d.feedPage(ColumnChunkDecoder.Page.v1(new byte[] {(byte) 0xFF, 0x01}, 20, ParquetPageDecoder.Encoding.PLAIN));
+        d.startBatch(20);
+        org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class, () -> d.readBatch(20, 0));
+        ColumnChunkDecoder r = new ColumnChunkDecoder(VecType.BOOL, 0, 32, scalarFactory());
+        r.startChunk(4);
+        org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class,
+                () -> r.feedPage(ColumnChunkDecoder.Page.v1(new byte[] {50, 0, 0, 0, 1},
+                        4, ParquetPageDecoder.Encoding.RLE)));
+    }
+
+    /**
+     * The BOOL batch loop, as the reader drives it: staging, then flushBool
+     * into each batch's bitmaps.
+     */
+    private static VectorBuffers runStreamingBool(ColumnChunkDecoder d, List<PreparedPage> pages, int rows,
+            int batchRows, boolean hasNulls, Arena arena) {
+        d.startChunk(rows);
+        boolean[] values = new boolean[rows];
+        boolean[] nullsOut = new boolean[rows];
+        int done = 0;
+        int pageIdx = 0;
+        while (done < rows) {
+            int want = Math.min(batchRows, rows - done);
+            d.startBatch(want);
+            int filled = 0;
+            while (filled < want) {
+                if (d.needsPage()) {
+                    d.feedPage(pages.get(pageIdx++)
+                                    .page());
+                }
+                filled += d.readBatch(want - filled, filled);
+            }
+            MemorySegment data = ArrowLayout.allocateBitmap(arena, want);
+            data.fill((byte) 0x55); // flushBool must overwrite every word it covers
+            MemorySegment validity = ArrowLayout.allocateBitmap(arena, want);
+            boolean batchNulls = d.batchNullCount() > 0;
+            d.flushBool(want, data, batchNulls ? validity : null);
+            for (int i = 0; i < want; i++) {
+                values[done + i] = ((data.get(ValueLayout.JAVA_BYTE, i >>> 3) >>> (i & 7)) & 1) != 0;
+                nullsOut[done + i] = batchNulls && ((validity.get(ValueLayout.JAVA_BYTE, i >>> 3) >>> (i & 7)) & 1) == 0;
+            }
+            // No stray bits past the batch's last row in its last word.
+            if (want % 64 != 0) {
+                long last = data.get(LE_LONG, ((long) (want - 1) >>> 6) << 3);
+                assertEquals(0L, last >>> (want & 63), "bits past row " + want);
+            }
+            done += want;
+        }
+        return ArrowLayout.ofBooleans(arena, values, hasNulls ? nullsOut : null);
+    }
+
     @Test
     void deltaByteArrayPagesRebuildPrefixesWithNullsAcrossPages() {
         // UTF8 lane: per page, a DELTA_BINARY_PACKED run of prefix lengths (bytes shared with the previous

@@ -435,14 +435,56 @@ class VectorParquetScanSuite extends VectorQuerySuite {
     checkVectorized("SELECT nanvl(c2, c1/c2 + c1/c2) FROM t_tiny", Seq(node))
   }
 
-  test("fallback: a boolean column is not decoded in slice 1 (shared support source of truth)") {
-    val path = newTempPath("t_bool")
-    withPlugin(enabled = false) {
-      spark.sql("SELECT CAST(id AS INT) AS i, (id % 2 = 0) AS b FROM range(0, 2000)")
-        .write.mode("overwrite").parquet(path)
-      spark.read.parquet(path).createOrReplaceTempView("t_bool")
+  test("BOOLEAN columns decode natively: PLAIN bit-packed (v1) and RLE (v2), with nulls (#559)") {
+    // parquet-java writes booleans PLAIN (bit-packed) in v1 pages and RLE (a width-1 hybrid stream) in v2.
+    // Runs and random stretches, nulls, several pages and row groups, a filter and an aggregate over the
+    // column, at two batch sizes. The node must read the row groups itself and match Spark's reader.
+    for ((version, view) <- Seq("v1" -> "t_bool_v1", "v2" -> "t_bool_v2")) {
+      val path = newTempPath(view)
+      withPlugin(enabled = false) {
+        spark.sql(
+          """SELECT CAST(id AS INT) AS i,
+            |  CASE WHEN id % 7 = 0 THEN NULL WHEN (id DIV 300) % 3 = 0 THEN (id * 2654435761) % 5 < 2
+            |       ELSE (id DIV 500) % 2 = 0 END AS b,
+            |  id % 2 = 0 AS even
+            |FROM range(0, 40000)""".stripMargin
+        ).repartition(2)
+          .sortWithinPartitions("i")
+          .write
+          .option("parquet.writer.version", version)
+          .mode("overwrite")
+          .parquet(path)
+        spark.read.parquet(path).createOrReplaceTempView(view)
+      }
+      val encodings = new java.io.File(path).listFiles((_, nm) => nm.endsWith(".parquet")).flatMap { f =>
+        val in = org.apache.parquet.hadoop.util.HadoopInputFile
+          .fromPath(new org.apache.hadoop.fs.Path(f.getAbsolutePath), new org.apache.hadoop.conf.Configuration())
+        val r = org.apache.parquet.hadoop.ParquetFileReader.open(in)
+        try {
+          val cols = new scala.collection.mutable.ArrayBuffer[(String, String)]()
+          r.getFooter.getBlocks.forEach(b =>
+            b.getColumns.forEach(c => c.getEncodings.forEach(e => cols += ((c.getPath.toDotString, e.name()))))
+          )
+          cols
+        } finally r.close()
+      }.toSet
+      val valueEncoding = if (version == "v1") "PLAIN" else "RLE"
+      assert(encodings.contains(("b", valueEncoding)), s"$version: b is not $valueEncoding: $encodings")
+      for (batch <- Seq("1024", "100")) {
+        withConf("spark.sql.parquet.columnarReaderBatchSize" -> batch) {
+          checkVectorized(s"SELECT * FROM $view", Seq(node))
+          checkVectorized(s"SELECT i FROM $view WHERE b AND NOT even", Seq(node))
+          checkVectorized(s"SELECT b, count(*), sum(i) FROM $view GROUP BY b", Seq(node))
+          withPlugin(enabled = true) {
+            val df = spark.sql(s"SELECT b, even FROM $view")
+            df.collect()
+            val scans = PlanUtils.allNodes(finalPlan(df)).collect { case s: VectorParquetScanExec => s }
+            assert(scans.nonEmpty, s"$version: expected ${node.getSimpleName}")
+            assert(scans.map(_.metrics("numRowGroups").value).sum > 0, s"$version: no row group read natively")
+          }
+        }
+      }
     }
-    checkFallback("SELECT i, b FROM t_bool", Seq(node), reasonContains = "unsupported column type")
   }
 
   test("fallback: a timestamp column is not decoded in slice 1") {

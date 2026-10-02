@@ -234,6 +234,62 @@ class RleBitPackingReaderTest {
         }
     }
 
+    @Test
+    void readBitsMatchesReadIntAtWidthOne() {
+        // The BOOLEAN path: readBits must leave exactly the bits readInt would yield, at any destination bit
+        // offset, across RLE runs of 0s and 1s, bit-packed runs, group tails, and after a partial group left by
+        // readInt; and leave the reader where readInt would.
+        Random rnd = new Random(5591);
+        for (int trial = 0; trial < 400; trial++) {
+            int len = rnd.nextInt(1200);
+            int[] v = new int[len];
+            int mode = trial % 3; // 0 coin flips (bit-packed), 1 long runs (RLE), 2 mixed run lengths
+            int cur = rnd.nextInt(2);
+            for (int i = 0; i < len; ) {
+                int run = mode == 0
+                        ? 1
+                        : mode == 1 ? 8 + rnd.nextInt(200) : 1 + rnd.nextInt(20);
+                for (int j = 0;
+                     j < run && i < len;
+                     j++, i++) {
+                    v[i] = mode == 0 ? rnd.nextInt(2) : cur;
+                }
+                cur ^= 1;
+            }
+            byte[] bytes = encode(v, 1, trial % 7 == 0);
+            int base = rnd.nextInt(130);
+            try (Arena arena = Arena.ofConfined()) {
+                RleBitPackingReader r = new RleBitPackingReader(seg(bytes, arena), 0, bytes.length, 1);
+                long[] words = new long[(base + len + 63) / 64 + 1];
+                int o = 0;
+                while (o < len) {
+                    int take = Math.min(1 + rnd.nextInt(trial % 2 == 0 ? 9 : 300), len - o);
+                    if (take == 1 && rnd.nextBoolean()) {
+                        words[(base + o) >>> 6] |= (long) r.readInt() << ((base + o) & 63);
+                    } else {
+                        r.readBits(words, base + o, take);
+                    }
+                    o += take;
+                }
+                for (int i = 0; i < words.length * 64; i++) {
+                    int bit = (int) (words[i >>> 6] >>> (i & 63)) & 1;
+                    int want = i >= base && i < base + len
+                            ? v[i - base]
+                            : 0;
+                    assertEquals(want, bit, "trial "
+                            + trial
+                            + " bit "
+                            + i
+                            + " (base "
+                            + base
+                            + ", len "
+                            + len
+                            + ")");
+                }
+            }
+        }
+    }
+
     private static MemorySegment seg(byte[] bytes, Arena arena) {
         MemorySegment s = arena.allocate(Math.max(bytes.length, 1) + 8L);
         MemorySegment.copy(MemorySegment.ofArray(bytes), 0, s, 0, bytes.length);

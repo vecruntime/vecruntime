@@ -653,9 +653,9 @@ private[vecruntime] final class VectorParquetPartitionReader(
     val wanted = new java.util.HashSet[String]()
     clipped.getColumns.forEach(cd => wanted.add(cd.getPath()(0).toLowerCase(java.util.Locale.ROOT)))
     // The planner admits a column by its Spark type; the file decides how it is stored. A decimal(p <= 18) may
-    // be INT32, INT64, FIXED_LEN_BYTE_ARRAY or BYTE_ARRAY in a given file (Spark's legacy writer and Hive/Impala
-    // use FIXED_LEN_BYTE_ARRAY), and only the first two have a decode path -- the bytes of the others are not
-    // an INT64 lane. Check every requested column's physical type against its lane, per file, before decoding.
+    // be INT32, INT64, FIXED_LEN_BYTE_ARRAY or BYTE_ARRAY in a given file, and only the first two have a
+    // decode path today -- the bytes of the others are not an INT64 lane. Check every requested column's
+    // physical type against its lane, per file, before any decode.
     var f = 0
     while (f < requiredSchema.length) {
       val field = requiredSchema.fields(f)
@@ -822,20 +822,23 @@ object VectorParquetScanExec {
 
   /**
    * True if a file column stored as `physical` decodes into the lane of the Spark type `dt`: INT32 for int and
-   * date; INT64, or INT32 sign-extended (not an unsigned one), for bigint; DOUBLE; BINARY for string; INT32 /
-   * INT64 for a decimal with precision <= 18. A FIXED_LEN_BYTE_ARRAY or BYTE_ARRAY decimal, or any other
-   * pairing, makes the file fall over to Spark's reader.
+   * date (and widened into a bigint lane); INT64 for bigint; DOUBLE; BOOLEAN; BINARY for string; INT32 / INT64
+   * for a decimal with precision <= 18 (a FIXED_LEN_BYTE_ARRAY or BYTE_ARRAY decimal is not an INT64 lane).
+   * Any other pairing makes the file fall over to Spark's reader.
    */
   def physicalMatches(dt: org.apache.spark.sql.types.DataType, physical: PrimitiveType): Boolean = {
     import org.apache.spark.sql.types._
-    import PrimitiveType.PrimitiveTypeName.{BINARY, DOUBLE => PDOUBLE, INT32, INT64}
     val p = physical.getPrimitiveTypeName
     dt match {
       case IntegerType | DateType => p == INT32
-      case LongType => p == INT64 || (p == INT32 && !isUnsigned(physical))
-      case DoubleType => p == PDOUBLE
+      case LongType =>
+        // INT32 widens by sign extension, so an unsigned INT32 (Spark reads UINT_32 as a long) does not match.
+        p == INT64 || (p == INT32 && !isUnsigned(physical))
+      case DoubleType => p == DOUBLE
+      case BooleanType => p == PrimitiveType.PrimitiveTypeName.BOOLEAN
       case _: StringType => p == BINARY
-      case d: DecimalType => (p == INT32 && d.precision <= 9) || (p == INT64 && d.precision <= 18)
+      case d: DecimalType =>
+        (p == INT32 && d.precision <= 9) || (p == INT64 && d.precision <= 18)
       case _ => false
     }
   }
