@@ -623,6 +623,8 @@ public final class GroupKeyTable {
         int[][] entryGen = new int[0][]; // per column: the generation entryIds[c][e] was computed in
         int[] gen = new int[0];
         VectorBuffers[] lastDict = new VectorBuffers[0];
+        GroupKeyTable[] lastTable = new GroupKeyTable[0]; // per column: the table the entry map is for
+        boolean[] lastInsert = new boolean[0]; // per column: whether only inserts used the map (no -1 cached)
         int[] offs = new int[0];
         byte[] bytes = new byte[0];
         long[] wordScratch = new long[0];
@@ -657,6 +659,8 @@ public final class GroupKeyTable {
                 s.entryGen = Arrays.copyOf(s.entryGen, k);
                 s.gen = Arrays.copyOf(s.gen, k);
                 s.lastDict = Arrays.copyOf(s.lastDict, k);
+                s.lastTable = Arrays.copyOf(s.lastTable, k);
+                s.lastInsert = Arrays.copyOf(s.lastInsert, k);
             }
             return s;
         }
@@ -714,16 +718,30 @@ public final class GroupKeyTable {
                     s.entryGen[c] = entryGen;
                     s.gen[c] = 0;
                     s.lastDict[c] = null;
+                    s.lastTable[c] = null;
                 }
                 // A new dictionary object invalidates the entry map by bumping the generation: entries are
                 // mapped when first used, so a batch costs its rows plus its distinct entries, never the
                 // whole dictionary. (Ids only ever grow, so a map of a dictionary that keeps arriving stays right.)
-                if (s.lastDict[c] != d) {
+                // The map is per thread, not per table, so it is also invalidated when another table uses
+                // it (a join probe and an aggregate over the same batch on one task thread: one table's ids
+                // are not the other's), and when a lookup's map (unknown values cached as -1) meets an
+                // insert, which must add those values rather than reuse the -1.
+                if (s.lastDict[c] != d
+                        || s.lastTable[c] != this
+                        || (insert && !s.lastInsert[c])) {
                     s.lastDict[c] = d;
+                    s.lastTable[c] = this;
+                    s.lastInsert[c] = insert;
                     if (++s.gen[c] == 0) {
                         Arrays.fill(entryGen, 0);
                         s.gen[c] = 1;
                     }
+                }
+                if (!insert) {
+                    // A lookup that reuses an insert's map still caches its misses as -1 in it (#593), so the
+                    // map no longer counts as an insert's: the next insert must rebuild it.
+                    s.lastInsert[c] = false;
                 }
                 int gen = s.gen[c];
                 MemorySegment dOff = d.offsets();

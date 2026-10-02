@@ -563,4 +563,95 @@ public final class RunMerge {
             gatherValidity(sources, runOf, idx, count, outValidity);
         }
     }
+
+    // ---------------------------------------------------------------- over heap mirrors (#565)
+
+    /**
+     * {@link #gatherValidity} from the runs' {@link RunMirrors}: the bits come
+     * from the mirrored words and the output words are written once each.
+     */
+    public static void gatherValidity(RunMirrors mirrors, int[] runOf, int[] idx,
+            int count, MemorySegment outValidity) {
+        for (int base = 0; base < count; base += 64) {
+            int limit = Math.min(64, count - base);
+            long word = 0L;
+            for (int j = 0; j < limit; j++) {
+                int o = base + j;
+                if (RunMirrors.valid(mirrors.validity(runOf[o]), idx[o])) {
+                    word |= 1L << j;
+                }
+            }
+            Bitmap.setWord(outValidity, base >>> 6, count, word);
+        }
+    }
+
+    /**
+     * {@link #gatherFixed} with the validity from {@code mirrors}; the values
+     * are still read from the runs' segments.
+     */
+    public static void gatherFixed(
+            VectorBuffers[] sources,
+            RunMirrors mirrors,
+            int[] runOf,
+            int[] idx,
+            int count,
+            MemorySegment outData,
+            MemorySegment outValidity) {
+        gatherFixed(sources, runOf, idx, count, outData, null);
+        if (outValidity != null) {
+            gatherValidity(mirrors, runOf, idx, count, outValidity);
+        }
+    }
+
+    /** {@link #gatherUtf8Bytes} from the runs' mirrored offsets and validity. */
+    public static long gatherUtf8Bytes(RunMirrors mirrors, int[] runOf, int[] idx,
+            int count) {
+        long total = 0;
+        for (int o = 0; o < count; o++) {
+            int r = runOf[o];
+            int i = idx[o];
+            if (RunMirrors.valid(mirrors.validity(r), i)) {
+                int[] off = mirrors.offsets(r);
+                total += off[i + 1] - off[i];
+            }
+        }
+        return total;
+    }
+
+    /**
+     * {@link #gatherUtf8} from the runs' mirrored offsets and validity: per
+     * row only the string's bytes are read from its run's segment; the output
+     * offsets are built in {@code offsetScratch} (at least {@code count + 1}
+     * long) and written in one bulk move.
+     */
+    public static void gatherUtf8(
+            VectorBuffers[] sources,
+            RunMirrors mirrors,
+            int[] runOf,
+            int[] idx,
+            int count,
+            int[] offsetScratch,
+            MemorySegment outOffsets,
+            MemorySegment outData,
+            MemorySegment outValidity) {
+        int pos = 0;
+        for (int o = 0; o < count; o++) {
+            int r = runOf[o];
+            int i = idx[o];
+            offsetScratch[o] = pos;
+            if (RunMirrors.valid(mirrors.validity(r), i)) {
+                int[] off = mirrors.offsets(r);
+                int start = off[i];
+                int len = off[i + 1] - start;
+                ByteCopy.copy(sources[r].data(), start, outData, pos, len);
+                pos += len;
+            }
+        }
+        offsetScratch[count] = pos;
+        MemorySegment.copy(offsetScratch, 0, outOffsets, VectorBuffers.LE_INT, 0L,
+                count + 1);
+        if (outValidity != null) {
+            gatherValidity(mirrors, runOf, idx, count, outValidity);
+        }
+    }
 }
