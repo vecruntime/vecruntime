@@ -651,6 +651,19 @@ private[vecruntime] final class VectorParquetPartitionReader(
   private def hasUnsupportedEncodingInFooter(footer: ParquetMetadata, clipped: MessageType): Boolean = {
     val wanted = new java.util.HashSet[String]()
     clipped.getColumns.forEach(cd => wanted.add(cd.getPath()(0).toLowerCase(java.util.Locale.ROOT)))
+    // The planner admits a column by its Spark type; the file decides how it is stored. A decimal(p <= 18) may
+    // be INT32, INT64, FIXED_LEN_BYTE_ARRAY or BYTE_ARRAY in a given file (Spark's legacy writer and Hive/Impala
+    // use FIXED_LEN_BYTE_ARRAY), and only the first two have a decode path -- the bytes of the others are not
+    // an INT64 lane. Check every requested column's physical type against its lane, per file, before decoding.
+    var f = 0
+    while (f < requiredSchema.length) {
+      val field = requiredSchema.fields(f)
+      val cd = clipped.getColumns.asScala.find(_.getPath()(0).equalsIgnoreCase(field.name))
+      if (cd.isDefined && !VectorParquetScanExec.physicalMatches(field.dataType, cd.get.getPrimitiveType)) {
+        return true
+      }
+      f += 1
+    }
     val blocks = footer.getBlocks
     var b = 0
     while (b < blocks.size()) {
@@ -794,6 +807,31 @@ object VectorParquetScanExec {
 
   /** Encodings the native decoder handles only on some physical types: DELTA_BINARY_PACKED on INT32/INT64 (#559). */
   private val IntegerOnlyEncodings: Set[String] = Set("DELTA_BINARY_PACKED")
+
+  /**
+   * True if a file column stored as `physical` decodes into the lane of the Spark type `dt`: INT32 for int and
+   * date; INT64, or INT32 sign-extended (not an unsigned one), for bigint; DOUBLE; BINARY for string; INT32 /
+   * INT64 for a decimal with precision <= 18. A FIXED_LEN_BYTE_ARRAY or BYTE_ARRAY decimal, or any other
+   * pairing, makes the file fall over to Spark's reader.
+   */
+  def physicalMatches(dt: org.apache.spark.sql.types.DataType, physical: PrimitiveType): Boolean = {
+    import org.apache.spark.sql.types._
+    import PrimitiveType.PrimitiveTypeName.{BINARY, DOUBLE => PDOUBLE, INT32, INT64}
+    val p = physical.getPrimitiveTypeName
+    dt match {
+      case IntegerType | DateType => p == INT32
+      case LongType => p == INT64 || (p == INT32 && !isUnsigned(physical))
+      case DoubleType => p == PDOUBLE
+      case _: StringType => p == BINARY
+      case d: DecimalType => (p == INT32 && d.precision <= 9) || (p == INT64 && d.precision <= 18)
+      case _ => false
+    }
+  }
+
+  private def isUnsigned(physical: PrimitiveType): Boolean = physical.getLogicalTypeAnnotation match {
+    case i: org.apache.parquet.schema.LogicalTypeAnnotation.IntLogicalTypeAnnotation => !i.isSigned
+    case _ => false
+  }
 
   /** True if a column chunk of physical type `physical` using `encoding` can be decoded natively. */
   def supportsEncoding(encoding: String, physical: PrimitiveType.PrimitiveTypeName): Boolean =

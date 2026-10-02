@@ -6,6 +6,18 @@ version may change configuration keys or defaults, always noted here.
 
 ## Unreleased
 
+### Fixed
+
+- The native Parquet scan (`spark.vecruntime.scan.nativeParquet.enabled`, off by default) decoded a decimal
+  with precision <= 18 stored as `FIXED_LEN_BYTE_ARRAY` as if it were INT64, and returned wrong values
+  without an error (#559). This affects 0.0.4-0.0.5. Spark's legacy writer
+  (`spark.sql.parquet.writeLegacyFormat=true`), Hive and Impala store decimals that way. The planner admits
+  a column by its Spark type, but the file decides the physical type. Each file now checks every requested
+  column's physical type against its lane at open time, and falls over to Spark's reader on a mismatch, as
+  it does for an unsupported encoding. The same check keeps an unsigned INT32 (`UINT_32`, read by Spark as a
+  bigint) out of the sign-extending INT32-to-INT64 path. The apache/parquet-testing file
+  `fixed_length_decimal_legacy.parquet` reproduced it.
+
 ### Added
 
 - The native Parquet scan (`spark.vecruntime.scan.nativeParquet.enabled`) decodes `DELTA_BINARY_PACKED`
