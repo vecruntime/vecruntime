@@ -68,6 +68,12 @@ public final class DeltaBinaryPackedReader {
 
     private static final VectorSpecies<Integer> I = Species.I;
 
+    /**
+     * The largest block a header may declare (values); parquet-java and arrow
+     * write 128.
+     */
+    static final int MAX_BLOCK_SIZE = 1 << 16;
+
     private final byte[] src;
     private final int end;
     private final boolean int64;
@@ -114,8 +120,12 @@ public final class DeltaBinaryPackedReader {
         this.unpackers = unpackers;
         int blockSize = readUleb32("block size");
         this.miniblocks = readUleb32("miniblock count");
+        // The header is file-controlled and sizes this reader's buffers: a block whose miniblocks are all
+        // width 0 costs two bytes on the page whatever its declared size, so an unbounded block size would let
+        // a few bytes ask for gigabytes. Writers emit 128; MAX_BLOCK_SIZE leaves wide headroom.
         if (miniblocks <= 0
                 || blockSize <= 0
+                || blockSize > MAX_BLOCK_SIZE
                 || blockSize % miniblocks != 0
                 || (blockSize / miniblocks) % 8 != 0) {
             throw new IllegalStateException("DELTA_BINARY_PACKED: bad block layout " + blockSize + "/" + miniblocks);

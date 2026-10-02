@@ -320,5 +320,17 @@ class DeltaBinaryPackedReaderTest {
         assertThrows(IllegalStateException.class, () -> new DeltaBinaryPackedReader(b, 0, b.length, false, null));
         // a header cut short
         assertThrows(IllegalStateException.class, () -> new DeltaBinaryPackedReader(enc, 0, 2, false, null));
+        // A five-byte header that declares a 2^30-value block (or a huge miniblock count) must be refused, not
+        // allocate buffers sized by it.
+        for (long[] h : new long[][] {{1L << 30, 4}, {128, Integer.MAX_VALUE}, {1L << 31, 1}}) {
+            ByteArrayOutputStream huge = new ByteArrayOutputStream();
+            uleb(huge, h[0]);
+            uleb(huge, h[1]);
+            uleb(huge, 1);
+            uleb(huge, 0);
+            byte[] hb = huge.toByteArray();
+            assertThrows(IllegalStateException.class, () -> new DeltaBinaryPackedReader(hb, 0, hb.length, false, null),
+                    "block " + h[0] + " miniblocks " + h[1]);
+        }
     }
 }

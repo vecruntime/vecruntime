@@ -16,6 +16,7 @@
 package io.vecruntime.spark.parquet;
 
 import io.vecruntime.spark.adapter.TypeMapping;
+import org.apache.spark.sql.types.BooleanType;
 import org.apache.spark.sql.types.DataType;
 import org.apache.spark.sql.types.DateType;
 import org.apache.spark.sql.types.DecimalType;
@@ -51,6 +52,9 @@ public final class NativeParquetSupport {
         }
         if (dt instanceof LongType) {
             return true; // INT64 physical, INT64 lane
+        }
+        if (dt instanceof BooleanType) {
+            return true; // BOOLEAN physical, BOOL lane (bitmap)
         }
         if (dt instanceof DoubleType) {
             return true; // DOUBLE physical, FLOAT64 lane
