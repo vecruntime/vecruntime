@@ -232,6 +232,34 @@ class VectorParquetScanSuite extends VectorQuerySuite {
     assert(rowGroupsRead(path + "/standard") > 0, "the INT32 / INT64 decimal file was not decoded natively")
   }
 
+  test("a pushed filter that skips pages through the column index keeps every column's rows aligned (#559)") {
+    // parquet-java's readNextFilteredRowGroup also filters PAGES by the column index when the filter is
+    // selective inside a row group, and returns only the matching row ranges of each column -- whose pages
+    // start at different rows per column. The native decoder reads every column's pages back to back against
+    // the row group's (filtered) row count, so a page-filtered row group misaligns the columns. The scan must
+    // read whole row groups (row-group statistics and dictionaries still prune) and leave the row filter to
+    // the Filter above it.
+    val path = newTempPath("t_colidx")
+    withPlugin(enabled = false) {
+      spark.sql(
+        """SELECT CAST(id AS INT) AS i, CAST(id * 7 AS BIGINT) AS l,
+          |  CONCAT('value-', CAST(id AS STRING), REPEAT('x', CAST(id % 37 AS INT))) AS s
+          |FROM range(0, 60000)""".stripMargin
+      ).coalesce(1)
+        .sortWithinPartitions("i")
+        .write
+        .option("parquet.page.size", "4096")
+        .option("parquet.page.row.count.limit", "1000")
+        .option("parquet.enable.dictionary", "false")
+        .mode("overwrite")
+        .parquet(path)
+      spark.read.parquet(path).createOrReplaceTempView("t_colidx")
+    }
+    checkVectorized("SELECT i, l, s FROM t_colidx WHERE i BETWEEN 12345 AND 12999", Seq(node))
+    checkVectorized("SELECT count(*), sum(l), max(s) FROM t_colidx WHERE i < 1500 OR i > 58000", Seq(node))
+    checkVectorized("SELECT s, i FROM t_colidx WHERE l = 7 * 31337", Seq(node))
+  }
+
   test("partition columns are read as constant columns") {
     val path = newTempPath("t_part")
     withPlugin(enabled = false) {

@@ -488,6 +488,12 @@ private[vecruntime] final class VectorParquetPartitionReader(
         .builder(hadoopConf, path)
         .withRange(start, end)
         .withRecordFilter(rowGroupFilter(clipped))
+        // Row groups only: with the column index on, readNextFilteredRowGroup also drops PAGES outside the
+        // filter's row ranges, and each column's remaining pages start at different rows. The decoder reads
+        // a column's pages back to back against the row group's row count, so that would misalign the
+        // columns (an overrun error, or rows from different positions). Statistics and dictionary pruning of
+        // whole row groups stay; the predicate is applied by the Filter above the scan.
+        .useColumnIndexFilter(false)
         .build()
       r = ParquetFileReader.open(inputFile, footer, readOpts, stream)
       stream = null

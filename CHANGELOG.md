@@ -8,6 +8,8 @@ version may change configuration keys or defaults, always noted here.
 
 ### Fixed
 
+- The native Parquet scan (`spark.vecruntime.scan.nativeParquet.enabled`, off by default) failed a query whose pushed filter is selective inside a row group of a file with column indexes (#559). The error was `page overruns the row group`. parquet-java's `readNextFilteredRowGroup` also drops pages outside the filter's row ranges, and each column's remaining pages start at different rows, while the decoder expects every column's pages to cover the row group back to back. The scan now turns column-index page filtering off and reads whole row groups. Row-group statistics and dictionary pruning still apply, and the Filter above the scan applies the predicate. This affects 0.0.4–0.0.5 on sorted or clustered data.
+
 - The native Parquet scan (`spark.vecruntime.scan.nativeParquet.enabled`, off by default) decoded a decimal
   with precision <= 18 stored as `FIXED_LEN_BYTE_ARRAY` as if it were INT64, and returned wrong values
   without an error (#559). This affects 0.0.4-0.0.5. Spark's legacy writer
