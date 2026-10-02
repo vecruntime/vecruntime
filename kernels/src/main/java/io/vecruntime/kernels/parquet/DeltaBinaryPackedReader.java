@@ -17,34 +17,62 @@ package io.vecruntime.kernels.parquet;
 
 import java.util.function.IntFunction;
 
+import io.vecruntime.kernels.Species;
+import jdk.incubator.vector.IntVector;
+import jdk.incubator.vector.VectorSpecies;
+
 /**
  * Resumable reader of a Parquet {@code DELTA_BINARY_PACKED} value stream over a
  * {@code byte[]}, for INT32 and INT64 columns (#559 slice 2).
  *
  * <h2>Format</h2>
+ *
  * A header of four varints -- block size in values, miniblocks per block, the
- * total value count and the first value (zigzag) -- then blocks. Each block is a
- * zigzag varint minimum delta, one bit-width byte per miniblock, then the
- * miniblocks: {@code blockSize / miniblocks} deltas each (a multiple of 32), bit
- * packed LSB-first at that miniblock's width, the same packing as the
- * RLE/bit-packed hybrid's groups. Value {@code i} is value {@code i - 1} plus the
- * minimum delta plus the unpacked delta. The writer computes the deltas in the
- * column's own width, wrapping, so the reader adds in that width too: INT32 in
- * {@code int}, INT64 in {@code long}. Only the miniblocks that hold values are
- * written; the last of them is padded to its full size by the writer, but this
- * reader does not rely on that and unpacks a truncated tail from a zero-padded copy.
+ * total value count and the first value (zigzag) -- then blocks. Each block is
+ * a zigzag varint minimum delta, one bit-width byte per miniblock, then the
+ * miniblocks: {@code blockSize / miniblocks} deltas each (a multiple of 32),
+ * bit packed LSB-first at that miniblock's width, the same packing as the
+ * RLE/bit-packed hybrid's groups. Value {@code i} is value {@code i - 1} plus
+ * the minimum delta plus the unpacked delta. The writer computes the deltas in
+ * the column's own width, wrapping, so the reader adds in that width too: INT32
+ * in {@code int}, INT64 in {@code long}. Only the miniblocks that hold values
+ * are written; the last of them is padded to its full size by the writer, but
+ * this reader does not rely on that and unpacks a truncated tail from a
+ * zero-padded copy.
  *
  * <h2>Resumable</h2>
- * A batch may stop anywhere inside a miniblock, so the reader decodes one
- * miniblock at a time into a small buffer and hands values out of it; {@link
- * #readInts} / {@link #readLongs} pick up exactly where the previous call left off.
+ *
+ * A batch may stop anywhere inside a miniblock, so the reader decodes whole
+ * miniblocks straight into the caller's array and only a miniblock a read stops
+ * inside through a small buffer; {@link #readInts} / {@link #readLongs} pick up
+ * exactly where the previous call left off.
  *
  * <h2>Unpacking</h2>
- * Widths up to 32 unpack eight at a time through the injected {@link GroupUnpacker}
- * (parquet-java's {@code BytePacker} on the scan path; {@code null} falls back to
- * the built-in scalar unpack). INT64 widths above 32 use the scalar long unpack.
+ *
+ * Widths up to 32 unpack eight at a time through the injected {@link
+ * GroupUnpacker} (parquet-java's {@code BytePacker} on the scan path; {@code
+ * null} falls back to the built-in scalar unpack). INT64 widths above 32 use
+ * the scalar long unpack. The INT32 prefix sum runs a log-step Vector API scan
+ * per register.
  */
 public final class DeltaBinaryPackedReader {
+
+    /**
+     * Prefix sum over a miniblock: {@code scalar} (default) the serial add,
+     * {@code vector} a log-step Vector API scan per register. On x86 with
+     * AVX-512 the two measured the same (JMH, #559), so the simpler one is the
+     * default; {@code -Dvecruntime.parquet.deltaScan=vector} is for A/B runs,
+     * e.g. on Graviton4's 128-bit NEON / SVE.
+     */
+    static final boolean VECTOR_SCAN = "vector".equals(System.getProperty("vecruntime.parquet.deltaScan", "scalar"));
+
+    private static final VectorSpecies<Integer> I = Species.I;
+
+    /**
+     * The largest block a header may declare (values); parquet-java and arrow
+     * write 128.
+     */
+    static final int MAX_BLOCK_SIZE = 1 << 16;
 
     private final byte[] src;
     private final int end;
@@ -62,11 +90,19 @@ public final class DeltaBinaryPackedReader {
     private final int[] widths;
     private int miniIndex; // next miniblock within the current block; == miniblocks => read a block header
 
-    private final long[] values; // decoded values of the current miniblock (or the first value)
+    // A miniblock decoded but only partly handed out (a read that stops inside one): INT32 streams use
+    // intBuf, INT64 streams longBuf. A read of whole miniblocks decodes straight into the caller's array.
+    private final int[] intBuf;
+    private final long[] longBuf;
     private int valuePos;
     private int valueLen;
-    private final int[] deltas32; // unpack scratch for widths <= 32
+    private final int[] deltas32; // INT64 unpack scratch for widths <= 32
     private byte[] padded = new byte[0]; // zero-padded copy of a truncated last miniblock
+
+    // The miniblock prepared by nextMiniblock(): its bytes and width.
+    private byte[] curIn;
+    private int curAt;
+    private int curWidth;
 
     /**
      * A reader of the stream at {@code src[offset .. offset + length)}. {@code
@@ -84,8 +120,12 @@ public final class DeltaBinaryPackedReader {
         this.unpackers = unpackers;
         int blockSize = readUleb32("block size");
         this.miniblocks = readUleb32("miniblock count");
+        // The header is file-controlled and sizes this reader's buffers: a block whose miniblocks are all
+        // width 0 costs two bytes on the page whatever its declared size, so an unbounded block size would let
+        // a few bytes ask for gigabytes. Writers emit 128; MAX_BLOCK_SIZE leaves wide headroom.
         if (miniblocks <= 0
                 || blockSize <= 0
+                || blockSize > MAX_BLOCK_SIZE
                 || blockSize % miniblocks != 0
                 || (blockSize / miniblocks) % 8 != 0) {
             throw new IllegalStateException("DELTA_BINARY_PACKED: bad block layout " + blockSize + "/" + miniblocks);
@@ -96,8 +136,22 @@ public final class DeltaBinaryPackedReader {
         this.last = int64 ? first : (int) first;
         this.widths = new int[miniblocks];
         this.miniIndex = miniblocks;
-        this.values = new long[Math.max(perMini, 1)];
-        this.deltas32 = new int[perMini];
+        this.intBuf = int64 ? null : new int[perMini];
+        this.longBuf = int64 ? new long[perMini] : null;
+        this.deltas32 = int64 ? new int[perMini] : null;
+    }
+
+    /**
+     * Once every value has been read, the offset just past the stream: where a
+     * following region starts (the bytes of {@code DELTA_LENGTH_BYTE_ARRAY}). The
+     * spec pads the last miniblock to its full size, so this is exact for
+     * conforming writers.
+     */
+    public int position() {
+        if (remaining != 0) {
+            throw new IllegalStateException("DELTA_BINARY_PACKED: position() with " + remaining + " values unread");
+        }
+        return pos;
     }
 
     /** Total values in the stream not yet read. */
@@ -107,44 +161,79 @@ public final class DeltaBinaryPackedReader {
 
     /**
      * Reads the next {@code n} values into {@code dst[off .. off+n)} (INT32
-     * streams).
+     * streams). Whole miniblocks are unpacked and summed in place in {@code
+     * dst}; only a miniblock a read stops inside goes through the buffer.
      */
     public void readInts(int[] dst, int off, int n) {
+        if (int64) {
+            throw new IllegalStateException("DELTA_BINARY_PACKED: readInts on an INT64 stream");
+        }
         int o = off;
         int left = checkAvailable(n);
         while (left > 0) {
-            if (valuePos == valueLen) {
-                fill();
+            if (valuePos < valueLen) {
+                int take = Math.min(left, valueLen - valuePos);
+                System.arraycopy(intBuf, valuePos, dst, o, take);
+                valuePos += take;
+                o += take;
+                left -= take;
+            } else if (firstPending) {
+                firstPending = false;
+                dst[o++] = (int) last;
+                left--;
+            } else if (left >= perMini) {
+                decodeInts(dst, o);
+                o += perMini;
+                left -= perMini;
+            } else {
+                decodeInts(intBuf, 0);
+                valuePos = 0;
+                valueLen = perMini;
             }
-            int take = Math.min(left, valueLen - valuePos);
-            long[] v = values;
-            int p = valuePos;
-            for (int k = 0; k < take; k++) {
-                dst[o + k] = (int) v[p + k];
-            }
-            valuePos += take;
-            o += take;
-            left -= take;
         }
         remaining -= n;
     }
 
     /**
-     * Reads the next {@code n} values into {@code dst[off .. off+n)} (INT64
-     * streams, or INT32 widened).
+     * Reads the next {@code n} values into {@code dst[off .. off+n)}: an INT64
+     * stream, decoded as {@link #readInts} does, or an INT32 stream widened
+     * (sign-extended) to long.
      */
     public void readLongs(long[] dst, int off, int n) {
         int o = off;
         int left = checkAvailable(n);
         while (left > 0) {
-            if (valuePos == valueLen) {
-                fill();
+            if (valuePos < valueLen) {
+                int take = Math.min(left, valueLen - valuePos);
+                if (int64) {
+                    System.arraycopy(longBuf, valuePos, dst, o, take);
+                } else {
+                    int[] b = intBuf;
+                    int p = valuePos;
+                    for (int k = 0; k < take; k++) {
+                        dst[o + k] = b[p + k];
+                    }
+                }
+                valuePos += take;
+                o += take;
+                left -= take;
+            } else if (firstPending) {
+                firstPending = false;
+                dst[o++] = last;
+                left--;
+            } else if (int64 && left >= perMini) {
+                decodeLongs(dst, o);
+                o += perMini;
+                left -= perMini;
+            } else {
+                if (int64) {
+                    decodeLongs(longBuf, 0);
+                } else {
+                    decodeInts(intBuf, 0);
+                }
+                valuePos = 0;
+                valueLen = perMini;
             }
-            int take = Math.min(left, valueLen - valuePos);
-            System.arraycopy(values, valuePos, dst, o, take);
-            valuePos += take;
-            o += take;
-            left -= take;
         }
         remaining -= n;
     }
@@ -157,17 +246,12 @@ public final class DeltaBinaryPackedReader {
     }
 
     /**
-     * Decodes the next miniblock (or hands out the header's first value) into
-     * {@link #values}.
+     * Positions on the next miniblock: reads a block header when one is due,
+     * checks the width, and leaves its bytes in {@link #curIn} at {@link
+     * #curAt} (a zero-padded copy for a truncated tail or one too close to the
+     * array's end for the 8-byte reads).
      */
-    private void fill() {
-        valuePos = 0;
-        if (firstPending) {
-            firstPending = false;
-            values[0] = last;
-            valueLen = 1;
-            return;
-        }
+    private void nextMiniblock() {
         if (miniIndex == miniblocks) {
             minDelta = zigzag(readUleb64());
             if (pos + miniblocks > end) {
@@ -185,73 +269,126 @@ public final class DeltaBinaryPackedReader {
             throw new IllegalStateException("DELTA_BINARY_PACKED: miniblock width " + width + " > " + limit);
         }
         int bytes = width * perMini / 8;
-        byte[] in = src;
-        int at = pos;
+        curIn = src;
+        curAt = pos;
+        curWidth = width;
         if (pos + bytes + 8 > src.length || pos + bytes > end) {
-            // A truncated last miniblock, or one too close to the array's end for the 8-byte reads:
-            // unpack from a zero-padded copy.
             if (padded.length < bytes + 8) {
                 padded = new byte[bytes + 8];
             }
             int avail = Math.max(0, Math.min(bytes, end - pos));
             System.arraycopy(src, pos, padded, 0, avail);
             java.util.Arrays.fill(padded, avail, bytes + 8, (byte) 0);
-            in = padded;
-            at = 0;
+            curIn = padded;
+            curAt = 0;
         }
         pos += bytes;
-        int count = perMini;
-        long[] v = values;
+    }
+
+    /**
+     * The next miniblock of an INT32 stream: unpacked into {@code out[off ..]},
+     * then prefix-summed in place.
+     */
+    private void decodeInts(int[] out, int off) {
+        nextMiniblock();
+        unpack32(curIn, curAt, curWidth, out, off);
+        last = scanInts(out, off, perMini, (int) minDelta,
+                (int) last);
+    }
+
+    /** The next miniblock of an INT64 stream into {@code out[off .. off+perMini)}. */
+    private void decodeLongs(long[] out, int off) {
+        nextMiniblock();
+        long md = minDelta;
         long prev = last;
-        if (int64) {
-            long md = minDelta;
-            if (width <= 32) {
-                unpack32(in, at, width);
-                int[] d = deltas32;
-                for (int k = 0; k < count; k++) {
-                    prev = prev + md + (d[k] & 0xFFFFFFFFL);
-                    v[k] = prev;
-                }
-            } else {
-                for (int k = 0; k < count; k++) {
-                    prev = prev + md + unpackLong(in, at, k, width);
-                    v[k] = prev;
-                }
-            }
-        } else {
-            int md = (int) minDelta;
-            int p = (int) prev;
-            unpack32(in, at, width);
+        int count = perMini;
+        if (curWidth <= 32) {
+            unpack32(curIn, curAt, curWidth, deltas32, 0);
             int[] d = deltas32;
             for (int k = 0; k < count; k++) {
-                p = p + md + d[k];
-                v[k] = p;
+                prev = prev + md + (d[k] & 0xFFFFFFFFL);
+                out[off + k] = prev;
             }
-            prev = p;
+        } else {
+            byte[] in = curIn;
+            int at = curAt;
+            int w = curWidth;
+            for (int k = 0; k < count; k++) {
+                prev = prev + md + unpackLong(in, at, k, w);
+                out[off + k] = prev;
+            }
         }
         last = prev;
-        valueLen = count;
+    }
+
+    /**
+     * In place: {@code a[off+k] = carry + sum_{i<=k} (a[off+i] + md)}, wrapping
+     * in 32 bits. Returns the last value. The vector form adds the minimum delta,
+     * runs a log-step inclusive scan inside each register ({@code v + (v << s
+     * lanes)} for s = 1, 2, 4, ...), adds the running carry and takes the top lane
+     * as the next carry; it computes the same wrapping sums in a different order,
+     * which int addition makes identical.
+     */
+    static int scanInts(int[] a, int off, int n,
+                        int md, int carry) {
+        return VECTOR_SCAN ? scanIntsVector(a, off, n, md, carry) : scanIntsScalar(a, off, n, md, carry);
+    }
+
+    /** The serial reference of {@link #scanInts}. */
+    static int scanIntsScalar(int[] a, int off, int n,
+            int md, int carry) {
+        for (int k = 0; k < n; k++) {
+            carry = carry + md + a[off + k];
+            a[off + k] = carry;
+        }
+        return carry;
+    }
+
+    /**
+     * The vector form of {@link #scanInts}; the tail past the last full
+     * register is scalar.
+     */
+    static int scanIntsVector(int[] a, int off, int n,
+            int md, int carry) {
+        int k = 0;
+        {
+            int lanes = I.length();
+            for (; k + lanes <= n; k += lanes) {
+                IntVector v = IntVector.fromArray(I, a, off + k).add(md);
+                for (int s = 1; s < lanes; s <<= 1) {
+                    v = v.add(v.unslice(s));
+                }
+                v = v.add(carry);
+                v.intoArray(a, off + k);
+                carry = v.lane(lanes - 1);
+            }
+        }
+        for (; k < n; k++) {
+            carry = carry + md + a[off + k];
+            a[off + k] = carry;
+        }
+        return carry;
     }
 
     /**
      * Unpacks {@link #perMini} values of {@code width <= 32} bits at {@code
-     * in[at ..]} into {@link #deltas32}.
+     * in[at ..]} into {@code out[off ..]}.
      */
-    private void unpack32(byte[] in, int at, int width) {
-        int[] d = deltas32;
+    private void unpack32(byte[] in, int at, int width,
+                          int[] out, int off) {
         if (width == 0) {
-            java.util.Arrays.fill(d, 0, perMini, 0);
+            java.util.Arrays.fill(out, off, off + perMini, 0);
             return;
         }
         GroupUnpacker u = unpackers == null ? null : unpackers.apply(width);
         if (u != null) {
             for (int g = 0; g < perMini; g += 8) {
-                u.unpack8(in, at + (g / 8) * width, d, g);
+                u.unpack8(in, at + (g / 8) * width, out, off + g);
             }
             return;
         }
         for (int k = 0; k < perMini; k++) {
-            d[k] = (int) unpackLong(in, at, k, width);
+            out[off + k] = (int) unpackLong(in, at, k, width);
         }
     }
 
@@ -271,7 +408,7 @@ public final class DeltaBinaryPackedReader {
         return width == 64 ? lo : lo & ((1L << width) - 1);
     }
 
-    // Little-endian long view over byte[]: one unaligned load. fill() guarantees 8 readable bytes past
+    // Little-endian long view over byte[]: one unaligned load. nextMiniblock() guarantees 8 readable bytes past
     // the miniblock (or switches to the zero-padded copy), so b + 8 is always in bounds.
     private static final java.lang.invoke.VarHandle BA_LONG = java.lang.invoke.MethodHandles.byteArrayViewVarHandle(long[].class, java.nio.ByteOrder.LITTLE_ENDIAN);
 

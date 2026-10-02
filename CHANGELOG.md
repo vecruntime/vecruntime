@@ -20,16 +20,46 @@ version may change configuration keys or defaults, always noted here.
   bigint) out of the sign-extending INT32-to-INT64 path. The apache/parquet-testing file
   `fixed_length_decimal_legacy.parquet` reproduced it.
 
+### Changed
+
+- Faster v2 page decoding in the native Parquet scan (#559). JMH, x86 / Graviton4:
+  - `BYTE_STREAM_SPLIT` transposes instead of gathering bytes: 3.7x / 2.0x on DOUBLE and INT64. It uses the Vector API
+    from 256-bit vectors and SWAR at 128 bits, where the Vector API's byte-to-long widening is not intrinsified
+    (`-Dvecruntime.parquet.bssMode=auto`).
+  - `DELTA_BINARY_PACKED` unpacks and sums whole miniblocks straight into the caller's array: 1.17-1.23x / 1.09-1.24x.
+  - `DELTA_BYTE_ARRAY` rebuilds values straight into the batch's bytes, without the per-page rebuild buffer:
+    1.34x / 1.49x.
+
+  The results are unchanged: `ByteStreamSplitKernelsTest` checks every variant against its scalar reference at
+  128, 256 and 512 bits. `-Dvecruntime.parquet.bssMode` and `-Dvecruntime.parquet.deltaScan` select the
+  alternatives for A/B runs.
+
 ### Added
 
+- BOOLEAN columns in the native Parquet scan (#559): v1 `PLAIN` (bit-packed) and v2 `RLE` pages, decoded into a bit-packed lane. JMH on x86, one 20,000-value page: `PLAIN` at 837 pages per ms against 10.7 for parquet-java's reader, `RLE` at 212 against 11.2. `RLE` is decoded straight into the bitmap: runs set as bit ranges, bit-packed runs moved 64 bits a step.
+- `ParquetTestingCorpusSuite`: 27 files from the Apache Parquet conformance corpus (`apache/parquet-testing`, Apache-2.0, vendored for tests) read column by column against Spark's reader, plus 3 corrupt files that must be refused.
 - The native Parquet scan (`spark.vecruntime.scan.nativeParquet.enabled`) decodes `DELTA_BINARY_PACKED`
   INT32 and INT64 columns, #559 slice 2: ints, bigints, dates and decimals with precision <= 18. This is the
   encoding parquet-java writes for those columns when `parquet.writer.version=v2` and the column is not
   dictionary-encoded. Before, such a file fell over to Spark's reader whole. `DeltaBinaryPackedReader` unpacks
   each miniblock through the injected `BytePacker` and resumes inside a miniblock across batches. It is
   checked against a from-scratch encoder, against parquet-java's writers and through Spark with v2 files.
-  JMH: 2.0-4.0x the pages per ms of Spark's `VectorizedDeltaBinaryPackedReader`. The other v2 encodings
-  (`DELTA_LENGTH_BYTE_ARRAY`, `DELTA_BYTE_ARRAY`, `BYTE_STREAM_SPLIT`) still fall the file over to Spark's reader.
+  JMH: 2.0-4.0x the pages per ms of Spark's `VectorizedDeltaBinaryPackedReader`.
+- The native Parquet scan also decodes `DELTA_LENGTH_BYTE_ARRAY` strings and `BYTE_STREAM_SPLIT` INT32 /
+  INT64 / DOUBLE columns (#559). For `DELTA_LENGTH_BYTE_ARRAY` it decodes the page's lengths through
+  `DeltaBinaryPackedReader`, then copies the bytes into the Arrow offsets and data. For `BYTE_STREAM_SPLIT` it
+  gathers each value's bytes from the K streams straight into the lane. Spark's vectorized reader rejects
+  `BYTE_STREAM_SPLIT` on INT32/INT64 ("Unsupported encoding"), so those files now read with the flag on and
+  fail with it off. Checked against parquet-java's writers, and through Spark with v1 and v2 files from a
+  test writer that picks the encodings per column, against Spark's row-based reader. JMH, one 20,000-value
+  page in 1024-row batches: `BYTE_STREAM_SPLIT` DOUBLE/INT64 8.8x and `DELTA_LENGTH_BYTE_ARRAY` 1.46x the pages
+  per ms of parquet-java's value readers.
+- The native Parquet scan decodes `DELTA_BYTE_ARRAY` strings (#559). This is what parquet-java writes for v2
+  strings without a dictionary, so v2 files written by Spark (`parquet.writer.version=v2`) no longer fall over
+  to Spark's reader for their string columns. Each page's values are rebuilt in one sequential pass from the
+  prefix lengths and the `DELTA_LENGTH_BYTE_ARRAY` suffixes into a reused buffer, then batched like
+  `DELTA_LENGTH_BYTE_ARRAY`. A corrupt page fails, for example on a prefix longer than the previous value. JMH:
+  2.0x the pages per ms of parquet-java's `DeltaByteArrayReader` on sorted URL-like keys.
 
 ## 0.0.5 -- 2026-10-02
 

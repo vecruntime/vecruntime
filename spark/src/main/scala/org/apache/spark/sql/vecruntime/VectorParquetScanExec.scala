@@ -476,7 +476,7 @@ private[vecruntime] final class VectorParquetPartitionReader(
       val fileSchema = footer.getFileMetaData.getSchema
       val clipped = ParquetReadSupport.clipParquetSchema(fileSchema, requiredSchema, caseSensitive, useFieldId, false)
       // Encoding is only knowable at read time. If any required column chunk uses an encoding we do not
-      // decode (DELTA_BYTE_ARRAY, BYTE_STREAM_SPLIT, ...), fall the WHOLE FILE over to Spark's vectorized
+      // decode (BYTE_STREAM_SPLIT on FIXED_LEN_BYTE_ARRAY, ...), fall the WHOLE FILE over to Spark's vectorized
       // reader -- correct results, no mid-decode crash.
       if (hasUnsupportedEncodingInFooter(footer, clipped)) {
         stream.close()
@@ -650,17 +650,18 @@ private[vecruntime] final class VectorParquetPartitionReader(
 
   /**
    * True if any required column chunk in any row group uses a value encoding the native decoder does not
-   * support (PLAIN and dictionary; DELTA_BINARY_PACKED on INT32/INT64 since slice 2). Read from the footer's
-   * column-chunk metadata, so the decision is made once per file at open time -- another DELTA_* or a
-   * BYTE_STREAM_SPLIT column falls the file over to Spark's reader with no mid-decode failure.
+   * support (PLAIN and dictionary; the v2 encodings on the physical types in `supportsEncoding`). Read from
+   * the footer's column-chunk metadata, so the decision is made once per file at open time -- a
+   * BYTE_STREAM_SPLIT FIXED_LEN_BYTE_ARRAY column, say, falls the file over to Spark's reader with no
+   * mid-decode failure.
    */
   private def hasUnsupportedEncodingInFooter(footer: ParquetMetadata, clipped: MessageType): Boolean = {
     val wanted = new java.util.HashSet[String]()
     clipped.getColumns.forEach(cd => wanted.add(cd.getPath()(0).toLowerCase(java.util.Locale.ROOT)))
     // The planner admits a column by its Spark type; the file decides how it is stored. A decimal(p <= 18) may
-    // be INT32, INT64, FIXED_LEN_BYTE_ARRAY or BYTE_ARRAY in a given file (Spark's legacy writer and Hive/Impala
-    // use FIXED_LEN_BYTE_ARRAY), and only the first two have a decode path -- the bytes of the others are not
-    // an INT64 lane. Check every requested column's physical type against its lane, per file, before decoding.
+    // be INT32, INT64, FIXED_LEN_BYTE_ARRAY or BYTE_ARRAY in a given file, and only the first two have a
+    // decode path today -- the bytes of the others are not an INT64 lane. Check every requested column's
+    // physical type against its lane, per file, before any decode.
     var f = 0
     while (f < requiredSchema.length) {
       val field = requiredSchema.fields(f)
@@ -811,25 +812,39 @@ object VectorParquetScanExec {
   /** The Parquet value/level encodings the native decoder handles; any other encoding falls the file over. */
   val SupportedEncodings: Set[String] = Set("PLAIN", "PLAIN_DICTIONARY", "RLE_DICTIONARY", "RLE", "BIT_PACKED")
 
-  /** Encodings the native decoder handles only on some physical types: DELTA_BINARY_PACKED on INT32/INT64 (#559). */
-  private val IntegerOnlyEncodings: Set[String] = Set("DELTA_BINARY_PACKED")
+  import PrimitiveType.PrimitiveTypeName.{BINARY, DOUBLE, INT32, INT64}
+
+  /**
+   * Encodings the native decoder handles only on some physical types (#559): DELTA_BINARY_PACKED on
+   * INT32/INT64, DELTA_LENGTH_BYTE_ARRAY and DELTA_BYTE_ARRAY on BINARY (the UTF8 lane), BYTE_STREAM_SPLIT on INT32/INT64/DOUBLE
+   * (not FLOAT or FIXED_LEN_BYTE_ARRAY, which have no lane).
+   */
+  private val TypedEncodings: Map[String, Set[PrimitiveType.PrimitiveTypeName]] = Map(
+    "DELTA_BINARY_PACKED" -> Set(INT32, INT64),
+    "DELTA_LENGTH_BYTE_ARRAY" -> Set(BINARY),
+    "DELTA_BYTE_ARRAY" -> Set(BINARY),
+    "BYTE_STREAM_SPLIT" -> Set(INT32, INT64, DOUBLE)
+  )
 
   /**
    * True if a file column stored as `physical` decodes into the lane of the Spark type `dt`: INT32 for int and
-   * date; INT64, or INT32 sign-extended (not an unsigned one), for bigint; DOUBLE; BINARY for string; INT32 /
-   * INT64 for a decimal with precision <= 18. A FIXED_LEN_BYTE_ARRAY or BYTE_ARRAY decimal, or any other
-   * pairing, makes the file fall over to Spark's reader.
+   * date (and widened into a bigint lane); INT64 for bigint; DOUBLE; BOOLEAN; BINARY for string; INT32 / INT64
+   * for a decimal with precision <= 18 (a FIXED_LEN_BYTE_ARRAY or BYTE_ARRAY decimal is not an INT64 lane).
+   * Any other pairing makes the file fall over to Spark's reader.
    */
   def physicalMatches(dt: org.apache.spark.sql.types.DataType, physical: PrimitiveType): Boolean = {
     import org.apache.spark.sql.types._
-    import PrimitiveType.PrimitiveTypeName.{BINARY, DOUBLE => PDOUBLE, INT32, INT64}
     val p = physical.getPrimitiveTypeName
     dt match {
       case IntegerType | DateType => p == INT32
-      case LongType => p == INT64 || (p == INT32 && !isUnsigned(physical))
-      case DoubleType => p == PDOUBLE
+      case LongType =>
+        // INT32 widens by sign extension, so an unsigned INT32 (Spark reads UINT_32 as a long) does not match.
+        p == INT64 || (p == INT32 && !isUnsigned(physical))
+      case DoubleType => p == DOUBLE
+      case BooleanType => p == PrimitiveType.PrimitiveTypeName.BOOLEAN
       case _: StringType => p == BINARY
-      case d: DecimalType => (p == INT32 && d.precision <= 9) || (p == INT64 && d.precision <= 18)
+      case d: DecimalType =>
+        (p == INT32 && d.precision <= 9) || (p == INT64 && d.precision <= 18)
       case _ => false
     }
   }
@@ -841,9 +856,7 @@ object VectorParquetScanExec {
 
   /** True if a column chunk of physical type `physical` using `encoding` can be decoded natively. */
   def supportsEncoding(encoding: String, physical: PrimitiveType.PrimitiveTypeName): Boolean =
-    SupportedEncodings.contains(encoding) ||
-      (IntegerOnlyEncodings.contains(encoding) &&
-        (physical == PrimitiveType.PrimitiveTypeName.INT32 || physical == PrimitiveType.PrimitiveTypeName.INT64))
+    SupportedEncodings.contains(encoding) || TypedEncodings.get(encoding).exists(_.contains(physical))
 }
 
 /**

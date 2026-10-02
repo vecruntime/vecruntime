@@ -124,6 +124,8 @@ public final class NativeParquetColumnReader {
                 return VecType.INT64;
             case DOUBLE:
                 return VecType.FLOAT64;
+            case BOOLEAN:
+                return VecType.BOOL;
             case BINARY:
                 return VecType.UTF8;
             default:
@@ -191,6 +193,16 @@ public final class NativeParquetColumnReader {
             }
             return flushUtf8(n, decoder.batchNullCount() > 0);
         }
+        if (type == VecType.BOOL) {
+            int filled = 0;
+            while (filled < n) {
+                if (decoder.needsPage()) {
+                    decoder.feedPage(toKernelPage(requirePage()));
+                }
+                filled += decoder.readBatch(n - filled, filled);
+            }
+            return flushBool(n, decoder.batchNullCount() > 0);
+        }
         return fillFixed(n, /* modeA= */ true);
     }
 
@@ -251,7 +263,9 @@ public final class NativeParquetColumnReader {
             filled += decoder.readBatch(n - filled, filled);
         }
         boolean hasNulls = decoder.batchNullCount() > 0;
-        return type == VecType.UTF8 ? flushUtf8(n, hasNulls) : flushFixed(n, hasNulls);
+        return type == VecType.UTF8
+                ? flushUtf8(n, hasNulls)
+                : type == VecType.BOOL ? flushBool(n, hasNulls) : flushFixed(n, hasNulls);
     }
 
     public FieldVector readBatchDirectA(int n) {
@@ -259,10 +273,10 @@ public final class NativeParquetColumnReader {
     }
 
     public FieldVector readBatchDirectB(int n) {
-        decoder.startBatch(n);
-        if (type == VecType.UTF8) {
+        if (type == VecType.UTF8 || type == VecType.BOOL) {
             return readBatchStaging(n);
         }
+        decoder.startBatch(n);
         return fillFixed(n, /* modeA= */ false);
     }
 
@@ -272,6 +286,15 @@ public final class NativeParquetColumnReader {
         decoder.flushFixed(rows, out.data(),
                 hasNulls ? out.validity() : null);
         // finish: set the Arrow value count and (when no nulls) mark all valid without a validity scan.
+        ArrowOutput.finish(out, rows, !hasNulls);
+        return v;
+    }
+
+    private FieldVector flushBool(int rows, boolean hasNulls) {
+        BaseFixedWidthVector v = (BaseFixedWidthVector) borrowFixed(rows);
+        ArrowVectorBuffers out = ArrowVectorBuffers.forWrite(v, rows, sparkType);
+        decoder.flushBool(rows, out.data(),
+                hasNulls ? out.validity() : null);
         ArrowOutput.finish(out, rows, !hasNulls);
         return v;
     }
@@ -297,7 +320,8 @@ public final class NativeParquetColumnReader {
         FieldVector v = pool.pollFirst();
         while (v != null) {
             BaseFixedWidthVector fv = (BaseFixedWidthVector) v;
-            long needData = (long) rows * fv.getTypeWidth();
+            // A BitVector has type width 0: its data is a bitmap, written by flushBool in whole 64-bit words.
+            long needData = type == VecType.BOOL ? (long) ((rows + 63) >>> 6) << 3 : (long) rows * fv.getTypeWidth();
             if (v.getDataBuffer().capacity() >= needData && v.getValidityBuffer().capacity() >= needValidity) {
                 fv.setValueCount(0);
                 return v;
@@ -344,15 +368,17 @@ public final class NativeParquetColumnReader {
         if (page instanceof DataPageV1 v1) {
             pageOut.reset();
             writeInto(v1.getBytes(), pageOut);
-            return ColumnChunkDecoder.Page.v1(pageOut.array(), v1.getValueCount(), encoding(v1.getValueEncoding()));
+            return ColumnChunkDecoder.Page.v1(pageOut.array(), pageOut.size(), v1.getValueCount(),
+                    encoding(v1.getValueEncoding()));
         }
         DataPageV2 v2 = (DataPageV2) page;
         pageOut.reset();
         writeInto(v2.getDefinitionLevels(), pageOut);
         int levelsLength = pageOut.size();
         writeInto(v2.getData(), pageOut);
-        return ColumnChunkDecoder.Page.v2(pageOut.array(), levelsLength, v2.getValueCount(),
-                encoding(v2.getDataEncoding()));
+        // The reused buffer is larger than the page: pass the page's real extent.
+        return ColumnChunkDecoder.Page.v2At(pageOut.array(), 0, levelsLength, levelsLength,
+                pageOut.size() - levelsLength, v2.getValueCount(), encoding(v2.getDataEncoding()));
     }
 
     @SuppressWarnings("deprecation") // PLAIN_DICTIONARY is the legacy data-page dictionary encoding
@@ -363,10 +389,22 @@ public final class NativeParquetColumnReader {
         if (e == Encoding.RLE_DICTIONARY || e == Encoding.PLAIN_DICTIONARY) {
             return ParquetPageDecoder.Encoding.RLE_DICTIONARY;
         }
+        if (e == Encoding.RLE) {
+            return ParquetPageDecoder.Encoding.RLE; // BOOLEAN values (the only RLE value encoding in data pages)
+        }
         if (e == Encoding.DELTA_BINARY_PACKED) {
             return ParquetPageDecoder.Encoding.DELTA_BINARY_PACKED;
         }
-        throw new UnsupportedOperationException("unsupported Parquet value encoding " + e + " (decodes PLAIN, dictionary and DELTA_BINARY_PACKED)");
+        if (e == Encoding.DELTA_LENGTH_BYTE_ARRAY) {
+            return ParquetPageDecoder.Encoding.DELTA_LENGTH_BYTE_ARRAY;
+        }
+        if (e == Encoding.DELTA_BYTE_ARRAY) {
+            return ParquetPageDecoder.Encoding.DELTA_BYTE_ARRAY;
+        }
+        if (e == Encoding.BYTE_STREAM_SPLIT) {
+            return ParquetPageDecoder.Encoding.BYTE_STREAM_SPLIT;
+        }
+        throw new UnsupportedOperationException("unsupported Parquet value encoding " + e + " (decodes PLAIN, dictionary, DELTA_BINARY_PACKED, DELTA_LENGTH_BYTE_ARRAY, DELTA_BYTE_ARRAY and BYTE_STREAM_SPLIT)");
     }
 
     private VectorBuffers decodeDictionary(PageReader pages) {
