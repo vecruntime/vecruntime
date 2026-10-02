@@ -135,7 +135,16 @@ public final class HeapMirror {
      * steady state. {@code prev} must not be used afterwards.
      */
     public static HeapMirror reuse(VectorBuffers in, HeapMirror prev) {
-        int n = in.length();
+        return reuse(in, in.length(), prev);
+    }
+
+    /**
+     * {@link #reuse} over the first {@code n} rows of {@code in}, for a caller
+     * whose buffers' recorded length is not their row count: the shuffle
+     * writer's staging, whose vectors grow past the length they were made with
+     * (#565).
+     */
+    public static HeapMirror reuse(VectorBuffers in, int n, HeapMirror prev) {
         VecType t = in.type();
         int[] ints = null;
         long[] longs = null;
