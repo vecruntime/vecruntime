@@ -745,6 +745,6 @@ public final class SortKernels {
         int ea = off.get(VectorBuffers.LE_INT, (long) (a + 1) << 2);
         int sb = off.get(VectorBuffers.LE_INT, (long) b << 2);
         int eb = off.get(VectorBuffers.LE_INT, (long) (b + 1) << 2);
-        return Integer.signum(StringCompareKernels.compareBytes(data, sa, ea, data, sb, eb));
+        return Integer.signum(StringCompareKernels.compareBytesForSort(data, sa, ea, data, sb, eb));
     }
 }

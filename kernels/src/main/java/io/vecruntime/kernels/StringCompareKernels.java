@@ -188,6 +188,44 @@ public final class StringCompareKernels {
         return Long.compare(lx, ly);
     }
 
+    /**
+     * {@link #compareBytes} for sort comparators (the in-memory sort and the
+     * run merge): the same comparison as a separate method, so it keeps its own
+     * branch profile.
+     *
+     * <p>HotSpot keeps a method's branch profile in that method, shared by
+     * every caller it is inlined into. The filter paths compare against short
+     * literals (a 3-byte store name in q88) and never take the 8-byte loop's
+     * {@code a != b} exit, so C2 compiles that exit as an {@code unstable_if}
+     * uncommon trap; a sort over long strings that differ in their first 8
+     * bytes then takes it on almost every call. On 1 TB TPC-DS with q67 after
+     * q88 in one app, 1-2 executors spent ~34% of the sort stage's CPU in
+     * deoptimization (StringCompareKernels.compareBytes under
+     * RunMerge.compareUtf8) and ran its tasks at ~2.2x CPU for the rest of the
+     * app; executors that had not run the filter first were unaffected.
+     */
+    public static int compareBytesForSort(MemorySegment x, long xs, long xe,
+            MemorySegment y, long ys, long ye) {
+        long lx = xe - xs, ly = ye - ys;
+        long common = Math.min(lx, ly);
+        long k = 0;
+        for (; k + Long.BYTES <= common; k += Long.BYTES) {
+            long a = x.get(BE_LONG_UNALIGNED, xs + k);
+            long b = y.get(BE_LONG_UNALIGNED, ys + k);
+            if (a != b) {
+                return Long.compareUnsigned(a, b);
+            }
+        }
+        for (; k < common; k++) {
+            int a = Byte.toUnsignedInt(x.get(ValueLayout.JAVA_BYTE, xs + k));
+            int b = Byte.toUnsignedInt(y.get(ValueLayout.JAVA_BYTE, ys + k));
+            if (a != b) {
+                return a - b;
+            }
+        }
+        return Long.compare(lx, ly);
+    }
+
     private static final ValueLayout.OfLong BE_LONG_UNALIGNED = ValueLayout.JAVA_LONG_UNALIGNED.withOrder(java.nio.ByteOrder.BIG_ENDIAN);
 
     /**
