@@ -729,12 +729,22 @@ private[vecruntime] class VectorHashJoinIterator(
   private val streamedMirrors = new Array[io.vecruntime.kernels.HeapMirror](spec.streamedWidth)
   private val streamedMirrorTried = new Array[Boolean](spec.streamedWidth)
 
+  /**
+   * The last mirror built per streamed column, whose arrays the next batch's mirror reuses (#565):
+   * building a fresh one per batch was the largest allocation at 1 TB (53 GB per executor over q4
+   * and q67). A batch's mirrors are only read inside its own `probe`, which emits every output
+   * chunk into Arrow memory before the next batch is mirrored.
+   */
+  private val streamedMirrorPool = new Array[io.vecruntime.kernels.HeapMirror](spec.streamedWidth)
+
   private def streamedMirror(ctx: EvalContext, ordinal: Int): io.vecruntime.kernels.HeapMirror = {
     if (!streamedMirrorTried(ordinal)) {
       streamedMirrorTried(ordinal) = true
       val in = ctx.input(ordinal)
-      if (io.vecruntime.kernels.HeapMirror.mirrors(in))
-        streamedMirrors(ordinal) = io.vecruntime.kernels.HeapMirror.of(in)
+      if (io.vecruntime.kernels.HeapMirror.mirrors(in)) {
+        streamedMirrorPool(ordinal) = io.vecruntime.kernels.HeapMirror.reuse(in, streamedMirrorPool(ordinal))
+        streamedMirrors(ordinal) = streamedMirrorPool(ordinal)
+      }
     }
     streamedMirrors(ordinal)
   }

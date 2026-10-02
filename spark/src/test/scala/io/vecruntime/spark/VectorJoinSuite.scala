@@ -112,6 +112,26 @@ class VectorJoinSuite extends VectorQuerySuite {
     checkVectorized("SELECT tk.i, dim.name FROM tk JOIN dim ON tk.i50 = dim.di AND dim.weight * 2.0 > 20.0", Seq(BHJ))
   }
 
+  test("streamed-side condition mirrors reused across batches of changing size and nulls (#565)") {
+    // Small reader batches: every probe reuses the previous batch's mirror arrays, which stay longer
+    // than a smaller batch and hold its stale rows and validity.
+    val key = "spark.sql.parquet.columnarReaderBatchSize"
+    val before = spark.conf.getOption(key)
+    spark.conf.set(key, "777")
+    try {
+      checkVectorized("SELECT tk.i, dim.name FROM tk JOIN dim ON tk.i50 = dim.di AND tk.d > dim.weight", Seq(BHJ))
+      checkVectorized("SELECT tk.i, dim.name FROM tk JOIN dim ON tk.i50 = dim.di AND tk.i > dim.di + 100", Seq(BHJ))
+      checkVectorized(
+        "SELECT tk.i, tk.l, dim.name FROM tk LEFT JOIN dim ON tk.i50 = dim.di AND tk.l > dim.dl",
+        Seq(BHJ)
+      )
+      checkVectorized("SELECT tk.i FROM tk LEFT SEMI JOIN dim ON tk.i50 = dim.di AND tk.l < dim.dl + 5000", Seq(BHJ))
+    } finally before match {
+        case Some(v) => spark.conf.set(key, v)
+        case None => spark.conf.unset(key)
+      }
+  }
+
   test("a non-equi condition on integer lanes with a literal offset is fused per pair (#332)") {
     // `lane OP lane ± literal` on INT32 lanes: the offset on the build side, on the streamed side,
     // subtracted, and written literal-first. q72's date_add on a date lane compiles to the same shape.
