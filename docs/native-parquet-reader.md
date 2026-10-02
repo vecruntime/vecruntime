@@ -181,7 +181,10 @@ The corpus approach follows Hardwood (`hardwood-hq/hardwood`), as does bounding 
   | `RLE`, runs of 1–64 | 212 | 11.2 (`RunLengthBitPackingHybridValuesReader`) |
 
   `RLE` measured 60.7 before `readBits`, which expands each value to an `int` and repacks it.
-- **TINYINT / SMALLINT.** INT32 physical; they need the narrow output wrapper (`VectorNarrowIntColumnVector`) for the lane.
+- **TINYINT / SMALLINT.** **Done**. INT32 physical (`INTEGER(8|16, true)`), decoded by the INT32 path (every encoding it has) into the INT32 lane, with the declared type on output (`VectorNarrowIntColumnVector`). A writer may store any INT32 under the annotation. Spark's readers narrow with a `(byte)` / `(short)` cast, so `fillFixed` sign-extends the low 8 or 16 bits of each slot in place. Operators compute on the `int`, and a value outside the range must wrap there exactly as Spark wraps it. This is one pass over the batch's ints; there is no new decode kernel, so no new JMH.
+  - Checked through Spark with dictionary, `PLAIN` and v2 `DELTA_BINARY_PACKED` pages, nulls, the extremes, filters, an aggregate, arithmetic and casts (`VectorParquetScanSuite`).
+  - Checked on a file written by parquet-java's `ExampleParquetWriter` with out-of-range values, against Spark's parquet-java-based reader. Without the narrowing, that test's sum differs.
+  - The corpus columns `tinyint_col` / `smallint_col` of the `alltypes_*` files are now read natively.
 - **FLOAT.** Needs a FLOAT32 lane, or a widening path that keeps exact values.
 - **TIMESTAMP / TIMESTAMP_NTZ.** INT64 micros or millis, with unit conversion. The rebase mode has to be honoured per file, from the file's metadata and the session configuration. INT96, the legacy Impala/Hive layout, needs a conversion kernel; until then it keeps the plan-level fallback.
 - **BINARY and wide decimals** (precision > 18, `FIXED_LEN_BYTE_ARRAY`). Need a variable-width binary lane and a 128-bit decimal lane.

@@ -86,7 +86,9 @@ public final class NativeParquetColumnReader {
     private final String name;
     private final int maxDefLevel;
     private final BufferAllocator allocator;
-
+    // TINYINT / SMALLINT: the INT32 lane's values are narrowed to these many bits (0: not narrow).
+    private final int narrowBits;
+    private static final java.lang.foreign.ValueLayout.OfInt INT_LE = java.lang.foreign.ValueLayout.JAVA_INT_UNALIGNED.withOrder(java.nio.ByteOrder.LITTLE_ENDIAN);
     private final GroupUnpacker[] unpackers = new GroupUnpacker[33];
     private final Arena scratch;
     private final ColumnChunkDecoder decoder;
@@ -109,6 +111,9 @@ public final class NativeParquetColumnReader {
         this.name = name;
         this.maxDefLevel = column.getMaxDefinitionLevel();
         this.allocator = allocator;
+        this.narrowBits = sparkType instanceof org.apache.spark.sql.types.ByteType
+                ? 8
+                : sparkType instanceof org.apache.spark.sql.types.ShortType ? 16 : 0;
         // Dictionary scratch is GC-managed: closing a shared Arena runs a JVM-wide handshake that walks every
         // thread's stack, and a reader is made per column per file -- on 1 TB TPC-DS (14,594 store_sales
         // files) those handshakes were 8-9% of executor CPU in q88. An automatic arena has no close.
@@ -244,8 +249,28 @@ public final class NativeParquetColumnReader {
             filled += modeA ? decoder.readBatchDirectA(n - filled, filled, data, validity) : decoder.readBatchDirectB(n - filled, filled, nio, validity);
         }
         boolean hasNulls = decoder.batchNullCount() > 0;
+        if (narrowBits != 0) {
+            narrow(data, n, narrowBits);
+        }
         io.vecruntime.spark.arrow.ArrowOutput.finish(out, n, !hasNulls);
         return v;
+    }
+
+    /**
+     * TINYINT / SMALLINT on the INT32 lane: Spark's readers (vectorized and
+     * row-based) narrow each INT32 value with a {@code (byte)} / {@code (short)}
+     * cast, so a file value outside the declared range wraps. The lane must hold
+     * the narrowed value too -- operators compute on the {@code int}, not on
+     * {@code getByte} -- so sign-extend the low {@code bits} of each slot in
+     * place. Null slots are narrowed as well, harmlessly.
+     */
+    private static void narrow(java.lang.foreign.MemorySegment data, int n, int bits) {
+        int shift = 32 - bits;
+        for (int i = 0; i < n; i++) {
+            long at = (long) i << 2;
+            int x = data.get(INT_LE, at);
+            data.set(INT_LE, at, (x << shift) >> shift);
+        }
     }
 
     // ----- #559 JMH A/B entry points (ParquetScanE2EBenchmark only) -----
@@ -285,6 +310,9 @@ public final class NativeParquetColumnReader {
         ArrowVectorBuffers out = ArrowVectorBuffers.forWrite(v, rows, sparkType);
         decoder.flushFixed(rows, out.data(),
                 hasNulls ? out.validity() : null);
+        if (narrowBits != 0) {
+            narrow(out.data(), rows, narrowBits);
+        }
         // finish: set the Arrow value count and (when no nulls) mark all valid without a validity scan.
         ArrowOutput.finish(out, rows, !hasNulls);
         return v;

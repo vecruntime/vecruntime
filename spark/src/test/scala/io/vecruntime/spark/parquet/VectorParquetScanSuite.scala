@@ -515,6 +515,86 @@ class VectorParquetScanSuite extends VectorQuerySuite {
     }
   }
 
+  test("TINYINT and SMALLINT columns decode natively: dictionary, PLAIN, DELTA_BINARY_PACKED, nulls (#559)") {
+    // INT32 physical with INT(8) / INT(16) annotations, into the INT32 lane with the declared type on output
+    // (VectorNarrowIntColumnVector). v1 pages are dictionary-encoded, v2 without a dictionary are
+    // DELTA_BINARY_PACKED; nulls, the full range including the extremes, several row groups, filters, an aggregate
+    // keyed by the narrow column, arithmetic and casts over it, at two batch sizes.
+    for (
+      (version, dict, view) <-
+        Seq(("v1", "true", "t_narrow_v1"), ("v1", "false", "t_narrow_v1p"), ("v2", "false", "t_narrow_v2"))
+    ) {
+      val path = newTempPath(view)
+      withPlugin(enabled = false) {
+        spark.sql(
+          """SELECT CAST(id AS INT) AS i,
+            |  CASE WHEN id % 7 = 0 THEN NULL ELSE CAST((id * 37) % 256 - 128 AS TINYINT) END AS t,
+            |  CASE WHEN id % 11 = 0 THEN NULL ELSE CAST((id * 2654435761) % 65536 - 32768 AS SMALLINT) END AS s,
+            |  CAST(id % 5 AS TINYINT) AS lowcard
+            |FROM range(0, 40000)""".stripMargin
+        ).repartition(2)
+          .sortWithinPartitions("i")
+          .write
+          .option("parquet.writer.version", version)
+          .option("parquet.enable.dictionary", dict)
+          .mode("overwrite")
+          .parquet(path)
+        spark.read.parquet(path).createOrReplaceTempView(view)
+      }
+      for (batch <- Seq("1024", "100")) {
+        withConf("spark.sql.parquet.columnarReaderBatchSize" -> batch) {
+          checkVectorized(s"SELECT * FROM $view", Seq(node))
+          checkVectorized(s"SELECT i, t, s FROM $view WHERE t < 0 AND s > 100", Seq(node))
+          checkVectorized(s"SELECT lowcard, count(*), sum(t), min(s), max(s) FROM $view GROUP BY lowcard", Seq(node))
+          checkVectorized(s"SELECT t + 1, s * 2, CAST(t AS STRING), CAST(s AS BIGINT) FROM $view", Seq(node))
+          withPlugin(enabled = true) {
+            val df = spark.sql(s"SELECT t, s FROM $view")
+            df.collect()
+            val scans = PlanUtils.allNodes(finalPlan(df)).collect { case s: VectorParquetScanExec => s }
+            assert(scans.nonEmpty, s"$view: expected ${node.getSimpleName}")
+            assert(scans.map(_.metrics("numRowGroups").value).sum > 0, s"$view: no row group read natively")
+          }
+        }
+      }
+    }
+  }
+
+  test("an INT(8) / INT(16) value outside its declared range wraps as Spark's readers wrap it (#559)") {
+    // A writer may store any INT32 under an INT(8) / INT(16) annotation. Spark's readers narrow with a
+    // (byte) / (short) cast; the lane must carry the narrowed value too, or an operator over the int (a sum, a
+    // comparison) would see 300 where Spark sees 44.
+    val path = newTempPath("t_narrow_wrap")
+    new java.io.File(path).mkdirs()
+    val schema = org.apache.parquet.schema.MessageTypeParser.parseMessageType(
+      "message m { required int32 t (INTEGER(8,true)); optional int32 s (INTEGER(16,true)); }"
+    )
+    val conf = new org.apache.hadoop.conf.Configuration()
+    val writer = org.apache.parquet.hadoop.example.ExampleParquetWriter
+      .builder(new org.apache.hadoop.fs.Path(path + "/part-0.parquet"))
+      .withConf(conf)
+      .withType(schema)
+      .build()
+    val factory = new org.apache.parquet.example.data.simple.SimpleGroupFactory(schema)
+    val raw = Seq(0, 1, -1, 127, -128, 128, 300, -300, 65535, Int.MaxValue, Int.MinValue, 40000, -40000)
+    try {
+      for (k <- 0 until 3000) {
+        val v = raw(k % raw.length) + (k / raw.length) * 256
+        val g = factory.newGroup().append("t", v)
+        if (k % 5 != 0) g.append("s", v)
+        writer.write(g)
+      }
+    } finally writer.close()
+    withPlugin(enabled = false)(spark.read.parquet(path).createOrReplaceTempView("t_narrow_wrap"))
+    checkVectorized("SELECT * FROM t_narrow_wrap", Seq(node))
+    checkVectorized("SELECT sum(t), sum(s), min(t), max(s), count(*) FROM t_narrow_wrap WHERE t > 0", Seq(node))
+    withPlugin(enabled = true) {
+      val df = spark.sql("SELECT t, s FROM t_narrow_wrap")
+      df.collect()
+      val scans = PlanUtils.allNodes(finalPlan(df)).collect { case s: VectorParquetScanExec => s }
+      assert(scans.map(_.metrics("numRowGroups").value).sum > 0, "no row group read natively")
+    }
+  }
+
   test("fallback: a timestamp column is not decoded in slice 1") {
     val path = newTempPath("t_ts")
     withPlugin(enabled = false) {

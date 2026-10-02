@@ -836,7 +836,7 @@ object VectorParquetScanExec {
     import org.apache.spark.sql.types._
     val p = physical.getPrimitiveTypeName
     dt match {
-      case IntegerType | DateType => p == INT32
+      case IntegerType | DateType | ByteType | ShortType => p == INT32
       case LongType =>
         // INT32 widens by sign extension, so an unsigned INT32 (Spark reads UINT_32 as a long) does not match.
         p == INT64 || (p == INT32 && !isUnsigned(physical))
