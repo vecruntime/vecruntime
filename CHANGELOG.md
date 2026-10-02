@@ -40,6 +40,14 @@ version may change configuration keys or defaults, always noted here.
   `fs.s3a.connection.maximum` 200 -> 1000, `fs.s3a.threads.max` 256, `fs.s3a.max.total.tasks` 128 and the
   Analytics Accelerator's `physicalio.thread.pool.size` 192 (the values every 1 TB #559 A/B round ran with).
 
+### Changed
+
+- Benchmarks: the launcher (`benchmarks/scripts/submit-cluster.sh`, and through it `benchmarks/k8s/render-run.sh`)
+  starts the driver and the executors with `-XX:+UseCompactObjectHeaders` (#578; JEP 519, product on JDK 25,
+  the default from JDK 27). The AOT cache scripts (`benchmarks/k8s/aot/aot-env.sh`) build with the same
+  flag, because a cache only serves a JVM with the header layout it was built with. A cache built before
+  this change is ignored, not an error (`AOTMode` stays auto), until it is retrained.
+
 ### Fixed
 
 - String sorts no longer fall into a C2 deoptimization storm (#559). The sort comparators now have their own
