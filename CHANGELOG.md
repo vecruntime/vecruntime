@@ -4,7 +4,13 @@ All notable changes to vecruntime. The format follows [Keep a Changelog](https:/
 the project uses [semantic versioning](https://semver.org/) once it reaches 1.0 -- until then a minor
 version may change configuration keys or defaults, always noted here.
 
-## Unreleased
+## 0.0.5 -- 2026-10-02
+
+Our own Parquet scan (`spark.vecruntime.scan.nativeParquet.enabled`, default off) with file and
+row-group read-ahead; the string-sort deoptimization storm fixed; fewer FFM checks in the group-key and
+shuffle-size hot loops; and the benchmark launcher on ACCP, wider S3A read concurrency and compact
+object headers. TPC-DS 1 TB on x86 with the native scan on, four engines in one session on
+2026-10-02: 2.01x Spark (1,542 s against 3,099), Comet 1.0.0 1.55x (`docs/results.md`).
 
 ### Added
 
@@ -42,6 +48,12 @@ version may change configuration keys or defaults, always noted here.
 
 ### Changed
 
+- Hot loops read heap copies instead of native memory, one bulk move per column (#565). The hash
+  aggregate's group-key accessors (`getInt` / `getLong` / `getDouble` / `isNull`) and `toIds`' dictionary
+  path read int/long arrays and 64-row validity words mirrored from the batch (#570). The shuffle
+  writer's per-batch string-size estimate for AQE map-size scaling moves to the `Utf8Sizes.paddedBytes`
+  kernel over reused arrays (#569). Results are unchanged. In q67's executor profile at 1 TB the shuffle
+  loop was 16.6% of the FFM liveness/bounds-check samples, and the key accessors and `toIds` about 15%.
 - Benchmarks: the launcher (`benchmarks/scripts/submit-cluster.sh`, and through it `benchmarks/k8s/render-run.sh`)
   starts the driver and the executors with `-XX:+UseCompactObjectHeaders` (#578; JEP 519, product on JDK 25,
   the default from JDK 27). The AOT cache scripts (`benchmarks/k8s/aot/aot-env.sh`) build with the same
