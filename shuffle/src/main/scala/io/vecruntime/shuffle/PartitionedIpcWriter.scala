@@ -1258,6 +1258,15 @@ final class PartitionedIpcWriter(
     dictScratch.foreach(sc => if (sc != null) { sc._1.close(); sc._2.close() })
     plainScratch.foreach(v => if (v != null) v.close())
     frameCompressor.close()
+    // The mirrors' arrays go to this thread's next writer (#565): one task's writer mirrors only a few
+    // staged flushes, so its own pools were mostly allocated once and dropped.
+    val stash = HeapMirror.Stash.local()
+    stash.give(stagedMirrorPool)
+    stash.give(mirrorPool)
+    java.util.Arrays.fill(stagedMirrorPool.asInstanceOf[Array[AnyRef]], null)
+    java.util.Arrays.fill(mirrorPool.asInstanceOf[Array[AnyRef]], null)
+    java.util.Arrays.fill(stagedMirrored.asInstanceOf[Array[AnyRef]], null)
+    java.util.Arrays.fill(mirrored.asInstanceOf[Array[AnyRef]], null)
   }
 }
 
