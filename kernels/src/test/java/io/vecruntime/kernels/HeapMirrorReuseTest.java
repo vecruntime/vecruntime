@@ -23,13 +23,14 @@ import io.vecruntime.kernels.reference.ScalarReference;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * {@link HeapMirror#reuse} (#565): a mirror built into the previous batch's
  * arrays gathers exactly what {@link GatherKernels#gatherFixed} gathers from the
- * segments, over a stream of batches that grows, shrinks, switches type and
- * gains and loses nulls -- so stale words or values left in the reused arrays
- * past the batch's rows must never show.
+ * segments, over a stream of batches that grows, shrinks, switches type (INT32,
+ * INT64, DECIMAL128, FLOAT64) and gains and loses nulls -- so stale words or
+ * values left in the reused arrays past the batch's rows must never show.
  */
 class HeapMirrorReuseTest {
 
@@ -44,11 +45,14 @@ class HeapMirrorReuseTest {
             for (int b = 0; b < sizes.length * 3; b++) {
                 int n = sizes[b % sizes.length];
                 boolean[] nulls = b % 2 == 0 ? TestData.nulls(rnd, n, 0.2) : null;
-                VectorBuffers in = switch (b % 3) {
+                VectorBuffers in = switch (b % 4) {
                     case 0 -> TestData.ints(arena, rnd, n, nulls);
                     case 1 -> TestData.longs(arena, rnd, n, nulls);
+                    case 2 -> TestData.decimal128s(arena, rnd, n, nulls);
                     default -> TestData.doubles(arena, rnd, n, nulls);
                 };
+                assertTrue(HeapMirror.mirrorsForGather(in),
+                        in.type().toString());
                 HeapMirror m = HeapMirror.reuse(in, prev);
                 prev = m;
                 int count = rnd.nextInt(2 * n + 1);
@@ -80,6 +84,11 @@ class HeapMirrorReuseTest {
                     if (width == 4) {
                         assertEquals(exp.get(VectorBuffers.LE_INT, (long) o << 2),
                                 act.get(VectorBuffers.LE_INT, (long) o << 2), what + " @" + o);
+                    } else if (width == 16) {
+                        assertEquals(exp.get(VectorBuffers.LE_LONG, (long) o << 4),
+                                act.get(VectorBuffers.LE_LONG, (long) o << 4), what + " lo @" + o);
+                        assertEquals(exp.get(VectorBuffers.LE_LONG, ((long) o << 4) + 8),
+                                act.get(VectorBuffers.LE_LONG, ((long) o << 4) + 8), what + " hi @" + o);
                     } else {
                         assertEquals(exp.get(VectorBuffers.LE_LONG, (long) o << 3),
                                 act.get(VectorBuffers.LE_LONG, (long) o << 3), what + " @" + o);
