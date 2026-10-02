@@ -31,6 +31,7 @@ import org.apache.parquet.column.values.delta.{
   DeltaBinaryPackingValuesWriterForLong
 }
 import org.apache.parquet.column.values.deltalengthbytearray.DeltaLengthByteArrayValuesWriter
+import org.apache.parquet.column.values.deltastrings.DeltaByteArrayWriter
 import org.apache.parquet.io.api.Binary
 import org.scalatest.funsuite.AnyFunSuite
 
@@ -146,6 +147,53 @@ class DeltaBinaryPackedCrossCheckSuite extends AnyFunSuite {
       done += want
     }
     SegmentVectorBuffers.fixedWidth(lane, n, null, data)
+  }
+
+  /** Decodes a UTF8 page of `n` values, no nulls, through ColumnChunkDecoder in `batch`-row batches. */
+  private def decodeUtf8(page: Array[Byte], n: Int, enc: ParquetPageDecoder.Encoding, batch: Int): Seq[Array[Byte]] = {
+    val d = new ColumnChunkDecoder(VecType.UTF8, 0, batch, bytePackers)
+    d.startChunk(n)
+    val out = scala.collection.mutable.ArrayBuffer[Array[Byte]]()
+    var row = 0
+    while (row < n) {
+      val want = math.min(batch, n - row)
+      d.startBatch(want)
+      var filled = 0
+      while (filled < want) {
+        if (d.needsPage()) d.feedPage(ColumnChunkDecoder.Page.v1(page, page.length, n, enc))
+        filled += d.readBatch(want - filled, filled)
+      }
+      val arena = Arena.ofConfined()
+      try {
+        val offsets = ArrowLayout.allocateOffsets(arena, want)
+        val bytes = ArrowLayout.allocateBytes(arena, math.max(d.utf8Bytes(), 1L))
+        d.flushUtf8(want, offsets, bytes, null)
+        val col = SegmentVectorBuffers.utf8(want, null, offsets, bytes)
+        for (k <- 0 until want) out += col.getUtf8Bytes(k)
+      } finally arena.close()
+      row += want
+    }
+    out.toSeq
+  }
+
+  test("DELTA_BYTE_ARRAY pages from parquet-java's writer decode identically") {
+    val rnd = new Random(55916)
+    for (n <- lengths; batch <- Seq(64, 1000); sorted <- Seq(true, false)) {
+      val raw = Array.tabulate(n) { i =>
+        i % 6 match {
+          case 0 => ""
+          case 1 => s"héllo wörld $i"
+          case 2 => "z" * rnd.nextInt(500)
+          case _ => f"https://example.com/item/${rnd.nextInt(1000000)}%09d"
+        }
+      }
+      val v = (if (sorted) raw.sorted else raw).map(_.getBytes(StandardCharsets.UTF_8))
+      val w = new DeltaByteArrayWriter(64, 1 << 20, HeapByteBufferAllocator.getInstance())
+      v.foreach(b => w.writeBytes(Binary.fromConstantByteArray(b)))
+      val got = decodeUtf8(w.getBytes.toByteArray, n, ParquetPageDecoder.Encoding.DELTA_BYTE_ARRAY, batch)
+      assert(got.length == n)
+      for (i <- 0 until n) assert(got(i).sameElements(v(i)), s"n=$n batch=$batch sorted=$sorted row $i")
+    }
   }
 
   test("DELTA_LENGTH_BYTE_ARRAY pages from parquet-java's writer decode identically") {

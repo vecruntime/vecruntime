@@ -23,8 +23,13 @@ version may change configuration keys or defaults, always noted here.
   fail with it off. Checked against parquet-java's writers, and through Spark with v1 and v2 files from a
   test writer that picks the encodings per column, against Spark's row-based reader. JMH, one 20,000-value
   page in 1024-row batches: `BYTE_STREAM_SPLIT` DOUBLE/INT64 8.8x and `DELTA_LENGTH_BYTE_ARRAY` 1.46x the pages
-  per ms of parquet-java's value readers. `DELTA_BYTE_ARRAY`, the encoding parquet-java writes for v2 strings
-  without a dictionary, still falls the file over to Spark's reader.
+  per ms of parquet-java's value readers.
+- The native Parquet scan decodes `DELTA_BYTE_ARRAY` strings (#559). This is what parquet-java writes for v2
+  strings without a dictionary, so v2 files written by Spark (`parquet.writer.version=v2`) no longer fall over
+  to Spark's reader for their string columns. Each page's values are rebuilt in one sequential pass from the
+  prefix lengths and the `DELTA_LENGTH_BYTE_ARRAY` suffixes into a reused buffer, then batched like
+  `DELTA_LENGTH_BYTE_ARRAY`. A corrupt page fails, for example on a prefix longer than the previous value. JMH:
+  2.0x the pages per ms of parquet-java's `DeltaByteArrayReader` on sorted URL-like keys.
 
 ## 0.0.5 -- 2026-10-02
 

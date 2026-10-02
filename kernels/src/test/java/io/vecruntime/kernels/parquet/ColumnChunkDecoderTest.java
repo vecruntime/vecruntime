@@ -569,6 +569,90 @@ class ColumnChunkDecoderTest {
     }
 
     @Test
+    void deltaByteArrayPagesRebuildPrefixesWithNullsAcrossPages() {
+        // UTF8 lane: per page, a DELTA_BINARY_PACKED run of prefix lengths (bytes shared with the previous
+        // present value; the chain restarts on each page), then a DELTA_LENGTH_BYTE_ARRAY of the suffixes.
+        // Sorted keys share long prefixes; nulls, empty and multi-byte values break the chain.
+        Random rnd = new Random(55915);
+        int rows = 4096;
+        for (boolean nulls : new boolean[] {false, true}) {
+            for (boolean v2 : new boolean[] {false, true}) {
+                String[] v = new String[rows];
+                for (int i = 0; i < rows; i++) {
+                    int kind = rnd.nextInt(12);
+                    v[i] = nulls && kind == 0
+                            ? null
+                            : kind == 1
+                                    ? ""
+                                    : kind == 2
+                                            ? "héllo wörld " + i
+                                            : kind == 3 ? "x".repeat(50 + rnd.nextInt(300)) : String.format("https://example.com/item/%09d", i);
+                }
+                int maxDef = nulls ? 1 : 0;
+                List<PreparedPage> pages = new ArrayList<>();
+                int start = 0;
+                for (int end : evenSplits(rows, 4)) {
+                    byte[] levels = levelBytes(v, start, end, maxDef);
+                    List<Long> prefixes = new ArrayList<>();
+                    List<Long> suffixLens = new ArrayList<>();
+                    ByteArrayOutputStream suffixBytes = new ByteArrayOutputStream();
+                    byte[] prev = new byte[0];
+                    for (int i = start; i < end; i++) {
+                        if (v[i] == null) {
+                            continue;
+                        }
+                        byte[] b = v[i].getBytes(StandardCharsets.UTF_8);
+                        int p = 0;
+                        while (p < b.length && p < prev.length && b[p] == prev[p]) {
+                            p++;
+                        }
+                        prefixes.add((long) p);
+                        suffixLens.add((long) (b.length - p));
+                        suffixBytes.write(b, p, b.length - p);
+                        prev = b;
+                    }
+                    ByteArrayOutputStream vals = new ByteArrayOutputStream();
+                    vals.writeBytes(DeltaBinaryPackedReaderTest.encode(prefixes.stream()
+                            .mapToLong(Long::longValue)
+                            .toArray(),
+                            false, 128, 4, false));
+                    vals.writeBytes(DeltaBinaryPackedReaderTest.encode(suffixLens.stream()
+                            .mapToLong(Long::longValue)
+                            .toArray(),
+                            false, 128, 4, false));
+                    vals.writeBytes(suffixBytes.toByteArray());
+                    byte[] page = assemble(levels, vals.toByteArray(), maxDef, v2);
+                    pages.add(
+                            new PreparedPage(
+                                    kernelPage(page, levels.length, maxDef, v2, end - start,
+                                            ParquetPageDecoder.Encoding.DELTA_BYTE_ARRAY),
+                                    end - start));
+                    start = end;
+                }
+                try (Arena arena = Arena.ofConfined()) {
+                    ColumnChunkDecoder d = new ColumnChunkDecoder(VecType.UTF8, maxDef, 384, scalarFactory());
+                    assertUtf8(v, runStreamingUtf8(d, pages, rows, 384, nulls, arena));
+                }
+            }
+        }
+    }
+
+    @Test
+    void deltaByteArrayRejectsAPrefixLongerThanThePreviousValue() {
+        // Two values: "ab", then prefix 3 (> 2) + suffix "c". A corrupt page must fail, not read garbage.
+        ByteArrayOutputStream vals = new ByteArrayOutputStream();
+        vals.writeBytes(DeltaBinaryPackedReaderTest.encode(new long[] {0, 3}, false, 128, 4,
+                false));
+        vals.writeBytes(DeltaBinaryPackedReaderTest.encode(new long[] {2, 1}, false, 128, 4,
+                false));
+        vals.writeBytes("abc".getBytes(StandardCharsets.UTF_8));
+        byte[] page = vals.toByteArray();
+        ColumnChunkDecoder d = new ColumnChunkDecoder(VecType.UTF8, 0, 2, scalarFactory());
+        d.startChunk(2);
+        org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class, () -> d.feedPage(ColumnChunkDecoder.Page.v1(page, 2, ParquetPageDecoder.Encoding.DELTA_BYTE_ARRAY)));
+    }
+
+    @Test
     void byteStreamSplitPagesDecodeOnEveryPathWithNullsAcrossPages() {
         // INT32, INT64, DOUBLE (incl. NaN, -0.0, infinities) and INT32 widened to INT64; nulls; v1 and v2;
         // staging and both direct paths; batches of 384 rows over ~1000-row pages.

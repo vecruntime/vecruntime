@@ -135,7 +135,10 @@ public final class ColumnChunkDecoder {
     private int utf8PlainCursor; // byte offset of the next unconsumed PLAIN utf8 value (== plainCursor role)
     private RleBitPackingReader idReader; // live RLE id reader for a dictionary page (resumes mid-run)
     private DeltaBinaryPackedReader deltaReader; // live reader for a DELTA_BINARY_PACKED page (resumes mid-miniblock)
-    private int[] pageLengths = new int[0]; // DELTA_LENGTH_BYTE_ARRAY: the page's value lengths, decoded at feedPage
+    private int[] pageLengths = new int[0]; // DELTA_LENGTH_BYTE_ARRAY / DELTA_BYTE_ARRAY: the page's value lengths, decoded at feedPage
+    private int[] prefixLengths = new int[0]; // DELTA_BYTE_ARRAY: bytes each value shares with the previous one
+    private byte[] dbaBytes = new byte[0]; // DELTA_BYTE_ARRAY: the page's values rebuilt back to back
+    private byte[] binarySrc; // where the DELTA_*_BYTE_ARRAY value bytes of the current page live
     private int lengthCursor; // next unconsumed entry of pageLengths
     private int bssStart; // BYTE_STREAM_SPLIT: offset of the first stream
     private int bssStride; // BYTE_STREAM_SPLIT: values in the page (= bytes per stream)
@@ -361,6 +364,17 @@ public final class ColumnChunkDecoder {
             this.lengthCursor = 0;
             this.plainCursor = 0;
             this.utf8PlainCursor = bytesStart;
+            this.binarySrc = page.data;
+        } else if (page.encoding == ParquetPageDecoder.Encoding.DELTA_BYTE_ARRAY) {
+            if (type != VecType.UTF8) {
+                throw new IllegalArgumentException("DELTA_BYTE_ARRAY on a " + type + " lane");
+            }
+            this.idReader = null;
+            materializeDeltaByteArray(page.data, (int) valuesStart, (int) page.dataEnd());
+            this.lengthCursor = 0;
+            this.plainCursor = 0;
+            this.utf8PlainCursor = 0;
+            this.binarySrc = dbaBytes;
         } else if (page.encoding == ParquetPageDecoder.Encoding.BYTE_STREAM_SPLIT) {
             if (physicalType == VecType.UTF8) {
                 throw new IllegalArgumentException("BYTE_STREAM_SPLIT on a UTF8 lane");
@@ -770,6 +784,72 @@ public final class ColumnChunkDecoder {
     // ------------------------------------------------------------------ DELTA_BINARY_PACKED / BYTE_STREAM_SPLIT (#559)
 
     /**
+     * Rebuilds a DELTA_BYTE_ARRAY page's values into {@link #dbaBytes}, back to
+     * back, with their lengths in {@link #pageLengths}. The page is a
+     * DELTA_BINARY_PACKED run of prefix lengths (how many leading bytes each value
+     * shares with the previous one, 0 for the first), then a
+     * DELTA_LENGTH_BYTE_ARRAY of the suffixes: a run of their lengths and their
+     * bytes. Each value needs the previous one, so this is one sequential pass per
+     * page; the batches then copy out of the rebuilt bytes like
+     * DELTA_LENGTH_BYTE_ARRAY. The prefix chain restarts on every page.
+     */
+    private void materializeDeltaByteArray(byte[] data, int start, int end) {
+        DeltaBinaryPackedReader prefixes = new DeltaBinaryPackedReader(data, start, end - start, false,
+                this::unpackerFor);
+        int count = prefixes.remaining();
+        if (prefixLengths.length < count) {
+            prefixLengths = new int[Math.max(count, 2 * prefixLengths.length)];
+        }
+        prefixes.readInts(prefixLengths, 0, count);
+        int suffixStart = prefixes.position();
+        DeltaBinaryPackedReader suffixes = new DeltaBinaryPackedReader(data, suffixStart, end - suffixStart, false,
+                this::unpackerFor);
+        if (suffixes.remaining() != count) {
+            throw new IllegalStateException("DELTA_BYTE_ARRAY: " + count + " prefixes but " + suffixes.remaining() + " suffixes");
+        }
+        if (pageLengths.length < count) {
+            pageLengths = new int[Math.max(count, 2 * pageLengths.length)];
+        }
+        suffixes.readInts(pageLengths, 0, count);
+        int s = suffixes.position();
+        byte[] out = dbaBytes;
+        int o = 0;
+        int prevStart = 0;
+        int prevLen = 0;
+        for (int i = 0; i < count; i++) {
+            int pre = prefixLengths[i];
+            int suf = pageLengths[i];
+            if (pre < 0 || suf < 0 || pre > prevLen) {
+                throw new IllegalStateException("DELTA_BYTE_ARRAY: value "
+                        + i
+                        + " has prefix "
+                        + pre
+                        + " and suffix "
+                        + suf
+                        + " after a "
+                        + prevLen
+                        + "-byte value");
+            }
+            if (s + suf > end) {
+                throw new IllegalStateException("DELTA_BYTE_ARRAY: suffix bytes past the end of the page");
+            }
+            int len = pre + suf;
+            if (o + len > out.length) {
+                out = java.util.Arrays.copyOf(out,
+                        Math.max(o + len, 2 * out.length));
+            }
+            System.arraycopy(out, prevStart, out, o, pre); // the previous value ends at o: no overlap
+            System.arraycopy(data, s, out, o + pre, suf);
+            s += suf;
+            prevStart = o;
+            prevLen = len;
+            pageLengths[i] = len;
+            o += len;
+        }
+        dbaBytes = out;
+    }
+
+    /**
      * True for a fixed-width page whose values are decoded into scratch first
      * (not PLAIN, not dictionary).
      */
@@ -1048,8 +1128,10 @@ public final class ColumnChunkDecoder {
         byte[] src = pageData;
         int s = utf8PlainCursor;
         int k = 0;
-        if (pageEncoding == ParquetPageDecoder.Encoding.DELTA_LENGTH_BYTE_ARRAY) {
-            // The lengths were decoded at feedPage; the bytes are back to back from utf8PlainCursor.
+        if (pageEncoding == ParquetPageDecoder.Encoding.DELTA_LENGTH_BYTE_ARRAY || pageEncoding == ParquetPageDecoder.Encoding.DELTA_BYTE_ARRAY) {
+            // The lengths were decoded at feedPage; the bytes are back to back from utf8PlainCursor, in the
+            // page (DELTA_LENGTH_BYTE_ARRAY) or in the page's rebuilt values (DELTA_BYTE_ARRAY).
+            src = binarySrc;
             int[] lens = pageLengths;
             int lc = lengthCursor;
             for (int i = 0; i < m; i++) {

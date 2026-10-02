@@ -371,10 +371,13 @@ public final class NativeParquetColumnReader {
         if (e == Encoding.DELTA_LENGTH_BYTE_ARRAY) {
             return ParquetPageDecoder.Encoding.DELTA_LENGTH_BYTE_ARRAY;
         }
+        if (e == Encoding.DELTA_BYTE_ARRAY) {
+            return ParquetPageDecoder.Encoding.DELTA_BYTE_ARRAY;
+        }
         if (e == Encoding.BYTE_STREAM_SPLIT) {
             return ParquetPageDecoder.Encoding.BYTE_STREAM_SPLIT;
         }
-        throw new UnsupportedOperationException("unsupported Parquet value encoding " + e + " (decodes PLAIN, dictionary, DELTA_BINARY_PACKED, DELTA_LENGTH_BYTE_ARRAY and BYTE_STREAM_SPLIT)");
+        throw new UnsupportedOperationException("unsupported Parquet value encoding " + e + " (decodes PLAIN, dictionary, DELTA_BINARY_PACKED, DELTA_LENGTH_BYTE_ARRAY, DELTA_BYTE_ARRAY and BYTE_STREAM_SPLIT)");
     }
 
     private VectorBuffers decodeDictionary(PageReader pages) {
