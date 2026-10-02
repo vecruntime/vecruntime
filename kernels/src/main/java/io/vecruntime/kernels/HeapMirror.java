@@ -151,14 +151,14 @@ public final class HeapMirror {
         if (t == VecType.INT32) {
             ints = prev != null && prev.ints != null && prev.ints.length >= n
                     ? prev.ints
-                    : new int[Math.max(n, 4096)];
+                    : Stash.local().takeInts(n);
             MemorySegment.copy(in.data(), VectorBuffers.LE_INT, 0L, ints, 0,
                     n);
         } else {
             int words = n * wordsPerRow(t);
             longs = prev != null && prev.longs != null && prev.longs.length >= words
                     ? prev.longs
-                    : new long[Math.max(words, 4096)];
+                    : Stash.local().takeLongs(words);
             MemorySegment.copy(in.data(), VectorBuffers.LE_LONG, 0L, longs, 0,
                     words);
         }
@@ -173,6 +173,104 @@ public final class HeapMirror {
             }
         }
         return new HeapMirror(t, n, ints, longs, validity);
+    }
+
+    /**
+     * Value arrays a finished {@link #reuse} caller left for the next one on
+     * the same thread (#565). The shuffle writer lives for one map task and
+     * mirrors a few staged flushes of up to its {@code bufferBytes} each, so
+     * its own pool rarely got a second use: at 1 TB the staged flush's mirrors
+     * allocated 18 GB per executor over q4 and q67. A task thread runs one task
+     * after another, so the next task's writer takes these instead.
+     *
+     * <p>Bounded to {@link #MAX_BYTES} per thread; arrays past the budget are
+     * left to the collector. New arrays get a quarter of headroom, so a flush
+     * slightly larger than the last one does not reallocate.
+     */
+    public static final class Stash {
+        /**
+         * The retained bytes per thread: one staging's worth at the writer's
+         * default 64 MB.
+         */
+        static final long MAX_BYTES = 64L << 20;
+
+        private static final ThreadLocal<Stash> LOCAL = ThreadLocal.withInitial(Stash::new);
+
+        private final java.util.ArrayList<int[]> ints = new java.util.ArrayList<>();
+        private final java.util.ArrayList<long[]> longs = new java.util.ArrayList<>();
+        private long bytes;
+
+        private Stash() {}
+
+        /** This thread's stash. */
+        public static Stash local() {
+            return LOCAL.get();
+        }
+
+        /** Bytes this stash holds (tests). */
+        long bytes() {
+            return bytes;
+        }
+
+        private static int withHeadroom(int n, int min) {
+            long grown = (long) n + (n >>> 2);
+            return (int) Math.max(min, Math.min(grown, Integer.MAX_VALUE - 8));
+        }
+
+        /** The smallest held {@code int[]} of at least {@code n}, or a new one. */
+        int[] takeInts(int n) {
+            int best = -1;
+            for (int i = 0; i < ints.size(); i++) {
+                int len = ints.get(i).length;
+                if (len >= n && (best < 0 || len < ints.get(best).length)) {
+                    best = i;
+                }
+            }
+            if (best < 0) {
+                return new int[withHeadroom(n, 4096)];
+            }
+            int[] a = ints.remove(best);
+            bytes -= 4L * a.length;
+            return a;
+        }
+
+        /** The smallest held {@code long[]} of at least {@code n}, or a new one. */
+        long[] takeLongs(int n) {
+            int best = -1;
+            for (int i = 0; i < longs.size(); i++) {
+                int len = longs.get(i).length;
+                if (len >= n && (best < 0 || len < longs.get(best).length)) {
+                    best = i;
+                }
+            }
+            if (best < 0) {
+                return new long[withHeadroom(n, 4096)];
+            }
+            long[] a = longs.remove(best);
+            bytes -= 8L * a.length;
+            return a;
+        }
+
+        /**
+         * Keeps the value arrays of {@code mirrors} (null entries skipped) for
+         * the next caller on this thread, within the budget. The mirrors must
+         * not be used afterwards.
+         */
+        public void give(HeapMirror[] mirrors) {
+            for (HeapMirror m : mirrors) {
+                if (m == null) {
+                    continue;
+                }
+                if (m.ints != null && bytes + 4L * m.ints.length <= MAX_BYTES) {
+                    ints.add(m.ints);
+                    bytes += 4L * m.ints.length;
+                }
+                if (m.longs != null && bytes + 8L * m.longs.length <= MAX_BYTES) {
+                    longs.add(m.longs);
+                    bytes += 8L * m.longs.length;
+                }
+            }
+        }
     }
 
     /** Whether row {@code i} is valid. */
