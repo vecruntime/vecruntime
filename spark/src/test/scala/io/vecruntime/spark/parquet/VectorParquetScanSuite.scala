@@ -15,6 +15,8 @@
  */
 package io.vecruntime.spark.parquet
 
+import scala.jdk.CollectionConverters._
+
 import io.vecruntime.spark.VectorConf
 import io.vecruntime.spark.arrow.VectorAllocators
 import io.vecruntime.spark.test.VectorQuerySuite
@@ -177,6 +179,57 @@ class VectorParquetScanSuite extends VectorQuerySuite {
     }
     checkVectorized("SELECT * FROM t_delta_str", Seq(node))
     checkVectorized("SELECT i FROM t_delta_str", Seq(node)) // the int column alone is decoded natively
+  }
+
+  test("a decimal stored as FIXED_LEN_BYTE_ARRAY falls over per file instead of decoding as INT64 (#559)") {
+    // spark.sql.parquet.writeLegacyFormat=true (the format Hive and Impala read) stores every decimal as
+    // FIXED_LEN_BYTE_ARRAY, also those with precision <= 18 that the planner admits as an INT64 lane. Before the
+    // per-file physical-type check, the scan decoded those bytes as INT64 values: wrong results, no error. One
+    // directory holds a legacy file and a standard one (INT32 / INT64 decimals): the legacy file must fall over
+    // to Spark's reader, the standard one must still be decoded natively, and the rows must be Spark's.
+    val path = newTempPath("t_flba_dec")
+    val query =
+      """SELECT CAST(id AS INT) AS i,
+        |  CASE WHEN id % 9 = 0 THEN NULL ELSE CAST((id * 37 % 1000000) / 100.0 AS DECIMAL(7,2)) END AS dec7,
+        |  CASE WHEN id % 7 = 0 THEN NULL ELSE CAST((id * 2654435761) % 1000000000000 AS DECIMAL(15,2)) END AS dec15,
+        |  CAST(-id * 1000003 AS DECIMAL(18,0)) AS dec18
+        |FROM range(0, 6000)""".stripMargin
+    withPlugin(enabled = false) {
+      withConf("spark.sql.parquet.writeLegacyFormat" -> "true") {
+        spark.sql(query).coalesce(1).write.mode("overwrite").parquet(path + "/legacy")
+      }
+      spark.sql(query).coalesce(1).write.mode("overwrite").parquet(path + "/standard")
+    }
+    def physical(dir: String): Set[String] =
+      new java.io.File(dir).listFiles((_, nm) => nm.endsWith(".parquet")).flatMap { f =>
+        val in = org.apache.parquet.hadoop.util.HadoopInputFile
+          .fromPath(new org.apache.hadoop.fs.Path(f.getAbsolutePath), new org.apache.hadoop.conf.Configuration())
+        val r = org.apache.parquet.hadoop.ParquetFileReader.open(in)
+        try r.getFileMetaData.getSchema.getColumns.asScala.map(c =>
+            s"${c.getPath.mkString(".")}:${c.getPrimitiveType.getPrimitiveTypeName}"
+          )
+        finally r.close()
+      }.toSet
+    assert(physical(path + "/legacy").contains("dec7:FIXED_LEN_BYTE_ARRAY"), physical(path + "/legacy").toString)
+    assert(physical(path + "/legacy").contains("dec15:FIXED_LEN_BYTE_ARRAY"), physical(path + "/legacy").toString)
+    assert(physical(path + "/standard").contains("dec7:INT32"), physical(path + "/standard").toString)
+    assert(physical(path + "/standard").contains("dec15:INT64"), physical(path + "/standard").toString)
+    def rowGroupsRead(dir: String): Long = withPlugin(enabled = true) {
+      val df = spark.read.parquet(dir).select("dec7", "dec15", "dec18")
+      df.collect()
+      PlanUtils.allNodes(
+        finalPlan(df)
+      ).collect { case s: VectorParquetScanExec => s }.map(_.metrics("numRowGroups").value).sum
+    }
+    withPlugin(enabled = false) {
+      spark.read.parquet(path + "/legacy").createOrReplaceTempView("t_flba_legacy")
+      spark.read.parquet(path + "/standard").createOrReplaceTempView("t_flba_standard")
+    }
+    checkVectorized("SELECT * FROM t_flba_legacy", Seq(node))
+    checkVectorized("SELECT sum(dec7), sum(dec15), min(dec18) FROM t_flba_legacy", Seq(node))
+    checkVectorized("SELECT * FROM t_flba_standard", Seq(node))
+    assert(rowGroupsRead(path + "/legacy") == 0, "the FIXED_LEN_BYTE_ARRAY decimal file was decoded natively")
+    assert(rowGroupsRead(path + "/standard") > 0, "the INT32 / INT64 decimal file was not decoded natively")
   }
 
   test("partition columns are read as constant columns") {
