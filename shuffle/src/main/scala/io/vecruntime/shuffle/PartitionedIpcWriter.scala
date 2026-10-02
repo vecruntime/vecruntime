@@ -802,10 +802,11 @@ final class PartitionedIpcWriter(
       PartitionKernels.partitionOrder(ids, n, numPartitions, starts, order)
       // Fixed-width columns are mirrored into heap arrays once for the batch (#565): every partition's
       // gather then reads arrays, where reading the batch's segments per row paid a liveness and a bounds
-      // check each (11 % of q67's FFM check samples at 1 TB were this gather).
+      // check each (11 % of q67's FFM check samples at 1 TB were this gather). DECIMAL128 too: at 1 TB
+      // the 128-bit decimal sums are most of these columns, and were left on the segment path.
       var mc = 0
       while (mc < plain.length) {
-        mirrored(mc) = if (HeapMirror.mirrors(plain(mc))) {
+        mirrored(mc) = if (HeapMirror.mirrorsForGather(plain(mc))) {
           mirrorPool(mc) = HeapMirror.reuse(plain(mc), mirrorPool(mc)); mirrorPool(mc)
         } else null
         mc += 1
