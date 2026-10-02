@@ -4,6 +4,8 @@ All notable changes to vecruntime. The format follows [Keep a Changelog](https:/
 the project uses [semantic versioning](https://semver.org/) once it reaches 1.0 -- until then a minor
 version may change configuration keys or defaults, always noted here.
 
+## Unreleased
+
 ## 0.0.5 -- 2026-10-02
 
 Our own Parquet scan (`spark.vecruntime.scan.nativeParquet.enabled`, default off) with file and
