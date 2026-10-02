@@ -162,7 +162,98 @@ class VectorParquetScanSuite extends VectorQuerySuite {
     }
   }
 
-  test("DELTA_BINARY_PACKED string columns still fall over per file to Spark's reader") {
+  test("DELTA_LENGTH_BYTE_ARRAY strings and BYTE_STREAM_SPLIT numbers are decoded natively (#559)") {
+    // parquet-java does not choose these encodings on its own, so the files come from a test writer with a
+    // per-column ValuesWriterFactory: DELTA_LENGTH_BYTE_ARRAY for the string, BYTE_STREAM_SPLIT for the
+    // INT32 / INT64 / DOUBLE columns (int, date, bigint, decimal(15,2), double). One file with v1 pages and
+    // one with v2, nulls in every column, the type extremes, NaN / -0.0 / infinities, empty and multi-byte
+    // strings. The node must count their row groups (no per-file fallback) and match Spark's reader.
+    import org.apache.parquet.example.data.simple.SimpleGroupFactory
+    import org.apache.parquet.io.api.Binary
+    val schema = org.apache.parquet.schema.MessageTypeParser.parseMessageType(
+      """message t {
+        |  optional int32 i32;
+        |  optional int32 dt (DATE);
+        |  optional int64 i64;
+        |  optional int64 dec (DECIMAL(15,2));
+        |  optional double d;
+        |  optional binary s (STRING);
+        |}""".stripMargin
+    )
+    val dir = newTempPath("t_dlba_bss")
+    new java.io.File(dir).mkdirs()
+    val specials =
+      Array(Double.NaN, -0.0, 0.0, Double.PositiveInfinity, Double.NegativeInfinity, Double.MinPositiveValue)
+    for ((v2, f) <- Seq(false -> "v1.parquet", true -> "v2.parquet")) {
+      val factory = new SimpleGroupFactory(schema)
+      val rnd = new scala.util.Random(if (v2) 2 else 1)
+      val rows = Iterator.tabulate(12000) { i =>
+        val g = factory.newGroup()
+        if (i % 11 != 0)
+          g.append("i32", if (i % 5 == 0) Int.MaxValue else if (i % 7 == 0) Int.MinValue else rnd.nextInt())
+        if (i % 13 != 0) g.append("dt", 10957 + (i % 3000))
+        if (i % 17 != 0)
+          g.append("i64", if (i % 6 == 0) Long.MaxValue else if (i % 9 == 0) Long.MinValue else rnd.nextLong())
+        if (i % 4 != 0) g.append("dec", (i.toLong * 2654435761L) % 1000000000000000L)
+        if (i % 19 != 0) g.append("d", if (i % 23 == 0) specials(i % specials.length) else rnd.nextGaussian() * 1e9)
+        if (i % 3 != 0) {
+          val s = i % 10 match {
+            case 1 => ""
+            case 2 => s"héllo wörld $i"
+            case 3 => "x" * (100 + i % 400)
+            case _ => s"v${rnd.nextInt(100000)}"
+          }
+          g.append("s", Binary.fromString(s))
+        }
+        g
+      }
+      org.apache.parquet.hadoop.V2EncodingWriter.write(new java.io.File(dir, f).getAbsolutePath, schema, rows, v2)
+    }
+    // The files really carry the encodings, and span several row groups.
+    val encodings = new java.io.File(dir).listFiles((_, nm) => nm.endsWith(".parquet")).flatMap { f =>
+      val in = org.apache.parquet.hadoop.util.HadoopInputFile
+        .fromPath(new org.apache.hadoop.fs.Path(f.getAbsolutePath), new org.apache.hadoop.conf.Configuration())
+      val r = org.apache.parquet.hadoop.ParquetFileReader.open(in)
+      try {
+        assert(r.getFooter.getBlocks.size() > 1, s"${f.getName}: expected several row groups")
+        val cols = new scala.collection.mutable.ArrayBuffer[(String, String)]()
+        r.getFooter.getBlocks.forEach(b =>
+          b.getColumns.forEach(c => c.getEncodings.forEach(e => cols += ((c.getPath.toDotString, e.name()))))
+        )
+        cols
+      } finally r.close()
+    }.toSet
+    assert(encodings.contains(("s", "DELTA_LENGTH_BYTE_ARRAY")), encodings.toString)
+    for (c <- Seq("i32", "dt", "i64", "dec", "d")) {
+      assert(encodings.contains((c, "BYTE_STREAM_SPLIT")), s"$c is not BYTE_STREAM_SPLIT: $encodings")
+    }
+    withPlugin(enabled = false) {
+      spark.read.parquet(dir).createOrReplaceTempView("t_dlba_bss")
+    }
+    // Spark's vectorized reader rejects BYTE_STREAM_SPLIT on INT32/INT64 ("Unsupported encoding"), so the
+    // reference is Spark's row-based parquet-mr reader.
+    for (q <- Seq("SELECT * FROM t_dlba_bss", "SELECT s, d FROM t_dlba_bss WHERE i32 IS NOT NULL")) {
+      val expected = withConf("spark.sql.parquet.enableVectorizedReader" -> "false") {
+        withPlugin(enabled = false)(spark.sql(q).collect())
+      }
+      assert(expected.length > 0)
+      for (batch <- Seq("1024", "100")) {
+        withConf("spark.sql.parquet.columnarReaderBatchSize" -> batch) {
+          withPlugin(enabled = true) {
+            val df = spark.sql(q)
+            val actual = df.collect()
+            assertRowsEqual(expected, actual, 1e-9, s"$q (batch $batch)")
+            val scans = PlanUtils.allNodes(finalPlan(df)).collect { case s: VectorParquetScanExec => s }
+            assert(scans.nonEmpty, s"expected ${node.getSimpleName} in plan\n${finalPlan(df).treeString}")
+            val rowGroups = scans.map(_.metrics("numRowGroups").value).sum
+            assert(rowGroups > 2, s"$rowGroups row groups read natively: the files fell over to Spark's reader")
+          }
+        }
+      }
+    }
+  }
+
+  test("a DELTA_BYTE_ARRAY string column (v2, no dictionary) still falls over per file to Spark's reader") {
     // Only INT32 / INT64 DELTA_BINARY_PACKED is decoded; a v2 string column without a dictionary
     // (DELTA_BYTE_ARRAY) keeps the per-file fallback and the results stay Spark's.
     val path = newTempPath("t_delta_str")

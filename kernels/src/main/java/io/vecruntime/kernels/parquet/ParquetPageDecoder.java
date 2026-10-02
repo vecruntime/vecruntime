@@ -76,7 +76,17 @@ public final class ParquetPageDecoder {
          * INT32/INT64 deltas (#559 slice 2). Decoded by {@link ColumnChunkDecoder}
          * through {@link DeltaBinaryPackedReader}; not by this one-shot decoder.
          */
-        DELTA_BINARY_PACKED
+        DELTA_BINARY_PACKED,
+        /**
+         * Strings: a {@code DELTA_BINARY_PACKED} run of lengths, then the bytes
+         * back to back (#559). {@link ColumnChunkDecoder} only.
+         */
+        DELTA_LENGTH_BYTE_ARRAY,
+        /**
+         * INT32/INT64/DOUBLE: one stream per value byte (#559). {@link
+         * ColumnChunkDecoder} only.
+         */
+        BYTE_STREAM_SPLIT
     }
 
     /** One data page as parquet-java hands it over, flat column only. */
@@ -192,8 +202,8 @@ public final class ParquetPageDecoder {
      */
     public static VectorBuffers decode(Page page, VecType type, VectorBuffers dictionary,
             Arena arena) {
-        if (page.encoding == Encoding.DELTA_BINARY_PACKED) {
-            throw new IllegalArgumentException("DELTA_BINARY_PACKED is decoded by ColumnChunkDecoder, not ParquetPageDecoder");
+        if (page.encoding != Encoding.PLAIN && page.encoding != Encoding.RLE_DICTIONARY) {
+            throw new IllegalArgumentException(page.encoding + " is decoded by ColumnChunkDecoder, not ParquetPageDecoder");
         }
         int n = page.valueCount;
         int defBitWidth = bitWidth(page.maxDefLevel);
