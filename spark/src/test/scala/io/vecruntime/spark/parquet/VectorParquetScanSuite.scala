@@ -253,21 +253,62 @@ class VectorParquetScanSuite extends VectorQuerySuite {
     }
   }
 
-  test("a DELTA_BYTE_ARRAY string column (v2, no dictionary) still falls over per file to Spark's reader") {
-    // Only INT32 / INT64 DELTA_BINARY_PACKED is decoded; a v2 string column without a dictionary
-    // (DELTA_BYTE_ARRAY) keeps the per-file fallback and the results stay Spark's.
-    val path = newTempPath("t_delta_str")
+  test("DELTA_BYTE_ARRAY strings (v2, no dictionary) are decoded natively (#559)") {
+    // parquet-java writes DELTA_BYTE_ARRAY for v2 strings without a dictionary: per value, the length of
+    // the prefix it shares with the previous value, then its suffix. Sorted keys share long prefixes;
+    // nulls, empty strings, multi-byte UTF-8 and long values break the chain in every way, and small
+    // pages restart it often. The node must count the row groups and return Spark's results.
+    val path = newTempPath("t_dba")
     withPlugin(enabled = false) {
-      spark.sql("SELECT CAST(id AS INT) AS i, CONCAT('v', CAST(id AS STRING)) AS s FROM range(0, 5000)")
+      spark.sql(
+        """SELECT
+          |  CAST(id AS INT) AS i,
+          |  CASE WHEN id % 13 = 0 THEN NULL
+          |       WHEN id % 17 = 0 THEN ''
+          |       WHEN id % 19 = 0 THEN CONCAT('héllo wörld ', CAST(id AS STRING))
+          |       WHEN id % 23 = 0 THEN REPEAT('x', CAST(100 + id % 400 AS INT))
+          |       ELSE CONCAT('https://example.com/item/', LPAD(CAST(id AS STRING), 9, '0')) END AS s,
+          |  LPAD(CAST(id * 7 AS STRING), 12, '0') AS k
+          |FROM range(0, 30000)""".stripMargin
+      ).repartition(2)
+        .sortWithinPartitions("i")
         .write
         .option("parquet.writer.version", "v2")
         .option("parquet.enable.dictionary", "false")
         .mode("overwrite")
         .parquet(path)
-      spark.read.parquet(path).createOrReplaceTempView("t_delta_str")
+      spark.read.parquet(path).createOrReplaceTempView("t_dba")
     }
-    checkVectorized("SELECT * FROM t_delta_str", Seq(node))
-    checkVectorized("SELECT i FROM t_delta_str", Seq(node)) // the int column alone is decoded natively
+    val files = new java.io.File(path).listFiles((_, nm) => nm.endsWith(".parquet"))
+    val encodings = files.flatMap { f =>
+      val in = org.apache.parquet.hadoop.util.HadoopInputFile
+        .fromPath(new org.apache.hadoop.fs.Path(f.getAbsolutePath), new org.apache.hadoop.conf.Configuration())
+      val r = org.apache.parquet.hadoop.ParquetFileReader.open(in)
+      try {
+        val cols = new scala.collection.mutable.ArrayBuffer[(String, String)]()
+        r.getFooter.getBlocks.forEach(b =>
+          b.getColumns.forEach(c => c.getEncodings.forEach(e => cols += ((c.getPath.toDotString, e.name()))))
+        )
+        cols
+      } finally r.close()
+    }.toSet
+    for (c <- Seq("s", "k")) {
+      assert(encodings.contains((c, "DELTA_BYTE_ARRAY")), s"$c is not DELTA_BYTE_ARRAY: $encodings")
+    }
+    for (batch <- Seq("1024", "100")) {
+      withConf("spark.sql.parquet.columnarReaderBatchSize" -> batch) {
+        checkVectorized("SELECT * FROM t_dba", Seq(node))
+        checkVectorized("SELECT s FROM t_dba WHERE s LIKE 'https://%5'", Seq(node))
+        withPlugin(enabled = true) {
+          val df = spark.sql("SELECT s, k FROM t_dba")
+          df.collect()
+          val scans = PlanUtils.allNodes(finalPlan(df)).collect { case s: VectorParquetScanExec => s }
+          assert(scans.nonEmpty)
+          val rowGroups = scans.map(_.metrics("numRowGroups").value).sum
+          assert(rowGroups > 0, "no row group read natively: the DELTA_BYTE_ARRAY files fell over to Spark's reader")
+        }
+      }
+    }
   }
 
   test("partition columns are read as constant columns") {

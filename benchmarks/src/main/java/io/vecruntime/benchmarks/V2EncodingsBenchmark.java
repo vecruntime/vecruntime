@@ -35,6 +35,8 @@ import org.apache.parquet.column.values.bytestreamsplit.ByteStreamSplitValuesRea
 import org.apache.parquet.column.values.bytestreamsplit.ByteStreamSplitValuesWriter;
 import org.apache.parquet.column.values.deltalengthbytearray.DeltaLengthByteArrayValuesReader;
 import org.apache.parquet.column.values.deltalengthbytearray.DeltaLengthByteArrayValuesWriter;
+import org.apache.parquet.column.values.deltastrings.DeltaByteArrayReader;
+import org.apache.parquet.column.values.deltastrings.DeltaByteArrayWriter;
 import org.apache.parquet.io.api.Binary;
 import org.openjdk.jmh.annotations.Benchmark;
 import org.openjdk.jmh.annotations.BenchmarkMode;
@@ -51,7 +53,7 @@ import org.openjdk.jmh.annotations.TearDown;
 import org.openjdk.jmh.annotations.Warmup;
 
 /**
- * Sanity JMH for the {@code BYTE_STREAM_SPLIT} and {@code
+ * Sanity JMH for the {@code BYTE_STREAM_SPLIT}, {@code DELTA_BYTE_ARRAY} and {@code
  * DELTA_LENGTH_BYTE_ARRAY} pages of the native scan (#559): one page decoded
  * through {@link ColumnChunkDecoder} in 1024-row batches into an Arrow buffer,
  * the scan's path, against parquet-java's own value readers over the same page
@@ -72,8 +74,11 @@ public class V2EncodingsBenchmark {
     @Param({"20000"})
     int n;
 
-    /** {@code bss-double}, {@code bss-long} or {@code dlba-string}. */
-    @Param({"bss-double", "bss-long", "dlba-string"})
+    /**
+     * {@code bss-double}, {@code bss-long}, {@code dlba-string} (short random
+     * strings) or {@code dba-string} (sorted URL-like keys).
+     */
+    @Param({"bss-double", "bss-long", "dlba-string", "dba-string"})
     String shape;
 
     private byte[] page;
@@ -108,6 +113,17 @@ public class V2EncodingsBenchmark {
                 page = w.getBytes().toByteArray();
                 lane = VecType.INT64;
                 encoding = ParquetPageDecoder.Encoding.BYTE_STREAM_SPLIT;
+            }
+            case "dba-string" -> {
+                DeltaByteArrayWriter w = new DeltaByteArrayWriter(64, 1 << 20, alloc);
+                int key = 0;
+                for (int i = 0; i < n; i++) {
+                    key += 1 + rnd.nextInt(5);
+                    w.writeBytes(Binary.fromString(String.format("https://example.com/catalog/item/%09d", key)));
+                }
+                page = w.getBytes().toByteArray();
+                lane = VecType.UTF8;
+                encoding = ParquetPageDecoder.Encoding.DELTA_BYTE_ARRAY;
             }
             default -> {
                 DeltaLengthByteArrayValuesWriter w = new DeltaLengthByteArrayValuesWriter(64, 1 << 20, alloc);
@@ -175,6 +191,7 @@ public class V2EncodingsBenchmark {
         ValuesReader r = switch (shape) {
             case "bss-double" -> new ByteStreamSplitValuesReaderForDouble();
             case "bss-long" -> new ByteStreamSplitValuesReaderForLong();
+            case "dba-string" -> new DeltaByteArrayReader();
             default -> new DeltaLengthByteArrayValuesReader();
         };
         r.initFromPage(n, ByteBufferInputStream.wrap(java.nio.ByteBuffer.wrap(page)));

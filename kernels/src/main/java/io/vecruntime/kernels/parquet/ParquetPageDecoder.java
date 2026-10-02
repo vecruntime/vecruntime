@@ -83,6 +83,12 @@ public final class ParquetPageDecoder {
          */
         DELTA_LENGTH_BYTE_ARRAY,
         /**
+         * Strings: a {@code DELTA_BINARY_PACKED} run of prefix lengths shared with
+         * the previous value, then a {@code DELTA_LENGTH_BYTE_ARRAY} of the
+         * suffixes (#559). {@link ColumnChunkDecoder} only.
+         */
+        DELTA_BYTE_ARRAY,
+        /**
          * INT32/INT64/DOUBLE: one stream per value byte (#559). {@link
          * ColumnChunkDecoder} only.
          */

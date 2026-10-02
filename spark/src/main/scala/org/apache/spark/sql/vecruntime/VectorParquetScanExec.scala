@@ -476,7 +476,7 @@ private[vecruntime] final class VectorParquetPartitionReader(
       val fileSchema = footer.getFileMetaData.getSchema
       val clipped = ParquetReadSupport.clipParquetSchema(fileSchema, requiredSchema, caseSensitive, useFieldId, false)
       // Encoding is only knowable at read time. If any required column chunk uses an encoding we do not
-      // decode (DELTA_BYTE_ARRAY, BYTE_STREAM_SPLIT, ...), fall the WHOLE FILE over to Spark's vectorized
+      // decode (BYTE_STREAM_SPLIT on FIXED_LEN_BYTE_ARRAY, ...), fall the WHOLE FILE over to Spark's vectorized
       // reader -- correct results, no mid-decode crash.
       if (hasUnsupportedEncodingInFooter(footer, clipped)) {
         stream.close()
@@ -644,10 +644,10 @@ private[vecruntime] final class VectorParquetPartitionReader(
 
   /**
    * True if any required column chunk in any row group uses a value encoding the native decoder does not
-   * support (PLAIN and dictionary; DELTA_BINARY_PACKED, DELTA_LENGTH_BYTE_ARRAY and BYTE_STREAM_SPLIT on the
-   * physical types in `supportsEncoding`). Read from the footer's column-chunk metadata, so the decision is
-   * made once per file at open time -- a DELTA_BYTE_ARRAY column, say, falls the file over to Spark's reader
-   * with no mid-decode failure.
+   * support (PLAIN and dictionary; the v2 encodings on the physical types in `supportsEncoding`). Read from
+   * the footer's column-chunk metadata, so the decision is made once per file at open time -- a
+   * BYTE_STREAM_SPLIT FIXED_LEN_BYTE_ARRAY column, say, falls the file over to Spark's reader with no
+   * mid-decode failure.
    */
   private def hasUnsupportedEncodingInFooter(footer: ParquetMetadata, clipped: MessageType): Boolean = {
     val wanted = new java.util.HashSet[String]()
@@ -797,12 +797,13 @@ object VectorParquetScanExec {
 
   /**
    * Encodings the native decoder handles only on some physical types (#559): DELTA_BINARY_PACKED on
-   * INT32/INT64, DELTA_LENGTH_BYTE_ARRAY on BINARY (the UTF8 lane), BYTE_STREAM_SPLIT on INT32/INT64/DOUBLE
+   * INT32/INT64, DELTA_LENGTH_BYTE_ARRAY and DELTA_BYTE_ARRAY on BINARY (the UTF8 lane), BYTE_STREAM_SPLIT on INT32/INT64/DOUBLE
    * (not FLOAT or FIXED_LEN_BYTE_ARRAY, which have no lane).
    */
   private val TypedEncodings: Map[String, Set[PrimitiveType.PrimitiveTypeName]] = Map(
     "DELTA_BINARY_PACKED" -> Set(INT32, INT64),
     "DELTA_LENGTH_BYTE_ARRAY" -> Set(BINARY),
+    "DELTA_BYTE_ARRAY" -> Set(BINARY),
     "BYTE_STREAM_SPLIT" -> Set(INT32, INT64, DOUBLE)
   )
 
