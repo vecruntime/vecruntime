@@ -27,7 +27,7 @@ import org.apache.parquet.hadoop.ParquetFileReader
 import org.apache.parquet.hadoop.metadata.ParquetMetadata
 import org.apache.parquet.hadoop.util.HadoopInputFile
 import org.apache.parquet.io.SeekableInputStream
-import org.apache.parquet.schema.MessageType
+import org.apache.parquet.schema.{MessageType, PrimitiveType}
 import org.apache.spark.{Partition, TaskContext}
 import org.apache.spark.deploy.SparkHadoopUtil
 import org.apache.spark.rdd.RDD
@@ -475,8 +475,8 @@ private[vecruntime] final class VectorParquetPartitionReader(
       val footer: ParquetMetadata = ParquetFileReader.readFooter(inputFile, rangeOpts, stream)
       val fileSchema = footer.getFileMetaData.getSchema
       val clipped = ParquetReadSupport.clipParquetSchema(fileSchema, requiredSchema, caseSensitive, useFieldId, false)
-      // Encoding is only knowable at read time (slice 1). If any required column chunk uses an encoding we
-      // do not decode (DELTA_*, BYTE_STREAM_SPLIT, ...), fall the WHOLE FILE over to Spark's vectorized
+      // Encoding is only knowable at read time. If any required column chunk uses an encoding we do not
+      // decode (DELTA_BYTE_ARRAY, BYTE_STREAM_SPLIT, ...), fall the WHOLE FILE over to Spark's vectorized
       // reader -- correct results, no mid-decode crash.
       if (hasUnsupportedEncodingInFooter(footer, clipped)) {
         stream.close()
@@ -644,9 +644,9 @@ private[vecruntime] final class VectorParquetPartitionReader(
 
   /**
    * True if any required column chunk in any row group uses a value encoding the native decoder does not
-   * support (slice 1 decodes PLAIN and dictionary only). Read from the footer's column-chunk metadata, so
-   * the decision is made once per file at open time -- a DELTA_* / BYTE_STREAM_SPLIT column falls the file
-   * over to Spark's reader with no mid-decode failure.
+   * support (PLAIN and dictionary; DELTA_BINARY_PACKED on INT32/INT64 since slice 2). Read from the footer's
+   * column-chunk metadata, so the decision is made once per file at open time -- another DELTA_* or a
+   * BYTE_STREAM_SPLIT column falls the file over to Spark's reader with no mid-decode failure.
    */
   private def hasUnsupportedEncodingInFooter(footer: ParquetMetadata, clipped: MessageType): Boolean = {
     val wanted = new java.util.HashSet[String]()
@@ -662,7 +662,7 @@ private[vecruntime] final class VectorParquetPartitionReader(
         if (wanted.contains(leaf)) {
           val it = cc.getEncodings.iterator()
           while (it.hasNext) {
-            if (!VectorParquetScanExec.SupportedEncodings.contains(it.next().name())) {
+            if (!VectorParquetScanExec.supportsEncoding(it.next().name(), cc.getPrimitiveType.getPrimitiveTypeName)) {
               return true
             }
           }
@@ -791,6 +791,15 @@ object VectorParquetScanExec {
 
   /** The Parquet value/level encodings the native decoder handles; any other encoding falls the file over. */
   val SupportedEncodings: Set[String] = Set("PLAIN", "PLAIN_DICTIONARY", "RLE_DICTIONARY", "RLE", "BIT_PACKED")
+
+  /** Encodings the native decoder handles only on some physical types: DELTA_BINARY_PACKED on INT32/INT64 (#559). */
+  private val IntegerOnlyEncodings: Set[String] = Set("DELTA_BINARY_PACKED")
+
+  /** True if a column chunk of physical type `physical` using `encoding` can be decoded natively. */
+  def supportsEncoding(encoding: String, physical: PrimitiveType.PrimitiveTypeName): Boolean =
+    SupportedEncodings.contains(encoding) ||
+      (IntegerOnlyEncodings.contains(encoding) &&
+        (physical == PrimitiveType.PrimitiveTypeName.INT32 || physical == PrimitiveType.PrimitiveTypeName.INT64))
 }
 
 /**

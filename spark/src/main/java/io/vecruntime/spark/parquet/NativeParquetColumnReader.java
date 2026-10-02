@@ -363,7 +363,10 @@ public final class NativeParquetColumnReader {
         if (e == Encoding.RLE_DICTIONARY || e == Encoding.PLAIN_DICTIONARY) {
             return ParquetPageDecoder.Encoding.RLE_DICTIONARY;
         }
-        throw new UnsupportedOperationException("unsupported Parquet value encoding " + e + " (slice 1 decodes PLAIN and dictionary only)");
+        if (e == Encoding.DELTA_BINARY_PACKED) {
+            return ParquetPageDecoder.Encoding.DELTA_BINARY_PACKED;
+        }
+        throw new UnsupportedOperationException("unsupported Parquet value encoding " + e + " (decodes PLAIN, dictionary and DELTA_BINARY_PACKED)");
     }
 
     private VectorBuffers decodeDictionary(PageReader pages) {

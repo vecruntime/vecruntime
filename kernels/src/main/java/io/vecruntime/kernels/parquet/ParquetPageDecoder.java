@@ -71,7 +71,12 @@ public final class ParquetPageDecoder {
     /** The value encoding of a data page this decoder supports. */
     public enum Encoding {
         PLAIN,
-        RLE_DICTIONARY
+        RLE_DICTIONARY,
+        /**
+         * INT32/INT64 deltas (#559 slice 2). Decoded by {@link ColumnChunkDecoder}
+         * through {@link DeltaBinaryPackedReader}; not by this one-shot decoder.
+         */
+        DELTA_BINARY_PACKED
     }
 
     /** One data page as parquet-java hands it over, flat column only. */
@@ -187,6 +192,9 @@ public final class ParquetPageDecoder {
      */
     public static VectorBuffers decode(Page page, VecType type, VectorBuffers dictionary,
             Arena arena) {
+        if (page.encoding == Encoding.DELTA_BINARY_PACKED) {
+            throw new IllegalArgumentException("DELTA_BINARY_PACKED is decoded by ColumnChunkDecoder, not ParquetPageDecoder");
+        }
         int n = page.valueCount;
         int defBitWidth = bitWidth(page.maxDefLevel);
 
