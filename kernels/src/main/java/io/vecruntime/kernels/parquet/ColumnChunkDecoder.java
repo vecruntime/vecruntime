@@ -134,10 +134,13 @@ public final class ColumnChunkDecoder {
     private int plainCursor; // byte offset of the next unconsumed PLAIN value
     private int utf8PlainCursor; // byte offset of the next unconsumed PLAIN utf8 value (== plainCursor role)
     private RleBitPackingReader idReader; // live RLE id reader for a dictionary page (resumes mid-run)
+    private DeltaBinaryPackedReader deltaReader; // live reader for a DELTA_BINARY_PACKED page (resumes mid-miniblock)
 
     // ---- reused per-batch scratch ----
     private int[] idScratch = new int[0]; // dictionary ids for a page-slice
     private int[] levelScratch = new int[0]; // page-level decode buffer
+    private int[] deltaInts = new int[0]; // DELTA_BINARY_PACKED INT32 values for a page-slice
+    private long[] deltaLongs = new long[0]; // DELTA_BINARY_PACKED INT64 (or widened INT32) values for a page-slice
 
     // ---- heap dictionary, decoded once per chunk ----
     private boolean hasDictionary;
@@ -200,6 +203,7 @@ public final class ColumnChunkDecoder {
         this.pageValueCount = 0;
         this.pageRow = 0;
         this.idReader = null;
+        this.deltaReader = null;
         this.hasDictionary = false;
     }
 
@@ -309,8 +313,18 @@ public final class ColumnChunkDecoder {
             }
             reader(page.data, (int) levelStart, levelLen, defBitWidth).readInts(pageLevels, 0, n);
         }
+        this.deltaReader = null;
         if (page.encoding == ParquetPageDecoder.Encoding.RLE_DICTIONARY) {
             this.idReader = dictionaryIds(page, valuesStart);
+            this.plainCursor = 0;
+            this.utf8PlainCursor = 0;
+        } else if (page.encoding == ParquetPageDecoder.Encoding.DELTA_BINARY_PACKED) {
+            if (physicalType != VecType.INT32 && physicalType != VecType.INT64) {
+                throw new IllegalArgumentException("DELTA_BINARY_PACKED on a " + physicalType + " lane");
+            }
+            this.idReader = null;
+            this.deltaReader = new DeltaBinaryPackedReader(page.data, (int) valuesStart, (int) (page.dataEnd() - valuesStart),
+                    physicalType == VecType.INT64, this::unpackerFor);
             this.plainCursor = 0;
             this.utf8PlainCursor = 0;
         } else {
@@ -421,6 +435,8 @@ public final class ColumnChunkDecoder {
             int[] ids = id(presentCount);
             idReader.readInts(ids, 0, presentCount);
             gatherFixedDirectA(ids, present, dstBase, presentCount, outData);
+        } else if (pageEncoding == ParquetPageDecoder.Encoding.DELTA_BINARY_PACKED) {
+            deltaFixedDirectA(present, dstBase, presentCount, outData);
         } else {
             plainFixedDirectA(present, dstBase, presentCount, outData);
         }
@@ -455,6 +471,8 @@ public final class ColumnChunkDecoder {
             int[] ids = id(presentCount);
             idReader.readInts(ids, 0, presentCount);
             gatherFixedDirectB(ids, present, dstBase, presentCount, outData);
+        } else if (pageEncoding == ParquetPageDecoder.Encoding.DELTA_BINARY_PACKED) {
+            deltaFixedDirectB(present, dstBase, presentCount, outData);
         } else {
             plainFixedDirectB(present, dstBase, presentCount, outData);
         }
@@ -695,8 +713,106 @@ public final class ColumnChunkDecoder {
             int[] ids = id(presentCount);
             idReader.readInts(ids, 0, presentCount); // resumes mid-run across batches
             gatherFixedFromDict(ids, present, dstBase, presentCount);
+        } else if (pageEncoding == ParquetPageDecoder.Encoding.DELTA_BINARY_PACKED) {
+            decodeDeltaFixed(present, dstBase, presentCount);
         } else {
             decodePlainFixed(present, dstBase, presentCount);
+        }
+    }
+
+    // ------------------------------------------------------------------ DELTA_BINARY_PACKED (#559 slice 2)
+
+    /**
+     * Reads the next {@code m} present values of the current DELTA_BINARY_PACKED
+     * page into the scratch array of the OUTPUT lane: {@link #deltaInts} for an
+     * INT32 lane, {@link #deltaLongs} for INT64 (including INT32 widened to INT64).
+     */
+    private void readDelta(int m) {
+        if (type == VecType.INT64) {
+            if (deltaLongs.length < m) {
+                deltaLongs = new long[Math.max(m, 2 * deltaLongs.length)];
+            }
+            deltaReader.readLongs(deltaLongs, 0, m);
+        } else {
+            if (deltaInts.length < m) {
+                deltaInts = new int[Math.max(m, 2 * deltaInts.length)];
+            }
+            deltaReader.readInts(deltaInts, 0, m);
+        }
+    }
+
+    /**
+     * Staging path: scatter the next {@code presentCount} delta-decoded values
+     * into the batch arrays.
+     */
+    private void decodeDeltaFixed(int[] present, int dstBase, int presentCount) {
+        readDelta(presentCount);
+        if (type == VecType.INT64) {
+            long[] v = deltaLongs;
+            if (present == null) {
+                System.arraycopy(v, 0, longs, dstBase, presentCount);
+            } else {
+                for (int k = 0; k < presentCount; k++) {
+                    longs[dstBase + present[k]] = v[k];
+                }
+            }
+        } else {
+            int[] v = deltaInts;
+            if (present == null) {
+                System.arraycopy(v, 0, ints, dstBase, presentCount);
+            } else {
+                for (int k = 0; k < presentCount; k++) {
+                    ints[dstBase + present[k]] = v[k];
+                }
+            }
+        }
+    }
+
+    /**
+     * Direct path: the next {@code m} delta-decoded values straight into the
+     * Arrow data segment, one bulk copy when every row is present.
+     */
+    private void deltaFixedDirectA(int[] present, int dstBase, int m,
+            MemorySegment out) {
+        readDelta(m);
+        if (type == VecType.INT64) {
+            long[] v = deltaLongs;
+            if (present == null) {
+                MemorySegment.copy(v, 0, out, LE_LONG, (long) dstBase << 3,
+                        m);
+            } else {
+                for (int k = 0; k < m; k++) {
+                    out.set(LE_LONG, (long) (dstBase + present[k]) << 3, v[k]);
+                }
+            }
+        } else {
+            int[] v = deltaInts;
+            if (present == null) {
+                MemorySegment.copy(v, 0, out, LE_INT, (long) dstBase << 2,
+                        m);
+            } else {
+                for (int k = 0; k < m; k++) {
+                    out.set(LE_INT, (long) (dstBase + present[k]) << 2, v[k]);
+                }
+            }
+        }
+    }
+
+    /** Direct variant B for a DELTA_BINARY_PACKED page (benchmark path). */
+    private void deltaFixedDirectB(int[] present, int dstBase, int m,
+            java.nio.ByteBuffer out) {
+        readDelta(m);
+        out.order(java.nio.ByteOrder.LITTLE_ENDIAN);
+        if (type == VecType.INT64) {
+            java.nio.LongBuffer lb = out.asLongBuffer();
+            for (int k = 0; k < m; k++) {
+                lb.put(dstBase + (present == null ? k : present[k]), deltaLongs[k]);
+            }
+        } else {
+            java.nio.IntBuffer ib = out.asIntBuffer();
+            for (int k = 0; k < m; k++) {
+                ib.put(dstBase + (present == null ? k : present[k]), deltaInts[k]);
+            }
         }
     }
 
@@ -795,6 +911,9 @@ public final class ColumnChunkDecoder {
 
     private void decodeBinary(int dstBase, int m, int[] present,
             int presentCount) {
+        if (pageEncoding == ParquetPageDecoder.Encoding.DELTA_BINARY_PACKED) {
+            throw new IllegalArgumentException("DELTA_BINARY_PACKED on a UTF8 lane");
+        }
         int pos = utf8Len;
         if (pageEncoding == ParquetPageDecoder.Encoding.RLE_DICTIONARY) {
             int[] ids = id(presentCount);

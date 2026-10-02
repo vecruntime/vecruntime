@@ -70,14 +70,14 @@ A few rules hold the design together:
 | | Decoded natively | Notes |
 |---|---|---|
 | Physical / logical types | INT32 (`int`, `date`), INT64 (`bigint`), DOUBLE, decimal with precision ≤ 18 (INT32/INT64 physical), UTF8 `string` with the default collation | `NativeParquetSupport.isReadable`; the planner and the reader share this check |
-| Encodings | `PLAIN`, `PLAIN_DICTIONARY`, `RLE_DICTIONARY`; definition levels in `RLE`/`BIT_PACKED` | `VectorParquetScanExec.SupportedEncodings` |
+| Encodings | `PLAIN`, `PLAIN_DICTIONARY`, `RLE_DICTIONARY`; `DELTA_BINARY_PACKED` on INT32/INT64 columns; definition levels in `RLE`/`BIT_PACKED` | `VectorParquetScanExec.supportsEncoding` |
 | Data pages | v1 and v2 | v2 levels and data are read separately |
 | Schema | Flat only | Nested types keep Spark's scan |
 | Codecs | Whatever parquet-java decompresses (snappy, zstd, gzip, lz4, …) | Decompression is done by parquet-java |
 
 What happens when a column is not supported:
 - **Spark's scan for the whole plan:** an unsupported type or a nested column, `INT96`, a non-`CORRECTED` date or timestamp rebase mode, or a bucketed scan. The planner records the reason, so VecRuntime's operators still run above Spark's scan.
-- **Spark's reader for that one file:** an unsupported encoding in a file's column chunks (`DELTA_*`, `BYTE_STREAM_SPLIT`). The rest of the scan stays native.
+- **Spark's reader for that one file:** an unsupported encoding in a file's column chunks (`DELTA_LENGTH_BYTE_ARRAY`, `DELTA_BYTE_ARRAY`, `BYTE_STREAM_SPLIT`). The rest of the scan stays native.
 
 ## Status at 1 TB TPC-DS
 
@@ -108,14 +108,23 @@ The items run roughly from most to least valuable.
 
 ### Encodings
 
-These are the Parquet v2 writer encodings. Today a file that uses any of them goes entirely to Spark's reader. Parquet-java and Spark 3.x/4.x write them when `parquet.writer.version=v2`, and other engines often do by default.
+These are the Parquet v2 writer encodings. A file that uses one the reader does not decode yet goes entirely to Spark's reader. Parquet-java and Spark 3.x/4.x write them when `parquet.writer.version=v2`, and other engines often do by default.
 
-1. **`DELTA_BINARY_PACKED`** for INT32 and INT64. The pages are made of blocks, each with a minimum delta and miniblocks of bit-packed deltas, then a prefix sum. The kernel needs:
-   - a block/miniblock header reader;
-   - a bit unpack per miniblock width, which can reuse the injected `BytePacker`;
-   - a vectorizable prefix sum written straight into the lane.
+1. **`DELTA_BINARY_PACKED`** for INT32 and INT64: **done** (slice 2). `DeltaBinaryPackedReader` reads the block and miniblock headers, unpacks each miniblock through the injected `BytePacker` (widths up to 32; INT64 widths above 32 with a scalar long unpack), and adds the deltas in the column's width, wrapping as the writer does. It decodes one miniblock at a time, so a batch can stop inside one. `ColumnChunkDecoder` writes the values straight into the lane, including INT32 widened to INT64. The footer check admits the encoding only on INT32/INT64 columns. It is checked:
+   - against a from-scratch encoder of the spec (`DeltaBinaryPackedReaderTest`, `ColumnChunkDecoderTest`);
+   - against parquet-java's own writers (`DeltaBinaryPackedCrossCheckSuite`);
+   - through Spark with `parquet.writer.version=v2` and the dictionary off (`VectorParquetScanSuite`).
 
-   It is the most common v2 encoding for integer and date columns.
+   `DeltaBinaryPackedBenchmark` (JMH, 20,000 values a page) decodes 2.0–4.0x as many pages per ms as Spark's `VectorizedDeltaBinaryPackedReader`:
+
+   | values | ours (ops/ms) | Spark (ops/ms) |
+   |---|---|---|
+   | sorted INT32 | 35.2 | 17.7 |
+   | random INT32 | 24.4 | 10.3 |
+   | INT64 timestamps | 32.7 | 14.9 |
+   | 44-bit random INT64 | 29.1 | 7.2 |
+
+   That is a kernel check, not a verdict; no TPC-DS file uses the encoding.
 2. **`DELTA_LENGTH_BYTE_ARRAY`** for strings: a `DELTA_BINARY_PACKED` run of lengths, followed by the concatenated bytes. It maps directly onto Arrow's offsets and data buffers, so it builds on item 1.
 3. **`DELTA_BYTE_ARRAY`** for strings: a prefix length and a suffix per value, so each value reuses part of the previous one. Rebuilding the values needs the previous value, so it is sequential within a page; the output is still Arrow offsets and data.
 4. **`BYTE_STREAM_SPLIT`** for FLOAT, DOUBLE, and in newer files also INT32, INT64 and fixed-length byte arrays. The bytes of each value are interleaved across K streams. Decoding is a transpose that SIMD handles well, with the Vector API, from a page into the lane.

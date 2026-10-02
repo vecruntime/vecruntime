@@ -99,6 +99,86 @@ class VectorParquetScanSuite extends VectorQuerySuite {
     checkVectorized("SELECT * FROM t_v2", Seq(node))
   }
 
+  test("DELTA_BINARY_PACKED (page v2, dictionary off) is decoded natively, not by Spark's reader (#559)") {
+    // parquet.writer.version=v2 with the dictionary off writes INT32 / INT64 columns (ints, bigints, dates,
+    // int-physical decimals) as DELTA_BINARY_PACKED. The footer check must admit those files, so the node
+    // counts their row groups (a file that falls over to Spark's reader counts none), and the values must
+    // match Spark's reader, including nulls, wrapping deltas at the type extremes, and small batches.
+    val path = newTempPath("t_delta")
+    withPlugin(enabled = false) {
+      spark.sql(
+        """SELECT
+          |  CASE WHEN id % 11 = 0 THEN NULL
+          |       WHEN id % 5 = 0 THEN CAST(2147483647 AS INT) WHEN id % 7 = 0 THEN CAST(-2147483648 AS INT)
+          |       ELSE CAST(id * 37 AS INT) END AS i32,
+          |  CASE WHEN id % 13 = 0 THEN NULL
+          |       WHEN id % 6 = 0 THEN 9223372036854775807L WHEN id % 9 = 0 THEN -9223372036854775808L
+          |       ELSE CAST(id * 2654435761 AS BIGINT) END AS i64,
+          |  CAST(id AS BIGINT) AS seq,
+          |  DATE_ADD(DATE'2000-01-01', CAST(id % 3000 AS INT)) AS dt,
+          |  CASE WHEN id % 4 = 0 THEN NULL ELSE CAST((id % 100000) / 100.0 AS DECIMAL(7,2)) END AS dec7,
+          |  CAST(id AS DECIMAL(15,2)) AS dec15,
+          |  CONCAT('s', CAST(id % 40 AS STRING)) AS s
+          |FROM range(0, 30000)""".stripMargin
+      ).repartition(3)
+        .write
+        .option("parquet.writer.version", "v2")
+        .option("parquet.enable.dictionary", "false")
+        .mode("overwrite")
+        .parquet(path)
+      spark.read.parquet(path).createOrReplaceTempView("t_delta")
+    }
+    // The files really carry DELTA_BINARY_PACKED for the integer columns.
+    val files = new java.io.File(path).listFiles((_, nm) => nm.endsWith(".parquet"))
+    assert(files.nonEmpty)
+    val encodings = files.flatMap { f =>
+      val in = org.apache.parquet.hadoop.util.HadoopInputFile
+        .fromPath(new org.apache.hadoop.fs.Path(f.getAbsolutePath), new org.apache.hadoop.conf.Configuration())
+      val r = org.apache.parquet.hadoop.ParquetFileReader.open(in)
+      try {
+        val cols = new scala.collection.mutable.ArrayBuffer[(String, String)]()
+        r.getFooter.getBlocks.forEach(b =>
+          b.getColumns.forEach(c => c.getEncodings.forEach(e => cols += ((c.getPath.toDotString, e.name()))))
+        )
+        cols
+      } finally r.close()
+    }.toSet
+    for (c <- Seq("i32", "i64", "seq", "dt", "dec7", "dec15")) {
+      assert(encodings.contains((c, "DELTA_BINARY_PACKED")), s"$c is not DELTA_BINARY_PACKED: $encodings")
+    }
+    for (batch <- Seq("1024", "100")) {
+      withConf("spark.sql.parquet.columnarReaderBatchSize" -> batch) {
+        checkVectorized("SELECT * FROM t_delta", Seq(node))
+        checkVectorized("SELECT i32, dt, dec7 FROM t_delta WHERE i64 IS NOT NULL", Seq(node))
+        withPlugin(enabled = true) {
+          val df = spark.sql("SELECT i32, i64, seq, dt, dec7, dec15 FROM t_delta")
+          df.collect()
+          val scans = PlanUtils.allNodes(finalPlan(df)).collect { case s: VectorParquetScanExec => s }
+          assert(scans.nonEmpty)
+          val rowGroups = scans.map(_.metrics("numRowGroups").value).sum
+          assert(rowGroups > 0, "no row group read natively: the DELTA_BINARY_PACKED files fell over to Spark's reader")
+        }
+      }
+    }
+  }
+
+  test("DELTA_BINARY_PACKED string columns still fall over per file to Spark's reader") {
+    // Only INT32 / INT64 DELTA_BINARY_PACKED is decoded; a v2 string column without a dictionary
+    // (DELTA_BYTE_ARRAY) keeps the per-file fallback and the results stay Spark's.
+    val path = newTempPath("t_delta_str")
+    withPlugin(enabled = false) {
+      spark.sql("SELECT CAST(id AS INT) AS i, CONCAT('v', CAST(id AS STRING)) AS s FROM range(0, 5000)")
+        .write
+        .option("parquet.writer.version", "v2")
+        .option("parquet.enable.dictionary", "false")
+        .mode("overwrite")
+        .parquet(path)
+      spark.read.parquet(path).createOrReplaceTempView("t_delta_str")
+    }
+    checkVectorized("SELECT * FROM t_delta_str", Seq(node))
+    checkVectorized("SELECT i FROM t_delta_str", Seq(node)) // the int column alone is decoded natively
+  }
+
   test("partition columns are read as constant columns") {
     val path = newTempPath("t_part")
     withPlugin(enabled = false) {

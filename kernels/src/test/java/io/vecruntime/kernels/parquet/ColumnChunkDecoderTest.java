@@ -421,6 +421,96 @@ class ColumnChunkDecoderTest {
     /** One prepared page: its kernel Page plus its value count, ready to feed. */
     private record PreparedPage(ColumnChunkDecoder.Page page, int valueCount) {}
 
+    // ---------------------------------------------------------------- DELTA_BINARY_PACKED (#559 slice 2)
+
+    @Test
+    void deltaBinaryPackedPagesDecodeOnEveryPathWithNullsAcrossPages() {
+        // INT32 and INT64 lanes, plus INT32 widened to an INT64 lane; with and without nulls; page v1 and v2;
+        // batches of 384 rows over ~1000-row pages, so a batch spans pages and resumes mid-miniblock. Each case
+        // runs the staging path (readBatch + flushFixed) and both direct paths.
+        Random rnd = new Random(5596);
+        int rows = 4096;
+        for (VecType physical : new VecType[] {VecType.INT32, VecType.INT64}) {
+            for (VecType lane : physical == VecType.INT32 ? new VecType[] {VecType.INT32, VecType.INT64} : new VecType[] {VecType.INT64}) {
+                for (boolean nulls : new boolean[] {false, true}) {
+                    for (boolean v2 : new boolean[] {false, true}) {
+                        Long[] v = new Long[rows];
+                        for (int i = 0; i < rows; i++) {
+                            long x = physical == VecType.INT32
+                                    ? (i % 3 == 0 ? rnd.nextInt() : 100_000 + i * 7L)
+                                    : (i % 3 == 0 ? rnd.nextLong() : 1_700_000_000_000L + i * 1000L);
+                            v[i] = nulls && rnd.nextInt(6) == 0 ? null : x;
+                        }
+                        int maxDef = nulls ? 1 : 0;
+                        List<PreparedPage> pages = new ArrayList<>();
+                        int start = 0;
+                        for (int end : evenSplits(rows, 4)) {
+                            byte[] levels = levelBytes(v, start, end, maxDef);
+                            long[] present = new long[presentCount(v, start, end)];
+                            int k = 0;
+                            for (int i = start; i < end; i++) {
+                                if (v[i] != null) {
+                                    present[k++] = v[i];
+                                }
+                            }
+                            byte[] vals = DeltaBinaryPackedReaderTest.encode(present, physical == VecType.INT64, 128, 4, false);
+                            byte[] page = assemble(levels, vals, maxDef, v2);
+                            ColumnChunkDecoder.Page p = v2 && maxDef > 0
+                                    ? ColumnChunkDecoder.Page.v2(page, levels.length, end - start, ParquetPageDecoder.Encoding.DELTA_BINARY_PACKED)
+                                    : v2 ? ColumnChunkDecoder.Page.v2(page, 0, end - start, ParquetPageDecoder.Encoding.DELTA_BINARY_PACKED) : ColumnChunkDecoder.Page.v1(page, end - start, ParquetPageDecoder.Encoding.DELTA_BINARY_PACKED);
+                            pages.add(new PreparedPage(p, end - start));
+                            start = end;
+                        }
+                        String what = physical
+                                + "->"
+                                + lane
+                                + " nulls="
+                                + nulls
+                                + " v2="
+                                + v2;
+                        try (Arena arena = Arena.ofConfined()) {
+                            ColumnChunkDecoder d = new ColumnChunkDecoder(physical, lane, maxDef, 384, scalarFactory());
+                            assertDelta(
+                                    v,
+                                    physical,
+                                    lane,
+                                    runStreaming(d, pages, lane, rows, 384, nulls,
+                                            arena),
+                                    what + " staging");
+                        }
+                        for (boolean modeA : new boolean[] {true, false}) {
+                            try (Arena arena = Arena.ofConfined()) {
+                                ColumnChunkDecoder d = new ColumnChunkDecoder(physical, lane, maxDef, 384, scalarFactory());
+                                assertDelta(
+                                        v,
+                                        physical,
+                                        lane,
+                                        runStreamingDirect(d, pages, lane, rows, 384, nulls,
+                                                modeA, arena),
+                                        what + (modeA ? " directA" : " directB"));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private static void assertDelta(Long[] v, VecType physical, VecType lane,
+            DecodeResult r, String what) {
+        for (int i = 0; i < v.length; i++) {
+            if (v[i] == null) {
+                assertTrue(r.buffers.isNull(i), what + " row " + i + " should be null");
+            } else if (lane == VecType.INT32) {
+                assertEquals((int) v[i].longValue(), r.buffers.getInt(i),
+                        what + " row " + i);
+            } else {
+                long want = physical == VecType.INT32 ? (int) v[i].longValue() : v[i];
+                assertEquals(want, r.buffers.getLong(i), what + " row " + i);
+            }
+        }
+    }
+
     // ---------------------------------------------------------------- direct-write variants (#559 study)
 
     @Test

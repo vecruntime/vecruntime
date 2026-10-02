@@ -6,6 +6,17 @@ version may change configuration keys or defaults, always noted here.
 
 ## Unreleased
 
+### Added
+
+- The native Parquet scan (`spark.vecruntime.scan.nativeParquet.enabled`) decodes `DELTA_BINARY_PACKED`
+  INT32 and INT64 columns, #559 slice 2: ints, bigints, dates and decimals with precision <= 18. This is the
+  encoding parquet-java writes for those columns when `parquet.writer.version=v2` and the column is not
+  dictionary-encoded. Before, such a file fell over to Spark's reader whole. `DeltaBinaryPackedReader` unpacks
+  each miniblock through the injected `BytePacker` and resumes inside a miniblock across batches. It is
+  checked against a from-scratch encoder, against parquet-java's writers and through Spark with v2 files.
+  JMH: 2.0-4.0x the pages per ms of Spark's `VectorizedDeltaBinaryPackedReader`. The other v2 encodings
+  (`DELTA_LENGTH_BYTE_ARRAY`, `DELTA_BYTE_ARRAY`, `BYTE_STREAM_SPLIT`) still fall the file over to Spark's reader.
+
 ## 0.0.5 -- 2026-10-02
 
 Our own Parquet scan (`spark.vecruntime.scan.nativeParquet.enabled`, default off) with file and
