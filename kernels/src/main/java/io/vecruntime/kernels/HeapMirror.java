@@ -107,6 +107,44 @@ public final class HeapMirror {
         return new HeapMirror(t, n, ints, longs, validity);
     }
 
+    /**
+     * {@link #of} into the arrays of {@code prev} when they are large enough
+     * (the arrays may then be longer than {@code length}), new ones otherwise:
+     * for a caller that mirrors every batch of a stream, such as the shuffle
+     * writer's per-partition gathers (#565), so a batch allocates no arrays in
+     * steady state. {@code prev} must not be used afterwards.
+     */
+    public static HeapMirror reuse(VectorBuffers in, HeapMirror prev) {
+        int n = in.length();
+        VecType t = in.type();
+        int[] ints = null;
+        long[] longs = null;
+        if (t == VecType.INT32) {
+            ints = prev != null && prev.ints != null && prev.ints.length >= n
+                    ? prev.ints
+                    : new int[Math.max(n, 4096)];
+            MemorySegment.copy(in.data(), VectorBuffers.LE_INT, 0L, ints, 0,
+                    n);
+        } else {
+            longs = prev != null && prev.longs != null && prev.longs.length >= n
+                    ? prev.longs
+                    : new long[Math.max(n, 4096)];
+            MemorySegment.copy(in.data(), VectorBuffers.LE_LONG, 0L, longs, 0,
+                    n);
+        }
+        long[] validity = null;
+        if (in.hasNulls()) {
+            int words = Bitmap.wordsFor(n);
+            validity = prev != null && prev.validity != null && prev.validity.length >= words
+                    ? prev.validity
+                    : new long[Math.max(words, 64)];
+            for (int w = 0; w < words; w++) {
+                validity[w] = Bitmap.wordAt(in.validity(), w, n);
+            }
+        }
+        return new HeapMirror(t, n, ints, longs, validity);
+    }
+
     /** Whether row {@code i} is valid. */
     public boolean isValid(int i) {
         return validity == null || ((validity[i >>> 6] >>> (i & 63)) & 1L) != 0L;
