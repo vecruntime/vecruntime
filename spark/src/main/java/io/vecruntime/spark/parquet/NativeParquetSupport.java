@@ -17,12 +17,14 @@ package io.vecruntime.spark.parquet;
 
 import io.vecruntime.spark.adapter.TypeMapping;
 import org.apache.spark.sql.types.BooleanType;
+import org.apache.spark.sql.types.ByteType;
 import org.apache.spark.sql.types.DataType;
 import org.apache.spark.sql.types.DateType;
 import org.apache.spark.sql.types.DecimalType;
 import org.apache.spark.sql.types.DoubleType;
 import org.apache.spark.sql.types.IntegerType;
 import org.apache.spark.sql.types.LongType;
+import org.apache.spark.sql.types.ShortType;
 import org.apache.spark.sql.types.StringType;
 
 /**
@@ -33,12 +35,13 @@ import org.apache.spark.sql.types.StringType;
  * can never drift -- a type the planner admits is exactly a type the reader
  * decodes.
  *
- * <p>Slice 1 decodes the fixed lanes INT32 (also {@code DATE}), INT64, FLOAT64,
- * the {@code INT64}-lane narrow decimal ({@code p<=18}), and UTF8. Deliberately
- * excluded: {@code BOOLEAN} (bit-packed, no decode path yet), {@code
- * TINYINT}/{@code SMALLINT} (INT32-physical but need the narrow output wrapper
- * -- deferred), {@code TIMESTAMP}/{@code TIMESTAMP_NTZ} (INT64-physical but
- * need rebase/int96 handling verified per file -- deferred), {@code BINARY},
+ * <p>The native reader decodes the fixed lanes INT32 (also {@code DATE}, and
+ * {@code TINYINT}/{@code SMALLINT} narrowed to their width on the INT32 lane),
+ * INT64, FLOAT64, BOOL, the {@code INT64}-lane narrow decimal ({@code p<=18}),
+ * and UTF8. Each file's physical types are checked against these lanes at open
+ * ({@code VectorParquetScanExec.physicalMatches}). Deliberately excluded: {@code
+ * TIMESTAMP}/{@code TIMESTAMP_NTZ} (INT64-physical but need rebase/int96
+ * handling verified per file -- deferred), {@code FLOAT}, {@code BINARY},
  * wide decimals ({@code p>18}), and every nested/complex type.
  */
 public final class NativeParquetSupport {
@@ -49,6 +52,9 @@ public final class NativeParquetSupport {
     public static boolean isReadable(DataType dt) {
         if (dt instanceof IntegerType || dt instanceof DateType) {
             return true; // INT32 physical, INT32 lane
+        }
+        if (dt instanceof ByteType || dt instanceof ShortType) {
+            return true; // INT32 physical, INT32 lane narrowed to the declared width (VectorNarrowIntColumnVector)
         }
         if (dt instanceof LongType) {
             return true; // INT64 physical, INT64 lane

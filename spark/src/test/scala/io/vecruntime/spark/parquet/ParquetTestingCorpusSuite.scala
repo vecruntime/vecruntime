@@ -79,9 +79,33 @@ class ParquetTestingCorpusSuite extends VectorQuerySuite {
   /** Every corpus file in `data/` and the columns the native scan must read itself. */
   private val goodFiles: Seq[(String, Set[String])] = Seq(
     // parquet-mr, PLAIN and dictionary, v1 pages, a mix of supported and unsupported types (INT96, float, binary)
-    "alltypes_plain.parquet" -> Set("id", "bool_col", "int_col", "bigint_col", "double_col"),
-    "alltypes_plain.snappy.parquet" -> Set("id", "bool_col", "int_col", "bigint_col", "double_col"),
-    "alltypes_dictionary.parquet" -> Set("id", "bool_col", "int_col", "bigint_col", "double_col"),
+    "alltypes_plain.parquet" -> Set(
+      "id",
+      "bool_col",
+      "tinyint_col",
+      "smallint_col",
+      "int_col",
+      "bigint_col",
+      "double_col"
+    ),
+    "alltypes_plain.snappy.parquet" -> Set(
+      "id",
+      "bool_col",
+      "tinyint_col",
+      "smallint_col",
+      "int_col",
+      "bigint_col",
+      "double_col"
+    ),
+    "alltypes_dictionary.parquet" -> Set(
+      "id",
+      "bool_col",
+      "tinyint_col",
+      "smallint_col",
+      "int_col",
+      "bigint_col",
+      "double_col"
+    ),
     // the v2 encodings, from parquet-mr and arrow
     "delta_binary_packed.parquet" -> Set("bitwidth0", "bitwidth1", "bitwidth32", "bitwidth64", "int_value"),
     "delta_byte_array.parquet" -> Set("c_customer_id", "c_salutation", "c_first_name", "c_last_name"),
