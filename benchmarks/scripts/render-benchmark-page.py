@@ -131,7 +131,9 @@ def main():
     # The Comet build is named by the meta (a release, or a source build with unmerged fixes); the ENGINES
     # label is the default, so pages rendered without the key are unchanged.
     comet_label = meta.get("comet_label", dict((e, l) for e, l, _ in ENGINES)["comet"])
-    engines = [(e, comet_label if e == "comet" else l, c) for e, l, c in ENGINES]
+    # VecRuntime's legend label likewise (e.g. once it runs on its own Parquet reader, #559); default unchanged.
+    vector_label = meta.get("vector_label", dict((e, l) for e, l, _ in ENGINES)["vector"])
+    engines = [(e, comet_label if e == "comet" else vector_label if e == "vector" else l, c) for e, l, c in ENGINES]
     data = {"spark": load(a.spark), "vector": load(a.vector), "comet": load(a.comet)}
     mixed_label = meta["mixed_label"]
     all_engines = list(ENGINES)
@@ -198,8 +200,9 @@ def main():
         e = "mixed"
         best_m = max(queries, key=lambda q: speed(e, q)); worst_m = min(queries, key=lambda q: speed(e, q))
         m_lt_v = sum(1 for q in queries if data[e][q]["medianMs"] < V[q]["medianMs"])
+        mixed_vs_vector = html.escape(meta.get("mixed_vs_vector", "VecRuntime on Spark's reader"), quote=False)
         mx["tldr"] = (f"\n<b>{html.escape(mixed_label)}</b> finished in {tot[e]:,.0f} s -- {tot['spark'] / tot[e]:.2f}x, {100 - 100 * tot[e] / tot['spark']:.0f}% less, faster than Spark on {faster[e]} of {n}"
-                      f" (best {best_m}: {speed(e, best_m):.2f}x; largest regression {worst_m}: {100 / speed(e, worst_m) - 100:.0f}%), and faster than VecRuntime on Spark's reader on {m_lt_v} of {n}."
+                      f" (best {best_m}: {speed(e, best_m):.2f}x; largest regression {worst_m}: {100 / speed(e, worst_m) - 100:.0f}%), and faster than {mixed_vs_vector} on {m_lt_v} of {n}."
                       + (f" {html.escape(meta['mixed_line'], quote=False)}" if meta["mixed_line"] else ""))
         mx["card"] = f'\n<div class="card"><div class="l">{html.escape(mixed_label)}</div><div class="n">{tot[e]:,.0f} s</div><div class="l">{tot["spark"] / tot[e]:.2f}x · {100 - 100 * tot[e] / tot["spark"]:.0f}% less runtime</div></div>'
         mx["row"] = [(html.escape(mixed_label), f"{tot[e]:,.1f}", f"<b>{tot['spark'] / tot[e]:.2f}x</b> ({100 - 100 * tot[e] / tot['spark']:.0f}% less)", f"{faster[e]} / {n}", f"{exe[e]:.1f}", f"{gc[e]:.2f}", f"{shuf[e]:.2f}")]

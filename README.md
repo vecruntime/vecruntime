@@ -28,23 +28,25 @@ Version 0.0.4, a preview release under the Apache License 2.0 (see `LICENSE` and
 plugin runs the whole of TPC-DS (103 queries) and TPC-H (22) with every operator accelerated and
 returns Spark's results; what it does not convert falls back to Spark, always with a recorded reason.
 Measured on the 1 TB TPC-DS Parquet dataset on EKS, eight 13-core executors with 50 GB each, all
-three engines back to back in one cluster session in one availability zone (2026-09-30), all queries
+four engines back to back in one cluster session in one availability zone (2026-10-02), all queries
 once, the median of the measured iteration
 (`docs/results.md` has the per-query tables, the configurations and every study behind them):
 
 | engine | total, 103 queries | faster than Spark on | notes |
 |---|---:|---:|---|
-| Spark 4.1.3 | 3313 s | -- | 20 GB heap / 30 GB overhead; the reference |
-| Apache DataFusion Comet (main + #6268, #6270) | 2178 s | 95 | native scan, operators and shuffle; a source build with two unmerged fixes (q5, q64) |
-| Comet Native Scan + VecRuntime (Comet's native Parquet reader, our operators and shuffle) | 2324 s | 87 | a second cluster session the same day; the scan-bound queries at Comet's level |
-| **VecRuntime** (Spark's scan, our operators, our Flight shuffle) | **2420 s** | **88** | 30 GB heap / 20 GB overhead; 1.37x Spark, Comet 1.11x ahead |
+| Spark 4.1.3 | 3099 s | -- | 20 GB heap / 30 GB overhead; the reference |
+| Apache DataFusion Comet 1.0.0 | 1999 s | 97 | native scan, operators and shuffle |
+| Comet Native Scan + VecRuntime (Comet's native Parquet reader, our operators and shuffle) | 1954 s | 98 | the same operators as the row below, on Comet's reader |
+| **VecRuntime** (our Parquet reader, our operators, our Flight shuffle) | **1542 s** | **99** | 30 GB heap / 20 GB overhead; `spark.vecruntime.scan.nativeParquet.enabled=true` (off by default); 2.01x Spark, 1.30x Comet |
 
-Where the plugin wins it is the joins (q93 57 s against Spark's 139 and Comet's 86; q64 49 against 93
-and 64; q23b 118 against 282 and 124; q29 10 against 34 and 16). Where it loses to Comet it is the
-scan-bound queries, where it pays Spark's Parquet reader like Spark does (q9 87 against Comet's 60,
-q28 116 against 85, q88 111 against 97), and a few aggregate-heavy ones (q4, q11, q67); against Spark it
-is slower on q18 (cold, #558), q99, q11 and the scan-bound q28 and q24b, each in `docs/results.md`.
-Every checksum equals Spark's except q65, whose result has ties that every engine orders differently.
+Every leg ran with the launcher's defaults: ACCP, the S3A read settings (#566) and compact object
+headers (#578). On its own Parquet reader (#559) the plugin now leads the scan-bound queries (q88 35 s
+against Spark's 96 and Comet's 84; q9 31 against 73 and 51; q28 58 against 102 and 67) as well as the
+joins (q23b 104 against 288 and 138; q64 26 against 88 and 49). Comet leads on the heavy aggregates
+(q4 57 against our 71, q11 31 against 39, q24a/b) and on q18; against Spark the plugin is slower on q18
+(12.1 against 8.0 s), q99, q92 and q12, each in `docs/results.md`. Every checksum equals Spark's except
+q65, whose result has ties that every engine orders differently. With Spark's own Parquet reader (the
+default) the 2026-09-30 run measured 2420 s, 1.37x Spark.
 
 The same comparison as a page with per-query charts: [Apache Spark vs VecRuntime vs DataFusion Comet on
 TPC-DS 1 TB](https://vecruntime.github.io/vecruntime/benchmarks/tpcds-1tb.html) (rendered from the result
