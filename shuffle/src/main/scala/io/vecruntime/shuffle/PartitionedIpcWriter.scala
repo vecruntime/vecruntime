@@ -898,6 +898,10 @@ final class PartitionedIpcWriter(
   private val mirrorPool = new Array[HeapMirror](schema.fields.length)
   private val mirrorGather = new HeapMirror.GatherScratch
 
+  /** The staged flush's per-column mirrors (#565), and their reused arrays: at most one staging's worth each. */
+  private val stagedMirrored = new Array[HeapMirror](schema.fields.length)
+  private val stagedMirrorPool = new Array[HeapMirror](schema.fields.length)
+
   private def appendIndexed(
       seg: Segment,
       buffers: Array[VectorBuffers],
@@ -969,6 +973,19 @@ final class PartitionedIpcWriter(
         PartitionKernels.partitionOrder(stagedIds, n, numPartitions, starts, order)
       }
       val scatteredBuffers = new Array[VectorBuffers](schema.fields.length)
+      // The gathered (non-scatter) fixed-width columns are mirrored into heap arrays once for the flush
+      // (#565): each partition's slices then read arrays through the order, where they read the staging
+      // segments per row with a bounds and liveness check each -- the flush taken at 1 TB, where staged
+      // data passes `bufferBytes`, left every gathered column on that path.
+      if (gather) {
+        var mc = 0
+        while (mc < schema.fields.length) {
+          stagedMirrored(mc) = if (!scatter(mc) && HeapMirror.mirrorsForGather(source(mc))) {
+            stagedMirrorPool(mc) = HeapMirror.reuse(source(mc), n, stagedMirrorPool(mc)); stagedMirrorPool(mc)
+          } else null
+          mc += 1
+        }
+      }
       val allValid = new Array[Boolean](schema.fields.length)
       var c = 0
       while (c < schema.fields.length) {
@@ -995,7 +1012,7 @@ final class PartitionedIpcWriter(
           c = 0
           while (c < schema.fields.length) {
             if (scatter(c)) batchBuilders(c).appendRange(scatteredBuffers(c), from, to - from, allValid(c))
-            else batchBuilders(c).appendIndexed(source(c), order, from, to, scratch)
+            else batchBuilders(c).appendIndexed(source(c), order, from, to, scratch, stagedMirrored(c), mirrorGather)
             c += 1
           }
           flush(segments(p), to - from, batchBuilders)
