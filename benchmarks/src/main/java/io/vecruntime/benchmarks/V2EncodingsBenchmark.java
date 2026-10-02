@@ -31,6 +31,7 @@ import org.apache.parquet.column.values.ValuesReader;
 import org.apache.parquet.column.values.bitpacking.BytePacker;
 import org.apache.parquet.column.values.bitpacking.Packer;
 import org.apache.parquet.column.values.bytestreamsplit.ByteStreamSplitValuesReaderForDouble;
+import org.apache.parquet.column.values.bytestreamsplit.ByteStreamSplitValuesReaderForInteger;
 import org.apache.parquet.column.values.bytestreamsplit.ByteStreamSplitValuesReaderForLong;
 import org.apache.parquet.column.values.bytestreamsplit.ByteStreamSplitValuesWriter;
 import org.apache.parquet.column.values.deltalengthbytearray.DeltaLengthByteArrayValuesReader;
@@ -75,10 +76,11 @@ public class V2EncodingsBenchmark {
     int n;
 
     /**
-     * {@code bss-double}, {@code bss-long}, {@code dlba-string} (short random
-     * strings) or {@code dba-string} (sorted URL-like keys).
+     * {@code bss-double}, {@code bss-long}, {@code bss-int}, {@code
+     * dlba-string} (short random strings) or {@code dba-string} (sorted
+     * URL-like keys).
      */
-    @Param({"bss-double", "bss-long", "dlba-string", "dba-string"})
+    @Param({"bss-double", "bss-long", "bss-int", "dlba-string", "dba-string"})
     String shape;
 
     private byte[] page;
@@ -112,6 +114,15 @@ public class V2EncodingsBenchmark {
                 }
                 page = w.getBytes().toByteArray();
                 lane = VecType.INT64;
+                encoding = ParquetPageDecoder.Encoding.BYTE_STREAM_SPLIT;
+            }
+            case "bss-int" -> {
+                ByteStreamSplitValuesWriter.IntegerByteStreamSplitValuesWriter w = new ByteStreamSplitValuesWriter.IntegerByteStreamSplitValuesWriter(64, 1 << 20, alloc);
+                for (int i = 0; i < n; i++) {
+                    w.writeInteger(rnd.nextInt());
+                }
+                page = w.getBytes().toByteArray();
+                lane = VecType.INT32;
                 encoding = ParquetPageDecoder.Encoding.BYTE_STREAM_SPLIT;
             }
             case "dba-string" -> {
@@ -191,6 +202,7 @@ public class V2EncodingsBenchmark {
         ValuesReader r = switch (shape) {
             case "bss-double" -> new ByteStreamSplitValuesReaderForDouble();
             case "bss-long" -> new ByteStreamSplitValuesReaderForLong();
+            case "bss-int" -> new ByteStreamSplitValuesReaderForInteger();
             case "dba-string" -> new DeltaByteArrayReader();
             default -> new DeltaLengthByteArrayValuesReader();
         };
@@ -200,6 +212,7 @@ public class V2EncodingsBenchmark {
             sum += switch (shape) {
                         case "bss-double" -> (long) r.readDouble();
                         case "bss-long" -> r.readLong();
+                        case "bss-int" -> r.readInteger();
                         default -> r.readBytes().length();
                     };
         }
