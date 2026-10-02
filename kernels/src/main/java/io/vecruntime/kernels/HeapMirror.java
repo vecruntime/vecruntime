@@ -42,7 +42,10 @@ public final class HeapMirror {
     /** INT32 values, or null. */
     public final int[] ints;
 
-    /** INT64 / FLOAT64 raw bits, or null. */
+    /**
+     * INT64 / FLOAT64 raw bits, or DECIMAL128 as two little-endian words per
+     * row (the Arrow layout, low word first), or null.
+     */
     public final long[] longs;
 
     /**
@@ -79,6 +82,22 @@ public final class HeapMirror {
     }
 
     /**
+     * Whether {@link #of} / {@link #reuse} and {@link #gather} cover {@code in}:
+     * what {@link #mirrors} covers, plus plain DECIMAL128 (#565: at 1 TB the
+     * shuffle writer's fixed-width columns are mostly 128-bit decimal sums).
+     * Only for callers that use nothing but {@link #gather}; the keyed readers
+     * of {@link #longs} assume one word per row and stay on {@link #mirrors}.
+     */
+    public static boolean mirrorsForGather(VectorBuffers in) {
+        return mirrors(in) || (!in.isDictionaryEncoded() && in.type() == VecType.DECIMAL128);
+    }
+
+    /** Words of {@link #longs} per row: 2 for DECIMAL128, 1 otherwise. */
+    private static int wordsPerRow(VecType t) {
+        return t == VecType.DECIMAL128 ? 2 : 1;
+    }
+
+    /**
      * Copies the column's data (and validity, when it has nulls) into arrays:
      * one bulk move each.
      */
@@ -92,9 +111,10 @@ public final class HeapMirror {
             MemorySegment.copy(in.data(), VectorBuffers.LE_INT, 0L, ints, 0,
                     n);
         } else {
-            longs = new long[n];
+            int words = n * wordsPerRow(t);
+            longs = new long[words];
             MemorySegment.copy(in.data(), VectorBuffers.LE_LONG, 0L, longs, 0,
-                    n);
+                    words);
         }
         long[] validity = null;
         if (in.hasNulls()) {
@@ -126,11 +146,12 @@ public final class HeapMirror {
             MemorySegment.copy(in.data(), VectorBuffers.LE_INT, 0L, ints, 0,
                     n);
         } else {
-            longs = prev != null && prev.longs != null && prev.longs.length >= n
+            int words = n * wordsPerRow(t);
+            longs = prev != null && prev.longs != null && prev.longs.length >= words
                     ? prev.longs
-                    : new long[Math.max(n, 4096)];
+                    : new long[Math.max(words, 4096)];
             MemorySegment.copy(in.data(), VectorBuffers.LE_LONG, 0L, longs, 0,
-                    n);
+                    words);
         }
         long[] validity = null;
         if (in.hasNulls()) {
@@ -166,6 +187,22 @@ public final class HeapMirror {
                 out[o] = i < 0 ? 0 : ints[i];
             }
             MemorySegment.copy(out, 0, outData, VectorBuffers.LE_INT, 0L, count);
+        } else if (type == VecType.DECIMAL128) {
+            long[] out = scratch.longs(count << 1);
+            for (int o = 0; o < count; o++) {
+                int i = idx[from + o];
+                int to2 = o << 1;
+                if (i < 0) {
+                    out[to2] = 0L;
+                    out[to2 + 1] = 0L;
+                } else {
+                    int from2 = i << 1;
+                    out[to2] = longs[from2];
+                    out[to2 + 1] = longs[from2 + 1];
+                }
+            }
+            MemorySegment.copy(out, 0, outData, VectorBuffers.LE_LONG, 0L,
+                    count << 1);
         } else {
             long[] out = scratch.longs(count);
             for (int o = 0; o < count; o++) {
