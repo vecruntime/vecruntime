@@ -84,6 +84,12 @@ public final class ColumnVectorAdapters {
     }
 
     public static VectorBuffers adapt(ColumnVector cv, int numRows, Arena scratch) {
+        if (cv instanceof io.vecruntime.spark.arrow.SlicedColumnVector s) {
+            // A batch-sized offset view over a reader-owned row-group vector (the native Parquet scan): adapt
+            // the underlying vector and slice it on the 64-aligned batch offset -- zero-copy, and it never
+            // hits the bulk-read copy path below (which would read Arrow null slots and throw).
+            return adapt(s.inner(), s.innerLength(), scratch).slice(s.offset(), s.offset() + numRows);
+        }
         if (cv instanceof BorrowedColumnVector b) {
             return adapt(b.inner(), numRows, scratch);
         }

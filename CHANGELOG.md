@@ -6,6 +6,40 @@ version may change configuration keys or defaults, always noted here.
 
 ## Unreleased
 
+### Added
+
+- Our own Parquet scan behind `spark.vecruntime.scan.nativeParquet.enabled` (default off), #559 slice 1:
+  `VectorParquetScanExec` replaces a supported flat-schema Parquet `FileSourceScanExec` and decodes pages
+  straight into our Arrow vectors through `NativeParquetColumnReader` (reused vectors across row groups,
+  the parquet-java `BytePacker` injected into the `ColumnChunkDecoder`), one pass, no Spark `ColumnVector`
+  in between -- the chain above is ours from the leaf. It reuses Spark's dynamically selected partitions
+  (DPP), file splitting, bucketing, pushed data filters (row-group / page skipping) and the required +
+  partition schema; batches are `spark.sql.parquet.columnarReaderBatchSize` rows, emitted as offset views
+  with no copy. Slice 1 decodes `PLAIN` and dictionary encodings only: a file whose column-chunk metadata
+  shows another encoding (`DELTA_*`, `BYTE_STREAM_SPLIT`) falls that file over to Spark's own vectorized
+  reader at open time (correct results, no mid-decode failure). An unsupported type, nested column,
+  `INT96`, non-`CORRECTED` date/timestamp rebase or a bucketed scan keeps Spark's scan with a recorded
+  reason. End-to-end decode of a 4M-row file was at parity with Spark's reader and ~17% faster than the
+  production Spark-reader-plus-adapter path (`docs/results.md`, `butterfly-keep`). `VectorParquetScanSuite`
+  compares results row-for-row with Spark across type x encoding x page v1/v2 x nulls, several row groups
+  and pages, partition columns, a pushed filter and a DPP query; `VectorParquetScanPlanSuite` pins planning.
+- `spark.vecruntime.scan.nativeParquet.prefetchFiles` (default `6`) and
+  `spark.vecruntime.scan.nativeParquet.prefetchRowGroups` (default `2`), `0` off, capped at 16: how far
+  `VectorParquetScanExec` reads ahead (#559/#566). The next N files of a split are opened (status, footer,
+  first row group), and the next M row groups of the current file are read, on background threads while the
+  task thread decodes; the row-group reads are a chained `CompletableFuture` pipeline, so a file's
+  `ParquetFileReader` is used by one thread at a time and in order. At 1 TB TPC-DS (store_sales is ~14.6k
+  files of ~7 MB, mostly one row group each) task threads were parked on S3 at least 66% of the time; same
+  session, flag on, checksums equal, against no read-ahead (experiment build: N files + one row group
+  ahead): N = 2 q88 -27%, q28 -56%, q9 -60%, q44 -50%; N = 6 q28 -57%, q9 -64%, q44 -59% (q88 varied
+  57-115 s per iteration at both depths). Memory per task grows by up to N opened files plus
+  M row groups (compressed pages).
+- Benchmarks: the cluster image ships Amazon Corretto Crypto Provider (#566), and `benchmarks/k8s/render-run.sh`
+  turns it on by default (`ACCP=1`; `ACCP=0` for the JDK's own crypto) for the S3 TLS cipher and SigV4
+  hashing. The rendered runs also raise the S3A read concurrency the native scan's read-ahead needs:
+  `fs.s3a.connection.maximum` 200 -> 1000, `fs.s3a.threads.max` 256, `fs.s3a.max.total.tasks` 128 and the
+  Analytics Accelerator's `physicalio.thread.pool.size` 192 (the values every 1 TB #559 A/B round ran with).
+
 ## 0.0.4 -- 2026-09-30
 
 `ObjectHashAggregateExec` for `bloom_filter_agg`, `collect_list` and `collect_set`, with spill; a
@@ -17,6 +51,17 @@ word at a time; and the scan adapter decoding dictionary ids in place. TPC-DS 1 
 
 ### Added
 
+- The value-decoding core of a native Parquet scan (#559, slice 1): a dependency-free Java page
+  decoder in `kernels` that turns a decompressed Parquet data page straight into Arrow-layout
+  `VectorBuffers`, one pass, no Spark `ColumnVector` in between. `RleBitPackingReader` decodes the
+  RLE / bit-packed hybrid encoding (definition levels and `RLE_DICTIONARY` ids, bit widths 0..32);
+  `ParquetPageDecoder` decodes definition-level nulls, `RLE_DICTIONARY` ids (dictionary decoded into
+  the output) and `PLAIN` values for INT32, INT64, DOUBLE, DATE, DECIMAL(p&le;18) over their int32 /
+  int64 physical type, and BINARY/UTF8, for data page v1 (length-prefixed inline levels) and v2
+  (header-sized level and value slices), flat columns only. Verified by a scalar-oracle kernel suite
+  and cross-checked against parquet-java's own `PlainValuesWriter` / `RunLengthBitPackingHybridEncoder`
+  in `spark`. The `VectorParquetScanExec` node and the `spark.vecruntime.scan.nativeParquet.enabled`
+  planner switch that use it are a following slice; nothing changes in planning yet.
 - `ObjectHashAggregateExec` is converted for the object aggregates whose buffer we can carry (#57,
   `spark.vecruntime.exec.objectAggregate.enabled`, default on): `bloom_filter_agg` (the runtime
   filter's build side), `collect_list` and `collect_set`. Spark carries their state between the

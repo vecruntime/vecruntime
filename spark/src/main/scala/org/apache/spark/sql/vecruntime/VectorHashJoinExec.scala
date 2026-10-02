@@ -804,6 +804,7 @@ private[vecruntime] class VectorHashJoinIterator(
 
   private def probe(batch: ColumnarBatch): Unit = {
     metrics.numInputBatches += 1
+    selWordsOf = null // a selection segment may be reused across batches: rebuild the words per batch
     java.util.Arrays.fill(streamedMirrorTried, false)
     java.util.Arrays.fill(streamedMirrors.asInstanceOf[Array[AnyRef]], null)
     EvalContexts.withBatch(batch) { ctx =>
@@ -842,7 +843,28 @@ private[vecruntime] class VectorHashJoinIterator(
     }
   }
 
-  private def selected(ctx: EvalContext, i: Int): Boolean = ctx.selection == null || Bitmap.isSet(ctx.selection, i)
+  // The batch's selection as heap words, built once per selection segment. `selected` runs once per
+  // streamed row inside the probe loops; reading the off-heap selection there paid the FFM session
+  // liveness/owner check per row (MemorySessionImpl.checkValidStateRaw, ~13% of a 1 TB q88 profile), which
+  // C2 does not hoist out of these call-heavy loops. A heap long[] read has no such check.
+  private var selWordsOf: java.lang.foreign.MemorySegment = _
+  private var selWords: Array[Long] = new Array[Long](0)
+
+  private def selectionWords(ctx: EvalContext): Array[Long] = {
+    val sel = ctx.selection
+    if (sel ne selWordsOf) {
+      val n = ctx.numRows
+      val words = Bitmap.wordsFor(n)
+      if (selWords.length < words) selWords = new Array[Long](words)
+      var w = 0
+      while (w < words) { selWords(w) = Bitmap.wordAt(sel, w, n); w += 1 }
+      selWordsOf = sel
+    }
+    selWords
+  }
+
+  private def selected(ctx: EvalContext, i: Int): Boolean =
+    ctx.selection == null || ((selectionWords(ctx)(i >>> 6) >>> (i & 63)) & 1L) != 0L
 
   /** Whether a key of streamed row `i` is null (`nonNullKeys` folds the selection in; `null` means none is). */
   private def nullKeyAt(i: Int): Boolean = nonNullKeys != null && !Bitmap.isSet(nonNullKeys, i)

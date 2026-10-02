@@ -77,6 +77,27 @@ class VectorJoinSuite extends VectorQuerySuite {
     checkVectorized("SELECT tk.i, dim.name FROM tk JOIN dim ON cast(tk.i50 as decimal(5,1)) = dim.dd", Seq(BHJ))
   }
 
+  test("a filtered streamed side probes only its selected rows, across word and batch boundaries") {
+    // The filter leaves a selection (not compacted) on the streamed batch; the probe reads it as heap words
+    // built per batch. Sparse, irregular predicates put selected bits on both sides of 64-bit word edges
+    // and in every batch, for the inner, semi, anti, outer and conditional probe paths.
+    // (`%` is not compiled, so the predicates use the materialised i50 = i % 50 and ranges of i.)
+    checkVectorized(
+      "SELECT tk.i, dim.name FROM tk JOIN dim ON tk.i50 = dim.di WHERE tk.i50 IN (3, 17, 41, 49) OR tk.i < 70",
+      Seq(BHJ, classOf[VectorFilterExec])
+    )
+    checkVectorized("SELECT tk.i FROM tk LEFT SEMI JOIN dim ON tk.l = dim.dl WHERE tk.i50 <> 1", Seq(BHJ))
+    checkVectorized("SELECT tk.i FROM tk LEFT ANTI JOIN dim ON tk.l = dim.dl WHERE tk.i50 > 30", Seq(BHJ))
+    checkVectorized(
+      "SELECT tk.i, dim.name FROM tk LEFT JOIN dim ON tk.l = dim.dl WHERE tk.i50 IN (0, 1, 13) OR tk.i > 19930",
+      Seq(BHJ)
+    )
+    checkVectorized(
+      "SELECT tk.i, dim.name FROM tk JOIN dim ON tk.i50 = dim.di AND tk.d > dim.weight WHERE tk.i50 < 4",
+      Seq(BHJ)
+    )
+  }
+
   test("broadcast outer, semi and anti joins keep or drop unmatched streamed rows") {
     checkVectorized("SELECT tk.i, tk.l, dim.name FROM tk LEFT JOIN dim ON tk.l = dim.dl", Seq(BHJ))
     checkVectorized("SELECT tk.i FROM tk LEFT SEMI JOIN dim ON tk.l = dim.dl", Seq(BHJ))

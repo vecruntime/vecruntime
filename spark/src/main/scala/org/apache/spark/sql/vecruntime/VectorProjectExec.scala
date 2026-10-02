@@ -169,30 +169,43 @@ private[vecruntime] class VectorProjectIterator(
         val columns = new Array[ColumnVector](exprs.length)
         var foreignRows: Array[Int] = null // the selection as row ids, built once for the columns with no lane
         var c = 0
-        while (c < columns.length) {
-          val (name, dt) = outputAttrs(c)
-          columns(c) = exprs(c) match {
-            case ColumnRef(ordinal, _) if compactTo != null && !TypeMapping.hasLane(dt) =>
-              if (foreignRows == null) foreignRows = RemappedColumnVector.rowsOf(compactTo, ctx.numRows, outRows)
-              RemappedColumnVector.of(ctx.column(ordinal), foreignRows)
-            case NestedColumnRef(ordinal, path, _) =>
-              val field = NestedFieldColumnVector.of(ctx.column(ordinal), path.toArray, ctx.numRows)
-              if (compactTo == null) field
-              else {
+        try {
+          while (c < columns.length) {
+            val (name, dt) = outputAttrs(c)
+            columns(c) = exprs(c) match {
+              case ColumnRef(ordinal, _) if compactTo != null && !TypeMapping.hasLane(dt) =>
                 if (foreignRows == null) foreignRows = RemappedColumnVector.rowsOf(compactTo, ctx.numRows, outRows)
-                RemappedColumnVector.of(field, foreignRows)
-              }
-            case ColumnRef(ordinal, _) if compactTo != null =>
-              ArrowOutput.compact(name, dt, ctx.input(ordinal), compactTo, outRows, allocator)
-            case ColumnRef(ordinal, _) =>
-              // Forwarded columns are never copied: the child keeps them alive until its next batch.
-              BorrowedColumnVector.of(batch.column(ordinal))
-            case lit: LiteralExpr if lit.value == null => ArrowOutput.nulls(name, dt, outRows, allocator)
-            case lit: LiteralExpr => ArrowOutput.constant(name, dt, lit.value, outRows, allocator)
-            case e if compactTo != null => ArrowOutput.compact(name, dt, e.eval(ctx), compactTo, outRows, allocator)
-            case e => ArrowOutput.copy(name, dt, e.eval(ctx), allocator)
+                RemappedColumnVector.of(ctx.column(ordinal), foreignRows)
+              case NestedColumnRef(ordinal, path, _) =>
+                val field = NestedFieldColumnVector.of(ctx.column(ordinal), path.toArray, ctx.numRows)
+                if (compactTo == null) field
+                else {
+                  if (foreignRows == null) foreignRows = RemappedColumnVector.rowsOf(compactTo, ctx.numRows, outRows)
+                  RemappedColumnVector.of(field, foreignRows)
+                }
+              case ColumnRef(ordinal, _) if compactTo != null =>
+                ArrowOutput.compact(name, dt, ctx.input(ordinal), compactTo, outRows, allocator)
+              case ColumnRef(ordinal, _) =>
+                // Forwarded columns are never copied: the child keeps them alive until its next batch.
+                BorrowedColumnVector.of(batch.column(ordinal))
+              case lit: LiteralExpr if lit.value == null => ArrowOutput.nulls(name, dt, outRows, allocator)
+              case lit: LiteralExpr => ArrowOutput.constant(name, dt, lit.value, outRows, allocator)
+              case e if compactTo != null => ArrowOutput.compact(name, dt, e.eval(ctx), compactTo, outRows, allocator)
+              case e => ArrowOutput.copy(name, dt, e.eval(ctx), allocator)
+            }
+            c += 1
           }
-          c += 1
+        } catch {
+          case t: Throwable =>
+            // An expression (e.g. an ANSI overflow) threw mid-batch: close the output columns already built
+            // from our allocator so it does not report leaked memory on task completion. Borrowed columns own
+            // nothing; close() is a no-op for them.
+            var k = 0
+            while (k < c) {
+              if (columns(k) != null) columns(k).close()
+              k += 1
+            }
+            throw t
         }
         metrics.numOutputRows += outRows
         if (selected && compactTo == null) {
