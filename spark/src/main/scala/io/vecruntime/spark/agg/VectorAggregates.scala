@@ -158,6 +158,29 @@ final case class SumLongAgg(input: VectorExpr, checked: Boolean, queryContext: o
       else
         try java.lang.Long.valueOf(acc.sum(g))
         catch { case _: ArithmeticException => overflow() }
+    // The same values as `bufferValue`, written straight into the INT64 lane (#565): no boxing, and
+    // no per-value type dispatch in the operator's boxed fallback, whose null branch C2 compiled as
+    // an uncommon trap that each null group then hit.
+    override def writeBuffer(slot: Int, from: Int, to: Int, out: ArrowVectorBuffers): Boolean = {
+      val data = out.data()
+      val validity = out.validity()
+      var g = from
+      while (g < to) {
+        val o = g - from
+        if (acc.count(g) == 0) {
+          Bitmap.clear(validity, o)
+          data.setAtIndex(VectorBuffers.LE_LONG, o.toLong, 0L)
+        } else {
+          val s =
+            try acc.sum(g)
+            catch { case _: ArithmeticException => overflow() }
+          Bitmap.set(validity, o)
+          data.setAtIndex(VectorBuffers.LE_LONG, o.toLong, s)
+        }
+        g += 1
+      }
+      true
+    }
   }
 }
 

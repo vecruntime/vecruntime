@@ -222,6 +222,20 @@ class VectorAggregateSuite extends VectorQuerySuite {
     }
   }
 
+  test("#565: grouped long sums write their buffer lane: empty groups are null, merged across stages") {
+    // Group 3 sees only nulls, so its partial buffer is null and its result is null; the rest sum.
+    val nullable = "CASE WHEN i % 7 = 3 THEN NULL ELSE l END"
+    Seq("true", "false").foreach { ansi =>
+      withConf("spark.sql.ansi.enabled" -> ansi) {
+        checkVectorized(s"SELECT i % 7 AS k, sum($nullable) AS s FROM t GROUP BY i % 7", Seq(Agg))
+        checkVectorized(s"SELECT i % 7 AS k, sum($nullable), sum(i), count(*) FROM t GROUP BY i % 7", Seq(Agg))
+        checkVectorized("SELECT s, sum(cast(i AS bigint)), sum(d2) FROM t GROUP BY s", Seq(Agg))
+        // Every input is null: every group's buffer and result are null.
+        checkVectorized("SELECT i % 5 AS k, sum(CAST(NULL AS bigint) + l) FROM t GROUP BY i % 5", Seq(Agg))
+      }
+    }
+  }
+
   test("unsupported aggregates fall back") {
     checkFallback("SELECT approx_count_distinct(i) FROM t", Seq(Agg), "unsupported aggregate function")
     checkVectorized(
