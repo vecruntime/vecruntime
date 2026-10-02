@@ -2909,3 +2909,42 @@ The x86 page (`docs/benchmarks/tpcds-1tb.html`) now shows this run.
   - **Caveat:** the comparison crosses two cluster sessions. A same-session baseline leg (ours on Spark's reader) was started and cancelled at the owner's request.
   - **What it means for #559:** Spark's Parquet reader accounts for the scan-bound gap to Comet. A faster reader of our own would recover it without the native crossing's fixed cost.
 - **Against the earlier x86 run:** that run used a 128m advisory size and `minPartitionNum=208`, with Comet 1.0.0 failing q64. It measured Spark 3,309 s, ours 2,557 s (1.29x) and Comet 2,514 s.
+
+## x86 TPC-DS 1 TB on our own Parquet reader, four engines in one session (2026-10-02)
+
+The x86 page (`docs/benchmarks/tpcds-1tb.html`) now shows this run. The result files and the page's
+metadata are in `benchmarks/results/tpcds-sf1000-2026-10-02/`.
+
+**Setup:**
+- **Code:** main at `bbc7261` (#579 native Parquet scan with read-ahead, #580 sort-compare deoptimization fix,
+  #581 compact object headers), image `main-bbc7261`, Comet 1.0.0 from Maven Central.
+- **Order:** Spark, VecRuntime, Comet Native Scan + VecRuntime, Comet, back to back in one cluster session
+  on 9 x m5.4xlarge in us-east-1a, each alone on the cluster; all 103 queries, one measured iteration, no warm-up.
+- **Every engine:** ACCP and the S3A read settings (#566), compact object headers (#578), AQE defaults,
+  `spark.sql.shuffle.partitions=300`, 50 GB per executor (Spark 20 heap / 30 overhead; VecRuntime 30 / 20;
+  Comet 20 heap / 8 overhead / 22 off-heap; Comet Native Scan + VecRuntime 30 / 12 / 8).
+- **VecRuntime:** `spark.vecruntime.scan.nativeParquet.enabled=true` (off by default), read-ahead at its
+  defaults (6 files, 2 row groups).
+
+**Totals:**
+
+| engine | total (s) | vs Spark | geomean | faster than Spark on | executor time (h) | GC (h) | shuffle read (TB) |
+|---|---|---|---|---|---|---|---|
+| Spark 4.1.3 | 3,098.7 | baseline | -- | -- | 74.5 | 0.63 | 0.94 |
+| VecRuntime (own reader) | 1,541.8 | 2.01x | 1.86x | 99 | 33.0 | 0.54 | 0.47 |
+| Comet Native Scan + VecRuntime | 1,954.0 | 1.59x | 1.48x | 98 | 45.4 | 0.10 | 0.48 |
+| Comet 1.0.0 | 1,999.4 | 1.55x | 1.52x | 97 | 47.7 | 0.01 | 0.43 |
+
+- **Correctness:** every engine returned Spark's row counts on all 103 queries and Spark's checksums on all
+  but q65 (ties, ordered differently by every engine).
+- **Fastest engine per query:** VecRuntime 56, Comet 32, Comet Native Scan + VecRuntime 14, Spark 1 (q99).
+- **Reader against reader:** under the same operators and shuffle, our reader finishes in 1,542 s and Comet's
+  in 1,954 s; ours is faster on 76 of 103 queries.
+- **The scan-bound queries:** q88 35.0 s (Spark 96.1, Comet 84.2), q9 30.6 (73.2, 50.5), q28 58.4 (101.8, 67.3),
+  q44 9.6 (34.8, 22.0), q90 7.4 (30.7, 31.0).
+- **Comet ahead:** q4 57.1 against our 70.6, q11 30.5 against 38.6, q24a 79.2 against 93.7, q24b 74.8 against
+  90.9, q65 13.1 against 19.0, q18 4.5 against 12.1.
+- **Ours slower than Spark:** q18 (8.0 -> 12.1 s, under investigation), q99 (8.4 -> 10.0 s), q92 (1.6 -> 1.9 s),
+  q12 (2.2 -> 2.3 s).
+- **Against the 2026-09-30 run** (another session, Spark's reader, before #566/#578): Spark 3,313 s, ours
+  2,420 s (1.37x).
