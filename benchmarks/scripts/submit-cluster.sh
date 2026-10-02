@@ -102,7 +102,8 @@ JVM_FLAGS="--add-modules=jdk.incubator.vector --enable-native-access=ALL-UNNAMED
 --add-opens=java.base/java.util=ALL-UNNAMED --add-opens=java.base/java.util.concurrent=ALL-UNNAMED --add-opens=java.base/java.util.concurrent.atomic=ALL-UNNAMED \
 --add-opens=java.base/jdk.internal.ref=ALL-UNNAMED --add-opens=java.base/sun.nio.ch=ALL-UNNAMED --add-opens=java.base/sun.nio.cs=ALL-UNNAMED \
 --add-opens=java.base/sun.security.action=ALL-UNNAMED --add-opens=java.base/sun.util.calendar=ALL-UNNAMED \
--Djdk.reflect.useDirectMethodHandle=false -Dio.netty.tryReflectionSetAccessible=true"
+-Djdk.reflect.useDirectMethodHandle=false -Dio.netty.tryReflectionSetAccessible=true \
+-XX:+UseCompactObjectHeaders"
 
 MASTER_ARGS=()
 if [ -n "${MASTER:-}" ]; then MASTER_ARGS=(--master "$MASTER"); fi

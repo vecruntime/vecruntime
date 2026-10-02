@@ -302,6 +302,13 @@ Spark 4.1 officially supports JDK 17 and 21. Running it on 25 needs two things b
   without it Arrow's Netty allocator cannot address direct memory on JDK 25 and the first columnar
   operator fails (`EmptyByteBuf.memoryAddress`).
 
+Recommended, not required: `-XX:+UseCompactObjectHeaders` on the driver and executors (#578). It is a
+product feature on JDK 25 (JEP 519) and the default from JDK 27 (JEP 534). Object headers shrink from
+12 to 8 bytes, which lands on Spark's row and expression objects, boxed fallback values and planning
+objects rather than on our off-heap batches. The benchmark launcher (`benchmarks/scripts/submit-cluster.sh`)
+passes it. A JDK AOT cache (#416) records the header layout it was built with, so build it with the
+same flag: `benchmarks/k8s/aot/aot-env.sh` does.
+
 ## Requirements and known limitations
 
 What a deployment needs, and what the plugin does not do yet -- the short list; the reasons and the
