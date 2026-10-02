@@ -1,7 +1,7 @@
 ---
 layout: default
 title: Testing & correctness
-description: How VecRuntime's correctness is established — Spark's SQL golden suite and its coverage floor, the ported Comet matrices, the project's own suites, and the benchmark checksums.
+description: How VecRuntime's correctness is established — Spark's SQL golden suite and its coverage floor, the ported Comet matrices, the project's own suites (including the native Parquet reader's parquet-java cross-checks and conformance corpus), and the benchmark checksums.
 ---
 
 # Testing & correctness
@@ -99,6 +99,56 @@ Validation the project maintains directly (all on JDK 25):
   strings, the shuffle rewrite and C-Data release; `IcebergScanSuite` and `CometIcebergSuite`
   (`-Piceberg`, tag `IcebergTest`).
 - **TPC-H / TPC-DS query tests** through the benchmark runners (see below).
+
+### The native Parquet reader
+
+Our own Parquet scan (`spark.vecruntime.scan.nativeParquet.enabled`, #559) decodes pages itself, so it is
+checked against the Parquet reference implementation as well as Spark. Each encoding and type is admitted
+only once all of these pass:
+
+- **Kernel tests against a scalar reference.** `ColumnChunkDecoderTest`, `DeltaBinaryPackedReaderTest`,
+  `RleBitPackingReaderTest` and `ByteStreamSplitKernelsTest` decode pages built by a from-scratch
+  encoder of the spec, with nulls, across pages and at every batch size. The SIMD and SWAR variants are
+  compared with their scalar twin at 128, 256 and 512 bits.
+- **parquet-java cross-checks, against its writers and its readers.** `ParquetPageDecoderCrossCheckSuite`
+  and `DeltaBinaryPackedCrossCheckSuite` encode values with parquet-java's own `ValuesWriter`s. Those
+  are the writers Spark, Hive and most JVM engines use: `PLAIN`, RLE/dictionary, `DELTA_BINARY_PACKED`,
+  `DELTA_LENGTH_BYTE_ARRAY`, `DELTA_BYTE_ARRAY`, `BYTE_STREAM_SPLIT`, and the boolean `PLAIN` and `RLE`
+  writers. The suites decode the same bytes with our decoder and with parquet-java's matching
+  `ValuesReader`, and require identical values.
+- **Round trips through Spark** (`VectorParquetScanSuite`). The suite writes v1 and v2 pages, with and
+  without dictionaries, and with nulls, several row groups and filters. Each query must return Spark's
+  rows, and the suite asserts that the scan read the row groups itself rather than handing them to
+  Spark's reader. It also reads files written directly with parquet-java, with out-of-range and
+  overflowing values, against Spark's parquet-java-based reader.
+- **The Apache Parquet conformance corpus** (`ParquetTestingCorpusSuite`). The suite reads 27 files from
+  `apache/parquet-testing`, vendored at a pinned commit (Apache-2.0, credited in `NOTICE`), one column at
+  a time. The files were written by parquet-mr of several ages, parquet-cpp, arrow-rs and Impala, and
+  cover v2 encodings, empty and all-null pages, checksums, and a dictionary page at offset 0.
+  - A column the scan supports must be read natively and match Spark's row-based reader.
+  - Any other column must return what Spark returns with the plugin off, rows or refusal.
+  - A corrupt file from `bad_data/` that Spark refuses must be refused too.
+
+  The corpus found a bug that predated it: a `FIXED_LEN_BYTE_ARRAY` decimal was decoded as INT64 (#592).
+- **Spark's SQL golden suite with the native scan on**
+  (`SQL_TESTS_JVM_ARGS=-Dspark.vecruntime.scan.nativeParquet.enabled=true`), as in section 1: 642
+  succeeded, 0 failed.
+- **Throughput.** Each decoder has a JMH benchmark against Spark's or parquet-java's reader for the same
+  page (`DeltaBinaryPackedBenchmark`, `V2EncodingsBenchmark`). The numbers are in the
+  [design note](native-parquet-reader.md).
+
+**What we took from Hardwood.** [Hardwood](https://github.com/hardwood-hq/hardwood) (Apache-2.0) is a
+Parquet reader for the JVM. We studied it, and no code was copied. Two practices came from it:
+- Testing against the `apache/parquet-testing` corpus, as its conformance runner does.
+- Bounding every size a file declares before allocating for it:
+  - the `DELTA_BINARY_PACKED` block size is capped at 2^16;
+  - a `BYTE_STREAM_SPLIT` value region that is not a whole number of values fails the page;
+  - a boolean page or RLE run that claims more values than its bytes hold fails the page;
+  - a bit-packed run past the stream end fails the page.
+
+We kept our own decoders, which measured faster: the vectorized `BYTE_STREAM_SPLIT` transpose, whole
+miniblocks for `DELTA_BINARY_PACKED`, and 64-bits-a-step booleans. Hardwood's are a scalar gather and
+bit-at-a-time booleans.
 
 *(Exact per-suite counts vary by revision and profile; run the suites to see the current numbers.)*
 

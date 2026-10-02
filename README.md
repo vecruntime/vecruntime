@@ -933,7 +933,10 @@ own operators, not ours).
 
 ## Not in scope (yet)
 
-- A Parquet-to-Arrow reader of our own; Comet's reader covers the zero-copy case.
+- The rest of the Parquet type system in our own reader (`spark.vecruntime.scan.nativeParquet.enabled`,
+  #559). It reads flat columns of the common types and encodings; FLOAT, BINARY, TIMESTAMP_NTZ, INT96 and
+  nested types (structs, lists, maps) are read by Spark's reader instead, decided per plan or per file.
+  Comet's reader remains an option for the zero-copy case.
 - A spilling window, TLS for the Flight shuffle server,
   and a push-based shuffle service for disposable executors (the `VectorShuffleBackend` seam is
   where it plugs in).
