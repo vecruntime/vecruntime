@@ -6,6 +6,20 @@ version may change configuration keys or defaults, always noted here.
 
 ## Unreleased
 
+### Changed
+
+- Faster v2 page decoding in the native Parquet scan (#559). JMH, x86 / Graviton4:
+  - `BYTE_STREAM_SPLIT` transposes instead of gathering bytes: 3.7x / 2.0x on DOUBLE and INT64. It uses the Vector API
+    from 256-bit vectors and SWAR at 128 bits, where the Vector API's byte-to-long widening is not intrinsified
+    (`-Dvecruntime.parquet.bssMode=auto`).
+  - `DELTA_BINARY_PACKED` unpacks and sums whole miniblocks straight into the caller's array: 1.17-1.23x / 1.09-1.24x.
+  - `DELTA_BYTE_ARRAY` rebuilds values straight into the batch's bytes, without the per-page rebuild buffer:
+    1.34x / 1.49x.
+
+  The results are unchanged: `ByteStreamSplitKernelsTest` checks every variant against its scalar reference at
+  128, 256 and 512 bits. `-Dvecruntime.parquet.bssMode` and `-Dvecruntime.parquet.deltaScan` select the
+  alternatives for A/B runs.
+
 ### Added
 
 - The native Parquet scan (`spark.vecruntime.scan.nativeParquet.enabled`) decodes `DELTA_BINARY_PACKED`
