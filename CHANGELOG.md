@@ -26,8 +26,17 @@ version may change configuration keys or defaults, always noted here.
   dictionary-encoded. Before, such a file fell over to Spark's reader whole. `DeltaBinaryPackedReader` unpacks
   each miniblock through the injected `BytePacker` and resumes inside a miniblock across batches. It is
   checked against a from-scratch encoder, against parquet-java's writers and through Spark with v2 files.
-  JMH: 2.0-4.0x the pages per ms of Spark's `VectorizedDeltaBinaryPackedReader`. The other v2 encodings
-  (`DELTA_LENGTH_BYTE_ARRAY`, `DELTA_BYTE_ARRAY`, `BYTE_STREAM_SPLIT`) still fall the file over to Spark's reader.
+  JMH: 2.0-4.0x the pages per ms of Spark's `VectorizedDeltaBinaryPackedReader`.
+- The native Parquet scan also decodes `DELTA_LENGTH_BYTE_ARRAY` strings and `BYTE_STREAM_SPLIT` INT32 /
+  INT64 / DOUBLE columns (#559). For `DELTA_LENGTH_BYTE_ARRAY` it decodes the page's lengths through
+  `DeltaBinaryPackedReader`, then copies the bytes into the Arrow offsets and data. For `BYTE_STREAM_SPLIT` it
+  gathers each value's bytes from the K streams straight into the lane. Spark's vectorized reader rejects
+  `BYTE_STREAM_SPLIT` on INT32/INT64 ("Unsupported encoding"), so those files now read with the flag on and
+  fail with it off. Checked against parquet-java's writers, and through Spark with v1 and v2 files from a
+  test writer that picks the encodings per column, against Spark's row-based reader. JMH, one 20,000-value
+  page in 1024-row batches: `BYTE_STREAM_SPLIT` DOUBLE/INT64 8.8x and `DELTA_LENGTH_BYTE_ARRAY` 1.46x the pages
+  per ms of parquet-java's value readers. `DELTA_BYTE_ARRAY`, the encoding parquet-java writes for v2 strings
+  without a dictionary, still falls the file over to Spark's reader.
 
 ## 0.0.5 -- 2026-10-02
 

@@ -644,9 +644,10 @@ private[vecruntime] final class VectorParquetPartitionReader(
 
   /**
    * True if any required column chunk in any row group uses a value encoding the native decoder does not
-   * support (PLAIN and dictionary; DELTA_BINARY_PACKED on INT32/INT64 since slice 2). Read from the footer's
-   * column-chunk metadata, so the decision is made once per file at open time -- another DELTA_* or a
-   * BYTE_STREAM_SPLIT column falls the file over to Spark's reader with no mid-decode failure.
+   * support (PLAIN and dictionary; DELTA_BINARY_PACKED, DELTA_LENGTH_BYTE_ARRAY and BYTE_STREAM_SPLIT on the
+   * physical types in `supportsEncoding`). Read from the footer's column-chunk metadata, so the decision is
+   * made once per file at open time -- a DELTA_BYTE_ARRAY column, say, falls the file over to Spark's reader
+   * with no mid-decode failure.
    */
   private def hasUnsupportedEncodingInFooter(footer: ParquetMetadata, clipped: MessageType): Boolean = {
     val wanted = new java.util.HashSet[String]()
@@ -805,8 +806,18 @@ object VectorParquetScanExec {
   /** The Parquet value/level encodings the native decoder handles; any other encoding falls the file over. */
   val SupportedEncodings: Set[String] = Set("PLAIN", "PLAIN_DICTIONARY", "RLE_DICTIONARY", "RLE", "BIT_PACKED")
 
-  /** Encodings the native decoder handles only on some physical types: DELTA_BINARY_PACKED on INT32/INT64 (#559). */
-  private val IntegerOnlyEncodings: Set[String] = Set("DELTA_BINARY_PACKED")
+  import PrimitiveType.PrimitiveTypeName.{BINARY, DOUBLE, INT32, INT64}
+
+  /**
+   * Encodings the native decoder handles only on some physical types (#559): DELTA_BINARY_PACKED on
+   * INT32/INT64, DELTA_LENGTH_BYTE_ARRAY on BINARY (the UTF8 lane), BYTE_STREAM_SPLIT on INT32/INT64/DOUBLE
+   * (not FLOAT or FIXED_LEN_BYTE_ARRAY, which have no lane).
+   */
+  private val TypedEncodings: Map[String, Set[PrimitiveType.PrimitiveTypeName]] = Map(
+    "DELTA_BINARY_PACKED" -> Set(INT32, INT64),
+    "DELTA_LENGTH_BYTE_ARRAY" -> Set(BINARY),
+    "BYTE_STREAM_SPLIT" -> Set(INT32, INT64, DOUBLE)
+  )
 
   /**
    * True if a file column stored as `physical` decodes into the lane of the Spark type `dt`: INT32 for int and
@@ -835,9 +846,7 @@ object VectorParquetScanExec {
 
   /** True if a column chunk of physical type `physical` using `encoding` can be decoded natively. */
   def supportsEncoding(encoding: String, physical: PrimitiveType.PrimitiveTypeName): Boolean =
-    SupportedEncodings.contains(encoding) ||
-      (IntegerOnlyEncodings.contains(encoding) &&
-        (physical == PrimitiveType.PrimitiveTypeName.INT32 || physical == PrimitiveType.PrimitiveTypeName.INT64))
+    SupportedEncodings.contains(encoding) || TypedEncodings.get(encoding).exists(_.contains(physical))
 }
 
 /**

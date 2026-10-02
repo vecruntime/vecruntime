@@ -344,15 +344,17 @@ public final class NativeParquetColumnReader {
         if (page instanceof DataPageV1 v1) {
             pageOut.reset();
             writeInto(v1.getBytes(), pageOut);
-            return ColumnChunkDecoder.Page.v1(pageOut.array(), v1.getValueCount(), encoding(v1.getValueEncoding()));
+            return ColumnChunkDecoder.Page.v1(pageOut.array(), pageOut.size(), v1.getValueCount(),
+                    encoding(v1.getValueEncoding()));
         }
         DataPageV2 v2 = (DataPageV2) page;
         pageOut.reset();
         writeInto(v2.getDefinitionLevels(), pageOut);
         int levelsLength = pageOut.size();
         writeInto(v2.getData(), pageOut);
-        return ColumnChunkDecoder.Page.v2(pageOut.array(), levelsLength, v2.getValueCount(),
-                encoding(v2.getDataEncoding()));
+        // The reused buffer is larger than the page: pass the page's real extent.
+        return ColumnChunkDecoder.Page.v2At(pageOut.array(), 0, levelsLength, levelsLength,
+                pageOut.size() - levelsLength, v2.getValueCount(), encoding(v2.getDataEncoding()));
     }
 
     @SuppressWarnings("deprecation") // PLAIN_DICTIONARY is the legacy data-page dictionary encoding
@@ -366,7 +368,13 @@ public final class NativeParquetColumnReader {
         if (e == Encoding.DELTA_BINARY_PACKED) {
             return ParquetPageDecoder.Encoding.DELTA_BINARY_PACKED;
         }
-        throw new UnsupportedOperationException("unsupported Parquet value encoding " + e + " (decodes PLAIN, dictionary and DELTA_BINARY_PACKED)");
+        if (e == Encoding.DELTA_LENGTH_BYTE_ARRAY) {
+            return ParquetPageDecoder.Encoding.DELTA_LENGTH_BYTE_ARRAY;
+        }
+        if (e == Encoding.BYTE_STREAM_SPLIT) {
+            return ParquetPageDecoder.Encoding.BYTE_STREAM_SPLIT;
+        }
+        throw new UnsupportedOperationException("unsupported Parquet value encoding " + e + " (decodes PLAIN, dictionary, DELTA_BINARY_PACKED, DELTA_LENGTH_BYTE_ARRAY and BYTE_STREAM_SPLIT)");
     }
 
     private VectorBuffers decodeDictionary(PageReader pages) {

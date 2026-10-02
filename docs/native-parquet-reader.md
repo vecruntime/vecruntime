@@ -70,14 +70,14 @@ A few rules hold the design together:
 | | Decoded natively | Notes |
 |---|---|---|
 | Physical / logical types | INT32 (`int`, `date`), INT64 (`bigint`), DOUBLE, decimal with precision ≤ 18 (INT32/INT64 physical), UTF8 `string` with the default collation | `NativeParquetSupport.isReadable`; the planner and the reader share this check |
-| Encodings | `PLAIN`, `PLAIN_DICTIONARY`, `RLE_DICTIONARY`; `DELTA_BINARY_PACKED` on INT32/INT64 columns; definition levels in `RLE`/`BIT_PACKED` | `VectorParquetScanExec.supportsEncoding` |
+| Encodings | `PLAIN`, `PLAIN_DICTIONARY`, `RLE_DICTIONARY`; `DELTA_BINARY_PACKED` on INT32/INT64, `DELTA_LENGTH_BYTE_ARRAY` on strings, `BYTE_STREAM_SPLIT` on INT32/INT64/DOUBLE; definition levels in `RLE`/`BIT_PACKED` | `VectorParquetScanExec.supportsEncoding` |
 | Data pages | v1 and v2 | v2 levels and data are read separately |
 | Schema | Flat only | Nested types keep Spark's scan |
 | Codecs | Whatever parquet-java decompresses (snappy, zstd, gzip, lz4, …) | Decompression is done by parquet-java |
 
 What happens when a column is not supported:
 - **Spark's scan for the whole plan:** an unsupported type or a nested column, `INT96`, a non-`CORRECTED` date or timestamp rebase mode, or a bucketed scan. The planner records the reason, so VecRuntime's operators still run above Spark's scan.
-- **Spark's reader for that one file:** an unsupported encoding in a file's column chunks (`DELTA_LENGTH_BYTE_ARRAY`, `DELTA_BYTE_ARRAY`, `BYTE_STREAM_SPLIT`). The rest of the scan stays native.
+- **Spark's reader for that one file:** an unsupported encoding in a file's column chunks (`DELTA_BYTE_ARRAY`). The rest of the scan stays native.
 
 ## Status at 1 TB TPC-DS
 
@@ -125,9 +125,9 @@ These are the Parquet v2 writer encodings. A file that uses one the reader does 
    | 44-bit random INT64 | 29.1 | 7.2 |
 
    That is a kernel check, not a verdict; no TPC-DS file uses the encoding.
-2. **`DELTA_LENGTH_BYTE_ARRAY`** for strings: a `DELTA_BINARY_PACKED` run of lengths, followed by the concatenated bytes. It maps directly onto Arrow's offsets and data buffers, so it builds on item 1.
-3. **`DELTA_BYTE_ARRAY`** for strings: a prefix length and a suffix per value, so each value reuses part of the previous one. Rebuilding the values needs the previous value, so it is sequential within a page; the output is still Arrow offsets and data.
-4. **`BYTE_STREAM_SPLIT`** for FLOAT, DOUBLE, and in newer files also INT32, INT64 and fixed-length byte arrays. The bytes of each value are interleaved across K streams. Decoding is a transpose that SIMD handles well, with the Vector API, from a page into the lane.
+2. **`DELTA_LENGTH_BYTE_ARRAY`** for strings: **done**. At `feedPage`, `DeltaBinaryPackedReader` decodes the page's lengths. Its `position()` after the last value is where the bytes start; the spec pads the last miniblock, so this is exact. Batches then copy the bytes into Arrow offsets and data like `PLAIN`. The total length is checked against the page's extent. JMH: 1.46x the pages per ms of parquet-java's `DeltaLengthByteArrayValuesReader` (10.2 against 7.0, 20,000 short strings, 1024-row batches).
+3. **`DELTA_BYTE_ARRAY`** for strings: a prefix length and a suffix per value, so each value reuses part of the previous one. Rebuilding the values needs the previous value, so it is sequential within a page; the output is still Arrow offsets and data. This is what parquet-java writes for v2 strings without a dictionary, so it is the next encoding worth doing.
+4. **`BYTE_STREAM_SPLIT`** for INT32, INT64 and DOUBLE: **done**. Byte j of value i is at stream j, position i, and the stride is the value region's length over the width. The scan now passes each page's real extent to the decoder, not its reused buffer's. Each value's K bytes are gathered from the streams straight into the lane, including INT32 widened to INT64. FLOAT and fixed-length byte arrays have no lane. Spark's vectorized reader rejects this encoding on INT32/INT64, so those files read only with the flag on. JMH: 8.8x the pages per ms of parquet-java's `ByteStreamSplitValuesReaderForDouble` / `ForLong` (20.5 against 2.3). The gather is scalar; a Vector API transpose is still open.
 5. **`RLE` for values**: booleans in v2 pages, and more generally the RLE/bit-packed hybrid as a value encoding, not only for levels. It comes together with BOOLEAN support in the next section.
 
 For each encoding:

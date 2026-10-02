@@ -15,23 +15,30 @@
  */
 package io.vecruntime.spark.parquet
 
+import java.lang.foreign.Arena
+import java.nio.charset.StandardCharsets
 import java.util.function.IntFunction
 
 import scala.util.Random
 
-import io.vecruntime.kernels.parquet.{DeltaBinaryPackedReader, GroupUnpacker}
+import io.vecruntime.kernels.{ArrowLayout, SegmentVectorBuffers, VecType, VectorBuffers}
+import io.vecruntime.kernels.parquet.{ColumnChunkDecoder, DeltaBinaryPackedReader, GroupUnpacker, ParquetPageDecoder}
 import org.apache.parquet.bytes.HeapByteBufferAllocator
 import org.apache.parquet.column.values.bitpacking.Packer
+import org.apache.parquet.column.values.bytestreamsplit.ByteStreamSplitValuesWriter
 import org.apache.parquet.column.values.delta.{
   DeltaBinaryPackingValuesWriterForInteger,
   DeltaBinaryPackingValuesWriterForLong
 }
+import org.apache.parquet.column.values.deltalengthbytearray.DeltaLengthByteArrayValuesWriter
+import org.apache.parquet.io.api.Binary
 import org.scalatest.funsuite.AnyFunSuite
 
 /**
- * Cross-checks [[DeltaBinaryPackedReader]] (#559 slice 2) against `DELTA_BINARY_PACKED` streams written by
- * parquet-java's own writers ([[DeltaBinaryPackingValuesWriterForInteger]] / `ForLong`), with the
- * `BytePacker` unpacker the scan node injects and with the built-in scalar one. The kernels tests pin the
+ * Cross-checks the v2 value decoders (#559) against streams written by parquet-java's own writers:
+ * [[DeltaBinaryPackedReader]] against `DELTA_BINARY_PACKED` ([[DeltaBinaryPackingValuesWriterForInteger]] /
+ * `ForLong`), with the `BytePacker` unpacker the scan node injects and with the built-in scalar one, and
+ * [[ColumnChunkDecoder]] against `DELTA_LENGTH_BYTE_ARRAY` and `BYTE_STREAM_SPLIT` pages. The kernels tests pin the
  * reader against a from-scratch encoder of the spec; this pins it against the writer whose bytes Spark's
  * `parquet.writer.version=v2` files carry.
  */
@@ -110,6 +117,135 @@ class DeltaBinaryPackedCrossCheckSuite extends AnyFunSuite {
         done += take
       }
       assert(got.sameElements(v), s"layout $block/$minis n=$n shape=$shape fast=$fast")
+    }
+  }
+
+  // ------------------------------------------------------------------- DELTA_LENGTH_BYTE_ARRAY, BYTE_STREAM_SPLIT
+
+  private def decodeChunk(
+      page: Array[Byte],
+      n: Int,
+      physical: VecType,
+      lane: VecType,
+      enc: ParquetPageDecoder.Encoding,
+      batch: Int,
+      arena: Arena
+  ): VectorBuffers = {
+    val d = new ColumnChunkDecoder(physical, lane, 0, batch, bytePackers)
+    d.startChunk(n)
+    val data = ArrowLayout.allocateData(arena, lane, math.max(n, 1))
+    var done = 0
+    while (done < n) {
+      val want = math.min(batch, n - done)
+      d.startBatch(want)
+      var filled = 0
+      while (filled < want) {
+        if (d.needsPage()) d.feedPage(ColumnChunkDecoder.Page.v1(page, page.length, n, enc))
+        filled += d.readBatchDirectA(want - filled, done + filled, data, null)
+      }
+      done += want
+    }
+    SegmentVectorBuffers.fixedWidth(lane, n, null, data)
+  }
+
+  test("DELTA_LENGTH_BYTE_ARRAY pages from parquet-java's writer decode identically") {
+    val rnd = new Random(55912)
+    for (n <- lengths; batch <- Seq(64, 1000)) {
+      val v = Array.tabulate(n) { i =>
+        (i % 5 match {
+          case 0 => ""
+          case 1 => s"héllo $i"
+          case 2 => "y" * rnd.nextInt(700)
+          case _ => s"v${rnd.nextInt()}"
+        }).getBytes(StandardCharsets.UTF_8)
+      }
+      val w = new DeltaLengthByteArrayValuesWriter(64, 1 << 20, HeapByteBufferAllocator.getInstance())
+      v.foreach(b => w.writeBytes(Binary.fromConstantByteArray(b)))
+      val page = w.getBytes.toByteArray
+      val d = new ColumnChunkDecoder(VecType.UTF8, 0, batch, bytePackers)
+      d.startChunk(n)
+      var row = 0
+      while (row < n) {
+        val want = math.min(batch, n - row)
+        d.startBatch(want)
+        var filled = 0
+        while (filled < want) {
+          if (d.needsPage()) {
+            d.feedPage(ColumnChunkDecoder.Page.v1(
+              page,
+              page.length,
+              n,
+              ParquetPageDecoder.Encoding.DELTA_LENGTH_BYTE_ARRAY
+            ))
+          }
+          filled += d.readBatch(want - filled, filled)
+        }
+        val arena = Arena.ofConfined()
+        try {
+          val offsets = ArrowLayout.allocateOffsets(arena, want)
+          val bytes = ArrowLayout.allocateBytes(arena, math.max(d.utf8Bytes(), 1L))
+          d.flushUtf8(want, offsets, bytes, null)
+          val col = SegmentVectorBuffers.utf8(want, null, offsets, bytes)
+          for (k <- 0 until want) {
+            assert(col.getUtf8Bytes(k).sameElements(v(row + k)), s"n=$n batch=$batch row ${row + k}")
+          }
+        } finally arena.close()
+        row += want
+      }
+    }
+  }
+
+  test("BYTE_STREAM_SPLIT pages from parquet-java's writers decode identically (INT32, INT64, DOUBLE)") {
+    val rnd = new Random(55913)
+    val alloc = HeapByteBufferAllocator.getInstance()
+    for (n <- lengths; batch <- Seq(64, 1000)) {
+      val arena = Arena.ofConfined()
+      try {
+        val ints = Array.tabulate(n)(i => if (i % 7 == 0) Int.MinValue else rnd.nextInt())
+        val wi = new ByteStreamSplitValuesWriter.IntegerByteStreamSplitValuesWriter(64, 1 << 20, alloc)
+        ints.foreach(wi.writeInteger)
+        val pi = wi.getBytes.toByteArray
+        val gotI =
+          decodeChunk(pi, n, VecType.INT32, VecType.INT32, ParquetPageDecoder.Encoding.BYTE_STREAM_SPLIT, batch, arena)
+        for (i <- 0 until n) assert(gotI.getInt(i) == ints(i), s"INT32 n=$n row $i")
+        val widened =
+          decodeChunk(pi, n, VecType.INT32, VecType.INT64, ParquetPageDecoder.Encoding.BYTE_STREAM_SPLIT, batch, arena)
+        for (i <- 0 until n) assert(widened.getLong(i) == ints(i).toLong, s"INT32->INT64 n=$n row $i")
+
+        val longs = Array.tabulate(n)(i => if (i % 7 == 0) Long.MaxValue else rnd.nextLong())
+        val wl = new ByteStreamSplitValuesWriter.LongByteStreamSplitValuesWriter(64, 1 << 20, alloc)
+        longs.foreach(wl.writeLong)
+        val gotL = decodeChunk(
+          wl.getBytes.toByteArray,
+          n,
+          VecType.INT64,
+          VecType.INT64,
+          ParquetPageDecoder.Encoding.BYTE_STREAM_SPLIT,
+          batch,
+          arena
+        )
+        for (i <- 0 until n) assert(gotL.getLong(i) == longs(i), s"INT64 n=$n row $i")
+
+        val specials = Array(Double.NaN, -0.0, Double.PositiveInfinity, Double.MinPositiveValue)
+        val doubles = Array.tabulate(n)(i => if (i % 9 == 0) specials(i % specials.length) else rnd.nextGaussian())
+        val wd = new ByteStreamSplitValuesWriter.DoubleByteStreamSplitValuesWriter(64, 1 << 20, alloc)
+        doubles.foreach(wd.writeDouble)
+        val gotD = decodeChunk(
+          wd.getBytes.toByteArray,
+          n,
+          VecType.FLOAT64,
+          VecType.FLOAT64,
+          ParquetPageDecoder.Encoding.BYTE_STREAM_SPLIT,
+          batch,
+          arena
+        )
+        for (i <- 0 until n) {
+          assert(
+            java.lang.Double.doubleToRawLongBits(gotD.getDouble(i)) == java.lang.Double.doubleToRawLongBits(doubles(i)),
+            s"DOUBLE n=$n row $i"
+          )
+        }
+      } finally arena.close()
     }
   }
 }

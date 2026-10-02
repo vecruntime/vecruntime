@@ -511,6 +511,200 @@ class ColumnChunkDecoderTest {
         }
     }
 
+    // ---------------------------------------------------------------- DELTA_LENGTH_BYTE_ARRAY / BYTE_STREAM_SPLIT (#559)
+
+    @Test
+    void deltaLengthByteArrayPagesDecodeWithNullsAndEmptiesAcrossPages() {
+        // UTF8 lane: per page, a DELTA_BINARY_PACKED run of the present values' lengths, then their bytes back to
+        // back. Nulls, empty strings, multi-byte UTF-8 and long values; batches of 384 rows over ~1000-row pages.
+        Random rnd = new Random(55910);
+        int rows = 4096;
+        for (boolean nulls : new boolean[] {false, true}) {
+            for (boolean v2 : new boolean[] {false, true}) {
+                String[] v = new String[rows];
+                for (int i = 0; i < rows; i++) {
+                    int kind = rnd.nextInt(10);
+                    v[i] = nulls && kind == 0
+                            ? null
+                            : kind == 1
+                                    ? ""
+                                    : kind == 2
+                                            ? "héllo wörld " + i
+                                            : kind == 3 ? "x".repeat(200 + rnd.nextInt(300)) : "v" + rnd.nextInt(100000);
+                }
+                int maxDef = nulls ? 1 : 0;
+                List<PreparedPage> pages = new ArrayList<>();
+                int start = 0;
+                for (int end : evenSplits(rows, 4)) {
+                    byte[] levels = levelBytes(v, start, end, maxDef);
+                    ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+                    List<Long> lens = new ArrayList<>();
+                    for (int i = start; i < end; i++) {
+                        if (v[i] != null) {
+                            byte[] b = v[i].getBytes(StandardCharsets.UTF_8);
+                            lens.add((long) b.length);
+                            bytes.writeBytes(b);
+                        }
+                    }
+                    long[] lenArr = lens.stream()
+                            .mapToLong(Long::longValue)
+                            .toArray();
+                    ByteArrayOutputStream vals = new ByteArrayOutputStream();
+                    vals.writeBytes(DeltaBinaryPackedReaderTest.encode(lenArr, false, 128, 4, false));
+                    vals.writeBytes(bytes.toByteArray());
+                    byte[] page = assemble(levels, vals.toByteArray(), maxDef, v2);
+                    pages.add(
+                            new PreparedPage(
+                                    kernelPage(page, levels.length, maxDef, v2, end - start,
+                                            ParquetPageDecoder.Encoding.DELTA_LENGTH_BYTE_ARRAY),
+                                    end - start));
+                    start = end;
+                }
+                try (Arena arena = Arena.ofConfined()) {
+                    ColumnChunkDecoder d = new ColumnChunkDecoder(VecType.UTF8, maxDef, 384, scalarFactory());
+                    assertUtf8(v, runStreamingUtf8(d, pages, rows, 384, nulls, arena));
+                }
+            }
+        }
+    }
+
+    @Test
+    void byteStreamSplitPagesDecodeOnEveryPathWithNullsAcrossPages() {
+        // INT32, INT64, DOUBLE (incl. NaN, -0.0, infinities) and INT32 widened to INT64; nulls; v1 and v2;
+        // staging and both direct paths; batches of 384 rows over ~1000-row pages.
+        Random rnd = new Random(55911);
+        int rows = 4096;
+        VecType[][] cases = {
+            {VecType.INT32, VecType.INT32}, {VecType.INT32, VecType.INT64},
+            {VecType.INT64, VecType.INT64}, {VecType.FLOAT64, VecType.FLOAT64}};
+        double[] specials = {Double.NaN, -0.0, 0.0, Double.POSITIVE_INFINITY, Double.NEGATIVE_INFINITY,
+                Double.MIN_VALUE};
+        for (VecType[] c : cases) {
+            VecType physical = c[0];
+            VecType lane = c[1];
+            int width = physical == VecType.INT32 ? 4 : 8;
+            for (boolean nulls : new boolean[] {false, true}) {
+                for (boolean v2 : new boolean[] {false, true}) {
+                    Long[] v = new Long[rows]; // raw bits for FLOAT64
+                    for (int i = 0; i < rows; i++) {
+                        long x = switch (physical) {
+                            case INT32 -> (long) rnd.nextInt();
+                            case INT64 -> rnd.nextLong();
+                            default -> Double.doubleToRawLongBits(i % 50 == 0 ? specials[(i / 50) % specials.length] : rnd.nextGaussian() * 1e6);
+                        };
+                        v[i] = nulls && rnd.nextInt(6) == 0 ? null : x;
+                    }
+                    int maxDef = nulls ? 1 : 0;
+                    List<PreparedPage> pages = new ArrayList<>();
+                    int start = 0;
+                    for (int end : evenSplits(rows, 4)) {
+                        byte[] levels = levelBytes(v, start, end, maxDef);
+                        List<Long> present = new ArrayList<>();
+                        for (int i = start; i < end; i++) {
+                            if (v[i] != null) {
+                                present.add(v[i]);
+                            }
+                        }
+                        int n = present.size();
+                        byte[] vals = new byte[n * width];
+                        for (int i = 0; i < n; i++) {
+                            long x = present.get(i);
+                            for (int j = 0; j < width; j++) {
+                                vals[j * n + i] = (byte) (x >>> (8 * j));
+                            }
+                        }
+                        byte[] page = assemble(levels, vals, maxDef, v2);
+                        pages.add(
+                                new PreparedPage(
+                                        kernelPage(page, levels.length, maxDef, v2, end - start,
+                                                ParquetPageDecoder.Encoding.BYTE_STREAM_SPLIT),
+                                        end - start));
+                        start = end;
+                    }
+                    String what = "BSS "
+                            + physical
+                            + "->"
+                            + lane
+                            + " nulls="
+                            + nulls
+                            + " v2="
+                            + v2;
+                    try (Arena arena = Arena.ofConfined()) {
+                        ColumnChunkDecoder d = new ColumnChunkDecoder(physical, lane, maxDef, 384, scalarFactory());
+                        assertBits(
+                                v,
+                                physical,
+                                lane,
+                                runStreaming(d, pages, lane, rows, 384, nulls,
+                                        arena),
+                                what + " staging");
+                    }
+                    for (boolean modeA : new boolean[] {true, false}) {
+                        try (Arena arena = Arena.ofConfined()) {
+                            ColumnChunkDecoder d = new ColumnChunkDecoder(physical, lane, maxDef, 384, scalarFactory());
+                            assertBits(
+                                    v,
+                                    physical,
+                                    lane,
+                                    runStreamingDirect(d, pages, lane, rows, 384, nulls,
+                                            modeA, arena),
+                                    what + (modeA ? " directA" : " directB"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
+    void byteStreamSplitStrideComesFromThePageExtentNotTheBuffer() {
+        // The scan hands pages over in a reused buffer larger than the page; the stride must come from the
+        // page's own extent. Same INT64 page in an exact array and in an oversized one with garbage after it.
+        int n = 100;
+        byte[] vals = new byte[n * 8];
+        for (int i = 0; i < n; i++) {
+            for (int j = 0; j < 8; j++) {
+                vals[j * n + i] = (byte) ((1000L * i + 7) >>> (8 * j));
+            }
+        }
+        byte[] big = new byte[vals.length + 333];
+        new Random(1).nextBytes(big);
+        System.arraycopy(vals, 0, big, 0, vals.length);
+        try (Arena arena = Arena.ofConfined()) {
+            ColumnChunkDecoder d = new ColumnChunkDecoder(VecType.INT64, 0, n, scalarFactory());
+            List<PreparedPage> pages = List.of(new PreparedPage(ColumnChunkDecoder.Page.v1(big, vals.length, n, ParquetPageDecoder.Encoding.BYTE_STREAM_SPLIT), n));
+            DecodeResult r = runStreaming(d, pages, VecType.INT64, n, n, false,
+                    arena);
+            for (int i = 0; i < n; i++) {
+                assertEquals(1000L * i + 7, r.buffers.getLong(i), "row " + i);
+            }
+        }
+    }
+
+    private ColumnChunkDecoder.Page kernelPage(byte[] page, int levelsLength, int maxDef,
+            boolean v2, int valueCount, ParquetPageDecoder.Encoding enc) {
+        if (!v2) {
+            return ColumnChunkDecoder.Page.v1(page, valueCount, enc);
+        }
+        return ColumnChunkDecoder.Page.v2(page, maxDef > 0 ? levelsLength : 0, valueCount,
+                enc);
+    }
+
+    private static void assertBits(Long[] v, VecType physical, VecType lane,
+            DecodeResult r, String what) {
+        if (lane != VecType.FLOAT64) {
+            assertDelta(v, physical, lane, r, what);
+            return;
+        }
+        for (int i = 0; i < v.length; i++) {
+            if (v[i] == null) {
+                assertTrue(r.buffers.isNull(i), what + " row " + i + " should be null");
+            } else {
+                assertEquals(v[i].longValue(), Double.doubleToRawLongBits(r.buffers.getDouble(i)), what + " row " + i);
+            }
+        }
+    }
+
     // ---------------------------------------------------------------- direct-write variants (#559 study)
 
     @Test

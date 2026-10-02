@@ -100,6 +100,19 @@ public final class DeltaBinaryPackedReader {
         this.deltas32 = new int[perMini];
     }
 
+    /**
+     * Once every value has been read, the offset just past the stream: where a
+     * following region starts (the bytes of {@code DELTA_LENGTH_BYTE_ARRAY}). The
+     * spec pads the last miniblock to its full size, so this is exact for
+     * conforming writers.
+     */
+    public int position() {
+        if (remaining != 0) {
+            throw new IllegalStateException("DELTA_BINARY_PACKED: position() with " + remaining + " values unread");
+        }
+        return pos;
+    }
+
     /** Total values in the stream not yet read. */
     public int remaining() {
         return remaining;
