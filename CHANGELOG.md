@@ -36,6 +36,7 @@ version may change configuration keys or defaults, always noted here.
 
 ### Added
 
+- TIMESTAMP columns in the native Parquet scan (#559), stored as INT64 `MICROS` or `MILLIS`. `MILLIS` values are scaled to micros with Spark's overflow check. The calendar rebase is resolved per file from its footer, as Spark resolves it: a file that needs a rebase (`LEGACY`, or `EXCEPTION` on a file that is not from Spark 3+) is read by Spark's reader with its own modes, and so is an INT96 file. The plan-level refusal of a non-`CORRECTED` date rebase is gone.
 - TINYINT and SMALLINT columns in the native Parquet scan (#559). They are INT32 in Parquet, so they reuse the INT32 decode in every encoding. Each value is narrowed to the declared width while decoding, as Spark's readers narrow it, so an out-of-range `INT(8)` / `INT(16)` value wraps the same way for operators.
 - BOOLEAN columns in the native Parquet scan (#559): v1 `PLAIN` (bit-packed) and v2 `RLE` pages, decoded into a bit-packed lane. JMH on x86, one 20,000-value page: `PLAIN` at 837 pages per ms against 10.7 for parquet-java's reader, `RLE` at 212 against 11.2. `RLE` is decoded straight into the bitmap: runs set as bit ranges, bit-packed runs moved 64 bits a step.
 - `ParquetTestingCorpusSuite`: 27 files from the Apache Parquet conformance corpus (`apache/parquet-testing`, Apache-2.0, vendored for tests) read column by column against Spark's reader, plus 3 corrupt files that must be refused.
