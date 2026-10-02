@@ -70,14 +70,14 @@ A few rules hold the design together:
 | | Decoded natively | Notes |
 |---|---|---|
 | Physical / logical types | INT32 (`int`, `date`), INT64 (`bigint`), DOUBLE, decimal with precision ≤ 18 (INT32/INT64 physical), UTF8 `string` with the default collation | `NativeParquetSupport.isReadable`; the planner and the reader share this check |
-| Encodings | `PLAIN`, `PLAIN_DICTIONARY`, `RLE_DICTIONARY`; `DELTA_BINARY_PACKED` on INT32/INT64, `DELTA_LENGTH_BYTE_ARRAY` on strings, `BYTE_STREAM_SPLIT` on INT32/INT64/DOUBLE; definition levels in `RLE`/`BIT_PACKED` | `VectorParquetScanExec.supportsEncoding` |
+| Encodings | `PLAIN`, `PLAIN_DICTIONARY`, `RLE_DICTIONARY`; `DELTA_BINARY_PACKED` on INT32/INT64, `DELTA_LENGTH_BYTE_ARRAY` and `DELTA_BYTE_ARRAY` on strings, `BYTE_STREAM_SPLIT` on INT32/INT64/DOUBLE; definition levels in `RLE`/`BIT_PACKED` | `VectorParquetScanExec.supportsEncoding` |
 | Data pages | v1 and v2 | v2 levels and data are read separately |
 | Schema | Flat only | Nested types keep Spark's scan |
 | Codecs | Whatever parquet-java decompresses (snappy, zstd, gzip, lz4, …) | Decompression is done by parquet-java |
 
 What happens when a column is not supported:
 - **Spark's scan for the whole plan:** an unsupported type or a nested column, `INT96`, a non-`CORRECTED` date or timestamp rebase mode, or a bucketed scan. The planner records the reason, so VecRuntime's operators still run above Spark's scan.
-- **Spark's reader for that one file:** an unsupported encoding in a file's column chunks (`DELTA_BYTE_ARRAY`). The rest of the scan stays native.
+- **Spark's reader for that one file:** an encoding on a physical type the decoder has no path for (`BYTE_STREAM_SPLIT` on `FIXED_LEN_BYTE_ARRAY`, say). The rest of the scan stays native.
 
 ## Status at 1 TB TPC-DS
 
@@ -126,9 +126,26 @@ These are the Parquet v2 writer encodings. A file that uses one the reader does 
 
    That is a kernel check, not a verdict; no TPC-DS file uses the encoding.
 2. **`DELTA_LENGTH_BYTE_ARRAY`** for strings: **done**. At `feedPage`, `DeltaBinaryPackedReader` decodes the page's lengths. Its `position()` after the last value is where the bytes start; the spec pads the last miniblock, so this is exact. Batches then copy the bytes into Arrow offsets and data like `PLAIN`. The total length is checked against the page's extent. JMH: 1.46x the pages per ms of parquet-java's `DeltaLengthByteArrayValuesReader` (10.2 against 7.0, 20,000 short strings, 1024-row batches).
-3. **`DELTA_BYTE_ARRAY`** for strings: a prefix length and a suffix per value, so each value reuses part of the previous one. Rebuilding the values needs the previous value, so it is sequential within a page; the output is still Arrow offsets and data. This is what parquet-java writes for v2 strings without a dictionary, so it is the next encoding worth doing.
-4. **`BYTE_STREAM_SPLIT`** for INT32, INT64 and DOUBLE: **done**. Byte j of value i is at stream j, position i, and the stride is the value region's length over the width. The scan now passes each page's real extent to the decoder, not its reused buffer's. Each value's K bytes are gathered from the streams straight into the lane, including INT32 widened to INT64. FLOAT and fixed-length byte arrays have no lane. Spark's vectorized reader rejects this encoding on INT32/INT64, so those files read only with the flag on. JMH: 8.8x the pages per ms of parquet-java's `ByteStreamSplitValuesReaderForDouble` / `ForLong` (20.5 against 2.3). The gather is scalar; a Vector API transpose is still open.
-5. **`RLE` for values**: booleans in v2 pages, and more generally the RLE/bit-packed hybrid as a value encoding, not only for levels. It comes together with BOOLEAN support in the next section.
+3. **`DELTA_BYTE_ARRAY`** for strings: **done**. This is what parquet-java writes for v2 strings without a dictionary. The page is a `DELTA_BINARY_PACKED` run of prefix lengths (bytes shared with the previous value), then a `DELTA_LENGTH_BYTE_ARRAY` of the suffixes. Each value needs the previous one, so `feedPage` rebuilds the page's values back to back in one sequential pass into a reused buffer, and the batches copy out of it like `DELTA_LENGTH_BYTE_ARRAY`. The prefix chain restarts on each page. A prefix longer than the previous value, a count mismatch between the two runs, or suffix bytes past the page end fail the page. JMH: 2.0x the pages per ms of parquet-java's `DeltaByteArrayReader` (2.54 against 1.26, 20,000 sorted URL-like keys).
+4. **`BYTE_STREAM_SPLIT`** for INT32, INT64 and DOUBLE: **done**. Byte j of value i is at stream j, position i, and the stride is the value region's length over the width. The scan now passes each page's real extent to the decoder, not its reused buffer's. Each value's K bytes are gathered from the streams straight into the lane, including INT32 widened to INT64. FLOAT and fixed-length byte arrays have no lane. Spark's vectorized reader rejects this encoding on INT32/INT64, so those files read only with the flag on. JMH: 8.8x the pages per ms of parquet-java's `ByteStreamSplitValuesReaderForDouble` / `ForLong` (20.5 against 2.3). It is a transpose (Vector API or SWAR, by vector width); see the optimization pass below.
+5. **`RLE` for values**: **done**, for BOOLEAN (the only physical type it applies to as a value encoding). The page holds a 4-byte little-endian length, then a width-1 RLE/bit-packed hybrid stream. `RleBitPackingReader.readBits` decodes straight into the batch's bitmap: an RLE run of 1s sets its bit range a word at a time, a run of 0s writes nothing, and a width-1 bit-packed run is already an LSB-first bitmap, so it moves 64 bits a step. See BOOLEAN below for the numbers.
+
+**Optimization pass on items 1–4.** JMH, one 20,000-value page in 1024-row batches, ops/ms. Each before/after pair ran on one host: x86 is an AVX-512 host, Graviton4 is m8g.4xlarge (Neoverse V2) with the default SVE codegen. Graviton4 with NEON codegen (`-XX:UseSVE=0`) matched SVE within a few percent, except the strings: `DELTA_BYTE_ARRAY` 2.8 → 3.6, `DELTA_LENGTH_BYTE_ARRAY` 7.0 → 7.6.
+
+| page | x86 before → after | Graviton4 before → after | what changed |
+|---|---|---|---|
+| `BYTE_STREAM_SPLIT` DOUBLE / INT64 | 21.0 / 20.5 → 77.9 / 75.2 | 15.2 / 15.2 → 31.0 / 31.0 | a transpose instead of a byte gather: the Vector API (per register, a byte vector from each stream widened to lanes, shifted and ORed) from 256 bits, SWAR (an 8x8 byte transpose in three mask-and-shift stages on plain longs) at 128 bits (`ByteStreamSplitKernels`) |
+| `BYTE_STREAM_SPLIT` INT32 | 46.1 → 298.0 | 60.9 (scalar) → 62.6 | the Vector API with int lanes |
+| `DELTA_BINARY_PACKED` sorted / random INT32 | 36.1 / 23.9 → 42.4 / 28.5 | 32.6 / 19.6 → 37.0 / 24.2 | whole miniblocks unpacked and summed in the caller's array; only a miniblock a read stops inside goes through the buffer |
+| `DELTA_BINARY_PACKED` INT64 timestamps | 33.4 → 41.0 | 31.2 → 33.9 | the same |
+| `DELTA_LENGTH_BYTE_ARRAY` | 9.4 → 11.2 | 9.7 → 11.1 | the faster length decode |
+| `DELTA_BYTE_ARRAY` | 2.8 → 3.7 | 3.1 → 4.6 | values rebuilt straight into the batch's bytes; the prefix comes from the previous value in the batch, or from a saved copy at a batch boundary. No per-page rebuild buffer and copy |
+
+The transpose and the prefix sum are switches, read once at startup, for A/B runs:
+- `-Dvecruntime.parquet.bssMode=auto|vector|swar|scalar`, default `auto`. `auto` uses the Vector API for 4-byte values at every width, and for 8-byte values when a register holds at least four longs. At 128 bits (NEON, or SVE on Graviton4) widening a byte vector into two long lanes is not intrinsified, and the 8-byte vector transpose ran 0.45 against SWAR's 31. It is the same on x86 forced to `-Dvecruntime.vectorBits=128`.
+- `-Dvecruntime.parquet.deltaScan=scalar|vector`, default `scalar`. The vector prefix sum (a log-step scan per register) gives the same wrapping sums. It measured the same as the serial add on x86 (43.5 against 42.4) and slower on Graviton4 NEON (28.9 against 37.0).
+
+`ByteStreamSplitKernelsTest` compares every variant, and the dispatch, with its scalar reference at every count, offset and array-end position. It passes at 128, 256 and 512 bits (`-Dvecruntime.vectorBits`).
 
 For each encoding:
 - Add a `ParquetPageDecoder.Encoding` case.
@@ -140,7 +157,30 @@ For each encoding:
 
 ### Types
 
-- **BOOLEAN.** Bit-packed in v1 `PLAIN` and RLE in v2. It needs a decode path into Arrow's bit-packed boolean vector.
+**Physical types are checked per file.** The planner admits a column by its Spark type, but each file decides how the column is stored. A `decimal(p <= 18)` can be INT32, INT64, `FIXED_LEN_BYTE_ARRAY` or `BYTE_ARRAY`: Spark's legacy writer, Hive and Impala use `FIXED_LEN_BYTE_ARRAY`. At open, `VectorParquetScanExec.physicalMatches` checks every requested column's physical type against its lane, and a mismatch falls that file over to Spark's reader, like an unsupported encoding. Before this check (0.0.4–0.0.5), a `FIXED_LEN_BYTE_ARRAY` decimal was decoded as INT64 and returned wrong values. The `apache/parquet-testing` corpus found it.
+
+**Conformance corpus.** `ParquetTestingCorpusSuite` reads 27 files from `apache/parquet-testing`. They are vendored under `spark/src/test/resources/parquet-testing/`, Apache-2.0, at the commit in `SOURCE_SHA`. The files were written by parquet-mr of several ages, parquet-cpp, arrow-rs and Impala, and cover v2 encodings, empty and null pages, checksums, a dictionary page at offset 0, and corrupt files from `bad_data/`. The suite reads each file column by column:
+- a column the scan supports must be read natively, with no per-file fallback, and match Spark's row-based reader;
+- any other column must return what Spark returns with the plugin off, rows or refusal;
+- a corrupt file Spark refuses must be refused too.
+
+The corpus approach follows Hardwood (`hardwood-hq/hardwood`), as does bounding every file-declared size before allocating: the `DELTA_BINARY_PACKED` block size, a `BYTE_STREAM_SPLIT` region that is not a whole number of values, and bit-packed runs past the stream end.
+
+- **BOOLEAN.** **Done**: v1 `PLAIN` (bit-packed, LSB first) and v2 `RLE`, into a `BOOL` lane (Arrow's bit-packed vector). `PLAIN` with every row present copies up to 64 bits a step from any source bit offset to any destination bit offset. With nulls, the bits are scattered one per present row. `flushBool` masks stray bits past the batch's last row. A page that claims more values than it holds fails.
+  - Checked against a scalar reference, at every batch size, with nulls and across pages (`ColumnChunkDecoderTest`).
+  - Checked against `readInt` at random bit offsets (`RleBitPackingReaderTest.readBitsMatchesReadIntAtWidthOne`).
+  - Cross-checked against parquet-java's `BooleanPlainValuesWriter`/`Reader` and `RunLengthBitPackingHybridValuesWriter`/`Reader` (`DeltaBinaryPackedCrossCheckSuite`).
+  - Round-tripped through Spark with v1 and v2 pages (`VectorParquetScanSuite`).
+  - Covered by the corpus file `rle_boolean_encoding.parquet`.
+
+  JMH (`V2EncodingsBenchmark`, x86, one 20,000-value page in 1024-row batches):
+
+  | page | ours (ops/ms) | parquet-java (ops/ms) |
+  |---|---|---|
+  | `PLAIN`, random values | 837 | 10.7 (`BooleanPlainValuesReader`) |
+  | `RLE`, runs of 1–64 | 212 | 11.2 (`RunLengthBitPackingHybridValuesReader`) |
+
+  `RLE` measured 60.7 before `readBits`, which expands each value to an `int` and repacks it.
 - **TINYINT / SMALLINT.** INT32 physical; they need the narrow output wrapper (`VectorNarrowIntColumnVector`) for the lane.
 - **FLOAT.** Needs a FLOAT32 lane, or a widening path that keeps exact values.
 - **TIMESTAMP / TIMESTAMP_NTZ.** INT64 micros or millis, with unit conversion. The rebase mode has to be honoured per file, from the file's metadata and the session configuration. INT96, the legacy Impala/Hive layout, needs a conversion kernel; until then it keeps the plan-level fallback.

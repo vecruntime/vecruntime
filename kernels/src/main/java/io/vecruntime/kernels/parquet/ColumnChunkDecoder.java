@@ -120,6 +120,7 @@ public final class ColumnChunkDecoder {
     private long[] longs; // INT64 lane (also widened narrow decimal)
     private double[] doubles; // FLOAT64 lane
     private long[] validityWords; // batch validity, 64 rows per word; only when maxDefLevel > 0
+    private long[] boolWords; // BOOL lane: the batch's values, 64 rows per word, LSB first (Arrow's bit order)
     private int[] utf8Offsets; // UTF8: batchRows + 1 entries
     private byte[] utf8Data; // UTF8: gathered bytes for the batch
     private int utf8Len; // bytes written into utf8Data this batch
@@ -136,10 +137,19 @@ public final class ColumnChunkDecoder {
     private RleBitPackingReader idReader; // live RLE id reader for a dictionary page (resumes mid-run)
     private DeltaBinaryPackedReader deltaReader; // live reader for a DELTA_BINARY_PACKED page (resumes mid-miniblock)
     private int[] pageLengths = new int[0]; // DELTA_LENGTH_BYTE_ARRAY: the page's value lengths, decoded at feedPage
+    private int[] prefixLengths = new int[0]; // DELTA_BYTE_ARRAY: bytes each value shares with the previous one
+    private int[] suffixLengths = new int[0]; // DELTA_BYTE_ARRAY: each value's suffix length
+    private byte[] dbaPrev = new byte[0]; // DELTA_BYTE_ARRAY: the previous value, when it is not in this batch's bytes
+    private int dbaPrevStart = -1; // DELTA_BYTE_ARRAY: the previous value's start in utf8Data, or -1 (it is in dbaPrev)
+    private int dbaPrevLen; // DELTA_BYTE_ARRAY: the previous value's length
+    private byte[] binarySrc; // DELTA_LENGTH_BYTE_ARRAY: the current page's bytes
     private int lengthCursor; // next unconsumed entry of pageLengths
     private int bssStart; // BYTE_STREAM_SPLIT: offset of the first stream
     private int bssStride; // BYTE_STREAM_SPLIT: values in the page (= bytes per stream)
     private int bssIndex; // BYTE_STREAM_SPLIT: next unconsumed value
+    private long boolBitCursor; // BOOL PLAIN: bit offset of the next unconsumed value in pageData
+    private int boolPageEnd; // BOOL: one past the last byte of the page's value region
+    private RleBitPackingReader boolReader; // BOOL RLE: the page's 1-bit hybrid value stream
 
     // ---- reused per-batch scratch ----
     private int[] idScratch = new int[0]; // dictionary ids for a page-slice
@@ -179,6 +189,12 @@ public final class ColumnChunkDecoder {
             case INT32 -> ints = grow(ints, batchRows);
             case INT64 -> longs = grow(longs, batchRows);
             case FLOAT64 -> doubles = grow(doubles, batchRows);
+            case BOOL -> {
+                int words = (batchRows + 63) >>> 6;
+                if (boolWords == null || boolWords.length < words) {
+                    boolWords = new long[words];
+                }
+            }
             case UTF8 -> {
                 if (utf8Offsets == null || utf8Offsets.length < batchRows + 1) {
                     utf8Offsets = new int[batchRows + 1];
@@ -319,6 +335,11 @@ public final class ColumnChunkDecoder {
             reader(page.data, (int) levelStart, levelLen, defBitWidth).readInts(pageLevels, 0, n);
         }
         this.deltaReader = null;
+        this.boolReader = null;
+        if (type == VecType.BOOL) {
+            feedBoolPage(page, valuesStart);
+            return;
+        }
         if (page.encoding == ParquetPageDecoder.Encoding.RLE_DICTIONARY) {
             this.idReader = dictionaryIds(page, valuesStart);
             this.plainCursor = 0;
@@ -361,6 +382,18 @@ public final class ColumnChunkDecoder {
             this.lengthCursor = 0;
             this.plainCursor = 0;
             this.utf8PlainCursor = bytesStart;
+            this.binarySrc = page.data;
+        } else if (page.encoding == ParquetPageDecoder.Encoding.DELTA_BYTE_ARRAY) {
+            if (type != VecType.UTF8) {
+                throw new IllegalArgumentException("DELTA_BYTE_ARRAY on a " + type + " lane");
+            }
+            this.idReader = null;
+            this.utf8PlainCursor = prepareDeltaByteArray(page.data, (int) valuesStart, (int) page.dataEnd());
+            this.lengthCursor = 0;
+            this.plainCursor = 0;
+            this.binarySrc = page.data;
+            this.dbaPrevStart = -1;
+            this.dbaPrevLen = 0;
         } else if (page.encoding == ParquetPageDecoder.Encoding.BYTE_STREAM_SPLIT) {
             if (physicalType == VecType.UTF8) {
                 throw new IllegalArgumentException("BYTE_STREAM_SPLIT on a UTF8 lane");
@@ -369,6 +402,9 @@ public final class ColumnChunkDecoder {
             // stream j, position i.
             this.idReader = null;
             int len = (int) (page.dataEnd() - valuesStart);
+            if (len < 0 || len % byteWidth() != 0) {
+                throw new IllegalStateException("BYTE_STREAM_SPLIT: a " + len + "-byte value region is not a whole number of " + byteWidth() + "-byte values");
+            }
             this.bssStart = (int) valuesStart;
             this.bssStride = len / byteWidth();
             this.bssIndex = 0;
@@ -391,6 +427,9 @@ public final class ColumnChunkDecoder {
         allocateBatch(batchRows);
         utf8Len = 0;
         batchNulls = 0;
+        if (type == VecType.BOOL) {
+            java.util.Arrays.fill(boolWords, 0, (batchRows + 63) >>> 6, 0L); // values are ORed in
+        }
         if (maxDefLevel > 0) {
             int words = (batchRows + 63) >>> 6;
             java.util.Arrays.fill(validityWords, 0, words, -1L); // start all-valid; nulls clear their bit
@@ -423,6 +462,8 @@ public final class ColumnChunkDecoder {
         }
         if (type == VecType.UTF8) {
             decodeBinary(dstBase, m, present, presentCount);
+        } else if (type == VecType.BOOL) {
+            decodeBool(dstBase, present, presentCount);
         } else {
             decodeFixed(dstBase, present, presentCount);
         }
@@ -770,6 +811,59 @@ public final class ColumnChunkDecoder {
     // ------------------------------------------------------------------ DELTA_BINARY_PACKED / BYTE_STREAM_SPLIT (#559)
 
     /**
+     * Decodes a DELTA_BYTE_ARRAY page's two length runs and checks them; the
+     * values themselves are rebuilt later, batch by batch, straight into the
+     * batch's bytes ({@link #decodeBinary}). The page is a DELTA_BINARY_PACKED
+     * run of prefix lengths (how many leading bytes each value shares with the
+     * previous one, 0 for the first), then a DELTA_LENGTH_BYTE_ARRAY of the
+     * suffixes: a run of their lengths and their bytes. The prefix chain restarts
+     * on every page. Returns the offset of the first suffix byte.
+     */
+    private int prepareDeltaByteArray(byte[] data, int start, int end) {
+        DeltaBinaryPackedReader prefixes = new DeltaBinaryPackedReader(data, start, end - start, false,
+                this::unpackerFor);
+        int count = prefixes.remaining();
+        if (prefixLengths.length < count) {
+            prefixLengths = new int[Math.max(count, 2 * prefixLengths.length)];
+        }
+        prefixes.readInts(prefixLengths, 0, count);
+        int suffixStart = prefixes.position();
+        DeltaBinaryPackedReader suffixes = new DeltaBinaryPackedReader(data, suffixStart, end - suffixStart, false,
+                this::unpackerFor);
+        if (suffixes.remaining() != count) {
+            throw new IllegalStateException("DELTA_BYTE_ARRAY: " + count + " prefixes but " + suffixes.remaining() + " suffixes");
+        }
+        if (suffixLengths.length < count) {
+            suffixLengths = new int[Math.max(count, 2 * suffixLengths.length)];
+        }
+        suffixes.readInts(suffixLengths, 0, count);
+        int bytesStart = suffixes.position();
+        long suffixTotal = 0;
+        int prevLen = 0;
+        for (int i = 0; i < count; i++) {
+            int pre = prefixLengths[i];
+            int suf = suffixLengths[i];
+            if (pre < 0 || suf < 0 || pre > prevLen) {
+                throw new IllegalStateException("DELTA_BYTE_ARRAY: value "
+                        + i
+                        + " has prefix "
+                        + pre
+                        + " and suffix "
+                        + suf
+                        + " after a "
+                        + prevLen
+                        + "-byte value");
+            }
+            prevLen = pre + suf;
+            suffixTotal += suf;
+        }
+        if (bytesStart + suffixTotal > end) {
+            throw new IllegalStateException("DELTA_BYTE_ARRAY: suffix bytes past the end of the page");
+        }
+        return bytesStart;
+    }
+
+    /**
      * True for a fixed-width page whose values are decoded into scratch first
      * (not PLAIN, not dictionary).
      */
@@ -812,39 +906,19 @@ public final class ColumnChunkDecoder {
         }
         byte[] src = pageData;
         int stride = bssStride;
-        int b0 = bssStart + bssIndex;
         if (physicalType == VecType.INT32) {
-            int b1 = b0 + stride;
-            int b2 = b1 + stride;
-            int b3 = b2 + stride;
             if (type == VecType.INT32) {
-                int[] dst = deltaInts;
-                for (int k = 0; k < m; k++) {
-                    dst[k] = (src[b0 + k] & 0xFF)
-                             | (src[b1 + k] & 0xFF) << 8
-                             | (src[b2 + k] & 0xFF) << 16
-                             | src[b3 + k] << 24;
-                }
+                ByteStreamSplitKernels.ints(src, bssStart, stride, bssIndex, deltaInts, m);
             } else { // INT32 widened to an INT64 lane: sign-extended
+                int[] tmp = id(m);
+                ByteStreamSplitKernels.ints(src, bssStart, stride, bssIndex, tmp, m);
                 long[] dst = deltaLongs;
                 for (int k = 0; k < m; k++) {
-                    dst[k] = (src[b0 + k] & 0xFF)
-                             | (src[b1 + k] & 0xFF) << 8
-                             | (src[b2 + k] & 0xFF) << 16
-                             | src[b3 + k] << 24;
+                    dst[k] = tmp[k];
                 }
             }
         } else { // INT64 / FLOAT64: eight streams
-            long[] dst = deltaLongs;
-            for (int k = 0; k < m; k++) {
-                long v = 0;
-                int p = b0 + k;
-                for (int j = 0; j < 8; j++) {
-                    v |= ((long) (src[p] & 0xFF)) << (8 * j);
-                    p += stride;
-                }
-                dst[k] = v;
-            }
+            ByteStreamSplitKernels.longs(src, bssStart, stride, bssIndex, deltaLongs, m);
         }
         bssIndex += m;
     }
@@ -1020,6 +1094,128 @@ public final class ColumnChunkDecoder {
         }
     }
 
+    // ------------------------------------------------------------------ BOOLEAN (#559)
+
+    /**
+     * A BOOLEAN page: {@code PLAIN} values are bit-packed one bit per present
+     * value, LSB first, from the first value byte; {@code RLE} values are a
+     * 4-byte little-endian length, then an RLE/bit-packed hybrid stream at bit
+     * width 1 (what parquet-java writes for v2 pages). Dictionary encoding does
+     * not apply to booleans.
+     */
+    private void feedBoolPage(Page page, long valuesStart) {
+        this.idReader = null;
+        this.plainCursor = 0;
+        this.utf8PlainCursor = 0;
+        this.boolPageEnd = (int) page.dataEnd();
+        if (page.encoding == ParquetPageDecoder.Encoding.PLAIN) {
+            this.boolBitCursor = valuesStart << 3;
+        } else if (page.encoding == ParquetPageDecoder.Encoding.RLE) {
+            int lenAt = (int) valuesStart;
+            if (lenAt + 4 > boolPageEnd) {
+                throw new IllegalStateException("BOOLEAN RLE: page too short for its length prefix");
+            }
+            int len = readLeInt(page.data, lenAt);
+            if (len < 0 || lenAt + 4 + len > boolPageEnd) {
+                throw new IllegalStateException("BOOLEAN RLE: stream length " + len + " past the end of the page");
+            }
+            this.boolReader = reader(page.data, lenAt + 4, len, 1);
+        } else {
+            throw new IllegalArgumentException(page.encoding + " on a BOOL lane");
+        }
+    }
+
+    /**
+     * Decodes the next {@code presentCount} values into {@link #boolWords} at
+     * batch rows {@code dstBase + (present == null ? k : present[k])}. PLAIN with
+     * every row present moves up to 64 bits per step from any source bit offset
+     * to any destination bit offset; otherwise the bits are scattered one per
+     * present row.
+     */
+    private void decodeBool(int dstBase, int[] present, int presentCount) {
+        long[] words = boolWords;
+        if (boolReader != null) {
+            if (present == null) {
+                // Straight into the bitmap: RLE runs as bit ranges, bit-packed runs 64 bits a step.
+                boolReader.readBits(words, dstBase, presentCount);
+                return;
+            }
+            int[] v = id(presentCount);
+            boolReader.readInts(v, 0, presentCount);
+            for (int k = 0; k < presentCount; k++) {
+                int row = dstBase + present[k];
+                words[row >>> 6] |= (long) (v[k] & 1) << (row & 63);
+            }
+            return;
+        }
+        long src = boolBitCursor;
+        long srcEndBit = (long) boolPageEnd << 3;
+        if (src + presentCount > srcEndBit) {
+            throw new IllegalStateException("BOOLEAN PLAIN: " + presentCount + " values past the end of the page");
+        }
+        byte[] page = pageData;
+        if (present == null) {
+            int k = 0;
+            while (k < presentCount) {
+                int take = Math.min(64, presentCount - k);
+                long v = loadBits(page, src + k, take, boolPageEnd);
+                int row = dstBase + k;
+                int bit = row & 63;
+                words[row >>> 6] |= v << bit;
+                if (bit != 0 && bit + take > 64) {
+                    words[(row >>> 6) + 1] |= v >>> (64 - bit);
+                }
+                k += take;
+            }
+        } else {
+            for (int k = 0; k < presentCount; k++) {
+                long b = src + k;
+                int v = (page[(int) (b >>> 3)] >>> (int) (b & 7)) & 1;
+                int row = dstBase + present[k];
+                words[row >>> 6] |= (long) v << (row & 63);
+            }
+        }
+        boolBitCursor = src + presentCount;
+    }
+
+    /**
+     * {@code n} (1..64) bits of {@code a} from bit {@code bitOff}, LSB first,
+     * reading no byte at or past {@code end}.
+     */
+    private static long loadBits(byte[] a, long bitOff, int n,
+            int end) {
+        int b = (int) (bitOff >>> 3);
+        int shift = (int) (bitOff & 7);
+        int bytes = Math.min((shift + n + 7) >>> 3, end - b); // at most 9
+        long lo = 0L;
+        int lim = Math.min(bytes, 8);
+        if (lim == 8) {
+            lo = (long) BA_LONG.get(a, b);
+        } else {
+            for (int i = 0; i < lim; i++) {
+                lo |= ((long) (a[b + i] & 0xFF)) << (8 * i);
+            }
+        }
+        long v = lo >>> shift;
+        if (bytes == 9) {
+            v |= ((long) (a[b + 8] & 0xFF)) << (64 - shift);
+        }
+        return n == 64 ? v : v & ((1L << n) - 1);
+    }
+
+    /**
+     * Copy the finished BOOL batch of {@code rows}: the value bits, then
+     * validity.
+     */
+    public void flushBool(int rows, MemorySegment outData, MemorySegment outValidity) {
+        int words = (rows + 63) >>> 6;
+        if (rows % 64 != 0) {
+            boolWords[words - 1] &= (1L << (rows & 63)) - 1; // no stray bits past the last row
+        }
+        MemorySegment.copy(boolWords, 0, outData, LE_LONG, 0L, words);
+        flushValidity(rows, outValidity);
+    }
+
     // ------------------------------------------------------------------ binary / utf8
 
     private void decodeBinary(int dstBase, int m, int[] present,
@@ -1048,8 +1244,13 @@ public final class ColumnChunkDecoder {
         byte[] src = pageData;
         int s = utf8PlainCursor;
         int k = 0;
+        if (pageEncoding == ParquetPageDecoder.Encoding.DELTA_BYTE_ARRAY) {
+            decodeDeltaByteArray(dstBase, m, present, presentCount);
+            return;
+        }
         if (pageEncoding == ParquetPageDecoder.Encoding.DELTA_LENGTH_BYTE_ARRAY) {
             // The lengths were decoded at feedPage; the bytes are back to back from utf8PlainCursor.
+            src = binarySrc;
             int[] lens = pageLengths;
             int lc = lengthCursor;
             for (int i = 0; i < m; i++) {
@@ -1080,6 +1281,62 @@ public final class ColumnChunkDecoder {
         utf8Offsets[dstBase + m] = pos;
         utf8Len = pos;
         utf8PlainCursor = s;
+    }
+
+    /**
+     * DELTA_BYTE_ARRAY: rebuilds each present value straight into the batch's
+     * bytes -- its prefix copied from the previous value (in this batch's bytes,
+     * or saved from the previous call), then its suffix from the page -- so
+     * every value byte is written once. At the end the last value is saved, since
+     * the next call may start a new batch and reuse the bytes.
+     */
+    private void decodeDeltaByteArray(int dstBase, int m, int[] present,
+            int presentCount) {
+        byte[] src = pageData;
+        int s = utf8PlainCursor;
+        int lc = lengthCursor;
+        int pos = utf8Len;
+        int k = 0;
+        int prevStart = dbaPrevStart;
+        int prevLen = dbaPrevLen;
+        for (int i = 0; i < m; i++) {
+            utf8Offsets[dstBase + i] = pos;
+            if (present == null || (k < presentCount && present[k] == i)) {
+                int pre = prefixLengths[lc];
+                int suf = suffixLengths[lc];
+                lc++;
+                int len = pre + suf;
+                if (pos + len > utf8Data.length) {
+                    utf8Data = java.util.Arrays.copyOf(utf8Data,
+                            Math.max(pos + len, utf8Data.length * 2));
+                }
+                if (pre > 0) { // pre <= prevLen, checked at feedPage
+                    if (prevStart >= 0) {
+                        System.arraycopy(utf8Data, prevStart, utf8Data, pos, pre); // the previous value ends at or before pos
+                    } else {
+                        System.arraycopy(dbaPrev, 0, utf8Data, pos, pre);
+                    }
+                }
+                System.arraycopy(src, s, utf8Data, pos + pre, suf);
+                s += suf;
+                prevStart = pos;
+                prevLen = len;
+                pos += len;
+                k++;
+            }
+        }
+        utf8Offsets[dstBase + m] = pos;
+        utf8Len = pos;
+        utf8PlainCursor = s;
+        lengthCursor = lc;
+        if (prevStart >= 0) { // keep the last value for a following call, whose batch may reuse utf8Data
+            if (dbaPrev.length < prevLen) {
+                dbaPrev = new byte[Math.max(prevLen, 2 * dbaPrev.length)];
+            }
+            System.arraycopy(utf8Data, prevStart, dbaPrev, 0, prevLen);
+        }
+        dbaPrevStart = -1;
+        dbaPrevLen = prevLen;
     }
 
     private int appendBytes(byte[] src, int srcPos, int len,

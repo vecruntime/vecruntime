@@ -31,6 +31,7 @@ import org.apache.parquet.column.values.delta.{
   DeltaBinaryPackingValuesWriterForLong
 }
 import org.apache.parquet.column.values.deltalengthbytearray.DeltaLengthByteArrayValuesWriter
+import org.apache.parquet.column.values.deltastrings.DeltaByteArrayWriter
 import org.apache.parquet.io.api.Binary
 import org.scalatest.funsuite.AnyFunSuite
 
@@ -148,6 +149,53 @@ class DeltaBinaryPackedCrossCheckSuite extends AnyFunSuite {
     SegmentVectorBuffers.fixedWidth(lane, n, null, data)
   }
 
+  /** Decodes a UTF8 page of `n` values, no nulls, through ColumnChunkDecoder in `batch`-row batches. */
+  private def decodeUtf8(page: Array[Byte], n: Int, enc: ParquetPageDecoder.Encoding, batch: Int): Seq[Array[Byte]] = {
+    val d = new ColumnChunkDecoder(VecType.UTF8, 0, batch, bytePackers)
+    d.startChunk(n)
+    val out = scala.collection.mutable.ArrayBuffer[Array[Byte]]()
+    var row = 0
+    while (row < n) {
+      val want = math.min(batch, n - row)
+      d.startBatch(want)
+      var filled = 0
+      while (filled < want) {
+        if (d.needsPage()) d.feedPage(ColumnChunkDecoder.Page.v1(page, page.length, n, enc))
+        filled += d.readBatch(want - filled, filled)
+      }
+      val arena = Arena.ofConfined()
+      try {
+        val offsets = ArrowLayout.allocateOffsets(arena, want)
+        val bytes = ArrowLayout.allocateBytes(arena, math.max(d.utf8Bytes(), 1L))
+        d.flushUtf8(want, offsets, bytes, null)
+        val col = SegmentVectorBuffers.utf8(want, null, offsets, bytes)
+        for (k <- 0 until want) out += col.getUtf8Bytes(k)
+      } finally arena.close()
+      row += want
+    }
+    out.toSeq
+  }
+
+  test("DELTA_BYTE_ARRAY pages from parquet-java's writer decode identically") {
+    val rnd = new Random(55916)
+    for (n <- lengths; batch <- Seq(64, 1000); sorted <- Seq(true, false)) {
+      val raw = Array.tabulate(n) { i =>
+        i % 6 match {
+          case 0 => ""
+          case 1 => s"héllo wörld $i"
+          case 2 => "z" * rnd.nextInt(500)
+          case _ => f"https://example.com/item/${rnd.nextInt(1000000)}%09d"
+        }
+      }
+      val v = (if (sorted) raw.sorted else raw).map(_.getBytes(StandardCharsets.UTF_8))
+      val w = new DeltaByteArrayWriter(64, 1 << 20, HeapByteBufferAllocator.getInstance())
+      v.foreach(b => w.writeBytes(Binary.fromConstantByteArray(b)))
+      val got = decodeUtf8(w.getBytes.toByteArray, n, ParquetPageDecoder.Encoding.DELTA_BYTE_ARRAY, batch)
+      assert(got.length == n)
+      for (i <- 0 until n) assert(got(i).sameElements(v(i)), s"n=$n batch=$batch sorted=$sorted row $i")
+    }
+  }
+
   test("DELTA_LENGTH_BYTE_ARRAY pages from parquet-java's writer decode identically") {
     val rnd = new Random(55912)
     for (n <- lengths; batch <- Seq(64, 1000)) {
@@ -189,6 +237,54 @@ class DeltaBinaryPackedCrossCheckSuite extends AnyFunSuite {
           for (k <- 0 until want) {
             assert(col.getUtf8Bytes(k).sameElements(v(row + k)), s"n=$n batch=$batch row ${row + k}")
           }
+        } finally arena.close()
+        row += want
+      }
+    }
+  }
+
+  test("BOOLEAN pages from parquet-java's PLAIN and RLE writers decode identically, also against its readers") {
+    // PLAIN: BooleanPlainValuesWriter (bit-packed); RLE: RunLengthBitPackingHybridValuesWriter at width 1,
+    // which writes the 4-byte length prefix itself. Both checked against the input and parquet-java's own
+    // readers over the same bytes.
+    val rnd = new Random(55920)
+    for (n <- lengths; batch <- Seq(7, 64, 1000); rle <- Seq(false, true)) {
+      val v = Array.tabulate(n)(i => if ((i / 50) % 2 == 0) rnd.nextBoolean() else (i / 130) % 2 == 0)
+      val alloc = HeapByteBufferAllocator.getInstance()
+      val bytes =
+        if (rle) {
+          val w = new org.apache.parquet.column.values.rle.RunLengthBitPackingHybridValuesWriter(1, 64, 1 << 20, alloc)
+          v.foreach(w.writeBoolean)
+          w.getBytes.toByteArray
+        } else {
+          val w = new org.apache.parquet.column.values.plain.BooleanPlainValuesWriter()
+          v.foreach(w.writeBoolean)
+          w.getBytes.toByteArray
+        }
+      val ref: org.apache.parquet.column.values.ValuesReader =
+        if (rle) new org.apache.parquet.column.values.rle.RunLengthBitPackingHybridValuesReader(1)
+        else new org.apache.parquet.column.values.plain.BooleanPlainValuesReader()
+      ref.initFromPage(n, org.apache.parquet.bytes.ByteBufferInputStream.wrap(java.nio.ByteBuffer.wrap(bytes)))
+      val refValues = Array.fill(n)(ref.readBoolean())
+      assert(refValues.sameElements(v), s"parquet-java's own reader disagrees with its writer (n=$n rle=$rle)")
+      val enc = if (rle) ParquetPageDecoder.Encoding.RLE else ParquetPageDecoder.Encoding.PLAIN
+      val d = new ColumnChunkDecoder(VecType.BOOL, 0, batch, bytePackers)
+      d.startChunk(n)
+      var row = 0
+      while (row < n) {
+        val want = math.min(batch, n - row)
+        d.startBatch(want)
+        var filled = 0
+        while (filled < want) {
+          if (d.needsPage()) d.feedPage(ColumnChunkDecoder.Page.v1(bytes, bytes.length, n, enc))
+          filled += d.readBatch(want - filled, filled)
+        }
+        val arena = Arena.ofConfined()
+        try {
+          val data = ArrowLayout.allocateBitmap(arena, want)
+          d.flushBool(want, data, null)
+          val col = SegmentVectorBuffers.fixedWidth(VecType.BOOL, want, null, data)
+          for (k <- 0 until want) assert(col.getBoolean(k) == v(row + k), s"n=$n batch=$batch rle=$rle row ${row + k}")
         } finally arena.close()
         row += want
       }

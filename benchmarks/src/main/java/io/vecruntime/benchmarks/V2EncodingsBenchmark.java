@@ -31,10 +31,17 @@ import org.apache.parquet.column.values.ValuesReader;
 import org.apache.parquet.column.values.bitpacking.BytePacker;
 import org.apache.parquet.column.values.bitpacking.Packer;
 import org.apache.parquet.column.values.bytestreamsplit.ByteStreamSplitValuesReaderForDouble;
+import org.apache.parquet.column.values.bytestreamsplit.ByteStreamSplitValuesReaderForInteger;
 import org.apache.parquet.column.values.bytestreamsplit.ByteStreamSplitValuesReaderForLong;
 import org.apache.parquet.column.values.bytestreamsplit.ByteStreamSplitValuesWriter;
 import org.apache.parquet.column.values.deltalengthbytearray.DeltaLengthByteArrayValuesReader;
 import org.apache.parquet.column.values.deltalengthbytearray.DeltaLengthByteArrayValuesWriter;
+import org.apache.parquet.column.values.deltastrings.DeltaByteArrayReader;
+import org.apache.parquet.column.values.deltastrings.DeltaByteArrayWriter;
+import org.apache.parquet.column.values.plain.BooleanPlainValuesReader;
+import org.apache.parquet.column.values.plain.BooleanPlainValuesWriter;
+import org.apache.parquet.column.values.rle.RunLengthBitPackingHybridValuesReader;
+import org.apache.parquet.column.values.rle.RunLengthBitPackingHybridValuesWriter;
 import org.apache.parquet.io.api.Binary;
 import org.openjdk.jmh.annotations.Benchmark;
 import org.openjdk.jmh.annotations.BenchmarkMode;
@@ -51,8 +58,9 @@ import org.openjdk.jmh.annotations.TearDown;
 import org.openjdk.jmh.annotations.Warmup;
 
 /**
- * Sanity JMH for the {@code BYTE_STREAM_SPLIT} and {@code
- * DELTA_LENGTH_BYTE_ARRAY} pages of the native scan (#559): one page decoded
+ * Sanity JMH for the {@code BYTE_STREAM_SPLIT}, {@code DELTA_BYTE_ARRAY},
+ * {@code DELTA_LENGTH_BYTE_ARRAY} and BOOLEAN ({@code PLAIN} and {@code RLE})
+ * pages of the native scan (#559): one page decoded
  * through {@link ColumnChunkDecoder} in 1024-row batches into an Arrow buffer,
  * the scan's path, against parquet-java's own value readers over the same page
  * (Spark's vectorized reader rejects {@code BYTE_STREAM_SPLIT} on INT64 and has
@@ -72,8 +80,13 @@ public class V2EncodingsBenchmark {
     @Param({"20000"})
     int n;
 
-    /** {@code bss-double}, {@code bss-long} or {@code dlba-string}. */
-    @Param({"bss-double", "bss-long", "dlba-string"})
+    /**
+     * {@code bss-double}, {@code bss-long}, {@code bss-int}, {@code
+     * dlba-string} (short random strings) or {@code dba-string} (sorted
+     * URL-like keys).
+     */
+    @Param({"bss-double", "bss-long", "bss-int", "dlba-string", "dba-string", "bool-plain",
+                "bool-rle"})
     String shape;
 
     private byte[] page;
@@ -109,6 +122,54 @@ public class V2EncodingsBenchmark {
                 lane = VecType.INT64;
                 encoding = ParquetPageDecoder.Encoding.BYTE_STREAM_SPLIT;
             }
+            case "bss-int" -> {
+                ByteStreamSplitValuesWriter.IntegerByteStreamSplitValuesWriter w = new ByteStreamSplitValuesWriter.IntegerByteStreamSplitValuesWriter(64, 1 << 20, alloc);
+                for (int i = 0; i < n; i++) {
+                    w.writeInteger(rnd.nextInt());
+                }
+                page = w.getBytes().toByteArray();
+                lane = VecType.INT32;
+                encoding = ParquetPageDecoder.Encoding.BYTE_STREAM_SPLIT;
+            }
+            case "bool-plain" -> {
+                // Independent coin flips: the bit-packed PLAIN layout parquet-mr v1 writes.
+                BooleanPlainValuesWriter w = new BooleanPlainValuesWriter();
+                for (int i = 0; i < n; i++) {
+                    w.writeBoolean(rnd.nextBoolean());
+                }
+                page = w.getBytes().toByteArray();
+                lane = VecType.BOOL;
+                encoding = ParquetPageDecoder.Encoding.PLAIN;
+            }
+            case "bool-rle" -> {
+                // Runs of 1..64 equal values: the 4-byte-length-prefixed RLE / bit-packed hybrid v2 writes,
+                // with both run kinds in the stream.
+                RunLengthBitPackingHybridValuesWriter w = new RunLengthBitPackingHybridValuesWriter(1, 64, 1 << 20, alloc);
+                boolean v = false;
+                for (int i = 0; i < n; ) {
+                    int run = 1 + rnd.nextInt(64);
+                    for (int j = 0;
+                         j < run && i < n;
+                         j++, i++) {
+                        w.writeBoolean(v);
+                    }
+                    v = !v;
+                }
+                page = w.getBytes().toByteArray();
+                lane = VecType.BOOL;
+                encoding = ParquetPageDecoder.Encoding.RLE;
+            }
+            case "dba-string" -> {
+                DeltaByteArrayWriter w = new DeltaByteArrayWriter(64, 1 << 20, alloc);
+                int key = 0;
+                for (int i = 0; i < n; i++) {
+                    key += 1 + rnd.nextInt(5);
+                    w.writeBytes(Binary.fromString(String.format("https://example.com/catalog/item/%09d", key)));
+                }
+                page = w.getBytes().toByteArray();
+                lane = VecType.UTF8;
+                encoding = ParquetPageDecoder.Encoding.DELTA_BYTE_ARRAY;
+            }
             default -> {
                 DeltaLengthByteArrayValuesWriter w = new DeltaLengthByteArrayValuesWriter(64, 1 << 20, alloc);
                 for (int i = 0; i < n; i++) {
@@ -132,6 +193,8 @@ public class V2EncodingsBenchmark {
         if (lane == VecType.UTF8) {
             outOffsets = ArrowLayout.allocateOffsets(arena, 1024);
             outBytes = ArrowLayout.allocateBytes(arena, 1 << 20);
+        } else if (lane == VecType.BOOL) {
+            out = arena.allocate(1024 / 8, 8); // one batch's value bitmap
         } else {
             out = ArrowLayout.allocateData(arena, lane, n);
         }
@@ -159,9 +222,14 @@ public class V2EncodingsBenchmark {
                 if (d.needsPage()) {
                     d.feedPage(ColumnChunkDecoder.Page.v1(page, page.length, n, encoding));
                 }
-                filled += lane == VecType.UTF8 ? d.readBatch(want - filled, filled) : d.readBatchDirectA(want - filled, done + filled, out, null);
+                filled += lane == VecType.UTF8 || lane == VecType.BOOL
+                        ? d.readBatch(want - filled, filled)
+                        : d.readBatchDirectA(want - filled, done + filled, out, null);
             }
-            if (lane == VecType.UTF8) {
+            if (lane == VecType.BOOL) {
+                d.flushBool(want, out, null);
+                sum += out.get(java.lang.foreign.ValueLayout.JAVA_LONG_UNALIGNED, 0);
+            } else if (lane == VecType.UTF8) {
                 d.flushUtf8(want, outOffsets, outBytes, null);
                 sum += d.utf8Bytes();
             }
@@ -175,6 +243,10 @@ public class V2EncodingsBenchmark {
         ValuesReader r = switch (shape) {
             case "bss-double" -> new ByteStreamSplitValuesReaderForDouble();
             case "bss-long" -> new ByteStreamSplitValuesReaderForLong();
+            case "bss-int" -> new ByteStreamSplitValuesReaderForInteger();
+            case "dba-string" -> new DeltaByteArrayReader();
+            case "bool-plain" -> new BooleanPlainValuesReader();
+            case "bool-rle" -> new RunLengthBitPackingHybridValuesReader(1);
             default -> new DeltaLengthByteArrayValuesReader();
         };
         r.initFromPage(n, ByteBufferInputStream.wrap(java.nio.ByteBuffer.wrap(page)));
@@ -183,6 +255,8 @@ public class V2EncodingsBenchmark {
             sum += switch (shape) {
                         case "bss-double" -> (long) r.readDouble();
                         case "bss-long" -> r.readLong();
+                        case "bss-int" -> r.readInteger();
+                        case "bool-plain", "bool-rle" -> r.readBoolean() ? 1 : 0;
                         default -> r.readBytes().length();
                     };
         }
