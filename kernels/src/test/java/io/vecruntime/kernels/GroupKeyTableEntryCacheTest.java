@@ -58,6 +58,43 @@ class GroupKeyTableEntryCacheTest {
     }
 
     @Test
+    void anInsertAfterALookupThatReusedAnInsertsMapAddsTheMissedKeys() {
+        try (Arena arena = Arena.ofConfined()) {
+            VectorBuffers dict = ArrowLayout.ofStrings(arena, new String[] {"a", "b", "c", "d"});
+            GroupKeyTable t = new GroupKeyTable(new VecType[] {VecType.UTF8}, true);
+            // The insert maps entries a and b only.
+            VectorBuffers first = col(arena, dict, 0, 1);
+            int[] ab = new int[2];
+            assertEquals(2, t.assign(new VectorBuffers[] {first}, 2, ab), "a and b");
+            // A lookup over the same dictionary object reuses that map and misses c and d (#593).
+            VectorBuffers second = nullableCol(
+                    arena,
+                    dict,
+                    new int[] {0, 2, 3, 0},
+                    new boolean[] {false, false, false, true});
+            int[] probe = new int[4];
+            assertEquals(1, t.lookup(new VectorBuffers[] {second}, 4, probe, null), "only a is found");
+            assertEquals(ab[0], probe[0], "a");
+            assertEquals(-1, probe[1], "c is not in the table");
+            assertEquals(-1, probe[2], "d is not in the table");
+            assertEquals(-1, probe[3], "nor is null");
+            // The insert after it adds c, d and null as three new groups, not one.
+            int[] ids = new int[4];
+            assertEquals(5, t.assign(new VectorBuffers[] {second}, 4, ids), "a, b, c, d and null");
+            assertEquals(ab[0], ids[0], "a keeps its group");
+            assertNotEquals(ids[1], ids[2], "c and d");
+            assertNotEquals(ids[1], ids[3], "c and null");
+            assertNotEquals(ids[2], ids[3], "d and null");
+        }
+    }
+
+    private static VectorBuffers nullableCol(Arena arena, VectorBuffers dict, int[] idx,
+            boolean[] nulls) {
+        VectorBuffers ix = ArrowLayout.ofInts(arena, idx, nulls);
+        return SegmentVectorBuffers.dictionaryUtf8(idx.length, ix.validity(), ix.data(), dict);
+    }
+
+    @Test
     void twoTablesOnOneThreadKeepTheirOwnIds() {
         try (Arena arena = Arena.ofConfined()) {
             GroupKeyTable t1 = new GroupKeyTable(new VecType[] {VecType.UTF8}, true);
