@@ -256,6 +256,9 @@ class StringCompareKernelsTest {
                 int got = Integer.signum(StringCompareKernels.compareBytes(x, xs, xs + lx, y, ys,
                         ys + ly));
                 assertEquals(expected, got, "lengths " + lx + "/" + ly + ", shared prefix " + shared);
+                int gotSort = Integer.signum(StringCompareKernels.compareBytesForSort(x, xs, xs + lx, y, ys,
+                        ys + ly));
+                assertEquals(expected, gotSort, "sort copy: lengths " + lx + "/" + ly + ", shared prefix " + shared);
             }
         }
     }

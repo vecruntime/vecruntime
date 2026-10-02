@@ -188,7 +188,96 @@ public final class StringCompareKernels {
         return Long.compare(lx, ly);
     }
 
+    /**
+     * {@link #compareBytes} for sort comparators (the in-memory sort and the
+     * run merge): the same comparison as a separate method, so its branch
+     * profile is the sorts' alone and the class-init warm-up below
+     * ({@code warmSortCompareProfile}) decides it, not whichever filter or sort
+     * happened to run first on the JVM.
+     */
+    public static int compareBytesForSort(MemorySegment x, long xs, long xe,
+            MemorySegment y, long ys, long ye) {
+        long lx = xe - xs, ly = ye - ys;
+        long common = Math.min(lx, ly);
+        long k = 0;
+        for (; k + Long.BYTES <= common; k += Long.BYTES) {
+            long a = x.get(BE_LONG_UNALIGNED, xs + k);
+            long b = y.get(BE_LONG_UNALIGNED, ys + k);
+            if (a != b) {
+                return Long.compareUnsigned(a, b);
+            }
+        }
+        for (; k < common; k++) {
+            int a = Byte.toUnsignedInt(x.get(ValueLayout.JAVA_BYTE, xs + k));
+            int b = Byte.toUnsignedInt(y.get(ValueLayout.JAVA_BYTE, ys + k));
+            if (a != b) {
+                return a - b;
+            }
+        }
+        return Long.compare(lx, ly);
+    }
+
     private static final ValueLayout.OfLong BE_LONG_UNALIGNED = ValueLayout.JAVA_LONG_UNALIGNED.withOrder(java.nio.ByteOrder.BIG_ENDIAN);
+
+    static {
+        warmSortCompareProfile();
+    }
+
+    /**
+     * Gives {@link #compareBytesForSort}'s branch profile every outcome of
+     * every branch before real data does.
+     *
+     * <p>C2 compiles a branch it has never seen taken as an {@code unstable_if}
+     * uncommon trap. A JVM whose first sorts only compare strings that differ
+     * within an 8-byte word never sees the word loop run out (bytecode 33) or
+     * the tail/length paths, so those exits become traps; a later sort over
+     * keys sharing long prefixes (TPC-DS q67) takes them on almost every call.
+     * After a few recompilations at the same bytecode HotSpot emits the trap
+     * with action {@code none}, so the compiled code is never replaced: on 1 TB
+     * q67 one executor logged 411,075 such traps at bytecode 33 and ran the
+     * sort stage at ~2.3x CPU for the rest of the app. Turning off C2's {@code
+     * OptimizeUnstableIf} did not change it.
+     *
+     * <p>A few thousand calls covering all paths at class initialization put a
+     * non-zero count on every branch, so C2 compiles both sides instead of a
+     * trap. It costs a few milliseconds once per JVM.
+     */
+    private static void warmSortCompareProfile() {
+        MemorySegment a = MemorySegment.ofArray(new byte[64]);
+        MemorySegment b = MemorySegment.ofArray(new byte[64]);
+        for (int i = 0; i < 64; i++) {
+            byte v = (byte) ('a' + (i % 23));
+            a.set(ValueLayout.JAVA_BYTE, i, v);
+            b.set(ValueLayout.JAVA_BYTE, i, v);
+        }
+        long sink = 0;
+        for (int r = 0; r < 4000; r++) {
+            int len = 1 + (r % 40);
+            // equal (word loop runs out, tail runs out, lengths decide), longer/shorter by one byte,
+            // differing in the first word, differing in the tail, both directions of each
+            sink += compareBytesForSort(a, 0, len, b, 0, len);
+            sink += compareBytesForSort(a, 0, len, b, 0,
+                    len + 1);
+            sink += compareBytesForSort(a, 0, len + 1, b, 0,
+                    len);
+            b.set(ValueLayout.JAVA_BYTE, 0, (byte) 'Z');
+            sink += compareBytesForSort(a, 0, len + 8, b, 0,
+                    len + 8);
+            sink += compareBytesForSort(b, 0, len + 8, a, 0,
+                    len + 8);
+            b.set(ValueLayout.JAVA_BYTE, 0, a.get(ValueLayout.JAVA_BYTE, 0));
+            int t = len - 1;
+            byte keep = b.get(ValueLayout.JAVA_BYTE, t);
+            b.set(ValueLayout.JAVA_BYTE, t, (byte) (keep + 1));
+            sink += compareBytesForSort(a, 0, len, b, 0, len);
+            sink += compareBytesForSort(b, 0, len, a, 0, len);
+            b.set(ValueLayout.JAVA_BYTE, t, keep);
+        }
+        WARM_SINK = sink;
+    }
+
+    @SuppressWarnings("unused")
+    private static volatile long WARM_SINK;
 
     /**
      * Per-row byte range of one operand, resolved through its dictionary when
