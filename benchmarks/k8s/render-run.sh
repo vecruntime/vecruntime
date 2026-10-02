@@ -17,6 +17,8 @@
 #   NODE_SELECTOR (workload=spark-xl; empty for none) OFFHEAP (32g, the comet configurations)
 #   EXEC_JAVA_OPTS (extra executor JVM options, e.g. a JFR recording: -XX:StartFlightRecording=duration=300s,filename=/tmp/exec.jfr,settings=profile)
 #   KEEP_EXECUTORS (unset; set to 1 to keep dead executor pods for their logs)
+#   ACCP (1; 0 = the JDK's own crypto: 1 puts Amazon Corretto Crypto Provider first for the S3 TLS cipher and
+#     SigV4 hashing, -Djava.security.properties=/opt/spark/accp/accp.security, #566; needs an image with it)
 #   DIRECT_MEM (EXEC_OVERHEAD minus 2g; the executors' -XX:MaxDirectMemorySize)
 #   AOT_CACHE (0; 1 = the executors start from the image's AOT cache, trained on the cluster (#416):
 #             an init container fetches s3://<bucket>/aot/<image tag>/executor.aot (AOT_BUCKET, default
@@ -101,7 +103,13 @@ cat <<EOF
     # shuffle's buffers hit a 20 GiB wall inside a 50 GiB container.
     spark.eventLog.enabled: "true"
     spark.eventLog.dir: "s3a://sfi-iceberg-wh-378683551918/spark-events"
-    spark.hadoop.fs.s3a.connection.maximum: "200"
+    spark.hadoop.fs.s3a.connection.maximum: "1000"
+    # S3 read concurrency for the native scan's read-ahead (#559/#566): each executor keeps up to 13 tasks x
+    # (prefetchFiles + prefetchRowGroups) file opens and row-group reads in flight, each holding a connection
+    # and an Analytics Accelerator block fetch. The 1 TB A/B rounds of #559 all ran with these values.
+    spark.hadoop.fs.s3a.threads.max: "256"
+    spark.hadoop.fs.s3a.max.total.tasks: "128"
+    spark.hadoop.fs.s3a.analytics.accelerator.physicalio.thread.pool.size: "192"
     spark.hadoop.fs.s3a.aws.credentials.provider: "software.amazon.awssdk.auth.credentials.WebIdentityTokenFileCredentialsProvider"
 EOF
 # Last setting of a key wins, as it does for spark-submit (the strict configuration overrides VECTOR's).
@@ -115,7 +123,8 @@ done
 # EXEC_JAVA_OPTS appended -- a second `spark.executor.extraJavaOptions` line would silently win over
 # the first in the YAML map (it did: the direct-memory bound never reached the executors before this).
 EXEC_OPTS="${SEEN[spark.executor.extraJavaOptions]:-}"
-EXEC_OPTS="${EXEC_OPTS:+$EXEC_OPTS }-XX:MaxDirectMemorySize=$DIRECT_MEM${EXEC_JAVA_OPTS:+ $EXEC_JAVA_OPTS}"
+ACCP_OPTS=""; [ "${ACCP:-1}" = 1 ] && ACCP_OPTS=" -Djava.security.properties=/opt/spark/accp/accp.security"
+EXEC_OPTS="${EXEC_OPTS:+$EXEC_OPTS }-XX:MaxDirectMemorySize=$DIRECT_MEM$ACCP_OPTS${EXEC_JAVA_OPTS:+ $EXEC_JAVA_OPTS}"
 # The executor's AOT cache (#416), trained on the cluster by real executors. A training run
 # (AOT_RECORD=1) records each executor's configuration to the node; a normal run fetches the assembled
 # cache for this image tag from S3 in an init container and points the JVM at it. A missing object,

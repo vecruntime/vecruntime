@@ -34,6 +34,11 @@ version may change configuration keys or defaults, always noted here.
   ahead): N = 2 q88 -27%, q28 -56%, q9 -60%, q44 -50%; N = 6 q28 -57%, q9 -64%, q44 -59% (q88 varied
   57-115 s per iteration at both depths). Memory per task grows by up to N opened files plus
   M row groups (compressed pages).
+- Benchmarks: the cluster image ships Amazon Corretto Crypto Provider (#566), and `benchmarks/k8s/render-run.sh`
+  turns it on by default (`ACCP=1`; `ACCP=0` for the JDK's own crypto) for the S3 TLS cipher and SigV4
+  hashing. The rendered runs also raise the S3A read concurrency the native scan's read-ahead needs:
+  `fs.s3a.connection.maximum` 200 -> 1000, `fs.s3a.threads.max` 256, `fs.s3a.max.total.tasks` 128 and the
+  Analytics Accelerator's `physicalio.thread.pool.size` 192 (the values every 1 TB #559 A/B round ran with).
 
 ## 0.0.4 -- 2026-09-30
 
