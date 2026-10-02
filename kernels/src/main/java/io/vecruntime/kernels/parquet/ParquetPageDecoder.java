@@ -439,6 +439,28 @@ public final class ParquetPageDecoder {
      */
     public static VectorBuffers decodeDictionary(MemorySegment data, long offset, long length,
             int numValues, VecType type, Arena arena) {
+        return decodeDictionary(data, offset, length, numValues, type, 0,
+                arena);
+    }
+
+    /**
+     * As {@link #decodeDictionary(MemorySegment, long, long, int, VecType, Arena)};
+     * {@code fixedLength > 0} reads a UTF8-staged FIXED_LEN_BYTE_ARRAY
+     * dictionary, whose entries are {@code fixedLength} bytes with no length
+     * prefix. Every entry must lie within {@code [offset, offset + length)}.
+     */
+    public static VectorBuffers decodeDictionary(
+            MemorySegment data,
+            long offset,
+            long length,
+            int numValues,
+            VecType type,
+            int fixedLength,
+            Arena arena) {
+        if (numValues < 0) {
+            throw new IllegalStateException("dictionary page: negative value count " + numValues);
+        }
+        long end = offset + length;
         if (type == VecType.UTF8) {
             MemorySegment offsets = ArrowLayout.allocateOffsets(arena, numValues);
             int[] lengths = new int[numValues];
@@ -446,8 +468,19 @@ public final class ParquetPageDecoder {
             long src = offset;
             long total = 0;
             for (int i = 0; i < numValues; i++) {
-                int len = data.get(LE_INT, src);
-                src += 4;
+                int len;
+                if (fixedLength > 0) {
+                    len = fixedLength;
+                } else {
+                    if (src + 4 > end) {
+                        throw new IllegalStateException("dictionary page: length prefix past the end of the page");
+                    }
+                    len = data.get(LE_INT, src);
+                    src += 4;
+                }
+                if (len < 0 || len > end - src) {
+                    throw new IllegalStateException("dictionary page: a " + len + "-byte entry past the end of the page");
+                }
                 starts[i] = src;
                 lengths[i] = len;
                 total += len;
@@ -465,6 +498,9 @@ public final class ParquetPageDecoder {
             return SegmentVectorBuffers.utf8(numValues, null, offsets, out);
         }
         int width = type.byteWidth();
+        if ((long) numValues * width > length) {
+            throw new IllegalStateException("dictionary page: " + numValues + " entries of " + width + " bytes past the end of the page");
+        }
         MemorySegment out = ArrowLayout.allocateData(arena, type, numValues);
         long src = offset;
         for (int i = 0; i < numValues; i++) {

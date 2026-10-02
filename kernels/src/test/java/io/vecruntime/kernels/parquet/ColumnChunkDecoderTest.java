@@ -668,6 +668,128 @@ class ColumnChunkDecoderTest {
     }
 
     /**
+     * FIXED_LEN_BYTE_ARRAY and BINARY decimals: big-endian two's complement
+     * staged on the UTF8 path, then flushDecimal into the DECIMAL128 lane (two LE
+     * limbs) or the INT64 lane (Spark's binaryToUnscaledLong), against a
+     * BigInteger reference. PLAIN fixed-length pages and length-prefixed BINARY
+     * pages (with bytes longer than 16 that are sign extensions), batches that
+     * split a page, every width 1..16, and a value that does not fit 128 bits.
+     */
+    @Test
+    void binaryDecimalsFlushIntoDecimal128AndInt64Lanes() {
+        Random rnd = new Random(55918);
+        for (int width = 1; width <= 16; width++) {
+            for (boolean fixed : new boolean[] {true, false}) {
+                int n = 700;
+                java.math.BigInteger[] v = new java.math.BigInteger[n];
+                byte[][] enc = new byte[n][];
+                ByteArrayOutputStream page = new ByteArrayOutputStream();
+                for (int i = 0; i < n; i++) {
+                    java.math.BigInteger x = new java.math.BigInteger(8 * width - 1, rnd);
+                    if (rnd.nextBoolean()) {
+                        x = x.negate().subtract(java.math.BigInteger.ONE);
+                    }
+                    if (i < 4) {
+                        x = java.math.BigInteger.valueOf(i % 2 == 0 ? 0 : -1); // zero and minus one at every width
+                    }
+                    v[i] = x;
+                    byte[] b = x.toByteArray(); // minimal two's complement, then sign-extended to the width
+                    // FLBA: exactly the width. BINARY: minimal, and every fifth value 18 sign bytes longer.
+                    int extra = i % 5 == 0 ? 18 : 0;
+                    byte[] w = new byte[fixed ? width : b.length + extra];
+                    java.util.Arrays.fill(w, x.signum() < 0 ? (byte) -1 : 0);
+                    System.arraycopy(b, 0, w, w.length - b.length, b.length);
+                    enc[i] = w;
+                    if (!fixed) {
+                        page.write(w.length & 0xFF);
+                        page.write((w.length >>> 8) & 0xFF);
+                        page.write(0);
+                        page.write(0);
+                    }
+                    page.writeBytes(w);
+                }
+                byte[] data = page.toByteArray();
+                for (boolean wide : new boolean[] {true, false}) {
+                    ColumnChunkDecoder d = new ColumnChunkDecoder(VecType.UTF8, VecType.UTF8, 0, 256, scalarFactory());
+                    d.setFixedLength(fixed ? width : 0);
+                    d.startChunk(n);
+                    try (Arena arena = Arena.ofConfined()) {
+                        MemorySegment out = arena.allocate(256L * 16, 16);
+                        int done = 0;
+                        while (done < n) {
+                            int want = Math.min(256, n - done);
+                            d.startBatch(want);
+                            int filled = 0;
+                            while (filled < want) {
+                                if (d.needsPage()) {
+                                    d.feedPage(ColumnChunkDecoder.Page.v1(data, n, ParquetPageDecoder.Encoding.PLAIN));
+                                }
+                                filled += d.readBatch(want - filled, filled);
+                            }
+                            d.flushDecimal(want, out, null, wide);
+                            for (int i = 0; i < want; i++) {
+                                java.math.BigInteger x = v[done + i];
+                                String what = "width "
+                                        + width
+                                        + (fixed ? " FLBA" : " BINARY")
+                                        + (wide ? " wide" : " long")
+                                        + " row "
+                                        + (done + i);
+                                if (wide) {
+                                    assertEquals(x.longValue(), out.get(ValueLayout.JAVA_LONG_UNALIGNED, (long) i << 4), what + " low limb");
+                                    assertEquals(x.shiftRight(64).longValue(),
+                                            out.get(ValueLayout.JAVA_LONG_UNALIGNED, ((long) i << 4) + 8), what + " high limb");
+                                } else {
+                                    assertEquals(sparkBinaryToUnscaledLong(enc[done + i]), out.get(ValueLayout.JAVA_LONG_UNALIGNED, (long) i << 3), what);
+                                }
+                            }
+                            done += want;
+                        }
+                    }
+                }
+            }
+        }
+        // 17 bytes whose top byte is not a sign extension of the low 16: no DECIMAL128 holds it.
+        byte[] w = new byte[17];
+        w[0] = 1;
+        ByteArrayOutputStream page = new ByteArrayOutputStream();
+        page.write(17);
+        page.write(0);
+        page.write(0);
+        page.write(0);
+        page.writeBytes(w);
+        ColumnChunkDecoder d = new ColumnChunkDecoder(VecType.UTF8, VecType.UTF8, 0, 8, scalarFactory());
+        d.startChunk(1);
+        d.feedPage(ColumnChunkDecoder.Page.v1(page.toByteArray(), 1, ParquetPageDecoder.Encoding.PLAIN));
+        d.startBatch(1);
+        d.readBatch(1, 0);
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment out = arena.allocate(16, 16);
+            org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class, () -> d.flushDecimal(1, out, null, true));
+        }
+        // A fixed-length page shorter than its values fails at the read, not past the page.
+        ColumnChunkDecoder s = new ColumnChunkDecoder(VecType.UTF8, VecType.UTF8, 0, 8, scalarFactory());
+        s.setFixedLength(16);
+        s.startChunk(2);
+        s.feedPage(ColumnChunkDecoder.Page.v1(new byte[20], 2, ParquetPageDecoder.Encoding.PLAIN));
+        s.startBatch(2);
+        org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class, () -> s.readBatch(2, 0));
+    }
+
+    /**
+     * Spark's ParquetRowConverter.binaryToUnscaledLong, verbatim: the INT64
+     * lane's reference.
+     */
+    private static long sparkBinaryToUnscaledLong(byte[] bytes) {
+        long unscaled = 0L;
+        for (byte b : bytes) {
+            unscaled = (unscaled << 8) | (b & 0xff);
+        }
+        int bits = 8 * bytes.length;
+        return (unscaled << (64 - bits)) >> (64 - bits);
+    }
+
+    /**
      * The BOOL batch loop, as the reader drives it: staging, then flushBool
      * into each batch's bitmaps.
      */
