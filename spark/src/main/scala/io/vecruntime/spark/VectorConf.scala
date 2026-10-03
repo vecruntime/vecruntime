@@ -76,6 +76,9 @@ object VectorConf {
 
   /** #603: a hash join emits its probe-side lane columns as views over the input, gathered on first read. */
   val JoinDeferredProbe = "spark.vecruntime.join.deferredProbe"
+
+  /** #603 step 2: a hash join emits its build-side lane columns as views over the build table. */
+  val JoinDeferredBuild = "spark.vecruntime.join.deferredBuild"
   val JoinBuildPayload = "spark.vecruntime.join.buildPayload"
   val CometRangeShuffleEnabled = "spark.vecruntime.comet.shuffle.range.enabled"
 
@@ -228,6 +231,12 @@ object VectorConf {
    * gathered once, by the first operator that reads it, or never.
    */
   def joinDeferredProbe(conf: SQLConf): Boolean = bool(conf, JoinDeferredProbe, default = true)
+
+  /**
+   * #603 step 2: a hash join emits its build-side lane columns as views over its build table (the build row
+   * ids, not copies), so a dimension string carried through a chain of joins is gathered once, where it is read.
+   */
+  def joinDeferredBuild(conf: SQLConf): Boolean = bool(conf, JoinDeferredBuild, default = true)
 
   /**
    * A broadcast hash join whose build side carries payload columns without a lane (arrays, maps,

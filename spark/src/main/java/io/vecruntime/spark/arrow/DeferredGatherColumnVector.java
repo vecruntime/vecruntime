@@ -44,21 +44,63 @@ import org.apache.spark.unsafe.types.UTF8String;
  */
 public final class DeferredGatherColumnVector extends ColumnVector {
 
+    /**
+     * Where the rows come from: gathers rows {@code idx} (-1 a null row) into a
+     * new column. A probe column's source is its input batch; a build column's
+     * is the join's build table, whose own gathers (heap mirrors, #565) it
+     * keeps using.
+     */
+    @FunctionalInterface
+    public interface Source {
+        ColumnVector gather(String name, DataType dt, int[] idx,
+                            BufferAllocator allocator);
+    }
+
     private final String name;
-    private final ColumnVector base;
-    private final int baseRows;
+    private final Source source;
     private final int[] idx;
     private final BufferAllocator allocator;
     private ColumnVector gathered;
 
-    private DeferredGatherColumnVector(String name, DataType dt, ColumnVector base,
-            int baseRows, int[] idx, BufferAllocator allocator) {
+    private DeferredGatherColumnVector(String name, DataType dt, Source source,
+            int[] idx, BufferAllocator allocator) {
         super(dt);
         this.name = name;
-        this.base = base;
-        this.baseRows = baseRows;
+        this.source = source;
         this.idx = idx;
         this.allocator = allocator;
+    }
+
+    /**
+     * A column of a batch of {@code numRows} rows as a source, adapted to
+     * buffers when gathered.
+     */
+    private static Source ofColumn(ColumnVector column, int numRows) {
+        return (name, dt, ids, allocator) -> {
+            try (Arena arena = Arena.ofConfined()) {
+                VectorBuffers in = ColumnVectorAdapters.adapt(column, numRows, arena);
+                return ArrowOutput.gather(name, dt, in, ids, 0, ids.length,
+                        allocator);
+            }
+        };
+    }
+
+    /**
+     * Rows {@code ids[from..to)} of {@code source} (#603 step 2: a build column
+     * through the build row ids). The source must outlive every batch the view
+     * is in; a join's build table does.
+     */
+    public static DeferredGatherColumnVector over(
+            String name,
+            DataType dt,
+            Source source,
+            int[] ids,
+            int from,
+            int to,
+            BufferAllocator allocator) {
+        int[] rows = new int[to - from];
+        System.arraycopy(ids, from, rows, 0, to - from);
+        return new DeferredGatherColumnVector(name, dt, source, rows, allocator);
     }
 
     /**
@@ -75,16 +117,14 @@ public final class DeferredGatherColumnVector extends ColumnVector {
             int from,
             int to,
             BufferAllocator allocator) {
-        int n = to - from;
         if (column instanceof BorrowedColumnVector b && b.inner() instanceof DeferredGatherColumnVector) {
             column = b.inner(); // a projection forwarded the view: compose through it
         }
         if (column instanceof DeferredGatherColumnVector d && d.gathered == null) {
             return d.compose(name, probe, from, to, allocator);
         }
-        int[] rows = new int[n];
-        System.arraycopy(probe, from, rows, 0, n);
-        return new DeferredGatherColumnVector(name, dt, column, numRows, rows, allocator);
+        return over(name, dt, ofColumn(column, numRows), probe, from,
+                to, allocator);
     }
 
     private DeferredGatherColumnVector compose(String outName, int[] probe, int from,
@@ -95,8 +135,7 @@ public final class DeferredGatherColumnVector extends ColumnVector {
             int p = probe[from + i];
             rows[i] = p < 0 ? -1 : idx[p];
         }
-        return new DeferredGatherColumnVector(outName, dataType(), base, baseRows, rows,
-                outAllocator);
+        return new DeferredGatherColumnVector(outName, dataType(), source, rows, outAllocator);
     }
 
     /** True once the column was read and gathered. */
@@ -107,11 +146,7 @@ public final class DeferredGatherColumnVector extends ColumnVector {
     /** The gathered column, gathering it on first use. */
     public ColumnVector gathered() {
         if (gathered == null) {
-            try (Arena arena = Arena.ofConfined()) {
-                VectorBuffers in = ColumnVectorAdapters.adapt(base, baseRows, arena);
-                gathered = ArrowOutput.gather(name, dataType(), in, idx, 0,
-                        idx.length, allocator);
-            }
+            gathered = source.gather(name, dataType(), idx, allocator);
             GATHERED.increment();
         }
         return gathered;
