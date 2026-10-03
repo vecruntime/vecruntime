@@ -379,6 +379,8 @@ object VectorConf {
   /** The decode-ahead producer's thread kind: `virtual` (the default) or `platform`. */
   def scanNativeParquetDecodeAheadVirtual(conf: SQLConf): Boolean =
     !conf.getConfString(ScanNativeParquetDecodeAheadThreads, "virtual").trim.equalsIgnoreCase("platform")
+
+  /**
    * #612: the native scan emits a string column's dictionary-encoded batches as dictionary vectors (ids over
    * the row group's dictionary) instead of resolving them into bytes, as Spark's scan path already hands them
    * to our operators. A row group whose pages fall back from the dictionary decodes flat from that page on.
