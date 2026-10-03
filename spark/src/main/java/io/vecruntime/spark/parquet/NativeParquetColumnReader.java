@@ -103,9 +103,12 @@ public final class NativeParquetColumnReader {
     private PageReader pages;
     private int rowGroupRows;
 
-    // A small pool of released batch vectors to reuse (bounded; extras are closed).
+    // A small pool of released batch vectors to reuse (bounded; extras are closed). Guarded by its own
+    // monitor: with decode-ahead (#606) the producer thread borrows while the task thread releases. On JDK 25 a
+    // monitor no longer pins a virtual thread (JEP 491).
     private final Deque<FieldVector> pool = new ArrayDeque<>();
-    private static final int MAX_POOL = 4;
+    private int maxPool = 4;
+    private boolean closed;
 
     public NativeParquetColumnReader(ColumnDescriptor column, VecType type, DataType sparkType,
             String name, int batchRows, BufferAllocator allocator) {
@@ -410,7 +413,7 @@ public final class NativeParquetColumnReader {
 
     private FieldVector borrowFixed(int rows) {
         long needValidity = io.vecruntime.kernels.Bitmap.bytesFor(rows);
-        FieldVector v = pool.pollFirst();
+        FieldVector v = pooled();
         while (v != null) {
             BaseFixedWidthVector fv = (BaseFixedWidthVector) v;
             // A BitVector has type width 0: its data is a bitmap, written by flushBool in whole 64-bit words.
@@ -420,7 +423,7 @@ public final class NativeParquetColumnReader {
                 return v;
             }
             v.close();
-            v = pool.pollFirst();
+            v = pooled();
         }
         BaseFixedWidthVector nv = (BaseFixedWidthVector) ArrowOutput.newVector(name, sparkType, allocator);
         nv.allocateNew(rows);
@@ -428,14 +431,14 @@ public final class NativeParquetColumnReader {
     }
 
     private FieldVector borrowUtf8(int rows, long bytes) {
-        FieldVector v = pool.pollFirst();
+        FieldVector v = pooled();
         while (v != null) {
             if (v.getValidityBuffer().capacity() >= io.vecruntime.kernels.Bitmap.bytesFor(rows) && v.getOffsetBuffer().capacity() >= (long) (rows + 1) * 4 && v.getDataBuffer().capacity() >= Math.max(bytes, 1L)) {
                 ((org.apache.arrow.vector.BaseVariableWidthVector) v).setValueCount(0);
                 return v;
             }
             v.close();
-            v = pool.pollFirst();
+            v = pooled();
         }
         org.apache.arrow.vector.BaseVariableWidthVector nv = (org.apache.arrow.vector.BaseVariableWidthVector) ArrowOutput.newVector(name, sparkType, allocator);
         nv.allocateNew(Math.max(bytes, 1L), rows);
@@ -450,10 +453,28 @@ public final class NativeParquetColumnReader {
         if (v == null) {
             return;
         }
-        if (pool.size() < MAX_POOL) {
-            pool.addLast(v);
-        } else {
-            v.close();
+        synchronized (pool) {
+            if (!closed && pool.size() < maxPool) {
+                pool.addLast(v);
+                return;
+            }
+        }
+        v.close();
+    }
+
+    /**
+     * How many released vectors the pool keeps (decode-ahead keeps more batches
+     * in flight).
+     */
+    public void setPoolLimit(int limit) {
+        synchronized (pool) {
+            maxPool = Math.max(1, limit);
+        }
+    }
+
+    private FieldVector pooled() {
+        synchronized (pool) {
+            return pool.pollFirst();
         }
     }
 
@@ -530,13 +551,16 @@ public final class NativeParquetColumnReader {
 
     /**
      * Releases the pool. The scratch arena is automatic: the GC frees it once
-     * the reader is unreachable.
+     * the reader is unreachable. A vector released after this is closed, not pooled.
      */
     public void close() {
-        for (FieldVector v : pool) {
-            v.close();
+        synchronized (pool) {
+            closed = true;
+            for (FieldVector v : pool) {
+                v.close();
+            }
+            pool.clear();
         }
-        pool.clear();
     }
 
     public ColumnDescriptor column() {

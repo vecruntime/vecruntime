@@ -65,6 +65,13 @@ A few rules hold the design together:
 - **Metrics.** Task input metrics follow `FileScanRDD`: records are counted per batch, and bytes are the task thread's FileSystem read count plus the bytes each prefetch step read on its own thread.
 - **Memory.** Per task, read-ahead adds up to N opened files and M row groups of compressed pages. It is not yet capped in bytes; see the work list.
 
+**Decode-ahead (#606, off by default).** With `…nativeParquet.decodeAhead` = K, the reader loop runs on a producer thread of the task's own, up to K batches ahead (`DecodeAheadIterator`). The task thread takes batches in order and runs the operators above the scan on them, while the producer decodes the next ones across row groups and files.
+- **Ownership.** A batch is the consumer's until its next `next()`, when its vectors go back to their column reader's pool. The pool is guarded for the two threads; a vector released after its file closed is closed instead.
+- **Fallback files.** A batch of Spark's fallback reader is recycled by that reader, so the producer waits until the consumer has moved past it.
+- **Threads.** A fresh virtual thread per task by default, or a platform thread. The first batch is decoded on the task thread, so the decoder's classes are initialized before a virtual thread runs it; file opens stay on the platform prefetch pool. A fresh thread also keeps the task's FileSystem byte count right.
+- **Close.** At task end, LIMIT or failure, the producer is stopped, the queue is drained, the producer is joined, and only then is the reader closed. A producer failure is rethrown on the task thread in order.
+- **Tests.** `DecodeAheadSuite` checks results against Spark's reader for K = 1 and 4 on both thread kinds, across row groups and files; a LIMIT that ends the task early, with the allocator back at its baseline; a table mixing native and fallback files; and a producer failure.
+
 **Arena lifetime.** A column reader exists per column per file, so it must not close a shared FFM arena. Closing a shared arena triggers a JVM-wide handshake, and on q88 those handshakes cost 8–9% of executor CPU; with GC-managed scratch they are 0.2–0.4%.
 
 ## Support matrix
@@ -242,7 +249,7 @@ The corpus approach follows Hardwood (`hardwood-hq/hardwood`), as does bounding 
   - Being validated: warming the method's branch profile at class initialization.
 
   This is not specific to the native scan. It also happens with the flag off, less often.
-- **Decode row groups in parallel for large files.** Read-ahead overlaps I/O with decode, but decode itself is serial per task. Files with many large row groups could decode the row group after next on a second thread into separately owned vectors, while keeping the batch order.
+- **Decode in parallel (#606).** Decode-ahead (above) runs decoding on a producer thread per task, off by default until measured. If one producer turns out to be the bottleneck on files with many large row groups, a second decoder on alternate row groups is the next step.
 - **Cap the read-ahead in bytes.** Bound how much read-ahead each task and each executor keeps in flight by compressed bytes, not just by depth, so wide row groups cannot exhaust memory.
 - **Row filtering during decode (late materialization).** Decode the predicate columns first, then decode the other columns only for the rows that survive, using the page index's row ranges. q88 and q9-style predicates over a few columns would benefit. Measure it against Comet with `rowFilterPushdown` on.
 - **TLS and HTTP client CPU** (about 46% of q88's executor CPU). Options: fewer and larger range reads, which means tuning the Analytics Accelerator's block sizes; HTTP/1.1 connection reuse settings; and checking that the CRT-based client really uses ACCP's AES-GCM.

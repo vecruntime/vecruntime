@@ -88,6 +88,12 @@ object VectorConf {
   /** VectorParquetScanExec read-ahead (#559/#566): row groups of the current file read ahead, `0` off. */
   val ScanNativeParquetPrefetchRowGroups = "spark.vecruntime.scan.nativeParquet.prefetchRowGroups"
 
+  /** VectorParquetScanExec decode-ahead (#606): batches decoded ahead on a producer thread, `0` off. */
+  val ScanNativeParquetDecodeAhead = "spark.vecruntime.scan.nativeParquet.decodeAhead"
+
+  /** The decode-ahead producer's thread kind (#606): `virtual` or `platform`. */
+  val ScanNativeParquetDecodeAheadThreads = "spark.vecruntime.scan.nativeParquet.decodeAhead.threads"
+
   /** Mixed chains (#280): Comet's native operators above ours through the sink leaf. Off until #281 decides an allowlist. */
   val CometMixedEnabled = "spark.vecruntime.comet.mixed.enabled"
 
@@ -360,6 +366,17 @@ object VectorConf {
    */
   def scanNativeParquetPrefetchRowGroups(conf: SQLConf): Int =
     intIn(conf, ScanNativeParquetPrefetchRowGroups, 2, 16)
+
+  /**
+   * Decode-ahead (#606): how many batches `VectorParquetScanExec` decodes ahead of the task thread, on a
+   * producer thread of each task's own, so decoding overlaps the operators above the scan. `0` (the default
+   * until measured) decodes on the task thread. Memory per task grows by up to N batches. Capped at 16.
+   */
+  def scanNativeParquetDecodeAhead(conf: SQLConf): Int = intIn(conf, ScanNativeParquetDecodeAhead, 0, 16)
+
+  /** The decode-ahead producer's thread kind: `virtual` (the default) or `platform`. */
+  def scanNativeParquetDecodeAheadVirtual(conf: SQLConf): Boolean =
+    !conf.getConfString(ScanNativeParquetDecodeAheadThreads, "virtual").trim.equalsIgnoreCase("platform")
 
   private def intIn(conf: SQLConf, key: String, default: Int, max: Int): Int =
     scala.util.Try(conf.getConfString(key, default.toString).trim.toInt).toOption.map(n =>
