@@ -91,6 +91,8 @@ case "$CONFIG" in
             --conf spark.memory.offHeap.enabled=true --conf "spark.memory.offHeap.size=$OFFHEAP") ;;
   *) echo "unknown config $CONFIG (spark, vector, vector-shuffle, vector-shuffle-strict, comet-scan, comet-scan-vector-shuffle, comet-scan-vector-ourshuffle, hybrid, comet)" >&2; exit 2 ;;
 esac
+# #559: every engine runs with no locality wait, so all are scheduled alike (TpchRunner.NoLocalityWait).
+ENGINE+=(--conf spark.locality.wait=0)
 JARS=()
 # The Comet jar: on the cluster image (benchmarks/k8s/Dockerfile) it is already on the classpath; set COMET_JAR for a plain Spark image.
 case "$CONFIG" in comet*|hybrid) if [ -n "${COMET_JAR:-}" ]; then JARS=(--jars "$COMET_JAR"); fi ;; esac
