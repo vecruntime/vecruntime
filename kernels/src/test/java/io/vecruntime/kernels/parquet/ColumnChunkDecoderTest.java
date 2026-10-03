@@ -827,7 +827,9 @@ class ColumnChunkDecoderTest {
             }
             done += want;
         }
-        return ArrowLayout.ofBooleans(arena, values, hasNulls ? nullsOut : null);
+        return skipChecked(d, pages, VecType.BOOL, rows, batchRows,
+                new DecodeResult(ArrowLayout.ofBooleans(arena, values, hasNulls ? nullsOut : null), 0))
+                             .buffers;
     }
 
     @Test
@@ -1259,7 +1261,8 @@ class ColumnChunkDecoderTest {
         int totalNulls = drive(d, pages, lane, rows, batchRows, outData,
                 outValidity, arena);
         MemorySegment viewValidity = hasNulls ? outValidity : null;
-        return new DecodeResult(SegmentVectorBuffers.fixedWidth(lane, rows, viewValidity, outData), totalNulls);
+        return skipChecked(d, pages, lane, rows, batchRows,
+                new DecodeResult(SegmentVectorBuffers.fixedWidth(lane, rows, viewValidity, outData), totalNulls));
     }
 
     private DecodeResult runStreamingUtf8(ColumnChunkDecoder d, List<PreparedPage> pages, int rows,
@@ -1316,7 +1319,113 @@ class ColumnChunkDecoderTest {
         MemorySegment fullData = ArrowLayout.allocateBytes(arena, Math.max(all.length, 1));
         MemorySegment.copy(MemorySegment.ofArray(all), 0, fullData, 0, all.length);
         MemorySegment viewValidity = hasNulls ? outValidity : null;
-        return new DecodeResult(SegmentVectorBuffers.utf8(rows, viewValidity, outOffsets, fullData), totalNulls);
+        return skipChecked(d, pages, VecType.UTF8, rows, batchRows,
+                new DecodeResult(SegmentVectorBuffers.utf8(rows, viewValidity, outOffsets, fullData), totalNulls));
+    }
+
+    /**
+     * #611: decodes the same pages again through a twin of {@code d}, skipping
+     * random runs of rows ({@link ColumnChunkDecoder#skip}) between reads of
+     * random length, and asserts every row read equals the full decode's {@code
+     * r}. Runs of 0 to two batches, reads of 1 to one batch: skips start and
+     * end mid-page, mid-run, mid-miniblock and mid-prefix-chain, and a read
+     * follows a skip within one batch.
+     */
+    private static DecodeResult skipChecked(ColumnChunkDecoder d, List<PreparedPage> pages, VecType lane,
+            int rows, int batchRows, DecodeResult r) {
+        for (long seed = 0; seed < 3; seed++) {
+            Random rnd = new Random(611L * rows + 31L * batchRows + seed);
+            ColumnChunkDecoder t = d.twin(batchRows);
+            int pos = 0;
+            int pageIdx = 0;
+            try (Arena arena = Arena.ofConfined()) {
+                while (pos < rows) {
+                    int s = Math.min(rows - pos,
+                            rnd.nextInt(3) == 0 ? 0 : rnd.nextInt(2 * batchRows + 1));
+                    int skipped = 0;
+                    while (skipped < s) {
+                        if (t.needsPage()) {
+                            t.feedPage(pages.get(pageIdx++)
+                                            .page());
+                        }
+                        skipped += t.skip(s - skipped);
+                    }
+                    pos += s;
+                    if (pos >= rows) {
+                        break;
+                    }
+                    int want = Math.min(rows - pos, 1 + rnd.nextInt(batchRows));
+                    t.startBatch(want);
+                    int filled = 0;
+                    while (filled < want) {
+                        if (t.needsPage()) {
+                            t.feedPage(pages.get(pageIdx++)
+                                            .page());
+                        }
+                        // A skip of zero rows mid-batch must not disturb it.
+                        t.skip(0);
+                        filled += t.readBatch(want - filled, filled);
+                    }
+                    if (t.batchIsDictionaryIds()) {
+                        return r; // ids, not values: covered by the id tests
+                    }
+                    VectorBuffers b = flushTwin(t, lane, want, arena);
+                    for (int i = 0; i < want; i++) {
+                        assertSameRow(r.buffers, pos + i, b, i, lane,
+                                "skip seed " + seed);
+                    }
+                    pos += want;
+                }
+            }
+        }
+        return r;
+    }
+
+    private static VectorBuffers flushTwin(ColumnChunkDecoder t, VecType lane, int n,
+            Arena arena) {
+        boolean nulls = t.batchNullCount() > 0;
+        MemorySegment validity = ArrowLayout.allocateBitmap(arena, n);
+        switch (lane) {
+            case UTF8 -> {
+                MemorySegment offsets = ArrowLayout.allocateOffsets(arena, n);
+                MemorySegment data = ArrowLayout.allocateBytes(arena, Math.max(t.utf8Bytes(), 1));
+                t.flushUtf8(n, offsets, data, nulls ? validity : null);
+                return SegmentVectorBuffers.utf8(n, nulls ? validity : null, offsets, data);
+            }
+            case BOOL -> {
+                MemorySegment data = ArrowLayout.allocateBitmap(arena, n);
+                t.flushBool(n, data, nulls ? validity : null);
+                boolean[] v = new boolean[n];
+                boolean[] isNull = new boolean[n];
+                for (int i = 0; i < n; i++) {
+                    v[i] = ((data.get(ValueLayout.JAVA_BYTE, i >>> 3) >>> (i & 7)) & 1) != 0;
+                    isNull[i] = nulls && ((validity.get(ValueLayout.JAVA_BYTE, i >>> 3) >>> (i & 7)) & 1) == 0;
+                }
+                return ArrowLayout.ofBooleans(arena, v, nulls ? isNull : null);
+            }
+            default -> {
+                MemorySegment data = ArrowLayout.allocateData(arena, lane, n);
+                t.flushFixed(n, data, nulls ? validity : null);
+                return SegmentVectorBuffers.fixedWidth(lane, n, nulls ? validity : null, data);
+            }
+        }
+    }
+
+    private static void assertSameRow(VectorBuffers want, int wi, VectorBuffers got,
+            int gi, VecType lane, String what) {
+        String at = what + " row " + wi;
+        assertEquals(want.isNull(wi), got.isNull(gi), at + " null");
+        if (want.isNull(wi)) {
+            return;
+        }
+        switch (lane) {
+            case INT32 -> assertEquals(want.getInt(wi), got.getInt(gi), at);
+            case INT64 -> assertEquals(want.getLong(wi), got.getLong(gi), at);
+            case FLOAT64 -> assertEquals(Double.doubleToRawLongBits(want.getDouble(wi)), Double.doubleToRawLongBits(got.getDouble(gi)), at);
+            case BOOL -> assertEquals(want.getBoolean(wi), got.getBoolean(gi), at);
+            case UTF8 -> org.junit.jupiter.api.Assertions.assertArrayEquals(want.getUtf8Bytes(wi), got.getUtf8Bytes(gi), at);
+            default -> throw new IllegalArgumentException(lane.toString());
+        }
     }
 
     private static void setBit(MemorySegment bitmap, int i, boolean set) {
@@ -1522,7 +1631,8 @@ class ColumnChunkDecoderTest {
         MemorySegment outValidity = ArrowLayout.allocateBitmap(arena, Math.max(rows, 1));
         int totalNulls = drive(d, pages, VecType.INT32, rows, batchRows, outData,
                 outValidity, arena);
-        return new DecodeResult(SegmentVectorBuffers.fixedWidth(VecType.INT32, rows, hasNulls ? outValidity : null, outData), totalNulls);
+        return skipChecked(d, pages, VecType.INT32, rows, batchRows,
+                new DecodeResult(SegmentVectorBuffers.fixedWidth(VecType.INT32, rows, hasNulls ? outValidity : null, outData), totalNulls));
     }
 
     private DecodeResult decodeUtf8(String[] v, Arena arena, int pages,
