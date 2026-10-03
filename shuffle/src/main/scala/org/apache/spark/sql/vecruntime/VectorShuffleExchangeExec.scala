@@ -265,6 +265,17 @@ object VectorShuffleExchangeExec {
   val SparkCompressionKey = "spark.vecruntime.shuffle.aqe.sparkCompressionRatio"
   val DefaultSparkCompression = 0.0
 
+  /**
+   * Whether the reduce tasks of our shuffle report preferred locations (the hosts holding most of their map
+   * output, or a skew split's mappers), as Spark's `ShuffledRowRDD` does under
+   * `spark.shuffle.reduceLocality.enabled`. Off by default (#559): the preference collapsed whole stages onto
+   * one host behind the 3 s locality wait; the network fetch a local read saves cost less. Spark's own
+   * flag still applies when this is on.
+   */
+  val ReduceLocalityKey = "spark.vecruntime.shuffle.reduceLocality.enabled"
+
+  def reduceLocality(conf: org.apache.spark.SparkConf): Boolean = conf.getBoolean(ReduceLocalityKey, false)
+
   def mapSizesScaled(origin: ShuffleOrigin, conf: SQLConf): Boolean = origin match {
     case REBALANCE_PARTITIONS_BY_COL | REBALANCE_PARTITIONS_BY_NONE => false
     case _ => conf.getConfString(MapSizeScalingKey, "true").toBoolean
@@ -472,6 +483,13 @@ final class ShuffledColumnarRDD(
     Array.tabulate[Partition](partitionSpecs.length)(i => new ShuffledColumnarRDDPartition(i, partitionSpecs(i)))
 
   override def getPreferredLocations(partition: Partition): Seq[String] = {
+    // Reduce-side locality is off unless asked for (spark.vecruntime.shuffle.reduceLocality.enabled). Spark
+    // prefers the hosts holding >= 20% of a reduce partition's map output, and a shuffled join intersects
+    // both sides' hosts -- often down to ONE host, where every task queues for its 13 slots until the 3 s
+    // locality wait sends the rest elsewhere, and the next stage, whose input now sits on that host, repeats
+    // it. A local read only saves fetching that executor's blocks. 1 TB TPC-DS A/B (2026-10-03, 2+2 legs):
+    // q81 -67%, q31 -42%, q87 -37%, q18 -24%, q30 -22%, q95 +2.5%, checksums equal.
+    if (!VectorShuffleExchangeExec.reduceLocality(SparkEnv.get.conf)) return Nil
     val tracker = SparkEnv.get.mapOutputTracker.asInstanceOf[org.apache.spark.MapOutputTrackerMaster]
     partition.asInstanceOf[ShuffledColumnarRDDPartition].spec match {
       case CoalescedPartitionSpec(startReducerIndex, endReducerIndex, _) =>

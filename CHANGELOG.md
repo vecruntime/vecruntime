@@ -26,6 +26,19 @@ version may change configuration keys or defaults, always noted here.
 
 ### Changed
 
+- Our shuffle's reduce tasks no longer report preferred locations (#559; `spark.vecruntime.shuffle.reduceLocality.enabled`, default `false`). Spark prefers the hosts holding at least 20% of a reduce partition's map output, and a shuffled join intersects both sides' hosts. At 1 TB that often left one host, so its 13 slots ran a whole post-shuffle stage while the remaining tasks waited out the 3 s locality wait, and the next stage, reading that host's output, repeated it. A reducer still reads its own executor's blocks locally, so locality saves some network fetch, but the wait cost far more. TPC-DS 1 TB, our engine with our reader, two legs each way, alternating:
+
+  | query | locality on (s) | off (s) | change |
+  |---|---|---|---|
+  | q81 | 13.28 | 4.40 | -67% |
+  | q31 | 7.92 | 4.61 | -42% |
+  | q87 | 16.03 | 10.11 | -37% |
+  | q18 | 6.25 | 4.77 | -24% |
+  | q30 | 10.57 | 8.25 | -22% |
+  | q95 | 26.25 | 26.91 | +2.5% |
+
+  Checksums are equal in every leg.
+
 - Faster v2 page decoding in the native Parquet scan (#559). JMH, x86 / Graviton4:
   - `BYTE_STREAM_SPLIT` transposes instead of gathering bytes: 3.7x / 2.0x on DOUBLE and INT64. It uses the Vector API
     from 256-bit vectors and SWAR at 128 bits, where the Vector API's byte-to-long widening is not intrinsified
