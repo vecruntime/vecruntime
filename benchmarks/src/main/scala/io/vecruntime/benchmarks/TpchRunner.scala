@@ -113,7 +113,11 @@ object TpchRunner {
 
   /** Spark configurations under comparison. Comet configs need the Comet jar on the classpath. */
   val Configs: Map[String, Map[String, String]] = Map(
-    "spark" -> Map.empty,
+    // #559: no locality wait. On S3 the scans have no locality to wait for, and the reduce-side preference
+    // piled post-shuffle stages onto one host behind the 3 s wait (1 TB A/B 2026-10-03: q81 -61%, q18 -46%,
+    // q30 -34%, q31 -26%, q87 -14%, q95 -4%; six queries 182.9 -> 151.8 s, checksums equal). Our engine drops
+    // its reduce-side preference instead (spark.vecruntime.shuffle.reduceLocality.enabled, default false).
+    "spark" -> Map("spark.locality.wait" -> "0"),
     "vector" -> VectorFast,
     // #288: our columnar exchange over Arrow IPC files and Arrow Flight, no row conversion around shuffles.
     "vector-shuffle" -> (VectorFast ++ Map(

@@ -59,7 +59,8 @@ COMET_SCAN_ONLY=(--conf spark.comet.enabled=true --conf spark.comet.scan.enabled
         --conf spark.comet.exec.explode.enabled=false --conf spark.comet.exec.sample.enabled=false
         --conf spark.memory.offHeap.enabled=true --conf "spark.memory.offHeap.size=$OFFHEAP")
 case "$CONFIG" in
-  spark) ENGINE=() ;;
+  # #559: no locality wait for Spark (TpchRunner.Configs explains the A/B).
+  spark) ENGINE=(--conf spark.locality.wait=0) ;;
   vector) ENGINE=("${VECTOR[@]}") ;;
   vector-shuffle)
     ENGINE=("${VECTOR[@]}" --conf spark.shuffle.manager=org.apache.spark.sql.vecruntime.shuffle.VectorShuffleManager
