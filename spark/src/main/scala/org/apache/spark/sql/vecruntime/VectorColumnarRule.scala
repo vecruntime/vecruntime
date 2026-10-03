@@ -680,7 +680,18 @@ case class VectorExecRule(session: SparkSession) extends Rule[SparkPlan] with Lo
       val refs = cond.references.map(_.name).toSet
       val compiles = ExpressionCompiler.compilePredicate(cond, s.output).isRight
       val dataRefs = refs.intersect(data)
-      if (compiles && refs.subsetOf(s.output.map(_.name).toSet) && dataRefs.nonEmpty && dataRefs.size < data.size)
+      // A conjunction of null checks (the join-key guards on every TPC-DS fact scan) drops almost nothing.
+      def conjuncts(e: org.apache.spark.sql.catalyst.expressions.Expression)
+          : Seq[org.apache.spark.sql.catalyst.expressions.Expression] =
+        e match {
+          case org.apache.spark.sql.catalyst.expressions.And(l, r) => conjuncts(l) ++ conjuncts(r)
+          case other => Seq(other)
+        }
+      val onlyNullChecks = conjuncts(cond).forall(_.isInstanceOf[org.apache.spark.sql.catalyst.expressions.IsNotNull])
+      if (
+        compiles && !onlyNullChecks && refs.subsetOf(s.output.map(_.name).toSet) && dataRefs.nonEmpty &&
+        dataRefs.size < data.size
+      )
         f.copy(child = s.copy(decodeFilter = Some(cond)))
       else f
   }

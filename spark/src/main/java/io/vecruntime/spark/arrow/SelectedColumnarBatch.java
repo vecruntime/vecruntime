@@ -67,16 +67,16 @@ public final class SelectedColumnarBatch extends ColumnarBatch {
     }
 
     /**
-     * {@link #of} with the selection in a shared arena: for a batch made on one
+     * {@link #of} with the selection on the heap: for a batch made on one
      * thread and read on another (the native scan's decode filter under
-     * decode-ahead, #611).
+     * decode-ahead, #611). Not a shared arena: closing one is a handshake with
+     * every thread, which per batch cost the scan several times its decode.
      */
-    public static SelectedColumnarBatch ofShared(ColumnVector[] columns, int numRows, MemorySegment selection,
+    public static SelectedColumnarBatch ofHeap(ColumnVector[] columns, int numRows, MemorySegment selection,
             int selectedCount, boolean ownsColumns) {
-        Arena arena = Arena.ofShared();
-        MemorySegment copy = ArrowLayout.allocateBitmap(arena, numRows);
+        MemorySegment copy = MemorySegment.ofArray(new long[(numRows + 63) >>> 6]);
         BitmapKernels.copy(selection, copy, numRows);
-        return new SelectedColumnarBatch(columns, numRows, arena, copy, selectedCount, ownsColumns);
+        return new SelectedColumnarBatch(columns, numRows, null, copy, selectedCount, ownsColumns);
     }
 
     /**
@@ -117,6 +117,8 @@ public final class SelectedColumnarBatch extends ColumnarBatch {
                 column(i).close();
             }
         }
-        arena.close();
+        if (arena != null) {
+            arena.close();
+        }
     }
 }

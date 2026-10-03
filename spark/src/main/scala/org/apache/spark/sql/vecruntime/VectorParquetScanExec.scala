@@ -540,7 +540,10 @@ private[vecruntime] final class VectorParquetPartitionReader(
             owned(partitionSchema.length + c) = v
             columns(c) = v
           } else {
-            val fv = if (count == n) r.readBatch(n) else r.readBatchSelected(n, selection)
+            // At the survivors only when they are few: a dense or scattered selection is many short runs, and a
+            // run costs a call into the decoder; then the whole batch is decoded and the selection carried.
+            val sparse = count <= n * VectorParquetPartitionReader.LateMaxFraction
+            val fv = if (count == n || !sparse) r.readBatch(n) else r.readBatchSelected(n, selection)
             dataVectors(c) = fv
             columns(c) = r.wrap(fv)
           }
@@ -548,8 +551,8 @@ private[vecruntime] final class VectorParquetPartitionReader(
         c += 1
       }
       metrics.numLateSkippedRows += n - count
-      // Shared: under decode-ahead the batch is made on the producer thread and read on the task thread.
-      if (count == n) null else SelectedColumnarBatch.ofShared(columns, n, selection, count, false)
+      // On the heap: under decode-ahead the batch is made on the producer thread and read on the task thread.
+      if (count == n) null else SelectedColumnarBatch.ofHeap(columns, n, selection, count, false)
     }
 
   /** A decode-filtered batch's selection lives in its own arena (its columns are released as usual). */
@@ -1015,6 +1018,10 @@ private[vecruntime] final class VectorParquetPartitionReader(
 }
 
 private[vecruntime] object VectorParquetPartitionReader {
+
+  /** #611: the largest surviving fraction a batch is decoded at its survivors for; `vecruntime.lateMaterialization.maxFraction`. */
+  val LateMaxFraction: Double =
+    java.lang.Double.parseDouble(System.getProperty("vecruntime.lateMaterialization.maxFraction", "0.05"))
 
   /**
    * A decoded batch with what it owns (#606): its data vectors (each returned to `readers(c)`'s pool) and

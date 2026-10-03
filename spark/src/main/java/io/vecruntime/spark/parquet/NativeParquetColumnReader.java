@@ -425,10 +425,7 @@ public final class NativeParquetColumnReader {
         int i = 0;
         while (i < n) {
             boolean sel = bit(selection, i);
-            int j = i + 1;
-            while (j < n && bit(selection, j) == sel) {
-                j++;
-            }
+            int j = nextDifferent(selection, i, n, sel);
             int done = 0;
             while (done < j - i) {
                 if (decoder.needsPage()) {
@@ -438,6 +435,31 @@ public final class NativeParquetColumnReader {
             }
             i = j;
         }
+    }
+
+    /**
+     * The first row at or after {@code from} whose bit is not {@code sel}, or
+     * {@code n}: a word at a time.
+     */
+    private static int nextDifferent(java.lang.foreign.MemorySegment bits, int from, int n,
+            boolean sel) {
+        int w = from >>> 6;
+        int words = io.vecruntime.kernels.Bitmap.wordsFor(n);
+        long word = io.vecruntime.kernels.Bitmap.wordAt(bits, w, n);
+        if (sel) {
+            word = ~word;
+        }
+        word &= -1L << (from & 63);
+        while (word == 0L) {
+            if (++w >= words) {
+                return n;
+            }
+            word = io.vecruntime.kernels.Bitmap.wordAt(bits, w, n);
+            if (sel) {
+                word = ~word;
+            }
+        }
+        return Math.min(n, (w << 6) + Long.numberOfTrailingZeros(word));
     }
 
     private static boolean bit(java.lang.foreign.MemorySegment bits, int i) {
