@@ -269,7 +269,7 @@ object VectorShuffleExchangeExec {
    * Whether the reduce tasks of our shuffle report preferred locations (the hosts holding most of their map
    * output, or a skew split's mappers), as Spark's `ShuffledRowRDD` does under
    * `spark.shuffle.reduceLocality.enabled`. Off by default (#559): the preference collapsed whole stages onto
-   * one host behind the 3 s locality wait, and our reducers fetch over the network either way. Spark's own
+   * one host behind the 3 s locality wait; the network fetch a local read saves cost less. Spark's own
    * flag still applies when this is on.
    */
   val ReduceLocalityKey = "spark.vecruntime.shuffle.reduceLocality.enabled"
@@ -487,7 +487,7 @@ final class ShuffledColumnarRDD(
     // prefers the hosts holding >= 20% of a reduce partition's map output, and a shuffled join intersects
     // both sides' hosts -- often down to ONE host, where every task queues for its 13 slots until the 3 s
     // locality wait sends the rest elsewhere, and the next stage, whose input now sits on that host, repeats
-    // it. Our reducers fetch every block over the network anyway. 1 TB TPC-DS A/B (2026-10-03, 2+2 legs):
+    // it. A local read only saves fetching that executor's blocks. 1 TB TPC-DS A/B (2026-10-03, 2+2 legs):
     // q81 -67%, q31 -42%, q87 -37%, q18 -24%, q30 -22%, q95 +2.5%, checksums equal.
     if (!VectorShuffleExchangeExec.reduceLocality(SparkEnv.get.conf)) return Nil
     val tracker = SparkEnv.get.mapOutputTracker.asInstanceOf[org.apache.spark.MapOutputTrackerMaster]
