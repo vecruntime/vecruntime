@@ -93,6 +93,7 @@ object VectorConf {
 
   /** The decode-ahead producer's thread kind (#606): `virtual` or `platform`. */
   val ScanNativeParquetDecodeAheadThreads = "spark.vecruntime.scan.nativeParquet.decodeAhead.threads"
+
   /** VectorParquetScanExec (#612): dictionary-encoded string columns as dictionary vectors, default on. */
   val ScanNativeParquetDictionaryStrings = "spark.vecruntime.scan.nativeParquet.dictionaryStrings"
 
