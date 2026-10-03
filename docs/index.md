@@ -116,5 +116,5 @@ Comet. The per-query tables and configurations are on the
 - [Comet as the scan](comet.html), [Apache Iceberg](iceberg.html),
   [The Flight shuffle](flight-shuffle.html).
 - [Native Parquet reader](native-parquet-reader.html) -- design of `VectorParquetScanExec` (#559): data
-  path, read-ahead, what it decodes today and the work list (DELTA / BYTE_STREAM_SPLIT encodings, more
-  types, nested, late materialization).
+  path, read-ahead, the support matrix (every flat type and v1/v2 encoding; INT96 and nested types go
+  to Spark's reader), how it is tested, and the work list (nested types, late materialization).

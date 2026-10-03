@@ -113,8 +113,8 @@ only once all of these pass:
 - **parquet-java cross-checks, against its writers and its readers.** `ParquetPageDecoderCrossCheckSuite`
   and `DeltaBinaryPackedCrossCheckSuite` encode values with parquet-java's own `ValuesWriter`s. Those
   are the writers Spark, Hive and most JVM engines use: `PLAIN`, RLE/dictionary, `DELTA_BINARY_PACKED`,
-  `DELTA_LENGTH_BYTE_ARRAY`, `DELTA_BYTE_ARRAY`, `BYTE_STREAM_SPLIT`, and the boolean `PLAIN` and `RLE`
-  writers. The suites decode the same bytes with our decoder and with parquet-java's matching
+  `DELTA_LENGTH_BYTE_ARRAY`, `DELTA_BYTE_ARRAY`, `BYTE_STREAM_SPLIT` (FLOAT bits included, NaN payloads and
+  -0.0), the boolean `PLAIN` and `RLE` writers, and the fixed-length byte-array writers used for decimals. The suites decode the same bytes with our decoder and with parquet-java's matching
   `ValuesReader`, and require identical values.
 - **Round trips through Spark** (`VectorParquetScanSuite`). The suite writes v1 and v2 pages, with and
   without dictionaries, and with nulls, several row groups and filters. Each query must return Spark's
