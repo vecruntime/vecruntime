@@ -109,7 +109,8 @@ trait VectorHashJoinLike extends VectorBinaryExec {
     buildPlan.output.map(_.dataType).toArray,
     streamedPlan.output.length,
     dropNullStreamedKeys = isNullAwareAntiJoin,
-    denseKeys = io.vecruntime.spark.VectorConf.joinDenseKeys(conf)
+    denseKeys = io.vecruntime.spark.VectorConf.joinDenseKeys(conf),
+    deferredProbe = io.vecruntime.spark.VectorConf.joinDeferredProbe(conf)
   )
 
   override def verboseStringWithOperatorId(): String = {
@@ -144,7 +145,9 @@ final case class JoinSpec(
      */
     dropNullStreamedKeys: Boolean = false,
     /** Probe a single small-range integer key through a [[io.vecruntime.kernels.DenseKeyIndex]] (#546). */
-    denseKeys: Boolean = true
+    denseKeys: Boolean = true,
+    /** Probe-side lane columns as not-yet-gathered views over the input (#603), gathered on first read. */
+    deferredProbe: Boolean = true
 )
 
 /**
@@ -1340,6 +1343,20 @@ private[vecruntime] class VectorHashJoinIterator(
           ArrowOutput.gatherHeap(name, dt, build.mirror(buildOrdinal(c)), bld, from, to, allocator, gatherScratch)
         else if (isBuildColumn(c) && dt.isInstanceOf[StringType] && build.utf8Mirror(buildOrdinal(c)) != null)
           ArrowOutput.gatherUtf8Heap(name, build.utf8Mirror(buildOrdinal(c)), bld, from, to, allocator, utf8Scratch)
+        else if (
+          !isBuildColumn(c) && spec.deferredProbe && TypeMapping.hasLane(dt) && ctx.column(streamedOrdinal(c)) != null
+        )
+          // #603: a view over the input batch through the probe ids; gathered when something reads it.
+          io.vecruntime.spark.arrow.DeferredGatherColumnVector.of(
+            name,
+            dt,
+            ctx.column(streamedOrdinal(c)),
+            ctx.numRows,
+            probe,
+            from,
+            to,
+            allocator
+          )
         else if (!isBuildColumn(c) && TypeMapping.hasLane(dt) && streamedMirror(ctx, streamedOrdinal(c)) != null)
           ArrowOutput.gatherHeap(
             name,

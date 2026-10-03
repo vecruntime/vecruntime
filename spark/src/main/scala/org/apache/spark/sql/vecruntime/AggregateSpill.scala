@@ -257,6 +257,7 @@ object AggregateSpill {
   }
 
   private[vecruntime] def vectorOf(col: ColumnVector): FieldVector = col match {
+    case d: io.vecruntime.spark.arrow.DeferredGatherColumnVector => vectorOf(d.gathered())
     case v: VectorArrowColumnVector => v.getValueVector.asInstanceOf[FieldVector]
     case d: VectorDecimalColumnVector => d.vector()
     // A tinyint/smallint column rides an INT32 lane in an IntVector (#327).
