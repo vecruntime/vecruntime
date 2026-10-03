@@ -44,6 +44,13 @@ final case class DictionaryMemoExpr(child: VectorExpr, ordinal: Int) extends Vec
   /** The last dictionary seen (its data and offsets segments) and the results over it, on the heap. */
   @transient @volatile private var memo: DictionaryMemoExpr.Memo = _
 
+  /**
+   * The dictionary of the previous batch, when it was seen once and not memoized: a memo is built on the
+   * second batch over the same dictionary, so a per-batch dictionary (an exchange's, an aggregate's
+   * output) never pays for one.
+   */
+  @transient @volatile private var seen: DictionaryMemoExpr.Memo = _
+
   override def eval(ctx: EvalContext): VectorBuffers = {
     val in = ctx.input(ordinal)
     if (!in.isDictionaryEncoded) return child.eval(ctx)
@@ -51,6 +58,11 @@ final case class DictionaryMemoExpr(child: VectorExpr, ordinal: Int) extends Vec
     if (dict.length() >= ctx.numRows) return child.eval(ctx)
     var m = memo
     if (m == null || !m.isFor(dict)) {
+      val s = seen
+      if (s == null || !s.isFor(dict)) {
+        seen = DictionaryMemoExpr.Memo.marker(dict)
+        return child.eval(ctx)
+      }
       m = DictionaryMemoExpr.Memo.of(child, ordinal, dict)
       memo = m
       DictionaryMemoExpr.BUILDS.increment()
@@ -77,6 +89,10 @@ object DictionaryMemoExpr {
       a.byteSize() == b.byteSize())
 
   object Memo {
+
+    /** The identity of `dict`, with no results. */
+    def marker(dict: VectorBuffers): Memo = new Memo(dict.data(), dict.offsets(), dict.length(), null)
+
     def of(child: VectorExpr, ordinal: Int, dict: VectorBuffers): Memo = {
       val n = dict.length()
       val arena = java.lang.foreign.Arena.ofConfined()
@@ -102,6 +118,15 @@ object DictionaryMemoExpr {
 
   /** `r` (n rows, no nulls) on the heap, in plain form. */
   private def toHeap(r: VectorBuffers, n: Int): VectorBuffers = r.`type`() match {
+    case VecType.UTF8 if !r.isDictionaryEncoded =>
+      // Two bulk copies: the offsets rebased to 0, the bytes they span.
+      val offsets = new Array[Int](n + 1)
+      MemorySegment.copy(r.offsets(), VectorBuffers.LE_INT, 0L, offsets, 0, n + 1)
+      val base = offsets(0)
+      val bytes = new Array[Byte](offsets(n) - base)
+      MemorySegment.copy(r.data(), java.lang.foreign.ValueLayout.JAVA_BYTE, base.toLong, bytes, 0, bytes.length)
+      if (base != 0) { var i = 0; while (i <= n) { offsets(i) -= base; i += 1 } }
+      SegmentVectorBuffers.utf8(n, null, MemorySegment.ofArray(offsets), MemorySegment.ofArray(bytes))
     case VecType.UTF8 =>
       val offsets = new Array[Int](n + 1)
       val bytes = new java.io.ByteArrayOutputStream()
