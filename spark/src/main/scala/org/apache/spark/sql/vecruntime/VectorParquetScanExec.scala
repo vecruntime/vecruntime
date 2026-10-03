@@ -565,7 +565,7 @@ private[vecruntime] final class VectorParquetPartitionReader(
       columnReaders(i) =
         new NativeParquetColumnReader(
           cd,
-          TypeMapping.vecTypeOf(field.dataType),
+          io.vecruntime.spark.parquet.NativeParquetSupport.decodeLane(field.dataType),
           field.dataType,
           field.name,
           batchSize,
@@ -890,7 +890,7 @@ object VectorParquetScanExec {
     "DELTA_BINARY_PACKED" -> Set(INT32, INT64),
     "DELTA_LENGTH_BYTE_ARRAY" -> Set(BINARY),
     "DELTA_BYTE_ARRAY" -> Set(BINARY, FIXED_LEN_BYTE_ARRAY),
-    "BYTE_STREAM_SPLIT" -> Set(INT32, INT64, DOUBLE)
+    "BYTE_STREAM_SPLIT" -> Set(INT32, INT64, DOUBLE, PrimitiveType.PrimitiveTypeName.FLOAT)
   )
 
   /**
@@ -917,6 +917,17 @@ object VectorParquetScanExec {
           case _ => false
         })
       case DoubleType => p == DOUBLE
+      // Columns without an engine lane (#559, option A): the scan decodes them on a lane of the same layout.
+      case FloatType => p == PrimitiveType.PrimitiveTypeName.FLOAT
+      case BinaryType => p == BINARY || p == FIXED_LEN_BYTE_ARRAY
+      case TimestampNTZType =>
+        // INT64 MICROS or MILLIS not adjusted to UTC (Spark refuses a UTC-adjusted column as TIMESTAMP_NTZ).
+        p == INT64 && (physical.getLogicalTypeAnnotation match {
+          case t: org.apache.parquet.schema.LogicalTypeAnnotation.TimestampLogicalTypeAnnotation =>
+            !t.isAdjustedToUTC && (t.getUnit == org.apache.parquet.schema.LogicalTypeAnnotation.TimeUnit.MICROS ||
+              t.getUnit == org.apache.parquet.schema.LogicalTypeAnnotation.TimeUnit.MILLIS)
+          case _ => false
+        })
       case BooleanType => p == PrimitiveType.PrimitiveTypeName.BOOLEAN
       case _: StringType => p == BINARY
       case d: DecimalType =>

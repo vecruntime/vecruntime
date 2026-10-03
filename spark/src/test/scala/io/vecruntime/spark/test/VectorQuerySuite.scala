@@ -134,6 +134,7 @@ abstract class VectorQuerySuite extends SparkVectorFunSuite {
     case d: java.lang.Double => d.doubleValue()
     case f: java.lang.Float => f.doubleValue()
     case bd: java.math.BigDecimal => bd.doubleValue()
+    case b: Array[Byte] => b.map("%02x".format(_)).mkString("0x", "", "") // binary compares by content
     case other => other
   }
 }

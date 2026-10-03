@@ -368,6 +368,53 @@ class DeltaBinaryPackedCrossCheckSuite extends AnyFunSuite {
     }
   }
 
+  test("FLOAT pages from parquet-java's writers decode on the INT32 lane as its readers read them (PLAIN, BSS)") {
+    // FLOAT has no engine lane; the scan decodes its 4-byte IEEE bits on the INT32 lane and emits a Float4Vector.
+    // The bits must be exactly what parquet-java's readers return, NaN payloads and -0.0 included.
+    val rnd = new Random(55920)
+    val alloc = HeapByteBufferAllocator.getInstance()
+    val specials = Array(
+      Float.NaN,
+      -0.0f,
+      Float.PositiveInfinity,
+      Float.NegativeInfinity,
+      Float.MinPositiveValue,
+      java.lang.Float.intBitsToFloat(0x7fc00123)
+    )
+    for (n <- lengths; batch <- Seq(64, 1000)) {
+      val floats = Array.tabulate(n)(i => if (i % 9 == 0) specials(i % specials.length) else rnd.nextGaussian().toFloat)
+      val pages = Seq(
+        (
+          "PLAIN",
+          ParquetPageDecoder.Encoding.PLAIN, {
+            val w = new org.apache.parquet.column.values.plain.PlainValuesWriter(64, 1 << 20, alloc)
+            floats.foreach(w.writeFloat)
+            w.getBytes.toByteArray
+          },
+          new org.apache.parquet.column.values.plain.PlainValuesReader.FloatPlainValuesReader(): org.apache.parquet.column.values.ValuesReader
+        ),
+        (
+          "BSS",
+          ParquetPageDecoder.Encoding.BYTE_STREAM_SPLIT, {
+            val w = new ByteStreamSplitValuesWriter.FloatByteStreamSplitValuesWriter(64, 1 << 20, alloc)
+            floats.foreach(w.writeFloat)
+            w.getBytes.toByteArray
+          },
+          new org.apache.parquet.column.values.bytestreamsplit.ByteStreamSplitValuesReaderForFloat(): org.apache.parquet.column.values.ValuesReader
+        )
+      )
+      for ((name, enc, page, reader) <- pages) {
+        reader.initFromPage(n, org.apache.parquet.bytes.ByteBufferInputStream.wrap(java.nio.ByteBuffer.wrap(page)))
+        val expected = Array.fill(n)(java.lang.Float.floatToRawIntBits(reader.readFloat()))
+        val arena = Arena.ofConfined()
+        try {
+          val got = decodeChunk(page, n, VecType.INT32, VecType.INT32, enc, batch, arena)
+          for (i <- 0 until n) assert(got.getInt(i) == expected(i), s"FLOAT $name n=$n batch=$batch row $i")
+        } finally arena.close()
+      }
+    }
+  }
+
   test("BYTE_STREAM_SPLIT pages from parquet-java's writers decode identically (INT32, INT64, DOUBLE)") {
     val rnd = new Random(55913)
     val alloc = HeapByteBufferAllocator.getInstance()

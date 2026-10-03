@@ -119,7 +119,19 @@ public final class ArrowVectorBuffers implements VectorBuffers {
      * decimal is a {@link BigIntVector}).
      */
     public static ArrowVectorBuffers forWrite(ValueVector v, int length, org.apache.spark.sql.types.DataType sparkType) {
-        ArrowVectorBuffers b = forWrite(v, length);
+        ArrowVectorBuffers b;
+        if (vecTypeOf(v) == null && (v instanceof org.apache.arrow.vector.Float4Vector || v instanceof org.apache.arrow.vector.VarBinaryVector)) {
+            // A column with no engine lane, written by the native Parquet scan on the lane of the same layout
+            // (#559): FLOAT's 4-byte bits on INT32, BINARY's offsets and bytes on UTF8. Deliberately not in
+            // vecTypeOf, so no reader of an incoming vector ever takes these for an INT32 or UTF8 lane.
+            if (v.getValidityBuffer().capacity() < Bitmap.bytesFor(length)) {
+                throw new IllegalStateException("vector not allocated for " + length + " elements");
+            }
+            VecType lane = v instanceof org.apache.arrow.vector.Float4Vector ? VecType.INT32 : VecType.UTF8;
+            b = wrap(v, lane, length, ArrowSegments.of(v.getValidityBuffer()));
+        } else {
+            b = forWrite(v, length);
+        }
         b.sparkType = sparkType;
         return b;
     }
