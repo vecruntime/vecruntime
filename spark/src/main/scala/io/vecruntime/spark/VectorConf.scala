@@ -110,6 +110,9 @@ object VectorConf {
   /** VectorParquetScanExec (#612): dictionary-encoded string columns as dictionary vectors, default on. */
   val ScanNativeParquetDictionaryStrings = "spark.vecruntime.scan.nativeParquet.dictionaryStrings"
 
+  /** #611: late materialization in the native scan. */
+  val ScanNativeParquetLateMaterialization = "spark.vecruntime.scan.nativeParquet.lateMaterialization"
+
   /** Mixed chains (#280): Comet's native operators above ours through the sink leaf. Off until #281 decides an allowlist. */
   val CometMixedEnabled = "spark.vecruntime.comet.mixed.enabled"
 
@@ -432,6 +435,15 @@ object VectorConf {
    */
   def scanNativeParquetDictionaryStrings(conf: SQLConf): Boolean =
     bool(conf, ScanNativeParquetDictionaryStrings, default = true)
+
+  /**
+   * #611: a filter directly over the native Parquet scan hands it its condition; the scan decodes the
+   * condition's columns first and the others only at the surviving rows (a run of dropped rows is skipped in
+   * the page streams, a batch with no survivor is skipped whole), emitting the batch with its selection.
+   * Off until measured.
+   */
+  def scanNativeParquetLateMaterialization(conf: SQLConf): Boolean =
+    bool(conf, ScanNativeParquetLateMaterialization, default = false)
 
   private def intIn(conf: SQLConf, key: String, default: Int, max: Int): Int =
     scala.util.Try(conf.getConfString(key, default.toString).trim.toInt).toOption.map(n =>

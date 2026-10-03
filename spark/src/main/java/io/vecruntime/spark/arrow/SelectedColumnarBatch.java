@@ -67,6 +67,19 @@ public final class SelectedColumnarBatch extends ColumnarBatch {
     }
 
     /**
+     * {@link #of} with the selection in a shared arena: for a batch made on one
+     * thread and read on another (the native scan's decode filter under
+     * decode-ahead, #611).
+     */
+    public static SelectedColumnarBatch ofShared(ColumnVector[] columns, int numRows, MemorySegment selection,
+            int selectedCount, boolean ownsColumns) {
+        Arena arena = Arena.ofShared();
+        MemorySegment copy = ArrowLayout.allocateBitmap(arena, numRows);
+        BitmapKernels.copy(selection, copy, numRows);
+        return new SelectedColumnarBatch(columns, numRows, arena, copy, selectedCount, ownsColumns);
+    }
+
+    /**
      * Wraps {@code columns} ({@code numRows} physical rows) selecting the rows
      * whose positions are {@code indices[0..selectedCount)}; the selection
      * bitmap lives in a fresh arena owned by the batch. This is how a foreign

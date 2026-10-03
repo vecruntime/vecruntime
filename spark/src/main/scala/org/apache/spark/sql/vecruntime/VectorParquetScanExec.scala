@@ -18,7 +18,7 @@ package org.apache.spark.sql.vecruntime
 import scala.jdk.CollectionConverters._
 
 import io.vecruntime.spark.adapter.TypeMapping
-import io.vecruntime.spark.arrow.{ArrowOutput, VectorAllocators}
+import io.vecruntime.spark.arrow.{ArrowOutput, SelectedColumnarBatch, VectorAllocators}
 import io.vecruntime.spark.parquet.NativeParquetColumnReader
 import org.apache.hadoop.conf.Configuration
 import org.apache.parquet.HadoopReadOptions
@@ -70,7 +70,11 @@ import org.apache.spark.util.SerializableConfiguration
  * `outputPartitioning` / `outputOrdering` verbatim, so `EnsureRequirements` (which ran before this
  * replacement) still holds.
  */
-case class VectorParquetScanExec(scan: FileSourceScanExec) extends LeafExecNode with VectorPlan {
+case class VectorParquetScanExec(
+    scan: FileSourceScanExec,
+    /** #611: the condition of the filter above, decoded first (see `markDecodeFilters`); None by default. */
+    decodeFilter: Option[org.apache.spark.sql.catalyst.expressions.Expression] = None
+) extends LeafExecNode with VectorPlan {
 
   override val output: Seq[Attribute] = scan.output
   override def outputPartitioning: Partitioning = scan.outputPartitioning
@@ -82,6 +86,7 @@ case class VectorParquetScanExec(scan: FileSourceScanExec) extends LeafExecNode 
     "numOutputBatches" -> SQLMetrics.createMetric(sparkContext, "number of output batches"),
     "numRowGroups" -> SQLMetrics.createMetric(sparkContext, "number of row groups read"),
     "numRuntimeFilters" -> SQLMetrics.createMetric(sparkContext, "number of runtime filters from joins"),
+    "numLateSkippedRows" -> SQLMetrics.createMetric(sparkContext, "rows the decode filter dropped before decoding"),
     "scanTime" -> SQLMetrics.createTimingMetric(sparkContext, "scan time")
   )
 
@@ -104,7 +109,10 @@ case class VectorParquetScanExec(scan: FileSourceScanExec) extends LeafExecNode 
   private[vecruntime] def isDataColumn(name: String): Boolean =
     scan.requiredSchema.fieldNames.contains(name) && !scan.relation.partitionSchema.fieldNames.contains(name)
 
-  override def doCanonicalize(): SparkPlan = VectorParquetScanExec(scan.canonicalized.asInstanceOf[FileSourceScanExec])
+  override def doCanonicalize(): SparkPlan = VectorParquetScanExec(
+    scan.canonicalized.asInstanceOf[FileSourceScanExec],
+    decodeFilter.map(e => org.apache.spark.sql.catalyst.plans.QueryPlan.normalizeExpressions(e, output))
+  )
 
   // Prepare the wrapped scan and WAIT for ALL its subqueries before this node's RDD reads
   // `scan.inputRDD.partitions` (which evaluates the selected partitions and reads the partition filters).
@@ -121,7 +129,7 @@ case class VectorParquetScanExec(scan: FileSourceScanExec) extends LeafExecNode 
   }
 
   override def simpleString(maxFields: Int): String =
-    s"VectorParquetScan ${scan.simpleString(maxFields)}"
+    s"VectorParquetScan ${decodeFilter.map(f => s"DecodeFilter: ${f.sql} ").getOrElse("")}${scan.simpleString(maxFields)}"
 
   override protected def doExecuteColumnar(): RDD[ColumnarBatch] = {
     val relation = scan.relation
@@ -188,11 +196,23 @@ case class VectorParquetScanExec(scan: FileSourceScanExec) extends LeafExecNode 
       longMetric("numOutputRows"),
       longMetric("numOutputBatches"),
       longMetric("numRowGroups"),
-      longMetric("scanTime")
+      longMetric("scanTime"),
+      longMetric("numLateSkippedRows")
     )
     val required = requiredSchema
     val partSchema = partitionSchema
     val attrs = outputAttrs.map(a => (a.name, a.dataType)).toArray
+    // #611: the decode filter, compiled over the output, and the data columns it reads.
+    val compiledFilter = decodeFilter.map(cond =>
+      io.vecruntime.spark.expr.ExpressionCompiler.compilePredicate(cond, outputAttrs) match {
+        case Right(e) => e
+        case Left(reason) => throw new IllegalStateException(s"cannot compile the decode filter: $reason")
+      }
+    ).orNull
+    val filterColumns = decodeFilter.map { cond =>
+      val ids = cond.references.map(_.exprId).toSet
+      outputAttrs.take(requiredSchema.length).map(a => ids.contains(a.exprId)).toArray
+    }.orNull
 
     val rdd = new VectorParquetRDD(
       session.sparkContext,
@@ -216,7 +236,9 @@ case class VectorParquetScanExec(scan: FileSourceScanExec) extends LeafExecNode 
       decodeAhead,
       decodeAheadVirtual,
       dictionaryStrings,
-      m
+      m,
+      compiledFilter,
+      filterColumns
     )
     // Counted by the task of partition 0, once per execution (a driver-side count is reset when a plan
     // whose stages are already materialised runs again).
@@ -235,7 +257,8 @@ final case class ScanMetrics(
     numOutputRows: SQLMetric,
     numOutputBatches: SQLMetric,
     numRowGroups: SQLMetric,
-    scanTime: SQLMetric
+    scanTime: SQLMetric,
+    numLateSkippedRows: SQLMetric
 ) extends Serializable
 
 /**
@@ -265,7 +288,9 @@ private[vecruntime] final class VectorParquetRDD(
     decodeAhead: Int,
     decodeAheadVirtual: Boolean,
     dictionaryStrings: Boolean,
-    metrics: ScanMetrics
+    metrics: ScanMetrics,
+    decodeFilter: io.vecruntime.spark.expr.VectorExpr,
+    filterColumns: Array[Boolean]
 ) extends RDD[ColumnarBatch](sc, Nil) {
 
   // Reuse the wrapped scan's file partitions verbatim (DPP / bucketing / splitting applied). Read lazily
@@ -302,7 +327,9 @@ private[vecruntime] final class VectorParquetRDD(
       handOff = decodeAhead > 0,
       // Up to `decodeAhead` queued, one handed out and one being decoded per column.
       poolLimit = math.max(4, decodeAhead + 2),
-      dictionaryStrings = dictionaryStrings
+      dictionaryStrings = dictionaryStrings,
+      decodeFilter = decodeFilter,
+      filterColumns = filterColumns
     )
     if (decodeAhead > 0) new DecodeAheadIterator(reader, decodeAhead, decodeAheadVirtual, context) else reader
   }
@@ -338,7 +365,10 @@ private[vecruntime] final class VectorParquetPartitionReader(
     context: TaskContext,
     handOff: Boolean = false, // #606: a DecodeAheadIterator owns release and close
     poolLimit: Int = 4,
-    dictionaryStrings: Boolean = false // #612: dictionary-encoded strings as dictionary vectors
+    dictionaryStrings: Boolean = false, // #612: dictionary-encoded strings as dictionary vectors
+    // #611: a predicate over the output, compiled, decoded first; and which data columns it reads
+    decodeFilter: io.vecruntime.spark.expr.VectorExpr = null,
+    filterColumns: Array[Boolean] = null
 ) extends Iterator[ColumnarBatch]
     with AutoCloseable {
 
@@ -429,17 +459,23 @@ private[vecruntime] final class VectorParquetPartitionReader(
     val n = math.min(batchSize, rgRows - rgOffset)
     val columns = new Array[ColumnVector](attrs.length)
     val dataVectors = new Array[org.apache.arrow.vector.FieldVector](dataColumnCount)
-    val partitionVectors = new Array[ColumnVector](partitionSchema.length)
+    // With a decode filter, a column skipped whole is a null vector the batch owns, closed with the constants.
+    val partitionVectors =
+      new Array[ColumnVector](partitionSchema.length + (if (decodeFilter == null) 0 else dataColumnCount))
+    var selected: SelectedColumnarBatch = null
     try {
       var c = 0
       while (c < dataColumnCount) {
         // Decode this batch's rows STRAIGHT into a fresh batch-owned Arrow vector (no row-group vector, no
         // copy of the group, no Arrow getNullCount): the reader streams pages and resumes mid-run. The
         // batch owns the vector; released to the reader's pool on the next batch / close. Self-contained,
-        // so a retained or serialized batch ships only its own rows.
-        val fv = columnReaders(c).readBatch(n)
-        dataVectors(c) = fv
-        columns(c) = columnReaders(c).wrap(fv)
+        // so a retained or serialized batch ships only its own rows. With a decode filter (#611) only the
+        // filter's columns are decoded here; the rest wait for its selection.
+        if (decodeFilter == null || filterColumns(c)) {
+          val fv = columnReaders(c).readBatch(n)
+          dataVectors(c) = fv
+          columns(c) = columnReaders(c).wrap(fv)
+        } else columns(c) = PlaceholderColumn
         c += 1
       }
       // Partition-value constant columns follow the data columns, ordered to the output: a constant vector
@@ -455,6 +491,7 @@ private[vecruntime] final class VectorParquetPartitionReader(
         partitionVectors(p) = col
         p += 1
       }
+      if (decodeFilter != null) selected = applyDecodeFilter(n, columns, dataVectors, partitionVectors)
     } catch {
       case t: Throwable =>
         var k = 0
@@ -470,7 +507,7 @@ private[vecruntime] final class VectorParquetPartitionReader(
         throw t
     }
     rgOffset += n
-    val batch = new ColumnarBatch(columns, n)
+    val batch = if (selected != null) selected else new ColumnarBatch(columns, n)
     metrics.numOutputBatches += 1
     metrics.numOutputRows += n
     if (inputMetrics != null) inputMetrics.incRecordsRead(n)
@@ -478,8 +515,52 @@ private[vecruntime] final class VectorParquetPartitionReader(
     new VectorParquetPartitionReader.OwnedBatch(batch, dataVectors, partitionVectors, columnReaders, recycled = false)
   }
 
+  /**
+   * #611: the decode filter over a batch whose filter columns are decoded: evaluates it, then decodes the
+   * other data columns at its survivors only -- in full when every row survives, skipped whole (a null
+   * vector) when none does, else at the selected rows ([[NativeParquetColumnReader.readBatchSelected]]).
+   * Returns the batch with its selection, or null when every row survives (a plain batch).
+   */
+  private def applyDecodeFilter(
+      n: Int,
+      columns: Array[ColumnVector],
+      dataVectors: Array[org.apache.arrow.vector.FieldVector],
+      owned: Array[ColumnVector]
+  ): SelectedColumnarBatch =
+    EvalContexts.withBatch(new ColumnarBatch(columns, n)) { ctx =>
+      val (selection, count) = io.vecruntime.spark.expr.VectorExpr.selection(decodeFilter.eval(ctx), ctx)
+      var c = 0
+      while (c < dataColumnCount) {
+        if (!filterColumns(c)) {
+          val r = columnReaders(c)
+          if (count == 0) {
+            r.skipRows(n)
+            val (name, dt) = attrs(c)
+            val v = ArrowOutput.nulls(name, dt, n, allocator)
+            owned(partitionSchema.length + c) = v
+            columns(c) = v
+          } else {
+            val fv = if (count == n) r.readBatch(n) else r.readBatchSelected(n, selection)
+            dataVectors(c) = fv
+            columns(c) = r.wrap(fv)
+          }
+        }
+        c += 1
+      }
+      metrics.numLateSkippedRows += n - count
+      // Shared: under decode-ahead the batch is made on the producer thread and read on the task thread.
+      if (count == n) null else SelectedColumnarBatch.ofShared(columns, n, selection, count, false)
+    }
+
+  /** A decode-filtered batch's selection lives in its own arena (its columns are released as usual). */
+  private def closeSelection(b: ColumnarBatch): Unit = b match {
+    case s: SelectedColumnarBatch => s.close()
+    case _ =>
+  }
+
   /** Returns a batch from [[nextOwned]]: its data vectors to their readers' pools, its constants closed. */
   def releaseOwned(o: VectorParquetPartitionReader.OwnedBatch): Unit = if (o != null && !o.recycled) {
+    closeSelection(o.batch)
     var c = 0
     while (c < o.vectors.length) {
       // A reader closed since (its file is done) closes the vector instead of pooling it.
@@ -874,6 +955,7 @@ private[vecruntime] final class VectorParquetPartitionReader(
   }
 
   private def releaseEmitted(): Unit = if (emitted != null) {
+    closeSelection(emitted)
     // Return the batch's owned data vectors to their reader's pool for reuse. Do NOT close the ColumnarBatch
     // (that would also close the file-owned partition constant columns / their views); the data vectors are
     // released here, the partition constants live until closeFile.
