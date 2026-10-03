@@ -9,7 +9,7 @@ This page is the design note for VecRuntime's own Parquet scan, #559. It covers 
 
 **In short (2026-10-03):** the scan reads every flat Parquet type and every encoding parquet-java's v1 and v2 writers produce. Only `INT96` timestamps and nested types (structs, lists, maps) go to Spark's reader: `INT96` per file, nested per plan. On the 1 TB TPC-DS run of 2026-10-02 it took VecRuntime to 1,542 s for the 103 queries, against 3,099 s for Spark, 1,999 s for Comet and 1,954 s for Comet's reader under our operators.
 
-The scan is **off by default**. You turn it on with `spark.vecruntime.scan.nativeParquet.enabled`. Its configuration keys are in the [Configuration reference](configuration.html), and the planner's fallback reasons are on the [Operators](operators.html) page.
+The scan is **on by default** since 0.0.6 (`spark.vecruntime.scan.nativeParquet.enabled`), except in a session where Comet's scan is active: Comet's plugin or extension registered, with `spark.comet.enabled` and `spark.comet.scan.enabled` not false. There Comet's reader stays the scan unless the key is set. Setting the key to `false` brings back Spark's vectorized reader under our operators. Its configuration keys are in the [Configuration reference](configuration.html), and the planner's fallback reasons are on the [Operators](operators.html) page.
 
 ## Why the scan exists
 
@@ -35,7 +35,7 @@ FileSourceScanExec (planned by Spark)
                                       → batch-owned Arrow vectors + constant partition columns
 ```
 
-**Opening a file.** Each split opens its file once. The `FileStatus` comes from the split instead of a separate HEAD request (#559 slice 1). The footer is read in a single stream, and `readNextFilteredRowGroup` applies the pushed filters through parquet-java: row-group statistics, dictionary and bloom filters, and the column index for page skipping. Rows are not filtered inside the decoder. Comet's equivalent switch, `spark.comet.parquet.rowFilterPushdown.enabled`, defaults to off as well.
+**Opening a file.** Each split opens its file once. The `FileStatus` comes from the split instead of a separate HEAD request (#559 slice 1). The footer is read in a single stream, and `readNextFilteredRowGroup` applies the pushed filters through parquet-java: row-group statistics, dictionary and bloom filters, and the column index for page skipping. Rows are not filtered inside the decoder. Each task prefers the same hosts as Spark's `FileScanRDD`: up to three holding the most of its bytes, with `localhost` dropped. S3A reports `localhost` for every block, so on S3 the tasks have no preference, as Spark's do; on HDFS they keep block locality. Comet's equivalent switch, `spark.comet.parquet.rowFilterPushdown.enabled`, defaults to off as well.
 
 **Decoding.** `NativeParquetColumnReader` turns each `DataPageV1` or `DataPageV2` into a kernel page. Definition levels and values are written into one reusable buffer per reader. `ColumnChunkDecoder` then decodes, at a row offset into the output:
 - the validity bitmap, built from the definition levels;
