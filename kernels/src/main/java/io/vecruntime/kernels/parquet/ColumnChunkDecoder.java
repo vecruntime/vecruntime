@@ -97,6 +97,7 @@ public final class ColumnChunkDecoder {
     // session/bounds/alignment checks (the page bytes are a heap byte[] parquet-java hands us).
     private static final java.lang.invoke.VarHandle BA_INT = java.lang.invoke.MethodHandles.byteArrayViewVarHandle(int[].class, java.nio.ByteOrder.LITTLE_ENDIAN);
     private static final java.lang.invoke.VarHandle BA_LONG = java.lang.invoke.MethodHandles.byteArrayViewVarHandle(long[].class, java.nio.ByteOrder.LITTLE_ENDIAN);
+    private static final java.lang.invoke.VarHandle BA_LONG_BE = java.lang.invoke.MethodHandles.byteArrayViewVarHandle(long[].class, java.nio.ByteOrder.BIG_ENDIAN);
 
     private static int leInt(byte[] a, int off) {
         return (int) BA_INT.get(a, off);
@@ -1418,6 +1419,27 @@ public final class ColumnChunkDecoder {
             }
             long lo = 0L;
             long hi = 0L;
+            if (len == 16) {
+                // The common case (decimal(38) as Spark writes it): two big-endian longs.
+                hi = (long) BA_LONG_BE.get(b, s);
+                lo = (long) BA_LONG_BE.get(b, s + 8);
+                long at = (long) i << 4;
+                outData.set(LE_LONG, at, lo);
+                outData.set(LE_LONG, at + 8, hi);
+                continue;
+            }
+            if (len > 8 && len < 16) {
+                // The high limb from the leading len - 8 bytes, sign-extended; the low limb is the last 8.
+                lo = (long) BA_LONG_BE.get(b, e - 8);
+                long h = b[s]; // sign-extended first byte
+                for (int j = s + 1; j < e - 8; j++) {
+                    h = (h << 8) | (b[j] & 0xFF);
+                }
+                long at = (long) i << 4;
+                outData.set(LE_LONG, at, lo);
+                outData.set(LE_LONG, at + 8, h);
+                continue;
+            }
             if (len > 0) {
                 long sign = b[s] < 0 ? -1L : 0L;
                 if (len > 16) {
