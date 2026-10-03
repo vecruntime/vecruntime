@@ -79,6 +79,9 @@ object VectorConf {
 
   /** #603 step 2: a hash join emits its build-side lane columns as views over the build table. */
   val JoinDeferredBuild = "spark.vecruntime.join.deferredBuild"
+
+  /** #603: build-side strings with at most this many distinct values are emitted as dictionary ids. */
+  val JoinBuildDictionaryMax = "spark.vecruntime.join.buildDictionaryMax"
   val JoinBuildPayload = "spark.vecruntime.join.buildPayload"
   val CometRangeShuffleEnabled = "spark.vecruntime.comet.shuffle.range.enabled"
 
@@ -237,6 +240,14 @@ object VectorConf {
    * ids, not copies), so a dimension string carried through a chain of joins is gathered once, where it is read.
    */
   def joinDeferredBuild(conf: SQLConf): Boolean = bool(conf, JoinDeferredBuild, default = true)
+
+  /**
+   * #603: a hash join emits a build-side string column with at most this many distinct values as ids over
+   * the distinct values (a dictionary vector) rather than the bytes, so an aggregate grouping on it maps the
+   * values once per batch instead of the rows, and the shuffle writer stages ids. 0 (the default) keeps bytes.
+   * Needs `deferredBuild`.
+   */
+  def joinBuildDictionaryMax(conf: SQLConf): Int = intIn(conf, JoinBuildDictionaryMax, default = 0, max = 1 << 16)
 
   /**
    * A broadcast hash join whose build side carries payload columns without a lane (arrays, maps,

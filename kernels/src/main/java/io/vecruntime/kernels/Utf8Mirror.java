@@ -114,6 +114,56 @@ public final class Utf8Mirror {
         return validity == null || ((validity[i >>> 6] >>> (i & 63)) & 1L) != 0L;
     }
 
+    /**
+     * The column dictionary encoded (#603: a join's build-side string, emitted
+     * as ids over its distinct values so a consumer such as an aggregate maps
+     * the values once instead of the rows): {@code ids[i]} is row {@code i}'s
+     * value id, -1 for a null row; the values are {@code dictionary}'s entries
+     * 0 until {@code size()}.
+     */
+    public static final class Encoded {
+        private final int[] ids;
+        private final StringDictionary dictionary;
+
+        Encoded(int[] ids, StringDictionary dictionary) {
+            this.ids = ids;
+            this.dictionary = dictionary;
+        }
+
+        public int[] ids() {
+            return ids;
+        }
+
+        public StringDictionary dictionary() {
+            return dictionary;
+        }
+    }
+
+    /**
+     * {@link Encoded} when the column has at most {@code maxDistinct} distinct
+     * values, else null. One pass over the rows; stops at the first value past
+     * the limit.
+     */
+    public Encoded encode(int maxDistinct) {
+        StringDictionary dict = new StringDictionary();
+        int[] ids = new int[length];
+        for (int i = 0; i < length; i++) {
+            if (!isValid(i)) {
+                ids[i] = -1;
+                continue;
+            }
+            int from = offsets[i] - base;
+            int len = offsets[i + 1] - offsets[i];
+            int id = dict.indexOf(StringDictionary.fingerprint(data, from, len),
+                    len, data, from, true);
+            if (dict.size() > maxDistinct) {
+                return null;
+            }
+            ids[i] = id;
+        }
+        return new Encoded(ids, dict);
+    }
+
     /** Whether the column has a null row. */
     public boolean hasNulls() {
         return validity != null;
