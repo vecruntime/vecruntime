@@ -91,6 +91,9 @@ public final class NativeParquetColumnReader {
     // A FIXED_LEN_BYTE_ARRAY / BINARY decimal, staged as bytes and converted at flush; its FLBA width (0: BINARY).
     private final boolean binaryDecimal;
     private final int fixedLength;
+    // TIMESTAMP stored as MILLIS: the lane holds micros, so each present value is scaled by 1000.
+    private final boolean millis;
+    private static final java.lang.foreign.ValueLayout.OfLong LONG_LE = java.lang.foreign.ValueLayout.JAVA_LONG_UNALIGNED.withOrder(java.nio.ByteOrder.LITTLE_ENDIAN);
     private static final java.lang.foreign.ValueLayout.OfInt INT_LE = java.lang.foreign.ValueLayout.JAVA_INT_UNALIGNED.withOrder(java.nio.ByteOrder.LITTLE_ENDIAN);
     private final GroupUnpacker[] unpackers = new GroupUnpacker[33];
     private final Arena scratch;
@@ -117,6 +120,7 @@ public final class NativeParquetColumnReader {
         this.narrowBits = sparkType instanceof org.apache.spark.sql.types.ByteType
                 ? 8
                 : sparkType instanceof org.apache.spark.sql.types.ShortType ? 16 : 0;
+        this.millis = sparkType instanceof org.apache.spark.sql.types.TimestampType && column.getPrimitiveType().getLogicalTypeAnnotation() instanceof org.apache.parquet.schema.LogicalTypeAnnotation.TimestampLogicalTypeAnnotation t && t.getUnit() == org.apache.parquet.schema.LogicalTypeAnnotation.TimeUnit.MILLIS;
         // Dictionary scratch is GC-managed: closing a shared Arena runs a JVM-wide handshake that walks every
         // thread's stack, and a reader is made per column per file -- on 1 TB TPC-DS (14,594 store_sales
         // files) those handshakes were 8-9% of executor CPU in q88. An automatic arena has no close.
@@ -280,8 +284,29 @@ public final class NativeParquetColumnReader {
         if (narrowBits != 0) {
             narrow(data, n, narrowBits);
         }
+        if (millis) {
+            millisToMicros(data, hasNulls ? validity : null, n);
+        }
         io.vecruntime.spark.arrow.ArrowOutput.finish(out, n, !hasNulls);
         return v;
+    }
+
+    /**
+     * TIMESTAMP(MILLIS) on the INT64 lane of micros: Spark's {@code
+     * LongAsMicrosUpdater} multiplies each value by 1000 with {@code
+     * Math.multiplyExact}, so an out-of-range value fails the read with an
+     * {@link ArithmeticException}, never a wrapped instant. Same here, on the
+     * present rows only: a null slot holds whatever the reused buffer held,
+     * which must not raise.
+     */
+    private static void millisToMicros(java.lang.foreign.MemorySegment data, java.lang.foreign.MemorySegment validity, int n) {
+        for (int i = 0; i < n; i++) {
+            if (validity != null && (validity.get(java.lang.foreign.ValueLayout.JAVA_BYTE, i >>> 3) & (1 << (i & 7))) == 0) {
+                continue;
+            }
+            long at = (long) i << 3;
+            data.set(LONG_LE, at, Math.multiplyExact(data.get(LONG_LE, at), 1000L));
+        }
     }
 
     /**
@@ -343,6 +368,10 @@ public final class NativeParquetColumnReader {
                 hasNulls ? out.validity() : null);
         if (narrowBits != 0) {
             narrow(out.data(), rows, narrowBits);
+        }
+        if (millis) {
+            millisToMicros(out.data(), hasNulls ? out.validity() : null,
+                    rows);
         }
         // finish: set the Arrow value count and (when no nulls) mark all valid without a validity scan.
         ArrowOutput.finish(out, rows, !hasNulls);

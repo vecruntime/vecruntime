@@ -663,16 +663,124 @@ class VectorParquetScanSuite extends VectorQuerySuite {
     }
   }
 
-  test("fallback: a timestamp column is not decoded in slice 1") {
-    val path = newTempPath("t_ts")
-    withPlugin(enabled = false) {
-      spark.sql(
-        "SELECT CAST(id AS INT) AS i, TIMESTAMP'2020-01-01 00:00:00' + MAKE_INTERVAL(0,0,0,0,0,0,id) AS ts FROM range(0, 1000)"
+  test("TIMESTAMP columns stored as INT64 MICROS and MILLIS decode natively, with nulls (#559)") {
+    // MICROS is the lane as stored; MILLIS is scaled by 1000 (Spark's LongAsMicrosUpdater). Dictionary and
+    // plain, v1 and v2 (DELTA_BINARY_PACKED), values before 1582 and after 2038, a filter and an aggregate.
+    for (
+      (unit, version, view) <- Seq(
+        ("TIMESTAMP_MICROS", "v1", "t_ts_us1"),
+        ("TIMESTAMP_MICROS", "v2", "t_ts_us2"),
+        ("TIMESTAMP_MILLIS", "v1", "t_ts_ms1"),
+        ("TIMESTAMP_MILLIS", "v2", "t_ts_ms2")
       )
-        .write.mode("overwrite").parquet(path)
-      spark.read.parquet(path).createOrReplaceTempView("t_ts")
+    ) {
+      val path = newTempPath(view)
+      withPlugin(enabled = false) {
+        withConf("spark.sql.parquet.outputTimestampType" -> unit) {
+          spark.sql(
+            """SELECT CAST(id AS INT) AS i,
+              |  CASE WHEN id % 7 = 0 THEN NULL
+              |       ELSE TIMESTAMP_MICROS((id * 2654435761 % 200000000000) * 1000000 - 30000000000000000) END AS ts,
+              |  TIMESTAMP_MICROS((id % 13) * 86400000000) AS lowcard
+              |FROM range(0, 30000)""".stripMargin
+          ).repartition(2)
+            .sortWithinPartitions("i")
+            .write
+            .option("parquet.writer.version", version)
+            .mode("overwrite")
+            .parquet(path)
+        }
+        spark.read.parquet(path).createOrReplaceTempView(view)
+      }
+      checkVectorized(s"SELECT * FROM $view", Seq(node))
+      checkVectorized(s"SELECT i, ts FROM $view WHERE ts > TIMESTAMP'1990-01-01 00:00:00'", Seq(node))
+      checkVectorized(s"SELECT lowcard, count(*), min(ts), max(ts) FROM $view GROUP BY lowcard", Seq(node))
+      assert(nativeRowGroups(s"SELECT ts, lowcard FROM $view") > 0, s"$view: no row group read natively")
     }
-    checkFallback("SELECT i, ts FROM t_ts", Seq(node), reasonContains = "unsupported column type")
+  }
+
+  test("INT96 timestamps and legacy-calendar files fall over per file with the file's own rebase modes (#559)") {
+    // Spark's default output timestamp type is INT96: such a file is read by Spark's reader. A file written
+    // with the LEGACY rebase mode (a hybrid-calendar date and timestamp before 1582) carries the legacy key, so
+    // Spark rebases it on read -- the fallback reader must be built with that file's LEGACY mode, not the fixed
+    // CORRECTED of its two-argument constructor. A CORRECTED file in the same table is still read natively.
+    val path = newTempPath("t_ts_mixed")
+    val query =
+      """SELECT CAST(id AS INT) AS i,
+        |  TIMESTAMP_MICROS(id * 86400000000 * 37 - 40000000000000000) AS ts,
+        |  DATE_ADD(DATE'1000-01-01', CAST(id * 11 AS INT)) AS d
+        |FROM range(0, 3000)""".stripMargin
+    withPlugin(enabled = false) {
+      withConf("spark.sql.parquet.outputTimestampType" -> "INT96") {
+        spark.sql(query).coalesce(1).write.mode("overwrite").parquet(path + "/int96")
+      }
+      withConf(
+        "spark.sql.parquet.outputTimestampType" -> "TIMESTAMP_MICROS",
+        "spark.sql.parquet.datetimeRebaseModeInWrite" -> "LEGACY"
+      ) {
+        spark.sql(query).coalesce(1).write.mode("overwrite").parquet(path + "/legacy")
+      }
+      withConf(
+        "spark.sql.parquet.outputTimestampType" -> "TIMESTAMP_MICROS",
+        "spark.sql.parquet.datetimeRebaseModeInWrite" -> "CORRECTED"
+      ) {
+        spark.sql(query).coalesce(1).write.mode("overwrite").parquet(path + "/corrected")
+      }
+    }
+    for (dir <- Seq("int96", "legacy", "corrected")) {
+      withPlugin(enabled = false)(spark.read.parquet(s"$path/$dir").createOrReplaceTempView(s"t_ts_$dir"))
+      checkVectorized(s"SELECT * FROM t_ts_$dir", Seq(node))
+      checkVectorized(s"SELECT min(ts), max(ts), min(d), max(d) FROM t_ts_$dir", Seq(node))
+    }
+    assert(nativeRowGroups("SELECT ts, d FROM t_ts_int96") == 0, "an INT96 file was decoded natively")
+    assert(nativeRowGroups("SELECT ts, d FROM t_ts_legacy") == 0, "a LEGACY-calendar file was decoded natively")
+    assert(nativeRowGroups("SELECT ts, d FROM t_ts_corrected") > 0, "a CORRECTED file was not decoded natively")
+    // Under EXCEPTION (resolved per file, not per plan), a CORRECTED Spark file is still read natively, and the
+    // legacy one gets Spark's own rebase from its footer key.
+    withConf("spark.sql.parquet.datetimeRebaseModeInRead" -> "EXCEPTION") {
+      checkVectorized("SELECT * FROM t_ts_corrected", Seq(node))
+      checkVectorized("SELECT * FROM t_ts_legacy", Seq(node))
+      assert(nativeRowGroups("SELECT ts, d FROM t_ts_corrected") > 0, "EXCEPTION: the CORRECTED file fell over")
+    }
+  }
+
+  test("a TIMESTAMP(MILLIS) value whose micros overflow fails the read, as Spark's reader does (#559)") {
+    val path = newTempPath("t_ts_overflow")
+    new java.io.File(path).mkdirs()
+    val schema = org.apache.parquet.schema.MessageTypeParser.parseMessageType(
+      "message m { optional int64 ts (TIMESTAMP(MILLIS,true)); }"
+    )
+    val writer = org.apache.parquet.hadoop.example.ExampleParquetWriter
+      .builder(new org.apache.hadoop.fs.Path(path + "/part-0.parquet"))
+      .withConf(new org.apache.hadoop.conf.Configuration())
+      .withType(schema)
+      .build()
+    val factory = new org.apache.parquet.example.data.simple.SimpleGroupFactory(schema)
+    try {
+      for (k <- 0 until 2000) {
+        val g = factory.newGroup()
+        // Nulls first: a null slot must not be scaled. Then one overflowing value.
+        if (k % 3 != 0) g.append("ts", if (k == 1999) Long.MaxValue / 100 else 1700000000000L + k)
+        writer.write(g)
+      }
+    } finally writer.close()
+    def attempt(plugin: Boolean): Either[Throwable, Long] =
+      try Right(withPlugin(enabled = plugin)(spark.read.parquet(path).collect().length.toLong))
+      catch { case e: Exception => Left(e) }
+    def overflow(t: Throwable): Boolean =
+      Iterator.iterate(t)(_.getCause).takeWhile(_ != null).exists(_.isInstanceOf[ArithmeticException])
+    val off = attempt(plugin = false)
+    val on = attempt(plugin = true)
+    assert(off.isLeft && overflow(off.left.toOption.get), s"Spark's reader did not overflow: $off")
+    assert(on.isLeft && overflow(on.left.toOption.get), s"the native scan did not overflow: $on")
+  }
+
+  private def nativeRowGroups(sql: String): Long = withPlugin(enabled = true) {
+    val df = spark.sql(sql)
+    df.collect()
+    PlanUtils.allNodes(
+      finalPlan(df)
+    ).collect { case s: VectorParquetScanExec => s }.map(_.metrics("numRowGroups").value).sum
   }
 
   test("early termination (LIMIT) does not leak the reused vectors") {

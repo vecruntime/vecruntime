@@ -25,6 +25,7 @@ import org.apache.spark.sql.types.IntegerType;
 import org.apache.spark.sql.types.LongType;
 import org.apache.spark.sql.types.ShortType;
 import org.apache.spark.sql.types.StringType;
+import org.apache.spark.sql.types.TimestampType;
 
 /**
  * The SINGLE source of truth for which Spark types the native Parquet reader
@@ -38,10 +39,12 @@ import org.apache.spark.sql.types.StringType;
  * {@code TINYINT}/{@code SMALLINT} narrowed to their width on the INT32 lane),
  * INT64, FLOAT64, BOOL, the {@code INT64}-lane narrow decimal ({@code p<=18}),
  * and UTF8. Each file's physical types are checked against these lanes at open
- * ({@code VectorParquetScanExec.physicalMatches}). Deliberately excluded: {@code
- * TIMESTAMP}/{@code TIMESTAMP_NTZ} (INT64-physical but need rebase/int96
- * handling verified per file -- deferred), {@code FLOAT}, {@code BINARY},
- * wide decimals ({@code p>18}), and every nested/complex type.
+ * ({@code VectorParquetScanExec.physicalMatches}), and so is each file's
+ * calendar-rebase mode. TIMESTAMP is the INT64 lane of micros (INT64 {@code
+ * MICROS}, or {@code MILLIS} scaled); an INT96 file falls over per file.
+ * Deliberately excluded: {@code TIMESTAMP_NTZ} (no engine lane yet), {@code
+ * FLOAT}, {@code BINARY}, wide decimals ({@code p>18}), and every
+ * nested/complex type.
  */
 public final class NativeParquetSupport {
 
@@ -57,6 +60,9 @@ public final class NativeParquetSupport {
         }
         if (dt instanceof LongType) {
             return true; // INT64 physical, INT64 lane
+        }
+        if (dt instanceof TimestampType) {
+            return true; // INT64 MICROS (or MILLIS, scaled) physical, INT64 lane of micros; INT96 falls over per file
         }
         if (dt instanceof BooleanType) {
             return true; // BOOLEAN physical, BOOL lane (bitmap)
