@@ -44,6 +44,12 @@ class JoinDeferredProbeSuite extends VectorQuerySuite {
           .write.mode("overwrite").parquet(newTempPath(s"dp/$name"))
         spark.read.parquet(newTempPath(s"dp/$name")).createOrReplaceTempView(s"dp_$name")
       }
+      // A low-cardinality build string with nulls: dictionary encoded under buildDictionaryMax.
+      spark.sql(
+        "SELECT CAST(id AS INT) AS k, CASE WHEN id % 4 = 0 THEN NULL ELSE CONCAT('g', CAST(id % 5 AS STRING)) END AS g FROM range(0, 60)"
+      )
+        .write.mode("overwrite").parquet(newTempPath("dp/d4"))
+      spark.read.parquet(newTempPath("dp/d4")).createOrReplaceTempView("dp_d4")
     }
   }
 
@@ -78,16 +84,48 @@ class JoinDeferredProbeSuite extends VectorQuerySuite {
       "SELECT d1.name, d2.name, count(*), sum(f.v) FROM dp_fact f JOIN dp_d1 d1 ON f.k1 = d1.k " +
         "JOIN dp_d2 d2 ON f.k2 = d2.k JOIN dp_d3 d3 ON f.k3 = d3.k WHERE d3.name LIKE 'd3-1%' GROUP BY d1.name, d2.name",
       "SELECT d1.name, d2.name FROM dp_fact f LEFT JOIN dp_d1 d1 ON f.k1 = d1.k AND d1.k < 40 " +
-        "LEFT JOIN dp_d2 d2 ON f.k2 = d2.k AND d2.k > 10 WHERE f.k3 = 4"
+        "LEFT JOIN dp_d2 d2 ON f.k2 = d2.k AND d2.k > 10 WHERE f.k3 = 4",
+      // Build strings as dictionary ids (#603): grouped on, filtered, carried through an outer join.
+      "SELECT d4.g, d3.name, count(*), sum(f.v) FROM dp_fact f JOIN dp_d4 d4 ON f.k1 = d4.k " +
+        "JOIN dp_d3 d3 ON f.k3 = d3.k GROUP BY d4.g, d3.name",
+      "SELECT d4.g, upper(d4.g), f.s FROM dp_fact f LEFT JOIN dp_d4 d4 ON f.k1 = d4.k WHERE f.k2 = 7 AND (d4.g IS NULL OR d4.g <> 'g2')"
     )
-    for (probe <- Seq("true", "false"); build <- Seq("true", "false")) {
-      withConf(VectorConf.JoinDeferredProbe -> probe, VectorConf.JoinDeferredBuild -> build) {
+    for (probe <- Seq("true", "false"); build <- Seq("true", "false"); dict <- Seq("0", "64")) {
+      withConf(
+        VectorConf.JoinDeferredProbe -> probe,
+        VectorConf.JoinDeferredBuild -> build,
+        VectorConf.JoinBuildDictionaryMax -> dict
+      ) {
         queries.foreach(q => checkVectorized(q, Nil))
       }
     }
   }
 
+  test("build strings under the distinct limit go out as dictionary ids") {
+    withConf(VectorConf.JoinBuildDictionaryMax -> "64", "spark.sql.adaptive.enabled" -> "false") {
+      val df = spark.sql("SELECT d4.g, f.v FROM dp_fact f JOIN dp_d4 d4 ON f.k1 = d4.k")
+      val join = df.queryExecution.executedPlan.collectFirst { case j: VectorBroadcastHashJoinExec => j }.get
+      val dicts = join.executeColumnar().mapPartitions { it =>
+        it.filter(_.numRows() > 0).map { b =>
+          (0 until b.numCols()).exists(c =>
+            b.column(c) match {
+              case d: DeferredGatherColumnVector =>
+                d.gathered().isInstanceOf[io.vecruntime.spark.arrow.VectorDictionaryColumnVector]
+              case _ => false
+            }
+          )
+        }
+      }.collect()
+      val batches = dicts
+      assert(batches.nonEmpty && batches.forall(identity), batches.mkString(","))
+    }
+  }
+
   test("a LIMIT over the chain leaks no gathered vectors") {
+    withConf(VectorConf.JoinBuildDictionaryMax -> "64") { limitLeaks() }
+  }
+
+  private def limitLeaks(): Unit = {
     val root = VectorAllocators.root()
     val before = root.getAllocatedMemory
     checkVectorized(chain.replace("GROUP BY d3.name", "GROUP BY d3.name ORDER BY d3.name LIMIT 3"), Seq(Bhj))

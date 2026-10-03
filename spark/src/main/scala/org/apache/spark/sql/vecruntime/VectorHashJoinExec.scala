@@ -111,7 +111,8 @@ trait VectorHashJoinLike extends VectorBinaryExec {
     dropNullStreamedKeys = isNullAwareAntiJoin,
     denseKeys = io.vecruntime.spark.VectorConf.joinDenseKeys(conf),
     deferredProbe = io.vecruntime.spark.VectorConf.joinDeferredProbe(conf),
-    deferredBuild = io.vecruntime.spark.VectorConf.joinDeferredBuild(conf)
+    deferredBuild = io.vecruntime.spark.VectorConf.joinDeferredBuild(conf),
+    buildDictionaryMax = io.vecruntime.spark.VectorConf.joinBuildDictionaryMax(conf)
   )
 
   override def verboseStringWithOperatorId(): String = {
@@ -150,7 +151,9 @@ final case class JoinSpec(
     /** Probe-side lane columns as not-yet-gathered views over the input (#603), gathered on first read. */
     deferredProbe: Boolean = true,
     /** Build-side lane columns as views over the build table (#603 step 2), gathered on first read. */
-    deferredBuild: Boolean = true
+    deferredBuild: Boolean = true,
+    /** Build strings with at most this many distinct values go out dictionary encoded (#603); 0 = never. */
+    buildDictionaryMax: Int = 0
 )
 
 /**
@@ -469,10 +472,84 @@ final class BuildTable(
     arena.close()
     if (builders != null) builders.foreach(b => if (b != null) b.close())
     if (payload != null) payload.foreach(p => if (p != null) p.close())
+    dictionaries.synchronized {
+      dictionaries.foreach(d => if (d != null) d.values.close())
+      if (dictionaryAllocator != null) dictionaryAllocator.close()
+    }
   }
+
+  /**
+   * Build string column `c` dictionary encoded (#603), made on first use: the build rows' value ids and
+   * an Arrow vector of the distinct values. Null when the column has no UTF8 mirror or more than
+   * `maxDistinct` distinct values. A build view gathers ids through it -- 4 bytes a row instead of the
+   * string -- and an aggregate grouping on the column maps its distinct values once per batch, not its rows.
+   */
+  def dictionary(c: Int, maxDistinct: Int): BuildTable.Dictionary = dictionaries.synchronized {
+    // Another join over the same shared table may ask under another limit: an entry is never replaced
+    // (tasks may be reading it), only retried when an earlier attempt failed under a smaller limit.
+    val made = dictionaries(c)
+    if (made == null && dictionaryTried(c) < maxDistinct) {
+      dictionaryTried(c) = maxDistinct
+      val m = utf8Mirror(c)
+      val enc = if (m == null) null else m.encode(maxDistinct)
+      if (enc != null) {
+        if (dictionaryAllocator == null)
+          dictionaryAllocator = BuildTable.dictionaryRoot.newChildAllocator("BuildTable.dictionary", 0L, Long.MaxValue)
+        val d = enc.dictionary()
+        val n = d.size()
+        val values = new org.apache.arrow.vector.VarCharVector("dict", dictionaryAllocator)
+        values.allocateNew(math.max(1L, d.valueBytes()), n)
+        var i = 0
+        while (i < n) { values.set(i, d.bytes(), d.offset(i), d.length(i)); i += 1 }
+        values.setValueCount(n)
+        dictionaries(c) = new BuildTable.Dictionary(enc.ids(), values)
+      }
+    }
+    val d = dictionaries(c)
+    if (d != null && d.values.getValueCount <= maxDistinct) d else null
+  }
+
+  private val dictionaries = new Array[BuildTable.Dictionary](columns.length)
+  private val dictionaryTried = Array.fill(columns.length)(-1) // the limit the entry was made under
+  private var dictionaryAllocator: org.apache.arrow.memory.BufferAllocator = _
 }
 
 object BuildTable {
+
+  /**
+   * Where build dictionaries live: a root of their own, because a broadcast table is released by a
+   * `Cleaner` when its relation is collected, not with any task, and its dictionaries are never moved into
+   * another vector (every consumer that copies decodes a dictionary column first, #612).
+   */
+  private[vecruntime] lazy val dictionaryRoot = new org.apache.arrow.memory.RootAllocator(Long.MaxValue)
+
+  /** A build string column as value ids per build row (-1 null) over `values`, its distinct strings. */
+  final class Dictionary(val ids: Array[Int], val values: org.apache.arrow.vector.VarCharVector)
+
+  /**
+   * Rows `rows` (-1 a null row) of a dictionary-encoded build column, as ids over the shared values: the
+   * values stay the table's (released with it), the ids are the batch's.
+   */
+  def gatherIds(
+      name: String,
+      dict: Dictionary,
+      rows: Array[Int],
+      alloc: org.apache.arrow.memory.BufferAllocator
+  ): ColumnVector = {
+    val n = rows.length
+    val out = new org.apache.arrow.vector.IntVector(name, alloc)
+    out.allocateNew(n)
+    val ids = dict.ids
+    var i = 0
+    while (i < n) {
+      val r = rows(i)
+      val v = if (r < 0) -1 else ids(r)
+      if (v < 0) out.setNull(i) else out.set(i, v)
+      i += 1
+    }
+    out.setValueCount(n)
+    new io.vecruntime.spark.arrow.VectorDictionaryColumnVector(out, dict.values, () => ())
+  }
 
   /** Rows whose keys are all non-null (and selected), or null when every row qualifies. */
   def nonNullKeys(ctx: EvalContext, keys: Seq[VectorBuffers]): MemorySegment = {
@@ -744,7 +821,11 @@ private[vecruntime] class VectorHashJoinIterator(
     if (s == null) {
       s = (name: String, dt: DataType, ids: Array[Int], alloc: org.apache.arrow.memory.BufferAllocator) => {
         val m = build.mirror(o)
+        val dict =
+          if (spec.buildDictionaryMax > 0 && dt.isInstanceOf[StringType]) build.dictionary(o, spec.buildDictionaryMax)
+          else null
         if (m != null) ArrowOutput.gatherHeap(name, dt, m, ids, 0, ids.length, alloc, gatherScratch)
+        else if (dict != null) BuildTable.gatherIds(name, dict, ids, alloc)
         else if (dt.isInstanceOf[StringType] && build.utf8Mirror(o) != null)
           ArrowOutput.gatherUtf8Heap(name, build.utf8Mirror(o), ids, 0, ids.length, alloc, utf8Scratch)
         else ArrowOutput.gather(name, dt, build.columns(o), ids, 0, ids.length, alloc)
