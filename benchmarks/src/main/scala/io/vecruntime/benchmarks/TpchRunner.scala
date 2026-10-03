@@ -111,13 +111,18 @@ object TpchRunner {
     "spark.sql.columnVector.offheap.enabled" -> "true"
   )
 
+  /**
+   * #559: every configuration runs with no locality wait, so all engines are scheduled alike. On S3 the
+   * scans have no locality to wait for, and Spark's reduce-side preference piled post-shuffle stages onto
+   * one host behind the 3 s wait (1 TB A/B on Spark, 2026-10-03: q81 -61%, q18 -46%, q30 -34%, q31 -26%,
+   * q87 -14%, q95 -4%; six queries 182.9 -> 151.8 s, checksums equal). Our shuffle also drops that
+   * preference itself (spark.vecruntime.shuffle.reduceLocality.enabled, default false).
+   */
+  val NoLocalityWait: Map[String, String] = Map("spark.locality.wait" -> "0")
+
   /** Spark configurations under comparison. Comet configs need the Comet jar on the classpath. */
   val Configs: Map[String, Map[String, String]] = Map(
-    // #559: no locality wait. On S3 the scans have no locality to wait for, and the reduce-side preference
-    // piled post-shuffle stages onto one host behind the 3 s wait (1 TB A/B 2026-10-03: q81 -61%, q18 -46%,
-    // q30 -34%, q31 -26%, q87 -14%, q95 -4%; six queries 182.9 -> 151.8 s, checksums equal). Our engine drops
-    // its reduce-side preference instead (spark.vecruntime.shuffle.reduceLocality.enabled, default false).
-    "spark" -> Map("spark.locality.wait" -> "0"),
+    "spark" -> Map.empty[String, String],
     "vector" -> VectorFast,
     // #288: our columnar exchange over Arrow IPC files and Arrow Flight, no row conversion around shuffles.
     "vector-shuffle" -> (VectorFast ++ Map(
@@ -174,7 +179,7 @@ object TpchRunner {
       "spark.memory.offHeap.enabled" -> "true",
       "spark.memory.offHeap.size" -> "3g"
     )
-  )
+  ).map { case (name, conf) => name -> (NoLocalityWait ++ conf) }
 
   val ConfigOrder: Seq[String] = Seq(
     "spark",
