@@ -115,6 +115,22 @@ case class VectorParquetScanExec(scan: FileSourceScanExec) extends LeafExecNode 
     // but keep the write-support keys so a nested/complex fallback path (should one slip through) is sane.
     hadoopConf.set(ParquetReadSupport.SPARK_ROW_REQUESTED_SCHEMA, requiredSchema.json)
     hadoopConf.set(ParquetWriteSupport.SPARK_ROW_SCHEMA, requiredSchema.json)
+    // The flags ParquetFileFormat.setupHadoopConf gives its reader: Spark's fallback reader for a file we do
+    // not decode (SparkFallbackFileReader) converts the file schema with these.
+    hadoopConf.set(org.apache.parquet.hadoop.ParquetInputFormat.READ_SUPPORT_CLASS, classOf[ParquetReadSupport].getName)
+    hadoopConf.set(SQLConf.SESSION_LOCAL_TIMEZONE.key, session.sessionState.conf.sessionLocalTimeZone)
+    hadoopConf.setBoolean(
+      SQLConf.NESTED_SCHEMA_PRUNING_ENABLED.key,
+      session.sessionState.conf.nestedSchemaPruningEnabled
+    )
+    hadoopConf.setBoolean(SQLConf.CASE_SENSITIVE.key, session.sessionState.conf.caseSensitiveAnalysis)
+    hadoopConf.setBoolean(SQLConf.PARQUET_BINARY_AS_STRING.key, session.sessionState.conf.isParquetBinaryAsString)
+    hadoopConf.setBoolean(SQLConf.PARQUET_INT96_AS_TIMESTAMP.key, session.sessionState.conf.isParquetINT96AsTimestamp)
+    hadoopConf.setBoolean(
+      SQLConf.PARQUET_INFER_TIMESTAMP_NTZ_ENABLED.key,
+      session.sessionState.conf.parquetInferTimestampNTZEnabled
+    )
+    hadoopConf.setBoolean(SQLConf.LEGACY_PARQUET_NANOS_AS_LONG.key, session.sessionState.conf.legacyParquetNanosAsLong)
     val confBroadcast = session.sparkContext.broadcast(new SerializableConfiguration(hadoopConf))
 
     // Batch size, rounded DOWN to a multiple of 64 (min 64) so every batch offset into a row group is a
@@ -130,7 +146,15 @@ case class VectorParquetScanExec(scan: FileSourceScanExec) extends LeafExecNode 
     val filterPushDown = sqlConf.parquetFilterPushDown
     val pushedFilters =
       if (filterPushDown) org.apache.spark.sql.execution.vector.FileScanAccess.pushedDownFilters(scan) else Seq.empty
-    val datetimeRebase = "CORRECTED" // the planner refuses anything else (see VectorParquetScanPlanner)
+    // The rebase modes and INT96 conversion are resolved per file from its footer, as Spark resolves them
+    // (DataSourceUtils.datetimeRebaseSpec / int96RebaseSpec): a file whose datetime values need a rebase is
+    // read by Spark's reader with that file's modes; the native path decodes CORRECTED files only.
+    val rebaseConf = NativeScanRebaseConf(
+      sqlConf.getConf(SQLConf.PARQUET_REBASE_MODE_IN_READ).toString,
+      sqlConf.getConf(SQLConf.PARQUET_INT96_REBASE_MODE_IN_READ).toString,
+      sqlConf.isParquetINT96TimestampConversion,
+      sqlConf.sessionLocalTimeZone
+    )
     val prefetchFiles = io.vecruntime.spark.VectorConf.scanNativeParquetPrefetchFiles(sqlConf)
     val prefetchRowGroups = io.vecruntime.spark.VectorConf.scanNativeParquetPrefetchRowGroups(sqlConf)
 
@@ -161,7 +185,7 @@ case class VectorParquetScanExec(scan: FileSourceScanExec) extends LeafExecNode 
       pushDownDecimal,
       pushDownStringPredicate,
       pushDownInFilterThreshold,
-      datetimeRebase,
+      rebaseConf,
       prefetchFiles,
       prefetchRowGroups,
       m
@@ -199,7 +223,7 @@ private[vecruntime] final class VectorParquetRDD(
     pushDownDecimal: Boolean,
     pushDownStringPredicate: Boolean,
     pushDownInFilterThreshold: Int,
-    datetimeRebase: String,
+    rebaseConf: NativeScanRebaseConf,
     prefetchFiles: Int,
     prefetchRowGroups: Int,
     metrics: ScanMetrics
@@ -226,7 +250,7 @@ private[vecruntime] final class VectorParquetRDD(
       pushDownDecimal,
       pushDownStringPredicate,
       pushDownInFilterThreshold,
-      datetimeRebase,
+      rebaseConf,
       prefetchFiles,
       prefetchRowGroups,
       metrics,
@@ -257,7 +281,7 @@ private[vecruntime] final class VectorParquetPartitionReader(
     pushDownDecimal: Boolean,
     pushDownStringPredicate: Boolean,
     pushDownInFilterThreshold: Int,
-    datetimeRebase: String,
+    rebaseConf: NativeScanRebaseConf,
     prefetchFiles: Int,
     prefetchRowGroups: Int,
     metrics: ScanMetrics,
@@ -394,7 +418,8 @@ private[vecruntime] final class VectorParquetPartitionReader(
       val clipped: MessageType,
       val firstRead: Boolean,
       val firstStore: org.apache.parquet.column.page.PageReadStore,
-      val needsFallback: Boolean
+      val needsFallback: Boolean,
+      val fallbackModes: FallbackModes = null
   )
 
   // Prefetch (`spark.vecruntime.scan.nativeParquet.prefetchFiles` = N > 0): the next N files of the split
@@ -475,13 +500,15 @@ private[vecruntime] final class VectorParquetPartitionReader(
       val footer: ParquetMetadata = ParquetFileReader.readFooter(inputFile, rangeOpts, stream)
       val fileSchema = footer.getFileMetaData.getSchema
       val clipped = ParquetReadSupport.clipParquetSchema(fileSchema, requiredSchema, caseSensitive, useFieldId, false)
+      val modes = fallbackModes(footer)
       // Encoding is only knowable at read time. If any required column chunk uses an encoding we do not
-      // decode (BYTE_STREAM_SPLIT on FIXED_LEN_BYTE_ARRAY, ...), fall the WHOLE FILE over to Spark's vectorized
-      // reader -- correct results, no mid-decode crash.
-      if (hasUnsupportedEncodingInFooter(footer, clipped)) {
+      // decode (BYTE_STREAM_SPLIT on FIXED_LEN_BYTE_ARRAY, ...), a column's physical type is not its lane's,
+      // or a date / timestamp column's values need a calendar rebase, fall the WHOLE FILE over to Spark's
+      // vectorized reader -- with this file's rebase modes -- for correct results, no mid-decode crash.
+      if (hasUnsupportedEncodingInFooter(footer, clipped) || (hasDatetime && modes.datetimeMode != "CORRECTED")) {
         stream.close()
         stream = null
-        return new Prepared(file, null, clipped, false, null, needsFallback = true)
+        return new Prepared(file, null, clipped, false, null, needsFallback = true, modes)
       }
       // The reader owns the stream from here (closed by reader.close()); clear our handle.
       val readOpts = HadoopReadOptions
@@ -511,7 +538,15 @@ private[vecruntime] final class VectorParquetPartitionReader(
   /** Makes a prepared file the current one (task thread): column readers, partition values, metrics. */
   private def install(p: Prepared): Unit = {
     if (p.needsFallback) {
-      fallback = new SparkFallbackFileReader(p.file, hadoopConf, requiredSchema, partitionSchema, batchSize, context)
+      fallback = new SparkFallbackFileReader(
+        p.file,
+        hadoopConf,
+        requiredSchema,
+        partitionSchema,
+        batchSize,
+        context,
+        p.fallbackModes
+      )
       metrics.numFiles += 1
       return
     }
@@ -694,12 +729,44 @@ private[vecruntime] final class VectorParquetPartitionReader(
     false
   }
 
+  /** Whether any requested column holds dates or timestamps: the only columns a calendar rebase touches. */
+  private val hasDatetime: Boolean = requiredSchema.fields.exists(f =>
+    f.dataType == org.apache.spark.sql.types.DateType || f.dataType == org.apache.spark.sql.types.TimestampType
+  )
+
+  /**
+   * This file's rebase modes and INT96 time-zone conversion, resolved as Spark's `ParquetFileFormat` resolves
+   * them: from the writer's version and legacy-calendar keys in the footer, else the session configuration.
+   * The native path reads a datetime file only when its mode is CORRECTED; the fallback reader is built with
+   * these modes, so a LEGACY or EXCEPTION file gets Spark's own rebase (or Spark's own error).
+   */
+  private def fallbackModes(footer: ParquetMetadata): FallbackModes = {
+    val kv = footer.getFileMetaData.getKeyValueMetaData
+    val lookup: String => String = k => kv.get(k)
+    val dt =
+      org.apache.spark.sql.execution.datasources.DataSourceUtils.datetimeRebaseSpec(lookup, rebaseConf.datetimeMode)
+    val i96 = org.apache.spark.sql.execution.datasources.DataSourceUtils.int96RebaseSpec(lookup, rebaseConf.int96Mode)
+    val createdBy = footer.getFileMetaData.getCreatedBy
+    val convertTz =
+      if (rebaseConf.int96Convert && (createdBy == null || !createdBy.startsWith("parquet-mr"))) rebaseConf.sessionTz
+      else null
+    FallbackModes(
+      dt.mode.toString,
+      dt.originTimeZone.getOrElse(rebaseConf.sessionTz),
+      i96.mode.toString,
+      i96.originTimeZone.getOrElse(rebaseConf.sessionTz),
+      convertTz
+    )
+  }
+
   private def rowGroupFilter(clipped: MessageType): FilterCompat.Filter = {
     if (pushedFilters.isEmpty) {
       return FilterCompat.NOOP
     }
+    // Only a file whose datetime columns resolved to CORRECTED is read natively (see prepare), so its
+    // filters see the values as stored.
     val rebaseSpec = org.apache.spark.sql.catalyst.util.RebaseDateTime.RebaseSpec(
-      org.apache.spark.sql.internal.LegacyBehaviorPolicy.withName(datetimeRebase)
+      org.apache.spark.sql.internal.LegacyBehaviorPolicy.CORRECTED
     )
     val parquetFilters = new ParquetFilters(
       clipped,
@@ -840,6 +907,15 @@ object VectorParquetScanExec {
       case LongType =>
         // INT32 widens by sign extension, so an unsigned INT32 (Spark reads UINT_32 as a long) does not match.
         p == INT64 || (p == INT32 && !isUnsigned(physical))
+      case TimestampType =>
+        // INT64 MICROS or MILLIS, as Spark's ParquetVectorUpdaterFactory matches them (either isAdjustedToUTC);
+        // INT96 and NANOS fall over per file.
+        p == INT64 && (physical.getLogicalTypeAnnotation match {
+          case t: org.apache.parquet.schema.LogicalTypeAnnotation.TimestampLogicalTypeAnnotation =>
+            t.getUnit == org.apache.parquet.schema.LogicalTypeAnnotation.TimeUnit.MICROS ||
+            t.getUnit == org.apache.parquet.schema.LogicalTypeAnnotation.TimeUnit.MILLIS
+          case _ => false
+        })
       case DoubleType => p == DOUBLE
       case BooleanType => p == PrimitiveType.PrimitiveTypeName.BOOLEAN
       case _: StringType => p == BINARY
@@ -868,30 +944,67 @@ object VectorParquetScanExec {
  * scan (`ColumnVectorAdapters`). The reader recycles its batch, so this iterator never closes an emitted
  * one.
  */
+/**
+ * The session's datetime settings the native scan resolves per file: the rebase modes in read
+ * (`spark.sql.parquet.datetimeRebaseModeInRead`, `spark.sql.parquet.int96RebaseModeInRead`), the INT96
+ * time-zone conversion flag and the session time zone.
+ */
+private[vecruntime] final case class NativeScanRebaseConf(
+    datetimeMode: String,
+    int96Mode: String,
+    int96Convert: Boolean,
+    sessionTz: String
+)
+
+/** One file's resolved modes for Spark's fallback reader; `convertTz` is null when no INT96 conversion applies. */
+private[vecruntime] final case class FallbackModes(
+    datetimeMode: String,
+    datetimeTz: String,
+    int96Mode: String,
+    int96Tz: String,
+    convertTz: String
+)
+
 private[vecruntime] final class SparkFallbackFileReader(
     file: PartitionedFile,
     hadoopConf: Configuration,
     requiredSchema: StructType,
     partitionSchema: StructType,
     batchSize: Int,
-    context: TaskContext
+    context: TaskContext,
+    modes: FallbackModes
 ) extends Iterator[ColumnarBatch]
     with AutoCloseable {
 
-  // A file we cannot decode natively falls back to Spark's own vectorized reader. That reader's simple
-  // initialize(path, columns) reads the WHOLE file with no split range, so to avoid duplicate rows when the
-  // file was split into several PartitionedFiles we read it on the FIRST split only (start == 0) and emit
-  // nothing for later splits. Correct: the whole-file read returns every row exactly once.
-  private val readsFile: Boolean = file.start == 0L
-
-  private val reader =
-    if (readsFile) new org.apache.spark.sql.execution.datasources.parquet.VectorizedParquetRecordReader(true, batchSize)
-    else null
-
-  if (readsFile) {
-    reader.initialize(file.toPath.toString, java.util.Arrays.asList(requiredSchema.fieldNames: _*))
-    reader.initBatch(partitionSchema, file.partitionValues)
-    reader.enableReturningBatches()
+  // A file we cannot decode natively falls back to Spark's own vectorized reader, opened as Spark's
+  // ParquetFileFormat opens it: over this split's byte range (so a file split into several PartitionedFiles
+  // returns each row group once, from the split that owns its midpoint), with the scan's Hadoop conf carrying
+  // the requested schema and ParquetFileFormat's reader flags (INT96 as timestamp, binary as string, ...),
+  // and with this file's own rebase modes and INT96 conversion (VectorParquetPartitionReader.fallbackModes).
+  // The simpler initialize(path, columns) reads the whole file and forces int96AsTimestamp off.
+  private val reader = {
+    val r = new org.apache.spark.sql.execution.datasources.parquet.VectorizedParquetRecordReader(
+      if (modes.convertTz == null) null else java.time.ZoneId.of(modes.convertTz),
+      modes.datetimeMode,
+      modes.datetimeTz,
+      modes.int96Mode,
+      modes.int96Tz,
+      true,
+      batchSize
+    )
+    val split = new org.apache.hadoop.mapred.FileSplit(file.toPath, file.start, file.length, Array.empty[String])
+    val attempt = new org.apache.hadoop.mapreduce.TaskAttemptID(
+      new org.apache.hadoop.mapreduce.TaskID(
+        new org.apache.hadoop.mapreduce.JobID(),
+        org.apache.hadoop.mapreduce.TaskType.MAP,
+        0
+      ),
+      0
+    )
+    r.initialize(split, new org.apache.hadoop.mapreduce.task.TaskAttemptContextImpl(hadoopConf, attempt))
+    r.initBatch(partitionSchema, file.partitionValues)
+    r.enableReturningBatches()
+    r
   }
   if (context != null) context.addTaskCompletionListener[Unit](_ => close())
 
@@ -935,8 +1048,9 @@ object VectorParquetScanPlanner {
     val nested = scan.requiredSchema.fields.find(f => !f.dataType.isInstanceOf[AtomicType])
     nested.foreach(f => return Some(s"nested or complex column ${f.name}:${f.dataType.simpleString}"))
     // Every required column must be a type the native reader actually decodes -- ONE shared source of truth
-    // (NativeParquetSupport) so the plan-time check and the runtime decoder cannot drift. Excludes BOOLEAN,
-    // TINYINT/SMALLINT, TIMESTAMP/TIMESTAMP_NTZ, BINARY, wide decimals and collated strings.
+    // (NativeParquetSupport) so the plan-time check and the runtime decoder cannot drift. Excludes FLOAT,
+    // TIMESTAMP_NTZ, BINARY, wide decimals and collated strings; each file's physical types are checked again
+    // at open (physicalMatches).
     scan.requiredSchema.fields.foreach { f =>
       if (!io.vecruntime.spark.parquet.NativeParquetSupport.isReadable(f.dataType)) {
         return Some(s"unsupported column type ${f.name}:${f.dataType.simpleString}")
@@ -948,14 +1062,8 @@ object VectorParquetScanPlanner {
         return Some(s"unsupported partition column type ${f.name}:${f.dataType.simpleString}")
       }
     }
-    // Non-CORRECTED date rebase is refused (read as Spark's). Timestamps are not a supported type at all
-    // (NativeParquetSupport excludes them), so only DATE reaches here.
-    if (scan.requiredSchema.fields.exists(_.dataType.isInstanceOf[DateType])) {
-      val mode = conf.getConf(SQLConf.PARQUET_REBASE_MODE_IN_READ).toString
-      if (mode != "CORRECTED") {
-        return Some(s"date rebase mode $mode (only CORRECTED)")
-      }
-    }
+    // The datetime rebase mode is resolved per file at open (VectorParquetPartitionReader.fallbackModes): a
+    // file that needs a rebase, or whose mode is EXCEPTION, is read by Spark's reader with its own modes.
     // Bucketed scans: leave to Spark unless bucketing is disabled for this scan (reproducing Spark's
     // bucket-to-partition mapping ourselves is out of slice 1).
     if (relation.bucketSpec.isDefined && !scan.disableBucketedScan) {
