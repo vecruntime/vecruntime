@@ -8,6 +8,7 @@ version may change configuration keys or defaults, always noted here.
 
 ### Fixed
 
+- The native Parquet scan's tasks now prefer the hosts Spark's `FileScanRDD` prefers (#559): up to three holding the most of the task's bytes, `localhost` dropped. They reported no preference at all, which cost HDFS block locality. On S3 nothing changes: S3A reports `localhost`, so both scans have no preference.
 - The native Parquet scan returned wrong values for a decimal read with a scale other than the file's (#559): a
   `decimal(15,2)` INT64 column read as `decimal(17,4)` (Spark's decimal widening, which rescales) was decoded
   without the rescale. Each file's decimal annotation must now have the requested scale and at most the requested
