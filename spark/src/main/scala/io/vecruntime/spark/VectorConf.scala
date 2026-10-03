@@ -82,6 +82,7 @@ object VectorConf {
 
   /** #603: build-side strings with at most this many distinct values are emitted as dictionary ids. */
   val JoinBuildDictionaryMax = "spark.vecruntime.join.buildDictionaryMax"
+
   /** #610: broadcast build keys as runtime filters on the native scan. */
   val JoinRuntimeFilters = "spark.vecruntime.join.runtimeFilters"
   val JoinRuntimeFiltersInMax = "spark.vecruntime.join.runtimeFilters.inMax"
