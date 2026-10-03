@@ -157,6 +157,8 @@ case class VectorParquetScanExec(scan: FileSourceScanExec) extends LeafExecNode 
     )
     val prefetchFiles = io.vecruntime.spark.VectorConf.scanNativeParquetPrefetchFiles(sqlConf)
     val prefetchRowGroups = io.vecruntime.spark.VectorConf.scanNativeParquetPrefetchRowGroups(sqlConf)
+    val decodeAhead = io.vecruntime.spark.VectorConf.scanNativeParquetDecodeAhead(sqlConf)
+    val decodeAheadVirtual = io.vecruntime.spark.VectorConf.scanNativeParquetDecodeAheadVirtual(sqlConf)
 
     val m = ScanMetrics(
       longMetric("numFiles"),
@@ -188,6 +190,8 @@ case class VectorParquetScanExec(scan: FileSourceScanExec) extends LeafExecNode 
       rebaseConf,
       prefetchFiles,
       prefetchRowGroups,
+      decodeAhead,
+      decodeAheadVirtual,
       m
     )
   }
@@ -226,6 +230,8 @@ private[vecruntime] final class VectorParquetRDD(
     rebaseConf: NativeScanRebaseConf,
     prefetchFiles: Int,
     prefetchRowGroups: Int,
+    decodeAhead: Int,
+    decodeAheadVirtual: Boolean,
     metrics: ScanMetrics
 ) extends RDD[ColumnarBatch](sc, Nil) {
 
@@ -239,8 +245,8 @@ private[vecruntime] final class VectorParquetRDD(
   override protected def getPreferredLocations(split: Partition): Seq[String] =
     split.asInstanceOf[FilePartition].preferredLocations().toSeq
 
-  override def compute(split: Partition, context: TaskContext): Iterator[ColumnarBatch] =
-    new VectorParquetPartitionReader(
+  override def compute(split: Partition, context: TaskContext): Iterator[ColumnarBatch] = {
+    val reader = new VectorParquetPartitionReader(
       split.asInstanceOf[FilePartition],
       confBroadcast.value.value,
       requiredSchema,
@@ -259,8 +265,13 @@ private[vecruntime] final class VectorParquetRDD(
       prefetchFiles,
       prefetchRowGroups,
       metrics,
-      context
+      context,
+      handOff = decodeAhead > 0,
+      // Up to `decodeAhead` queued, one handed out and one being decoded per column.
+      poolLimit = math.max(4, decodeAhead + 2)
     )
+    if (decodeAhead > 0) new DecodeAheadIterator(reader, decodeAhead, decodeAheadVirtual, context) else reader
+  }
 }
 
 /**
@@ -290,7 +301,9 @@ private[vecruntime] final class VectorParquetPartitionReader(
     prefetchFiles: Int,
     prefetchRowGroups: Int,
     metrics: ScanMetrics,
-    context: TaskContext
+    context: TaskContext,
+    handOff: Boolean = false, // #606: a DecodeAheadIterator owns release and close
+    poolLimit: Int = 4
 ) extends Iterator[ColumnarBatch]
     with AutoCloseable {
 
@@ -312,7 +325,7 @@ private[vecruntime] final class VectorParquetPartitionReader(
   private var emittedPartitionVectors: Array[ColumnVector] = _ // batch-owned partition constant columns to close
   private var fallback: Iterator[ColumnarBatch] = _ // Spark's reader for a file we cannot decode
 
-  if (context != null) context.addTaskCompletionListener[Unit](_ => close())
+  if (context != null && !handOff) context.addTaskCompletionListener[Unit](_ => close())
 
   override def hasNext: Boolean = {
     // A file whose encodings we cannot decode falls back to Spark's reader for that file.
@@ -351,14 +364,30 @@ private[vecruntime] final class VectorParquetPartitionReader(
 
   override def next(): ColumnarBatch = {
     if (!hasNext) throw new NoSuchElementException("no more batches")
+    if (fallback != null) return nextOwned().batch
+    releaseEmitted()
+    val o = nextOwned()
+    emitted = o.batch
+    emittedVectors = o.vectors
+    emittedPartitionVectors = o.partitionVectors
+    emitted
+  }
+
+  /**
+   * The next batch together with what it owns, for a consumer that releases batches itself
+   * ([[DecodeAheadIterator]], #606): nothing is released here, the caller hands the batch back with
+   * [[releaseOwned]]. A batch of Spark's fallback reader is `recycled` -- that reader reuses it on its next
+   * call, so it must be consumed before the reader is advanced.
+   */
+  def nextOwned(): VectorParquetPartitionReader.OwnedBatch = {
+    if (!hasNext) throw new NoSuchElementException("no more batches")
     if (fallback != null) {
       // Spark's reader owns and recycles its batch; do not wrap or close it here.
       val b = fallback.next()
       metrics.numOutputBatches += 1
       metrics.numOutputRows += b.numRows()
-      return b
+      return new VectorParquetPartitionReader.OwnedBatch(b, null, null, null, recycled = true)
     }
-    releaseEmitted()
     val n = math.min(batchSize, rgRows - rgOffset)
     val columns = new Array[ColumnVector](attrs.length)
     val dataVectors = new Array[org.apache.arrow.vector.FieldVector](dataColumnCount)
@@ -403,14 +432,27 @@ private[vecruntime] final class VectorParquetPartitionReader(
         throw t
     }
     rgOffset += n
-    emitted = new ColumnarBatch(columns, n)
-    emittedVectors = dataVectors
-    emittedPartitionVectors = partitionVectors
+    val batch = new ColumnarBatch(columns, n)
     metrics.numOutputBatches += 1
     metrics.numOutputRows += n
     if (inputMetrics != null) inputMetrics.incRecordsRead(n)
     updateBytesRead()
-    emitted
+    new VectorParquetPartitionReader.OwnedBatch(batch, dataVectors, partitionVectors, columnReaders, recycled = false)
+  }
+
+  /** Returns a batch from [[nextOwned]]: its data vectors to their readers' pools, its constants closed. */
+  def releaseOwned(o: VectorParquetPartitionReader.OwnedBatch): Unit = if (o != null && !o.recycled) {
+    var c = 0
+    while (c < o.vectors.length) {
+      // A reader closed since (its file is done) closes the vector instead of pooling it.
+      if (o.vectors(c) != null) o.readers(c).release(o.vectors(c))
+      c += 1
+    }
+    var p = 0
+    while (p < o.partitionVectors.length) {
+      if (o.partitionVectors(p) != null) o.partitionVectors(p).close()
+      p += 1
+    }
   }
 
   /**
@@ -576,6 +618,7 @@ private[vecruntime] final class VectorParquetPartitionReader(
           batchSize,
           allocator
         )
+      columnReaders(i).setPoolLimit(poolLimit)
       i += 1
     }
     buildPartitionColumns(p.file)
@@ -852,6 +895,19 @@ private[vecruntime] final class VectorParquetPartitionReader(
 }
 
 private[vecruntime] object VectorParquetPartitionReader {
+
+  /**
+   * A decoded batch with what it owns (#606): its data vectors (each returned to `readers(c)`'s pool) and
+   * partition constant columns (closed), or a `recycled` batch of Spark's fallback reader that owns nothing
+   * and is reused by that reader's next call.
+   */
+  final class OwnedBatch(
+      val batch: ColumnarBatch,
+      val vectors: Array[org.apache.arrow.vector.FieldVector],
+      val partitionVectors: Array[ColumnVector],
+      val readers: Array[io.vecruntime.spark.parquet.NativeParquetColumnReader],
+      val recycled: Boolean
+  )
 
   /**
    * The prefetch threads (`prefetchFiles` or `prefetchRowGroups` > 0): daemon platform threads, cached and
