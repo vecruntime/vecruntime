@@ -80,6 +80,9 @@ object VectorConf {
   /** #603 step 2: a hash join emits its build-side lane columns as views over the build table. */
   val JoinDeferredBuild = "spark.vecruntime.join.deferredBuild"
 
+  /** Velox's evalWithMemo: string expressions once per dictionary entry. */
+  val ExprDictionaryMemo = "spark.vecruntime.expr.dictionaryMemo"
+
   /** #603: build-side strings with at most this many distinct values are emitted as dictionary ids. */
   val JoinBuildDictionaryMax = "spark.vecruntime.join.buildDictionaryMax"
 
@@ -247,6 +250,13 @@ object VectorConf {
    * ids, not copies), so a dimension string carried through a chain of joins is gathered once, where it is read.
    */
   def joinDeferredBuild(conf: SQLConf): Boolean = bool(conf, JoinDeferredBuild, default = true)
+
+  /**
+   * An expression whose only input is one string column (substring, upper, like, ... and literals) is
+   * evaluated once per entry of a dictionary-encoded input and kept while the dictionary is the same one
+   * (a row group's), the rows taking their entry's result by id. Off until measured.
+   */
+  def exprDictionaryMemo(conf: SQLConf): Boolean = bool(conf, ExprDictionaryMemo, default = false)
 
   /**
    * #603: a hash join emits a build-side string column with at most this many distinct values as ids over

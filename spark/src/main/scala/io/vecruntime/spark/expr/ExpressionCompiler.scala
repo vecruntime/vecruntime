@@ -279,7 +279,14 @@ object ExpressionCompiler {
     case e => compile(e, input)
   }
 
-  def compile(expr: Expression, input: Seq[Attribute]): Result = expr match {
+  /**
+   * Compiles `expr` over `input`; an expression of one dictionary-encodable string column is wrapped to
+   * run once per dictionary entry ([[DictionaryMemoExpr]], `spark.vecruntime.expr.dictionaryMemo`).
+   */
+  def compile(expr: Expression, input: Seq[Attribute]): Result =
+    compileNode(expr, input).map(c => DictionaryMemoExpr.wrap(expr, c, input))
+
+  private def compileNode(expr: Expression, input: Seq[Attribute]): Result = expr match {
     // A scalar subquery result in any reference-free shape (the ScalarSubquery, a struct field of a
     // merged one, a CASE over such fields): a literal by the time the operator runs, read then.
     case e if SubqueryLiteralExpr.isDeferred(e) =>
