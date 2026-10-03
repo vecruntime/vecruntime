@@ -342,6 +342,117 @@ public final class NativeParquetColumnReader {
         return fillFixed(n, /* modeA= */ true);
     }
 
+    // ----- late materialization (#611) -----
+
+    /**
+     * Skips the next {@code n} rows of the row group without decoding them into
+     * any vector.
+     */
+    public void skipRows(int n) {
+        int done = 0;
+        while (done < n) {
+            if (decoder.needsPage()) {
+                decoder.feedPage(toKernelPage(requirePage()));
+            }
+            done += decoder.skip(n - done);
+        }
+    }
+
+    /**
+     * {@link #readBatch} decoding only the rows set in {@code selection}
+     * ({@code n} bits): the vector has {@code n} slots, the others null for a
+     * nullable column (zero, false or empty otherwise), and the batch's
+     * selection excludes them. Runs of unselected rows are skipped in the page
+     * streams.
+     */
+    public FieldVector readBatchSelected(int n, java.lang.foreign.MemorySegment selection) {
+        decoder.startBatch(n);
+        if (type == VecType.UTF8 || type == VecType.BOOL || binaryDecimal) {
+            forRuns(n, selection,
+                    (sel, len, at) -> sel ? decoder.readBatch(len, at) : decoder.skipIntoBatch(len, at));
+            boolean nulls = decoder.batchNullCount() > 0;
+            if (type == VecType.UTF8) {
+                return decoder.batchIsDictionaryIds() ? flushIds(n, nulls) : flushUtf8(n, nulls);
+            }
+            return binaryDecimal ? flushDecimal(n, nulls) : flushBool(n, nulls);
+        }
+        BaseFixedWidthVector v = (BaseFixedWidthVector) borrowFixed(n);
+        ArrowVectorBuffers out = ArrowVectorBuffers.forWrite(v, n, sparkType);
+        java.lang.foreign.MemorySegment data = out.data();
+        java.lang.foreign.MemorySegment validity = maxDefLevel > 0 ? out.validity() : null;
+        if (validity != null) {
+            validity.asSlice(0L, (long) ((n + 63) >>> 6) * 8).fill((byte) 0);
+        }
+        int width = v.getTypeWidth();
+        forRuns(
+                n,
+                selection,
+                (sel, len, at) -> {
+                    if (sel) {
+                        return decoder.readBatchDirectA(len, at, data, validity);
+                    }
+                    int m = decoder.skip(len);
+                    // Defined values in the skipped slots (a pooled vector holds an earlier batch's): the
+                    // conversions below run over every slot, and a stale micros value times 1000 could overflow.
+                    data.asSlice((long) at * width, (long) m * width).fill((byte) 0);
+                    return m;
+                });
+        boolean hasNulls = decoder.batchNullCount() > 0 || (validity != null && hasUnselected(n, selection));
+        if (narrowBits != 0) {
+            narrow(data, n, narrowBits);
+        }
+        if (millis) {
+            millisToMicros(data, hasNulls ? validity : null, n);
+        }
+        io.vecruntime.spark.arrow.ArrowOutput.finish(out, n, !hasNulls);
+        return v;
+    }
+
+    @FunctionalInterface
+    private interface RunStep {
+        /**
+         * Decodes or skips up to {@code len} rows at batch row {@code at};
+         * returns the rows done.
+         */
+        int apply(boolean selected, int len, int at);
+    }
+
+    /**
+     * Walks the runs of equal bits of {@code selection}, feeding pages, calling
+     * {@code step} until each run is done.
+     */
+    private void forRuns(int n, java.lang.foreign.MemorySegment selection, RunStep step) {
+        int i = 0;
+        while (i < n) {
+            boolean sel = bit(selection, i);
+            int j = i + 1;
+            while (j < n && bit(selection, j) == sel) {
+                j++;
+            }
+            int done = 0;
+            while (done < j - i) {
+                if (decoder.needsPage()) {
+                    decoder.feedPage(toKernelPage(requirePage()));
+                }
+                done += step.apply(sel, j - i - done, i + done);
+            }
+            i = j;
+        }
+    }
+
+    private static boolean bit(java.lang.foreign.MemorySegment bits, int i) {
+        return ((bits.get(java.lang.foreign.ValueLayout.JAVA_BYTE, i >>> 3) >>> (i & 7)) & 1) != 0;
+    }
+
+    private static boolean hasUnselected(int n, java.lang.foreign.MemorySegment selection) {
+        for (int i = 0; i < n; i++) {
+            if (!bit(selection, i)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     /**
      * A FIXED_LEN_BYTE_ARRAY / BINARY decimal batch: the staged big-endian
      * bytes into the INT64 or DECIMAL128 lane.
