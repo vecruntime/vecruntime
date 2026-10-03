@@ -93,6 +93,8 @@ object VectorConf {
 
   /** The decode-ahead producer's thread kind (#606): `virtual` or `platform`. */
   val ScanNativeParquetDecodeAheadThreads = "spark.vecruntime.scan.nativeParquet.decodeAhead.threads"
+  /** VectorParquetScanExec (#612): dictionary-encoded string columns as dictionary vectors, default on. */
+  val ScanNativeParquetDictionaryStrings = "spark.vecruntime.scan.nativeParquet.dictionaryStrings"
 
   /** Mixed chains (#280): Comet's native operators above ours through the sink leaf. Off until #281 decides an allowlist. */
   val CometMixedEnabled = "spark.vecruntime.comet.mixed.enabled"
@@ -377,6 +379,12 @@ object VectorConf {
   /** The decode-ahead producer's thread kind: `virtual` (the default) or `platform`. */
   def scanNativeParquetDecodeAheadVirtual(conf: SQLConf): Boolean =
     !conf.getConfString(ScanNativeParquetDecodeAheadThreads, "virtual").trim.equalsIgnoreCase("platform")
+   * #612: the native scan emits a string column's dictionary-encoded batches as dictionary vectors (ids over
+   * the row group's dictionary) instead of resolving them into bytes, as Spark's scan path already hands them
+   * to our operators. A row group whose pages fall back from the dictionary decodes flat from that page on.
+   */
+  def scanNativeParquetDictionaryStrings(conf: SQLConf): Boolean =
+    bool(conf, ScanNativeParquetDictionaryStrings, default = true)
 
   private def intIn(conf: SQLConf, key: String, default: Int, max: Int): Int =
     scala.util.Try(conf.getConfString(key, default.toString).trim.toInt).toOption.map(n =>

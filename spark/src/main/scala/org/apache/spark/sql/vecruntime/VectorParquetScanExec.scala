@@ -159,6 +159,7 @@ case class VectorParquetScanExec(scan: FileSourceScanExec) extends LeafExecNode 
     val prefetchRowGroups = io.vecruntime.spark.VectorConf.scanNativeParquetPrefetchRowGroups(sqlConf)
     val decodeAhead = io.vecruntime.spark.VectorConf.scanNativeParquetDecodeAhead(sqlConf)
     val decodeAheadVirtual = io.vecruntime.spark.VectorConf.scanNativeParquetDecodeAheadVirtual(sqlConf)
+    val dictionaryStrings = io.vecruntime.spark.VectorConf.scanNativeParquetDictionaryStrings(sqlConf)
 
     val m = ScanMetrics(
       longMetric("numFiles"),
@@ -192,6 +193,7 @@ case class VectorParquetScanExec(scan: FileSourceScanExec) extends LeafExecNode 
       prefetchRowGroups,
       decodeAhead,
       decodeAheadVirtual,
+      dictionaryStrings,
       m
     )
   }
@@ -232,6 +234,7 @@ private[vecruntime] final class VectorParquetRDD(
     prefetchRowGroups: Int,
     decodeAhead: Int,
     decodeAheadVirtual: Boolean,
+    dictionaryStrings: Boolean,
     metrics: ScanMetrics
 ) extends RDD[ColumnarBatch](sc, Nil) {
 
@@ -268,7 +271,8 @@ private[vecruntime] final class VectorParquetRDD(
       context,
       handOff = decodeAhead > 0,
       // Up to `decodeAhead` queued, one handed out and one being decoded per column.
-      poolLimit = math.max(4, decodeAhead + 2)
+      poolLimit = math.max(4, decodeAhead + 2),
+      dictionaryStrings = dictionaryStrings
     )
     if (decodeAhead > 0) new DecodeAheadIterator(reader, decodeAhead, decodeAheadVirtual, context) else reader
   }
@@ -303,7 +307,8 @@ private[vecruntime] final class VectorParquetPartitionReader(
     metrics: ScanMetrics,
     context: TaskContext,
     handOff: Boolean = false, // #606: a DecodeAheadIterator owns release and close
-    poolLimit: Int = 4
+    poolLimit: Int = 4,
+    dictionaryStrings: Boolean = false // #612: dictionary-encoded strings as dictionary vectors
 ) extends Iterator[ColumnarBatch]
     with AutoCloseable {
 
@@ -322,6 +327,8 @@ private[vecruntime] final class VectorParquetPartitionReader(
   private var rgOffset = 0
   private var emitted: ColumnarBatch = _
   private var emittedVectors: Array[org.apache.arrow.vector.FieldVector] = _ // batch-owned data vectors to release
+  private var emittedReaders: Array[NativeParquetColumnReader] =
+    _ // the readers that made them (#612: an id batch must go back to its own)
   private var emittedPartitionVectors: Array[ColumnVector] = _ // batch-owned partition constant columns to close
   private var fallback: Iterator[ColumnarBatch] = _ // Spark's reader for a file we cannot decode
 
@@ -369,6 +376,7 @@ private[vecruntime] final class VectorParquetPartitionReader(
     val o = nextOwned()
     emitted = o.batch
     emittedVectors = o.vectors
+    emittedReaders = o.readers
     emittedPartitionVectors = o.partitionVectors
     emitted
   }
@@ -401,7 +409,7 @@ private[vecruntime] final class VectorParquetPartitionReader(
         // so a retained or serialized batch ships only its own rows.
         val fv = columnReaders(c).readBatch(n)
         dataVectors(c) = fv
-        columns(c) = ArrowOutput.wrap(fv, attrs(c)._2)
+        columns(c) = columnReaders(c).wrap(fv)
         c += 1
       }
       // Partition-value constant columns follow the data columns, ordered to the output: a constant vector
@@ -619,6 +627,7 @@ private[vecruntime] final class VectorParquetPartitionReader(
           allocator
         )
       columnReaders(i).setPoolLimit(poolLimit)
+      columnReaders(i).setDictionaryIds(dictionaryStrings)
       i += 1
     }
     buildPartitionColumns(p.file)
@@ -842,9 +851,8 @@ private[vecruntime] final class VectorParquetPartitionReader(
       var c = 0
       while (c < dataColumnCount) {
         if (emittedVectors(c) != null) {
-          // Return to the reader's pool if the reader is still open; otherwise (file already closed) close.
-          if (columnReaders != null && columnReaders(c) != null) columnReaders(c).release(emittedVectors(c))
-          else emittedVectors(c).close()
+          // Back to the reader that made it: its pool, or closed if that reader (its file) is closed.
+          emittedReaders(c).release(emittedVectors(c))
         }
         c += 1
       }

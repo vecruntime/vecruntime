@@ -167,6 +167,7 @@ public final class ColumnChunkDecoder {
     private double[] dictDoubles;
     private byte[] dictBytes;
     private int[] dictOffsets;
+    private int dictSize; // UTF8 dictionary entries
 
     private final GroupUnpacker[] unpackers = new GroupUnpacker[33];
     private final boolean[] unpackerSet = new boolean[33];
@@ -205,6 +206,9 @@ public final class ColumnChunkDecoder {
                 if (utf8Data == null) {
                     utf8Data = new byte[Math.max(1 << 14, batchRows)];
                 }
+                if (emitIds) {
+                    ints = grow(ints, batchRows); // dictionary ids (#612)
+                }
             }
             default -> throw new IllegalArgumentException("unsupported lane " + type);
         }
@@ -229,6 +233,70 @@ public final class ColumnChunkDecoder {
         this.idReader = null;
         this.deltaReader = null;
         this.hasDictionary = false;
+        this.chunkFellBack = false;
+    }
+
+    // ---- dictionary-id output (#612) ----
+    private boolean emitIds; // the consumer takes dictionary ids for UTF8 dictionary pages
+    private boolean chunkFellBack; // a non-dictionary page was met in this chunk: flat from here on
+    private boolean batchIds; // the current batch holds ids in `ints`, not bytes
+
+    /**
+     * Whether a UTF8 chunk's dictionary-encoded batches are emitted as
+     * dictionary ids (INT32, into the fixed lane's staging, read with {@link
+     * #flushIds}) rather than resolved into bytes. A batch is ids only while
+     * every page it reads is dictionary-encoded; when a page falls back to
+     * another encoding (parquet-java does that mid-chunk once its dictionary
+     * grows too large), the ids already written in the batch are resolved into
+     * bytes and the rest of the chunk is decoded flat.
+     */
+    public void setEmitDictionaryIds(boolean emit) {
+        if (type != VecType.UTF8) {
+            throw new IllegalStateException("dictionary ids are a UTF8 lane's");
+        }
+        this.emitIds = emit;
+    }
+
+    /**
+     * True when the batch just read holds dictionary ids ({@link #flushIds}),
+     * not bytes.
+     */
+    public boolean batchIsDictionaryIds() {
+        return batchIds;
+    }
+
+    /** Copy the finished batch's dictionary ids (0 at a null) and validity. */
+    public void flushIds(int rows, MemorySegment outData, MemorySegment outValidity) {
+        if (!batchIds) {
+            throw new IllegalStateException("the batch holds bytes, not dictionary ids");
+        }
+        MemorySegment.copy(ints, 0, outData, LE_INT, 0L, rows);
+        flushValidity(rows, outValidity);
+    }
+
+    /** The dictionary's entry count (ids are in [0, n)). */
+    public int dictionarySize() {
+        return hasDictionary && dictOffsets != null ? dictSize : 0;
+    }
+
+    /**
+     * Resolves the `rows` ids already in this batch into bytes, then continues
+     * the batch flat.
+     */
+    private void resolveBatchIds(int rows) {
+        int pos = 0;
+        for (int i = 0; i < rows; i++) {
+            utf8Offsets[i] = pos;
+            boolean valid = maxDefLevel == 0 || (validityWords[i >>> 6] & (1L << (i & 63))) != 0;
+            if (valid) {
+                int id = ints[i];
+                int start = dictOffsets[id];
+                pos = appendBytes(dictBytes, start, dictOffsets[id + 1] - start, pos);
+            }
+        }
+        utf8Offsets[rows] = pos;
+        utf8Len = pos;
+        batchIds = false;
     }
 
     // ------------------------------------------------------------------ dictionary (heap)
@@ -261,6 +329,7 @@ public final class ColumnChunkDecoder {
                 }
             }
             case UTF8 -> {
+                dictSize = n;
                 dictOffsets = ensureInts(dictOffsets, n + 1);
                 MemorySegment off = dict.offsets();
                 for (int i = 0; i <= n; i++) {
@@ -431,6 +500,7 @@ public final class ColumnChunkDecoder {
         allocateBatch(batchRows);
         utf8Len = 0;
         batchNulls = 0;
+        batchIds = emitIds && hasDictionary && !chunkFellBack;
         if (type == VecType.BOOL) {
             java.util.Arrays.fill(boolWords, 0, (batchRows + 63) >>> 6, 0L); // values are ORed in
         }
@@ -1228,6 +1298,28 @@ public final class ColumnChunkDecoder {
             throw new IllegalArgumentException(pageEncoding + " on a UTF8 lane");
         }
         int pos = utf8Len;
+        if (batchIds) {
+            if (pageEncoding == ParquetPageDecoder.Encoding.RLE_DICTIONARY) {
+                // #612: ids, not bytes. A null row's slot is 0 (a valid id), masked by the validity.
+                int[] ids = id(presentCount);
+                idReader.readInts(ids, 0, presentCount);
+                if (present == null) {
+                    System.arraycopy(ids, 0, ints, dstBase, m);
+                } else {
+                    int k = 0;
+                    for (int i = 0; i < m; i++) {
+                        ints[dstBase + i] = k < presentCount && present[k] == i
+                                ? ids[k++]
+                                : 0;
+                    }
+                }
+                return;
+            }
+            // A non-dictionary page in a dictionary chunk: parquet-java's fallback is for the rest of the chunk.
+            chunkFellBack = true;
+            resolveBatchIds(dstBase);
+            pos = utf8Len;
+        }
         if (pageEncoding == ParquetPageDecoder.Encoding.RLE_DICTIONARY) {
             int[] ids = id(presentCount);
             idReader.readInts(ids, 0, presentCount);

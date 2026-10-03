@@ -87,6 +87,15 @@ public final class VectorDictionaryColumnVector extends ColumnVector {
         return new VectorDictionaryColumnVector(indices, dictionary, false, null);
     }
 
+    /**
+     * A view over vectors someone else owns (#612: the native Parquet scan's
+     * batch-owned ids over its row group's shared dictionary, returned to the
+     * scan's reader rather than closed here).
+     */
+    public static VectorDictionaryColumnVector borrowed(IntVector indices, VarCharVector dictionary) {
+        return new VectorDictionaryColumnVector(indices, dictionary, false, null);
+    }
+
     /** Zero-copy dictionary-encoded UTF8 buffers over the two vectors. */
     public VectorBuffers buffers() {
         ArrowVectorBuffers idx = ArrowVectorBuffers.forRead(indices);
