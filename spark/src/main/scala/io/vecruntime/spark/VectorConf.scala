@@ -79,7 +79,7 @@ object VectorConf {
   /** The scan-side prefetching converter (#403, lever 2): the queue depth, `0` off. */
   val ScanPrefetch = "spark.vecruntime.scan.prefetch"
 
-  /** Our own Java Parquet page decoder behind a VectorParquetScanExec (#559), default off. */
+  /** Our own Java Parquet page decoder behind a VectorParquetScanExec (#559), on by default (see scanNativeParquet). */
   val ScanNativeParquet = "spark.vecruntime.scan.nativeParquet.enabled"
 
   /** VectorParquetScanExec read-ahead (#559/#566): files of a split opened ahead, `0` off. */
@@ -327,8 +327,22 @@ object VectorConf {
     )).getOrElse(0)
   def cometMixedEnabled(conf: SQLConf): Boolean = bool(conf, CometMixedEnabled, default = false)
 
-  /** Plan our own VectorParquetScanExec in place of a supported Parquet FileSourceScanExec (#559). */
-  def scanNativeParquet(conf: SQLConf): Boolean = bool(conf, ScanNativeParquet, default = false)
+  /**
+   * Plan our own VectorParquetScanExec in place of a supported Parquet FileSourceScanExec (#559). On by default
+   * since 0.0.6, except in a session where Comet's scan is active (Comet's plugin or extension registered, with
+   * `spark.comet.enabled` and `spark.comet.scan.enabled` not false): there Comet's reader stays the scan unless
+   * this key is set explicitly.
+   */
+  def scanNativeParquet(conf: SQLConf): Boolean = bool(conf, ScanNativeParquet, default = !cometScanActive(conf))
+
+  /** Whether Comet's scan is active in this session: its plugin or extension registered and its scan not off. */
+  def cometScanActive(conf: SQLConf): Boolean = {
+    val registered = Seq("spark.plugins", "spark.sql.extensions").exists(k =>
+      conf.getConfString(k, "").toLowerCase(java.util.Locale.ROOT).contains("comet")
+    )
+    registered && bool(conf, "spark.comet.enabled", default = true) &&
+    bool(conf, "spark.comet.scan.enabled", default = true)
+  }
 
   /**
    * How many files of a split `VectorParquetScanExec` opens ahead (#559/#566): status, footer and first row
@@ -339,7 +353,7 @@ object VectorConf {
   def scanNativeParquetPrefetchFiles(conf: SQLConf): Int = intIn(conf, ScanNativeParquetPrefetchFiles, 6, 16)
 
   /**
-   * How many row groups of the current file `VectorParquetScanExec` reads ahead (#559/#566), on virtual
+   * How many row groups of the current file `VectorParquetScanExec` reads ahead (#559/#566), on platform
    * threads, chained so a file's reader is used by one thread at a time and in order. Pays off on files with
    * several row groups. `0` reads each row group on the task thread. Memory per task grows by up to N row
    * groups (compressed pages), so it scales with the row-group size. Capped at 16.

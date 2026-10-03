@@ -9,7 +9,7 @@ This page is the design note for VecRuntime's own Parquet scan, #559. It covers 
 
 **In short (2026-10-03):** the scan reads every flat Parquet type and every encoding parquet-java's v1 and v2 writers produce. Only `INT96` timestamps and nested types (structs, lists, maps) go to Spark's reader: `INT96` per file, nested per plan. On the 1 TB TPC-DS run of 2026-10-02 it took VecRuntime to 1,542 s for the 103 queries, against 3,099 s for Spark, 1,999 s for Comet and 1,954 s for Comet's reader under our operators.
 
-The scan is **off by default**. You turn it on with `spark.vecruntime.scan.nativeParquet.enabled`. Its configuration keys are in the [Configuration reference](configuration.html), and the planner's fallback reasons are on the [Operators](operators.html) page.
+The scan is **on by default** since 0.0.6 (`spark.vecruntime.scan.nativeParquet.enabled`), except in a session where Comet's scan is active: Comet's plugin or extension registered, with `spark.comet.enabled` and `spark.comet.scan.enabled` not false. There Comet's reader stays the scan unless the key is set. Setting the key to `false` brings back Spark's vectorized reader under our operators. Its configuration keys are in the [Configuration reference](configuration.html), and the planner's fallback reasons are on the [Operators](operators.html) page.
 
 ## Why the scan exists
 

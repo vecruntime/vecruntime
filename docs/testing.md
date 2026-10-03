@@ -102,7 +102,7 @@ Validation the project maintains directly (all on JDK 25):
 
 ### The native Parquet reader
 
-Our own Parquet scan (`spark.vecruntime.scan.nativeParquet.enabled`, #559) decodes pages itself, so it is
+Our own Parquet scan (`spark.vecruntime.scan.nativeParquet.enabled`, #559, on by default) decodes pages itself, so it is
 checked against the Parquet reference implementation as well as Spark. Each encoding and type is admitted
 only once all of these pass:
 
@@ -131,7 +131,8 @@ only once all of these pass:
 
   The corpus found a bug that predated it: a `FIXED_LEN_BYTE_ARRAY` decimal was decoded as INT64 (#592).
 - **Spark's SQL golden suite with the native scan on**
-  (`SQL_TESTS_JVM_ARGS=-Dspark.vecruntime.scan.nativeParquet.enabled=true`), as in section 1: 642
+  (on by default, so the suite of section 1 runs on it; before 0.0.6 it took
+  `SQL_TESTS_JVM_ARGS=-Dspark.vecruntime.scan.nativeParquet.enabled=true`): 642
   succeeded, 0 failed.
 - **Throughput.** Each decoder has a JMH benchmark against Spark's or parquet-java's reader for the same
   page (`DeltaBinaryPackedBenchmark`, `V2EncodingsBenchmark`). The numbers are in the

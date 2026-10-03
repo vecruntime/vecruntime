@@ -27,6 +27,7 @@ version may change configuration keys or defaults, always noted here.
 
 ### Changed
 
+- **The native Parquet scan is on by default** (#559; `spark.vecruntime.scan.nativeParquet.enabled`). It reads every flat type, passes Spark's SQL golden suite (642/0) and the project's suites, and took the 1 TB TPC-DS run of 2026-10-02 to 1,542 s against Spark's 3,099 and Comet's 1,999. In a session where Comet's scan is active (Comet's plugin or extension registered, `spark.comet.enabled` and `spark.comet.scan.enabled` not false), it stays off, so Comet's reader remains the scan. Setting the key explicitly always wins; `false` restores Spark's vectorized reader under our operators. CI's suites and golden suite now run on the native scan through the default.
 - Our shuffle's reduce tasks no longer report preferred locations (#559; `spark.vecruntime.shuffle.reduceLocality.enabled`, default `false`). Spark prefers the hosts holding at least 20% of a reduce partition's map output, and a shuffled join intersects both sides' hosts. At 1 TB that often left one host, so its 13 slots ran a whole post-shuffle stage while the remaining tasks waited out the 3 s locality wait, and the next stage, reading that host's output, repeated it. A reducer still reads its own executor's blocks locally, so locality saves some network fetch, but the wait cost far more. TPC-DS 1 TB, our engine with our reader, two legs each way, alternating:
 
   | query | locality on (s) | off (s) | change |

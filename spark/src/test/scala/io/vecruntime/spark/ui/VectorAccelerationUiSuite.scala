@@ -117,15 +117,20 @@ class VectorAccelerationUiSuite extends SparkVectorFunSuite with Eventually {
 
   test("a scan plus our operators is fully accelerated") {
     TestTables.createMixed(spark, newTempPath("ui/full"), rows = 1000)
-    // Scan (columnar source) -> VectorFilter -> ColumnarToRow (transition). The scan and the
+    // Spark's scan (columnar source) -> VectorFilter -> ColumnarToRow (transition). The scan and the
     // transition are plumbing, so the only operator is ours.
-    val plan = PlanAcceleration.fromPlan(
-      spark.sql("SELECT i FROM t WHERE i > 10").queryExecution.executedPlan
-    )
+    spark.conf.set(io.vecruntime.spark.VectorConf.ScanNativeParquet, "false")
+    val plan =
+      try PlanAcceleration.fromPlan(spark.sql("SELECT i FROM t WHERE i > 10").queryExecution.executedPlan)
+      finally spark.conf.unset(io.vecruntime.spark.VectorConf.ScanNativeParquet)
     assert(plan.countBy(Engine.Vector) >= 1)
     assert(plan.countBy(Engine.ColumnarSource) === 1, "the vectorized scan is a columnar source")
     assert(plan.countBy(Engine.Spark) === 0)
     assert(plan.fullyAccelerated)
+    // On the native scan (the default) the scan is ours too, and the plan is still fully accelerated.
+    val native = PlanAcceleration.fromPlan(spark.sql("SELECT i FROM t WHERE i > 10").queryExecution.executedPlan)
+    assert(native.countBy(Engine.Spark) === 0)
+    assert(native.fullyAccelerated)
   }
 
   test("an operator we do not implement is not fully accelerated") {

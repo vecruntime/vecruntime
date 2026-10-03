@@ -62,7 +62,11 @@ class VectorWideDecimalSuite extends VectorQuerySuite {
     spark.read.parquet(newTempPath("wide/plain")).createOrReplaceTempView("tw_plain")
   }
 
-  private def lanesAdaptedBy[T](f: => T): Long = {
+  /**
+   * How many wide columns of Spark's vectors `f` adapted into lanes. The adapter only runs over Spark's
+   * scan, so `f` runs with the native scan off; the queries below also run on the native scan (the default).
+   */
+  private def lanesAdaptedBy[T](f: => T): Long = withConf(VectorConf.ScanNativeParquet -> "false") {
     val before = SparkColumnVectorBuffers.wideDecimalColumns()
     f
     SparkColumnVectorBuffers.wideDecimalColumns() - before
