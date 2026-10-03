@@ -40,7 +40,8 @@ FileSourceScanExec (planned by Spark)
 **Decoding.** `NativeParquetColumnReader` turns each `DataPageV1` or `DataPageV2` into a kernel page. Definition levels and values are written into one reusable buffer per reader. `ColumnChunkDecoder` then decodes, at a row offset into the output:
 - the validity bitmap, built from the definition levels;
 - fixed-width lanes, written straight into the Arrow data buffer;
-- dictionary indices, resolved against a decoded dictionary held in a GC-managed arena.
+- dictionary indices, resolved against a decoded dictionary held in a GC-managed arena, for every lane but strings;
+- for a string column (#612, `…dictionaryStrings`, on by default), dictionary ids instead: the batch is a `VectorDictionaryColumnVector` over one Arrow dictionary per row group, shared by its batches and reference-counted, closed when the reader and the last batch let go. A data page that falls back from the dictionary (parquet-java does so mid-chunk once the dictionary outgrows its page limit) resolves the ids already in the batch into bytes, and the rest of the row group decodes flat.
 
 Parquet-java's `BytePacker` is injected for the bit-unpacking. Vectors are pooled and reused from one row group to the next.
 

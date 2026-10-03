@@ -334,7 +334,7 @@ public final class ArrowOutput {
         return v;
     }
 
-    private static VarCharVector copyDictionary(String name, VectorBuffers dict, BufferAllocator allocator) {
+    public static VarCharVector copyDictionary(String name, VectorBuffers dict, BufferAllocator allocator) {
         int n = dict.length();
         int end = dict.offsets().get(VectorBuffers.LE_INT, (long) n << 2);
         ArrowVectorBuffers out = allocateUtf8(name, n, end, allocator);

@@ -186,9 +186,110 @@ public final class NativeParquetColumnReader {
         this.pages = pages;
         this.rowGroupRows = rowGroupRows;
         decoder.startChunk(rowGroupRows);
+        releaseChunkDictionary();
         VectorBuffers dict = decodeDictionary(pages);
         if (dict != null) {
             decoder.setDictionary(dict);
+            if (dictionaryIds) {
+                // #612: the row group's dictionary as one Arrow vector, shared by every batch emitted as ids.
+                chunkDict = new SharedDictionary(io.vecruntime.spark.arrow.ArrowOutput.copyDictionary(name + ".dictionary", dict, allocator));
+            }
+        }
+    }
+
+    // ---- dictionary-encoded string output (#612) ----
+
+    /**
+     * A row group's dictionary, shared by its id batches; closed when the
+     * reader and every batch let go.
+     */
+    private static final class SharedDictionary {
+        final org.apache.arrow.vector.VarCharVector vector;
+        private int refs = 1; // the reader's own, dropped at the next row group / close
+
+        SharedDictionary(org.apache.arrow.vector.VarCharVector vector) {
+            this.vector = vector;
+        }
+
+        synchronized void retain() {
+            refs++;
+        }
+
+        synchronized void release() {
+            if (--refs == 0) {
+                vector.close();
+            }
+        }
+    }
+
+    private boolean dictionaryIds;
+    private SharedDictionary chunkDict;
+    private final java.util.IdentityHashMap<FieldVector, SharedDictionary> idBatches = new java.util.IdentityHashMap<>();
+    private final Deque<FieldVector> idPool = new ArrayDeque<>();
+
+    /**
+     * Emit a string column's dictionary-encoded batches as dictionary ids over
+     * the row group's dictionary ({@link #wrap} gives the {@code
+     * VectorDictionaryColumnVector}), so the operators above compute on ids, as
+     * they do over Spark's scan. Only for a UTF8 string column read through the
+     * UTF8 path (not binary, not a fixed-length or byte-array decimal).
+     */
+    public void setDictionaryIds(boolean enabled) {
+        boolean ok = enabled
+                && type == VecType.UTF8
+                && !binaryDecimal
+                && fixedLength == 0
+                && sparkType instanceof org.apache.spark.sql.types.StringType;
+        this.dictionaryIds = ok;
+        if (type == VecType.UTF8) {
+            decoder.setEmitDictionaryIds(ok);
+        }
+    }
+
+    /**
+     * The batch vector as Spark's column: a dictionary view for an id batch,
+     * else the plain Arrow wrapper.
+     */
+    public org.apache.spark.sql.vectorized.ColumnVector wrap(FieldVector v) {
+        SharedDictionary d;
+        synchronized (pool) {
+            d = idBatches.get(v);
+        }
+        if (d != null) {
+            return io.vecruntime.spark.arrow.VectorDictionaryColumnVector.borrowed((org.apache.arrow.vector.IntVector) v, d.vector);
+        }
+        return io.vecruntime.spark.arrow.ArrowOutput.wrap(v, sparkType);
+    }
+
+    private FieldVector flushIds(int rows, boolean hasNulls) {
+        org.apache.arrow.vector.IntVector v;
+        synchronized (pool) {
+            v = (org.apache.arrow.vector.IntVector) idPool.pollFirst();
+        }
+        long needValidity = io.vecruntime.kernels.Bitmap.bytesFor(rows);
+        if (v != null && (v.getDataBuffer().capacity() < (long) rows * 4 || v.getValidityBuffer().capacity() < needValidity)) {
+            v.close();
+            v = null;
+        }
+        if (v == null) {
+            v = new org.apache.arrow.vector.IntVector(name, allocator);
+            v.allocateNew(rows);
+        }
+        ArrowVectorBuffers out = ArrowVectorBuffers.forWrite(v, rows, org.apache.spark.sql.types.DataTypes.IntegerType);
+        decoder.flushIds(rows, out.data(),
+                hasNulls ? out.validity() : null);
+        io.vecruntime.spark.arrow.ArrowOutput.finish(out, rows, !hasNulls);
+        chunkDict.retain();
+        synchronized (pool) {
+            idBatches.put(v, chunkDict);
+        }
+        return v;
+    }
+
+    private void releaseChunkDictionary() {
+        if (chunkDict != null) {
+            chunkDict.release();
+            chunkDict = null;
         }
     }
 
@@ -221,6 +322,9 @@ public final class NativeParquetColumnReader {
                     decoder.feedPage(toKernelPage(requirePage()));
                 }
                 filled += decoder.readBatch(n - filled, filled);
+            }
+            if (decoder.batchIsDictionaryIds()) {
+                return flushIds(n, decoder.batchNullCount() > 0);
             }
             return flushUtf8(n, decoder.batchNullCount() > 0);
         }
@@ -453,6 +557,22 @@ public final class NativeParquetColumnReader {
         if (v == null) {
             return;
         }
+        SharedDictionary d;
+        synchronized (pool) {
+            d = idBatches.remove(v);
+        }
+        if (d != null) {
+            // An id batch (#612): drop its hold on the row group's dictionary, pool the ids.
+            d.release();
+            synchronized (pool) {
+                if (!closed && idPool.size() < maxPool) {
+                    idPool.addLast(v);
+                    return;
+                }
+            }
+            v.close();
+            return;
+        }
         synchronized (pool) {
             if (!closed && pool.size() < maxPool) {
                 pool.addLast(v);
@@ -560,7 +680,13 @@ public final class NativeParquetColumnReader {
                 v.close();
             }
             pool.clear();
+            for (FieldVector v : idPool) {
+                v.close();
+            }
+            idPool.clear();
         }
+        // Batches still out keep the dictionary until they are released; the reader's own hold goes now.
+        releaseChunkDictionary();
     }
 
     public ColumnDescriptor column() {
