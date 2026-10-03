@@ -27,6 +27,7 @@ version may change configuration keys or defaults, always noted here.
 
 ### Changed
 
+- The native Parquet scan keeps dictionary-encoded strings as dictionary vectors (#612; `spark.vecruntime.scan.nativeParquet.dictionaryStrings`, default `true`). Since #609 made the native scan the default, its string columns were resolved into flat bytes, which lost the dictionary paths Spark's scan path had: filters compacting ids, the aggregate grouping on ids (#377), string expressions once per entry. Now each row group's dictionary is one shared Arrow vector and its batches carry ids; a chunk that falls back from its dictionary mid-way decodes flat from that page on.
 - Benchmarks: every configuration (Spark, Comet, ours and the mixed ones) now runs with `spark.locality.wait=0` (#559), in `submit-cluster.sh` and `TpchRunner.Configs`, so all engines are scheduled alike. Spark's reduce tasks prefer the hosts that hold their map output, which piled post-shuffle stages onto one host behind the 3 s wait, the same pile-up our shuffle now avoids (above). TPC-DS 1 TB, Spark 4.1.3, two legs each way, alternating, checksums equal:
 
   | query | default (s) | wait 0 (s) | change |
