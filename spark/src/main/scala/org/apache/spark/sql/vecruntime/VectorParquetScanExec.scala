@@ -81,8 +81,28 @@ case class VectorParquetScanExec(scan: FileSourceScanExec) extends LeafExecNode 
     "numOutputRows" -> SQLMetrics.createMetric(sparkContext, "number of output rows"),
     "numOutputBatches" -> SQLMetrics.createMetric(sparkContext, "number of output batches"),
     "numRowGroups" -> SQLMetrics.createMetric(sparkContext, "number of row groups read"),
+    "numRuntimeFilters" -> SQLMetrics.createMetric(sparkContext, "number of runtime filters from joins"),
     "scanTime" -> SQLMetrics.createTimingMetric(sparkContext, "scan time")
   )
+
+  /**
+   * Filters a broadcast hash join above derived from its build keys (#610), set on the driver before this
+   * node's RDD is made (the join's `doExecuteColumnar` attaches them, then executes its streamed side). They
+   * are ANDed with the static pushed filters, so they skip row groups and pages through the same
+   * statistics, dictionary and column-index paths. Data columns only: never a partition column.
+   */
+  @transient @volatile private[vecruntime] var runtimeFilters: Seq[org.apache.spark.sql.sources.Filter] = Nil
+
+  /** The runtime filters attached so far (tests). */
+  def runtimeFilterCount: Int = runtimeFilters.size
+
+  private[vecruntime] def addRuntimeFilter(f: org.apache.spark.sql.sources.Filter): Unit = synchronized {
+    if (!runtimeFilters.contains(f)) runtimeFilters = runtimeFilters :+ f
+  }
+
+  /** Whether `name` is a column of the files (not a partition column) this scan reads. */
+  private[vecruntime] def isDataColumn(name: String): Boolean =
+    scan.requiredSchema.fieldNames.contains(name) && !scan.relation.partitionSchema.fieldNames.contains(name)
 
   override def doCanonicalize(): SparkPlan = VectorParquetScanExec(scan.canonicalized.asInstanceOf[FileSourceScanExec])
 
@@ -145,7 +165,9 @@ case class VectorParquetScanExec(scan: FileSourceScanExec) extends LeafExecNode 
     val pushDownInFilterThreshold = sqlConf.parquetFilterPushDownInFilterThreshold
     val filterPushDown = sqlConf.parquetFilterPushDown
     val pushedFilters =
-      if (filterPushDown) org.apache.spark.sql.execution.vector.FileScanAccess.pushedDownFilters(scan) else Seq.empty
+      if (filterPushDown)
+        org.apache.spark.sql.execution.vector.FileScanAccess.pushedDownFilters(scan) ++ runtimeFilters
+      else Seq.empty
     // The rebase modes and INT96 conversion are resolved per file from its footer, as Spark resolves them
     // (DataSourceUtils.datetimeRebaseSpec / int96RebaseSpec): a file whose datetime values need a rebase is
     // read by Spark's reader with that file's modes; the native path decodes CORRECTED files only.
@@ -172,7 +194,7 @@ case class VectorParquetScanExec(scan: FileSourceScanExec) extends LeafExecNode 
     val partSchema = partitionSchema
     val attrs = outputAttrs.map(a => (a.name, a.dataType)).toArray
 
-    new VectorParquetRDD(
+    val rdd = new VectorParquetRDD(
       session.sparkContext,
       scan,
       confBroadcast,
@@ -196,6 +218,14 @@ case class VectorParquetScanExec(scan: FileSourceScanExec) extends LeafExecNode 
       dictionaryStrings,
       m
     )
+    // Counted by the task of partition 0, once per execution (a driver-side count is reset when a plan
+    // whose stages are already materialised runs again).
+    val runtime = if (filterPushDown) runtimeFilters.size.toLong else 0L
+    if (runtime == 0L) rdd
+    else {
+      val counter = longMetric("numRuntimeFilters")
+      rdd.mapPartitionsWithIndexInternal { (i, it) => if (i == 0) counter += runtime; it }
+    }
   }
 }
 
