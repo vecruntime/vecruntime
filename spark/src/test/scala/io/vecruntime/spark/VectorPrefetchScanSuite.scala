@@ -45,6 +45,11 @@ import org.apache.spark.unsafe.types.UTF8String
  */
 class VectorPrefetchScanSuite extends VectorQuerySuite {
 
+  // VectorPrefetchScanExec sits over Spark's own scan (the native scan has its own read-ahead), so this
+  // suite pins the native scan (on by default since 0.0.6) off.
+  override protected def extraSparkConf: Map[String, String] =
+    super.extraSparkConf ++ Map(VectorConf.ScanNativeParquet -> "false")
+
   private val Prefetch = classOf[VectorPrefetchScanExec]
   private val Filter = classOf[VectorFilterExec]
   private val Agg = classOf[VectorHashAggregateExec]

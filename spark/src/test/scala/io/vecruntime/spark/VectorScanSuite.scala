@@ -28,6 +28,11 @@ import org.apache.spark.sql.vecruntime.{VectorFilterExec, VectorHashAggregateExe
  */
 class VectorScanSuite extends VectorQuerySuite {
 
+  // This suite is about our operators over Spark's own Parquet scan (the adapter seam, off-heap views, the
+  // row-scan fallback), so it pins the native scan (on by default since 0.0.6) off.
+  override protected def extraSparkConf: Map[String, String] =
+    super.extraSparkConf ++ Map(VectorConf.ScanNativeParquet -> "false")
+
   private val Filter = classOf[VectorFilterExec]
   private val Project = classOf[VectorProjectExec]
   private val Agg = classOf[VectorHashAggregateExec]
