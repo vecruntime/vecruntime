@@ -93,6 +93,9 @@ public final class ColumnVectorAdapters {
         if (cv instanceof BorrowedColumnVector b) {
             return adapt(b.inner(), numRows, scratch);
         }
+        if (cv instanceof io.vecruntime.spark.arrow.DeferredGatherColumnVector d) {
+            return adapt(d.gathered(), numRows, scratch); // a join's not-yet-gathered probe column (#603)
+        }
         if (cv instanceof VectorArrowColumnVector v) {
             return ArrowVectorBuffers.forRead(v.getValueVector());
         }
