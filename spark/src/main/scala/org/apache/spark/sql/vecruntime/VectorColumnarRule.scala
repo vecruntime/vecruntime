@@ -217,7 +217,7 @@ case class VectorExecRule(session: SparkSession) extends Rule[SparkPlan] with Lo
         case l: LocalTableScanExec if VectorConf.localTableScanEnabled(conf) =>
           VectorSamplePlanner.planLocalTableScan(l).fold(reason => fallback(l, reason), v => v)
 
-        // Our own Parquet scan (#559), behind spark.vecruntime.scan.nativeParquet.enabled (default off):
+        // Our own Parquet scan (#559), behind spark.vecruntime.scan.nativeParquet.enabled (on by default unless Comet's scan is active):
         // decode pages straight into our Arrow vectors, so the chain above is ours from the leaf. Only a
         // supported flat Parquet scan converts; anything else keeps Spark's scan with a recorded reason.
         case s: FileSourceScanExec if VectorConf.scanNativeParquet(conf) =>

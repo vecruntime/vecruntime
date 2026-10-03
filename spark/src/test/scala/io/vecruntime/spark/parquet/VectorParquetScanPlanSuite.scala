@@ -46,6 +46,33 @@ class VectorParquetScanPlanSuite extends VectorQuerySuite {
     }
   }
 
+  test("default (key unset): the native scan is planned") {
+    write("p_default", "SELECT CAST(id AS INT) AS i FROM range(0, 2000)")
+    spark.conf.unset(VectorConf.ScanNativeParquet)
+    val df = withPlugin(enabled = true)(spark.sql("SELECT i FROM p_default"))
+    df.collect()
+    val nodes = PlanUtils.allNodes(finalPlan(df))
+    assert(nodes.exists(_.isInstanceOf[VectorParquetScanExec]), "the native scan is on by default")
+  }
+
+  test("default with Comet's scan active: off unless set explicitly") {
+    def conf(kv: (String, String)*) = {
+      val c = new org.apache.spark.sql.internal.SQLConf
+      kv.foreach { case (k, v) => c.setConfString(k, v) }
+      c
+    }
+    val comet = "spark.plugins" -> "org.apache.spark.CometPlugin,io.vecruntime.spark.VectorPlugin"
+    assert(VectorConf.scanNativeParquet(conf()))
+    assert(!VectorConf.scanNativeParquet(conf(comet)))
+    assert(
+      !VectorConf.scanNativeParquet(conf("spark.sql.extensions" -> "org.apache.comet.CometSparkSessionExtensions"))
+    )
+    assert(VectorConf.scanNativeParquet(conf(comet, "spark.comet.scan.enabled" -> "false")))
+    assert(VectorConf.scanNativeParquet(conf(comet, "spark.comet.enabled" -> "false")))
+    assert(VectorConf.scanNativeParquet(conf(comet, VectorConf.ScanNativeParquet -> "true")))
+    assert(!VectorConf.scanNativeParquet(conf(VectorConf.ScanNativeParquet -> "false")))
+  }
+
   test("flag on, supported scan: the node is planned") {
     write("p_on", "SELECT CAST(id AS INT) AS i, CAST(id AS BIGINT) AS l FROM range(0, 2000)")
     withConf(VectorConf.ScanNativeParquet -> "true") {
