@@ -161,19 +161,28 @@ private[vecruntime] final class DecodeAheadIterator(
   override def close(): Unit = if (!closed) {
     closed = true
     stopping = true
-    if (producer != null) {
-      handBack.release() // a producer waiting on a recycled batch
-      while (producer.isAlive) {
-        // Drain so a producer blocked on a full queue sees the stop; release what it had queued.
-        val item = queue.poll(10, TimeUnit.MILLISECONDS)
-        if (item != null) releaseItem(item)
+    // A killed task's thread arrives here interrupted (it was blocked in take()): clear the flag for the
+    // drain and join, so a timed poll does not throw before the reader is closed, and restore it after.
+    val interrupted = Thread.interrupted()
+    try {
+      if (producer != null) {
+        handBack.release() // a producer waiting on a recycled batch
+        while (producer.isAlive) {
+          // Drain so a producer blocked on a full queue sees the stop; release what it had queued.
+          val item =
+            try queue.poll(10, TimeUnit.MILLISECONDS)
+            catch { case _: InterruptedException => null }
+          if (item != null) releaseItem(item)
+        }
       }
+      var item = queue.poll()
+      while (item != null) { releaseItem(item); item = queue.poll() }
+      if (peeked != null) { releaseItem(peeked); peeked = null }
+      releaseCurrent()
+    } finally {
+      inner.close()
+      if (interrupted) Thread.currentThread().interrupt()
     }
-    var item = queue.poll()
-    while (item != null) { releaseItem(item); item = queue.poll() }
-    if (peeked != null) { releaseItem(peeked); peeked = null }
-    releaseCurrent()
-    inner.close()
   }
 }
 

@@ -18,7 +18,7 @@ package io.vecruntime.spark.parquet
 import io.vecruntime.spark.VectorConf
 import io.vecruntime.spark.arrow.VectorAllocators
 import io.vecruntime.spark.test.VectorQuerySuite
-import org.apache.spark.sql.vecruntime.{DecodeAheadIterator, VectorParquetScanExec}
+import org.apache.spark.sql.vecruntime.{DecodeAheadIterator, PlanUtils, VectorParquetScanExec}
 
 /**
  * #606: decode-ahead in the native Parquet scan. With `decodeAhead` = K > 0 a producer thread per task decodes
@@ -50,6 +50,27 @@ class DecodeAheadSuite extends VectorQuerySuite {
       ).repartition(3).write.mode("overwrite").parquet(newTempPath("da/t"))
       spark.read.parquet(newTempPath("da/t")).createOrReplaceTempView("da_t")
     }
+  }
+
+  /** Row groups the native scan read (its `numRowGroups` metric) for `sql`. */
+  private def nativeRowGroups(sql: String): Long = withPlugin(enabled = true) {
+    val df = spark.sql(sql)
+    df.collect()
+    PlanUtils.allNodes(finalPlan(df)).collect { case s: VectorParquetScanExec => s }
+      .map(_.metrics("numRowGroups").value).sum
+  }
+
+  private def parquetFiles(dir: String): Int =
+    new java.io.File(dir).listFiles().count(_.getName.endsWith(".parquet"))
+
+  test("the test table spans many row groups per file, all decoded natively") {
+    val files = parquetFiles(newTempPath("da/t"))
+    val groups = nativeRowGroups("SELECT * FROM da_t")
+    // 3 files of 20,000 rows under 64 KB blocks: several row groups each, so decode-ahead crosses row-group
+    // and file boundaries in the tests below.
+    assert(files === 3, s"$files files")
+    assert(groups >= 4L * files, s"only $groups row groups in $files files")
+    withDecodeAhead(4, "virtual")(assert(nativeRowGroups("SELECT * FROM da_t") === groups))
   }
 
   private def withDecodeAhead[T](k: Int, threads: String)(f: => T): T =
