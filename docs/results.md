@@ -2910,6 +2910,43 @@ The x86 page (`docs/benchmarks/tpcds-1tb.html`) now shows this run.
   - **What it means for #559:** Spark's Parquet reader accounts for the scan-bound gap to Comet. A faster reader of our own would recover it without the native crossing's fixed cost.
 - **Against the earlier x86 run:** that run used a 128m advisory size and `minPartitionNum=208`, with Comet 1.0.0 failing q64. It measured Spark 3,309 s, ours 2,557 s (1.29x) and Comet 2,514 s.
 
+## x86 TPC-DS 1 TB with no locality wait, four engines in one session (2026-10-03)
+
+The x86 page (`docs/benchmarks/tpcds-1tb.html`) now shows this run. The result files and the page's
+metadata are in `benchmarks/results/tpcds-sf1000-2026-10-03/`.
+
+**Setup:** as on 2026-10-02 (below), with these changes:
+- **Code:** main at `77283b2`, image `main-77283b2`. The native Parquet scan is the default (#609), our
+  shuffle's reduce tasks report no preferred locations (#604), and the native scan's tasks prefer Spark's
+  file hosts (#607; no change on S3).
+- **Every engine:** `spark.locality.wait=0` (#608). Spark's reduce-side preference had piled post-shuffle
+  stages onto one host behind the 3 s wait; the six-query A/Bs behind #604 and #608 are in the CHANGELOG.
+
+**Totals:**
+
+| engine | total (s) | vs Spark | geomean | faster than Spark on | executor time (h) | GC (h) | shuffle read (TB) |
+|---|---|---|---|---|---|---|---|
+| Spark 4.1.3 | 2,963.4 | baseline | -- | -- | 74.7 | 0.61 | 0.94 |
+| VecRuntime (own reader) | 1,414.8 | 2.09x | 1.91x | 100 | 33.4 | 0.60 | 0.47 |
+| Comet Native Scan + VecRuntime | 1,813.1 | 1.63x | 1.56x | 101 | 44.1 | 0.11 | 0.48 |
+| Comet 1.0.0 | 1,964.1 | 1.51x | 1.47x | 96 | 48.8 | 0.02 | 0.43 |
+
+- **Against 2026-10-02** (same nodes and settings except the locality changes): Spark 3,098.7 -> 2,963.4 s
+  (-4.4%), VecRuntime 1,541.8 -> 1,414.8 s (-8.2%), Comet Native Scan + VecRuntime 1,954.0 -> 1,813.1 s
+  (-7.2%), Comet 1,999.4 -> 1,964.1 s (-1.8%). The largest moves are the queries whose post-shuffle stages had
+  piled onto one host: Spark's q81 19.7 -> 9.0 s, q43 11.0 -> 5.0, q30 16.1 -> 10.5; ours q18 12.1 -> 6.2.
+- **Correctness:** every engine returned Spark's row counts on all 103 queries and Spark's checksums on all
+  but q65 (ties, ordered differently by every engine).
+- **Fastest engine per query:** VecRuntime 65, Comet 20, Comet Native Scan + VecRuntime 18, Spark 0.
+- **Reader against reader:** under the same operators and shuffle, our reader finishes in 1,415 s and Comet's
+  in 1,813 s; ours is faster on 74 of 103 queries.
+- **The scan-bound queries:** q88 35.1 s (Spark 94.3, Comet 83.0), q9 32.0 (76.9, 52.0), q28 60.7 (97.4, 69.2),
+  q44 10.2 (34.1, 24.1), q90 9.6 (27.2, 27.8).
+- **Comet ahead:** q95 by 27.3 s, q4 51.4 against our 62.1, q11 29.2 against 33.6, q65 13.5 against 18.2, q51,
+  q96 and q18 (3.7 against 6.2).
+- **Ours slower than Spark:** q99 (8.4 -> 9.0 s, the join-chain gather of #603), q96 (14.6 -> 15.5 s), q12
+  (2.1 -> 2.3 s). q18 is level with Spark (6.2 s each), down from 12.1 s.
+
 ## x86 TPC-DS 1 TB on our own Parquet reader, four engines in one session (2026-10-02)
 
 The x86 page (`docs/benchmarks/tpcds-1tb.html`) now shows this run. The result files and the page's

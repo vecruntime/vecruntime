@@ -1,0 +1,81 @@
+{
+  "title": "Apache Spark vs VecRuntime vs DataFusion Comet on TPC-DS 1 TB",
+  "dataset": "TPC-DS scale factor 1000 (1 TB), Parquet on Amazon S3 (103 query variants, one measured iteration each, no warm-up)",
+  "cluster": "Amazon EKS 1.36; 9 x m5.4xlarge (16 vCPU, 64 GB, x86-64 with AVX-512), 300 GB root volume; one node group in one availability zone (us-east-1a), the driver on the ninth node",
+  "executors": "8 executors x 13 cores x 50 GB each (Spark: 20 GB heap / 30 GB overhead; VecRuntime: 30 GB heap / 20 GB overhead; Comet: 20 GB heap / 8 GB overhead / 22 GB off-heap; Comet Native Scan + VecRuntime: 30 GB heap / 12 GB overhead / 8 GB off-heap); driver 2 cores x 4 GB",
+  "storage": "Amazon S3 through an S3 gateway VPC endpoint, Hadoop 3.4.3 S3A with the Analytics Accelerator input stream (the default in 3.4.3); fs.s3a.connection.maximum=1000, threads.max=256, max.total.tasks=128, Analytics Accelerator physicalio.thread.pool.size=192 for every engine (#566)",
+  "versions": {
+    "Spark": "4.1.3",
+    "Scala": "2.13",
+    "JDK": "Amazon Corretto 25, -XX:+UseCompactObjectHeaders and Amazon Corretto Crypto Provider on driver and executors (#578, #566)",
+    "VecRuntime": "main at 77283b2 (native Parquet scan on by default #609, reduce-side locality off #604, scan locality #607)",
+    "Comet": "1.0.0",
+    "Hadoop": "3.4.3"
+  },
+  "common_conf": [
+    "spark.sql.shuffle.partitions=300",
+    "spark.locality.wait=0   # every engine (#608): no locality wait; on S3 the scans have no locality, and Spark's reduce-side preference piled post-shuffle stages onto one host",
+    "# spark.sql.adaptive.advisoryPartitionSizeInBytes left at Spark's default (64 MB); no coalescePartitions.minPartitionNum",
+    "spark.eventLog.enabled=true",
+    "-XX:+UseCompactObjectHeaders, -Djava.security.properties=<ACCP first> (driver and executors, every engine)"
+  ],
+  "vector_conf": [
+    "spark.plugins=io.vecruntime.spark.VectorPlugin",
+    "spark.shuffle.manager=org.apache.spark.sql.vecruntime.shuffle.VectorShuffleManager",
+    "spark.vecruntime.scan.nativeParquet.enabled=true   # our Parquet reader, VectorParquetScanExec (#559); the default since #609",
+    "spark.vecruntime.shuffle.reduceLocality.enabled=false   # default (#604): our reduce tasks report no preferred locations",
+    "spark.vecruntime.scan.nativeParquet.prefetchFiles=6   # default: files read ahead per split",
+    "spark.vecruntime.scan.nativeParquet.prefetchRowGroups=2   # default: row groups read ahead per file",
+    "spark.vecruntime.exec.strictFloatingPoint=false   # Comet's default too",
+    "spark.vecruntime.shuffle.aqe.mapSizeScaling=true   # AQE sees Spark-scale map output sizes (#514)",
+    "spark.vecruntime.shuffle.aqe.sparkCompressionRatio=0   # the uncompressed-bytes ratio (#514)",
+    "AOT class-data cache off",
+    "--add-modules=jdk.incubator.vector --enable-native-access=ALL-UNNAMED (driver and executors)"
+  ],
+  "comet_conf": [
+    "spark.plugins=org.apache.spark.CometPlugin",
+    "spark.shuffle.manager=org.apache.spark.sql.comet.execution.shuffle.CometShuffleManager",
+    "spark.memory.offHeap.enabled=true",
+    "spark.memory.offHeap.size=22g",
+    "spark.comet.exec.enabled=true",
+    "spark.comet.scan.enabled=true",
+    "spark.comet.exec.shuffle.enabled=true",
+    "spark.comet.exec.shuffle.mode=auto",
+    "spark.comet.cast.allowIncompatible=true",
+    "spark.comet.explainFallback.enabled=true"
+  ],
+  "mixed_conf": [
+    "spark.plugins=org.apache.spark.CometPlugin,io.vecruntime.spark.VectorPlugin",
+    "spark.shuffle.manager=org.apache.spark.sql.vecruntime.shuffle.VectorShuffleManager",
+    "spark.vecruntime.shuffle.enabled=true",
+    "spark.comet.enabled=true",
+    "spark.comet.scan.enabled=true   # CometNativeScanExec: DataFusion's Rust Parquet reader and object_store S3 I/O",
+    "spark.comet.exec.enabled=true   # with every Comet operator switched off: filter, project, aggregate, joins, sort, window, ...",
+    "spark.comet.exec.shuffle.enabled=false",
+    "spark.memory.offHeap.enabled=true",
+    "spark.memory.offHeap.size=8g   # executors 30 GB heap / 12 GB overhead / 8 GB off-heap"
+  ],
+  "notes": [
+    "Every engine returned Spark's row counts on every query, and Spark's checksums on every query except q65, whose result has ties that every engine orders differently.",
+    "The four legs ran on 2026-10-03 in one cluster session on the same nine nodes, one after another (Spark, VecRuntime, Comet Native Scan + VecRuntime, Comet), each alone on the cluster. S3 throughput varies between sessions, so only legs from one session are compared.",
+    "VecRuntime runs on its own Parquet reader (spark.vecruntime.scan.nativeParquet.enabled, #559), the default since #609: pages decoded in Java straight into the Arrow buffers its operators read, with the next files and row groups of each split read ahead on background threads.",
+    "Every engine ran with spark.locality.wait=0 (#608). Against the 2026-10-02 run, which kept Spark's 3 s wait, Spark went from 3,099 to 2,963 s, VecRuntime from 1,542 to 1,415 s (with #604 as well), Comet Native Scan + VecRuntime from 1,954 to 1,813 s and Comet from 1,999 to 1,964 s.",
+    "Comet is the 1.0.0 release from Maven Central. The S3A settings, ACCP and compact object headers are the benchmark launcher's defaults since #566 and #578 and apply to all four engines.",
+    "AQE is at its defaults for every engine."
+  ],
+  "methodology_html": "<p><b>Methodology.</b> Spark, VecRuntime, Comet Native Scan + VecRuntime and Comet ran one after another in one cluster session on 2026-10-03, on the same nine nodes, each alone on the cluster, over the same S3 data with the same Spark settings; only the execution engine and its own memory split differ (every engine has 50 GB per executor; where it puts them follows where it allocates). Each query ran once after the plan was compiled; the time is the wall-clock of the query's execution as the runner measures it.</p>",
+  "wins_html": "<p>The scan-bound queries are VecRuntime's, on its own Parquet reader: q88 35.1 s against Spark's 94.3 and Comet's 83.0; q9 32.0 against 76.9 and 52.0; q28 60.7 against 97.4 and 69.2; q44 10.2 against 34.1 and 24.1; q90 9.6 against 27.2 and 27.8. So are the heavy joins: q23b 91.9 against 273.6 and 133.2; q64 24.5 against 88.5 and 54.7; q93 41.6 against 129.4 and 76.9. Comet Native Scan + VecRuntime (the same operators on Comet's Rust reader) finishes in 1,813 s against VecRuntime's 1,415 s on its own reader. Comet leads on q95 (27 s ahead), the heavy aggregates (q4 51.4 against VecRuntime's 62.1, q11 29.2 against 33.6), q65, q51, q96 and q18. VecRuntime's losses to Spark are q99 (9.0 s against 8.4, the join-chain gather of #603), q96 (15.5 against 14.6) and q12 (2.3 against 2.1).</p>",
+  "results_doc": "https://github.com/vecruntime/vecruntime/blob/main/docs/results.md",
+  "repo": "https://github.com/vecruntime/vecruntime",
+  "run_doc": "https://github.com/vecruntime/vecruntime/blob/main/benchmarks/k8s/README.md",
+  "vector_vs_comet": " and leads on the scan-bound queries and the heavy joins; Comet leads on q95, the heavy aggregates (q4, q11) and q18",
+  "results_line": "Every engine returned Spark's results (q65: ties, ordered differently by every engine).",
+  "query_notes": {
+    "q65": "ties"
+  },
+  "comet_label": "DataFusion Comet 1.0.0",
+  "vector_label": "VecRuntime (own Parquet reader + Flight shuffle)",
+  "mixed_label": "Comet Native Scan + VecRuntime",
+  "mixed_vs_vector": "VecRuntime on its own reader",
+  "mixed_line": "Same operators and shuffle as VecRuntime, on Comet's Rust Parquet reader."
+}
