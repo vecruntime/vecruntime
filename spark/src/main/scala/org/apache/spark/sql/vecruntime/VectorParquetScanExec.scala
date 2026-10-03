@@ -234,6 +234,11 @@ private[vecruntime] final class VectorParquetRDD(
   // before `scan.inputRDD` is materialised (accessing it early throws "dynamicpruning has not finished").
   override protected def getPartitions: Array[Partition] = scan.inputRDD.partitions
 
+  // The hosts FileScanRDD would prefer: up to three holding the most of the partition's bytes, `localhost`
+  // dropped (S3A reports it for every block, so on S3 this is empty and the task NO_PREF, as Spark's).
+  override protected def getPreferredLocations(split: Partition): Seq[String] =
+    split.asInstanceOf[FilePartition].preferredLocations().toSeq
+
   override def compute(split: Partition, context: TaskContext): Iterator[ColumnarBatch] =
     new VectorParquetPartitionReader(
       split.asInstanceOf[FilePartition],
