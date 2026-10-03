@@ -26,9 +26,10 @@ import org.apache.spark.sql.types.{DataType, IntegerType, LongType, StringType}
  * native Parquet scan through filters, projections and the streamed sides of other inner joins hands the
  * scan, per join key that is a plain data column there, the build side's key domain: an IN list when the
  * build has few distinct values, otherwise the [min, max] range of an integer key. The scan ANDs them with
- * its static pushed filters, so row groups and pages that hold no key the build side has are skipped
- * through the existing statistics, dictionary and column-index paths (Parquet's IN conversion turns a long
- * list into its range, `spark.sql.parquet.pushdown.inFilterThreshold`).
+ * its static pushed filters, so row groups that hold no key the build side has are skipped through the
+ * existing statistics and dictionary paths (the native reader does not page-skip: its column index filter
+ * is off). Parquet's IN conversion turns a long list into its range (`spark.sql.parquet.pushdown.inFilterThreshold`).
+ * Rows are not filtered in the scan: that is #611's (late materialization), which can reuse this path.
  *
  * Only for joins that drop a streamed row without a match: inner joins and left semi joins with the build
  * on the right. A null key never matches, and neither filter keeps one.

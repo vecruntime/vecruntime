@@ -88,8 +88,8 @@ case class VectorParquetScanExec(scan: FileSourceScanExec) extends LeafExecNode 
   /**
    * Filters a broadcast hash join above derived from its build keys (#610), set on the driver before this
    * node's RDD is made (the join's `doExecuteColumnar` attaches them, then executes its streamed side). They
-   * are ANDed with the static pushed filters, so they skip row groups and pages through the same
-   * statistics, dictionary and column-index paths. Data columns only: never a partition column.
+   * are ANDed with the static pushed filters, so they skip row groups through the same statistics and
+   * dictionary paths. Data columns only: never a partition column.
    */
   @transient @volatile private[vecruntime] var runtimeFilters: Seq[org.apache.spark.sql.sources.Filter] = Nil
 
