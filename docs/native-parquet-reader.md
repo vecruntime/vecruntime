@@ -7,6 +7,8 @@ title: Native Parquet reader
 
 This page is the design note for VecRuntime's own Parquet scan, #559. It covers what the scan does today, how it is put together, what it does not decode yet, and the work that is left.
 
+**In short (2026-10-03):** the scan reads every flat Parquet type and every encoding parquet-java's v1 and v2 writers produce. Only `INT96` timestamps and nested types (structs, lists, maps) go to Spark's reader: `INT96` per file, nested per plan. On the 1 TB TPC-DS run of 2026-10-02 it took VecRuntime to 1,542 s for the 103 queries, against 3,099 s for Spark, 1,999 s for Comet and 1,954 s for Comet's reader under our operators.
+
 The scan is **off by default**. You turn it on with `spark.vecruntime.scan.nativeParquet.enabled`. Its configuration keys are in the [Configuration reference](configuration.html), and the planner's fallback reasons are on the [Operators](operators.html) page.
 
 ## Why the scan exists
@@ -69,19 +71,33 @@ A few rules hold the design together:
 
 | | Decoded natively | Notes |
 |---|---|---|
-| Physical / logical types | INT32 (`int`, `date`), INT64 (`bigint`), DOUBLE, decimal with precision ≤ 18 (INT32/INT64 physical), UTF8 `string` with the default collation | `NativeParquetSupport.isReadable`; the planner and the reader share this check |
-| Encodings | `PLAIN`, `PLAIN_DICTIONARY`, `RLE_DICTIONARY`; `DELTA_BINARY_PACKED` on INT32/INT64, `DELTA_LENGTH_BYTE_ARRAY` and `DELTA_BYTE_ARRAY` on strings, `BYTE_STREAM_SPLIT` on INT32/INT64/DOUBLE; definition levels in `RLE`/`BIT_PACKED` | `VectorParquetScanExec.supportsEncoding` |
+| Types with an engine lane | `boolean`, `tinyint`, `smallint`, `int`, `bigint`, `double`, `date`, `timestamp` (INT64 `MICROS`/`MILLIS`), `decimal` up to precision 38, UTF8 `string` with the default collation | `NativeParquetSupport.isReadable`; the planner and the reader share this check |
+| Types carried without a lane | `float`, `binary`, `timestamp_ntz` | Decoded on the lane of the same layout and emitted as Arrow vectors Spark reads; operators carry them, and an operator that computes on one stays Spark's |
+| Physical storage | INT32, INT64, DOUBLE, FLOAT, BOOLEAN, BINARY; `FIXED_LEN_BYTE_ARRAY` for decimals and binary | Checked per file at open (`physicalMatches`), including the decimal scale |
+| Encodings | `PLAIN`, `PLAIN_DICTIONARY`, `RLE_DICTIONARY`; `RLE` for booleans; `DELTA_BINARY_PACKED` on INT32/INT64; `DELTA_LENGTH_BYTE_ARRAY` on BINARY; `DELTA_BYTE_ARRAY` on BINARY and `FIXED_LEN_BYTE_ARRAY`; `BYTE_STREAM_SPLIT` on INT32/INT64/FLOAT/DOUBLE; definition levels in `RLE`/`BIT_PACKED` | `VectorParquetScanExec.supportsEncoding` |
+| Calendar | Files whose datetime rebase mode resolves to `CORRECTED` | Resolved per file from the footer and the session, as Spark resolves it |
 | Data pages | v1 and v2 | v2 levels and data are read separately |
 | Schema | Flat only | Nested types keep Spark's scan |
 | Codecs | Whatever parquet-java decompresses (snappy, zstd, gzip, lz4, …) | Decompression is done by parquet-java |
 
 What happens when a column is not supported:
-- **Spark's scan for the whole plan:** an unsupported type or a nested column, `INT96`, a non-`CORRECTED` date or timestamp rebase mode, or a bucketed scan. The planner records the reason, so VecRuntime's operators still run above Spark's scan.
-- **Spark's reader for that one file:** an encoding on a physical type the decoder has no path for (`BYTE_STREAM_SPLIT` on `FIXED_LEN_BYTE_ARRAY`, say). The rest of the scan stays native.
+- **Spark's scan for the whole plan:** a nested column, a type with no decode path (a string with a non-default collation, say), or a bucketed scan. The planner records the reason, so VecRuntime's operators still run above Spark's scan.
+- **Spark's reader for that one file**, with that file's own rebase modes and INT96 conversion: an `INT96` timestamp, a date or timestamp that needs a calendar rebase, a UTC-adjusted column read as `timestamp_ntz`, a decimal stored with another scale, or an encoding on a physical type the decoder has no path for (`BYTE_STREAM_SPLIT` on `FIXED_LEN_BYTE_ARRAY`, say). The rest of the scan stays native.
 
 ## Status at 1 TB TPC-DS
 
-These numbers come from 8 × m5.4xlarge in one AZ, with ACCP and the S3A read settings on. The flag-off and flag-on legs ran in one session; checksums equal the references.
+**Full run, 2026-10-02.** All 103 queries once, the four engines back to back in one session (8 × m5.4xlarge, one AZ, the launcher's defaults):
+
+| Engine | Total | Faster than Spark on |
+|---|---:|---:|
+| Spark 4.1.3 | 3,099 s | -- |
+| Comet 1.0.0 | 1,999 s | 97 |
+| Comet's native scan + VecRuntime operators and shuffle | 1,954 s | 98 |
+| **VecRuntime with this reader** | **1,542 s** | **99** |
+
+The scan-bound queries gain most: q88 35 s against Spark's 96 and Comet's 84, q9 31 against 73 and 51, q28 58 against 102 and 67. The per-query tables are in `docs/results.md`.
+
+**The scan-bound queries, flag off against flag on.** These numbers come from 8 × m5.4xlarge in one AZ, with ACCP and the S3A read settings on. The flag-off and flag-on legs ran in one session; checksums equal the references.
 
 | Query | Flag off | Flag on | Comet's native scan (earlier session, same operators) |
 |---|---|---|---|
