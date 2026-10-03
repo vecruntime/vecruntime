@@ -301,6 +301,27 @@ public final class ColumnChunkDecoder {
 
     // ------------------------------------------------------------------ dictionary (heap)
 
+    /**
+     * A decoder of the same column, at the start of the same chunk, with this
+     * one's dictionary (shared: it is read only) and settings. Tests decode the
+     * same pages twice through it, once with skips (#611).
+     */
+    ColumnChunkDecoder twin(int batchRows) {
+        ColumnChunkDecoder t = new ColumnChunkDecoder(physicalType, type, maxDefLevel, batchRows, unpackerFactory);
+        t.emitIds = emitIds;
+        t.fixedLength = fixedLength;
+        t.allocateBatch(batchRows);
+        t.startChunk(rowGroupRows);
+        t.hasDictionary = hasDictionary;
+        t.dictInts = dictInts;
+        t.dictLongs = dictLongs;
+        t.dictDoubles = dictDoubles;
+        t.dictBytes = dictBytes;
+        t.dictOffsets = dictOffsets;
+        t.dictSize = dictSize;
+        return t;
+    }
+
     public void setDictionary(VectorBuffers dict) {
         hasDictionary = true;
         int n = dict.length();
@@ -548,6 +569,185 @@ public final class ColumnChunkDecoder {
 
     public int batchNullCount() {
         return batchNulls;
+    }
+
+    // ================================================================== skip (#611)
+
+    /**
+     * Skips up to {@code want} rows of the current page without writing them
+     * (#611, late materialization: rows of a column no filter survivor needs).
+     * The page's value stream is advanced past the rows' present values, by the
+     * cheapest step its encoding allows: a cursor bump for PLAIN fixed width and
+     * BYTE_STREAM_SPLIT, a walk of the lengths for PLAIN and
+     * DELTA_LENGTH_BYTE_ARRAY strings, the ids read and dropped for a
+     * dictionary, the values decoded and dropped for DELTA_BINARY_PACKED, and
+     * the prefix chain rebuilt for DELTA_BYTE_ARRAY. The batch being filled is
+     * untouched, so skips and {@link #readBatch} calls interleave freely within
+     * one batch. Returns the rows skipped (<= {@code want}, <= the page's
+     * remaining rows); call repeatedly, feeding pages, as for readBatch.
+     */
+    public int skip(int want) {
+        if (pageData == null || pageRow >= pageValueCount) {
+            return 0;
+        }
+        int m = Math.min(want, pageValueCount - pageRow);
+        int k = m;
+        if (maxDefLevel > 0) {
+            k = 0;
+            int[] levels = pageLevels;
+            int max = maxDefLevel;
+            for (int i = pageRow, e = pageRow + m;
+                 i < e;
+                 i++) {
+                if (levels[i] == max) {
+                    k++;
+                }
+            }
+        }
+        if (k > 0) {
+            skipValues(k);
+        }
+        pageRow += m;
+        rowsDone += m;
+        return m;
+    }
+
+    /**
+     * {@link #skip} for rows that keep their slots in the batch being filled
+     * (#611: a batch decoded at its selected rows only): slots {@code
+     * [dstBase, dstBase + skipped)} become null rows when the column is
+     * nullable (an empty string, a false, an unwritten value otherwise) -- the
+     * batch's selection excludes them. On the staging path only; a direct
+     * fixed-width write pre-clears its validity, so it calls {@link #skip}.
+     */
+    public int skipIntoBatch(int want, int dstBase) {
+        int pos = utf8Len;
+        int m = skip(want);
+        if (m == 0) {
+            return 0;
+        }
+        if (type == VecType.UTF8) {
+            if (batchIds) {
+                java.util.Arrays.fill(ints, dstBase, dstBase + m, 0);
+            } else {
+                java.util.Arrays.fill(utf8Offsets, dstBase, dstBase + m + 1, pos);
+            }
+        }
+        if (maxDefLevel > 0) {
+            clearValidity(dstBase, m);
+            batchNulls += m;
+        }
+        return m;
+    }
+
+    private void clearValidity(int from, int count) {
+        long[] words = validityWords;
+        int i = from;
+        int end = from + count;
+        while (i < end) {
+            int w = i >>> 6;
+            int bit = i & 63;
+            int take = Math.min(64 - bit, end - i);
+            long window = take == 64 ? -1L : (((1L << take) - 1) << bit);
+            words[w] &= ~window;
+            i += take;
+        }
+    }
+
+    /**
+     * Advances the current page's value stream past its next {@code k} present
+     * values.
+     */
+    private void skipValues(int k) {
+        if (type == VecType.BOOL) {
+            if (boolReader != null) {
+                boolReader.readInts(id(k), 0, k);
+            } else {
+                boolBitCursor += k;
+            }
+            return;
+        }
+        ParquetPageDecoder.Encoding e = pageEncoding;
+        if (e == ParquetPageDecoder.Encoding.RLE_DICTIONARY) {
+            idReader.readInts(id(k), 0, k);
+        } else if (e == ParquetPageDecoder.Encoding.BYTE_STREAM_SPLIT) {
+            if (bssIndex + k > bssStride) {
+                throw new IllegalStateException("BYTE_STREAM_SPLIT: " + k + " values skipped, " + (bssStride - bssIndex) + " left");
+            }
+            bssIndex += k;
+        } else if (e == ParquetPageDecoder.Encoding.DELTA_BINARY_PACKED) {
+            readDelta(k);
+        } else if (e == ParquetPageDecoder.Encoding.DELTA_LENGTH_BYTE_ARRAY) {
+            int s = utf8PlainCursor;
+            int lc = lengthCursor;
+            for (int i = 0; i < k; i++) {
+                s += pageLengths[lc++];
+            }
+            utf8PlainCursor = s;
+            lengthCursor = lc;
+        } else if (e == ParquetPageDecoder.Encoding.DELTA_BYTE_ARRAY) {
+            skipDeltaByteArray(k);
+        } else if (type == VecType.UTF8) {
+            int s = utf8PlainCursor;
+            if (fixedLength > 0) {
+                s += k * fixedLength;
+            } else {
+                int end = (int) pageEndExclusive;
+                for (int i = 0; i < k; i++) {
+                    if (s + 4 > end) {
+                        throw new IllegalStateException("PLAIN binary: length prefix past the end of the page");
+                    }
+                    int len = readLeInt(pageData, s);
+                    if (len < 0 || len > end - s - 4) {
+                        throw new IllegalStateException("PLAIN binary: a " + len + "-byte value past the end of the page");
+                    }
+                    s += 4 + len;
+                }
+            }
+            utf8PlainCursor = s;
+        } else {
+            plainCursor += k * byteWidth();
+        }
+    }
+
+    private byte[] dbaSkipScratch = new byte[64];
+
+    /**
+     * DELTA_BYTE_ARRAY: the next {@code k} values rebuilt only far enough to
+     * keep the prefix chain, two buffers alternating, the last one left as the
+     * previous value of whatever reads next.
+     */
+    private void skipDeltaByteArray(int k) {
+        byte[] src = pageData;
+        int s = utf8PlainCursor;
+        int lc = lengthCursor;
+        byte[] prev = dbaPrev;
+        int prevLen = dbaPrevLen;
+        byte[] cur = dbaSkipScratch;
+        for (int i = 0; i < k; i++) {
+            int pre = prefixLengths[lc];
+            int suf = suffixLengths[lc];
+            lc++;
+            int len = pre + suf;
+            if (cur.length < len) {
+                cur = new byte[Math.max(len, 2 * cur.length)];
+            }
+            if (pre > 0) {
+                System.arraycopy(prev, 0, cur, 0, pre); // pre <= prevLen, checked at feedPage
+            }
+            System.arraycopy(src, s, cur, pre, suf);
+            s += suf;
+            byte[] t = prev;
+            prev = cur;
+            cur = t;
+            prevLen = len;
+        }
+        dbaPrev = prev;
+        dbaSkipScratch = cur;
+        dbaPrevLen = prevLen;
+        dbaPrevStart = -1;
+        utf8PlainCursor = s;
+        lengthCursor = lc;
     }
 
     // ================================================================== direct-write variants (#559 study)

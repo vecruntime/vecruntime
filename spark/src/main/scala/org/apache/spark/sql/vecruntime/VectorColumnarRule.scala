@@ -481,7 +481,10 @@ case class VectorExecRule(session: SparkSession) extends Rule[SparkPlan] with Lo
       val converted = plan.transformUp(delegation.orElse(conversions))
       val prefetchDepth = VectorConf.scanPrefetchDepth(conf)
       val withPrefetch = if (prefetchDepth > 0) prefetchScans(converted, prefetchDepth) else converted
-      val withSelections = if (VectorConf.selectionEnabled(conf)) markSelectionProducers(withPrefetch) else withPrefetch
+      val withDecodeFilters =
+        if (VectorConf.scanNativeParquetLateMaterialization(conf)) markDecodeFilters(withPrefetch) else withPrefetch
+      val withSelections =
+        if (VectorConf.selectionEnabled(conf)) markSelectionProducers(withDecodeFilters) else withDecodeFilters
       val withMixed = if (bridge != null) mixedChains(withSelections, bridge, prefer, conversions) else withSelections
       val withShuffles =
         if (
@@ -665,6 +668,34 @@ case class VectorExecRule(session: SparkSession) extends Rule[SparkPlan] with Lo
    * columns with a selection bitmap instead of compacting them; the consumer folds the bitmap into
    * its own evaluation. Anything else (Spark operators, exchanges) needs dense batches.
    */
+  /**
+   * #611: a filter directly over the native scan hands the scan its condition as a decode filter, when the
+   * condition is deterministic, compiles over the scan's output and reads some but not all of its data
+   * columns: the scan then decodes the filter's columns first and the others at the survivors only. The
+   * filter stays (it compacts a sparse selection, as over any input).
+   */
+  private def markDecodeFilters(plan: SparkPlan): SparkPlan = plan.transformUp {
+    case f @ VectorFilterExec(cond, s: VectorParquetScanExec, _) if s.decodeFilter.isEmpty && cond.deterministic =>
+      val data = s.scan.requiredSchema.fieldNames.toSet
+      val refs = cond.references.map(_.name).toSet
+      val compiles = ExpressionCompiler.compilePredicate(cond, s.output).isRight
+      val dataRefs = refs.intersect(data)
+      // A conjunction of null checks (the join-key guards on every TPC-DS fact scan) drops almost nothing.
+      def conjuncts(e: org.apache.spark.sql.catalyst.expressions.Expression)
+          : Seq[org.apache.spark.sql.catalyst.expressions.Expression] =
+        e match {
+          case org.apache.spark.sql.catalyst.expressions.And(l, r) => conjuncts(l) ++ conjuncts(r)
+          case other => Seq(other)
+        }
+      val onlyNullChecks = conjuncts(cond).forall(_.isInstanceOf[org.apache.spark.sql.catalyst.expressions.IsNotNull])
+      if (
+        compiles && !onlyNullChecks && refs.subsetOf(s.output.map(_.name).toSet) && dataRefs.nonEmpty &&
+        dataRefs.size < data.size
+      )
+        f.copy(child = s.copy(decodeFilter = Some(cond)))
+      else f
+  }
+
   private def markSelectionProducers(plan: SparkPlan): SparkPlan = plan.transformDown {
     case parent: VectorPlan if !parent.isInstanceOf[VectorPassThrough] =>
       parent.withNewChildren(parent.children.map {

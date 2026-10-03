@@ -67,6 +67,19 @@ public final class SelectedColumnarBatch extends ColumnarBatch {
     }
 
     /**
+     * {@link #of} with the selection on the heap: for a batch made on one
+     * thread and read on another (the native scan's decode filter under
+     * decode-ahead, #611). Not a shared arena: closing one is a handshake with
+     * every thread, which per batch cost the scan several times its decode.
+     */
+    public static SelectedColumnarBatch ofHeap(ColumnVector[] columns, int numRows, MemorySegment selection,
+            int selectedCount, boolean ownsColumns) {
+        MemorySegment copy = MemorySegment.ofArray(new long[(numRows + 63) >>> 6]);
+        BitmapKernels.copy(selection, copy, numRows);
+        return new SelectedColumnarBatch(columns, numRows, null, copy, selectedCount, ownsColumns);
+    }
+
+    /**
      * Wraps {@code columns} ({@code numRows} physical rows) selecting the rows
      * whose positions are {@code indices[0..selectedCount)}; the selection
      * bitmap lives in a fresh arena owned by the batch. This is how a foreign
@@ -104,6 +117,8 @@ public final class SelectedColumnarBatch extends ColumnarBatch {
                 column(i).close();
             }
         }
-        arena.close();
+        if (arena != null) {
+            arena.close();
+        }
     }
 }
