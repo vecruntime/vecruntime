@@ -110,7 +110,8 @@ trait VectorHashJoinLike extends VectorBinaryExec {
     streamedPlan.output.length,
     dropNullStreamedKeys = isNullAwareAntiJoin,
     denseKeys = io.vecruntime.spark.VectorConf.joinDenseKeys(conf),
-    deferredProbe = io.vecruntime.spark.VectorConf.joinDeferredProbe(conf)
+    deferredProbe = io.vecruntime.spark.VectorConf.joinDeferredProbe(conf),
+    deferredBuild = io.vecruntime.spark.VectorConf.joinDeferredBuild(conf)
   )
 
   override def verboseStringWithOperatorId(): String = {
@@ -147,7 +148,9 @@ final case class JoinSpec(
     /** Probe a single small-range integer key through a [[io.vecruntime.kernels.DenseKeyIndex]] (#546). */
     denseKeys: Boolean = true,
     /** Probe-side lane columns as not-yet-gathered views over the input (#603), gathered on first read. */
-    deferredProbe: Boolean = true
+    deferredProbe: Boolean = true,
+    /** Build-side lane columns as views over the build table (#603 step 2), gathered on first read. */
+    deferredBuild: Boolean = true
 )
 
 /**
@@ -727,6 +730,29 @@ private[vecruntime] class VectorHashJoinIterator(
   private var survBuildIdx = new Array[Int](0)
   private val gatherScratch = new io.vecruntime.kernels.HeapMirror.GatherScratch
   private val utf8Scratch = new io.vecruntime.kernels.Utf8Mirror.Scratch
+
+  /**
+   * Build column `o` as the source of deferred views (#603 step 2): gathered through the table's heap
+   * mirrors where it has them, as the eager path does. The table outlives every batch of this task.
+   */
+  private val buildSources = new Array[io.vecruntime.spark.arrow.DeferredGatherColumnVector.Source](
+    spec.buildTypes.length
+  )
+
+  private def buildSource(o: Int): io.vecruntime.spark.arrow.DeferredGatherColumnVector.Source = {
+    var s = buildSources(o)
+    if (s == null) {
+      s = (name: String, dt: DataType, ids: Array[Int], alloc: org.apache.arrow.memory.BufferAllocator) => {
+        val m = build.mirror(o)
+        if (m != null) ArrowOutput.gatherHeap(name, dt, m, ids, 0, ids.length, alloc, gatherScratch)
+        else if (dt.isInstanceOf[StringType] && build.utf8Mirror(o) != null)
+          ArrowOutput.gatherUtf8Heap(name, build.utf8Mirror(o), ids, 0, ids.length, alloc, utf8Scratch)
+        else ArrowOutput.gather(name, dt, build.columns(o), ids, 0, ids.length, alloc)
+      }
+      buildSources(o) = s
+    }
+    s
+  }
 
   /** Heap mirrors of the streamed columns the condition reads, for the current batch (#332). */
   private val streamedMirrors = new Array[io.vecruntime.kernels.HeapMirror](spec.streamedWidth)
@@ -1339,6 +1365,19 @@ private[vecruntime] class VectorHashJoinIterator(
         if (only != null && !only(c)) PlaceholderColumn
         else if (isBuildColumn(c) && build.payloadAt(buildOrdinal(c)) != null)
           build.payloadAt(buildOrdinal(c)).view(bld, from, to)
+        else if (
+          isBuildColumn(c) && spec.deferredBuild && TypeMapping.hasLane(dt) && build.columns(buildOrdinal(c)) != null
+        )
+          // #603 step 2: a view over the build table through the build ids; gathered when something reads it.
+          io.vecruntime.spark.arrow.DeferredGatherColumnVector.over(
+            name,
+            dt,
+            buildSource(buildOrdinal(c)),
+            bld,
+            from,
+            to,
+            allocator
+          )
         else if (isBuildColumn(c) && build.mirror(buildOrdinal(c)) != null)
           ArrowOutput.gatherHeap(name, dt, build.mirror(buildOrdinal(c)), bld, from, to, allocator, gatherScratch)
         else if (isBuildColumn(c) && dt.isInstanceOf[StringType] && build.utf8Mirror(buildOrdinal(c)) != null)

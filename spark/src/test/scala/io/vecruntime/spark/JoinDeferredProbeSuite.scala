@@ -73,10 +73,15 @@ class JoinDeferredProbeSuite extends VectorQuerySuite {
       "SELECT f.k1, f.v FROM dp_fact f LEFT ANTI JOIN dp_d3 d3 ON f.k3 = d3.k",
       "SELECT f.k1, f.v, d1.name, d2.name FROM dp_fact f JOIN dp_d1 d1 ON f.k1 = d1.k " +
         "JOIN dp_d2 d2 ON f.k2 = d2.k AND f.v > d2.k * 100",
-      "SELECT d1.name, f.s, count(*) FROM dp_fact f FULL OUTER JOIN dp_d1 d1 ON f.k1 = d1.k GROUP BY d1.name, f.s"
+      "SELECT d1.name, f.s, count(*) FROM dp_fact f FULL OUTER JOIN dp_d1 d1 ON f.k1 = d1.k GROUP BY d1.name, f.s",
+      // Build-side strings carried through later joins (step 2), then grouped and filtered.
+      "SELECT d1.name, d2.name, count(*), sum(f.v) FROM dp_fact f JOIN dp_d1 d1 ON f.k1 = d1.k " +
+        "JOIN dp_d2 d2 ON f.k2 = d2.k JOIN dp_d3 d3 ON f.k3 = d3.k WHERE d3.name LIKE 'd3-1%' GROUP BY d1.name, d2.name",
+      "SELECT d1.name, d2.name FROM dp_fact f LEFT JOIN dp_d1 d1 ON f.k1 = d1.k AND d1.k < 40 " +
+        "LEFT JOIN dp_d2 d2 ON f.k2 = d2.k AND d2.k > 10 WHERE f.k3 = 4"
     )
-    for (on <- Seq("true", "false")) {
-      withConf(VectorConf.JoinDeferredProbe -> on) {
+    for (probe <- Seq("true", "false"); build <- Seq("true", "false")) {
+      withConf(VectorConf.JoinDeferredProbe -> probe, VectorConf.JoinDeferredBuild -> build) {
         queries.foreach(q => checkVectorized(q, Nil))
       }
     }
