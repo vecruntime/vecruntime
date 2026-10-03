@@ -8,6 +8,10 @@ version may change configuration keys or defaults, always noted here.
 
 ### Fixed
 
+- The native Parquet scan returned wrong values for a decimal read with a scale other than the file's (#559): a
+  `decimal(15,2)` INT64 column read as `decimal(17,4)` (Spark's decimal widening, which rescales) was decoded
+  without the rescale. Each file's decimal annotation must now have the requested scale and at most the requested
+  precision; otherwise the file is read by Spark's reader. Affects 0.0.4-0.0.5.
 - The native Parquet scan (`spark.vecruntime.scan.nativeParquet.enabled`, off by default) failed a query whose pushed filter is selective inside a row group of a file with column indexes (#559). The error was `page overruns the row group`. parquet-java's `readNextFilteredRowGroup` also drops pages outside the filter's row ranges, and each column's remaining pages start at different rows, while the decoder expects every column's pages to cover the row group back to back. The scan now turns column-index page filtering off and reads whole row groups. Row-group statistics and dictionary pruning still apply, and the Filter above the scan applies the predicate. This affects 0.0.4–0.0.5 on sorted or clustered data.
 
 - The native Parquet scan (`spark.vecruntime.scan.nativeParquet.enabled`, off by default) decoded a decimal
@@ -36,6 +40,10 @@ version may change configuration keys or defaults, always noted here.
 
 ### Added
 
+- Wide decimals (`decimal(p > 18)`) in the native Parquet scan (#559), and decimals of any precision stored as
+  `FIXED_LEN_BYTE_ARRAY` or `BINARY` (Spark's legacy format, Hive, Impala): `PLAIN`, dictionary and
+  `DELTA_BYTE_ARRAY` pages decode into the DECIMAL128 lane (or the INT64 lane for p <= 18), as Spark converts them.
+  JMH, one 20,000-value `decimal(38)` page: 13.5 pages per ms, the same as parquet-java's reader slicing the bytes.
 - TIMESTAMP columns in the native Parquet scan (#559), stored as INT64 `MICROS` or `MILLIS`. `MILLIS` values are scaled to micros with Spark's overflow check. The calendar rebase is resolved per file from its footer, as Spark resolves it: a file that needs a rebase (`LEGACY`, or `EXCEPTION` on a file that is not from Spark 3+) is read by Spark's reader with its own modes, and so is an INT96 file. The plan-level refusal of a non-`CORRECTED` date rebase is gone.
 - TINYINT and SMALLINT columns in the native Parquet scan (#559). They are INT32 in Parquet, so they reuse the INT32 decode in every encoding. Each value is narrowed to the declared width while decoding, as Spark's readers narrow it, so an out-of-range `INT(8)` / `INT(16)` value wraps the same way for operators.
 - BOOLEAN columns in the native Parquet scan (#559): v1 `PLAIN` (bit-packed) and v2 `RLE` pages, decoded into a bit-packed lane. JMH on x86, one 20,000-value page: `PLAIN` at 837 pages per ms against 10.7 for parquet-java's reader, `RLE` at 212 against 11.2. `RLE` is decoded straight into the bitmap: runs set as bit ranges, bit-packed runs moved 64 bits a step.

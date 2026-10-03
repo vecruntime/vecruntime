@@ -194,7 +194,17 @@ The corpus approach follows Hardwood (`hardwood-hq/hardwood`), as does bounding 
   - **Checked across one table** holding an INT96 file, a `LEGACY`-calendar file and a `CORRECTED` file. Each is read by the right reader with Spark's values, under `CORRECTED` and `EXCEPTION`.
   - **Checked on a parquet-java-written `MILLIS` file** whose micros overflow. It fails with `ArithmeticException` under both readers.
 - **TIMESTAMP_NTZ.** The engine has no `TimestampNTZType` lane yet: `TypeMapping` does not map it, and operators fall back on it. Scanning it natively is part of the lane work, with FLOAT and BINARY below.
-- **BINARY and wide decimals** (precision > 18, `FIXED_LEN_BYTE_ARRAY`). Need a variable-width binary lane and a 128-bit decimal lane.
+- **Wide decimals and decimals stored as bytes.** **Done**. A decimal stored as `FIXED_LEN_BYTE_ARRAY` or `BINARY` is decoded by the binary page paths: `PLAIN` (fixed-length values have no length prefix), dictionary, `DELTA_LENGTH_BYTE_ARRAY` and `DELTA_BYTE_ARRAY`, which is what parquet-java's v2 writer uses for FLBA. Its big-endian two's-complement bytes are then converted at flush (`ColumnChunkDecoder.flushDecimal`):
+  - **`decimal(p > 18)`** goes into the DECIMAL128 lane: two little-endian limbs, sign-extended, which is Arrow's Decimal128 layout. A 16-byte value is read as two big-endian longs. A value longer than 16 bytes must be a sign extension, or the read fails.
+  - **`decimal(p <= 18)`** stored as bytes goes into the INT64 lane, exactly as Spark's `binaryToUnscaledLong` computes it. Spark's legacy writer, Hive and Impala store such decimals; since #592 those files had fallen over to Spark's reader.
+  - **Scale check.** `physicalMatches` now also requires the file's decimal annotation to have the requested scale and at most the requested precision. Spark reads, for example, a `decimal(9,2)` file as `decimal(12,4)` by rescaling, and the lanes carry the stored unscaled values as they are, so such a file falls over to Spark's reader. Before this check, an INT64 (or narrow INT32) decimal read with another scale was decoded natively without the rescale: wrong values.
+  - **Tests.**
+    - `ColumnChunkDecoderTest`: every width from 1 to 16, FLBA and BINARY (with sign-extended values longer than 16 bytes), both lanes, against `BigInteger` and Spark's formula.
+    - `DeltaBinaryPackedCrossCheckSuite`: parquet-java's `FixedLenByteArrayPlainValuesWriter` and `DeltaByteArrayWriter`, read back by its matching readers.
+    - `VectorParquetScanSuite`: `decimal(20|25|38)` round trips (v1 dictionary, `PLAIN`, v2 `DELTA_BYTE_ARRAY`, legacy format) and the rescale fallback.
+    - The corpus files `fixed_length_decimal*` and `byte_array_decimal` are now read natively.
+  - **JMH** (`V2EncodingsBenchmark` `flba-dec38`, x86, one 20,000-value page): 13.5 pages per ms. parquet-java's `FixedLenByteArrayPlainValuesReader.readBytes` does 13.7, but it only slices the bytes and does no conversion. Before the big-endian long reads this path measured 3.4.
+- **BINARY** (a binary lane): still to do; with FLOAT and TIMESTAMP_NTZ, it needs a new engine lane.
 - **Nested types** (structs, lists, maps). Need repetition levels and Arrow list and struct builders. This is the largest item and needs its own design.
 
 ### Performance
