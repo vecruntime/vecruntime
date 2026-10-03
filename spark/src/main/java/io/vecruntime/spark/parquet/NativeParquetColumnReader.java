@@ -88,6 +88,9 @@ public final class NativeParquetColumnReader {
     private final BufferAllocator allocator;
     // TINYINT / SMALLINT: the INT32 lane's values are narrowed to these many bits (0: not narrow).
     private final int narrowBits;
+    // A FIXED_LEN_BYTE_ARRAY / BINARY decimal, staged as bytes and converted at flush; its FLBA width (0: BINARY).
+    private final boolean binaryDecimal;
+    private final int fixedLength;
     // TIMESTAMP stored as MILLIS: the lane holds micros, so each present value is scaled by 1000.
     private final boolean millis;
     private static final java.lang.foreign.ValueLayout.OfLong LONG_LE = java.lang.foreign.ValueLayout.JAVA_LONG_UNALIGNED.withOrder(java.nio.ByteOrder.LITTLE_ENDIAN);
@@ -122,7 +125,18 @@ public final class NativeParquetColumnReader {
         // thread's stack, and a reader is made per column per file -- on 1 TB TPC-DS (14,594 store_sales
         // files) those handshakes were 8-9% of executor CPU in q88. An automatic arena has no close.
         this.scratch = Arena.ofAuto();
-        this.decoder = new ColumnChunkDecoder(physicalType, type, maxDefLevel, batchRows, this::unpackerFor);
+        // A decimal stored as FIXED_LEN_BYTE_ARRAY or BINARY: its big-endian bytes are staged on the decoder's
+        // UTF8 path (PLAIN, dictionary, DELTA_LENGTH_BYTE_ARRAY, DELTA_BYTE_ARRAY) and converted into the INT64
+        // lane (p <= 18) or the DECIMAL128 lane by flushDecimal.
+        org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName ptn = column.getPrimitiveType().getPrimitiveTypeName();
+        this.binaryDecimal = sparkType instanceof org.apache.spark.sql.types.DecimalType && (ptn == org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.FIXED_LEN_BYTE_ARRAY || ptn == org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.BINARY);
+        this.fixedLength = ptn == org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.FIXED_LEN_BYTE_ARRAY ? column.getPrimitiveType().getTypeLength() : 0;
+        if (binaryDecimal) {
+            this.decoder = new ColumnChunkDecoder(VecType.UTF8, VecType.UTF8, maxDefLevel, batchRows, this::unpackerFor);
+            this.decoder.setFixedLength(fixedLength);
+        } else {
+            this.decoder = new ColumnChunkDecoder(physicalType, type, maxDefLevel, batchRows, this::unpackerFor);
+        }
     }
 
     private static VecType physicalTypeOf(ColumnDescriptor column, VecType lane) {
@@ -202,7 +216,7 @@ public final class NativeParquetColumnReader {
             }
             return flushUtf8(n, decoder.batchNullCount() > 0);
         }
-        if (type == VecType.BOOL) {
+        if (type == VecType.BOOL || binaryDecimal) {
             int filled = 0;
             while (filled < n) {
                 if (decoder.needsPage()) {
@@ -210,9 +224,23 @@ public final class NativeParquetColumnReader {
                 }
                 filled += decoder.readBatch(n - filled, filled);
             }
-            return flushBool(n, decoder.batchNullCount() > 0);
+            boolean nulls = decoder.batchNullCount() > 0;
+            return binaryDecimal ? flushDecimal(n, nulls) : flushBool(n, nulls);
         }
         return fillFixed(n, /* modeA= */ true);
+    }
+
+    /**
+     * A FIXED_LEN_BYTE_ARRAY / BINARY decimal batch: the staged big-endian
+     * bytes into the INT64 or DECIMAL128 lane.
+     */
+    private FieldVector flushDecimal(int rows, boolean hasNulls) {
+        BaseFixedWidthVector v = (BaseFixedWidthVector) borrowFixed(rows);
+        ArrowVectorBuffers out = ArrowVectorBuffers.forWrite(v, rows, sparkType);
+        decoder.flushDecimal(rows, out.data(),
+                hasNulls ? out.validity() : null, type == VecType.DECIMAL128);
+        ArrowOutput.finish(out, rows, !hasNulls);
+        return v;
     }
 
     private DataPage requirePage() {
@@ -313,6 +341,9 @@ public final class NativeParquetColumnReader {
             filled += decoder.readBatch(n - filled, filled);
         }
         boolean hasNulls = decoder.batchNullCount() > 0;
+        if (binaryDecimal) {
+            return flushDecimal(n, hasNulls);
+        }
         return type == VecType.UTF8
                 ? flushUtf8(n, hasNulls)
                 : type == VecType.BOOL ? flushBool(n, hasNulls) : flushFixed(n, hasNulls);
@@ -323,7 +354,7 @@ public final class NativeParquetColumnReader {
     }
 
     public FieldVector readBatchDirectB(int n) {
-        if (type == VecType.UTF8 || type == VecType.BOOL) {
+        if (type == VecType.UTF8 || type == VecType.BOOL || binaryDecimal) {
             return readBatchStaging(n);
         }
         decoder.startBatch(n);
@@ -471,8 +502,8 @@ public final class NativeParquetColumnReader {
         }
         byte[] data = bytes(dp.getBytes());
         int numValues = dp.getDictionarySize();
-        return ParquetPageDecoder.decodeDictionary(MemorySegment.ofArray(data), 0L, data.length, numValues, physicalType,
-                scratch);
+        return ParquetPageDecoder.decodeDictionary(MemorySegment.ofArray(data), 0L, data.length, numValues,
+                binaryDecimal ? VecType.UTF8 : physicalType, fixedLength, scratch);
     }
 
     private static void writeInto(BytesInput in, ReusableByteOut out) {

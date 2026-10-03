@@ -15,7 +15,6 @@
  */
 package io.vecruntime.spark.parquet;
 
-import io.vecruntime.spark.adapter.TypeMapping;
 import org.apache.spark.sql.types.BooleanType;
 import org.apache.spark.sql.types.ByteType;
 import org.apache.spark.sql.types.DataType;
@@ -75,7 +74,10 @@ public final class NativeParquetSupport {
             return st.isUTF8BinaryCollation(); // UTF8; a collated string has no lane
         }
         if (dt instanceof DecimalType d) {
-            return d.precision() <= TypeMapping.MAX_DECIMAL_PRECISION; // INT32/INT64-physical narrow decimal
+            // p <= 18: the INT64 lane (INT32 / INT64 widened, or FIXED_LEN_BYTE_ARRAY / BINARY bytes converted);
+            // p > 18: the DECIMAL128 lane (FIXED_LEN_BYTE_ARRAY / BINARY bytes converted). Each file's physical
+            // type and decimal annotation are checked at open (VectorParquetScanExec.physicalMatches).
+            return d.precision() <= 38;
         }
         return false;
     }

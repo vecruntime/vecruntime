@@ -97,6 +97,7 @@ public final class ColumnChunkDecoder {
     // session/bounds/alignment checks (the page bytes are a heap byte[] parquet-java hands us).
     private static final java.lang.invoke.VarHandle BA_INT = java.lang.invoke.MethodHandles.byteArrayViewVarHandle(int[].class, java.nio.ByteOrder.LITTLE_ENDIAN);
     private static final java.lang.invoke.VarHandle BA_LONG = java.lang.invoke.MethodHandles.byteArrayViewVarHandle(long[].class, java.nio.ByteOrder.LITTLE_ENDIAN);
+    private static final java.lang.invoke.VarHandle BA_LONG_BE = java.lang.invoke.MethodHandles.byteArrayViewVarHandle(long[].class, java.nio.ByteOrder.BIG_ENDIAN);
 
     private static int leInt(byte[] a, int off) {
         return (int) BA_INT.get(a, off);
@@ -150,6 +151,8 @@ public final class ColumnChunkDecoder {
     private long boolBitCursor; // BOOL PLAIN: bit offset of the next unconsumed value in pageData
     private int boolPageEnd; // BOOL: one past the last byte of the page's value region
     private RleBitPackingReader boolReader; // BOOL RLE: the page's 1-bit hybrid value stream
+    private long pageEndExclusive; // PLAIN: one past the last byte of the page's value region
+    private int fixedLength; // UTF8 staging of a FIXED_LEN_BYTE_ARRAY column: the value width (0: length-prefixed)
 
     // ---- reused per-batch scratch ----
     private int[] idScratch = new int[0]; // dictionary ids for a page-slice
@@ -414,6 +417,7 @@ public final class ColumnChunkDecoder {
             this.idReader = null;
             this.plainCursor = (int) valuesStart;
             this.utf8PlainCursor = (int) valuesStart;
+            this.pageEndExclusive = page.dataEnd();
         }
     }
 
@@ -1268,11 +1272,23 @@ public final class ColumnChunkDecoder {
             lengthCursor = lc;
             return;
         }
+        int end = (int) pageEndExclusive;
         for (int i = 0; i < m; i++) {
             utf8Offsets[dstBase + i] = pos;
             if (present == null || (k < presentCount && present[k] == i)) {
-                int len = readLeInt(src, s);
-                s += 4;
+                int len;
+                if (fixedLength > 0) {
+                    len = fixedLength; // FIXED_LEN_BYTE_ARRAY: no length prefix
+                } else {
+                    if (s + 4 > end) {
+                        throw new IllegalStateException("PLAIN binary: length prefix past the end of the page");
+                    }
+                    len = readLeInt(src, s);
+                    s += 4;
+                }
+                if (len < 0 || len > end - s) {
+                    throw new IllegalStateException("PLAIN binary: a " + len + "-byte value past the end of the page");
+                }
                 pos = appendBytes(src, s, len, pos);
                 s += len;
                 k++;
@@ -1351,6 +1367,108 @@ public final class ColumnChunkDecoder {
 
     public long utf8Bytes() {
         return utf8Len;
+    }
+
+    /**
+     * Stage a FIXED_LEN_BYTE_ARRAY column of {@code width}-byte values on the
+     * UTF8 lane: its {@code PLAIN} values carry no length prefix. 0 restores the
+     * length-prefixed BINARY layout.
+     */
+    public void setFixedLength(int width) {
+        if (width < 0) {
+            throw new IllegalArgumentException("fixed length " + width);
+        }
+        this.fixedLength = width;
+    }
+
+    /**
+     * Converts the finished batch of {@code rows} decimals, staged as big-endian
+     * two's-complement unscaled values (Parquet's FIXED_LEN_BYTE_ARRAY / BINARY
+     * decimal layout), into a fixed-width lane, then copies validity.
+     * <ul>
+     * <li>{@code wide == false}: the INT64 lane of a {@code decimal(p <= 18)},
+     * one little-endian long per row, computed exactly as Spark's {@code
+     * ParquetRowConverter.binaryToUnscaledLong}: the bytes shifted into a long,
+     * then sign-extended from {@code 8 * len} bits (shift counts mod 64, as the
+     * JVM does).</li>
+     * <li>{@code wide == true}: the DECIMAL128 lane, two little-endian limbs per
+     * row (low, then high), sign-extended from the value's top bit, Arrow's
+     * Decimal128 layout. A value longer than 16 bytes must be a sign extension of
+     * its low 16 bytes (it then fits 128 bits), else the batch fails: no
+     * DECIMAL128 holds it.</li>
+     * </ul>
+     * A null row (zero bytes) writes 0.
+     */
+    public void flushDecimal(int rows, MemorySegment outData, MemorySegment outValidity,
+            boolean wide) {
+        byte[] b = utf8Data;
+        int[] off = utf8Offsets;
+        for (int i = 0; i < rows; i++) {
+            int s = off[i];
+            int e = off[i + 1];
+            int len = e - s;
+            if (!wide) {
+                long u = 0L;
+                for (int j = s; j < e; j++) {
+                    u = (u << 8) | (b[j] & 0xFF);
+                }
+                int bits = 8 * len;
+                long v = len == 0 ? 0L : (u << (64 - bits)) >> (64 - bits);
+                outData.set(LE_LONG, (long) i << 3, v);
+                continue;
+            }
+            long lo = 0L;
+            long hi = 0L;
+            if (len == 16) {
+                // The common case (decimal(38) as Spark writes it): two big-endian longs.
+                hi = (long) BA_LONG_BE.get(b, s);
+                lo = (long) BA_LONG_BE.get(b, s + 8);
+                long at = (long) i << 4;
+                outData.set(LE_LONG, at, lo);
+                outData.set(LE_LONG, at + 8, hi);
+                continue;
+            }
+            if (len > 8 && len < 16) {
+                // The high limb from the leading len - 8 bytes, sign-extended; the low limb is the last 8.
+                lo = (long) BA_LONG_BE.get(b, e - 8);
+                long h = b[s]; // sign-extended first byte
+                for (int j = s + 1; j < e - 8; j++) {
+                    h = (h << 8) | (b[j] & 0xFF);
+                }
+                long at = (long) i << 4;
+                outData.set(LE_LONG, at, lo);
+                outData.set(LE_LONG, at + 8, h);
+                continue;
+            }
+            if (len > 0) {
+                long sign = b[s] < 0 ? -1L : 0L;
+                if (len > 16) {
+                    // The bytes above the low 16 must all be the sign, and agree with the low 16's top bit.
+                    byte sb = (byte) sign;
+                    for (int j = s; j < e - 16; j++) {
+                        if (b[j] != sb) {
+                            throw new IllegalStateException("a " + len + "-byte decimal does not fit 128 bits");
+                        }
+                    }
+                    if ((b[e - 16] < 0) != (sign < 0)) {
+                        throw new IllegalStateException("a " + len + "-byte decimal does not fit 128 bits");
+                    }
+                    s = e - 16;
+                    len = 16;
+                }
+                hi = sign;
+                lo = sign;
+                for (int j = s; j < e; j++) {
+                    // Shift the 128-bit (hi, lo) left by 8 and bring in the next byte.
+                    hi = (hi << 8) | (lo >>> 56);
+                    lo = (lo << 8) | (b[j] & 0xFF);
+                }
+            }
+            long at = (long) i << 4;
+            outData.set(LE_LONG, at, lo);
+            outData.set(LE_LONG, at + 8, hi);
+        }
+        flushValidity(rows, outValidity);
     }
 
     // ------------------------------------------------------------------ flush the batch (one bulk copy each)

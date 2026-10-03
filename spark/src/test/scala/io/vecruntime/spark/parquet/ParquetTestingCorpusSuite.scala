@@ -122,12 +122,12 @@ class ParquetTestingCorpusSuite extends VectorQuerySuite {
       "int64_byte_stream_split"
     ),
     "rle_boolean_encoding.parquet" -> Set("datatype_boolean"),
-    // decimals carried in INT32 / INT64; BYTE_ARRAY and FIXED_LEN_BYTE_ARRAY decimals fall back per file
+    // decimals carried in INT32 / INT64, BYTE_ARRAY and FIXED_LEN_BYTE_ARRAY (big-endian bytes converted)
     "int32_decimal.parquet" -> Set("value"),
     "int64_decimal.parquet" -> Set("value"),
-    "byte_array_decimal.parquet" -> Set(),
-    "fixed_length_decimal.parquet" -> Set(),
-    "fixed_length_decimal_legacy.parquet" -> Set(),
+    "byte_array_decimal.parquet" -> Set("value"),
+    "fixed_length_decimal.parquet" -> Set("value"),
+    "fixed_length_decimal_legacy.parquet" -> Set("value"),
     // page-level corner cases
     "datapage_v2_empty_datapage.snappy.parquet" -> Set(),
     "page_v2_empty_compressed.parquet" -> Set("integer_column"),

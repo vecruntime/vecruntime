@@ -40,6 +40,8 @@ import org.apache.parquet.column.values.deltastrings.DeltaByteArrayReader;
 import org.apache.parquet.column.values.deltastrings.DeltaByteArrayWriter;
 import org.apache.parquet.column.values.plain.BooleanPlainValuesReader;
 import org.apache.parquet.column.values.plain.BooleanPlainValuesWriter;
+import org.apache.parquet.column.values.plain.FixedLenByteArrayPlainValuesReader;
+import org.apache.parquet.column.values.plain.FixedLenByteArrayPlainValuesWriter;
 import org.apache.parquet.column.values.rle.RunLengthBitPackingHybridValuesReader;
 import org.apache.parquet.column.values.rle.RunLengthBitPackingHybridValuesWriter;
 import org.apache.parquet.io.api.Binary;
@@ -86,7 +88,7 @@ public class V2EncodingsBenchmark {
      * URL-like keys).
      */
     @Param({"bss-double", "bss-long", "bss-int", "dlba-string", "dba-string", "bool-plain",
-                "bool-rle"})
+                "bool-rle", "flba-dec38"})
     String shape;
 
     private byte[] page;
@@ -159,6 +161,24 @@ public class V2EncodingsBenchmark {
                 lane = VecType.BOOL;
                 encoding = ParquetPageDecoder.Encoding.RLE;
             }
+            case "flba-dec38" -> {
+                // decimal(38, s) as Spark writes it: 16-byte big-endian two's complement, PLAIN.
+                FixedLenByteArrayPlainValuesWriter w = new FixedLenByteArrayPlainValuesWriter(16, 64, 1 << 20, alloc);
+                for (int i = 0; i < n; i++) {
+                    java.math.BigInteger x = new java.math.BigInteger(120, rnd);
+                    if (i % 2 == 0) {
+                        x = x.negate();
+                    }
+                    byte[] b = x.toByteArray();
+                    byte[] v = new byte[16];
+                    java.util.Arrays.fill(v, x.signum() < 0 ? (byte) -1 : 0);
+                    System.arraycopy(b, 0, v, 16 - b.length, b.length);
+                    w.writeBytes(Binary.fromConstantByteArray(v));
+                }
+                page = w.getBytes().toByteArray();
+                lane = VecType.DECIMAL128;
+                encoding = ParquetPageDecoder.Encoding.PLAIN;
+            }
             case "dba-string" -> {
                 DeltaByteArrayWriter w = new DeltaByteArrayWriter(64, 1 << 20, alloc);
                 int key = 0;
@@ -182,7 +202,7 @@ public class V2EncodingsBenchmark {
         }
         arena = Arena.ofShared();
         GroupUnpacker[] cache = new GroupUnpacker[33];
-        decoder = new ColumnChunkDecoder(lane, 0, 1024,
+        decoder = new ColumnChunkDecoder(lane == VecType.DECIMAL128 ? VecType.UTF8 : lane, 0, 1024,
                 width -> {
                     if (cache[width] == null) {
                         BytePacker p = Packer.LITTLE_ENDIAN.newBytePacker(width);
@@ -190,7 +210,10 @@ public class V2EncodingsBenchmark {
                     }
                     return cache[width];
                 });
-        if (lane == VecType.UTF8) {
+        if (lane == VecType.DECIMAL128) {
+            decoder.setFixedLength(16); // the bytes are staged, then converted into two limbs per row
+            out = ArrowLayout.allocateData(arena, VecType.DECIMAL128, 1024);
+        } else if (lane == VecType.UTF8) {
             outOffsets = ArrowLayout.allocateOffsets(arena, 1024);
             outBytes = ArrowLayout.allocateBytes(arena, 1 << 20);
         } else if (lane == VecType.BOOL) {
@@ -222,11 +245,14 @@ public class V2EncodingsBenchmark {
                 if (d.needsPage()) {
                     d.feedPage(ColumnChunkDecoder.Page.v1(page, page.length, n, encoding));
                 }
-                filled += lane == VecType.UTF8 || lane == VecType.BOOL
+                filled += lane == VecType.UTF8 || lane == VecType.BOOL || lane == VecType.DECIMAL128
                         ? d.readBatch(want - filled, filled)
                         : d.readBatchDirectA(want - filled, done + filled, out, null);
             }
-            if (lane == VecType.BOOL) {
+            if (lane == VecType.DECIMAL128) {
+                d.flushDecimal(want, out, null, true);
+                sum += out.get(java.lang.foreign.ValueLayout.JAVA_LONG_UNALIGNED, 8);
+            } else if (lane == VecType.BOOL) {
                 d.flushBool(want, out, null);
                 sum += out.get(java.lang.foreign.ValueLayout.JAVA_LONG_UNALIGNED, 0);
             } else if (lane == VecType.UTF8) {
@@ -247,6 +273,7 @@ public class V2EncodingsBenchmark {
             case "dba-string" -> new DeltaByteArrayReader();
             case "bool-plain" -> new BooleanPlainValuesReader();
             case "bool-rle" -> new RunLengthBitPackingHybridValuesReader(1);
+            case "flba-dec38" -> new FixedLenByteArrayPlainValuesReader(16);
             default -> new DeltaLengthByteArrayValuesReader();
         };
         r.initFromPage(n, ByteBufferInputStream.wrap(java.nio.ByteBuffer.wrap(page)));

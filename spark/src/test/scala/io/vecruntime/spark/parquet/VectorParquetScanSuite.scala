@@ -313,12 +313,12 @@ class VectorParquetScanSuite extends VectorQuerySuite {
     }
   }
 
-  test("a decimal stored as FIXED_LEN_BYTE_ARRAY falls over per file instead of decoding as INT64 (#559)") {
+  test("a decimal stored as FIXED_LEN_BYTE_ARRAY (legacy format) decodes natively into its INT64 lane (#559)") {
     // spark.sql.parquet.writeLegacyFormat=true (the format Hive and Impala read) stores every decimal as
-    // FIXED_LEN_BYTE_ARRAY, also those with precision <= 18 that the planner admits as an INT64 lane. Before the
-    // per-file physical-type check, the scan decoded those bytes as INT64 values: wrong results, no error. One
-    // directory holds a legacy file and a standard one (INT32 / INT64 decimals): the legacy file must fall over
-    // to Spark's reader, the standard one must still be decoded natively, and the rows must be Spark's.
+    // FIXED_LEN_BYTE_ARRAY, also those with precision <= 18 that the planner admits as an INT64 lane. #592 made
+    // such a file fall over (before it, the bytes were read as INT64 values: wrong results, no error); now its
+    // big-endian bytes are converted into the INT64 lane. A legacy file and a standard one (INT32 / INT64
+    // decimals) must both be decoded natively, with Spark's rows.
     val path = newTempPath("t_flba_dec")
     val query =
       """SELECT CAST(id AS INT) AS i,
@@ -360,7 +360,7 @@ class VectorParquetScanSuite extends VectorQuerySuite {
     checkVectorized("SELECT * FROM t_flba_legacy", Seq(node))
     checkVectorized("SELECT sum(dec7), sum(dec15), min(dec18) FROM t_flba_legacy", Seq(node))
     checkVectorized("SELECT * FROM t_flba_standard", Seq(node))
-    assert(rowGroupsRead(path + "/legacy") == 0, "the FIXED_LEN_BYTE_ARRAY decimal file was decoded natively")
+    assert(rowGroupsRead(path + "/legacy") > 0, "the FIXED_LEN_BYTE_ARRAY decimal file was not decoded natively")
     assert(rowGroupsRead(path + "/standard") > 0, "the INT32 / INT64 decimal file was not decoded natively")
   }
 
@@ -390,6 +390,74 @@ class VectorParquetScanSuite extends VectorQuerySuite {
     checkVectorized("SELECT i, l, s FROM t_colidx WHERE i BETWEEN 12345 AND 12999", Seq(node))
     checkVectorized("SELECT count(*), sum(l), max(s) FROM t_colidx WHERE i < 1500 OR i > 58000", Seq(node))
     checkVectorized("SELECT s, i FROM t_colidx WHERE l = 7 * 31337", Seq(node))
+  }
+
+  test("wide decimals (p > 18) decode natively into the DECIMAL128 lane: FLBA, dictionary, DELTA_BYTE_ARRAY (#559)") {
+    // Spark writes decimal(p > 18) as FIXED_LEN_BYTE_ARRAY: dictionary-encoded in v1, DELTA_BYTE_ARRAY in v2
+    // without a dictionary, PLAIN when the dictionary is off. Values to +-(10^38 - 1), nulls, several row groups,
+    // filters, aggregates and arithmetic on the lane, at two batch sizes; and a legacy-format file.
+    val query =
+      """SELECT CAST(id AS INT) AS i,
+        |  CASE WHEN id % 7 = 0 THEN NULL
+        |       ELSE CAST(CONCAT(CASE WHEN id % 2 = 0 THEN '-' ELSE '' END, CAST(id * 2654435761 AS STRING),
+        |                        REPEAT(CAST(id % 10 AS STRING), CAST(id % 21 AS INT)), '.', CAST(id % 100 AS STRING))
+        |                 AS DECIMAL(38, 2)) END AS d38,
+        |  CAST(id % 97 AS DECIMAL(20, 0)) AS d20,
+        |  CASE WHEN id % 5 = 0 THEN NULL ELSE CAST(id * 1000003 / 7 AS DECIMAL(25, 6)) END AS d25
+        |FROM range(0, 30000)""".stripMargin
+    for (
+      (version, dict, legacy, view) <- Seq(
+        ("v1", "true", "false", "t_wide_v1d"),
+        ("v1", "false", "false", "t_wide_v1p"),
+        ("v2", "false", "false", "t_wide_v2"),
+        ("v1", "true", "true", "t_wide_legacy")
+      )
+    ) {
+      val path = newTempPath(view)
+      withPlugin(enabled = false) {
+        withConf("spark.sql.parquet.writeLegacyFormat" -> legacy) {
+          spark.sql(query).repartition(2).sortWithinPartitions("i")
+            .write.option("parquet.writer.version", version).option("parquet.enable.dictionary", dict)
+            .mode("overwrite").parquet(path)
+        }
+        spark.read.parquet(path).createOrReplaceTempView(view)
+      }
+      for (batch <- Seq("1024", "100")) {
+        withConf("spark.sql.parquet.columnarReaderBatchSize" -> batch) {
+          checkVectorized(s"SELECT * FROM $view", Seq(node))
+          checkVectorized(s"SELECT i, d38 FROM $view WHERE d38 > 0 AND d20 < 50", Seq(node))
+          checkVectorized(s"SELECT d20, count(*), sum(d25), min(d38), max(d38) FROM $view GROUP BY d20", Seq(node))
+        }
+      }
+      assert(nativeRowGroupsOf(s"SELECT d38, d20, d25 FROM $view") > 0, s"$view: not decoded natively")
+    }
+  }
+
+  test("a decimal whose file scale differs from the requested one falls over per file, with Spark's rescale (#559)") {
+    // Spark reads a decimal(9,2) file as decimal(12,4) by rescaling the unscaled value; the native lanes carry the
+    // file's unscaled values as they are, so such a file must go to Spark's reader. The same precision widening at
+    // the same scale is read natively.
+    val path = newTempPath("t_dec_scale")
+    withPlugin(enabled = false) {
+      spark.sql("SELECT CAST(id AS INT) AS i, CAST(id / 100.0 AS DECIMAL(9,2)) AS d, CAST(id AS DECIMAL(30,2)) AS w " +
+        "FROM range(0, 5000)").coalesce(1).write.mode("overwrite").parquet(path)
+    }
+    def read(schema: String): Unit =
+      withPlugin(enabled = false)(spark.read.schema(schema).parquet(path).createOrReplaceTempView("t_dec_scale"))
+    read("i INT, d DECIMAL(12,4), w DECIMAL(32,4)")
+    checkVectorized("SELECT * FROM t_dec_scale", Seq(node))
+    assert(nativeRowGroupsOf("SELECT d, w FROM t_dec_scale") == 0, "a rescaled decimal was decoded natively")
+    read("i INT, d DECIMAL(12,2), w DECIMAL(36,2)")
+    checkVectorized("SELECT * FROM t_dec_scale", Seq(node))
+    assert(nativeRowGroupsOf("SELECT d, w FROM t_dec_scale") > 0, "a widened same-scale decimal fell over")
+  }
+
+  private def nativeRowGroupsOf(sql: String): Long = withPlugin(enabled = true) {
+    val df = spark.sql(sql)
+    df.collect()
+    PlanUtils.allNodes(
+      finalPlan(df)
+    ).collect { case s: VectorParquetScanExec => s }.map(_.metrics("numRowGroups").value).sum
   }
 
   test("partition columns are read as constant columns") {

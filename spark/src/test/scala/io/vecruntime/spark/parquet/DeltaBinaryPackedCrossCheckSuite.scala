@@ -196,6 +196,83 @@ class DeltaBinaryPackedCrossCheckSuite extends AnyFunSuite {
     }
   }
 
+  test("FIXED_LEN_BYTE_ARRAY decimal pages from parquet-java's writers decode as its readers read them") {
+    // PLAIN (FixedLenByteArrayPlainValuesWriter) and DELTA_BYTE_ARRAY (what v2 writes for FLBA): our decoder's
+    // DECIMAL128 limbs and INT64 lane against the bytes parquet-java's matching reader returns, as BigInteger.
+    val rnd = new Random(55919)
+    for (width <- Seq(4, 9, 12, 16); n <- lengths; batch <- Seq(64, 1000); enc <- Seq("PLAIN", "DELTA_BYTE_ARRAY")) {
+      val vals = Array.tabulate(n) { i =>
+        val x = new java.math.BigInteger(8 * width - 1, rnd.self)
+        if (i % 3 == 0) x.negate() else x
+      }
+      def bytesOf(x: java.math.BigInteger): Array[Byte] = {
+        val b = x.toByteArray
+        val w = Array.fill[Byte](width)(if (x.signum < 0) -1 else 0)
+        System.arraycopy(b, 0, w, width - b.length, b.length)
+        w
+      }
+      val alloc = HeapByteBufferAllocator.getInstance()
+      val (page, encoding, reader) = enc match {
+        case "PLAIN" =>
+          val w =
+            new org.apache.parquet.column.values.plain.FixedLenByteArrayPlainValuesWriter(width, 64, 1 << 20, alloc)
+          vals.foreach(x => w.writeBytes(Binary.fromConstantByteArray(bytesOf(x))))
+          (
+            w.getBytes.toByteArray,
+            ParquetPageDecoder.Encoding.PLAIN,
+            new org.apache.parquet.column.values.plain.FixedLenByteArrayPlainValuesReader(
+              width
+            ): org.apache.parquet.column.values.ValuesReader
+          )
+        case _ =>
+          val w = new DeltaByteArrayWriter(64, 1 << 20, alloc)
+          vals.foreach(x => w.writeBytes(Binary.fromConstantByteArray(bytesOf(x))))
+          (
+            w.getBytes.toByteArray,
+            ParquetPageDecoder.Encoding.DELTA_BYTE_ARRAY,
+            new org.apache.parquet.column.values.deltastrings.DeltaByteArrayReader(): org.apache.parquet.column.values.ValuesReader
+          )
+      }
+      reader.initFromPage(n, org.apache.parquet.bytes.ByteBufferInputStream.wrap(java.nio.ByteBuffer.wrap(page)))
+      val expected = Array.fill(n)(new java.math.BigInteger(reader.readBytes().getBytes))
+      for (wide <- Seq(true, false) if wide || width <= 8) {
+        val d = new ColumnChunkDecoder(VecType.UTF8, VecType.UTF8, 0, batch, bytePackers)
+        d.setFixedLength(if (enc == "PLAIN") width else 0)
+        d.startChunk(n)
+        var row = 0
+        while (row < n) {
+          val want = math.min(batch, n - row)
+          d.startBatch(want)
+          var filled = 0
+          while (filled < want) {
+            if (d.needsPage()) d.feedPage(ColumnChunkDecoder.Page.v1(page, page.length, n, encoding))
+            filled += d.readBatch(want - filled, filled)
+          }
+          val arena = Arena.ofConfined()
+          try {
+            val out = arena.allocate(want.toLong * 16, 16)
+            d.flushDecimal(want, out, null, wide)
+            for (k <- 0 until want) {
+              val x = expected(row + k)
+              val what = s"width=$width n=$n batch=$batch $enc wide=$wide row ${row + k}"
+              if (wide) {
+                assert(out.get(java.lang.foreign.ValueLayout.JAVA_LONG_UNALIGNED, k.toLong << 4) == x.longValue, what)
+                assert(
+                  out.get(java.lang.foreign.ValueLayout.JAVA_LONG_UNALIGNED, (k.toLong << 4) + 8) ==
+                    x.shiftRight(64).longValue,
+                  what
+                )
+              } else {
+                assert(out.get(java.lang.foreign.ValueLayout.JAVA_LONG_UNALIGNED, k.toLong << 3) == x.longValue, what)
+              }
+            }
+          } finally arena.close()
+          row += want
+        }
+      }
+    }
+  }
+
   test("DELTA_LENGTH_BYTE_ARRAY pages from parquet-java's writer decode identically") {
     val rnd = new Random(55912)
     for (n <- lengths; batch <- Seq(64, 1000)) {

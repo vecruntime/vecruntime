@@ -879,7 +879,7 @@ object VectorParquetScanExec {
   /** The Parquet value/level encodings the native decoder handles; any other encoding falls the file over. */
   val SupportedEncodings: Set[String] = Set("PLAIN", "PLAIN_DICTIONARY", "RLE_DICTIONARY", "RLE", "BIT_PACKED")
 
-  import PrimitiveType.PrimitiveTypeName.{BINARY, DOUBLE, INT32, INT64}
+  import PrimitiveType.PrimitiveTypeName.{BINARY, DOUBLE, FIXED_LEN_BYTE_ARRAY, INT32, INT64}
 
   /**
    * Encodings the native decoder handles only on some physical types (#559): DELTA_BINARY_PACKED on
@@ -889,7 +889,7 @@ object VectorParquetScanExec {
   private val TypedEncodings: Map[String, Set[PrimitiveType.PrimitiveTypeName]] = Map(
     "DELTA_BINARY_PACKED" -> Set(INT32, INT64),
     "DELTA_LENGTH_BYTE_ARRAY" -> Set(BINARY),
-    "DELTA_BYTE_ARRAY" -> Set(BINARY),
+    "DELTA_BYTE_ARRAY" -> Set(BINARY, FIXED_LEN_BYTE_ARRAY),
     "BYTE_STREAM_SPLIT" -> Set(INT32, INT64, DOUBLE)
   )
 
@@ -920,7 +920,23 @@ object VectorParquetScanExec {
       case BooleanType => p == PrimitiveType.PrimitiveTypeName.BOOLEAN
       case _: StringType => p == BINARY
       case d: DecimalType =>
-        (p == INT32 && d.precision <= 9) || (p == INT64 && d.precision <= 18)
+        // The file's own decimal annotation must have the requested scale and at most the requested precision:
+        // then its unscaled values are the requested type's unscaled values. Another scale (Spark's decimal
+        // widening with a rescale), or no decimal annotation, falls over to Spark's reader.
+        val fileDecimal = physical.getLogicalTypeAnnotation match {
+          case a: org.apache.parquet.schema.LogicalTypeAnnotation.DecimalLogicalTypeAnnotation =>
+            a.getScale == d.scale && a.getPrecision <= d.precision
+          case _ => false
+        }
+        fileDecimal && (
+          if (d.precision <= 18) {
+            // The INT64 lane: an INT32 or INT64 widened, or big-endian bytes converted (flushDecimal).
+            p == INT32 || p == INT64 || p == FIXED_LEN_BYTE_ARRAY || p == BINARY
+          } else {
+            // The DECIMAL128 lane: big-endian bytes converted into two limbs.
+            p == FIXED_LEN_BYTE_ARRAY || p == BINARY
+          }
+        )
       case _ => false
     }
   }
