@@ -82,6 +82,10 @@ object VectorConf {
 
   /** #603: build-side strings with at most this many distinct values are emitted as dictionary ids. */
   val JoinBuildDictionaryMax = "spark.vecruntime.join.buildDictionaryMax"
+
+  /** #610: broadcast build keys as runtime filters on the native scan. */
+  val JoinRuntimeFilters = "spark.vecruntime.join.runtimeFilters"
+  val JoinRuntimeFiltersInMax = "spark.vecruntime.join.runtimeFilters.inMax"
   val JoinBuildPayload = "spark.vecruntime.join.buildPayload"
   val CometRangeShuffleEnabled = "spark.vecruntime.comet.shuffle.range.enabled"
 
@@ -248,6 +252,16 @@ object VectorConf {
    * Needs `deferredBuild`.
    */
   def joinBuildDictionaryMax(conf: SQLConf): Int = intIn(conf, JoinBuildDictionaryMax, default = 0, max = 1 << 16)
+
+  /**
+   * #610: a broadcast hash join (inner, or left semi with the build on the right) hands the native Parquet
+   * scan its streamed keys reach, through filters, projections and other inner joins, the build side's key
+   * domain as a pushed filter: an IN list of at most `runtimeFilters.inMax` values, else an integer key's
+   * range. Row groups without a matching key are skipped. Off: on TPC-DS (fact keys not clustered) it skips
+   * nothing and measured 1-5% slower locally.
+   */
+  def joinRuntimeFilters(conf: SQLConf): Boolean = bool(conf, JoinRuntimeFilters, default = false)
+  def joinRuntimeFiltersInMax(conf: SQLConf): Int = intIn(conf, JoinRuntimeFiltersInMax, default = 1024, max = 1 << 16)
 
   /**
    * A broadcast hash join whose build side carries payload columns without a lane (arrays, maps,
