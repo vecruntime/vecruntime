@@ -78,7 +78,7 @@ class ParquetTestingCorpusSuite extends VectorQuerySuite {
 
   /** Every corpus file in `data/` and the columns the native scan must read itself. */
   private val goodFiles: Seq[(String, Set[String])] = Seq(
-    // parquet-mr, PLAIN and dictionary, v1 pages, a mix of supported and unsupported types (INT96, float, binary)
+    // parquet-mr, PLAIN and dictionary, v1 pages, every flat type; INT96 timestamps fall over per file
     "alltypes_plain.parquet" -> Set(
       "id",
       "bool_col",
@@ -86,7 +86,10 @@ class ParquetTestingCorpusSuite extends VectorQuerySuite {
       "smallint_col",
       "int_col",
       "bigint_col",
-      "double_col"
+      "float_col",
+      "double_col",
+      "date_string_col",
+      "string_col"
     ),
     "alltypes_plain.snappy.parquet" -> Set(
       "id",
@@ -95,7 +98,10 @@ class ParquetTestingCorpusSuite extends VectorQuerySuite {
       "smallint_col",
       "int_col",
       "bigint_col",
-      "double_col"
+      "float_col",
+      "double_col",
+      "date_string_col",
+      "string_col"
     ),
     "alltypes_dictionary.parquet" -> Set(
       "id",
@@ -104,7 +110,10 @@ class ParquetTestingCorpusSuite extends VectorQuerySuite {
       "smallint_col",
       "int_col",
       "bigint_col",
-      "double_col"
+      "float_col",
+      "double_col",
+      "date_string_col",
+      "string_col"
     ),
     // the v2 encodings, from parquet-mr and arrow
     "delta_binary_packed.parquet" -> Set("bitwidth0", "bitwidth1", "bitwidth32", "bitwidth64", "int_value"),
@@ -112,8 +121,11 @@ class ParquetTestingCorpusSuite extends VectorQuerySuite {
     "delta_length_byte_array.parquet" -> Set("FRUIT"),
     "delta_encoding_optional_column.parquet" -> Set("c_customer_sk", "c_current_cdemo_sk", "c_customer_id"),
     "delta_encoding_required_column.parquet" -> Set("c_customer_sk:", "c_current_cdemo_sk:", "c_customer_id:"),
-    "byte_stream_split.zstd.parquet" -> Set("f64"),
+    "byte_stream_split.zstd.parquet" -> Set("f32", "f64"),
     "byte_stream_split_extended.gzip.parquet" -> Set(
+      "float_plain",
+      "float_byte_stream_split",
+      "flba5_plain",
       "double_plain",
       "double_byte_stream_split",
       "int32_plain",
@@ -137,8 +149,8 @@ class ParquetTestingCorpusSuite extends VectorQuerySuite {
     "single_nan.parquet" -> Set("mycol"),
     "datapage_v1-snappy-compressed-checksum.parquet" -> Set("a", "b"),
     "datapage_v1-uncompressed-checksum.parquet" -> Set("a", "b"),
-    "plain-dict-uncompressed-checksum.parquet" -> Set("long_field"),
-    "rle-dict-snappy-checksum.parquet" -> Set("long_field"),
+    "plain-dict-uncompressed-checksum.parquet" -> Set("long_field", "binary_field"),
+    "rle-dict-snappy-checksum.parquet" -> Set("long_field", "binary_field"),
     // INT96 keeps the plan-level fallback
     "int96_from_spark.parquet" -> Set()
   )

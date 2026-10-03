@@ -40,6 +40,7 @@ version may change configuration keys or defaults, always noted here.
 
 ### Added
 
+- FLOAT, BINARY and TIMESTAMP_NTZ columns in the native Parquet scan (#559, option A of the design note). They are decoded on the lane of the same layout and emitted as Spark's Arrow vectors: FLOAT on INT32 (`PLAIN`, dictionary, `BYTE_STREAM_SPLIT`), BINARY on UTF8 (also `FIXED_LEN_BYTE_ARRAY` read as binary), TIMESTAMP_NTZ on INT64. Operators carry them as columns without a lane, so a table with such a column no longer keeps all its other columns on Spark's reader.
 - Wide decimals (`decimal(p > 18)`) in the native Parquet scan (#559), and decimals of any precision stored as
   `FIXED_LEN_BYTE_ARRAY` or `BINARY` (Spark's legacy format, Hive, Impala): `PLAIN`, dictionary and
   `DELTA_BYTE_ARRAY` pages decode into the DECIMAL128 lane (or the INT64 lane for p <= 18), as Spark converts them.

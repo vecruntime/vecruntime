@@ -185,7 +185,20 @@ The corpus approach follows Hardwood (`hardwood-hq/hardwood`), as does bounding 
   - Checked through Spark with dictionary, `PLAIN` and v2 `DELTA_BINARY_PACKED` pages, nulls, the extremes, filters, an aggregate, arithmetic and casts (`VectorParquetScanSuite`).
   - Checked on a file written by parquet-java's `ExampleParquetWriter` with out-of-range values, against Spark's parquet-java-based reader. Without the narrowing, that test's sum differs.
   - The corpus columns `tinyint_col` / `smallint_col` of the `alltypes_*` files are now read natively.
-- **FLOAT.** Needs a FLOAT32 lane, or a widening path that keeps exact values.
+- **FLOAT, BINARY and TIMESTAMP_NTZ.** **Done**, as option A of the design note: decoded by the scan, no engine lane. Each is decoded on the lane of the same layout:
+  - FLOAT's 4-byte IEEE bits on INT32: `PLAIN`, dictionary, `BYTE_STREAM_SPLIT`;
+  - BINARY on the UTF8 path: `PLAIN`, dictionary, DLBA, DBA, and `FIXED_LEN_BYTE_ARRAY` read as binary;
+  - TIMESTAMP_NTZ on INT64: micros, MILLIS scaled with Spark's overflow check, only from a column not adjusted to UTC; a UTC-adjusted column falls over to Spark's reader, which refuses it.
+
+  They are emitted as Arrow `Float4Vector` / `VarBinaryVector` / `TimeStampMicroVector`, which Spark's `ArrowColumnVector` reads. They stay out of `TypeMapping` and `ArrowVectorBuffers.vecTypeOf`, so no operator takes them for an INT32 or UTF8 lane.
+
+  Filters and projections carry them as foreign columns; an operator that computes on one stays Spark's, reading our batches as it reads Spark's scan. A table with such a column no longer keeps all its other columns on Spark's reader.
+  - **Tests:**
+    - `DeltaBinaryPackedCrossCheckSuite`: FLOAT `PLAIN` and `BYTE_STREAM_SPLIT` from parquet-java's writers, checked bit for bit against its readers (NaN payloads, -0.0, infinities).
+    - `VectorParquetScanSuite`: round trips for all three (v1 dictionary, v1 `PLAIN` with MILLIS, v2), and filters, an aggregate and predicates on them. Also the UTC-adjusted TIMESTAMP_NTZ fallback.
+    - The corpus columns `float_col`, `date_string_col`, `string_col`, `f32`, `float_plain`, `float_byte_stream_split`, `flba5_plain` and `binary_field` are now read natively.
+  - **JMH:** no new decode kernel (the INT32, UTF8 and INT64 paths are the ones measured above), so there is no new benchmark.
+  - **Option B** (real lanes, so operators compute on these types) stays open; see the note.
 - **TIMESTAMP.** **Done** for INT64 `MICROS` and `MILLIS`, into the INT64 lane of micros. `physicalMatches` admits the `TIMESTAMP` annotation with either unit and either `isAdjustedToUTC`, the same match as Spark's `ParquetVectorUpdaterFactory`. `MILLIS` is scaled by 1000 with `Math.multiplyExact`, as Spark's `LongAsMicrosUpdater` does, so an overflowing value fails the read instead of wrapping. Only present rows are scaled, because a null slot holds whatever the reused buffer held.
   - **Rebase, per file.** At open, `fallbackModes` resolves the file's datetime and INT96 rebase specs with `DataSourceUtils.datetimeRebaseSpec` / `int96RebaseSpec`, from the writer version and legacy keys in the footer, or else the session configuration. It also resolves the INT96 time-zone conversion, the way `ParquetFileFormat` does. A file with date or timestamp columns is decoded natively only when its datetime mode resolves to `CORRECTED`. This replaces the earlier plan-level refusal of a non-`CORRECTED` date rebase. Under `EXCEPTION`, a Spark 3+ file without the legacy key is still read natively.
   - **INT96** (the legacy Impala/Hive layout) is not an INT64 lane, so such a file falls over per file. This deviates from the earlier plan, which kept INT96 as a plan-level fallback. The per-file check is finer: INT96 files and INT64 files in one table are each read by the right reader.
@@ -193,7 +206,6 @@ The corpus approach follows Hardwood (`hardwood-hq/hardwood`), as does bounding 
   - **Checked through Spark** with `TIMESTAMP_MICROS` and `TIMESTAMP_MILLIS` output, v1 and v2 pages, nulls, values before 1582 and after 2038, filters and an aggregate, all natively.
   - **Checked across one table** holding an INT96 file, a `LEGACY`-calendar file and a `CORRECTED` file. Each is read by the right reader with Spark's values, under `CORRECTED` and `EXCEPTION`.
   - **Checked on a parquet-java-written `MILLIS` file** whose micros overflow. It fails with `ArithmeticException` under both readers.
-- **TIMESTAMP_NTZ.** The engine has no `TimestampNTZType` lane yet: `TypeMapping` does not map it, and operators fall back on it. Scanning it natively is part of the lane work, with FLOAT and BINARY below.
 - **Wide decimals and decimals stored as bytes.** **Done**. A decimal stored as `FIXED_LEN_BYTE_ARRAY` or `BINARY` is decoded by the binary page paths: `PLAIN` (fixed-length values have no length prefix), dictionary, `DELTA_LENGTH_BYTE_ARRAY` and `DELTA_BYTE_ARRAY`, which is what parquet-java's v2 writer uses for FLBA. Its big-endian two's-complement bytes are then converted at flush (`ColumnChunkDecoder.flushDecimal`):
   - **`decimal(p > 18)`** goes into the DECIMAL128 lane: two little-endian limbs, sign-extended, which is Arrow's Decimal128 layout. A 16-byte value is read as two big-endian longs. A value longer than 16 bytes must be a sign extension, or the read fails.
   - **`decimal(p <= 18)`** stored as bytes goes into the INT64 lane, exactly as Spark's `binaryToUnscaledLong` computes it. Spark's legacy writer, Hive and Impala store such decimals; since #592 those files had fallen over to Spark's reader.
@@ -204,7 +216,6 @@ The corpus approach follows Hardwood (`hardwood-hq/hardwood`), as does bounding 
     - `VectorParquetScanSuite`: `decimal(20|25|38)` round trips (v1 dictionary, `PLAIN`, v2 `DELTA_BYTE_ARRAY`, legacy format) and the rescale fallback.
     - The corpus files `fixed_length_decimal*` and `byte_array_decimal` are now read natively.
   - **JMH** (`V2EncodingsBenchmark` `flba-dec38`, x86, one 20,000-value page): 13.5 pages per ms. parquet-java's `FixedLenByteArrayPlainValuesReader.readBytes` does 13.7, but it only slices the bytes and does no conversion. Before the big-endian long reads this path measured 3.4.
-- **BINARY** (a binary lane): still to do; with FLOAT and TIMESTAMP_NTZ, it needs a new engine lane.
 - **Nested types** (structs, lists, maps). Need repetition levels and Arrow list and struct builders. This is the largest item and needs its own design.
 
 ### Performance

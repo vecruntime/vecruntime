@@ -15,16 +15,21 @@
  */
 package io.vecruntime.spark.parquet;
 
+import io.vecruntime.kernels.VecType;
+import io.vecruntime.spark.adapter.TypeMapping;
+import org.apache.spark.sql.types.BinaryType;
 import org.apache.spark.sql.types.BooleanType;
 import org.apache.spark.sql.types.ByteType;
 import org.apache.spark.sql.types.DataType;
 import org.apache.spark.sql.types.DateType;
 import org.apache.spark.sql.types.DecimalType;
 import org.apache.spark.sql.types.DoubleType;
+import org.apache.spark.sql.types.FloatType;
 import org.apache.spark.sql.types.IntegerType;
 import org.apache.spark.sql.types.LongType;
 import org.apache.spark.sql.types.ShortType;
 import org.apache.spark.sql.types.StringType;
+import org.apache.spark.sql.types.TimestampNTZType;
 import org.apache.spark.sql.types.TimestampType;
 
 /**
@@ -42,9 +47,10 @@ import org.apache.spark.sql.types.TimestampType;
  * ({@code VectorParquetScanExec.physicalMatches}), and so is each file's
  * calendar-rebase mode. TIMESTAMP is the INT64 lane of micros (INT64 {@code
  * MICROS}, or {@code MILLIS} scaled); an INT96 file falls over per file.
- * Deliberately excluded: {@code TIMESTAMP_NTZ} (no engine lane yet), {@code
- * FLOAT}, {@code BINARY}, wide decimals ({@code p>18}), and every
- * nested/complex type.
+ * FLOAT, BINARY and TIMESTAMP_NTZ have no engine lane: they are decoded on a
+ * lane of the same layout ({@link #decodeLane}) and emitted as Spark's Arrow
+ * vectors, carried by operators as foreign columns. Deliberately excluded:
+ * every nested/complex type.
  */
 public final class NativeParquetSupport {
 
@@ -79,6 +85,39 @@ public final class NativeParquetSupport {
             // type and decimal annotation are checked at open (VectorParquetScanExec.physicalMatches).
             return d.precision() <= 38;
         }
-        return false;
+        // No engine lane (option A of the FLOAT / BINARY / TIMESTAMP_NTZ note, #559): decoded on a lane of the
+        // same layout and emitted as Spark's Arrow vector, so operators carry the column as a foreign column.
+        return decodeLane(dt) != null;
+    }
+
+    /**
+     * The decoder lane for a Spark type: {@link TypeMapping#vecTypeOf} for a
+     * type with an engine lane, else the lane whose bytes a column without one
+     * shares -- FLOAT on INT32 (the 4-byte IEEE bits, as stored), BINARY on UTF8
+     * (offsets and bytes), TIMESTAMP_NTZ on INT64 (micros). The scan emits those
+     * as Arrow {@code Float4Vector} / {@code VarBinaryVector} / {@code
+     * TimeStampMicroVector}, which Spark's {@code ArrowColumnVector} reads;
+     * operators pass them through as columns without a lane, as they do over
+     * Spark's own scan. {@code null}: not decodable.
+     */
+    public static VecType decodeLane(DataType dt) {
+        if (dt instanceof FloatType) {
+            return VecType.INT32;
+        }
+        if (dt instanceof BinaryType) {
+            return VecType.UTF8;
+        }
+        if (dt instanceof TimestampNTZType) {
+            return VecType.INT64;
+        }
+        return TypeMapping.vecTypeOf(dt);
+    }
+
+    /**
+     * True for a type the scan decodes but no engine lane holds (operators
+     * carry it as a foreign column).
+     */
+    public static boolean isForeign(DataType dt) {
+        return dt instanceof FloatType || dt instanceof BinaryType || dt instanceof TimestampNTZType;
     }
 }

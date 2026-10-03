@@ -460,6 +460,71 @@ class VectorParquetScanSuite extends VectorQuerySuite {
     ).collect { case s: VectorParquetScanExec => s }.map(_.metrics("numRowGroups").value).sum
   }
 
+  test("FLOAT, BINARY and TIMESTAMP_NTZ decode natively and pass through as foreign columns (#559)") {
+    // No engine lane holds these: the scan decodes FLOAT on the INT32 lane (its 4-byte bits), BINARY on the
+    // UTF8 path, TIMESTAMP_NTZ on the INT64 lane, and emits Spark's Arrow vectors. Operators carry them
+    // untouched (a filter and a projection over the other columns stay ours) and any operator that computes
+    // on them falls back as over Spark's scan. Dictionary, PLAIN, v2 (BYTE_STREAM_SPLIT for floats via the
+    // writer property, DELTA_* for binary), nulls, NaN / -0.0 / infinities, empty binaries.
+    val query =
+      """SELECT CAST(id AS INT) AS i,
+        |  CASE WHEN id % 7 = 0 THEN NULL WHEN id % 11 = 0 THEN CAST('NaN' AS FLOAT)
+        |       WHEN id % 13 = 0 THEN CAST(-0.0 AS FLOAT) WHEN id % 17 = 0 THEN CAST('Infinity' AS FLOAT)
+        |       ELSE CAST(id * 1.25 - 5000 AS FLOAT) END AS f,
+        |  CASE WHEN id % 5 = 0 THEN NULL WHEN id % 9 = 0 THEN X''
+        |       ELSE CAST(CONCAT('b', CAST(id % 97 AS STRING), REPEAT('z', CAST(id % 7 AS INT))) AS BINARY) END AS b,
+        |  CASE WHEN id % 3 = 0 THEN NULL
+        |       ELSE CAST(TIMESTAMP_MICROS(id * 86400000000 * 3 + 123456) AS TIMESTAMP_NTZ) END AS ntz,
+        |  CONCAT('s', CAST(id % 50 AS STRING)) AS s
+        |FROM range(0, 20000)""".stripMargin
+    for (
+      (version, dict, millis, view) <- Seq(
+        ("v1", "true", false, "t_foreign_v1d"),
+        ("v1", "false", true, "t_foreign_v1p"),
+        ("v2", "false", false, "t_foreign_v2")
+      )
+    ) {
+      val path = newTempPath(view)
+      withPlugin(enabled = false) {
+        withConf("spark.sql.parquet.outputTimestampType" -> (if (millis) "TIMESTAMP_MILLIS" else "TIMESTAMP_MICROS")) {
+          spark.sql(query).repartition(2).sortWithinPartitions("i")
+            .write.option("parquet.writer.version", version).option("parquet.enable.dictionary", dict)
+            .option("parquet.column.byte.stream.split", if (version == "v2") "true" else "false")
+            .mode("overwrite").parquet(path)
+        }
+        spark.read.parquet(path).createOrReplaceTempView(view)
+      }
+      for (batch <- Seq("1024", "100")) {
+        withConf("spark.sql.parquet.columnarReaderBatchSize" -> batch) {
+          checkVectorized(s"SELECT * FROM $view", Seq(node))
+          checkVectorized(s"SELECT i, f, b, ntz FROM $view WHERE i % 4 = 1 AND s <> 's3'", Seq(node))
+          checkVectorized(s"SELECT s, count(*), sum(f), max(b), min(ntz) FROM $view GROUP BY s", Seq(node))
+          checkVectorized(
+            s"SELECT i FROM $view WHERE f > 100 OR b = X'623132' OR ntz < TIMESTAMP_NTZ'1975-01-01 00:00:00'",
+            Seq(node)
+          )
+        }
+      }
+      assert(nativeRowGroupsOf(s"SELECT i, f, b, ntz FROM $view") > 0, s"$view: not decoded natively")
+    }
+  }
+
+  test("a TIMESTAMP_NTZ read from a UTC-adjusted column falls over to Spark's reader (#559)") {
+    val path = newTempPath("t_ntz_utc")
+    withPlugin(enabled = false) {
+      spark.sql("SELECT CAST(id AS INT) AS i, TIMESTAMP_MICROS(id * 1000000) AS ts FROM range(0, 1000)")
+        .coalesce(1).write.mode("overwrite").parquet(path)
+    }
+    def outcome(plugin: Boolean): Either[String, Seq[org.apache.spark.sql.Row]] =
+      try
+        Right(withPlugin(enabled = plugin)(spark.read.schema("i INT, ts TIMESTAMP_NTZ").parquet(path).collect().toSeq))
+      catch { case e: Exception => Left(e.getClass.getSimpleName) }
+    val off = outcome(plugin = false)
+    val on = outcome(plugin = true)
+    assert(off.isLeft == on.isLeft, s"Spark: $off; plugin: $on")
+    if (off.isRight) assert(off.toOption.get.map(_.toString).sorted == on.toOption.get.map(_.toString).sorted)
+  }
+
   test("partition columns are read as constant columns") {
     val path = newTempPath("t_part")
     withPlugin(enabled = false) {
@@ -1075,14 +1140,15 @@ class VectorParquetScanSuite extends VectorQuerySuite {
     checkFallback("SELECT i, st FROM t_nested", Seq(node), reasonContains = "nested or complex column")
   }
 
-  test("fallback: a binary column is not a supported lane in slice 1") {
+  test("a binary column alone is read by the native scan (#559, option A)") {
     val path = newTempPath("t_bin")
     withPlugin(enabled = false) {
       spark.sql("SELECT CAST(id AS INT) AS i, CAST(CONCAT('b', CAST(id AS STRING)) AS BINARY) AS b FROM range(0, 1000)")
         .write.mode("overwrite").parquet(path)
       spark.read.parquet(path).createOrReplaceTempView("t_bin")
     }
-    checkFallback("SELECT i, b FROM t_bin", Seq(node), reasonContains = "unsupported column type")
+    checkVectorized("SELECT i, b FROM t_bin", Seq(node))
+    assert(nativeRowGroupsOf("SELECT i, b FROM t_bin") > 0, "the binary file was not decoded natively")
   }
 
   test("the open path makes one open and one getFileStatus per split") {

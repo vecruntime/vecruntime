@@ -90,6 +90,16 @@ public final class ArrowOutput {
             // Spark's ArrowColumnVector reads through getDecimal (a BigDecimal per row; accepted, #257).
             return new DecimalVector(name, allocator, d.precision(), d.scale());
         }
+        // Types with no engine lane that the native Parquet scan emits (#559): Spark's ArrowColumnVector reads them.
+        if (dt instanceof org.apache.spark.sql.types.FloatType) {
+            return new org.apache.arrow.vector.Float4Vector(name, allocator);
+        }
+        if (dt instanceof org.apache.spark.sql.types.BinaryType) {
+            return new org.apache.arrow.vector.VarBinaryVector(name, allocator);
+        }
+        if (dt instanceof org.apache.spark.sql.types.TimestampNTZType) {
+            return new org.apache.arrow.vector.TimeStampMicroVector(name, allocator);
+        }
         throw new UnsupportedOperationException("unsupported output type " + dt);
     }
 

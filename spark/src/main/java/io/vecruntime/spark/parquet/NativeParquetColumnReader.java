@@ -32,7 +32,6 @@ import io.vecruntime.spark.arrow.ArrowVectorBuffers;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.BaseFixedWidthVector;
 import org.apache.arrow.vector.FieldVector;
-import org.apache.arrow.vector.VarCharVector;
 import org.apache.parquet.bytes.BytesInput;
 import org.apache.parquet.column.ColumnDescriptor;
 import org.apache.parquet.column.Encoding;
@@ -120,7 +119,9 @@ public final class NativeParquetColumnReader {
         this.narrowBits = sparkType instanceof org.apache.spark.sql.types.ByteType
                 ? 8
                 : sparkType instanceof org.apache.spark.sql.types.ShortType ? 16 : 0;
-        this.millis = sparkType instanceof org.apache.spark.sql.types.TimestampType && column.getPrimitiveType().getLogicalTypeAnnotation() instanceof org.apache.parquet.schema.LogicalTypeAnnotation.TimestampLogicalTypeAnnotation t && t.getUnit() == org.apache.parquet.schema.LogicalTypeAnnotation.TimeUnit.MILLIS;
+        this.millis = (sparkType instanceof org.apache.spark.sql.types.TimestampType || sparkType instanceof org.apache.spark.sql.types.TimestampNTZType)
+                      && column.getPrimitiveType().getLogicalTypeAnnotation() instanceof org.apache.parquet.schema.LogicalTypeAnnotation.TimestampLogicalTypeAnnotation t
+                      && t.getUnit() == org.apache.parquet.schema.LogicalTypeAnnotation.TimeUnit.MILLIS;
         // Dictionary scratch is GC-managed: closing a shared Arena runs a JVM-wide handshake that walks every
         // thread's stack, and a reader is made per column per file -- on 1 TB TPC-DS (14,594 store_sales
         // files) those handshakes were 8-9% of executor CPU in q88. An automatic arena has no close.
@@ -136,6 +137,10 @@ public final class NativeParquetColumnReader {
             this.decoder.setFixedLength(fixedLength);
         } else {
             this.decoder = new ColumnChunkDecoder(physicalType, type, maxDefLevel, batchRows, this::unpackerFor);
+            if (type == VecType.UTF8 && fixedLength > 0) {
+                // A FIXED_LEN_BYTE_ARRAY column read as BINARY: fixed-length values with no length prefix.
+                this.decoder.setFixedLength(fixedLength);
+            }
         }
     }
 
@@ -389,8 +394,8 @@ public final class NativeParquetColumnReader {
 
     private FieldVector flushUtf8(int rows, boolean hasNulls) {
         long bytes = decoder.utf8Bytes();
-        VarCharVector v = (VarCharVector) borrowUtf8(rows, bytes);
-        ArrowVectorBuffers vb = ArrowVectorBuffers.forWrite(v, rows);
+        org.apache.arrow.vector.BaseVariableWidthVector v = (org.apache.arrow.vector.BaseVariableWidthVector) borrowUtf8(rows, bytes);
+        ArrowVectorBuffers vb = ArrowVectorBuffers.forWrite(v, rows, sparkType);
         decoder.flushUtf8(rows, vb.offsets(), vb.data(),
                 hasNulls ? vb.validity() : null);
         if (!hasNulls) {
@@ -426,13 +431,13 @@ public final class NativeParquetColumnReader {
         FieldVector v = pool.pollFirst();
         while (v != null) {
             if (v.getValidityBuffer().capacity() >= io.vecruntime.kernels.Bitmap.bytesFor(rows) && v.getOffsetBuffer().capacity() >= (long) (rows + 1) * 4 && v.getDataBuffer().capacity() >= Math.max(bytes, 1L)) {
-                ((VarCharVector) v).setValueCount(0);
+                ((org.apache.arrow.vector.BaseVariableWidthVector) v).setValueCount(0);
                 return v;
             }
             v.close();
             v = pool.pollFirst();
         }
-        VarCharVector nv = (VarCharVector) ArrowOutput.newVector(name, sparkType, allocator);
+        org.apache.arrow.vector.BaseVariableWidthVector nv = (org.apache.arrow.vector.BaseVariableWidthVector) ArrowOutput.newVector(name, sparkType, allocator);
         nv.allocateNew(Math.max(bytes, 1L), rows);
         return nv;
     }
