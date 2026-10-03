@@ -613,6 +613,48 @@ public final class ColumnChunkDecoder {
     }
 
     /**
+     * {@link #skip} for rows that keep their slots in the batch being filled
+     * (#611: a batch decoded at its selected rows only): slots {@code
+     * [dstBase, dstBase + skipped)} become null rows when the column is
+     * nullable (an empty string, a false, an unwritten value otherwise) -- the
+     * batch's selection excludes them. On the staging path only; a direct
+     * fixed-width write pre-clears its validity, so it calls {@link #skip}.
+     */
+    public int skipIntoBatch(int want, int dstBase) {
+        int pos = utf8Len;
+        int m = skip(want);
+        if (m == 0) {
+            return 0;
+        }
+        if (type == VecType.UTF8) {
+            if (batchIds) {
+                java.util.Arrays.fill(ints, dstBase, dstBase + m, 0);
+            } else {
+                java.util.Arrays.fill(utf8Offsets, dstBase, dstBase + m + 1, pos);
+            }
+        }
+        if (maxDefLevel > 0) {
+            clearValidity(dstBase, m);
+            batchNulls += m;
+        }
+        return m;
+    }
+
+    private void clearValidity(int from, int count) {
+        long[] words = validityWords;
+        int i = from;
+        int end = from + count;
+        while (i < end) {
+            int w = i >>> 6;
+            int bit = i & 63;
+            int take = Math.min(64 - bit, end - i);
+            long window = take == 64 ? -1L : (((1L << take) - 1) << bit);
+            words[w] &= ~window;
+            i += take;
+        }
+    }
+
+    /**
      * Advances the current page's value stream past its next {@code k} present
      * values.
      */

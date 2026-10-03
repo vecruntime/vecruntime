@@ -1378,6 +1378,48 @@ class ColumnChunkDecoderTest {
                 }
             }
         }
+        // Selected-row batches: within each batch, runs skipped in place (skipIntoBatch) between runs read.
+        for (long seed = 0; seed < 3; seed++) {
+            Random rnd = new Random(6110L * rows + 7L * batchRows + seed);
+            ColumnChunkDecoder t = d.twin(batchRows);
+            int pos = 0;
+            int pageIdx = 0;
+            try (Arena arena = Arena.ofConfined()) {
+                while (pos < rows) {
+                    int want = Math.min(rows - pos, batchRows);
+                    boolean[] read = new boolean[want];
+                    t.startBatch(want);
+                    int filled = 0;
+                    while (filled < want) {
+                        if (t.needsPage()) {
+                            t.feedPage(pages.get(pageIdx++)
+                                            .page());
+                        }
+                        int run = Math.min(want - filled, 1 + rnd.nextInt(Math.max(1, want / 4)));
+                        if (rnd.nextBoolean()) {
+                            filled += t.skipIntoBatch(run, filled);
+                        } else {
+                            int got = t.readBatch(run, filled);
+                            java.util.Arrays.fill(read, filled, filled + got, true);
+                            filled += got;
+                        }
+                    }
+                    if (t.batchIsDictionaryIds()) {
+                        return r;
+                    }
+                    VectorBuffers b = flushTwin(t, lane, want, arena);
+                    for (int i = 0; i < want; i++) {
+                        if (read[i]) {
+                            assertSameRow(r.buffers, pos + i, b, i, lane,
+                                    "in-batch skip seed " + seed);
+                        } else if (lane == VecType.UTF8 && !b.isNull(i)) {
+                            assertEquals(0, b.getUtf8Bytes(i).length, "skipped slot " + (pos + i) + " is not empty");
+                        }
+                    }
+                    pos += want;
+                }
+            }
+        }
         return r;
     }
 
