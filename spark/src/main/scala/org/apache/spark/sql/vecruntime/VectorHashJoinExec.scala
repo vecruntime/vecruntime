@@ -198,7 +198,14 @@ case class VectorBroadcastHashJoinExec(
       case VectorBroadcastExchangeExec(e) =>
         val batches = e.executeVectorBroadcast()
         val nullAware = isNullAwareAntiJoin
-        attachRuntimeFilters(BuildTable.sharedFromBroadcast(batches.value, spec))
+        if (runtimeFiltersOn && VectorRuntimeFilters.eligible(this))
+          VectorRuntimeFilters.attach(
+            this,
+            batches.value,
+            spec,
+            io.vecruntime.spark.VectorConf.joinRuntimeFiltersInMax(conf),
+            io.vecruntime.spark.VectorConf.joinRuntimeFiltersMaxBuildRows(conf)
+          )
         return streamedPlan.executeColumnar().mapPartitionsInternal { iter =>
           // The broadcast value stays referenced by this closure for the task's lifetime, which keeps
           // the shared table (keyed on it) alive; see BuildTable.sharedFromBroadcast.
@@ -211,7 +218,12 @@ case class VectorBroadcastHashJoinExec(
       case _ =>
     }
     val relation = buildPlan.executeBroadcast[Any]()
-    attachRuntimeFilters(BuildTable.sharedFromRelation(relation.value.asInstanceOf[AnyRef], spec))
+    if (
+      VectorRuntimeFilters.sparkBuildRows(buildPlan).forall(
+        _ <= io.vecruntime.spark.VectorConf.joinRuntimeFiltersMaxBuildRows(conf)
+      )
+    )
+      attachRuntimeFilters(BuildTable.sharedFromRelation(relation.value.asInstanceOf[AnyRef], spec))
     streamedPlan.executeColumnar().mapPartitionsInternal { iter =>
       // A null-aware anti join whose build side held a null key keeps nothing: `x NOT IN (..., NULL)`
       // is never true. Spark marks that relation with a singleton that has no rows to read.
@@ -231,8 +243,9 @@ case class VectorBroadcastHashJoinExec(
 
   /**
    * #610: hands the native scans the streamed keys reach the build side's key domain, on the driver and
-   * before the streamed side is executed (which is when a scan reads its filters). The table is the shared
-   * one tasks probe, so a task in the driver's JVM (local mode) does not build it again.
+   * before the streamed side is executed (which is when a scan reads its filters). Spark's own broadcast
+   * relation is read through the shared table tasks probe; our columnar broadcast is read off its batches
+   * ([[VectorRuntimeFilters.attach]]), so the driver builds no table for it.
    */
   private def attachRuntimeFilters(build: => BuildTable): Unit =
     if (runtimeFiltersOn && VectorRuntimeFilters.eligible(this))

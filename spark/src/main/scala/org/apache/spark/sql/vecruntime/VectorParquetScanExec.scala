@@ -159,6 +159,17 @@ case class VectorParquetScanExec(
       session.sessionState.conf.parquetInferTimestampNTZEnabled
     )
     hadoopConf.setBoolean(SQLConf.LEGACY_PARQUET_NANOS_AS_LONG.key, session.sessionState.conf.legacyParquetNanosAsLong)
+    // #610: runtime filters prune row groups by statistics only. A dictionary (or bloom) check costs a read of
+    // the key column's dictionary page per row group -- an extra object-store request each -- and a key domain
+    // too wide for its statistics to prune (an IN list Parquet widens to its range) gains nothing from it. So
+    // with runtime filters and no static filter but null checks, Parquet's dictionary and bloom paths are off.
+    if (runtimeFilters.nonEmpty && sqlConf.parquetFilterPushDown) {
+      val static = org.apache.spark.sql.execution.vector.FileScanAccess.pushedDownFilters(scan)
+      if (static.forall(_.isInstanceOf[org.apache.spark.sql.sources.IsNotNull])) {
+        hadoopConf.setBoolean(org.apache.parquet.hadoop.ParquetInputFormat.DICTIONARY_FILTERING_ENABLED, false)
+        hadoopConf.setBoolean(org.apache.parquet.hadoop.ParquetInputFormat.BLOOM_FILTERING_ENABLED, false)
+      }
+    }
     val confBroadcast = session.sparkContext.broadcast(new SerializableConfiguration(hadoopConf))
 
     // Batch size, rounded DOWN to a multiple of 64 (min 64) so every batch offset into a row group is a

@@ -125,6 +125,14 @@ class RuntimeFiltersSuite extends VectorQuerySuite {
     }
   }
 
+  test("no runtime filter from a build side past maxBuildRows") {
+    val sql = "SELECT count(*), sum(f.v) FROM rf_fact f JOIN rf_dim d ON f.k = d.k WHERE d.name LIKE 'd1__'"
+    val capped = withConf(VectorConf.JoinRuntimeFiltersMaxBuildRows -> "99") { run(sql, on = true) }
+    assert(metric(capped, "numRuntimeFilters") === 0, finalPlan(capped).treeString)
+    val within = withConf(VectorConf.JoinRuntimeFiltersMaxBuildRows -> "100") { run(sql, on = true) }
+    assert(metric(within, "numRuntimeFilters") > 0, finalPlan(within).treeString)
+  }
+
   test("an empty build side") {
     // AQE would replace the join with an empty relation; without it the join runs over an empty build.
     withConf("spark.sql.adaptive.enabled" -> "false") {
