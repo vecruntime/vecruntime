@@ -34,7 +34,8 @@ SUITE="${SUITE:-tpcds}"
 case "$SUITE" in
   tpcds) MAIN=io.vecruntime.benchmarks.TpcdsRunner ;;
   tpch) MAIN=io.vecruntime.benchmarks.TpchRunner ;;
-  *) echo "SUITE must be tpcds or tpch" >&2; exit 2 ;;
+  showcase) MAIN=io.vecruntime.benchmarks.ShowcaseRunner ;;
+  *) echo "SUITE must be tpcds, tpch or showcase" >&2; exit 2 ;;
 esac
 JAR="${BENCH_JAR:-$ROOT/benchmarks/target/benchmarks.jar}"
 OFFHEAP="${OFFHEAP:-32g}"

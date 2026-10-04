@@ -36,6 +36,7 @@ NAMESPACE="${NAMESPACE:-bench}"; SERVICE_ACCOUNT="${SERVICE_ACCOUNT:-sfi-engine}
 EXECUTORS="${EXECUTORS:-8}"; EXEC_CORES="${EXEC_CORES:-14}"; EXEC_MEM="${EXEC_MEM:-40g}"; EXEC_OVERHEAD="${EXEC_OVERHEAD:-10g}"
 DRIVER_CORES="${DRIVER_CORES:-2}"; DRIVER_MEM="${DRIVER_MEM:-8g}"; NODE_SELECTOR="${NODE_SELECTOR-workload=spark-xl}"
 MAIN=io.vecruntime.benchmarks.TpcdsRunner; [ "$SUITE" = tpch ] && MAIN=io.vecruntime.benchmarks.TpchRunner
+[ "$SUITE" = showcase ] && MAIN=io.vecruntime.benchmarks.ShowcaseRunner
 DIRECT_MEM="${DIRECT_MEM:-$(( ${EXEC_OVERHEAD%g} - 2 ))g}"
 
 # The engine's --conf pairs, from the submit script's dry run (the Comet jar is on the image: no --jars).
