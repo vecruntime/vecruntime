@@ -261,10 +261,11 @@ object VectorConf {
    * #610: a broadcast hash join (inner, or left semi with the build on the right) hands the native Parquet
    * scan its streamed keys reach, through filters, projections and other inner joins, the build side's key
    * domain as a pushed filter: an IN list of at most `runtimeFilters.inMax` values, else an integer key's
-   * range. Row groups without a matching key are skipped. Off: on TPC-DS (fact keys not clustered) it skips
-   * nothing and measured 1-5% slower locally.
+   * range. Row groups without a matching key are skipped. On by default: TPC-DS 1 TB (fact keys not
+   * clustered, so nothing is skipped) is neutral on its twelve longest queries, and the showcase dataset (a
+   * fact table clustered on its join key) is 2.8x faster on a selective dimension.
    */
-  def joinRuntimeFilters(conf: SQLConf): Boolean = bool(conf, JoinRuntimeFilters, default = false)
+  def joinRuntimeFilters(conf: SQLConf): Boolean = bool(conf, JoinRuntimeFilters, default = true)
   def joinRuntimeFiltersInMax(conf: SQLConf): Int = intIn(conf, JoinRuntimeFiltersInMax, default = 1024, max = 1 << 16)
 
   /**
