@@ -345,6 +345,18 @@ public final class NativeParquetColumnReader {
     // ----- late materialization (#611) -----
 
     /**
+     * Whether decoding only a batch's selected rows can beat decoding it whole:
+     * for a string column (its bytes are copied per value). A fixed-width
+     * column, a boolean or a binary decimal is unpacked a whole batch at a
+     * time, so a run-by-run walk of a scattered selection -- a decoder call per
+     * run of one or a few rows -- costs more than it saves (1 TB q44: twice the
+     * executor time at ~0.1% scattered survivors).
+     */
+    public boolean decodesSelectedFaster() {
+        return type == VecType.UTF8;
+    }
+
+    /**
      * Skips the next {@code n} rows of the row group without decoding them into
      * any vector.
      */
