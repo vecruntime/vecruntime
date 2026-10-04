@@ -3,10 +3,10 @@
   <groupId>io.github.vecruntime</groupId>
   <artifactId>vecruntime-kernels</artifactId>
   <versioning>
-    <release>0.0.5</release>
+    <release>0.0.6</release>
     <versions>
-      <version>0.0.5</version>
+      <version>0.0.6</version>
     </versions>
-    <lastUpdated>20261002122827</lastUpdated>
+    <lastUpdated>20261004162831</lastUpdated>
   </versioning>
 </metadata>
