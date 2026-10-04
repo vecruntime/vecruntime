@@ -4,7 +4,14 @@ All notable changes to vecruntime. The format follows [Keep a Changelog](https:/
 the project uses [semantic versioning](https://semver.org/) once it reaches 1.0 -- until then a minor
 version may change configuration keys or defaults, always noted here.
 
-## Unreleased
+## 0.0.6 -- 2026-10-04
+
+Our own Parquet scan is on by default and reads every flat type (v2 encodings, BOOLEAN, TINYINT/SMALLINT,
+TIMESTAMP, wide decimals, FLOAT/BINARY/TIMESTAMP_NTZ); dictionary strings stay dictionaries from the scan
+through hash joins, whose probe and build columns leave as deferred views; broadcast build keys prune the
+probe scan as runtime filters (on by default); no reduce-side locality wait. Late materialization and
+decode-ahead are in, off by default. Several native-scan correctness fixes. TPC-DS 1 TB on x86, four engines
+in one session on 2026-10-03: 2.09x Spark (1,415 s against 2,963), Comet 1.0.0 1.51x (`docs/results.md`).
 
 ### Fixed
 
