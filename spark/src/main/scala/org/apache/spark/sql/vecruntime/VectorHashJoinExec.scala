@@ -203,7 +203,8 @@ case class VectorBroadcastHashJoinExec(
             this,
             batches.value,
             spec,
-            io.vecruntime.spark.VectorConf.joinRuntimeFiltersInMax(conf)
+            io.vecruntime.spark.VectorConf.joinRuntimeFiltersInMax(conf),
+            io.vecruntime.spark.VectorConf.joinRuntimeFiltersMaxBuildRows(conf)
           )
         return streamedPlan.executeColumnar().mapPartitionsInternal { iter =>
           // The broadcast value stays referenced by this closure for the task's lifetime, which keeps
@@ -217,7 +218,12 @@ case class VectorBroadcastHashJoinExec(
       case _ =>
     }
     val relation = buildPlan.executeBroadcast[Any]()
-    attachRuntimeFilters(BuildTable.sharedFromRelation(relation.value.asInstanceOf[AnyRef], spec))
+    if (
+      VectorRuntimeFilters.sparkBuildRows(buildPlan).forall(
+        _ <= io.vecruntime.spark.VectorConf.joinRuntimeFiltersMaxBuildRows(conf)
+      )
+    )
+      attachRuntimeFilters(BuildTable.sharedFromRelation(relation.value.asInstanceOf[AnyRef], spec))
     streamedPlan.executeColumnar().mapPartitionsInternal { iter =>
       // A null-aware anti join whose build side held a null key keeps nothing: `x NOT IN (..., NULL)`
       // is never true. Spark marks that relation with a singleton that has no rows to read.

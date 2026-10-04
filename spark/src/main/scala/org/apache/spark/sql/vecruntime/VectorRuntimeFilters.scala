@@ -90,10 +90,18 @@ object VectorRuntimeFilters {
    * The same from our columnar broadcast, read straight off its batches: one pass that evaluates the build
    * keys and keeps, per key, its distinct values up to `inMax` and its range. The driver does not build the
    * join's hash table for this (the executors build their own), which cost a short query with several
-   * broadcast joins about 0.4 s at 1 TB (q61).
+   * broadcast joins about 0.4 s at 1 TB (q61). A build side of more than `maxBuildRows` rows gets no filter:
+   * reading it still deserializes the whole broadcast on the driver (0.1-0.25 s on short TPC-DS queries for
+   * item's 300k rows), and so wide a key domain rarely rules out a row group.
    */
-  def attach(join: VectorBroadcastHashJoinExec, relation: VectorBroadcastBatches, spec: JoinSpec, inMax: Int): Unit = {
-    if (!eligible(join) || relation.numRows == 0) return
+  def attach(
+      join: VectorBroadcastHashJoinExec,
+      relation: VectorBroadcastBatches,
+      spec: JoinSpec,
+      inMax: Int,
+      maxBuildRows: Int
+  ): Unit = {
+    if (!eligible(join) || relation.numRows == 0 || relation.numRows > maxBuildRows) return
     val targets = join.streamedKeys.zipWithIndex.flatMap {
       case (a: Attribute, k) if supported(a.dataType) && k < spec.buildKeys.length =>
         scanFor(join.streamedPlan, a).collect { case (scan, col) if scan.isDataColumn(col.name) => (k, scan, col) }
@@ -150,6 +158,20 @@ object VectorRuntimeFilters {
           Some(sources.And(sources.GreaterThanOrEqual(name, lit(lo)), sources.LessThanOrEqual(name, lit(hi))))
         case _ => None
       }
+  }
+
+  /**
+   * The rows of Spark's own broadcast under `plan` (its exchange's `numOutputRows`, set once the broadcast is
+   * built on the driver), or None when there is no such exchange to read.
+   */
+  def sparkBuildRows(plan: SparkPlan): Option[Long] = plan match {
+    case s: org.apache.spark.sql.execution.adaptive.BroadcastQueryStageExec => sparkBuildRows(s.plan)
+    case r: org.apache.spark.sql.execution.exchange.ReusedExchangeExec => sparkBuildRows(r.child)
+    case b: org.apache.spark.sql.execution.exchange.BroadcastExchangeExec =>
+      b.metrics.get("numOutputRows").map(_.value)
+    // A row/columnar transition (or another pass-through) over the exchange.
+    case p if p.children.size == 1 => sparkBuildRows(p.children.head)
+    case _ => None
   }
 
   /** The filter of key column `k` over its `groups` keys, or None when it would keep everything. */
