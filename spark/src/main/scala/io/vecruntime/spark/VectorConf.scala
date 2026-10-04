@@ -113,6 +113,8 @@ object VectorConf {
 
   /** #611: late materialization in the native scan. */
   val ScanNativeParquetLateMaterialization = "spark.vecruntime.scan.nativeParquet.lateMaterialization"
+  val ScanNativeParquetLateMaterializationMinBytes =
+    "spark.vecruntime.scan.nativeParquet.lateMaterialization.minScanBytes"
 
   /** Mixed chains (#280): Comet's native operators above ours through the sink leaf. Off until #281 decides an allowlist. */
   val CometMixedEnabled = "spark.vecruntime.comet.mixed.enabled"
@@ -455,6 +457,17 @@ object VectorConf {
    */
   def scanNativeParquetLateMaterialization(conf: SQLConf): Boolean =
     bool(conf, ScanNativeParquetLateMaterialization, default = false)
+
+  /**
+   * #611: the smallest scan (bytes on storage) a decode filter is handed to. A dimension-sized scan saves
+   * nothing worth the change of output (a selection instead of compacted rows); at 1 TB the decode filters
+   * on q24's store and item scans cost the query 7-13% downstream.
+   */
+  def scanNativeParquetLateMaterializationMinBytes(conf: SQLConf): Long =
+    scala.util.Try(conf.getConfString(ScanNativeParquetLateMaterializationMinBytes, (1L << 30).toString).trim.toLong)
+      .toOption
+      .filter(_ >= 0)
+      .getOrElse(1L << 30)
 
   private def intIn(conf: SQLConf, key: String, default: Int, max: Int): Int =
     scala.util.Try(conf.getConfString(key, default.toString).trim.toInt).toOption.map(n =>
