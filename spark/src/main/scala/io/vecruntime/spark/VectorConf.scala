@@ -453,7 +453,9 @@ object VectorConf {
    * #611: a filter directly over the native Parquet scan hands it its condition; the scan decodes the
    * condition's columns first and the others only at the surviving rows (a run of dropped rows is skipped in
    * the page streams, a batch with no survivor is skipped whole), emitting the batch with its selection.
-   * Off until measured.
+   * Off by default: it saves decode CPU, not I/O, and on TPC-DS at 1 TB it is even overall with q24b 10% slower.
+   * Worth turning on for very selective filters over large tables, wide string columns behind a selective
+   * filter, or data clustered on the filtered column (see docs/configuration.md).
    */
   def scanNativeParquetLateMaterialization(conf: SQLConf): Boolean =
     bool(conf, ScanNativeParquetLateMaterialization, default = false)
