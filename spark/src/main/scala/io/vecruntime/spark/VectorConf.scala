@@ -251,10 +251,11 @@ object VectorConf {
   /**
    * #603: a hash join emits a build-side string column with at most this many distinct values as ids over
    * the distinct values (a dictionary vector) rather than the bytes, so an aggregate grouping on it maps the
-   * values once per batch instead of the rows, and the shuffle writer stages ids. 0 (the default) keeps bytes.
+   * values once per batch instead of the rows, and the shuffle writer stages ids. Default 4096, the owner's
+   * call on the 1 TB A/B (fourteen join queries -2.7%, q99 -9%; q18 +5%, q43 +4%); 0 keeps bytes.
    * Needs `deferredBuild`.
    */
-  def joinBuildDictionaryMax(conf: SQLConf): Int = intIn(conf, JoinBuildDictionaryMax, default = 0, max = 1 << 16)
+  def joinBuildDictionaryMax(conf: SQLConf): Int = intIn(conf, JoinBuildDictionaryMax, default = 4096, max = 1 << 16)
 
   /**
    * #610: a broadcast hash join (inner, or left semi with the build on the right) hands the native Parquet
