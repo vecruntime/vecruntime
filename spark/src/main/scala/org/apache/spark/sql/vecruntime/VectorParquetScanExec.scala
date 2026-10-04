@@ -563,9 +563,11 @@ private[vecruntime] final class VectorParquetPartitionReader(
             owned(partitionSchema.length + c) = v
             columns(c) = v
           } else {
-            // At the survivors only when they are few: a dense or scattered selection is many short runs, and a
-            // run costs a call into the decoder; then the whole batch is decoded and the selection carried.
-            val sparse = count <= n * VectorParquetPartitionReader.LateMaxFraction
+            // At the survivors only when they are few and the column is a string: a dense or scattered selection
+            // is many short runs, and a run costs a call into the decoder; a fixed-width column is unpacked a
+            // whole batch at once for less than that walk. Otherwise the batch is decoded whole and the
+            // selection carried.
+            val sparse = count <= n * VectorParquetPartitionReader.LateMaxFraction && r.decodesSelectedFaster()
             val fv = if (count == n || !sparse) r.readBatch(n) else r.readBatchSelected(n, selection)
             dataVectors(c) = fv
             columns(c) = r.wrap(fv)
