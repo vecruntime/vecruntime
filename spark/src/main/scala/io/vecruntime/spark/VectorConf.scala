@@ -86,6 +86,7 @@ object VectorConf {
   /** #610: broadcast build keys as runtime filters on the native scan. */
   val JoinRuntimeFilters = "spark.vecruntime.join.runtimeFilters"
   val JoinRuntimeFiltersInMax = "spark.vecruntime.join.runtimeFilters.inMax"
+  val JoinRuntimeFiltersMaxBuildRows = "spark.vecruntime.join.runtimeFilters.maxBuildRows"
   val JoinBuildPayload = "spark.vecruntime.join.buildPayload"
   val CometRangeShuffleEnabled = "spark.vecruntime.comet.shuffle.range.enabled"
 
@@ -267,6 +268,14 @@ object VectorConf {
    */
   def joinRuntimeFilters(conf: SQLConf): Boolean = bool(conf, JoinRuntimeFilters, default = true)
   def joinRuntimeFiltersInMax(conf: SQLConf): Int = intIn(conf, JoinRuntimeFiltersInMax, default = 1024, max = 1 << 16)
+
+  /**
+   * #610: the largest broadcast build side (rows) a runtime filter is derived from. Reading the key domain
+   * means deserializing the whole broadcast on the driver before the streamed side starts; a large build side
+   * (TPC-DS item, 300k rows at 1 TB) cost a short query 0.1-0.25 s there, and its keys rarely prune anyway.
+   */
+  def joinRuntimeFiltersMaxBuildRows(conf: SQLConf): Int =
+    intIn(conf, JoinRuntimeFiltersMaxBuildRows, default = 65536, max = Int.MaxValue)
 
   /**
    * A broadcast hash join whose build side carries payload columns without a lane (arrays, maps,
