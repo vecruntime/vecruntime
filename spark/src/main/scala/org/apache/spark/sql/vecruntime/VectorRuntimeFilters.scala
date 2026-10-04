@@ -86,6 +86,72 @@ object VectorRuntimeFilters {
     }
   }
 
+  /**
+   * The same from our columnar broadcast, read straight off its batches: one pass that evaluates the build
+   * keys and keeps, per key, its distinct values up to `inMax` and its range. The driver does not build the
+   * join's hash table for this (the executors build their own), which cost a short query with several
+   * broadcast joins about 0.4 s at 1 TB (q61).
+   */
+  def attach(join: VectorBroadcastHashJoinExec, relation: VectorBroadcastBatches, spec: JoinSpec, inMax: Int): Unit = {
+    if (!eligible(join) || relation.numRows == 0) return
+    val targets = join.streamedKeys.zipWithIndex.flatMap {
+      case (a: Attribute, k) if supported(a.dataType) && k < spec.buildKeys.length =>
+        scanFor(join.streamedPlan, a).collect { case (scan, col) if scan.isDataColumn(col.name) => (k, scan, col) }
+      case _ => None
+    }
+    if (targets.isEmpty) return
+    val domains = targets.map { case (_, _, col) => new KeyDomain(col.dataType, inMax) }
+    val it = relation.batches()
+    while (it.hasNext) {
+      val batch = it.next()
+      if (batch.numRows() > 0) EvalContexts.withBatch(batch) { ctx =>
+        var t = 0
+        while (t < targets.length) {
+          domains(t).add(spec.buildKeys(targets(t)._1).eval(ctx), ctx.numRows, ctx.selection)
+          t += 1
+        }
+      }
+    }
+    targets.zip(domains).foreach { case ((_, scan, col), d) => d.filter(col.name).foreach(scan.addRuntimeFilter) }
+  }
+
+  /** A key's distinct values (until there are more than `inMax`) and its range, accumulated batch by batch. */
+  private[vecruntime] final class KeyDomain(dt: DataType, inMax: Int) {
+    private val values = new java.util.HashSet[Any]()
+    private var overflow = false
+    private var lo = Long.MaxValue
+    private var hi = Long.MinValue
+
+    def add(v: io.vecruntime.kernels.VectorBuffers, n: Int, selection: java.lang.foreign.MemorySegment): Unit = {
+      var i = 0
+      while (i < n) {
+        if ((selection == null || io.vecruntime.kernels.Bitmap.isSet(selection, i)) && !v.isNull(i)) dt match {
+          case IntegerType | LongType =>
+            val x = if (dt == IntegerType) v.getInt(i).toLong else v.getLong(i)
+            if (x < lo) lo = x
+            if (x > hi) hi = x
+            if (!overflow) { values.add(if (dt == IntegerType) x.toInt else x); overflow = values.size() > inMax }
+          case _ =>
+            if (!overflow) {
+              values.add(v.getString(i))
+              overflow = values.size() > inMax
+            } else return // a string key past inMax has no filter; nothing more to learn
+        }
+        i += 1
+      }
+    }
+
+    def filter(name: String): Option[sources.Filter] =
+      if (values.isEmpty) Some(sources.In(name, Array.empty[Any])) // no key can match
+      else if (!overflow) Some(sources.In(name, values.toArray))
+      else dt match {
+        case IntegerType | LongType =>
+          def lit(x: Long): Any = if (dt == IntegerType) x.toInt else x
+          Some(sources.And(sources.GreaterThanOrEqual(name, lit(lo)), sources.LessThanOrEqual(name, lit(hi))))
+        case _ => None
+      }
+  }
+
   /** The filter of key column `k` over its `groups` keys, or None when it would keep everything. */
   private[vecruntime] def filterOf(
       name: String,

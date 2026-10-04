@@ -198,7 +198,13 @@ case class VectorBroadcastHashJoinExec(
       case VectorBroadcastExchangeExec(e) =>
         val batches = e.executeVectorBroadcast()
         val nullAware = isNullAwareAntiJoin
-        attachRuntimeFilters(BuildTable.sharedFromBroadcast(batches.value, spec))
+        if (runtimeFiltersOn && VectorRuntimeFilters.eligible(this))
+          VectorRuntimeFilters.attach(
+            this,
+            batches.value,
+            spec,
+            io.vecruntime.spark.VectorConf.joinRuntimeFiltersInMax(conf)
+          )
         return streamedPlan.executeColumnar().mapPartitionsInternal { iter =>
           // The broadcast value stays referenced by this closure for the task's lifetime, which keeps
           // the shared table (keyed on it) alive; see BuildTable.sharedFromBroadcast.
@@ -231,8 +237,9 @@ case class VectorBroadcastHashJoinExec(
 
   /**
    * #610: hands the native scans the streamed keys reach the build side's key domain, on the driver and
-   * before the streamed side is executed (which is when a scan reads its filters). The table is the shared
-   * one tasks probe, so a task in the driver's JVM (local mode) does not build it again.
+   * before the streamed side is executed (which is when a scan reads its filters). Spark's own broadcast
+   * relation is read through the shared table tasks probe; our columnar broadcast is read off its batches
+   * ([[VectorRuntimeFilters.attach]]), so the driver builds no table for it.
    */
   private def attachRuntimeFilters(build: => BuildTable): Unit =
     if (runtimeFiltersOn && VectorRuntimeFilters.eligible(this))
