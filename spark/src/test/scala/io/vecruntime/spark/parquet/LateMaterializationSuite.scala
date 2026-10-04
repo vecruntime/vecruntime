@@ -32,6 +32,7 @@ class LateMaterializationSuite extends VectorQuerySuite {
   override protected def extraSparkConf: Map[String, String] =
     super.extraSparkConf ++ Map(
       VectorConf.ScanNativeParquet -> "true",
+      VectorConf.ScanNativeParquetLateMaterializationMinBytes -> "0",
       "parquet.block.size" -> (64 * 1024).toString,
       "parquet.page.size" -> (2 * 1024).toString,
       "spark.sql.parquet.columnarReaderBatchSize" -> "1000"
@@ -123,5 +124,13 @@ class LateMaterializationSuite extends VectorQuerySuite {
     }
     val off = checkVectorized("SELECT k, splain FROM lm_t WHERE small = 1", Nil)
     assert(scanOf(off).forall(_.decodeFilter.isEmpty))
+    // A scan smaller than minScanBytes gets no decode filter.
+    withConf(
+      VectorConf.ScanNativeParquetLateMaterialization -> "true",
+      VectorConf.ScanNativeParquetLateMaterializationMinBytes -> (1L << 40).toString
+    ) {
+      val small = checkVectorized("SELECT k, splain FROM lm_t WHERE small = 1", Nil)
+      assert(scanOf(small).forall(_.decodeFilter.isEmpty))
+    }
   }
 }

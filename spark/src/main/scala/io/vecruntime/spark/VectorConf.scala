@@ -113,6 +113,8 @@ object VectorConf {
 
   /** #611: late materialization in the native scan. */
   val ScanNativeParquetLateMaterialization = "spark.vecruntime.scan.nativeParquet.lateMaterialization"
+  val ScanNativeParquetLateMaterializationMinBytes =
+    "spark.vecruntime.scan.nativeParquet.lateMaterialization.minScanBytes"
 
   /** Mixed chains (#280): Comet's native operators above ours through the sink leaf. Off until #281 decides an allowlist. */
   val CometMixedEnabled = "spark.vecruntime.comet.mixed.enabled"
@@ -451,10 +453,23 @@ object VectorConf {
    * #611: a filter directly over the native Parquet scan hands it its condition; the scan decodes the
    * condition's columns first and the others only at the surviving rows (a run of dropped rows is skipped in
    * the page streams, a batch with no survivor is skipped whole), emitting the batch with its selection.
-   * Off until measured.
+   * Off by default: it saves decode CPU, not I/O, and on TPC-DS at 1 TB it is even overall with q24b 10% slower.
+   * Worth turning on for very selective filters over large tables, wide string columns behind a selective
+   * filter, or data clustered on the filtered column (see docs/configuration.md).
    */
   def scanNativeParquetLateMaterialization(conf: SQLConf): Boolean =
     bool(conf, ScanNativeParquetLateMaterialization, default = false)
+
+  /**
+   * #611: the smallest scan (bytes on storage) a decode filter is handed to. A dimension-sized scan saves
+   * nothing worth the change of output (a selection instead of compacted rows); at 1 TB the decode filters
+   * on q24's store and item scans cost the query 7-13% downstream.
+   */
+  def scanNativeParquetLateMaterializationMinBytes(conf: SQLConf): Long =
+    scala.util.Try(conf.getConfString(ScanNativeParquetLateMaterializationMinBytes, (1L << 30).toString).trim.toLong)
+      .toOption
+      .filter(_ >= 0)
+      .getOrElse(1L << 30)
 
   private def intIn(conf: SQLConf, key: String, default: Int, max: Int): Int =
     scala.util.Try(conf.getConfString(key, default.toString).trim.toInt).toOption.map(n =>

@@ -690,7 +690,8 @@ case class VectorExecRule(session: SparkSession) extends Rule[SparkPlan] with Lo
       val onlyNullChecks = conjuncts(cond).forall(_.isInstanceOf[org.apache.spark.sql.catalyst.expressions.IsNotNull])
       if (
         compiles && !onlyNullChecks && refs.subsetOf(s.output.map(_.name).toSet) && dataRefs.nonEmpty &&
-        dataRefs.size < data.size
+        dataRefs.size < data.size &&
+        s.scan.relation.location.sizeInBytes >= VectorConf.scanNativeParquetLateMaterializationMinBytes(conf)
       )
         f.copy(child = s.copy(decodeFilter = Some(cond)))
       else f
