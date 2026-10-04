@@ -11,7 +11,7 @@
   <parent>
     <groupId>io.github.vecruntime</groupId>
     <artifactId>vecruntime-parent</artifactId>
-    <version>0.0.6-SNAPSHOT</version>
+    <version>0.0.6</version>
   </parent>
 
   <artifactId>vecruntime-spark-sql-tests_${scala.binary.version}</artifactId>
