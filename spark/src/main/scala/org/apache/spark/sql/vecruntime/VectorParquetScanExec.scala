@@ -396,6 +396,11 @@ private[vecruntime] final class VectorParquetPartitionReader(
   // Current row group state.
   private var rgRows = 0
   private var rgOffset = 0
+  // #611: the decode filter is dropped for the rest of a row group after LateDenseBatches batches in a row kept
+  // more than LateMaxFraction of their rows: such a batch is decoded whole anyway, and the filter above the
+  // scan evaluates the same predicate again, so filtering in the scan only adds a pass. Reset per row group.
+  private var lateOff = false
+  private var lateDenseRun = 0
   private var emitted: ColumnarBatch = _
   private var emittedVectors: Array[org.apache.arrow.vector.FieldVector] = _ // batch-owned data vectors to release
   private var emittedReaders: Array[NativeParquetColumnReader] =
@@ -425,6 +430,8 @@ private[vecruntime] final class VectorParquetPartitionReader(
           metrics.numRowGroups += 1
           rgRows = rgRowCount
           rgOffset = 0
+          lateOff = false
+          lateDenseRun = 0
           if (rgRows > 0) return true
         } else {
           metrics.scanTime += (System.nanoTime() - t0) / 1000000L
@@ -474,6 +481,7 @@ private[vecruntime] final class VectorParquetPartitionReader(
     val partitionVectors =
       new Array[ColumnVector](partitionSchema.length + (if (decodeFilter == null) 0 else dataColumnCount))
     var selected: SelectedColumnarBatch = null
+    val late = decodeFilter != null && !lateOff
     try {
       var c = 0
       while (c < dataColumnCount) {
@@ -482,7 +490,7 @@ private[vecruntime] final class VectorParquetPartitionReader(
         // batch owns the vector; released to the reader's pool on the next batch / close. Self-contained,
         // so a retained or serialized batch ships only its own rows. With a decode filter (#611) only the
         // filter's columns are decoded here; the rest wait for its selection.
-        if (decodeFilter == null || filterColumns(c)) {
+        if (!late || filterColumns(c)) {
           val fv = columnReaders(c).readBatch(n)
           dataVectors(c) = fv
           columns(c) = columnReaders(c).wrap(fv)
@@ -502,7 +510,7 @@ private[vecruntime] final class VectorParquetPartitionReader(
         partitionVectors(p) = col
         p += 1
       }
-      if (decodeFilter != null) selected = applyDecodeFilter(n, columns, dataVectors, partitionVectors)
+      if (late) selected = applyDecodeFilter(n, columns, dataVectors, partitionVectors)
     } catch {
       case t: Throwable =>
         var k = 0
@@ -540,6 +548,10 @@ private[vecruntime] final class VectorParquetPartitionReader(
   ): SelectedColumnarBatch =
     EvalContexts.withBatch(new ColumnarBatch(columns, n)) { ctx =>
       val (selection, count) = io.vecruntime.spark.expr.VectorExpr.selection(decodeFilter.eval(ctx), ctx)
+      if (count > n * VectorParquetPartitionReader.LateMaxFraction) {
+        lateDenseRun += 1
+        if (lateDenseRun >= VectorParquetPartitionReader.LateDenseBatches) lateOff = true
+      } else lateDenseRun = 0
       var c = 0
       while (c < dataColumnCount) {
         if (!filterColumns(c)) {
@@ -1033,6 +1045,9 @@ private[vecruntime] object VectorParquetPartitionReader {
   /** #611: the largest surviving fraction a batch is decoded at its survivors for; `vecruntime.lateMaterialization.maxFraction`. */
   val LateMaxFraction: Double =
     java.lang.Double.parseDouble(System.getProperty("vecruntime.lateMaterialization.maxFraction", "0.05"))
+
+  /** #611: dense batches in a row that turn the decode filter off for the rest of the row group; `vecruntime.lateMaterialization.denseBatches`. */
+  val LateDenseBatches: Int = Integer.getInteger("vecruntime.lateMaterialization.denseBatches", 2)
 
   /**
    * A decoded batch with what it owns (#606): its data vectors (each returned to `readers(c)`'s pool) and
