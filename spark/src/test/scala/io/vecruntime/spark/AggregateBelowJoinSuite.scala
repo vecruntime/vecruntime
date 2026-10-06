@@ -73,7 +73,7 @@ class AggregateBelowJoinSuite extends VectorQuerySuite {
     assert(preAggregated(df.queryExecution.optimizedPlan), df.queryExecution.optimizedPlan.treeString)
   }
 
-  test("declined: grouped by a fact column, a distinct or avg aggregate, or no join") {
+  test("declined: grouped by a fact column, a distinct or avg aggregate, a non-equi join column, inputs on two sides") {
     val byFact = run(
       "SELECT s_qty, c_first, sum(s_amount) FROM abj_sales JOIN abj_customer ON s_cust = c_sk GROUP BY s_qty, c_first"
     )
@@ -84,6 +84,11 @@ class AggregateBelowJoinSuite extends VectorQuerySuite {
     assert(!preAggregated(distinct.queryExecution.optimizedPlan), distinct.queryExecution.optimizedPlan.treeString)
     val avg = run("SELECT c_first, avg(s_qty) FROM abj_sales JOIN abj_customer ON s_cust = c_sk GROUP BY c_first")
     assert(!preAggregated(avg.queryExecution.optimizedPlan), avg.queryExecution.optimizedPlan.treeString)
+    // A fact column in a non-equality join condition (q72's `inv_quantity_on_hand < cs_quantity`).
+    val nonEqui = run(
+      "SELECT c_first, sum(s_qty) FROM abj_sales JOIN abj_customer ON s_cust = c_sk AND s_qty < c_sk GROUP BY c_first"
+    )
+    assert(!preAggregated(nonEqui.queryExecution.optimizedPlan), nonEqui.queryExecution.optimizedPlan.treeString)
     // An aggregate input from the dimension side as well: no single side to aggregate.
     val both = run(
       "SELECT d_year, sum(s_qty + c_sk) FROM abj_sales JOIN abj_customer ON s_cust = c_sk JOIN abj_date ON s_date = d_sk GROUP BY d_year"

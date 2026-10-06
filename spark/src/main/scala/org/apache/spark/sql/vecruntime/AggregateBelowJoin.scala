@@ -23,9 +23,12 @@ import org.apache.spark.sql.catalyst.expressions.{
   AttributeSet,
   Cast,
   Coalesce,
+  EqualNullSafe,
+  EqualTo,
   Expression,
   Literal,
-  NamedExpression
+  NamedExpression,
+  PredicateHelper
 }
 import org.apache.spark.sql.catalyst.expressions.aggregate.{AggregateExpression, Complete, Count, Max, Min, Sum}
 import org.apache.spark.sql.catalyst.plans.{Inner, LeftSemi}
@@ -58,7 +61,7 @@ import org.apache.spark.sql.catalyst.rules.Rule
  * pre-aggregated again (its subtree is an `Aggregate`). Off with
  * `spark.vecruntime.optimizer.aggregateBelowJoin.enabled=false` and with the plugin.
  */
-case class AggregateBelowJoin(session: SparkSession) extends Rule[LogicalPlan] {
+case class AggregateBelowJoin(session: SparkSession) extends Rule[LogicalPlan] with PredicateHelper {
 
   override def apply(plan: LogicalPlan): LogicalPlan = {
     if (!VectorConf.aggregateBelowJoinEnabled(session.sessionState.conf)) return plan
@@ -121,13 +124,20 @@ case class AggregateBelowJoin(session: SparkSession) extends Rule[LogicalPlan] {
         (Filter(cond, c), m, parts)
       }
     case j @ Join(l, r, jt, Some(cond), _) if jt == Inner || jt == LeftSemi =>
-      val keys = cond.references
+      // Only columns compared for equality are join keys; a column in any other conjunct (q72's
+      // `inv_quantity_on_hand < cs_quantity`) is needed above but is not one, so the fact is not pre-aggregated.
+      val keys = AttributeSet(splitConjunctivePredicates(cond).flatMap {
+        case EqualTo(a: Attribute, b: Attribute) => Seq(a, b)
+        case EqualNullSafe(a: Attribute, b: Attribute) => Seq(a, b)
+        case _ => Nil
+      })
+      val refs = cond.references
       if (inputs.subsetOf(l.outputSet))
-        descend(l, aggExprs, inputs, needed ++ keys, joinKeys ++ keys, joins + 1).map { case (c, m, parts) =>
+        descend(l, aggExprs, inputs, needed ++ refs, joinKeys ++ keys, joins + 1).map { case (c, m, parts) =>
           (j.copy(left = c), m, parts)
         }
       else if (jt == Inner && inputs.subsetOf(r.outputSet))
-        descend(r, aggExprs, inputs, needed ++ keys, joinKeys ++ keys, joins + 1).map { case (c, m, parts) =>
+        descend(r, aggExprs, inputs, needed ++ refs, joinKeys ++ keys, joins + 1).map { case (c, m, parts) =>
           (j.copy(right = c), m, parts)
         }
       else None
