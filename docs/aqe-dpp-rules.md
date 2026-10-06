@@ -318,6 +318,26 @@ join key gets one filter per key. The filter's expected items come from the crea
 its bytes over its row width when the row count is unknown (as at 1 TB); the bit size is capped by
 `spark.sql.optimizer.runtime.bloomFilter.maxNumItems` and `maxNumBits`.
 
+**Evidence of selectivity (#650).** Size alone says nothing about pruning: at 1 TB the rule also built filters
+from whole dimension tables (`customer`, `customer_address`, `item`), whose keys every fact row matches, and each
+such filter only delayed its scan (q19 2.2 -> 4.8 s, q45 2.8 -> 5.7, q64 23.8 -> 71.9). The rule now needs evidence:
+- **Distinct counts, when they exist** -- `CatalogTable.stats.colStats` from `ANALYZE TABLE ... COMPUTE STATISTICS
+  FOR COLUMNS` (read directly, so `spark.sql.cbo.enabled` is not needed), or `attributeStats` of a DSv2 relation
+  that reports column statistics (Iceberg, from Puffin theta sketches). Each key is traced through projections,
+  filters and joins to its base relation (`KeyStats`). At most `ndv(creation) / ndv(application)` of the
+  application rows can match; the filter is added when that is at most `maxSelectivity` (0.5), sized by the
+  creation key's distinct count (capped by the creation side's row estimate).
+- **Otherwise, a reduced creation side** -- a filter on it other than the `IS NOT NULL` of a column the optimizer
+  infers from join keys. A whole, unfiltered table gets no filter.
+
+**Two-level merge (#646).** `bloom_filter_agg` makes one partial filter per creation-side task, each the whole bit
+array (up to `maxNumBits`/8 bytes), and a single Final task would merge all of them: at 1 TB q17's filters merged 595
+and 801 partials in one task each (3.8-6.6 GB read, 44-59 s). The subquery is therefore
+`bloom_filter_merge(bloom_filter_agg(xxhash64(key)) GROUP BY pmod(spark_partition_id(), mergeBuckets))`: each task's
+partial goes to one of `mergeBuckets` (32) groups merged in parallel, and `bloom_filter_merge` ORs the group filters in
+one small task. Both levels use the same bits and hash count, so the OR is the single-level filter bit for bit
+(`FactBloomFilterSuite`); a group with no key gives null and is skipped.
+
 **Why the result is the same.** A bloom filter has no false negatives, and a row whose key the creation side
 does not hold cannot survive the join. False positives only let a non-matching row through to the join, which
 then drops it.
@@ -328,6 +348,8 @@ duplicate a filter they already placed and can see an existing one. At most
 
 **Declined:**
 - two sides of similar size (the ratio test);
+- no evidence of selectivity: distinct counts give a match share above `maxSelectivity`, or, without them, the
+  creation side is a whole, unfiltered table (#650);
 - a broadcastable creation side (a broadcast join needs no extra filter -- this also excludes q75, q78 and
   q80, which regressed when Spark injected one);
 - an application side below the scan-size threshold;

@@ -58,7 +58,16 @@ class FactBloomFilterSuite extends VectorQuerySuite {
       .flatMap(_.condition.collect { case b: BloomFilterMightContain => b })
       .count(_.valueExpression.references.exists(_.name.startsWith("ss_")))
 
+  // The creation side is reduced by a filter (#650): without statistics a whole, unfiltered table gets no filter.
+  // `isnotnull(nullif(..))` drops a third of the returns, and Spark's own runtime filter does not count it as
+  // selective, so only this rule's filters are in the plan.
   private val q93 =
+    """SELECT ss_item_sk, sum(ss_quantity - sr_return_quantity) q, count(*) c, max(ss_pad) p
+      |FROM store_sales JOIN (SELECT * FROM store_returns WHERE isnotnull(nullif(sr_return_quantity, 0))) r
+      |  ON ss_ticket_number = sr_ticket_number AND ss_item_sk = sr_item_sk
+      |GROUP BY ss_item_sk""".stripMargin
+
+  private val q93Unfiltered =
     """SELECT ss_item_sk, sum(ss_quantity - sr_return_quantity) q, count(*) c, max(ss_pad) p
       |FROM store_sales JOIN store_returns ON ss_ticket_number = sr_ticket_number AND ss_item_sk = sr_item_sk
       |GROUP BY ss_item_sk""".stripMargin
@@ -117,5 +126,90 @@ class FactBloomFilterSuite extends VectorQuerySuite {
 
   test("the switch turns the rewrite off") {
     withConf(VectorConf.FactBloomFilterEnabled -> "false")(assert(salesBlooms(run(q93)) === 0))
+  }
+
+  /** The filters' subquery plans in the optimized plan. */
+  private def filterSubqueries(df: DataFrame): Seq[org.apache.spark.sql.catalyst.plans.logical.LogicalPlan] =
+    df.queryExecution.optimizedPlan.collect { case f: org.apache.spark.sql.catalyst.plans.logical.Filter => f }
+      .flatMap(_.condition.collect { case b: BloomFilterMightContain => b.bloomFilterExpression })
+      .flatMap(_.collect { case s: org.apache.spark.sql.catalyst.expressions.ScalarSubquery => s.plan })
+
+  private def mergesInTwoLevels(p: org.apache.spark.sql.catalyst.plans.logical.LogicalPlan): Boolean =
+    p.exists {
+      case a: org.apache.spark.sql.catalyst.plans.logical.Aggregate =>
+        a.aggregateExpressions.exists(_.exists(_.isInstanceOf[org.apache.spark.sql.vecruntime.BloomFilterMerge]))
+      case _ => false
+    }
+
+  test("the filter is merged in two levels, a bucket of the partition id first (#646)") {
+    // Many small files: many creation-side tasks, so the per-task partials go through the buckets.
+    val df = withConf("spark.sql.files.maxPartitionBytes" -> "4096", "spark.sql.files.openCostInBytes" -> "0")(run(q93))
+    val subs = filterSubqueries(df)
+    assert(subs.nonEmpty && subs.forall(mergesInTwoLevels), subs.map(_.treeString).mkString("\n"))
+    // mergeBuckets = 1 is the single-level filter, with the same results.
+    val one = withConf(VectorConf.FactBloomFilterMergeBuckets -> "1")(run(q93))
+    val subs1 = filterSubqueries(one)
+    assert(subs1.nonEmpty && !subs1.exists(mergesInTwoLevels), subs1.map(_.treeString).mkString("\n"))
+  }
+
+  test("bloom_filter_merge of bucket filters is the single-level filter, bit for bit; nulls are skipped") {
+    import org.apache.spark.sql.catalyst.InternalRow
+    import org.apache.spark.sql.catalyst.expressions.BoundReference
+    import org.apache.spark.sql.catalyst.expressions.aggregate.BloomFilterAggregate
+    import org.apache.spark.sql.types.BinaryType
+    import org.apache.spark.util.sketch.BloomFilter
+    val (items, bits) = (5000L, 1L << 16)
+    def filterOf(keys: Seq[Long]): BloomFilter = { val f = BloomFilter.create(items, bits); keys.foreach(f.putLong); f }
+    val all = (0L until 5000L).map(_ * 7919L)
+    val single = BloomFilterAggregate.serialize(filterOf(all))
+    val merge = org.apache.spark.sql.vecruntime.BloomFilterMerge(BoundReference(0, BinaryType, nullable = true))
+    // Three buckets plus a null (a bucket with no key), split across two partial buffers merged together.
+    val parts = all.grouped(1700).map(ks => BloomFilterAggregate.serialize(filterOf(ks))).toSeq
+    val b1 = merge.createAggregationBuffer()
+    merge.update(b1, InternalRow(parts.head))
+    merge.update(b1, InternalRow(null))
+    val b2 = merge.createAggregationBuffer()
+    parts.tail.foreach(p => merge.update(b2, InternalRow(p)))
+    val roundTrip = merge.deserialize(merge.serialize(b2))
+    val out = merge.eval(merge.merge(b1, roundTrip)).asInstanceOf[Array[Byte]]
+    assert(java.util.Arrays.equals(out, single))
+    // Only nulls (or nothing): null, as bloom_filter_agg is with no key.
+    val empty = merge.createAggregationBuffer()
+    merge.update(empty, InternalRow(null))
+    assert(merge.eval(merge.merge(empty, merge.deserialize(merge.serialize(merge.createAggregationBuffer())))) == null)
+  }
+
+  /** Bloom filters on the sales side, by the sales key they probe. */
+  private def salesBloomKeys(df: DataFrame): Set[String] =
+    df.queryExecution.optimizedPlan.collect { case f: org.apache.spark.sql.catalyst.plans.logical.Filter => f }
+      .flatMap(_.condition.collect { case b: BloomFilterMightContain => b })
+      .flatMap(_.valueExpression.references.map(_.name)).filter(_.startsWith("ss_")).toSet
+
+  test("without statistics, a whole unfiltered creation side gets no filter: it would prune nothing (#650)") {
+    assert(salesBlooms(run(q93Unfiltered)) === 0)
+  }
+
+  test("with ANALYZE column statistics, the filter follows the keys' distinct counts, not filters (#650)") {
+    // Catalog copies with ANALYZE ... FOR ALL COLUMNS; spark.sql.cbo.enabled stays off.
+    try {
+      spark.table("store_sales").write.saveAsTable("fb_sales")
+      spark.table("store_returns").write.saveAsTable("fb_returns")
+      spark.sql("ANALYZE TABLE fb_sales COMPUTE STATISTICS FOR ALL COLUMNS")
+      spark.sql("ANALYZE TABLE fb_returns COMPUTE STATISTICS FOR ALL COLUMNS")
+      val sql = q93Unfiltered.replace("store_sales", "fb_sales").replace("store_returns", "fb_returns")
+      // ticket numbers: 2000 of 10000 sales tickets have a return (0.2 <= 0.5) -> a filter, though unfiltered;
+      // item keys: all 97 items on both sides (1.0) -> none, as for a whole dimension.
+      assert(salesBloomKeys(run(sql)) === Set("ss_ticket_number"))
+      // A stricter maxSelectivity than the ticket key's 0.2 declines it too.
+      withConf(VectorConf.FactBloomFilterMaxSelectivity -> "0.1")(assert(salesBlooms(run(sql)) === 0))
+    } finally {
+      Seq("fb_sales", "fb_returns").foreach { t =>
+        spark.sessionState.catalog.dropTable(
+          org.apache.spark.sql.catalyst.TableIdentifier(t),
+          ignoreIfNotExists = true,
+          purge = false
+        )
+      }
+    }
   }
 }

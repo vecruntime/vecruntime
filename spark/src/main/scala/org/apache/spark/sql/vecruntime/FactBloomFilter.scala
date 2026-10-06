@@ -23,8 +23,10 @@ import org.apache.spark.sql.catalyst.expressions.{
   DynamicPruningSubquery,
   Expression,
   Literal,
+  Pmod,
   PredicateHelper,
   ScalarSubquery,
+  SparkPartitionID,
   XxHash64
 }
 import org.apache.spark.sql.catalyst.expressions.aggregate.BloomFilterAggregate
@@ -104,20 +106,64 @@ case class FactBloomFilter(session: SparkSession) extends Rule[LogicalPlan] with
     val ratio = VectorConf.factBloomFilterSizeRatio(conf)
     if (!appKey.deterministic || !creationKey.deterministic || creationKey.references.isEmpty) return None
     if (app.stats.sizeInBytes < creation.stats.sizeInBytes * BigInt(ratio)) return None
+    val items = expectedItems(app, appKey, creation, creationKey, VectorConf.factBloomFilterMaxSelectivity(conf))
+    if (items.isEmpty) return None
     val threshold = conf.getConf(SQLConf.RUNTIME_BLOOM_FILTER_APPLICATION_SIDE_SCAN_SIZE_THRESHOLD)
-    onScan(app, appKey, threshold, filterFor(creation, creationKey))
+    onScan(app, appKey, threshold, filterFor(creation, creationKey, items.get))
   }
 
-  private def filterFor(creation: LogicalPlan, key: Expression): Expression => Expression = { appExpr =>
-    val rows = creation.stats.rowCount.getOrElse {
-      val width = math.max(8L, creation.output.map(_.dataType.defaultSize.toLong).sum + 8L)
-      creation.stats.sizeInBytes / width
+  /**
+   * Evidence that the filter is selective (#650), and the filter's expected item count; None declines.
+   *
+   * With both keys' distinct counts known (Spark `ANALYZE ... FOR COLUMNS` in the catalog, or a DSv2 source
+   * that reports them -- Iceberg from Puffin theta sketches), at most `ndv(creation) / ndv(application)` of
+   * the application rows can find a match (containment): fire when that is at most `maxSelectivity`, sized by
+   * the creation key's distinct count, capped by the creation side's row estimate when it has one.
+   *
+   * Without distinct counts, fire only when the creation side is reduced below its base tables: a filter
+   * other than `IS NOT NULL` somewhere under it. A whole, unfiltered table -- an entire dimension, whose keys
+   * every fact row matches -- would cost the filter's build and prune nothing. Sized by the row estimate.
+   */
+  private def expectedItems(
+      app: LogicalPlan,
+      appKey: Expression,
+      creation: LogicalPlan,
+      creationKey: Expression,
+      maxSelectivity: Double
+  ): Option[Long] = {
+    def clamp(n: BigInt): Long = n.max(1).min(BigInt(Long.MaxValue)).toLong
+    val rowsEstimate = creation.stats.rowCount
+    (KeyStats.distinctCount(creation, creationKey), KeyStats.distinctCount(app, appKey)) match {
+      case (Some(cNdv), Some(aNdv)) if aNdv > 0 =>
+        val effective = rowsEstimate.fold(cNdv)(_.min(cNdv))
+        if (BigDecimal(effective) / BigDecimal(aNdv) <= BigDecimal(maxSelectivity)) Some(clamp(effective)) else None
+      case _ =>
+        if (!KeyStats.reduced(creation)) None
+        else Some(clamp(rowsEstimate.getOrElse {
+          val width = math.max(8L, creation.output.map(_.dataType.defaultSize.toLong).sum + 8L)
+          creation.stats.sizeInBytes / width
+        }))
     }
-    val items = rows.max(1).min(BigInt(Long.MaxValue)).toLong
+  }
+
+  private def filterFor(creation: LogicalPlan, key: Expression, items: Long): Expression => Expression = { appExpr =>
     val agg = new BloomFilterAggregate(new XxHash64(Seq(key)), Literal(items))
-    val alias = Alias(agg.toAggregateExpression(), "bloomFilter")()
+    val buckets = VectorConf.factBloomFilterMergeBuckets(session.sessionState.conf)
+    val plan =
+      if (buckets <= 1) Aggregate(Nil, Seq(Alias(agg.toAggregateExpression(), "bloomFilter")()), creation)
+      else {
+        // Two levels (#646): one partial filter per creation-side task would all meet in a single task. Group
+        // them by a bucket of the task's partition id, so `buckets` tasks each merge a share of them, then OR
+        // the bucket filters in one small aggregate. Same bits and hash count at both levels: the same filter.
+        val bucket = Alias(Pmod(SparkPartitionID(), Literal(buckets)), "bloomBucket")()
+        val tagged = Project(creation.output :+ bucket, creation)
+        val partial = Alias(agg.toAggregateExpression(), "bloomPartial")()
+        val byBucket = Aggregate(Seq(bucket.toAttribute), Seq(partial), tagged)
+        val merged = BloomFilterMerge(partial.toAttribute).toAggregateExpression()
+        Aggregate(Nil, Seq(Alias(merged, "bloomFilter")()), byBucket)
+      }
     // Column pruning as Spark's own rule does: the subquery reads only the creation key.
-    val subquery = ScalarSubquery(ColumnPruning(Aggregate(Nil, Seq(alias), creation)), Nil)
+    val subquery = ScalarSubquery(ColumnPruning(plan), Nil)
     BloomFilterMightContain(subquery, new XxHash64(Seq(appExpr)))
   }
 
