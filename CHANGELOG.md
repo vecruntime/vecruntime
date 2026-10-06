@@ -12,6 +12,18 @@ version may change configuration keys or defaults, always noted here.
   default): `t1 JOIN t2 ON t1.k = t2.k AND t1.v <> t2.v`, when it is only read for which keys exist (under `IN` /
   `EXISTS`, or the build side of a semi / anti join), becomes `GROUP BY k HAVING min(v) <> max(v)`. TPC-DS q95's
   `ws_wh` CTE is that join; EMR Serverless rewrites it the same way.
+- A logical rewrite that computes global aggregates over the same data with different filters in one pass
+  (`spark.vecruntime.optimizer.mergeFilteredAggregates.enabled`, on by default): cross-joined single-row
+  aggregates (TPC-DS q28, q88, q90) and uncorrelated scalar subqueries (q9) whose inputs differ only in their
+  `WHERE`s become one aggregate over the union of the filters, each aggregate keeping its own rows through
+  `FILTER (WHERE ...)` (a `DISTINCT` one through `IF(p, x, NULL)`). q88 read `store_sales` eight times; EMR
+  Serverless merges the same way.
+
+### Fixed
+
+- A grouped aggregate with a `FILTER (WHERE ...)` clause failed with `ArrayIndexOutOfBoundsException` when a
+  batch in which no row passed the filter brought new groups (seen as `avg(decimal) FILTER (...)` grouped by
+  a fine key). The filtered function now sees every batch, with the failing rows cleared.
 
 ## 0.0.6 -- 2026-10-04
 

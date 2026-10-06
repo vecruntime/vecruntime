@@ -63,6 +63,10 @@ object VectorConf {
    * (TPC-DS q95's `ws_wh`) becomes `GROUP BY k HAVING min(v) <> max(v)` -- no many-to-many join.
    */
   val SelfJoinToAggregateEnabled = "spark.vecruntime.optimizer.selfJoinToAggregate.enabled"
+   * Logical rewrite: global aggregates over the same input with different filters (TPC-DS q9's
+   * scalar subqueries, q28 / q88 / q90's cross-joined aggregates) are computed in one pass.
+   */
+  val MergeFilteredAggregatesEnabled = "spark.vecruntime.optimizer.mergeFilteredAggregates.enabled"
   val SampleEnabled = "spark.vecruntime.exec.sample.enabled"
   val GenerateEnabled = "spark.vecruntime.exec.generate.enabled"
   val WindowEnabled = "spark.vecruntime.exec.window.enabled"
@@ -215,6 +219,9 @@ object VectorConf {
   /** The existence-only self-join to min/max aggregate rewrite; also off when the plugin is off. */
   def selfJoinToAggregateEnabled(conf: SQLConf): Boolean =
     isEnabled(conf) && bool(conf, SelfJoinToAggregateEnabled, default = true)
+  /** Merging global aggregates that differ only in their filters; also off when the plugin is off. */
+  def mergeFilteredAggregatesEnabled(conf: SQLConf): Boolean =
+    isEnabled(conf) && bool(conf, MergeFilteredAggregatesEnabled, default = true)
 
   /** Convert SampleExec without replacement over a columnar child (Spark's own Bernoulli sequence per partition). */
   def sampleEnabled(conf: SQLConf): Boolean = bool(conf, SampleEnabled, default = true)
