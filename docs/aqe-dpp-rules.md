@@ -128,8 +128,17 @@ The two forms are then finished differently:
   | q90 | 7.5 | 11.3 |
 
 - **q90:** the merge applies and the single `web_sales` scan is identical to each of the two it
-  replaces, but its tasks waited on S3 3-4x longer than in the main leg. That is being rechecked with
-  alternating legs before any conclusion.
+  replaces, but its tasks waited on S3 3-4x longer than in the main leg. That turned out to be S3
+  variance. A recheck alternating the two images (main, rules, main, rules; 3 iterations each)
+  measured, in seconds:
+
+  | Query | `main` round 1 | rules round 1 | `main` round 2 | rules round 2 |
+  |---|---:|---:|---:|---:|
+  | q90 | 8.8 | 5.4 | 9.5 | 5.5 |
+  | q88 | 121.3 | 6.9 | 121.1 | 6.3 |
+
+  Checksums were identical. In both rounds `main`'s q88 had two iterations near 121 s and one near
+  37 s.
 
 **Fix shipped with it.** A grouped aggregate with `FILTER` failed with `ArrayIndexOutOfBoundsException`
 when a batch in which no row passed the filter brought new groups. The filtered function now sees
