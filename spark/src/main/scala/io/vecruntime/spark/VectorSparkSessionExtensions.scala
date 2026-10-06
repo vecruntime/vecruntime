@@ -37,5 +37,11 @@ class VectorSparkSessionExtensions extends (SparkSessionExtensions => Unit) {
     // The columnar v3 deletion-vector writer (#20): a planner strategy over the logical WriteDelta,
     // gated on spark.vecruntime.iceberg.dvWriter.enabled and a v3 target; declines to Spark otherwise.
     extensions.injectPlannerStrategy(session => VectorWriteDeltaStrategy(session))
+    // Last optimizer batch ("User Provided Optimizers"), after Spark's final filter push-down, which
+    // would move its pulled-up predicates back (#632). Extensions cannot inject there; the analyzer
+    // runs before the first optimization, so a post-hoc resolution rule registers it once per session.
+    extensions.injectPostHocResolutionRule(session =>
+      org.apache.spark.sql.vecruntime.RegisterLateOptimizerRules(session)
+    )
   }
 }

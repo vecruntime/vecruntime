@@ -18,6 +18,10 @@ version may change configuration keys or defaults, always noted here.
   `WHERE`s become one aggregate over the union of the filters, each aggregate keeping its own rows through
   `FILTER (WHERE ...)` (a `DISTINCT` one through `IF(p, x, NULL)`). q88 read `store_sales` eight times; EMR
   Serverless merges the same way.
+- A logical rewrite that lets two uses of the same aggregate subquery share their input
+  (`spark.vecruntime.optimizer.sharedAggregateInputs.enabled`, on by default): when the copies differ only by an
+  inferred `IS NOT NULL` on a grouping key, that predicate moves above the aggregate, where it drops only the null
+  group, and the copies plan one scan and one shuffle. TPC-DS q65 and q1 read their fact table once instead of twice.
 
 ### Fixed
 
