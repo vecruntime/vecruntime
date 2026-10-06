@@ -65,6 +65,15 @@ object VectorConf {
    */
   val TransitiveDppEnabled = "spark.vecruntime.optimizer.transitiveDpp.enabled"
 
+  /**
+   * Logical rewrite (#641): a runtime bloom filter on a shuffle join's much larger side, built from the other
+   * side (a fact from a smaller fact), where Spark's own runtime filter needs a selective filtered scan.
+   */
+  val FactBloomFilterEnabled = "spark.vecruntime.optimizer.factBloomFilter.enabled"
+
+  /** How many times larger (estimated bytes) the filtered side must be than the side the filter is built from. */
+  val FactBloomFilterSizeRatio = "spark.vecruntime.optimizer.factBloomFilter.sizeRatio"
+
   /** The grouped aggregate emits its UTF8 keys dictionary-encoded, ids over the group table's own dictionary (#377). */
   val AggDictionaryKeys = "spark.vecruntime.agg.dictionaryKeys"
   val SortEnabled = "spark.vecruntime.exec.sort.enabled"
@@ -539,6 +548,13 @@ object VectorConf {
   /** Transitive DPP through a second join key (#634); also off when the plugin is off. */
   def transitiveDppEnabled(conf: SQLConf): Boolean =
     isEnabled(conf) && bool(conf, TransitiveDppEnabled, default = true)
+
+  /** The fact-to-fact bloom filter (#641); also off when the plugin is off. */
+  def factBloomFilterEnabled(conf: SQLConf): Boolean =
+    isEnabled(conf) && bool(conf, FactBloomFilterEnabled, default = true)
+
+  def factBloomFilterSizeRatio(conf: SQLConf): Int =
+    math.max(2, conf.getConfString(FactBloomFilterSizeRatio, "10").trim.toInt)
 
   private def bool(conf: SQLConf, key: String, default: Boolean): Boolean =
     conf.getConfString(key, default.toString).trim.equalsIgnoreCase("true")

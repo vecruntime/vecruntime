@@ -8,6 +8,11 @@ version may change configuration keys or defaults, always noted here.
 
 ### Added
 
+- A runtime bloom filter from a smaller fact table onto a larger one it joins
+  (`spark.vecruntime.optimizer.factBloomFilter.enabled`, on by default): a shuffle join whose filtered side is at
+  least 10x larger (estimated bytes) than the side the filter is built from gets
+  `might_contain(bloom, xxhash64(key))` on the larger side. TPC-DS q93 filters `store_sales` by `store_returns`;
+  Spark's own runtime filter only builds one from a selectively-filtered scan, and EMR Serverless does this.
 - A logical rewrite for existence-only self-joins (`spark.vecruntime.optimizer.selfJoinToAggregate.enabled`, on by
   default): `t1 JOIN t2 ON t1.k = t2.k AND t1.v <> t2.v`, when it is only read for which keys exist (under `IN` /
   `EXISTS`, or the build side of a semi / anti join), becomes `GROUP BY k HAVING min(v) <> max(v)`. TPC-DS q95's
@@ -37,6 +42,11 @@ version may change configuration keys or defaults, always noted here.
 - A grouped aggregate with a `FILTER (WHERE ...)` clause failed with `ArrayIndexOutOfBoundsException` when a
   batch in which no row passed the filter brought new groups (seen as `avg(decimal) FILTER (...)` grouped by
   a fine key). The filtered function now sees every batch, with the failing rows cleared.
+
+### Changed
+
+- The runtime bloom-filter probe (`BloomProbeExpr`) now skips rows an earlier `AND` conjunct already rejected,
+  instead of probing every row of a batch. No result change; it was 13.9% of q24a's executor CPU at 1 TB.
 
 ## 0.0.6 -- 2026-10-04
 

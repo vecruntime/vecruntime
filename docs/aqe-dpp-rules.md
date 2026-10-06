@@ -30,6 +30,7 @@ which shapes are worth handling.
 | `SharedAggregateInputs` | `spark.vecruntime.optimizer.sharedAggregateInputs.enabled` | q1, q65 |
 | `DppThroughAggregate` | `spark.vecruntime.optimizer.dppThroughAggregate.enabled` | q2, q59 |
 | `TransitiveDpp` | `spark.vecruntime.optimizer.transitiveDpp.enabled` | q72 |
+| `FactBloomFilter` | `spark.vecruntime.optimizer.factBloomFilter.enabled` | q16, q50, q93, q94 |
 
 The plugin changes no AQE setting. `DppThroughAggregate` and `TransitiveDpp` add dynamic partition pruning
 filters where Spark's DPP does not reach; Spark's own DPP settings are unchanged.
@@ -289,3 +290,52 @@ results with Spark with the plugin off:
 - an unfiltered source, an outer join, and the switch leave the plan alone.
 
 The 1 TB numbers come with the PR.
+
+## `FactBloomFilter`: a runtime bloom filter from a smaller fact onto a larger one
+
+`spark/src/main/scala/org/apache/spark/sql/vecruntime/FactBloomFilter.scala`, issue #641.
+
+**Shape.** A shuffle equi-join (neither side broadcastable) that can prune the application side (inner, left
+semi, or the null-supplying side of an outer join), where:
+- the application key traces, through projections, filters and inner or semi joins, to a file scan of at
+  least `spark.sql.optimizer.runtime.bloomFilter.applicationSideScanSizeThreshold` (10 GB by default);
+- the application side is at least `spark.vecruntime.optimizer.factBloomFilter.sizeRatio` (10) times larger
+  in estimated bytes than the creation side;
+- that scan has no dynamic pruning or bloom filter on the key yet.
+
+TPC-DS q93 is this shape: `store_sales` (2.9G rows at 1 TB) joined to `store_returns` (~290M) on ticket and
+item. EMR Serverless filters `store_sales` by `store_returns`' keys before the shuffle; we and Spark did not.
+
+**Why Spark does not add it.** `InjectRuntimeFilter.extractSelectiveFilterOverScan` requires a selective
+`Filter` directly over the creation-side scan. `store_returns` has none of its own, so Spark builds nothing
+for q93, q50, q16 or q94. Raising Spark's bloom caps does not help and makes q75, q78 and q80 worse (a
+20-query 1 TB run; the issue has the numbers).
+
+**Rewrite.** The application scan gets `Filter(might_contain(ScalarSubquery(BloomFilterAggregate(
+xxhash64(creationKey))), xxhash64(applicationKey)))` -- the same `BloomFilterAggregate` and
+`BloomFilterMightContain` Spark's own rule uses, so the aggregate and the probe run vectorised. A composite
+join key gets one filter per key. The filter's expected items come from the creation side's row estimate, or
+its bytes over its row width when the row count is unknown (as at 1 TB); the bit size is capped by
+`spark.sql.optimizer.runtime.bloomFilter.maxNumItems` and `maxNumBits`.
+
+**Why the result is the same.** A bloom filter has no false negatives, and a row whose key the creation side
+does not hold cannot survive the join. False positives only let a non-matching row through to the join, which
+then drops it.
+
+**Placement.** The session's last optimizer batch, after Spark's DPP and runtime-filter rules, so it does not
+duplicate a filter they already placed and can see an existing one. At most
+`spark.sql.optimizer.runtimeFilter.number.threshold` filters per query, counting Spark's.
+
+**Declined:**
+- two sides of similar size (the ratio test);
+- a broadcastable creation side (a broadcast join needs no extra filter -- this also excludes q75, q78 and
+  q80, which regressed when Spark injected one);
+- an application side below the scan-size threshold;
+- the preserved side of an outer join;
+- a key already carrying a dynamic pruning or bloom filter.
+
+**Measured.** `FactBloomFilterSuite` covers the q93 shape (the larger fact gets the filters, results match
+Spark) and the declined shapes. The 1 TB numbers come with the PR.
+
+**Related.** `BloomProbeExpr` now skips rows an earlier conjunct already rejected (#635), so a probe this rule
+adds costs nothing on rows the scan's other filters drop.
