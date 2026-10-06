@@ -39,6 +39,11 @@ version may change configuration keys or defaults, always noted here.
 
 ### Fixed
 
+- TPC-DS q17 at 1 TB failed with `Cannot reserve additional contiguous bytes in the
+  vectorized reader (integer overflow)`: the Final aggregate of a runtime bloom filter ran on our operator over
+  Spark's `RowToColumnarExec`, which batches by row count the partial filters (one per creation-side map task, up
+  to 8 MB each) into a single vector past 2 GB. That aggregate now stays Spark's `ObjectHashAggregateExec` when its
+  child is row-based (#647).
 - A grouped aggregate with a `FILTER (WHERE ...)` clause failed with `ArrayIndexOutOfBoundsException` when a
   batch in which no row passed the filter brought new groups (seen as `avg(decimal) FILTER (...)` grouped by
   a fine key). The filtered function now sees every batch, with the failing rows cleared.

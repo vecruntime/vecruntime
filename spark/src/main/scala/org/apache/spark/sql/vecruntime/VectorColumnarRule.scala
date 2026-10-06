@@ -760,6 +760,14 @@ case class VectorExecRule(session: SparkSession) extends Rule[SparkPlan] with Lo
   private def columnarChild(plan: SparkPlan): Boolean =
     plan.supportsColumnar || plan.getTagValue(VectorFallback.Delegated).isDefined
 
+  /** Whether an object aggregate merges `bloom_filter_agg` buffers (its Final / PartialMerge stage). */
+  private def mergesBloomFilter(o: ObjectHashAggregateExec): Boolean =
+    o.aggregateExpressions.exists { e =>
+      e.aggregateFunction.isInstanceOf[org.apache.spark.sql.catalyst.expressions.aggregate.BloomFilterAggregate] &&
+      (e.mode == org.apache.spark.sql.catalyst.expressions.aggregate.Final ||
+        e.mode == org.apache.spark.sql.catalyst.expressions.aggregate.PartialMerge)
+    }
+
   /** None if `plan` is an acceptable columnar input, else the reason it is not. */
   private def columnarInputReason(plan: SparkPlan): Option[String] = {
     if (!columnarChild(plan)) Some(s"child ${plan.nodeName} is not columnar") else typeReason(plan)
@@ -844,6 +852,12 @@ case class VectorExecRule(session: SparkSession) extends Rule[SparkPlan] with Lo
     // it does require a columnar child. Keys and functions are gated by VectorAggregatePlanner.plan.
     val readsExchange = VectorAggregatePlanner.readsExchange(o)
     if (!readsExchange && !columnarChild(o.child)) fallback(o, s"child ${o.child.nodeName} is not columnar")
+    else if (readsExchange && !columnarChild(o.child) && mergesBloomFilter(o))
+      // A bloom filter's partials are its whole bit array (up to maxNumBits/8 each), one per map task of
+      // the creation side. Spark's RowToColumnarExec would batch them by row count into one vector, which
+      // passes 2 GB with a few hundred 8 MB partials (q17 at 1 TB, #647). Spark's ObjectHashAggregate
+      // merges them a row at a time through the same BloomFilterAggregate.merge we would call.
+      fallback(o, "bloom_filter_agg merge over a row child: its partial filters would overflow a row-to-columnar batch")
     else VectorAggregatePlanner.plan(
       o,
       VectorConf.finalAggregateEnabled(conf),

@@ -71,6 +71,28 @@ class FactBloomFilterSuite extends VectorQuerySuite {
     assert(salesBlooms(off) === 0, off.queryExecution.optimizedPlan.treeString)
   }
 
+  test("the filter's Final aggregate over a row exchange stays Spark's, not ours over RowToColumnar (#647)") {
+    import org.apache.spark.sql.catalyst.expressions.aggregate.{BloomFilterAggregate, Final}
+    import org.apache.spark.sql.execution.{RowToColumnarExec, SparkPlan}
+    object Plans extends org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanHelper
+    // One partial filter per creation-side map task; Spark's RowToColumnarExec batches them by row count,
+    // which overflows a 2 GB vector at 1 TB. Many small files give the creation side many map tasks here.
+    val df = withConf("spark.sql.files.maxPartitionBytes" -> "4096", "spark.sql.files.openCostInBytes" -> "0")(run(q93))
+    val all: Seq[SparkPlan] = Plans.collectWithSubqueries(df.queryExecution.executedPlan) { case p => p }
+    def isBloomFinal(p: SparkPlan): Boolean = {
+      val exprs = p match {
+        case a: org.apache.spark.sql.execution.aggregate.BaseAggregateExec => a.aggregateExpressions
+        case v: org.apache.spark.sql.vecruntime.VectorHashAggregateExec => v.aggregateExpressions
+        case _ => Nil
+      }
+      exprs.exists(e => e.mode == Final && e.aggregateFunction.isInstanceOf[BloomFilterAggregate])
+    }
+    val finals = all.filter(isBloomFinal)
+    assert(finals.nonEmpty, "no bloom filter aggregate found:\n" + all.headOption.map(_.treeString).getOrElse(""))
+    val overR2C = finals.filter(_.children.exists(_.isInstanceOf[RowToColumnarExec]))
+    assert(overR2C.isEmpty, "a bloom aggregate reads RowToColumnarExec:\n" + overR2C.map(_.treeString).mkString("\n"))
+  }
+
   test("sides of similar size get no filter") {
     val sql =
       "SELECT count(*), max(a.ss_pad) FROM store_sales a JOIN store_sales b ON a.ss_ticket_number = b.ss_ticket_number"
