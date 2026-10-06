@@ -141,12 +141,12 @@ object ClusterRunner {
     } else {
       val base = source.stripSuffix("/")
       val fs = fileSystem(spark, base)
-      tables.filter { t =>
-        val dir = new HPath(s"$base/$t")
-        val exists = fs.exists(dir)
-        if (exists) spark.read.parquet(dir.toString).createOrReplaceTempView(t)
-        exists
+      val found = tables.filter(t => fs.exists(new HPath(s"$base/$t")))
+      TableStats.mode(spark) match {
+        case None => found.foreach(t => spark.read.parquet(s"$base/$t").createOrReplaceTempView(t))
+        case Some(mode) => TableStats.register(spark, base, found, mode)
       }
+      found
     }
 
   /** Query texts from `<dir>/<name>.sql` on any Hadoop file system, for a cluster without the spark-sql tests jar. */
