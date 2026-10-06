@@ -63,6 +63,8 @@ object VectorConf {
    * (TPC-DS q95's `ws_wh`) becomes `GROUP BY k HAVING min(v) <> max(v)` -- no many-to-many join.
    */
   val SelfJoinToAggregateEnabled = "spark.vecruntime.optimizer.selfJoinToAggregate.enabled"
+
+  /**
    * Logical rewrite: global aggregates over the same input with different filters (TPC-DS q9's
    * scalar subqueries, q28 / q88 / q90's cross-joined aggregates) are computed in one pass.
    */
