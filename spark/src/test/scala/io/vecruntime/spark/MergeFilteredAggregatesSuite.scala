@@ -104,6 +104,14 @@ class MergeFilteredAggregatesSuite extends VectorQuerySuite {
     // Spark's MergeScalarSubqueries already shares each bucket's three; the buckets now share one too.
     assert(executedFactScans(withPlugin(enabled = false) { val d = spark.sql(sql); d.collect(); d }) === 3)
     assert(executedFactScans(df) === 1)
+    // Each aggregate keeps its own filter: folding the third and later inputs in must not AND the
+    // growing union of the others onto it (it reached ~50 KB of predicate per aggregate).
+    def filters(p: LogicalPlan): Seq[org.apache.spark.sql.catalyst.expressions.Expression] =
+      p.flatMap(_.expressions.flatMap(_.collect {
+        case ae: org.apache.spark.sql.catalyst.expressions.aggregate.AggregateExpression => ae.filter.toSeq
+      }.flatten)) ++ p.subqueries.flatMap(filters)
+    val sizes = filters(withPlugin(enabled = true)(df.queryExecution.optimizedPlan)).map(_.treeString.length)
+    assert(sizes.nonEmpty && sizes.max < 400, s"filter sizes: $sizes")
   }
 
   /** `store_sales` scans the executed plan runs, subqueries included, each reused one counted once. */

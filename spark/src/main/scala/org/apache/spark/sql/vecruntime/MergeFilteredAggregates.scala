@@ -164,16 +164,38 @@ case class MergeFilteredAggregates(session: SparkSession) extends Rule[LogicalPl
         case ae: AggregateExpression if ae.isDistinct =>
           ae.aggregateFunction match {
             case _: Count | _: Sum | _: Average | _: Min | _: Max =>
-              val fn = ae.aggregateFunction.mapChildren(c => If(pred, c, Literal(null, c.dataType)))
+              val fn = ae.aggregateFunction.mapChildren {
+                // An argument an earlier merge restricted to rows `pred` already admits stays as it is.
+                case c @ If(cond, _, Literal(null, _)) if implies(cond, pred) => c
+                case c => If(pred, c, Literal(null, c.dataType))
+              }
               ae.copy(aggregateFunction =
                 fn.asInstanceOf[org.apache.spark.sql.catalyst.expressions.aggregate.AggregateFunction]
               )
             case _ => ok = false; ae
           }
         case ae: AggregateExpression =>
-          ae.copy(filter = Some(ae.filter.map(f => And(f, pred)).getOrElse(pred)))
+          ae.filter match {
+            // Merging a third input ORs one more filter into `pred`; an aggregate whose filter already
+            // selects one of its branches needs nothing more. Without this, q9's fifteen filters grew
+            // into predicates of tens of KB each, evaluated per row.
+            case Some(f) if implies(f, pred) => ae
+            case Some(f) => ae.copy(filter = Some(And(f, pred)))
+            case None => ae.copy(filter = Some(pred))
+          }
       }
       if (ok) Some(out.asInstanceOf[NamedExpression]) else None
+  }
+
+  /** Whether `f` implies `p`, by syntax: every conjunct of some disjunct of `p` is a conjunct of `f`. */
+  private def implies(f: Expression, p: Expression): Boolean = {
+    val have = splitConjunctivePredicates(f)
+    def holds(c: Expression): Boolean = have.exists(_.semanticEquals(c))
+    p match {
+      case And(a, b) => implies(f, a) && implies(f, b)
+      case _ =>
+        holds(p) || splitDisjunctivePredicates(p).exists(d => splitConjunctivePredicates(d).forall(holds))
+    }
   }
 
   private def rename[E <: Expression](e: E, map: AttributeMap[Attribute]): E =
