@@ -215,6 +215,12 @@ under test.
   `NestedValidityExpr` in `expr/NestedExprs.scala`) resolves `GetStructField` chains to a leaf and
   folds the ancestors' nulls into the validity (#50); `arr[i]`, `map[key]`, constructors and the
   lambda families are refused with reasons naming #50.
+- Logical optimizer rules (`injectOptimizerRule`), and any change to AQE or DPP behaviour or
+  defaults, are documented in `docs/aqe-dpp-rules.md` in the same commit. Document the shape the
+  rule rewrites, why the result is unchanged, every shape it declines, its
+  `spark.vecruntime.optimizer.*` switch (also off with the plugin) and the measurement. Such rules
+  must be general SQL rewrites, never tuned to particular TPC-DS queries. Their tests compare
+  against Spark with the plugin off, and assert both the applied and the declined shapes.
 
 ### 5.2 Decimals and ANSI
 
