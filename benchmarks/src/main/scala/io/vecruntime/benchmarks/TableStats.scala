@@ -57,8 +57,12 @@ object TableStats {
     mode match {
       case Load(path) =>
         val recorded = read(spark, path)
-        tables.foreach(t => recorded.get(t).foreach(s => catalog.alterTableStats(TableIdentifier(t), Some(s(spark)(t)))))
-        println(s"[tpcds] table statistics loaded from $path for ${tables.count(recorded.contains)} of ${tables.size} tables")
+        tables.foreach(t =>
+          recorded.get(t).foreach(s => catalog.alterTableStats(TableIdentifier(t), Some(s(spark)(t))))
+        )
+        println(
+          s"[tpcds] table statistics loaded from $path for ${tables.count(recorded.contains)} of ${tables.size} tables"
+        )
       case Analyze(path) =>
         tables.foreach { t =>
           val t0 = System.nanoTime()
@@ -96,20 +100,24 @@ object TableStats {
     implicit val formats: Formats = DefaultFormats
     val in = new HPath(path)
     val is = in.getFileSystem(spark.sparkContext.hadoopConfiguration).open(in)
-    val text = try new String(is.readAllBytes(), StandardCharsets.UTF_8) finally is.close()
+    val text =
+      try new String(is.readAllBytes(), StandardCharsets.UTF_8)
+      finally is.close()
     parse(text).extract[Map[String, JValue]].map { case (t, v) =>
       val size = BigInt((v \ "sizeInBytes").extract[String])
       val rows = (v \ "rowCount").extractOpt[String].map(BigInt(_))
       val cols = (v \ "colStats").extract[Map[String, Map[String, String]]]
-      t -> ((s: SparkSession) => (table: String) => {
-        val schema = s.sessionState.catalog.getTableMetadata(TableIdentifier(table)).schema
-        val colStats = cols.flatMap { case (c, m) =>
-          schema.find(_.name == c).flatMap { f =>
-            CatalogColumnStat.fromMap(table, c, m.map { case (k, x) => s"$c.$k" -> x })
-          }.map(c -> _)
+      t -> ((s: SparkSession) =>
+        (table: String) => {
+          val schema = s.sessionState.catalog.getTableMetadata(TableIdentifier(table)).schema
+          val colStats = cols.flatMap { case (c, m) =>
+            schema.find(_.name == c).flatMap { f =>
+              CatalogColumnStat.fromMap(table, c, m.map { case (k, x) => s"$c.$k" -> x })
+            }.map(c -> _)
+          }
+          CatalogStatistics(size, rows, colStats)
         }
-        CatalogStatistics(size, rows, colStats)
-      })
+      )
     }
   }
 }
