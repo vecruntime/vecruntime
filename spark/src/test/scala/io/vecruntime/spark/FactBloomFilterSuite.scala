@@ -212,4 +212,51 @@ class FactBloomFilterSuite extends VectorQuerySuite {
       }
     }
   }
+
+  /** Partitioned filters (#653) on the sales side's keys in the optimized plan. */
+  private def partitionedBlooms(df: DataFrame): Int =
+    df.queryExecution.optimizedPlan.collect { case f: org.apache.spark.sql.catalyst.plans.logical.Filter => f }
+      .flatMap(_.condition.collect { case p: org.apache.spark.sql.vecruntime.PartitionedBloomMightContain => p })
+      .size
+
+  test("a filter too large for one bloom_filter_agg is partitioned by hash bucket, results unchanged (#653)") {
+    // maxNumItems 100: the returns side's ~1300 keys need 50-item sub-filters, ~27 buckets.
+    withConf("spark.sql.optimizer.runtime.bloomFilter.maxNumItems" -> "100") {
+      val df = run(q93)
+      assert(partitionedBlooms(df) >= 1, df.queryExecution.optimizedPlan.treeString)
+      assert(salesBlooms(df) === 0, df.queryExecution.optimizedPlan.treeString) // no plain filter instead
+      // A total size cap the filter cannot meet even at 4 bits a key (~400 keys, 1024 bits): declined, not built
+      // saturated.
+      withConf(VectorConf.FactBloomFilterMaxTotalBits -> "1024") {
+        val small = run(q93)
+        assert(
+          partitionedBlooms(small) === 0 && salesBlooms(small) === 0,
+          small.queryExecution.optimizedPlan.treeString
+        )
+      }
+    }
+  }
+
+  test("partitioned filter: every key is found in its bucket's sub-filter; pack and unpack round-trip (#653)") {
+    import org.apache.spark.sql.vecruntime.PartitionedBloomFilter
+    import org.apache.spark.sql.catalyst.expressions.aggregate.BloomFilterAggregate
+    import org.apache.spark.util.sketch.BloomFilter
+    val buckets = 7
+    val keys = (0L until 20000L).map(i => org.apache.spark.sql.catalyst.expressions.XXH64.hashLong(i * 31L, 42L))
+    val subs = Array.tabulate(buckets) { b =>
+      val ks = keys.filter(h => Math.floorMod(h, buckets.toLong) == b)
+      if (b == 3) null // a bucket without keys
+      else { val f = BloomFilter.create(5000L, 40000L); ks.foreach(f.putLong); BloomFilterAggregate.serialize(f) }
+    }
+    val filters = PartitionedBloomFilter.unpack(PartitionedBloomFilter.pack(subs))
+    assert(filters.length == buckets && filters(3) == null)
+    assert(keys.filter(h => Math.floorMod(h, buckets.toLong) != 3).forall(PartitionedBloomFilter.mightContain(
+      filters,
+      _
+    )))
+    assert(keys.filter(h => Math.floorMod(h, buckets.toLong) == 3).forall(!PartitionedBloomFilter.mightContain(
+      filters,
+      _
+    )))
+  }
 }

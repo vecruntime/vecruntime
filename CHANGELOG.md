@@ -50,6 +50,11 @@ version may change configuration keys or defaults, always noted here.
 
 ### Changed
 
+- `FactBloomFilter` builds a filter for many keys partitioned by hash bucket: the keys are shuffled by
+  `pmod(xxhash64(key), B)`, one sub-filter per bucket is built after the shuffle within Spark's caps, and the probe
+  tests its bucket's sub-filter. A single `bloom_filter_agg` for tens of millions of keys was capped at 8 MB and
+  saturated. Total size capped by `spark.vecruntime.optimizer.factBloomFilter.maxTotalBits`; larger filters are
+  declined (#653).
 - `FactBloomFilter` adds a filter only on evidence that it prunes: with distinct-count statistics for both keys
   (Spark `ANALYZE ... FOR COLUMNS`, or Iceberg's Puffin statistics through DSv2), when at most
   `spark.vecruntime.optimizer.factBloomFilter.maxSelectivity` (0.5) of the filtered side can match; without them,
