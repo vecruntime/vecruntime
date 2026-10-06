@@ -27,6 +27,10 @@ version may change configuration keys or defaults, always noted here.
   grouping key is joined above the aggregate to a filtered relation. The pruning set is the dimension's partition
   keys whose grouping key the filtered relation keeps. TPC-DS q59 and q2 get the pruning EMR Serverless applies;
   Spark's own DPP stops at the aggregate because the key is not a partition column.
+- Transitive dynamic partition pruning (`spark.vecruntime.optimizer.transitiveDpp.enabled`, on by default): a
+  scan joined to an unfiltered dimension on its partition column and on a second key is pruned, when that
+  second key comes from a small filtered relation elsewhere in the join. TPC-DS q72's `inventory` (through
+  `d2.d_week_seq = d1.d_week_seq`, `d1` restricted to one year) gets the pruning EMR Serverless applies.
 
 ### Fixed
 

@@ -59,6 +59,12 @@ object VectorConf {
    */
   val DppThroughAggregateEnabled = "spark.vecruntime.optimizer.dppThroughAggregate.enabled"
 
+  /**
+   * Logical rewrite (#634): dynamic partition pruning of a scan through a second join key, when the joined
+   * dimension is unfiltered but another key of the same join comes from a filtered relation.
+   */
+  val TransitiveDppEnabled = "spark.vecruntime.optimizer.transitiveDpp.enabled"
+
   /** The grouped aggregate emits its UTF8 keys dictionary-encoded, ids over the group table's own dictionary (#377). */
   val AggDictionaryKeys = "spark.vecruntime.agg.dictionaryKeys"
   val SortEnabled = "spark.vecruntime.exec.sort.enabled"
@@ -529,6 +535,10 @@ object VectorConf {
   /** DPP through an aggregate (#633); also off when the plugin is off. */
   def dppThroughAggregateEnabled(conf: SQLConf): Boolean =
     isEnabled(conf) && bool(conf, DppThroughAggregateEnabled, default = true)
+
+  /** Transitive DPP through a second join key (#634); also off when the plugin is off. */
+  def transitiveDppEnabled(conf: SQLConf): Boolean =
+    isEnabled(conf) && bool(conf, TransitiveDppEnabled, default = true)
 
   private def bool(conf: SQLConf, key: String, default: Boolean): Boolean =
     conf.getConfString(key, default.toString).trim.equalsIgnoreCase("true")
