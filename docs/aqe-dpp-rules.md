@@ -235,8 +235,17 @@ before Spark's `PartitionPruning`, which skips a join that already has a pruning
 - non-deterministic filters or aggregates on the path.
 
 **Measured.** `DppThroughAggregateSuite` covers the q59 and q2 shapes, which read fewer files than with the
-rule off, plus the two declined shapes and the switch. Results are compared with Spark with the plugin off. The
-1 TB numbers come with the PR.
+rule off, plus the two declined shapes and the switch. Results are compared with Spark with the plugin off.
+
+At 1 TB on 2026-10-06, `main` 35e797d against the rule, with legs alternated (3 iterations each). Times are
+median seconds, and checksums are identical:
+
+| Query | `main` | With the rule | EMR Serverless |
+|---|---:|---:|---:|
+| q59 | 13.7 / 13.3 | 6.4 / 6.2 | 6.0 |
+| q2 | 14.1 / 13.2 | 4.5 / 4.3 | 11.0 |
+| q67 (control) | 58.4 / 59.7 | 57.5 / 58.4 | |
+| q18 (control) | 4.15 / 4.12 | 4.17 / 4.09 | |
 
 ## `TransitiveDpp`: dynamic partition pruning through a second join key
 
