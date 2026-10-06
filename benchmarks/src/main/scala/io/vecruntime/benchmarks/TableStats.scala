@@ -51,8 +51,13 @@ object TableStats {
   def register(spark: SparkSession, base: String, tables: Seq[String], mode: Mode): Unit = {
     val catalog = spark.sessionState.catalog
     tables.foreach { t =>
-      if (!catalog.tableExists(TableIdentifier(t)))
+      if (!catalog.tableExists(TableIdentifier(t))) {
         spark.sql(s"CREATE TABLE `$t` USING parquet LOCATION '$base/$t'")
+        // A partitioned directory (the fact tables, `ss_sold_date_sk=...`) has no partition in the catalog
+        // until they are recovered; without this the table reads as empty.
+        if (catalog.getTableMetadata(TableIdentifier(t)).partitionColumnNames.nonEmpty)
+          spark.sql(s"ALTER TABLE `$t` RECOVER PARTITIONS")
+      }
     }
     mode match {
       case Load(path) =>
@@ -67,7 +72,8 @@ object TableStats {
         tables.foreach { t =>
           val t0 = System.nanoTime()
           spark.sql(s"ANALYZE TABLE `$t` COMPUTE STATISTICS FOR ALL COLUMNS")
-          println(f"[tpcds] analyzed $t in ${(System.nanoTime() - t0) / 1e9}%.1f s")
+          val rows = catalog.getTableMetadata(TableIdentifier(t)).stats.flatMap(_.rowCount).getOrElse(BigInt(-1))
+          println(f"[tpcds] analyzed $t ($rows rows) in ${(System.nanoTime() - t0) / 1e9}%.1f s")
         }
         write(spark, path, tables.flatMap(t => catalog.getTableMetadata(TableIdentifier(t)).stats.map(t -> _)).toMap)
         println(s"[tpcds] table statistics written to $path")
