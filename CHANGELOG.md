@@ -39,6 +39,9 @@ version may change configuration keys or defaults, always noted here.
 
 ### Fixed
 
+- `FactBloomFilter`'s probe on a fact scan that already has a filter is added to that filter instead of a second
+  one below it: Spark takes partition filters only from the filter directly over the relation, so the scan lost
+  its dynamic partition pruning and the stage ran row by row (TPC-DS q48, q13, q61, q18 and q23b at 1 TB).
 - TPC-DS q17 at 1 TB failed with `Cannot reserve additional contiguous bytes in the
   vectorized reader (integer overflow)`: the Final aggregate of a runtime bloom filter ran on our operator over
   Spark's `RowToColumnarExec`, which batches by row count the partial filters (one per creation-side map task, up
