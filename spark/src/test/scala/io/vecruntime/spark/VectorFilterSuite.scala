@@ -338,6 +338,13 @@ class VectorFilterSuite extends VectorQuerySuite {
         nodesOf[VectorFilterExec](df2).exists(_.condition.exists(_.isInstanceOf[BloomFilterMightContain])),
         finalPlan(df2).treeString
       )
+      // The probe after another conjunct that rejects most rows: it only probes the rows still undecided
+      // (ctx.active), and the result is the same as Spark's.
+      checkVectorized(
+        "SELECT count(*), sum(l_quantity) FROM lineitem JOIN t ON lineitem.l_partkey = t.i " +
+          "WHERE t.b AND t.i < 500 AND lineitem.l_quantity > 45",
+        Seq(Filter)
+      )
     }
   }
 }

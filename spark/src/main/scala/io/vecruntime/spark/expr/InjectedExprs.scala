@@ -168,9 +168,13 @@ final case class BloomProbeExpr(filter: SubqueryLiteralExpr, hash: VectorExpr) e
     if (b == null) return SubqueryLiteralExpr.nulls(BooleanType, ctx)
     val h = hash.eval(ctx)
     val bits = ArrowLayout.allocateBitmap(ctx.arena, n)
+    // Only rows still undecided are probed: under AND, `ctx.active` excludes rows an earlier conjunct already
+    // made false, whose result the AND discards. The probe is a hash and a random bit read per row (13.9%
+    // of q24a's executor CPU at 1 TB, #635), so skipping those rows is the saving.
+    val active = ctx.active
     var i = 0
     while (i < n) {
-      if (h.validity() == null || Bitmap.isSet(h.validity(), i)) {
+      if ((active == null || Bitmap.isSet(active, i)) && (h.validity() == null || Bitmap.isSet(h.validity(), i))) {
         Bitmap.setTo(bits, i, b.mightContainLong(h.data().getAtIndex(VectorBuffers.LE_LONG, i)))
       }
       i += 1
