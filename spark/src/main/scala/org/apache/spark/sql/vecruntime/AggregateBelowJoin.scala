@@ -23,9 +23,11 @@ import org.apache.spark.sql.catalyst.expressions.{
   AttributeSet,
   Cast,
   Coalesce,
+  DynamicPruningSubquery,
   EqualNullSafe,
   EqualTo,
   Expression,
+  IsNotNull,
   Literal,
   NamedExpression,
   PredicateHelper
@@ -132,7 +134,13 @@ case class AggregateBelowJoin(session: SparkSession) extends Rule[LogicalPlan] w
         case _ => Nil
       })
       val refs = cond.references
-      if (inputs.subsetOf(l.outputSet))
+      // A selectively filtered other side prunes the fact at run time -- the runtime filters that skip row groups
+      // need the join directly over the fact's scan, and an aggregate in between would cost them -- unless the
+      // fact is already pruned on this join's keys by dynamic partition pruning, which sits in the fact's own
+      // subtree (q4's `date_dim` filtered by year, `ss_sold_date_sk` pruned by it).
+      val (factSide, other) = if (inputs.subsetOf(l.outputSet)) (l, r) else (r, l)
+      if (selective(other) && !partitionPruned(factSide, keys)) None
+      else if (inputs.subsetOf(l.outputSet))
         descend(l, aggExprs, inputs, needed ++ refs, joinKeys ++ keys, joins + 1).map { case (c, m, parts) =>
           (j.copy(left = c), m, parts)
         }
@@ -147,6 +155,22 @@ case class AggregateBelowJoin(session: SparkSession) extends Rule[LogicalPlan] w
       // A star aggregation only: every fact column kept above is a join key, none is grouped by itself.
       if (keys.isEmpty || !keys.forall(joinKeys.contains)) None else Some(preAggregate(f, keys, aggExprs))
     case _ => None
+  }
+
+  /** Whether `p` has a filter other than IS NOT NULL checks (a selective dimension). */
+  private def selective(p: LogicalPlan): Boolean = p.exists {
+    case Filter(cond, _) => splitConjunctivePredicates(cond).exists(!_.isInstanceOf[IsNotNull])
+    case _ => false
+  }
+
+  /** Whether `p` has a dynamic partition pruning filter on one of `keys`. */
+  private def partitionPruned(p: LogicalPlan, keys: AttributeSet): Boolean = p.exists {
+    case Filter(cond, _) =>
+      splitConjunctivePredicates(cond).exists {
+        case d: DynamicPruningSubquery => d.pruningKey.references.intersect(keys).nonEmpty
+        case _ => false
+      }
+    case _ => false
   }
 
   private def passThrough(e: NamedExpression, inputs: AttributeSet): Boolean = e match {

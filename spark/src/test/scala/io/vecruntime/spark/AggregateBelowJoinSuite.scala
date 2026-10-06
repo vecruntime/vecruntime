@@ -84,6 +84,10 @@ class AggregateBelowJoinSuite extends VectorQuerySuite {
     assert(!preAggregated(distinct.queryExecution.optimizedPlan), distinct.queryExecution.optimizedPlan.treeString)
     val avg = run("SELECT c_first, avg(s_qty) FROM abj_sales JOIN abj_customer ON s_cust = c_sk GROUP BY c_first")
     assert(!preAggregated(avg.queryExecution.optimizedPlan), avg.queryExecution.optimizedPlan.treeString)
+    // A selectively filtered dimension: the join prunes the fact at run time, which a pre-aggregate would cost.
+    val filtered = run(
+      "SELECT c_first, sum(s_qty) FROM abj_sales JOIN abj_customer ON s_cust = c_sk WHERE c_last = 'last-3' GROUP BY c_first")
+    assert(!preAggregated(filtered.queryExecution.optimizedPlan), filtered.queryExecution.optimizedPlan.treeString)
     // A fact column in a non-equality join condition (q72's `inv_quantity_on_hand < cs_quantity`).
     val nonEqui = run(
       "SELECT c_first, sum(s_qty) FROM abj_sales JOIN abj_customer ON s_cust = c_sk AND s_qty < c_sk GROUP BY c_first"
