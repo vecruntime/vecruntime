@@ -47,6 +47,10 @@ version may change configuration keys or defaults, always noted here.
 
 - The runtime bloom-filter probe (`BloomProbeExpr`) now skips rows an earlier `AND` conjunct already rejected,
   instead of probing every row of a batch. No result change; it was 13.9% of q24a's executor CPU at 1 TB.
+- The runtime bloom-filter probe deserialises its filter once per executor instead of once per task. Each task
+  receives the filter's bytes in the plan; the first one builds the `BloomFilter` and the others reuse it. At
+  Spark's default 8 MB cap this was small; a filter sized for a large creation side (~128 MB) was read again by
+  every task. No result change.
 
 ## 0.0.6 -- 2026-10-04
 

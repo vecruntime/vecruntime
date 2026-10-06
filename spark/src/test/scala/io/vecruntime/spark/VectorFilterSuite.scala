@@ -347,4 +347,32 @@ class VectorFilterSuite extends VectorQuerySuite {
       )
     }
   }
+
+  test("runtime bloom filter: deserialised once per executor, not once per task") {
+    import io.vecruntime.spark.expr.BloomFilterCache
+    // Local mode is one JVM, so every scan task shares the cache. Small file splits give lineitem's scan
+    // several tasks; the one filter is still built once.
+    withConf(
+      "spark.sql.optimizer.runtime.bloomFilter.enabled" -> "true",
+      "spark.sql.optimizer.runtime.bloomFilter.applicationSideScanSizeThreshold" -> "0",
+      "spark.sql.autoBroadcastJoinThreshold" -> "-1",
+      "spark.sql.files.maxPartitionBytes" -> "4096",
+      "spark.sql.files.openCostInBytes" -> "0"
+    ) {
+      BloomFilterCache.clearForTest()
+      val sql =
+        "SELECT count(*), sum(l_quantity) FROM lineitem JOIN t ON lineitem.l_partkey = t.i WHERE t.b AND t.i < 300"
+      val df = checkVectorized(sql, Seq(Filter))
+      assert(
+        nodesOf[VectorFilterExec](df)
+          .exists(
+            _.condition.exists(_.isInstanceOf[org.apache.spark.sql.catalyst.expressions.BloomFilterMightContain])
+          ),
+        finalPlan(df).treeString
+      )
+      val scanTasks = spark.table("lineitem").rdd.getNumPartitions
+      assert(scanTasks > 1, s"expected a multi-task scan, got $scanTasks")
+      assert(BloomFilterCache.buildCount == 1, s"filters built: ${BloomFilterCache.buildCount}")
+    }
+  }
 }
