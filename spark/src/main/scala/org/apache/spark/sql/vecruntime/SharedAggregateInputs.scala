@@ -17,8 +17,16 @@ package org.apache.spark.sql.vecruntime
 
 import io.vecruntime.spark.VectorConf
 import org.apache.spark.sql.SparkSession
-import org.apache.spark.sql.catalyst.expressions.{And, Attribute, AttributeSet, Expression, IsNotNull, PredicateHelper}
-import org.apache.spark.sql.catalyst.plans.Inner
+import org.apache.spark.sql.catalyst.expressions.{
+  And,
+  Attribute,
+  AttributeSet,
+  DynamicPruningSubquery,
+  Expression,
+  IsNotNull,
+  PredicateHelper
+}
+import org.apache.spark.sql.catalyst.plans.{Inner, QueryPlan}
 import org.apache.spark.sql.catalyst.plans.logical.{Aggregate, Filter, Join, LogicalPlan, Project}
 import org.apache.spark.sql.catalyst.rules.Rule
 
@@ -62,7 +70,7 @@ case class SharedAggregateInputs(session: SparkSession) extends Rule[LogicalPlan
       val (a, b) = (aggs(i), aggs(j))
       val (ca, ra) = stripped(a)
       val (cb, rb) = stripped(b)
-      if ((ra.nonEmpty || rb.nonEmpty) && !a.child.sameResult(b.child) && ca.sameResult(cb) && sameGrouping(a, b)) {
+      if ((ra.nonEmpty || rb.nonEmpty) && !same(a.child, b.child) && same(ca, cb) && sameGrouping(a, b)) {
         rewrite.getOrElseUpdate(a, pullUp(a, ca, ra))
         rewrite.getOrElseUpdate(b, pullUp(b, cb, rb))
       }
@@ -72,6 +80,20 @@ case class SharedAggregateInputs(session: SparkSession) extends Rule[LogicalPlan
   }
 
   private def keys(a: Aggregate): Seq[Attribute] = a.groupingExpressions.collect { case k: Attribute => k }
+
+  /**
+   * `sameResult`, with the build keys of dynamic pruning subqueries normalized against their build plan.
+   * `DynamicPruningSubquery` canonicalizes its build keys on their own, keeping their expression ids, so
+   * two copies of a query pruned by DPP (each with its own copy of the dimension) never compare equal
+   * otherwise (q65 at 1 TB, #632).
+   */
+  private def same(x: LogicalPlan, y: LogicalPlan): Boolean = {
+    def norm(p: LogicalPlan): LogicalPlan = p.transformAllExpressions {
+      case d: DynamicPruningSubquery =>
+        d.copy(buildKeys = d.buildKeys.map(k => QueryPlan.normalizeExpressions(k, d.buildQuery.output)))
+    }
+    norm(x).sameResult(norm(y))
+  }
 
   private def sameGrouping(a: Aggregate, b: Aggregate): Boolean = {
     // The inputs are the same plan up to attribute names; compare the groupings by position in it.
@@ -100,7 +122,10 @@ case class SharedAggregateInputs(session: SparkSession) extends Rule[LogicalPlan
           }
           drop.foreach { case IsNotNull(a: Attribute) => removed += a; case _ => }
           val c = strip(child, keys, removed)
-          if (keep.isEmpty) c else Filter(keep.reduce(And), c)
+          // The remaining conjuncts in one canonical order: the copies can list them differently (a pruning
+          // subquery first in one, last in the other), and canonicalization does not reorder an AND that
+          // holds a subquery, so the inputs would never compare equal (#632 at 1 TB).
+          if (keep.isEmpty) c else Filter(keep.sortBy(_.canonicalized.toString).reduce(And), c)
         case Project(list, child) =>
           // A key passes through when the projection keeps the child's attribute as it is.
           val through = AttributeSet(list.collect { case a: Attribute if keys.contains(a) => a })
