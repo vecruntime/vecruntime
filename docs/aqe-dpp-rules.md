@@ -29,9 +29,10 @@ which shapes are worth handling.
 | `MergeFilteredAggregates` | `spark.vecruntime.optimizer.mergeFilteredAggregates.enabled` | q9, q28, q88, q90 |
 | `SharedAggregateInputs` | `spark.vecruntime.optimizer.sharedAggregateInputs.enabled` | q1, q65 |
 | `DppThroughAggregate` | `spark.vecruntime.optimizer.dppThroughAggregate.enabled` | q2, q59 |
+| `TransitiveDpp` | `spark.vecruntime.optimizer.transitiveDpp.enabled` | q72 |
 
-The plugin changes no AQE setting. `DppThroughAggregate` adds dynamic partition pruning filters where Spark's
-DPP does not reach; Spark's own DPP settings are unchanged.
+The plugin changes no AQE setting. `DppThroughAggregate` and `TransitiveDpp` add dynamic partition pruning
+filters where Spark's DPP does not reach; Spark's own DPP settings are unchanged.
 
 ## `SelfJoinToAggregate`: existence-only self-joins as a min/max aggregate
 
@@ -234,5 +235,57 @@ before Spark's `PartitionPruning`, which skips a join that already has a pruning
 - non-deterministic filters or aggregates on the path.
 
 **Measured.** `DppThroughAggregateSuite` covers the q59 and q2 shapes, which read fewer files than with the
-rule off, plus the two declined shapes and the switch. Results are compared with Spark with the plugin off. The
-1 TB numbers come with the PR.
+rule off, plus the two declined shapes and the switch. Results are compared with Spark with the plugin off.
+
+At 1 TB on 2026-10-06, `main` 35e797d against the rule, with legs alternated (3 iterations each). Times are
+median seconds, and checksums are identical:
+
+| Query | `main` | With the rule | EMR Serverless |
+|---|---:|---:|---:|
+| q59 | 13.7 / 13.3 | 6.4 / 6.2 | 6.0 |
+| q2 | 14.1 / 13.2 | 4.5 / 4.3 | 11.0 |
+| q67 (control) | 58.4 / 59.7 | 57.5 / 58.4 | |
+| q18 (control) | 4.15 / 4.12 | 4.17 / 4.09 | |
+
+## `TransitiveDpp`: dynamic partition pruning through a second join key
+
+`spark/src/main/scala/org/apache/spark/sql/vecruntime/TransitiveDpp.scala`, issue #634.
+
+**Shape.** An inner `Join(X, D)` on `X.p = D.d AND X.x = D.y`, where:
+- `p` traces to a partition column of a file scan inside `X`, through projections, filters, unions and
+  inner or semi joins;
+- `D` has no selective filter of its own;
+- `x` traces, through projections, filters and inner joins, to a join-free subtree `S` of `X` that has one.
+
+TPC-DS q72 is this shape. `inventory` joins `date_dim d2` on `inv_date_sk = d2.d_date_sk AND
+d1.d_week_seq = d2.d_week_seq`, and `d1` is restricted to one `d_year`. EMR Serverless prunes `inventory`
+there; we did not.
+
+**Why Spark does not prune it.** `PartitionPruning` finds `inv_date_sk` as a partition column, but the
+filtering side, `d2`, has no selective predicate (`hasPartitionPruningFilter`). What makes `d2` selective
+is the second equality, which comes from `d1` on the other side of the same join.
+
+**Rewrite.** The scan gets `Filter(DynamicPruningSubquery(p, D LEFT SEMI JOIN S ON D.y = S.x, D.d))`,
+with `onlyInBroadcast = false`, planned like Spark's own DPP.
+
+**Why the result is the same.** Every row the join keeps has `p = D.d` for a `D` row whose `y` equals an
+`x`. That `x` comes from a row of `S` that passed `S`'s filter: only inner joins lie between `S` and the
+join. So that `D` row's `d` is in the pruning set, and no row the join keeps is removed.
+
+**Placement.** Pre-CBO, once, before Spark's `PartitionPruning`, like `DppThroughAggregate`.
+
+**Declined:**
+- a selective `D` (Spark's own DPP covers it);
+- a non-selective `S`;
+- a `D` or `S` larger than `spark.sql.autoBroadcastJoinThreshold`, since the subquery scans both once
+  more. This also keeps a filtered fact from ever being the source;
+- a non-inner join at the top;
+- a source key computed by an expression;
+- a scan that already has a pruning filter on `p`.
+
+**Measured.** `TransitiveDppSuite` runs over two partitioned facts and a date dimension, and compares
+results with Spark with the plugin off:
+- the q72 shape prunes `inventory` and reads fewer files than with the rule off;
+- an unfiltered source, an outer join, and the switch leave the plan alone.
+
+The 1 TB numbers come with the PR.

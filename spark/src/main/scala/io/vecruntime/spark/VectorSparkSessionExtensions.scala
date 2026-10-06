@@ -36,6 +36,7 @@ class VectorSparkSessionExtensions extends (SparkSessionExtensions => Unit) {
     extensions.injectOptimizerRule(session => MergeFilteredAggregates(session))
     // Once, before Spark's own DPP rules, after filters were pushed down (#633).
     extensions.injectPreCBORule(session => org.apache.spark.sql.vecruntime.DppThroughAggregate(session))
+    extensions.injectPreCBORule(session => org.apache.spark.sql.vecruntime.TransitiveDpp(session))
     // The columnar v3 deletion-vector writer (#20): a planner strategy over the logical WriteDelta,
     // gated on spark.vecruntime.iceberg.dvWriter.enabled and a v3 target; declines to Spark otherwise.
     extensions.injectPlannerStrategy(session => VectorWriteDeltaStrategy(session))
