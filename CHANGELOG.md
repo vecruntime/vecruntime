@@ -22,6 +22,11 @@ version may change configuration keys or defaults, always noted here.
   (`spark.vecruntime.optimizer.sharedAggregateInputs.enabled`, on by default): when the copies differ only by an
   inferred `IS NOT NULL` on a grouping key, that predicate moves above the aggregate, where it drops only the null
   group, and the copies plan one scan and one shuffle. TPC-DS q65 and q1 read their fact table once instead of twice.
+- Dynamic partition pruning through an aggregate (`spark.vecruntime.optimizer.dppThroughAggregate.enabled`, on by
+  default): a fact scan below a `GROUP BY` on a dimension attribute (such as `d_week_seq`) is pruned when that
+  grouping key is joined above the aggregate to a filtered relation. The pruning set is the dimension's partition
+  keys whose grouping key the filtered relation keeps. TPC-DS q59 and q2 get the pruning EMR Serverless applies;
+  Spark's own DPP stops at the aggregate because the key is not a partition column.
 
 ### Fixed
 
