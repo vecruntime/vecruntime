@@ -2,7 +2,8 @@
 
 vecruntime plans most of its work in the columnar rule that runs after Spark's planner. A few speedups
 need a different logical plan, not a different physical operator for the same plan. They are
-optimizer rules injected through `SparkSessionExtensions.injectOptimizerRule`. This page lists every
+optimizer rules injected through `SparkSessionExtensions.injectOptimizerRule` (or, when Spark's own
+push-down would undo them, added to its last optimizer batch). This page lists every
 such rule and every change we make to Spark's adaptive execution (AQE) or dynamic partition pruning
 (DPP): what each one rewrites, when it applies and when it does not, why the result is the same,
 how to switch it off, and what it was measured to do.
@@ -26,6 +27,7 @@ which shapes are worth handling.
 |---|---|---|
 | `SelfJoinToAggregate` | `spark.vecruntime.optimizer.selfJoinToAggregate.enabled` | q95 |
 | `MergeFilteredAggregates` | `spark.vecruntime.optimizer.mergeFilteredAggregates.enabled` | q9, q28, q88, q90 |
+| `SharedAggregateInputs` | `spark.vecruntime.optimizer.sharedAggregateInputs.enabled` | q1, q65 |
 
 No AQE or DPP setting is changed by the plugin today. Changes to either belong on this page too.
 
@@ -132,3 +134,43 @@ The two forms are then finished differently:
 **Fix shipped with it.** A grouped aggregate with `FILTER` failed with `ArrayIndexOutOfBoundsException`
 when a batch in which no row passed the filter brought new groups. The filtered function now sees
 every batch.
+
+## `SharedAggregateInputs`: one input for aggregates that differ only by an inferred `IS NOT NULL`
+
+`spark/src/main/scala/org/apache/spark/sql/vecruntime/SharedAggregateInputs.scala`, issue #632.
+
+**Shape.** A CTE or view with a `GROUP BY` used twice is inlined twice, and Spark optimizes each copy
+on its own. `InferFiltersFromConstraints` adds `IS NOT NULL(k)` to the copy that is later joined on a
+grouping key `k` and pushes it down to the scan; the other copy (say, one aggregated again by a coarser
+key) does not get it. The two inputs no longer match, so `ReuseExchange` cannot share them, and the
+input -- typically a fact scan, a dimension join and a shuffle -- runs twice. TPC-DS q65 (`store_sales`)
+and q1 (`store_returns`) have this shape.
+
+**Rewrite.** For two aggregates with the same grouping (by position in the input), the rule removes
+`IS NOT NULL` conjuncts on grouping keys from each input, walking projections that pass the key
+through, filters and inner joins. If the stripped inputs are the same plan, each aggregate gets the
+stripped input and the removed predicates as a `Filter` above it, adding the key to its output first
+when the parent had pruned it. Below an aggregate grouping by `k`, `IS NOT NULL(k)` removes exactly the
+rows of the null group, so filtering the null group out afterwards gives the same result.
+
+**Placement.** The rule runs in Spark's last optimizer batch, `User Provided Optimizers`
+(`spark.experimental.extraOptimizations`). Every earlier batch is followed by Spark's own filter
+push-down (the last one is `Pushdown Filters from PartitionPruning`), which moves the predicates back
+below the aggregates. `SparkSessionExtensions` cannot inject into that batch, so a post-hoc analyzer
+rule, `RegisterLateOptimizerRules`, adds it to the session's `extraOptimizations` once, before the
+session's first optimization. A rewritten pair has the same input, so the rule does nothing on the
+batch's next pass.
+
+**Declined:**
+
+- aggregates with different groupings, or grouping by expressions rather than columns;
+- inputs that still differ after the `IS NOT NULL`s are removed (another filter, another join);
+- `IS NOT NULL` of anything other than a grouping column, or below an outer, semi or anti join, an
+  aggregate, a window, or a projection that computes the key.
+
+**Measured.**
+
+- SF1 checksums match Spark on q1, q65, q30, q81, q24a and q18.
+- At SF1, q65 and q1 plan 4 Parquet scans instead of 6: the fact scan and its `date_dim` join are
+  planned once and reused.
+- A 1 TB A/B is pending.
