@@ -46,6 +46,12 @@ object VectorConf {
    */
   val IcebergDvWriterEnabled = "spark.vecruntime.iceberg.dvWriter.enabled"
 
+  /**
+   * Logical rewrite (#632): `IsNotNull` on a grouping key that is the only difference between the
+   * inputs of two aggregates (a CTE used twice) moves above the aggregates, so the input is shared.
+   */
+  val SharedAggregateInputsEnabled = "spark.vecruntime.optimizer.sharedAggregateInputs.enabled"
+
   /** The grouped aggregate emits its UTF8 keys dictionary-encoded, ids over the group table's own dictionary (#377). */
   val AggDictionaryKeys = "spark.vecruntime.agg.dictionaryKeys"
   val SortEnabled = "spark.vecruntime.exec.sort.enabled"
@@ -508,6 +514,10 @@ object VectorConf {
    */
   def strictFloatingPoint(conf: SQLConf): Boolean = bool(conf, StrictFloatingPoint, default = true)
   def explainFallback(conf: SQLConf): Boolean = bool(conf, ExplainFallbackEnabled, default = false)
+
+  /** The shared-aggregate-inputs rewrite (#632); also off when the plugin is off. */
+  def sharedAggregateInputsEnabled(conf: SQLConf): Boolean =
+    isEnabled(conf) && bool(conf, SharedAggregateInputsEnabled, default = true)
 
   private def bool(conf: SQLConf, key: String, default: Boolean): Boolean =
     conf.getConfString(key, default.toString).trim.equalsIgnoreCase("true")
