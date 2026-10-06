@@ -47,12 +47,13 @@ final case class FilteredAgg(inner: VectorAggFunction, predicate: VectorExpr) ex
     override def update(ctx: EvalContext, groups: GroupAssignment): Unit = {
       val n = ctx.numRows
       val bits = FilteredAgg.passing(ctx, predicate)
-      if (Bitmap.popcount(bits, n) > 0) {
-        val ids = groups.ids().clone()
-        var i = 0
-        while (i < n) { if (!Bitmap.isSet(bits, i)) ids(i) = -1; i += 1 }
-        s.update(ctx, GroupAssignment.of(ids, n, groups.numGroups(), ctx.arena, groups.useMasks(), bits))
-      }
+      // Updated even when no row passes: the inner state sizes itself to the batch's group count, and
+      // a group first seen in a batch where nothing passes is still read back (it was an
+      // ArrayIndexOutOfBounds in the inner buffers when a later batch only added groups).
+      val ids = groups.ids().clone()
+      var i = 0
+      while (i < n) { if (!Bitmap.isSet(bits, i)) ids(i) = -1; i += 1 }
+      s.update(ctx, GroupAssignment.of(ids, n, groups.numGroups(), ctx.arena, groups.useMasks(), bits))
     }
     override def bufferValue(g: Int, slot: Int): Any = s.bufferValue(g, slot)
   }
