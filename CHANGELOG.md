@@ -50,6 +50,10 @@ version may change configuration keys or defaults, always noted here.
 
 ### Changed
 
+- `FactBloomFilter` merges its filter in two levels: the creation side's per-task partial filters go to 32
+  groups merged in parallel (`spark.vecruntime.optimizer.factBloomFilter.mergeBuckets`), then one small merge ORs the
+  group filters. A single task used to merge every partial (q17 at 1 TB: 595 and 801 partials of 8 MB, 44-59 s each).
+  The filter is bit-for-bit the same (#646).
 - The runtime bloom-filter probe (`BloomProbeExpr`) now skips rows an earlier `AND` conjunct already rejected,
   instead of probing every row of a batch. No result change; it was 13.9% of q24a's executor CPU at 1 TB.
 - The runtime bloom-filter probe deserialises its filter once per executor instead of once per task. Each task

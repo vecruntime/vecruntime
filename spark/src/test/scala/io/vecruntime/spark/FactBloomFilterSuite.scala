@@ -118,4 +118,55 @@ class FactBloomFilterSuite extends VectorQuerySuite {
   test("the switch turns the rewrite off") {
     withConf(VectorConf.FactBloomFilterEnabled -> "false")(assert(salesBlooms(run(q93)) === 0))
   }
+
+  /** The filters' subquery plans in the optimized plan. */
+  private def filterSubqueries(df: DataFrame): Seq[org.apache.spark.sql.catalyst.plans.logical.LogicalPlan] =
+    df.queryExecution.optimizedPlan.collect { case f: org.apache.spark.sql.catalyst.plans.logical.Filter => f }
+      .flatMap(_.condition.collect { case b: BloomFilterMightContain => b.bloomFilterExpression })
+      .flatMap(_.collect { case s: org.apache.spark.sql.catalyst.expressions.ScalarSubquery => s.plan })
+
+  private def mergesInTwoLevels(p: org.apache.spark.sql.catalyst.plans.logical.LogicalPlan): Boolean =
+    p.exists {
+      case a: org.apache.spark.sql.catalyst.plans.logical.Aggregate =>
+        a.aggregateExpressions.exists(_.exists(_.isInstanceOf[org.apache.spark.sql.vecruntime.BloomFilterMerge]))
+      case _ => false
+    }
+
+  test("the filter is merged in two levels, a bucket of the partition id first (#646)") {
+    // Many small files: many creation-side tasks, so the per-task partials go through the buckets.
+    val df = withConf("spark.sql.files.maxPartitionBytes" -> "4096", "spark.sql.files.openCostInBytes" -> "0")(run(q93))
+    val subs = filterSubqueries(df)
+    assert(subs.nonEmpty && subs.forall(mergesInTwoLevels), subs.map(_.treeString).mkString("\n"))
+    // mergeBuckets = 1 is the single-level filter, with the same results.
+    val one = withConf(VectorConf.FactBloomFilterMergeBuckets -> "1")(run(q93))
+    val subs1 = filterSubqueries(one)
+    assert(subs1.nonEmpty && !subs1.exists(mergesInTwoLevels), subs1.map(_.treeString).mkString("\n"))
+  }
+
+  test("bloom_filter_merge of bucket filters is the single-level filter, bit for bit; nulls are skipped") {
+    import org.apache.spark.sql.catalyst.InternalRow
+    import org.apache.spark.sql.catalyst.expressions.BoundReference
+    import org.apache.spark.sql.catalyst.expressions.aggregate.BloomFilterAggregate
+    import org.apache.spark.sql.types.BinaryType
+    import org.apache.spark.util.sketch.BloomFilter
+    val (items, bits) = (5000L, 1L << 16)
+    def filterOf(keys: Seq[Long]): BloomFilter = { val f = BloomFilter.create(items, bits); keys.foreach(f.putLong); f }
+    val all = (0L until 5000L).map(_ * 7919L)
+    val single = BloomFilterAggregate.serialize(filterOf(all))
+    val merge = org.apache.spark.sql.vecruntime.BloomFilterMerge(BoundReference(0, BinaryType, nullable = true))
+    // Three buckets plus a null (a bucket with no key), split across two partial buffers merged together.
+    val parts = all.grouped(1700).map(ks => BloomFilterAggregate.serialize(filterOf(ks))).toSeq
+    val b1 = merge.createAggregationBuffer()
+    merge.update(b1, InternalRow(parts.head))
+    merge.update(b1, InternalRow(null))
+    val b2 = merge.createAggregationBuffer()
+    parts.tail.foreach(p => merge.update(b2, InternalRow(p)))
+    val roundTrip = merge.deserialize(merge.serialize(b2))
+    val out = merge.eval(merge.merge(b1, roundTrip)).asInstanceOf[Array[Byte]]
+    assert(java.util.Arrays.equals(out, single))
+    // Only nulls (or nothing): null, as bloom_filter_agg is with no key.
+    val empty = merge.createAggregationBuffer()
+    merge.update(empty, InternalRow(null))
+    assert(merge.eval(merge.merge(empty, merge.deserialize(merge.serialize(merge.createAggregationBuffer())))) == null)
+  }
 }

@@ -318,6 +318,14 @@ join key gets one filter per key. The filter's expected items come from the crea
 its bytes over its row width when the row count is unknown (as at 1 TB); the bit size is capped by
 `spark.sql.optimizer.runtime.bloomFilter.maxNumItems` and `maxNumBits`.
 
+**Two-level merge (#646).** `bloom_filter_agg` makes one partial filter per creation-side task, each the whole bit
+array (up to `maxNumBits`/8 bytes), and a single Final task would merge all of them: at 1 TB q17's filters merged 595
+and 801 partials in one task each (3.8-6.6 GB read, 44-59 s). The subquery is therefore
+`bloom_filter_merge(bloom_filter_agg(xxhash64(key)) GROUP BY pmod(spark_partition_id(), mergeBuckets))`: each task's
+partial goes to one of `mergeBuckets` (32) groups merged in parallel, and `bloom_filter_merge` ORs the group filters in
+one small task. Both levels use the same bits and hash count, so the OR is the single-level filter bit for bit
+(`FactBloomFilterSuite`); a group with no key gives null and is skipped.
+
 **Why the result is the same.** A bloom filter has no false negatives, and a row whose key the creation side
 does not hold cannot survive the join. False positives only let a non-matching row through to the join, which
 then drops it.

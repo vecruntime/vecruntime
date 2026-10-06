@@ -23,8 +23,10 @@ import org.apache.spark.sql.catalyst.expressions.{
   DynamicPruningSubquery,
   Expression,
   Literal,
+  Pmod,
   PredicateHelper,
   ScalarSubquery,
+  SparkPartitionID,
   XxHash64
 }
 import org.apache.spark.sql.catalyst.expressions.aggregate.BloomFilterAggregate
@@ -115,9 +117,22 @@ case class FactBloomFilter(session: SparkSession) extends Rule[LogicalPlan] with
     }
     val items = rows.max(1).min(BigInt(Long.MaxValue)).toLong
     val agg = new BloomFilterAggregate(new XxHash64(Seq(key)), Literal(items))
-    val alias = Alias(agg.toAggregateExpression(), "bloomFilter")()
+    val buckets = VectorConf.factBloomFilterMergeBuckets(session.sessionState.conf)
+    val plan =
+      if (buckets <= 1) Aggregate(Nil, Seq(Alias(agg.toAggregateExpression(), "bloomFilter")()), creation)
+      else {
+        // Two levels (#646): one partial filter per creation-side task would all meet in a single task. Group
+        // them by a bucket of the task's partition id, so `buckets` tasks each merge a share of them, then OR
+        // the bucket filters in one small aggregate. Same bits and hash count at both levels: the same filter.
+        val bucket = Alias(Pmod(SparkPartitionID(), Literal(buckets)), "bloomBucket")()
+        val tagged = Project(creation.output :+ bucket, creation)
+        val partial = Alias(agg.toAggregateExpression(), "bloomPartial")()
+        val byBucket = Aggregate(Seq(bucket.toAttribute), Seq(partial), tagged)
+        val merged = BloomFilterMerge(partial.toAttribute).toAggregateExpression()
+        Aggregate(Nil, Seq(Alias(merged, "bloomFilter")()), byBucket)
+      }
     // Column pruning as Spark's own rule does: the subquery reads only the creation key.
-    val subquery = ScalarSubquery(ColumnPruning(Aggregate(Nil, Seq(alias), creation)), Nil)
+    val subquery = ScalarSubquery(ColumnPruning(plan), Nil)
     BloomFilterMightContain(subquery, new XxHash64(Seq(appExpr)))
   }
 
