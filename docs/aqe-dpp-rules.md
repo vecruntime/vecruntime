@@ -184,7 +184,15 @@ batch's next pass.
 - SF1 checksums match Spark on q1, q65, q30, q81, q24a and q18.
 - At SF1, q65 and q1 plan 4 Parquet scans instead of 6: the fact scan and its `date_dim` join are
   planned once and reused.
-- A 1 TB A/B is pending.
+- At 1 TB on 2026-10-06, the first version (PR #636) did not fire on q65 or q1. The fact table is partitioned
+  there, and Spark's DPP gives each copy its own pruning subquery, which broke the comparison in two ways:
+  - the subquery sits in a different place among each copy's filters, and canonicalization does not
+    reorder an `AND` that holds a subquery;
+  - `DynamicPruningSubquery` canonicalizes its build keys on their own, keeping their expression ids.
+
+  The rule now rebuilds the remaining conjuncts in one canonical order. It compares inputs with the pruning
+  subqueries' build keys normalized against their build plan. A partitioned-fact test covers this case.
+- The 1 TB A/B of the fixed rule is pending.
 
 ## `DppThroughAggregate`: dynamic partition pruning through an aggregate
 

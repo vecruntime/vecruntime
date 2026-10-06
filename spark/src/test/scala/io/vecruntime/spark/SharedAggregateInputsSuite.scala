@@ -96,6 +96,22 @@ class SharedAggregateInputsSuite extends VectorQuerySuite {
     assert(factScans(check(sql)) === 1)
   }
 
+  test("the same, with the fact partitioned and pruned by DPP in each use (as at 1 TB)") {
+    // Each copy gets its own dynamic pruning subquery, listed in a different place among its filters.
+    spark.table("store_sales").write.mode("overwrite").partitionBy("ss_sold_date_sk")
+      .parquet(newTempPath("shared/store_sales_p"))
+    spark.read.parquet(newTempPath("shared/store_sales_p")).createOrReplaceTempView("store_sales_p")
+    val sql =
+      s"""WITH ${sa.replace("FROM store_sales,", "FROM store_sales_p,")}
+         |SELECT s_store_name, i_item_desc, sc.revenue
+         |FROM store, item, (SELECT ss_store_sk, avg(revenue) ave FROM sa GROUP BY ss_store_sk) sb, sa sc
+         |WHERE sb.ss_store_sk = sc.ss_store_sk AND sc.revenue <= 0.9 * sb.ave
+         |  AND s_store_sk = sc.ss_store_sk AND i_item_sk = sc.ss_item_sk""".stripMargin
+    assert(sql.contains("store_sales_p"))
+    assert(without(sql) === 2)
+    assert(factScans(check(sql)) === 1)
+  }
+
   test("q1's correlated average over the same CTE is scanned once") {
     val sql =
       s"""WITH $sa
