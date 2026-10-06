@@ -80,6 +80,55 @@ class FactBloomFilterSuite extends VectorQuerySuite {
     assert(salesBlooms(off) === 0, off.queryExecution.optimizedPlan.treeString)
   }
 
+  test("the probe joins the fact's own filter directly above the scan, keeping its partition pruning") {
+    import org.apache.spark.sql.catalyst.expressions.DynamicPruning
+    import org.apache.spark.sql.catalyst.plans.logical.Filter
+    import org.apache.spark.sql.execution.{FileSourceScanExec, FilterExec}
+    try {
+      // The sales partitioned by a date key and pruned through a filtered date table, as store_sales at 1 TB.
+      spark.table("store_sales").selectExpr("*", "ss_item_sk % 7 AS ss_date").write.partitionBy("ss_date")
+        .saveAsTable("fb_psales")
+      spark.range(0, 7).selectExpr("id AS d_date", "id % 2 AS d_odd").write.saveAsTable("fb_pdate")
+      val sql =
+        """SELECT ss_item_sk, sum(ss_quantity - sr_return_quantity) q, count(*) c, max(ss_pad) p
+          |FROM fb_psales JOIN fb_pdate ON ss_date = d_date
+          |JOIN (SELECT * FROM store_returns WHERE isnotnull(nullif(sr_return_quantity, 0))) r
+          |  ON ss_ticket_number = sr_ticket_number AND ss_item_sk = sr_item_sk
+          |WHERE d_odd = 1 AND ss_quantity > 2
+          |GROUP BY ss_item_sk""".stripMargin
+      run(sql) // results unchanged (broadcast-reuse pruning only, as by default)
+      // The physical planning, not run: a non-broadcast pruning subquery is what puts the expression in the plan.
+      withConf("spark.sql.optimizer.dynamicPartitionPruning.reuseBroadcastOnly" -> "false") {
+        shuffleOnly {
+          val qe = withPlugin(enabled = true)(spark.sql(sql).queryExecution)
+          val plan = qe.optimizedPlan
+          assert(salesBlooms(spark.sql(sql)) >= 1, plan.treeString)
+          assert(!plan.exists { case Filter(_, _: Filter) => true; case _ => false }, plan.treeString)
+          // The scan took the pruning expression as a partition filter; no row filter evaluates it.
+          val physical = qe.sparkPlan
+          assert(
+            physical.collect { case f: FileSourceScanExec => f }.exists(_.partitionFilters.exists(
+              _.isInstanceOf[DynamicPruning]
+            )),
+            physical.treeString
+          )
+          assert(
+            physical.collect { case f: FilterExec => f }.forall(!_.condition.exists(_.isInstanceOf[DynamicPruning])),
+            physical.treeString
+          )
+        }
+      }
+    } finally {
+      Seq("fb_psales", "fb_pdate").foreach { t =>
+        spark.sessionState.catalog.dropTable(
+          org.apache.spark.sql.catalyst.TableIdentifier(t),
+          ignoreIfNotExists = true,
+          purge = false
+        )
+      }
+    }
+  }
+
   test("the filter's Final aggregate over a row exchange stays Spark's, not ours over RowToColumnar (#647)") {
     import org.apache.spark.sql.catalyst.expressions.aggregate.{BloomFilterAggregate, Final}
     import org.apache.spark.sql.execution.{RowToColumnarExec, SparkPlan}

@@ -19,6 +19,7 @@ import io.vecruntime.spark.VectorConf
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.expressions.{
   Alias,
+  And,
   BloomFilterMightContain,
   DynamicPruningSubquery,
   Expression,
@@ -231,7 +232,15 @@ case class FactBloomFilter(session: SparkSession) extends Rule[LogicalPlan] with
     case pr @ Project(list, child) =>
       onScan(child, replaceAlias(key, getAliasMap(pr)), threshold, mk).map(c => Project(list, c))
     case Filter(cond, child) =>
-      if (hasFilterOn(cond, key)) None else onScan(child, key, threshold, mk).map(c => Filter(cond, c))
+      if (hasFilterOn(cond, key)) None
+      else onScan(child, key, threshold, mk).map {
+        // The probe joins the filter right above the scan rather than going below it: Spark takes partition
+        // filters (a dynamic pruning expression among them) only from the filter directly over the relation, so
+        // a second filter in between would lose the scan's partition pruning and leave the pruning expression in
+        // a filter evaluated row by row (q48, q13 and q61 at 1 TB).
+        case Filter(probe, rel: LogicalRelation) if child.isInstanceOf[LogicalRelation] => Filter(And(cond, probe), rel)
+        case c => Filter(cond, c)
+      }
     case jn @ Join(l, r, jt, _, _) if jt == Inner || jt == LeftSemi =>
       if (key.references.subsetOf(l.outputSet)) onScan(l, key, threshold, mk).map(c => jn.copy(left = c))
       else if (jt == Inner && key.references.subsetOf(r.outputSet))
