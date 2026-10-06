@@ -15,8 +15,6 @@
  */
 package io.vecruntime.spark.expr
 
-import java.io.ByteArrayInputStream
-
 import io.vecruntime.kernels.{ArrowLayout, Bitmap, SegmentVectorBuffers, VecType, VectorBuffers}
 import io.vecruntime.spark.adapter.TypeMapping
 import org.apache.spark.sql.catalyst.expressions.{EmptyRow, Expression, XXH64}
@@ -150,8 +148,9 @@ object XxHash64Expr {
 
 /**
  * `BloomFilterMightContain(filter, xxhash64(key))`: Spark's runtime join filter, probed per lane
- * through Spark's own `BloomFilter` deserialised once from the subquery's bytes. A null filter (the
- * build side produced none) gives a null lane for every row, as Spark's does.
+ * through Spark's own `BloomFilter`, deserialised once per executor from the subquery's bytes
+ * (`BloomFilterCache`) rather than once per task. A null filter (the build side produced none) gives a
+ * null lane for every row, as Spark's does.
  */
 final case class BloomProbeExpr(filter: SubqueryLiteralExpr, hash: VectorExpr) extends VectorExpr {
   override def dataType: DataType = BooleanType
@@ -159,7 +158,7 @@ final case class BloomProbeExpr(filter: SubqueryLiteralExpr, hash: VectorExpr) e
 
   @transient private lazy val bloom: BloomFilter = filter.value match {
     case null => null
-    case bytes: Array[Byte] => BloomFilter.readFrom(new ByteArrayInputStream(bytes))
+    case bytes: Array[Byte] => BloomFilterCache.get(bytes)
   }
 
   override def eval(ctx: EvalContext): VectorBuffers = {
