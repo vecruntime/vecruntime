@@ -59,6 +59,12 @@ object VectorConf {
   val RollupRewriteEnabled = "spark.vecruntime.exec.aggregate.rollupRewrite.enabled"
 
   /**
+   * Logical rewrite: an existence-only self-join `t1 JOIN t2 ON t1.k = t2.k AND t1.v <> t2.v`
+   * (TPC-DS q95's `ws_wh`) becomes `GROUP BY k HAVING min(v) <> max(v)` -- no many-to-many join.
+   */
+  val SelfJoinToAggregateEnabled = "spark.vecruntime.optimizer.selfJoinToAggregate.enabled"
+
+  /**
    * Logical rewrite: global aggregates over the same input with different filters (TPC-DS q9's
    * scalar subqueries, q28 / q88 / q90's cross-joined aggregates) are computed in one pass.
    */
@@ -211,6 +217,10 @@ object VectorConf {
   /** Convert ExpandExec (grouping sets, the distinct rewrite) over a columnar child. */
   def expandEnabled(conf: SQLConf): Boolean = bool(conf, ExpandEnabled, default = true)
   def rollupRewriteEnabled(conf: SQLConf): Boolean = bool(conf, RollupRewriteEnabled, default = true)
+
+  /** The existence-only self-join to min/max aggregate rewrite; also off when the plugin is off. */
+  def selfJoinToAggregateEnabled(conf: SQLConf): Boolean =
+    isEnabled(conf) && bool(conf, SelfJoinToAggregateEnabled, default = true)
 
   /** Merging global aggregates that differ only in their filters; also off when the plugin is off. */
   def mergeFilteredAggregatesEnabled(conf: SQLConf): Boolean =

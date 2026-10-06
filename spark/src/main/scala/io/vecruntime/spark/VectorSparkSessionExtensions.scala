@@ -16,7 +16,12 @@
 package io.vecruntime.spark
 
 import org.apache.spark.sql.SparkSessionExtensions
-import org.apache.spark.sql.vecruntime.{MergeFilteredAggregates, VectorColumnarRule, VectorWriteDeltaStrategy}
+import org.apache.spark.sql.vecruntime.{
+  MergeFilteredAggregates,
+  SelfJoinToAggregate,
+  VectorColumnarRule,
+  VectorWriteDeltaStrategy
+}
 
 /**
  * Registers the planner rule. Enable with
@@ -27,6 +32,7 @@ class VectorSparkSessionExtensions extends (SparkSessionExtensions => Unit) {
   override def apply(extensions: SparkSessionExtensions): Unit = {
     extensions.injectColumnar(session => VectorColumnarRule(session))
     // Logical rewrites EMR Serverless also does (spark.vecruntime.optimizer.*); off with the plugin.
+    extensions.injectOptimizerRule(session => SelfJoinToAggregate(session))
     extensions.injectOptimizerRule(session => MergeFilteredAggregates(session))
     // The columnar v3 deletion-vector writer (#20): a planner strategy over the logical WriteDelta,
     // gated on spark.vecruntime.iceberg.dvWriter.enabled and a v3 target; declines to Spark otherwise.
