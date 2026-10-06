@@ -28,8 +28,10 @@ which shapes are worth handling.
 | `SelfJoinToAggregate` | `spark.vecruntime.optimizer.selfJoinToAggregate.enabled` | q95 |
 | `MergeFilteredAggregates` | `spark.vecruntime.optimizer.mergeFilteredAggregates.enabled` | q9, q28, q88, q90 |
 | `SharedAggregateInputs` | `spark.vecruntime.optimizer.sharedAggregateInputs.enabled` | q1, q65 |
+| `DppThroughAggregate` | `spark.vecruntime.optimizer.dppThroughAggregate.enabled` | q2, q59 |
 
-No AQE or DPP setting is changed by the plugin today. Changes to either belong on this page too.
+The plugin changes no AQE setting. `DppThroughAggregate` adds dynamic partition pruning filters where Spark's
+DPP does not reach; Spark's own DPP settings are unchanged.
 
 ## `SelfJoinToAggregate`: existence-only self-joins as a min/max aggregate
 
@@ -191,3 +193,46 @@ batch's next pass.
   The rule now rebuilds the remaining conjuncts in one canonical order. It compares inputs with the pruning
   subqueries' build keys normalized against their build plan. A partitioned-fact test covers this case.
 - The 1 TB A/B of the fixed rule is pending.
+
+## `DppThroughAggregate`: dynamic partition pruning through an aggregate
+
+`spark/src/main/scala/org/apache/spark/sql/vecruntime/DppThroughAggregate.scala`, issue #633.
+
+**Shape.** `Join(Inner | LeftSemi, A, F, A.k = F.k')` where:
+- `F` has a selective filter (`isLikelySelective`, the test Spark's DPP uses);
+- `A` reaches, through projections, filters and inner or semi joins, an `Aggregate` with `k` among its
+  grouping columns;
+- below the aggregate, `k` comes from a dimension `D` that is inner-joined to a fact on `fact.p = D.d`;
+- `p` traces to a partition column of a file scan, through projections, filters and unions of fact branches.
+
+TPC-DS q59 (`store_sales` grouped by `d_week_seq`, each use joined to a `d_month_seq` range of `date_dim`) and
+q2 (`web_sales` union `catalog_sales`, the same way) have it.
+
+**Why Spark does not prune it.** `PartitionPruning` follows the join key down through the aggregate to `D.k`.
+That is not a partition column, so it stops. The inner fact-to-dimension join gets no pruning either: `D`
+has no selective filter of its own, and a dynamic filter does not count as one.
+
+**Rewrite.** The fact scan gets `Filter(DynamicPruningSubquery(p, D LEFT SEMI JOIN F ON D.k = F.k', D.d))`,
+with `onlyInBroadcast = false`. Spark plans it like its own DPP: a broadcast reuse where one matches, else
+a one-off subquery over the small dimension, and the partition filter reaches `FileSourceStrategy`. For a
+union, every branch whose scan is partitioned on the matching column gets its own filter.
+
+**Why the result is the same.** The aggregate groups by `k`, and above it an inner or semi join keeps only
+the `k` values `F` produces. A fact row whose dimension row has a `k` outside that set only feeds groups the
+join drops. Every dimension row whose `k` is in the set keeps its `d`, so no row of a surviving group is
+removed. Null keys never join, on either side.
+
+**Placement.** Runs once in the Pre-CBO batch (`injectPreCBORule`): after filters were pushed down, and
+before Spark's `PartitionPruning`, which skips a join that already has a pruning filter on its side.
+
+**Declined:**
+- a join key that is not a grouping column of the aggregate (an aggregate output such as `max(...)`);
+- an outer join that preserves the aggregate's side;
+- an `F` with no selective filter;
+- a scan that already has a pruning filter on `p`;
+- a key computed by an expression above the aggregate rather than passed through;
+- non-deterministic filters or aggregates on the path.
+
+**Measured.** `DppThroughAggregateSuite` covers the q59 and q2 shapes, which read fewer files than with the
+rule off, plus the two declined shapes and the switch. Results are compared with Spark with the plugin off. The
+1 TB numbers come with the PR.

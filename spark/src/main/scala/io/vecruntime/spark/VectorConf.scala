@@ -52,6 +52,13 @@ object VectorConf {
    */
   val SharedAggregateInputsEnabled = "spark.vecruntime.optimizer.sharedAggregateInputs.enabled"
 
+  /**
+   * Logical rewrite (#633): dynamic partition pruning of a fact scan below an aggregate whose grouping
+   * key is joined above it to a filtered relation (through the dimension that maps the key to the
+   * fact's partition column).
+   */
+  val DppThroughAggregateEnabled = "spark.vecruntime.optimizer.dppThroughAggregate.enabled"
+
   /** The grouped aggregate emits its UTF8 keys dictionary-encoded, ids over the group table's own dictionary (#377). */
   val AggDictionaryKeys = "spark.vecruntime.agg.dictionaryKeys"
   val SortEnabled = "spark.vecruntime.exec.sort.enabled"
@@ -518,6 +525,10 @@ object VectorConf {
   /** The shared-aggregate-inputs rewrite (#632); also off when the plugin is off. */
   def sharedAggregateInputsEnabled(conf: SQLConf): Boolean =
     isEnabled(conf) && bool(conf, SharedAggregateInputsEnabled, default = true)
+
+  /** DPP through an aggregate (#633); also off when the plugin is off. */
+  def dppThroughAggregateEnabled(conf: SQLConf): Boolean =
+    isEnabled(conf) && bool(conf, DppThroughAggregateEnabled, default = true)
 
   private def bool(conf: SQLConf, key: String, default: Boolean): Boolean =
     conf.getConfString(key, default.toString).trim.equalsIgnoreCase("true")
