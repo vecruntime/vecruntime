@@ -221,6 +221,7 @@ object VectorConf {
   /** The existence-only self-join to min/max aggregate rewrite; also off when the plugin is off. */
   def selfJoinToAggregateEnabled(conf: SQLConf): Boolean =
     isEnabled(conf) && bool(conf, SelfJoinToAggregateEnabled, default = true)
+
   /** Merging global aggregates that differ only in their filters; also off when the plugin is off. */
   def mergeFilteredAggregatesEnabled(conf: SQLConf): Boolean =
     isEnabled(conf) && bool(conf, MergeFilteredAggregatesEnabled, default = true)
