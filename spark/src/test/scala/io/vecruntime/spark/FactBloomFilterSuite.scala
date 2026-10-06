@@ -58,7 +58,16 @@ class FactBloomFilterSuite extends VectorQuerySuite {
       .flatMap(_.condition.collect { case b: BloomFilterMightContain => b })
       .count(_.valueExpression.references.exists(_.name.startsWith("ss_")))
 
+  // The creation side is reduced by a filter (#650): without statistics a whole, unfiltered table gets no filter.
+  // `isnotnull(nullif(..))` drops a third of the returns, and Spark's own runtime filter does not count it as
+  // selective, so only this rule's filters are in the plan.
   private val q93 =
+    """SELECT ss_item_sk, sum(ss_quantity - sr_return_quantity) q, count(*) c, max(ss_pad) p
+      |FROM store_sales JOIN (SELECT * FROM store_returns WHERE isnotnull(nullif(sr_return_quantity, 0))) r
+      |  ON ss_ticket_number = sr_ticket_number AND ss_item_sk = sr_item_sk
+      |GROUP BY ss_item_sk""".stripMargin
+
+  private val q93Unfiltered =
     """SELECT ss_item_sk, sum(ss_quantity - sr_return_quantity) q, count(*) c, max(ss_pad) p
       |FROM store_sales JOIN store_returns ON ss_ticket_number = sr_ticket_number AND ss_item_sk = sr_item_sk
       |GROUP BY ss_item_sk""".stripMargin
@@ -168,5 +177,39 @@ class FactBloomFilterSuite extends VectorQuerySuite {
     val empty = merge.createAggregationBuffer()
     merge.update(empty, InternalRow(null))
     assert(merge.eval(merge.merge(empty, merge.deserialize(merge.serialize(merge.createAggregationBuffer())))) == null)
+  }
+
+  /** Bloom filters on the sales side, by the sales key they probe. */
+  private def salesBloomKeys(df: DataFrame): Set[String] =
+    df.queryExecution.optimizedPlan.collect { case f: org.apache.spark.sql.catalyst.plans.logical.Filter => f }
+      .flatMap(_.condition.collect { case b: BloomFilterMightContain => b })
+      .flatMap(_.valueExpression.references.map(_.name)).filter(_.startsWith("ss_")).toSet
+
+  test("without statistics, a whole unfiltered creation side gets no filter: it would prune nothing (#650)") {
+    assert(salesBlooms(run(q93Unfiltered)) === 0)
+  }
+
+  test("with ANALYZE column statistics, the filter follows the keys' distinct counts, not filters (#650)") {
+    // Catalog copies with ANALYZE ... FOR ALL COLUMNS; spark.sql.cbo.enabled stays off.
+    try {
+      spark.table("store_sales").write.saveAsTable("fb_sales")
+      spark.table("store_returns").write.saveAsTable("fb_returns")
+      spark.sql("ANALYZE TABLE fb_sales COMPUTE STATISTICS FOR ALL COLUMNS")
+      spark.sql("ANALYZE TABLE fb_returns COMPUTE STATISTICS FOR ALL COLUMNS")
+      val sql = q93Unfiltered.replace("store_sales", "fb_sales").replace("store_returns", "fb_returns")
+      // ticket numbers: 2000 of 10000 sales tickets have a return (0.2 <= 0.5) -> a filter, though unfiltered;
+      // item keys: all 97 items on both sides (1.0) -> none, as for a whole dimension.
+      assert(salesBloomKeys(run(sql)) === Set("ss_ticket_number"))
+      // A stricter maxSelectivity than the ticket key's 0.2 declines it too.
+      withConf(VectorConf.FactBloomFilterMaxSelectivity -> "0.1")(assert(salesBlooms(run(sql)) === 0))
+    } finally {
+      Seq("fb_sales", "fb_returns").foreach { t =>
+        spark.sessionState.catalog.dropTable(
+          org.apache.spark.sql.catalyst.TableIdentifier(t),
+          ignoreIfNotExists = true,
+          purge = false
+        )
+      }
+    }
   }
 }

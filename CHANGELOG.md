@@ -50,6 +50,11 @@ version may change configuration keys or defaults, always noted here.
 
 ### Changed
 
+- `FactBloomFilter` adds a filter only on evidence that it prunes: with distinct-count statistics for both keys
+  (Spark `ANALYZE ... FOR COLUMNS`, or Iceberg's Puffin statistics through DSv2), when at most
+  `spark.vecruntime.optimizer.factBloomFilter.maxSelectivity` (0.5) of the filtered side can match; without them,
+  only from a creation side a filter reduces. It no longer builds filters from whole dimension tables, which pruned
+  nothing and delayed the scan (q19, q45, q46, q31, q38, q23b, q64 at 1 TB) (#650).
 - `FactBloomFilter` merges its filter in two levels: the creation side's per-task partial filters go to 32
   groups merged in parallel (`spark.vecruntime.optimizer.factBloomFilter.mergeBuckets`), then one small merge ORs the
   group filters. A single task used to merge every partial (q17 at 1 TB: 595 and 801 partials of 8 MB, 44-59 s each).

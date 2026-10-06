@@ -80,6 +80,12 @@ object VectorConf {
    */
   val FactBloomFilterMergeBuckets = "spark.vecruntime.optimizer.factBloomFilter.mergeBuckets"
 
+  /**
+   * With distinct counts for both join keys (#650): fire only when at most this share of the application
+   * rows can find a match, `ndv(creation key) / ndv(application key)`.
+   */
+  val FactBloomFilterMaxSelectivity = "spark.vecruntime.optimizer.factBloomFilter.maxSelectivity"
+
   /** The grouped aggregate emits its UTF8 keys dictionary-encoded, ids over the group table's own dictionary (#377). */
   val AggDictionaryKeys = "spark.vecruntime.agg.dictionaryKeys"
   val SortEnabled = "spark.vecruntime.exec.sort.enabled"
@@ -564,6 +570,9 @@ object VectorConf {
 
   def factBloomFilterMergeBuckets(conf: SQLConf): Int =
     math.max(1, conf.getConfString(FactBloomFilterMergeBuckets, "32").trim.toInt)
+
+  def factBloomFilterMaxSelectivity(conf: SQLConf): Double =
+    math.min(1.0, math.max(0.0, conf.getConfString(FactBloomFilterMaxSelectivity, "0.5").trim.toDouble))
 
   private def bool(conf: SQLConf, key: String, default: Boolean): Boolean =
     conf.getConfString(key, default.toString).trim.equalsIgnoreCase("true")
