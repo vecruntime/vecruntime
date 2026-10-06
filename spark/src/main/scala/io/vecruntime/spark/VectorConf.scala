@@ -60,6 +60,10 @@ object VectorConf {
   val DppThroughAggregateEnabled = "spark.vecruntime.optimizer.dppThroughAggregate.enabled"
 
   /**
+   * Logical rewrite (#634): dynamic partition pruning of a scan through a second join key, when the joined
+   * dimension is unfiltered but another key of the same join comes from a filtered relation.
+   */
+  val TransitiveDppEnabled = "spark.vecruntime.optimizer.transitiveDpp.enabled"
    * Logical rewrite (#641): a runtime bloom filter on a shuffle join's much larger side, built from the other
    * side (a fact from a smaller fact), where Spark's own runtime filter needs a selective filtered scan.
    */
@@ -539,6 +543,9 @@ object VectorConf {
   def dppThroughAggregateEnabled(conf: SQLConf): Boolean =
     isEnabled(conf) && bool(conf, DppThroughAggregateEnabled, default = true)
 
+  /** Transitive DPP through a second join key (#634); also off when the plugin is off. */
+  def transitiveDppEnabled(conf: SQLConf): Boolean =
+    isEnabled(conf) && bool(conf, TransitiveDppEnabled, default = true)
   /** The fact-to-fact bloom filter (#641); also off when the plugin is off. */
   def factBloomFilterEnabled(conf: SQLConf): Boolean =
     isEnabled(conf) && bool(conf, FactBloomFilterEnabled, default = true)
