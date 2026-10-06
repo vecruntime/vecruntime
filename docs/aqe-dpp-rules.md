@@ -361,3 +361,33 @@ Spark) and the declined shapes. The 1 TB numbers come with the PR.
 
 **Related.** `BloomProbeExpr` now skips rows an earlier conjunct already rejected (#635), so a probe this rule
 adds costs nothing on rows the scan's other filters drop.
+
+## `AggregateBelowJoin`: the fact aggregated by its join keys before a star join
+
+TPC-DS q4, q11 and q74 sum `store_sales` (and the catalog and web facts) per customer and year, grouped by seven
+`customer` strings and `d_year`, after joining `customer` and `date_dim`. Spark aggregates after the joins, so
+every fact row is joined and then hashed on the strings: at 1 TB each of q4's fact stages shuffled 6.1 GB
+(537M rows) against 0.7 GB on EMR Serverless, which aggregates `(ss_customer_sk, ss_sold_date_sk)` directly
+above the scan.
+
+Shape (logical, in the late optimizer batch):
+
+```
+Aggregate(G, aggs, path)   path: Project / Filter / Join(inner, or left semi with F on the left) down to F
+```
+
+where every aggregate function is a non-distinct, unfiltered `sum`, `count`, `min` or `max` over columns of `F`,
+and every column of `F` the plan above needs apart from those inputs is a join key on the path (`G` groups by the
+other sides). `F` becomes `Aggregate(P, P ++ partials, F)` with `P` those join keys, and the top aggregate
+combines: `sum` of partial sums cast to the original type, `coalesce(sum(partial counts), 0)`, `min`/`max` of
+the partial minima and maxima.
+
+The result is unchanged: an inner join keeps or repeats an `F` row by its join keys alone, and every row of a
+pre-aggregated group has the same keys, so the group meets the same rows each of its rows would; `sum`, `count`,
+`min` and `max` distribute over that. A null key forms one group, which the join drops as it would drop its rows.
+Decimal sums are exact; a floating-point sum can differ in the last digits, as any change in summation order.
+
+Declined: a `DISTINCT` or filtered aggregate, any other function (`avg`, `stddev`, ...), aggregate inputs from
+more than one side, a column of `F` grouped by or used above other than as a join key, outer joins, and an `F`
+that is already an aggregate. Off with `spark.vecruntime.optimizer.aggregateBelowJoin.enabled=false`.
+

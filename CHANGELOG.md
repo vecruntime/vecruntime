@@ -8,6 +8,9 @@ version may change configuration keys or defaults, always noted here.
 
 ### Added
 
+- Eager aggregation below star joins (`spark.vecruntime.optimizer.aggregateBelowJoin.enabled`, on by default,
+  #657): an aggregate of `sum`/`count`/`min`/`max` over one fact table, grouped by the other join sides' columns,
+  first aggregates the fact by its join keys before the inner joins (TPC-DS q4, q11 and q74).
 - A runtime bloom filter from a smaller fact table onto a larger one it joins
   (`spark.vecruntime.optimizer.factBloomFilter.enabled`, on by default): a shuffle join whose filtered side is at
   least 10x larger (estimated bytes) than the side the filter is built from gets
