@@ -569,7 +569,7 @@ object VectorConf {
 
   /** The fact-to-fact bloom filter (#641); also off when the plugin is off. */
   def factBloomFilterEnabled(conf: SQLConf): Boolean =
-    isEnabled(conf) && bool(conf, FactBloomFilterEnabled, default = true)
+    isEnabled(conf) && bool(conf, FactBloomFilterEnabled, default = false)
 
   def factBloomFilterSizeRatio(conf: SQLConf): Int =
     math.max(2, conf.getConfString(FactBloomFilterSizeRatio, "10").trim.toInt)

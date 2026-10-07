@@ -9,7 +9,7 @@ version may change configuration keys or defaults, always noted here.
 ### Added
 
 - A runtime bloom filter from a smaller fact table onto a larger one it joins
-  (`spark.vecruntime.optimizer.factBloomFilter.enabled`, on by default): a shuffle join whose filtered side is at
+  (`spark.vecruntime.optimizer.factBloomFilter.enabled`, off by default): a shuffle join whose filtered side is at
   least 10x larger (estimated bytes) than the side the filter is built from gets
   `might_contain(bloom, xxhash64(key))` on the larger side. TPC-DS q93 filters `store_sales` by `store_returns`;
   Spark's own runtime filter only builds one from a selectively-filtered scan, and EMR Serverless does this.
@@ -56,6 +56,9 @@ version may change configuration keys or defaults, always noted here.
 
 ### Changed
 
+- `spark.vecruntime.optimizer.factBloomFilter.enabled` defaults to `false`. Full 1 TB runs with `ANALYZE` statistics:
+  1197 s off, 1208 s on; the rule helps q49, q51, q28 and q50 but still slows q23b, q18, q61 and q13, whose
+  creation sides are filtered dimensions that prune little. It stays available to turn on.
 - `FactBloomFilter` builds a filter for many keys partitioned by hash bucket: the keys are shuffled by
   `pmod(xxhash64(key), B)`, one sub-filter per bucket is built after the shuffle within Spark's caps, and the probe
   tests its bucket's sub-filter. A single `bloom_filter_agg` for tens of millions of keys was capped at 8 MB and

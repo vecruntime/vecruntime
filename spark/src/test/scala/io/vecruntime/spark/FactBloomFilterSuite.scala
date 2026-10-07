@@ -22,8 +22,15 @@ import org.apache.spark.sql.catalyst.expressions.BloomFilterMightContain
 /** A bloom filter from a smaller fact onto a larger one it joins (#641), against Spark with the plugin off. */
 class FactBloomFilterSuite extends VectorQuerySuite {
 
+  override protected def afterAll(): Unit = {
+    try spark.conf.unset(VectorConf.FactBloomFilterEnabled)
+    finally super.afterAll()
+  }
+
   override protected def beforeAll(): Unit = {
     super.beforeAll()
+    // Off by default (1 TB: q18, q61, q23b slower with it); on for this suite, whose tests turn it off themselves.
+    spark.conf.set(VectorConf.FactBloomFilterEnabled, "true")
     val session = spark
     import session.implicits._
     // q93-like: sales with many tickets, returns for one ticket in twenty (about 20x smaller).
