@@ -310,8 +310,48 @@ class FactBloomFilterSuite extends VectorQuerySuite {
     val plan = df.queryExecution.optimizedPlan
     assert(returnsProbe(plan), plan.treeString)
     assert(salesBlooms(df) >= 1, plan.treeString)
+    // The probes stay columnar: no scan falls back to Spark's row filter over them (1 TB, #659).
+    val rowFilters = org.apache.spark.sql.vecruntime.VectorFallback.reasons(df.queryExecution.executedPlan)
+      .filter(_._1.nodeName == "Filter").map(_._2)
+    assert(rowFilters.isEmpty, rowFilters.mkString("; "))
     // (With the reduction off, Spark's own runtime filter adds the reason's filter at this tiny scale, so the switch
     // is not observable here; at 1 TB it did not, and q93's returns got no filter.)
+  }
+
+  test("the filter of a dynamically pruned creation side is dropped and its scan stays columnar (q50, #659)") {
+    try {
+      // q50's shape: the returns partitioned by a date key and pruned through a broadcast, filtered date table.
+      spark.table("store_returns").selectExpr("*", "sr_item_sk % 7 AS sr_date").write.partitionBy("sr_date")
+        .saveAsTable("fb_preturns")
+      spark.range(0, 7).selectExpr("id AS d_date", "id % 2 AS d_odd").write.saveAsTable("fb_pdate2")
+      val sql =
+        """SELECT ss_item_sk, sum(ss_quantity - sr_return_quantity) q, count(*) c, max(ss_pad) p
+          |FROM store_sales JOIN fb_preturns ON ss_ticket_number = sr_ticket_number AND ss_item_sk = sr_item_sk
+          |JOIN fb_pdate2 ON sr_date = d_date
+          |WHERE d_odd = 1 AND isnull(nullif(sr_return_quantity, 0))
+          |GROUP BY ss_item_sk""".stripMargin
+      val small = Seq(
+        "spark.sql.autoBroadcastJoinThreshold" -> "2000",
+        "spark.sql.optimizer.runtime.bloomFilter.applicationSideScanSizeThreshold" -> "0"
+      )
+      withConf(small: _*) {
+        val expected = withPlugin(enabled = false)(spark.sql(sql).collect())
+        val df = withPlugin(enabled = true) { val d = spark.sql(sql); d.collect(); d }
+        assertRowsEqual(expected, df.collect(), 1e-9, sql)
+        assert(expected.nonEmpty)
+        val rowFilters = org.apache.spark.sql.vecruntime.VectorFallback.reasons(df.queryExecution.executedPlan)
+          .filter(_._1.nodeName == "Filter").map(_._2)
+        assert(rowFilters.isEmpty, rowFilters.mkString("; ") + "\n" + df.queryExecution.executedPlan)
+      }
+    } finally {
+      Seq("fb_preturns", "fb_pdate2").foreach { t =>
+        spark.sessionState.catalog.dropTable(
+          org.apache.spark.sql.catalyst.TableIdentifier(t),
+          ignoreIfNotExists = true,
+          purge = false
+        )
+      }
+    }
   }
 
   test("sides of similar size get no filter") {

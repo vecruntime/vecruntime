@@ -20,7 +20,7 @@ import java.util.concurrent.atomic.AtomicLong
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeSet, Literal}
+import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeSet, Coalesce, Literal}
 import org.apache.spark.sql.catalyst.plans.logical.{LeafNode, LogicalPlan, Statistics}
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.execution.{
@@ -36,7 +36,7 @@ import org.apache.spark.sql.execution.{
 import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanExec
 import org.apache.spark.sql.execution.exchange.ShuffleExchangeExec
 import org.apache.spark.sql.execution.joins.{ShuffledHashJoinExec, SortMergeJoinExec}
-import org.apache.spark.sql.types.BinaryType
+import org.apache.spark.sql.types.{BinaryType, BooleanType}
 
 /**
  * The creation side of a `FactBloomFilter` filter, as its build subquery reads it (#659): a reference to the
@@ -83,11 +83,30 @@ case class ShareBloomCreationExchange(session: SparkSession) extends Rule[SparkP
       case j: ShuffledHashJoinExec => share(j, j.left, j.right).map(c => j.withNewChildren(c)).getOrElse(j)
     }
     // Any reference left unclaimed: drop its filter rather than execute a placeholder.
-    joined.transformUp { case p =>
+    val dropped = joined.transformUp { case p =>
       p.transformExpressionsUp {
         case s: ScalarSubquery if refsIn(s).nonEmpty => Literal.create(null, BinaryType)
       }
     }
+    // A dropped filter's probe is folded away: `coalesce(might_contain(null, h), true)` is true. Left in place, the
+    // columnar filter cannot compile a probe of a literal and the whole scan falls back to Spark's row filter and
+    // a row exchange (q50 at 1 TB: store_sales' shuffle 51 GiB -> 118.6 GiB, the query 2.3x slower, #659).
+    dropped.transformUp { case p =>
+      p.transformExpressionsUp {
+        case Coalesce(Seq(m, Literal(true, BooleanType))) if probesNull(m) => Literal.TrueLiteral
+      }
+    }
+  }
+
+  private def probesNull(e: org.apache.spark.sql.catalyst.expressions.Expression): Boolean = e match {
+    case p: PartitionedBloomMightContain => isNullLiteral(p.filter)
+    case b: org.apache.spark.sql.catalyst.expressions.BloomFilterMightContain => isNullLiteral(b.bloomFilterExpression)
+    case _ => false
+  }
+
+  private def isNullLiteral(e: org.apache.spark.sql.catalyst.expressions.Expression): Boolean = e match {
+    case Literal(null, _) => true
+    case _ => false
   }
 
   private def isBloomSubquery(e: org.apache.spark.sql.catalyst.expressions.Expression): Boolean = e match {
