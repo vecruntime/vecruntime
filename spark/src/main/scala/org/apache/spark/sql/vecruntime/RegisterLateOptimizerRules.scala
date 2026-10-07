@@ -40,6 +40,9 @@ case class RegisterLateOptimizerRules(session: SparkSession) extends Rule[Logica
         if (!exp.extraOptimizations.exists(_.isInstanceOf[NarrowBelowJoin])) {
           exp.extraOptimizations = exp.extraOptimizations :+ NarrowBelowJoin(session)
         }
+        if (!exp.extraOptimizations.exists(_.isInstanceOf[AggregateBelowJoin])) {
+          exp.extraOptimizations = exp.extraOptimizations :+ AggregateBelowJoin(session)
+        }
         if (!exp.extraOptimizations.exists(_.isInstanceOf[FactBloomFilter])) {
           exp.extraOptimizations = exp.extraOptimizations :+ FactBloomFilter(session)
         }
