@@ -8,6 +8,10 @@ version may change configuration keys or defaults, always noted here.
 
 ### Added
 
+- A logical rewrite that computes a substring or length of a join's smaller side below the join
+  (`spark.vecruntime.optimizer.narrowBelowJoin.enabled`, on by default): the join carries the short result instead
+  of the whole string. TPC-DS q23a's `substr(i_item_desc, 1, 30)` was computed on ~1.66G joined rows at 1 TB, each
+  gathering the full description; it now runs once per item row (#635).
 - A runtime bloom filter from a smaller fact table onto a larger one it joins
   (`spark.vecruntime.optimizer.factBloomFilter.enabled`, on by default): a shuffle join whose filtered side is at
   least 10x larger (estimated bytes) than the side the filter is built from gets
