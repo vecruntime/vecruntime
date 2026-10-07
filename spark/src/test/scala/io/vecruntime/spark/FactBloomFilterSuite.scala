@@ -195,6 +195,25 @@ class FactBloomFilterSuite extends VectorQuerySuite {
     assert(built.nonEmpty && built.forall(_ != null), s"filters: $built")
   }
 
+  test("the filter's build reads the join's own creation-side exchange: the returns are scanned once (#659)") {
+    import org.apache.spark.sql.execution.SparkPlan
+    import org.apache.spark.sql.execution.adaptive.{AdaptiveSparkPlanHelper, ShuffleQueryStageExec}
+    object Plans extends AdaptiveSparkPlanHelper
+    def returnsScans(df: DataFrame): Int =
+      Plans.collectWithSubqueries(df.queryExecution.executedPlan) { case p: SparkPlan => p }
+        .count(p =>
+          p.nodeName.contains("Scan") && p.output.exists(_.name == "sr_return_quantity") &&
+            !p.isInstanceOf[ShuffleQueryStageExec]
+        )
+    val shared = withConf(VectorConf.FactBloomFilterSizeRatio -> "2")(run(q93))
+    assert(builtFilters(shared).exists(_ != null), shared.queryExecution.executedPlan.treeString)
+    val separate = withConf(
+      VectorConf.FactBloomFilterSizeRatio -> "2",
+      VectorConf.FactBloomFilterShareExchange -> "false"
+    )(run(q93))
+    assert(returnsScans(shared) < returnsScans(separate), s"${shared.queryExecution.executedPlan}")
+  }
+
   test("sides of similar size get no filter") {
     val sql =
       "SELECT count(*), max(a.ss_pad) FROM store_sales a JOIN store_sales b ON a.ss_ticket_number = b.ss_ticket_number"

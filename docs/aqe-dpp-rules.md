@@ -382,6 +382,14 @@ side's actual rows, and yields a null filter when they are not `sizeRatio` times
 side's estimated rows; the probe is `coalesce(might_contain(...), true)`, so a declined filter keeps every row.
 Off with `spark.vecruntime.optimizer.factBloomFilter.runtimeEvidence=false`.
 
+**Shared creation-side exchange (#659).** The build subquery reads `BloomCreationRef`, a reference to the join
+input that the optimizer leaves alone. The query-stage preparation rule `ShareBloomCreationExchange` replaces its
+physical placeholder with that join input's own shuffle exchange, carrying the reference's logical link so the
+subquery's re-planning keeps it. AQE's stage cache then materialises the exchange once, for the join and for the
+filter, and the build is a read of a stage the join computes anyway (EMR Serverless's `GenerateBloomFilter` over a
+`ReusedExchange`). A reference no shuffle join claims turns its filter into null, which every row passes. Off with
+`spark.vecruntime.optimizer.factBloomFilter.shareExchange=false`.
+
 ## `NarrowBelowJoin`: a substring or length of one join side's string computed below the join
 
 `spark/src/main/scala/org/apache/spark/sql/vecruntime/NarrowBelowJoin.scala`, issue #635.

@@ -83,6 +83,9 @@ object VectorConf {
   /** Run-time evidence (#659): the build counts the creation side's actual rows and declines when not much smaller. */
   val FactBloomFilterRuntimeEvidence = "spark.vecruntime.optimizer.factBloomFilter.runtimeEvidence"
 
+  /** The filter's build reads the join's creation-side exchange instead of a second copy (#659, AQE only). */
+  val FactBloomFilterShareExchange = "spark.vecruntime.optimizer.factBloomFilter.shareExchange"
+
   /** How many times larger (estimated bytes) the filtered side must be than the side the filter is built from. */
   val FactBloomFilterSizeRatio = "spark.vecruntime.optimizer.factBloomFilter.sizeRatio"
 
@@ -598,6 +601,10 @@ object VectorConf {
   /** FactBloomFilter's run-time row-count check (#659), default true. */
   def factBloomFilterRuntimeEvidence(conf: SQLConf): Boolean =
     bool(conf, FactBloomFilterRuntimeEvidence, default = true)
+
+  /** FactBloomFilter's shared creation-side exchange (#659), default true; needs runtimeEvidence and AQE. */
+  def factBloomFilterShareExchange(conf: SQLConf): Boolean =
+    bool(conf, FactBloomFilterShareExchange, default = true)
 
   def factBloomFilterSizeRatio(conf: SQLConf): Int =
     math.max(2, conf.getConfString(FactBloomFilterSizeRatio, "10").trim.toInt)

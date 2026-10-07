@@ -229,9 +229,16 @@ case class FactBloomFilter(session: SparkSession) extends Rule[LogicalPlan] with
       if (VectorConf.factBloomFilterRuntimeEvidence(conf))
         Some(RuntimeGate(BigInt(VectorConf.factBloomFilterSizeRatio(conf)), appRows))
       else None
+    // With AQE, the build reads the join's own creation-side exchange (#659, ShareBloomCreationExchange) rather
+    // than a second copy of the creation side; it needs the run-time gate's null-passing probe for the case
+    // where no join claims the reference.
+    val source =
+      if (gate.isDefined && VectorConf.factBloomFilterShareExchange(conf) && conf.adaptiveExecutionEnabled)
+        BloomCreationRef(BloomCreationRef.nextId(), creation.output, creation.stats.sizeInBytes)
+      else creation
     layout(items).map {
-      case (1, n, _) => singleFilter(creation, key, n, gate)
-      case (buckets, n, bits) => partitionedFilter(creation, key, buckets, n, bits, gate)
+      case (1, n, _) => singleFilter(source, key, n, gate)
+      case (buckets, n, bits) => partitionedFilter(source, key, buckets, n, bits, gate)
     }
   }
 
