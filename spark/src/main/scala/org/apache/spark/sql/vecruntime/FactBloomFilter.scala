@@ -237,7 +237,12 @@ case class FactBloomFilter(session: SparkSession) extends Rule[LogicalPlan] with
     val conf = session.sessionState.conf
     val gate =
       if (VectorConf.factBloomFilterRuntimeEvidence(conf))
-        Some(RuntimeGate(BigInt(VectorConf.factBloomFilterSizeRatio(conf)), appRows))
+        Some(RuntimeGate(
+          BigInt(VectorConf.factBloomFilterSizeRatio(conf)),
+          appRows,
+          keyTableRows(creation, key),
+          VectorConf.factBloomFilterRuntimeMaxReduced(conf)
+        ))
       else None
     // With AQE, the build reads the join's own creation-side exchange (#659, ShareBloomCreationExchange) rather
     // than a second copy of the creation side; it needs the run-time gate's null-passing probe for the case
@@ -259,10 +264,43 @@ case class FactBloomFilter(session: SparkSession) extends Rule[LogicalPlan] with
    * dimension, a join) are what made q18, q61 and q23b slower at 1 TB; its actual row count is known only once
    * the build has read it.
    */
-  private case class RuntimeGate(ratio: BigInt, appRows: BigInt) {
+  private case class RuntimeGate(ratio: BigInt, appRows: BigInt, keyTableRows: Option[BigInt], maxReduced: Double) {
     def apply(filter: Expression, rows: Expression): Expression = {
-      val limit = Literal((appRows / ratio).min(BigInt(Long.MaxValue)).toLong)
+      // Two limits: the creation side `ratio` times smaller than the application side, and -- when the creation
+      // key's base table is known -- reduced to at most `maxReduced` of that table's rows. The second is what
+      // tells a selective filter from a weak one: q18's `customer` filtered to six birth months keeps half its
+      // keys, so the filter cost more to probe than it pruned (+59 % at 1 TB).
+      val bySize = appRows / ratio
+      val byReduction: Option[BigInt] = keyTableRows.map(r => (BigDecimal(r) * BigDecimal(maxReduced)).toBigInt)
+      val limit = Literal(byReduction.fold(bySize)(r => r.min(bySize)).min(BigInt(Long.MaxValue)).toLong)
       If(GreaterThan(rows, limit), Literal.create(null, filter.dataType), filter)
+    }
+  }
+
+  /** Estimated rows of the base relation the creation key traces to, through projections, filters and joins. */
+  private def keyTableRows(plan: LogicalPlan, key: Expression): Option[BigInt] = {
+    def rows(rel: LogicalRelation): BigInt = rel.catalogTable.flatMap(_.stats).flatMap(_.rowCount).getOrElse {
+      val width = math.max(8L, rel.output.map(_.dataType.defaultSize.toLong).sum + 8L)
+      rel.stats.sizeInBytes / width
+    }
+    def trace(p: LogicalPlan, a: org.apache.spark.sql.catalyst.expressions.Attribute): Option[BigInt] = p match {
+      case Project(list, child) =>
+        list.collectFirst {
+          case x: org.apache.spark.sql.catalyst.expressions.Attribute if x.exprId == a.exprId => trace(child, x)
+          case al @ Alias(src: org.apache.spark.sql.catalyst.expressions.Attribute, _) if al.exprId == a.exprId =>
+            trace(child, src)
+        }.flatten
+      case Filter(_, child) => trace(child, a)
+      case j: Join =>
+        if (j.left.outputSet.contains(a)) trace(j.left, a)
+        else if (j.right.outputSet.contains(a)) trace(j.right, a)
+        else None
+      case rel: LogicalRelation if rel.outputSet.contains(a) => Some(rows(rel))
+      case _ => None
+    }
+    key match {
+      case a: org.apache.spark.sql.catalyst.expressions.Attribute => trace(plan, a)
+      case _ => None
     }
   }
 

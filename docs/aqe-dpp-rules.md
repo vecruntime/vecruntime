@@ -380,6 +380,10 @@ adds costs nothing on rows the scan's other filters drop.
 what made q18, q61 and q23b slower with the rule at 1 TB. The filter's build therefore also counts the creation
 side's actual rows, and yields a null filter when they are not `sizeRatio` times fewer than the application
 side's estimated rows; the probe is `coalesce(might_contain(...), true)`, so a declined filter keeps every row.
+A second run-time limit compares the same count with the creation key's base table: at most
+`runtimeMaxReduced` (0.2) of its rows. q18's `customer` filtered to six birth months keeps half its keys; its filter
+was built and applied, and the `catalog_sales` scan stage's task time doubled.
+No probe goes on a relation the plan reads more than once (q23b's CTE): it would cost the copies' exchange reuse.
 Off with `spark.vecruntime.optimizer.factBloomFilter.runtimeEvidence=false`.
 
 **Shared creation-side exchange (#659).** The build subquery reads `BloomCreationRef`, a reference to the join

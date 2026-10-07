@@ -79,6 +79,11 @@ class FactBloomFilterSuite extends VectorQuerySuite {
       |FROM store_sales JOIN store_returns ON ss_ticket_number = sr_ticket_number AND ss_item_sk = sr_item_sk
       |GROUP BY ss_item_sk""".stripMargin
 
+  // A more reduced returns side: quantity 0 only (a third of the rows), still opaque to Spark's own runtime filter
+  // (`isnull(nullif(..))` is not one of its selective predicates) and on a column that is not a join key.
+  private val q93Selective =
+    q93.replace("isnotnull(nullif(sr_return_quantity, 0))", "isnull(nullif(sr_return_quantity, 0))")
+
   test("q93's shape: the larger fact gets bloom filters from the smaller one, results unchanged") {
     val df = run(q93)
     assert(salesBlooms(df) >= 1, df.queryExecution.optimizedPlan.treeString)
@@ -158,6 +163,24 @@ class FactBloomFilterSuite extends VectorQuerySuite {
     assert(overR2C.isEmpty, "a bloom aggregate reads RowToColumnarExec:\n" + overR2C.map(_.treeString).mkString("\n"))
   }
 
+  /**
+   * `f` over a catalog copy of the returns with a table-level row count (`ANALYZE TABLE ... COMPUTE STATISTICS`,
+   * no column statistics, so #650's evidence is unchanged): the run-time cap compares the creation side's actual
+   * rows with that count, which a file-size estimate of these tiny compressed files would understate.
+   */
+  private def withCountedReturns[T](f: String => T): T =
+    try {
+      spark.table("store_returns").write.saveAsTable("fb_counted_returns")
+      spark.sql("ANALYZE TABLE fb_counted_returns COMPUTE STATISTICS")
+      f("fb_counted_returns")
+    } finally {
+      spark.sessionState.catalog.dropTable(
+        org.apache.spark.sql.catalyst.TableIdentifier("fb_counted_returns"),
+        ignoreIfNotExists = true,
+        purge = false
+      )
+    }
+
   /** The values of the executed plan's scalar subqueries that build a bloom filter (null: declined at run time). */
   private def builtFilters(df: DataFrame): Seq[Any] = {
     object Plans extends org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanHelper
@@ -187,12 +210,33 @@ class FactBloomFilterSuite extends VectorQuerySuite {
     }
   }
 
+  test("run-time evidence: a creation side keeping most of its key's table yields a null filter (q18)") {
+    // q93's returns keep quantities 1 and 2: two thirds of the rows, far above runtimeMaxReduced (0.2).
+    val keepsMost = q93
+    withCountedReturns { returns =>
+      val sql = keepsMost.replace("store_returns", returns)
+      val df = withConf(VectorConf.FactBloomFilterSizeRatio -> "2")(run(sql))
+      val built = builtFilters(df)
+      assert(built.nonEmpty && built.forall(_ == null), s"filters: $built")
+      // A looser cap lets it through.
+      val loose = withConf(
+        VectorConf.FactBloomFilterSizeRatio -> "2",
+        VectorConf.FactBloomFilterRuntimeMaxReduced -> "1"
+      )(run(sql))
+      assert(builtFilters(loose).exists(_ != null))
+    }
+  }
+
   test("run-time evidence: q93's reduced returns still build their filter") {
     // The application side's row estimate comes from its compressed file size, a few times below its 40000 rows
     // here; ratio 2 keeps the ~1300 returns clearly under it.
-    val df = withConf(VectorConf.FactBloomFilterSizeRatio -> "2")(run(q93))
+    val df = withCountedReturns { returns =>
+      withConf(VectorConf.FactBloomFilterSizeRatio -> "2", VectorConf.FactBloomFilterRuntimeMaxReduced -> "0.5")(
+        run(q93Selective.replace("store_returns", returns))
+      )
+    }
     val built = builtFilters(df)
-    assert(built.nonEmpty && built.forall(_ != null), s"filters: $built")
+    assert(built.nonEmpty && built.forall(_ != null), s"filters: $built\n${df.queryExecution.optimizedPlan}")
   }
 
   test("the filter's build reads the join's own creation-side exchange: the returns are scanned once (#659)") {
@@ -205,13 +249,20 @@ class FactBloomFilterSuite extends VectorQuerySuite {
           p.nodeName.contains("Scan") && p.output.exists(_.name == "sr_return_quantity") &&
             !p.isInstanceOf[ShuffleQueryStageExec]
         )
-    val shared = withConf(VectorConf.FactBloomFilterSizeRatio -> "2")(run(q93))
-    assert(builtFilters(shared).exists(_ != null), shared.queryExecution.executedPlan.treeString)
-    val separate = withConf(
-      VectorConf.FactBloomFilterSizeRatio -> "2",
-      VectorConf.FactBloomFilterShareExchange -> "false"
-    )(run(q93))
-    assert(returnsScans(shared) < returnsScans(separate), s"${shared.queryExecution.executedPlan}")
+    withCountedReturns { returns =>
+      val sql = q93Selective.replace("store_returns", returns)
+      val shared = withConf(
+        VectorConf.FactBloomFilterSizeRatio -> "2",
+        VectorConf.FactBloomFilterRuntimeMaxReduced -> "0.5"
+      )(run(sql))
+      assert(builtFilters(shared).exists(_ != null), shared.queryExecution.executedPlan.treeString)
+      val separate = withConf(
+        VectorConf.FactBloomFilterSizeRatio -> "2",
+        VectorConf.FactBloomFilterRuntimeMaxReduced -> "0.5",
+        VectorConf.FactBloomFilterShareExchange -> "false"
+      )(run(sql))
+      assert(returnsScans(shared) < returnsScans(separate), s"${shared.queryExecution.executedPlan}")
+    }
   }
 
   test("a relation the plan reads twice gets no probe: its copies keep their exchange reuse (q23b)") {
