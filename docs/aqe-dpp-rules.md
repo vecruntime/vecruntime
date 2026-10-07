@@ -351,6 +351,13 @@ filter that would need more is declined. The probe is vectorised and its sub-fil
 executor (`BloomFilterCache`). EMR Serverless sizes its own filters the same way (q93: `GenerateBloomFilter` for ~110M
 rows on `store_returns`' keys, shuffle 2.8 GB against our 41.8 GB).
 
+**Split-block sub-filters (#659).** Each sub-filter of a partitioned filter is a split-block bloom filter, the layout
+of Parquet and Impala: 256-bit blocks of eight 32-bit words, a key setting one bit in each word of the one block its
+remixed hash picks. A probe reads one 32-byte block -- a cache line -- where Spark's `BloomFilterImpl` reads its `k`
+bits anywhere in a multi-megabyte array. At 1 TB the probe was the filter's cost: q93's `store_sales` scan probes
+2.9G rows, and with Spark's layout spent 27 % more task time than without the filter, more than the 41 GB of
+shuffle it saved. At 8 bits a key the false-positive rate is about 3 % (Spark's: about 2 %).
+
 **Why the result is the same.** A bloom filter has no false negatives, and a row whose key the creation side
 does not hold cannot survive the join. False positives only let a non-matching row through to the join, which
 then drops it.
@@ -374,6 +381,34 @@ Spark) and the declined shapes. The 1 TB numbers come with the PR.
 
 **Related.** `BloomProbeExpr` now skips rows an earlier conjunct already rejected (#635), so a probe this rule
 adds costs nothing on rows the scan's other filters drop.
+
+
+**Run-time evidence (#659).** Plan-time estimates of the creation side -- a filtered dimension, a join -- are
+what made q18, q61 and q23b slower with the rule at 1 TB. The filter's build therefore also counts the creation
+side's actual rows, and yields a null filter when they are not `sizeRatio` times fewer than the application
+side's estimated rows; the probe is `coalesce(might_contain(...), true)`, so a declined filter keeps every row.
+A second run-time limit compares the same count with the creation key's base table: at most
+`runtimeMaxReduced` (0.2) of its rows. q18's `customer` filtered to six birth months keeps half its keys; its filter
+was built and applied, and the `catalog_sales` scan stage's task time doubled.
+No probe goes on a relation the plan reads more than once (q23b's CTE): it would cost the copies' exchange reuse.
+Off with `spark.vecruntime.optimizer.factBloomFilter.runtimeEvidence=false`.
+
+**Transitive reduction (#659).** A small, selectively filtered relation `D` broadcast-joined above a shuffle join,
+on a column of one of its inputs `C`, first gets a bloom filter of its key on `C`'s scan. `C` is then reduced and
+is the creation side of a filter onto the shuffle join's larger input -- the chain EMR Serverless applies in q93
+(a run-time filter on `sr_reason_sk` from one `reason`, then bloom filters onto `store_sales`). The inner join with
+`D` above keeps exactly the rows the filter can keep, so results are unchanged. Spark's own runtime filter leaves
+it out because the join with `D` is a broadcast. With run-time evidence, the plan-time size check only requires
+the application side to be the larger: the estimate of a reduced creation side is its base table's size.
+Off with `spark.vecruntime.optimizer.factBloomFilter.transitive=false`.
+
+**Shared creation-side exchange (#659).** The build subquery reads `BloomCreationRef`, a reference to the join
+input that the optimizer leaves alone. The query-stage preparation rule `ShareBloomCreationExchange` replaces its
+physical placeholder with that join input's own shuffle exchange, carrying the reference's logical link so the
+subquery's re-planning keeps it. AQE's stage cache then materialises the exchange once, for the join and for the
+filter, and the build is a read of a stage the join computes anyway (EMR Serverless's `GenerateBloomFilter` over a
+`ReusedExchange`). A reference no shuffle join claims turns its filter into null, which every row passes. Off with
+`spark.vecruntime.optimizer.factBloomFilter.shareExchange=false`.
 
 ## `NarrowBelowJoin`: a substring or length of one join side's string computed below the join
 

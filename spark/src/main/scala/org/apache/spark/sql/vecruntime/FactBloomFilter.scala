@@ -21,16 +21,20 @@ import org.apache.spark.sql.catalyst.expressions.{
   Alias,
   And,
   BloomFilterMightContain,
+  Coalesce,
   DynamicPruningSubquery,
   Expression,
+  GreaterThan,
+  If,
   Literal,
+  Multiply,
   Pmod,
   PredicateHelper,
   ScalarSubquery,
   SparkPartitionID,
   XxHash64
 }
-import org.apache.spark.sql.catalyst.expressions.aggregate.BloomFilterAggregate
+import org.apache.spark.sql.catalyst.expressions.aggregate.{BloomFilterAggregate, Count, Sum}
 import org.apache.spark.sql.catalyst.optimizer.{ColumnPruning, JoinSelectionHelper}
 import org.apache.spark.sql.catalyst.planning.ExtractEquiJoinKeys
 import org.apache.spark.sql.catalyst.plans.{Inner, JoinType, LeftOuter, LeftSemi, RightOuter}
@@ -72,21 +76,36 @@ import org.apache.spark.sql.internal.SQLConf
 case class FactBloomFilter(session: SparkSession) extends Rule[LogicalPlan] with PredicateHelper
     with JoinSelectionHelper {
 
+  /** Canonical forms of the relations the current plan reads more than once (set per `apply`). */
+  private var shared: Set[LogicalPlan] = Set.empty
+
   override def apply(plan: LogicalPlan): LogicalPlan = {
     val conf = session.sessionState.conf
     if (!VectorConf.factBloomFilterEnabled(conf) || !conf.runtimeFilterBloomFilterEnabled) return plan
     var budget = conf.getConf(SQLConf.RUNTIME_FILTER_NUMBER_THRESHOLD) - countBlooms(plan)
-    plan.transformUp {
+    // Relations read more than once (a CTE referenced twice, q23b's store_sales): Spark reuses the exchanges over
+    // their identical copies, and a probe on one copy would make it differ and cost that reuse -- at 1 TB q23b's
+    // shuffle grew from 75 to 101 GB. Such a relation gets no probe.
+    // Copies are told apart by their attribute ids: the same relation inside a subquery of the plan (Spark's
+    // own runtime filter built from it) keeps its ids and is not a second read.
+    shared = plan.collect { case r: LogicalRelation => (r.canonicalized, r.output.map(_.exprId)) }
+      .groupBy(_._1).collect { case (c, copies) if copies.map(_._2).distinct.size > 1 => c }.toSet
+    val reduced = if (VectorConf.factBloomFilterTransitive(conf)) transitive(plan, conf) else plan
+    budget -= countBlooms(reduced) - countBlooms(plan)
+    reduced.transformUp {
       case j @ ExtractEquiJoinKeys(jt, leftKeys, rightKeys, _, _, left, right, hint)
           if budget > 0 && !canBroadcastBySize(left, conf) && !canBroadcastBySize(right, conf) &&
             !hintToBroadcastLeft(hint) && !hintToBroadcastRight(hint) =>
         var newLeft = left
         var newRight = right
+        // One filter per side, on the first key that qualifies: the probe is a hash and a random bit read per row of
+        // the application scan, and a second key's filter prunes few rows the first has not (q93: two probes on
+        // store_sales' 2.9G rows cost 25 % more scan task time than the join they saved).
         leftKeys.zip(rightKeys).foreach { case (l, r) =>
-          if (budget > 0 && prunesLeft(jt)) {
+          if (budget > 0 && prunesLeft(jt) && (newLeft eq left)) {
             inject(newLeft, l, right, r).foreach { p => newLeft = p; budget -= 1 }
           }
-          if (budget > 0 && prunesRight(jt)) {
+          if (budget > 0 && prunesRight(jt) && (newRight eq right)) {
             inject(newRight, r, left, l).foreach { p => newRight = p; budget -= 1 }
           }
         }
@@ -108,11 +127,19 @@ case class FactBloomFilter(session: SparkSession) extends Rule[LogicalPlan] with
     val conf = session.sessionState.conf
     val ratio = VectorConf.factBloomFilterSizeRatio(conf)
     if (!appKey.deterministic || !creationKey.deterministic || creationKey.references.isEmpty) return None
-    if (app.stats.sizeInBytes < creation.stats.sizeInBytes * BigInt(ratio)) return None
+    // With run-time evidence the build checks the creation side's actual rows against `ratio`; the plan-time
+    // estimate of a creation side reduced by a filter or a join (its base table's size) would understate that
+    // reduction and decline q50's returns, so the plan only requires the application side to be the larger.
+    val planRatio = if (VectorConf.factBloomFilterRuntimeEvidence(conf)) 1 else ratio
+    if (app.stats.sizeInBytes < creation.stats.sizeInBytes * BigInt(planRatio)) return None
     val items = expectedItems(app, appKey, creation, creationKey, VectorConf.factBloomFilterMaxSelectivity(conf))
     if (items.isEmpty) return None
     val threshold = conf.getConf(SQLConf.RUNTIME_BLOOM_FILTER_APPLICATION_SIDE_SCAN_SIZE_THRESHOLD)
-    filterFor(creation, creationKey, items.get).flatMap(mk => onScan(app, appKey, threshold, mk))
+    val appRows = app.stats.rowCount.getOrElse {
+      val width = math.max(8L, app.output.map(_.dataType.defaultSize.toLong).sum + 8L)
+      app.stats.sizeInBytes / width
+    }
+    filterFor(creation, creationKey, items.get, appRows).flatMap(mk => onScan(app, appKey, threshold, mk))
   }
 
   /**
@@ -181,8 +208,14 @@ case class FactBloomFilter(session: SparkSession) extends Rule[LogicalPlan] with
    * already satisfied, so no per-map-task partial filters), packed into one value; the probe tests the bucket's
    * sub-filter.
    */
-  private def partitionedFilter(creation: LogicalPlan, key: Expression, buckets: Int, items: Long, bits: Long)
-      : Expression => Expression = { appExpr =>
+  private def partitionedFilter(
+      creation: LogicalPlan,
+      key: Expression,
+      buckets: Int,
+      items: Long,
+      bits: Long,
+      gate: Option[RuntimeGate]
+  ): Expression => Expression = { appExpr =>
     val h = Alias(new XxHash64(Seq(key)), "bloomHash")()
     val b = Alias(
       org.apache.spark.sql.catalyst.expressions.Cast(
@@ -195,27 +228,115 @@ case class FactBloomFilter(session: SparkSession) extends Rule[LogicalPlan] with
     val bucketed = Project(Seq(h.toAttribute, b), hashed)
     val shuffled =
       org.apache.spark.sql.catalyst.plans.logical.RepartitionByExpression(Seq(b.toAttribute), bucketed, buckets)
-    val sub = Alias(
-      new BloomFilterAggregate(h.toAttribute, Literal(items), Literal(bits)).toAggregateExpression(),
-      "bloomPart"
-    )()
-    val perBucket = Aggregate(Seq(b.toAttribute), Seq(b.toAttribute, sub), shuffled)
+    // Each bucket's sub-filter is a split-block filter: its probe reads one cache line (#659).
+    val sub = Alias(BlockedBloomFilterAgg(h.toAttribute, bits).toAggregateExpression(), "bloomPart")()
+    val rowsPart = Alias(Count(Literal(1)).toAggregateExpression(), "bloomRowsPart")()
+    val perBucket =
+      Aggregate(Seq(b.toAttribute), Seq(b.toAttribute, sub) ++ gate.map(_ => rowsPart), shuffled)
     val packed = PartitionedBloomFilterAgg(b.toAttribute, sub.toAttribute, buckets).toAggregateExpression()
-    val plan = Aggregate(Nil, Seq(Alias(packed, "bloomFilter")()), perBucket)
-    PartitionedBloomMightContain(ScalarSubquery(ColumnPruning(plan), Nil), new XxHash64(Seq(appExpr)))
+    val rows = gate.map(_ => Alias(Sum(rowsPart.toAttribute).toAggregateExpression(), "bloomRows")())
+    val plan = gatedPlan(Alias(packed, "bloomFilter")(), rows, gate, perBucket)
+    probe(PartitionedBloomMightContain(ScalarSubquery(ColumnPruning(plan), Nil), new XxHash64(Seq(appExpr))), gate)
   }
 
-  private def filterFor(creation: LogicalPlan, key: Expression, items: Long): Option[Expression => Expression] =
+  private def filterFor(creation: LogicalPlan, key: Expression, items: Long, appRows: BigInt)
+      : Option[Expression => Expression] = {
+    val conf = session.sessionState.conf
+    val gate =
+      if (VectorConf.factBloomFilterRuntimeEvidence(conf))
+        Some(RuntimeGate(
+          BigInt(VectorConf.factBloomFilterSizeRatio(conf)),
+          appRows,
+          keyTableRows(creation, key),
+          VectorConf.factBloomFilterRuntimeMaxReduced(conf)
+        ))
+      else None
+    // With AQE, the build reads the join's own creation-side exchange (#659, ShareBloomCreationExchange) rather
+    // than a second copy of the creation side; it needs the run-time gate's null-passing probe for the case
+    // where no join claims the reference.
+    val source =
+      if (gate.isDefined && VectorConf.factBloomFilterShareExchange(conf) && conf.adaptiveExecutionEnabled)
+        BloomCreationRef(BloomCreationRef.nextId(), creation.output, creation.stats.sizeInBytes)
+      else creation
     layout(items).map {
-      case (1, n, _) => singleFilter(creation, key, n)
-      case (buckets, n, bits) => partitionedFilter(creation, key, buckets, n, bits)
+      case (1, n, _) => singleFilter(source, key, n, gate)
+      case (buckets, n, bits) => partitionedFilter(source, key, buckets, n, bits, gate)
     }
+  }
 
-  private def singleFilter(creation: LogicalPlan, key: Expression, items: Long): Expression => Expression = { appExpr =>
+  /**
+   * The run-time evidence check (#659): the filter's build also counts the creation side's actual rows, and
+   * yields a null filter -- which the probe passes every row through -- when they are not at least `ratio`
+   * times fewer than the application side's estimated rows. Estimates of the creation side (a filtered
+   * dimension, a join) are what made q18, q61 and q23b slower at 1 TB; its actual row count is known only once
+   * the build has read it.
+   */
+  private case class RuntimeGate(ratio: BigInt, appRows: BigInt, keyTableRows: Option[BigInt], maxReduced: Double) {
+    def apply(filter: Expression, rows: Expression): Expression = {
+      // Two limits: the creation side `ratio` times smaller than the application side, and -- when the creation
+      // key's base table is known -- reduced to at most `maxReduced` of that table's rows. The second is what
+      // tells a selective filter from a weak one: q18's `customer` filtered to six birth months keeps half its
+      // keys, so the filter cost more to probe than it pruned (+59 % at 1 TB).
+      val bySize = appRows / ratio
+      val byReduction: Option[BigInt] = keyTableRows.map(r => (BigDecimal(r) * BigDecimal(maxReduced)).toBigInt)
+      val limit = Literal(byReduction.fold(bySize)(r => r.min(bySize)).min(BigInt(Long.MaxValue)).toLong)
+      If(GreaterThan(rows, limit), Literal.create(null, filter.dataType), filter)
+    }
+  }
+
+  /** Estimated rows of the base relation the creation key traces to, through projections, filters and joins. */
+  private def keyTableRows(plan: LogicalPlan, key: Expression): Option[BigInt] = {
+    def rows(rel: LogicalRelation): BigInt = rel.catalogTable.flatMap(_.stats).flatMap(_.rowCount).getOrElse {
+      val width = math.max(8L, rel.output.map(_.dataType.defaultSize.toLong).sum + 8L)
+      rel.stats.sizeInBytes / width
+    }
+    def trace(p: LogicalPlan, a: org.apache.spark.sql.catalyst.expressions.Attribute): Option[BigInt] = p match {
+      case Project(list, child) =>
+        list.collectFirst {
+          case x: org.apache.spark.sql.catalyst.expressions.Attribute if x.exprId == a.exprId => trace(child, x)
+          case al @ Alias(src: org.apache.spark.sql.catalyst.expressions.Attribute, _) if al.exprId == a.exprId =>
+            trace(child, src)
+        }.flatten
+      case Filter(_, child) => trace(child, a)
+      case j: Join =>
+        if (j.left.outputSet.contains(a)) trace(j.left, a)
+        else if (j.right.outputSet.contains(a)) trace(j.right, a)
+        else None
+      case rel: LogicalRelation if rel.outputSet.contains(a) => Some(rows(rel))
+      case _ => None
+    }
+    key match {
+      case a: org.apache.spark.sql.catalyst.expressions.Attribute => trace(plan, a)
+      case _ => None
+    }
+  }
+
+  /** The final aggregate of a filter build: its filter, plus the gated filter when a gate is set. */
+  private def gatedPlan(
+      filter: Alias,
+      rows: Option[Alias],
+      gate: Option[RuntimeGate],
+      child: LogicalPlan,
+      grouping: Seq[Expression] = Nil
+  ): LogicalPlan = (gate, rows) match {
+    case (Some(g), Some(r)) =>
+      val agg = Aggregate(grouping, Seq(filter, r), child)
+      Project(Seq(Alias(g(filter.toAttribute, r.toAttribute), "bloomFilter")()), agg)
+    case _ => Aggregate(grouping, Seq(filter), child)
+  }
+
+  /** The probe: with a run-time gate, a null (declined) filter passes every row. */
+  private def probe(p: Expression, gate: Option[RuntimeGate]): Expression =
+    if (gate.isDefined) Coalesce(Seq(p, Literal(true))) else p
+
+  private def singleFilter(creation: LogicalPlan, key: Expression, items: Long, gate: Option[RuntimeGate])
+      : Expression => Expression = { appExpr =>
     val agg = new BloomFilterAggregate(new XxHash64(Seq(key)), Literal(items))
     val buckets = VectorConf.factBloomFilterMergeBuckets(session.sessionState.conf)
+    val count = Alias(Count(Literal(1)).toAggregateExpression(), "bloomRows")()
     val plan =
-      if (buckets <= 1) Aggregate(Nil, Seq(Alias(agg.toAggregateExpression(), "bloomFilter")()), creation)
+      if (buckets <= 1)
+        gatedPlan(Alias(agg.toAggregateExpression(), "bloomFilter")(), gate.map(_ => count), gate, creation)
       else {
         // Two levels (#646): one partial filter per creation-side task would all meet in a single task. Group
         // them by a bucket of the task's partition id, so `buckets` tasks each merge a share of them, then OR
@@ -223,13 +344,69 @@ case class FactBloomFilter(session: SparkSession) extends Rule[LogicalPlan] with
         val bucket = Alias(Pmod(SparkPartitionID(), Literal(buckets)), "bloomBucket")()
         val tagged = Project(creation.output :+ bucket, creation)
         val partial = Alias(agg.toAggregateExpression(), "bloomPartial")()
-        val byBucket = Aggregate(Seq(bucket.toAttribute), Seq(partial), tagged)
+        val rowsPart = Alias(Count(Literal(1)).toAggregateExpression(), "bloomRowsPart")()
+        val byBucket = Aggregate(Seq(bucket.toAttribute), Seq(partial) ++ gate.map(_ => rowsPart), tagged)
         val merged = BloomFilterMerge(partial.toAttribute).toAggregateExpression()
-        Aggregate(Nil, Seq(Alias(merged, "bloomFilter")()), byBucket)
+        val rows = gate.map(_ => Alias(Sum(rowsPart.toAttribute).toAggregateExpression(), "bloomRows")())
+        gatedPlan(Alias(merged, "bloomFilter")(), rows, gate, byBucket)
       }
     // Column pruning as Spark's own rule does: the subquery reads only the creation key.
     val subquery = ScalarSubquery(ColumnPruning(plan), Nil)
-    BloomFilterMightContain(subquery, new XxHash64(Seq(appExpr)))
+    probe(BloomFilterMightContain(subquery, new XxHash64(Seq(appExpr))), gate)
+  }
+
+  /**
+   * Transitive reduction (#659): a small, selectively filtered relation `D` joined (a broadcast join) above a
+   * shuffle join, on a column of one of that join's inputs `C`, reduces `C` before the shuffle join. A bloom filter
+   * of `D`'s key goes on `C`'s scan, so `C` -- now reduced -- is the creation side of a filter onto the shuffle
+   * join's larger input. TPC-DS q93: `store_returns` is reduced by its join with one `reason`, above
+   * `store_sales JOIN store_returns`; q50: by a one-month `date_dim`. EMR Serverless applies the same chain (a
+   * run-time filter on `sr_reason_sk`, then bloom filters onto `store_sales`). Spark's own runtime filter leaves
+   * these out: the join with `D` is a broadcast join. The inner join with `D` above keeps exactly the `C` rows the
+   * filter can keep (a bloom filter has no false negatives), so the result is unchanged.
+   */
+  private def transitive(plan: LogicalPlan, conf: SQLConf): LogicalPlan = plan.transformDown {
+    case j @ ExtractEquiJoinKeys(Inner, leftKeys, rightKeys, _, _, left, right, _) =>
+      def reduceWith(x: LogicalPlan, d: LogicalPlan, xKeys: Seq[Expression], dKeys: Seq[Expression]): LogicalPlan =
+        if (!canBroadcastBySize(d, conf) || !KeyStats.reduced(d) || canBroadcastBySize(x, conf)) x
+        else xKeys.zip(dKeys).foldLeft(x) {
+          case (acc, (xk: org.apache.spark.sql.catalyst.expressions.Attribute, dk)) if dk.references.nonEmpty =>
+            belowShuffleJoin(acc, xk, dimensionFilter(d, dk), conf).getOrElse(acc)
+          case (acc, _) => acc
+        }
+      val l = reduceWith(left, right, leftKeys, rightKeys)
+      val r = if (l ne left) right else reduceWith(right, left, rightKeys, leftKeys)
+      if ((l eq left) && (r eq right)) j else j.withNewChildren(Seq(l, r))
+  }
+
+  /** A plain bloom filter of `d`'s `key` (`d` is small): the probe `mk(appKey)`. */
+  private def dimensionFilter(d: LogicalPlan, key: Expression): Expression => Expression = { appExpr =>
+    val agg = new BloomFilterAggregate(new XxHash64(Seq(key)))
+    val plan = Aggregate(Nil, Seq(Alias(agg.toAggregateExpression(), "bloomFilter")()), d)
+    BloomFilterMightContain(ScalarSubquery(ColumnPruning(plan), Nil), new XxHash64(Seq(appExpr)))
+  }
+
+  /**
+   * `p` with the dimension filter on the scan of the input holding `key` of the first shuffle join (both inputs
+   * too large to broadcast) found under it; `None` if there is none, or the key's input is not a plain scan.
+   */
+  private def belowShuffleJoin(
+      p: LogicalPlan,
+      key: org.apache.spark.sql.catalyst.expressions.Attribute,
+      mk: Expression => Expression,
+      conf: SQLConf
+  ): Option[LogicalPlan] = p match {
+    case pr @ Project(_, child) if child.outputSet.contains(key) =>
+      belowShuffleJoin(child, key, mk, conf).map(c => pr.copy(child = c))
+    case f @ Filter(_, child) => belowShuffleJoin(child, key, mk, conf).map(c => f.copy(child = c))
+    case jn @ Join(l, r, jt, _, _) if jt == Inner || jt == LeftSemi =>
+      val inLeft = l.outputSet.contains(key)
+      val side = if (inLeft) l else r
+      if (!inLeft && !r.outputSet.contains(key)) None
+      else if (!canBroadcastBySize(l, conf) && !canBroadcastBySize(r, conf))
+        onScan(side, key, 0L, mk).map(c => if (inLeft) jn.copy(left = c) else jn.copy(right = c))
+      else belowShuffleJoin(side, key, mk, conf).map(c => if (inLeft) jn.copy(left = c) else jn.copy(right = c))
+    case _ => None
   }
 
   /** Puts the filter right above the scan `key` traces to; `None` if it reaches none that qualifies. */
@@ -252,7 +429,9 @@ case class FactBloomFilter(session: SparkSession) extends Rule[LogicalPlan] with
       else if (jt == Inner && key.references.subsetOf(r.outputSet))
         onScan(r, key, threshold, mk).map(c => jn.copy(right = c))
       else None
-    case rel: LogicalRelation if key.references.subsetOf(rel.outputSet) && rel.stats.sizeInBytes >= BigInt(threshold) =>
+    case rel: LogicalRelation
+        if key.references.subsetOf(rel.outputSet) && rel.stats.sizeInBytes >= BigInt(threshold) &&
+          !shared.contains(rel.canonicalized) =>
       Some(Filter(mk(key), rel))
     case _ => None
   }
@@ -260,6 +439,8 @@ case class FactBloomFilter(session: SparkSession) extends Rule[LogicalPlan] with
   private def hasFilterOn(cond: Expression, key: Expression): Boolean =
     splitConjunctivePredicates(cond).exists {
       case d: DynamicPruningSubquery => d.pruningKey.semanticEquals(key)
+      case Coalesce(Seq(BloomFilterMightContain(_, XxHash64(Seq(v), _)), _)) => v.semanticEquals(key)
+      case Coalesce(Seq(PartitionedBloomMightContain(_, XxHash64(Seq(v), _)), _)) => v.semanticEquals(key)
       case BloomFilterMightContain(_, XxHash64(Seq(v), _)) => v.semanticEquals(key)
       case PartitionedBloomMightContain(_, XxHash64(Seq(v), _)) => v.semanticEquals(key)
       case _ => false

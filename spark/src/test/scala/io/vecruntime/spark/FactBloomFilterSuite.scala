@@ -79,6 +79,11 @@ class FactBloomFilterSuite extends VectorQuerySuite {
       |FROM store_sales JOIN store_returns ON ss_ticket_number = sr_ticket_number AND ss_item_sk = sr_item_sk
       |GROUP BY ss_item_sk""".stripMargin
 
+  // A more reduced returns side: quantity 0 only (a third of the rows), still opaque to Spark's own runtime filter
+  // (`isnull(nullif(..))` is not one of its selective predicates) and on a column that is not a join key.
+  private val q93Selective =
+    q93.replace("isnotnull(nullif(sr_return_quantity, 0))", "isnull(nullif(sr_return_quantity, 0))")
+
   test("q93's shape: the larger fact gets bloom filters from the smaller one, results unchanged") {
     val df = run(q93)
     assert(salesBlooms(df) >= 1, df.queryExecution.optimizedPlan.treeString)
@@ -156,6 +161,197 @@ class FactBloomFilterSuite extends VectorQuerySuite {
     assert(finals.nonEmpty, "no bloom filter aggregate found:\n" + all.headOption.map(_.treeString).getOrElse(""))
     val overR2C = finals.filter(_.children.exists(_.isInstanceOf[RowToColumnarExec]))
     assert(overR2C.isEmpty, "a bloom aggregate reads RowToColumnarExec:\n" + overR2C.map(_.treeString).mkString("\n"))
+  }
+
+  /**
+   * `f` over a catalog copy of the returns with a table-level row count (`ANALYZE TABLE ... COMPUTE STATISTICS`,
+   * no column statistics, so #650's evidence is unchanged): the run-time cap compares the creation side's actual
+   * rows with that count, which a file-size estimate of these tiny compressed files would understate.
+   */
+  private def withCountedReturns[T](f: String => T): T =
+    try {
+      spark.table("store_returns").write.saveAsTable("fb_counted_returns")
+      spark.sql("ANALYZE TABLE fb_counted_returns COMPUTE STATISTICS")
+      f("fb_counted_returns")
+    } finally {
+      spark.sessionState.catalog.dropTable(
+        org.apache.spark.sql.catalyst.TableIdentifier("fb_counted_returns"),
+        ignoreIfNotExists = true,
+        purge = false
+      )
+    }
+
+  /** The values of the executed plan's scalar subqueries that build a bloom filter (null: declined at run time). */
+  private def builtFilters(df: DataFrame): Seq[Any] = {
+    object Plans extends org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanHelper
+    Plans.collectWithSubqueries(df.queryExecution.executedPlan) { case p => p }
+      .flatMap(_.expressions.flatMap(_.collect { case s: org.apache.spark.sql.execution.ScalarSubquery => s }))
+      .filter(_.dataType == org.apache.spark.sql.types.BinaryType)
+      .map(_.eval(null))
+  }
+
+  test("run-time evidence: a creation side not much smaller in actual rows yields a null filter, every row kept") {
+    // Every return row survives the filter (2000 rows): reduced in shape, not in rows. The application side is
+    // ~50x larger in bytes, so the plan-time size check passes at ratio 25, but 2000 x 25 rows exceed its
+    // estimated rows: the build declines at run time.
+    // `nullif(q, -1)` is never null (quantities are 0-2): every row kept, and Spark's own runtime filter does not
+    // count it as selective, so only this rule's filters are in the plan.
+    val weak = q93.replace("isnotnull(nullif(sr_return_quantity, 0))", "isnotnull(nullif(sr_return_quantity, -1))")
+    withConf(VectorConf.FactBloomFilterSizeRatio -> "25") {
+      val df = run(weak)
+      assert(salesBlooms(df) >= 1, df.queryExecution.optimizedPlan.treeString)
+      val built = builtFilters(df)
+      assert(built.nonEmpty && built.forall(_ == null), s"filters: $built\n${df.queryExecution.executedPlan}")
+    }
+    // Without the run-time check the same plan builds and applies the filter.
+    withConf(VectorConf.FactBloomFilterSizeRatio -> "25", VectorConf.FactBloomFilterRuntimeEvidence -> "false") {
+      val df = run(weak)
+      assert(builtFilters(df).exists(_ != null))
+    }
+  }
+
+  test("run-time evidence: a creation side keeping most of its key's table yields a null filter (q18)") {
+    // q93's returns keep quantities 1 and 2: two thirds of the rows, far above runtimeMaxReduced (0.2).
+    val keepsMost = q93
+    withCountedReturns { returns =>
+      val sql = keepsMost.replace("store_returns", returns)
+      val df = withConf(VectorConf.FactBloomFilterSizeRatio -> "2")(run(sql))
+      val built = builtFilters(df)
+      assert(built.nonEmpty && built.forall(_ == null), s"filters: $built")
+      // A looser cap lets it through.
+      val loose = withConf(
+        VectorConf.FactBloomFilterSizeRatio -> "2",
+        VectorConf.FactBloomFilterRuntimeMaxReduced -> "1"
+      )(run(sql))
+      assert(builtFilters(loose).exists(_ != null))
+    }
+  }
+
+  test("run-time evidence: q93's reduced returns still build their filter") {
+    // The application side's row estimate comes from its compressed file size, a few times below its 40000 rows
+    // here; ratio 2 keeps the ~1300 returns clearly under it.
+    val df = withCountedReturns { returns =>
+      withConf(VectorConf.FactBloomFilterSizeRatio -> "2", VectorConf.FactBloomFilterRuntimeMaxReduced -> "0.5")(
+        run(q93Selective.replace("store_returns", returns))
+      )
+    }
+    val built = builtFilters(df)
+    assert(built.nonEmpty && built.forall(_ != null), s"filters: $built\n${df.queryExecution.optimizedPlan}")
+  }
+
+  test("the filter's build reads the join's own creation-side exchange: the returns are scanned once (#659)") {
+    import org.apache.spark.sql.execution.SparkPlan
+    import org.apache.spark.sql.execution.adaptive.{AdaptiveSparkPlanHelper, ShuffleQueryStageExec}
+    object Plans extends AdaptiveSparkPlanHelper
+    def returnsScans(df: DataFrame): Int =
+      Plans.collectWithSubqueries(df.queryExecution.executedPlan) { case p: SparkPlan => p }
+        .count(p =>
+          p.nodeName.contains("Scan") && p.output.exists(_.name == "sr_return_quantity") &&
+            !p.isInstanceOf[ShuffleQueryStageExec]
+        )
+    withCountedReturns { returns =>
+      val sql = q93Selective.replace("store_returns", returns)
+      val shared = withConf(
+        VectorConf.FactBloomFilterSizeRatio -> "2",
+        VectorConf.FactBloomFilterRuntimeMaxReduced -> "0.5"
+      )(run(sql))
+      assert(builtFilters(shared).exists(_ != null), shared.queryExecution.executedPlan.treeString)
+      val separate = withConf(
+        VectorConf.FactBloomFilterSizeRatio -> "2",
+        VectorConf.FactBloomFilterRuntimeMaxReduced -> "0.5",
+        VectorConf.FactBloomFilterShareExchange -> "false"
+      )(run(sql))
+      assert(returnsScans(shared) < returnsScans(separate), s"${shared.queryExecution.executedPlan}")
+    }
+  }
+
+  test("a relation the plan reads twice gets no probe: its copies keep their exchange reuse (q23b)") {
+    val twice =
+      s"""SELECT * FROM ($q93) a JOIN (SELECT ss_item_sk k, count(*) n FROM store_sales GROUP BY ss_item_sk) b
+         |  ON a.ss_item_sk = b.k""".stripMargin
+    assert(salesBlooms(run(twice)) === 0)
+  }
+
+  test("transitive reduction: a selective dimension above the shuffle join reduces the returns first (q93, #659)") {
+    val session = spark
+    import session.implicits._
+    // Returns with a reason (ticket numbers are multiples of 5, so one of 7 reasons occurs), and the reason
+    // dimension: q93 keeps one reason.
+    // Parquet, so the reason's filter stays a filter (a local relation's would be folded into its rows).
+    spark.table("store_returns").selectExpr("*", "sr_ticket_number % 35 AS sr_reason_sk")
+      .write.mode("overwrite").parquet(newTempPath("fbloom/returns_r"))
+    spark.read.parquet(newTempPath("fbloom/returns_r")).createOrReplaceTempView("fb_returns_r")
+    (0 until 35).map(i => (i.toLong, s"reason $i")).toDF("r_reason_sk", "r_reason_desc")
+      .write.mode("overwrite").parquet(newTempPath("fbloom/reason"))
+    spark.read.parquet(newTempPath("fbloom/reason")).createOrReplaceTempView("fb_reason")
+    val sql =
+      """SELECT ss_item_sk, sum(ss_quantity - sr_return_quantity) q, count(*) c, max(ss_pad) p
+        |FROM store_sales JOIN fb_returns_r ON ss_ticket_number = sr_ticket_number AND ss_item_sk = sr_item_sk
+        |JOIN fb_reason ON sr_reason_sk = r_reason_sk
+        |WHERE r_reason_desc = 'reason 10'
+        |GROUP BY ss_item_sk""".stripMargin
+    // Broadcast only the reason (tiny); the sales and returns stay a shuffle join.
+    val small = Seq(
+      "spark.sql.autoBroadcastJoinThreshold" -> "2000",
+      "spark.sql.optimizer.runtime.bloomFilter.applicationSideScanSizeThreshold" -> "0"
+    )
+    val df = withConf(small: _*) {
+      val expected = withPlugin(enabled = false)(spark.sql(sql).collect())
+      val d = withPlugin(enabled = true) { val x = spark.sql(sql); x.collect(); x }
+      assertRowsEqual(expected, d.collect(), 1e-9, sql)
+      assert(expected.nonEmpty)
+      d
+    }
+    // The returns' scan gets the reason's filter, and the sales get filters from the reduced returns.
+    def returnsProbe(p: org.apache.spark.sql.catalyst.plans.logical.LogicalPlan): Boolean =
+      p.collect { case f: org.apache.spark.sql.catalyst.plans.logical.Filter => f }
+        .exists(_.condition.collect { case b: BloomFilterMightContain => b }
+          .exists(_.valueExpression.references.exists(_.name == "sr_reason_sk")))
+    val plan = df.queryExecution.optimizedPlan
+    assert(returnsProbe(plan), plan.treeString)
+    assert(salesBlooms(df) >= 1, plan.treeString)
+    // The probes stay columnar: no scan falls back to Spark's row filter over them (1 TB, #659).
+    val rowFilters = org.apache.spark.sql.vecruntime.VectorFallback.reasons(df.queryExecution.executedPlan)
+      .filter(_._1.nodeName == "Filter").map(_._2)
+    assert(rowFilters.isEmpty, rowFilters.mkString("; "))
+    // (With the reduction off, Spark's own runtime filter adds the reason's filter at this tiny scale, so the switch
+    // is not observable here; at 1 TB it did not, and q93's returns got no filter.)
+  }
+
+  test("the filter of a dynamically pruned creation side is dropped and its scan stays columnar (q50, #659)") {
+    try {
+      // q50's shape: the returns partitioned by a date key and pruned through a broadcast, filtered date table.
+      spark.table("store_returns").selectExpr("*", "sr_item_sk % 7 AS sr_date").write.partitionBy("sr_date")
+        .saveAsTable("fb_preturns")
+      spark.range(0, 7).selectExpr("id AS d_date", "id % 2 AS d_odd").write.saveAsTable("fb_pdate2")
+      val sql =
+        """SELECT ss_item_sk, sum(ss_quantity - sr_return_quantity) q, count(*) c, max(ss_pad) p
+          |FROM store_sales JOIN fb_preturns ON ss_ticket_number = sr_ticket_number AND ss_item_sk = sr_item_sk
+          |JOIN fb_pdate2 ON sr_date = d_date
+          |WHERE d_odd = 1 AND isnull(nullif(sr_return_quantity, 0))
+          |GROUP BY ss_item_sk""".stripMargin
+      val small = Seq(
+        "spark.sql.autoBroadcastJoinThreshold" -> "2000",
+        "spark.sql.optimizer.runtime.bloomFilter.applicationSideScanSizeThreshold" -> "0"
+      )
+      withConf(small: _*) {
+        val expected = withPlugin(enabled = false)(spark.sql(sql).collect())
+        val df = withPlugin(enabled = true) { val d = spark.sql(sql); d.collect(); d }
+        assertRowsEqual(expected, df.collect(), 1e-9, sql)
+        assert(expected.nonEmpty)
+        val rowFilters = org.apache.spark.sql.vecruntime.VectorFallback.reasons(df.queryExecution.executedPlan)
+          .filter(_._1.nodeName == "Filter").map(_._2)
+        assert(rowFilters.isEmpty, rowFilters.mkString("; ") + "\n" + df.queryExecution.executedPlan)
+      }
+    } finally {
+      Seq("fb_preturns", "fb_pdate2").foreach { t =>
+        spark.sessionState.catalog.dropTable(
+          org.apache.spark.sql.catalyst.TableIdentifier(t),
+          ignoreIfNotExists = true,
+          purge = false
+        )
+      }
+    }
   }
 
   test("sides of similar size get no filter") {
@@ -298,15 +494,16 @@ class FactBloomFilterSuite extends VectorQuerySuite {
   }
 
   test("partitioned filter: every key is found in its bucket's sub-filter; pack and unpack round-trip (#653)") {
-    import org.apache.spark.sql.vecruntime.PartitionedBloomFilter
-    import org.apache.spark.sql.catalyst.expressions.aggregate.BloomFilterAggregate
-    import org.apache.spark.util.sketch.BloomFilter
+    import org.apache.spark.sql.vecruntime.{BlockedBloomFilter, PartitionedBloomFilter}
     val buckets = 7
     val keys = (0L until 20000L).map(i => org.apache.spark.sql.catalyst.expressions.XXH64.hashLong(i * 31L, 42L))
     val subs = Array.tabulate(buckets) { b =>
       val ks = keys.filter(h => Math.floorMod(h, buckets.toLong) == b)
       if (b == 3) null // a bucket without keys
-      else { val f = BloomFilter.create(5000L, 40000L); ks.foreach(f.putLong); BloomFilterAggregate.serialize(f) }
+      else {
+        val f = BlockedBloomFilter.create(40000L); ks.foreach(BlockedBloomFilter.put(f, _));
+        BlockedBloomFilter.serialize(f)
+      }
     }
     val filters = PartitionedBloomFilter.unpack(PartitionedBloomFilter.pack(subs))
     assert(filters.length == buckets && filters(3) == null)
@@ -318,5 +515,30 @@ class FactBloomFilterSuite extends VectorQuerySuite {
       filters,
       _
     )))
+  }
+
+  test("blocked filter: no false negatives, a false-positive rate near a split-block filter's, merge is the union") {
+    import org.apache.spark.sql.vecruntime.BlockedBloomFilter
+    def h(i: Long) = org.apache.spark.sql.catalyst.expressions.XXH64.hashLong(i, 42L)
+    val n = 100000
+    val a = BlockedBloomFilter.create(8L * n) // 8 bits a key, as the partitioned layout
+    (0 until n / 2).foreach(i => BlockedBloomFilter.put(a, h(i)))
+    val b = BlockedBloomFilter.create(8L * n)
+    (n / 2 until n).foreach(i => BlockedBloomFilter.put(b, h(i)))
+    BlockedBloomFilter.merge(a, b)
+    val f = BlockedBloomFilter.deserialize(BlockedBloomFilter.serialize(a))
+    assert(f.sameElements(a))
+    assert((0 until n).forall(i => BlockedBloomFilter.mightContain(f, h(i))))
+    val probes = 200000
+    val fp = (0 until probes).count(i => BlockedBloomFilter.mightContain(f, h(10000000L + i)))
+    // A split-block filter at 8 bits a key: about 3 % false positives (Spark's layout: about 2 %).
+    assert(fp.toDouble / probes < 0.05, s"false-positive rate ${fp.toDouble / probes}")
+    // Keys of one bucket of a partitioned filter (pmod(h, 7) == 3) still spread over the blocks.
+    val bucket = BlockedBloomFilter.create(8L * 2000)
+    val ks = (0L until 100000L).map(h).filter(x => Math.floorMod(x, 7L) == 3).take(2000)
+    ks.foreach(BlockedBloomFilter.put(bucket, _))
+    val others = (200000L until 400000L).map(h).filter(x => Math.floorMod(x, 7L) == 3)
+    val fp2 = others.count(BlockedBloomFilter.mightContain(bucket, _))
+    assert(fp2.toDouble / others.size < 0.05, s"false-positive rate within a bucket ${fp2.toDouble / others.size}")
   }
 }

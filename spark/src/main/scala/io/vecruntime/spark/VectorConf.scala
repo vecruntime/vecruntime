@@ -80,6 +80,18 @@ object VectorConf {
    */
   val FactBloomFilterEnabled = "spark.vecruntime.optimizer.factBloomFilter.enabled"
 
+  /** Run-time evidence (#659): the build counts the creation side's actual rows and declines when not much smaller. */
+  val FactBloomFilterRuntimeEvidence = "spark.vecruntime.optimizer.factBloomFilter.runtimeEvidence"
+
+  /** The filter's build reads the join's creation-side exchange instead of a second copy (#659, AQE only). */
+  val FactBloomFilterShareExchange = "spark.vecruntime.optimizer.factBloomFilter.shareExchange"
+
+  /** Run-time evidence: the creation side's actual rows at most this share of its key's base table (#659). */
+  val FactBloomFilterRuntimeMaxReduced = "spark.vecruntime.optimizer.factBloomFilter.runtimeMaxReduced"
+
+  /** Transitive reduction (#659): a selective broadcast dimension above a shuffle join reduces its input first. */
+  val FactBloomFilterTransitive = "spark.vecruntime.optimizer.factBloomFilter.transitive"
+
   /** How many times larger (estimated bytes) the filtered side must be than the side the filter is built from. */
   val FactBloomFilterSizeRatio = "spark.vecruntime.optimizer.factBloomFilter.sizeRatio"
 
@@ -590,7 +602,22 @@ object VectorConf {
 
   /** The fact-to-fact bloom filter (#641); also off when the plugin is off. */
   def factBloomFilterEnabled(conf: SQLConf): Boolean =
-    isEnabled(conf) && bool(conf, FactBloomFilterEnabled, default = false)
+    isEnabled(conf) && bool(conf, FactBloomFilterEnabled, default = true)
+
+  /** FactBloomFilter's run-time row-count check (#659), default true. */
+  def factBloomFilterRuntimeEvidence(conf: SQLConf): Boolean =
+    bool(conf, FactBloomFilterRuntimeEvidence, default = true)
+
+  /** FactBloomFilter's shared creation-side exchange (#659), default true; needs runtimeEvidence and AQE. */
+  def factBloomFilterShareExchange(conf: SQLConf): Boolean =
+    bool(conf, FactBloomFilterShareExchange, default = true)
+
+  /** FactBloomFilter's run-time reduction cap (#659), default 0.2, in (0, 1]. */
+  /** FactBloomFilter's transitive reduction (#659), default true. */
+  def factBloomFilterTransitive(conf: SQLConf): Boolean = bool(conf, FactBloomFilterTransitive, default = true)
+
+  def factBloomFilterRuntimeMaxReduced(conf: SQLConf): Double =
+    math.min(1.0, math.max(1e-9, conf.getConfString(FactBloomFilterRuntimeMaxReduced, "0.2").trim.toDouble))
 
   def factBloomFilterSizeRatio(conf: SQLConf): Int =
     math.max(2, conf.getConfString(FactBloomFilterSizeRatio, "10").trim.toInt)

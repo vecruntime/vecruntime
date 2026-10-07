@@ -15,7 +15,6 @@
  */
 package org.apache.spark.sql.vecruntime
 
-import java.io.ByteArrayInputStream
 import java.nio.ByteBuffer
 
 import org.apache.spark.sql.catalyst.InternalRow
@@ -25,12 +24,12 @@ import org.apache.spark.sql.catalyst.expressions.aggregate.TypedImperativeAggreg
 import org.apache.spark.sql.catalyst.expressions.codegen.{CodegenContext, CodegenFallback, ExprCode}
 import org.apache.spark.sql.catalyst.trees.BinaryLike
 import org.apache.spark.sql.types.{BinaryType, DataType, IntegerType, LongType}
-import org.apache.spark.util.sketch.BloomFilter
 
 /**
  * A partitioned runtime bloom filter (#653): `B` sub-filters, sub-filter `b` holding the keys whose hash `h`
  * has `pmod(h, B) = b`. One value holds them all:
- * `int B, then per bucket: int length (-1 = no key in the bucket), the bucket's serialized BloomFilter`.
+ * `int B, then per bucket: int length (-1 = no key in the bucket), the bucket's serialized`
+ * [[BlockedBloomFilter]] (one cache line read per probe, #659).
  *
  * A filter sized for tens of millions of keys cannot be a single `bloom_filter_agg`: Spark caps one at
  * `maxNumItems` / `maxNumBits`, and every map task would ship a full-size partial (#646). Split by the hash,
@@ -48,15 +47,15 @@ object PartitionedBloomFilter {
     buf.array()
   }
 
-  /** The sub-filters, `null` for a bucket that saw no key. */
-  def unpack(bytes: Array[Byte]): Array[BloomFilter] = {
+  /** The sub-filters' words, `null` for a bucket that saw no key. */
+  def unpack(bytes: Array[Byte]): Array[Array[Int]] = {
     val buf = ByteBuffer.wrap(bytes)
     val n = buf.getInt()
     Array.fill(n) {
       val len = buf.getInt()
       if (len < 0) null
       else {
-        val f = BloomFilter.readFrom(new ByteArrayInputStream(bytes, buf.position(), len))
+        val f = BlockedBloomFilter.deserialize(bytes, buf.position(), len)
         buf.position(buf.position() + len)
         f
       }
@@ -64,10 +63,9 @@ object PartitionedBloomFilter {
   }
 
   /** Whether `h` may be a key: its bucket's sub-filter says so. An empty bucket holds no key. */
-  def mightContain(filters: Array[BloomFilter], h: Long): Boolean = {
-    val b = Math.floorMod(h, filters.length.toLong).toInt
-    val f = filters(b)
-    f != null && f.mightContainLong(h)
+  def mightContain(filters: Array[Array[Int]], h: Long): Boolean = {
+    val f = filters(Math.floorMod(h, filters.length.toLong).toInt)
+    f != null && BlockedBloomFilter.mightContain(f, h)
   }
 }
 
@@ -159,7 +157,7 @@ case class PartitionedBloomMightContain(filter: Expression, value: Expression)
     if (filter.dataType == BinaryType && value.dataType == LongType) TypeCheckResult.TypeCheckSuccess
     else TypeCheckResult.TypeCheckFailure(s"needs (binary, long), got ${filter.dataType}, ${value.dataType}")
 
-  @transient private lazy val filters: Array[BloomFilter] = filter.eval() match {
+  @transient private lazy val filters: Array[Array[Int]] = filter.eval() match {
     case null => null
     case bytes: Array[Byte] => PartitionedBloomFilter.unpack(bytes)
   }
