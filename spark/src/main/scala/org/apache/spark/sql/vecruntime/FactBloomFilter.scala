@@ -90,7 +90,9 @@ case class FactBloomFilter(session: SparkSession) extends Rule[LogicalPlan] with
     // own runtime filter built from it) keeps its ids and is not a second read.
     shared = plan.collect { case r: LogicalRelation => (r.canonicalized, r.output.map(_.exprId)) }
       .groupBy(_._1).collect { case (c, copies) if copies.map(_._2).distinct.size > 1 => c }.toSet
-    plan.transformUp {
+    val reduced = if (VectorConf.factBloomFilterTransitive(conf)) transitive(plan, conf) else plan
+    budget -= countBlooms(reduced) - countBlooms(plan)
+    reduced.transformUp {
       case j @ ExtractEquiJoinKeys(jt, leftKeys, rightKeys, _, _, left, right, hint)
           if budget > 0 && !canBroadcastBySize(left, conf) && !canBroadcastBySize(right, conf) &&
             !hintToBroadcastLeft(hint) && !hintToBroadcastRight(hint) =>
@@ -122,7 +124,11 @@ case class FactBloomFilter(session: SparkSession) extends Rule[LogicalPlan] with
     val conf = session.sessionState.conf
     val ratio = VectorConf.factBloomFilterSizeRatio(conf)
     if (!appKey.deterministic || !creationKey.deterministic || creationKey.references.isEmpty) return None
-    if (app.stats.sizeInBytes < creation.stats.sizeInBytes * BigInt(ratio)) return None
+    // With run-time evidence the build checks the creation side's actual rows against `ratio`; the plan-time
+    // estimate of a creation side reduced by a filter or a join (its base table's size) would understate that
+    // reduction and decline q50's returns, so the plan only requires the application side to be the larger.
+    val planRatio = if (VectorConf.factBloomFilterRuntimeEvidence(conf)) 1 else ratio
+    if (app.stats.sizeInBytes < creation.stats.sizeInBytes * BigInt(planRatio)) return None
     val items = expectedItems(app, appKey, creation, creationKey, VectorConf.factBloomFilterMaxSelectivity(conf))
     if (items.isEmpty) return None
     val threshold = conf.getConf(SQLConf.RUNTIME_BLOOM_FILTER_APPLICATION_SIDE_SCAN_SIZE_THRESHOLD)
@@ -346,6 +352,60 @@ case class FactBloomFilter(session: SparkSession) extends Rule[LogicalPlan] with
     // Column pruning as Spark's own rule does: the subquery reads only the creation key.
     val subquery = ScalarSubquery(ColumnPruning(plan), Nil)
     probe(BloomFilterMightContain(subquery, new XxHash64(Seq(appExpr))), gate)
+  }
+
+  /**
+   * Transitive reduction (#659): a small, selectively filtered relation `D` joined (a broadcast join) above a
+   * shuffle join, on a column of one of that join's inputs `C`, reduces `C` before the shuffle join. A bloom filter
+   * of `D`'s key goes on `C`'s scan, so `C` -- now reduced -- is the creation side of a filter onto the shuffle
+   * join's larger input. TPC-DS q93: `store_returns` is reduced by its join with one `reason`, above
+   * `store_sales JOIN store_returns`; q50: by a one-month `date_dim`. EMR Serverless applies the same chain (a
+   * run-time filter on `sr_reason_sk`, then bloom filters onto `store_sales`). Spark's own runtime filter leaves
+   * these out: the join with `D` is a broadcast join. The inner join with `D` above keeps exactly the `C` rows the
+   * filter can keep (a bloom filter has no false negatives), so the result is unchanged.
+   */
+  private def transitive(plan: LogicalPlan, conf: SQLConf): LogicalPlan = plan.transformDown {
+    case j @ ExtractEquiJoinKeys(Inner, leftKeys, rightKeys, _, _, left, right, _) =>
+      def reduceWith(x: LogicalPlan, d: LogicalPlan, xKeys: Seq[Expression], dKeys: Seq[Expression]): LogicalPlan =
+        if (!canBroadcastBySize(d, conf) || !KeyStats.reduced(d) || canBroadcastBySize(x, conf)) x
+        else xKeys.zip(dKeys).foldLeft(x) {
+          case (acc, (xk: org.apache.spark.sql.catalyst.expressions.Attribute, dk)) if dk.references.nonEmpty =>
+            belowShuffleJoin(acc, xk, dimensionFilter(d, dk), conf).getOrElse(acc)
+          case (acc, _) => acc
+        }
+      val l = reduceWith(left, right, leftKeys, rightKeys)
+      val r = if (l ne left) right else reduceWith(right, left, rightKeys, leftKeys)
+      if ((l eq left) && (r eq right)) j else j.withNewChildren(Seq(l, r))
+  }
+
+  /** A plain bloom filter of `d`'s `key` (`d` is small): the probe `mk(appKey)`. */
+  private def dimensionFilter(d: LogicalPlan, key: Expression): Expression => Expression = { appExpr =>
+    val agg = new BloomFilterAggregate(new XxHash64(Seq(key)))
+    val plan = Aggregate(Nil, Seq(Alias(agg.toAggregateExpression(), "bloomFilter")()), d)
+    BloomFilterMightContain(ScalarSubquery(ColumnPruning(plan), Nil), new XxHash64(Seq(appExpr)))
+  }
+
+  /**
+   * `p` with the dimension filter on the scan of the input holding `key` of the first shuffle join (both inputs
+   * too large to broadcast) found under it; `None` if there is none, or the key's input is not a plain scan.
+   */
+  private def belowShuffleJoin(
+      p: LogicalPlan,
+      key: org.apache.spark.sql.catalyst.expressions.Attribute,
+      mk: Expression => Expression,
+      conf: SQLConf
+  ): Option[LogicalPlan] = p match {
+    case pr @ Project(_, child) if child.outputSet.contains(key) =>
+      belowShuffleJoin(child, key, mk, conf).map(c => pr.copy(child = c))
+    case f @ Filter(_, child) => belowShuffleJoin(child, key, mk, conf).map(c => f.copy(child = c))
+    case jn @ Join(l, r, jt, _, _) if jt == Inner || jt == LeftSemi =>
+      val inLeft = l.outputSet.contains(key)
+      val side = if (inLeft) l else r
+      if (!inLeft && !r.outputSet.contains(key)) None
+      else if (!canBroadcastBySize(l, conf) && !canBroadcastBySize(r, conf))
+        onScan(side, key, 0L, mk).map(c => if (inLeft) jn.copy(left = c) else jn.copy(right = c))
+      else belowShuffleJoin(side, key, mk, conf).map(c => if (inLeft) jn.copy(left = c) else jn.copy(right = c))
+    case _ => None
   }
 
   /** Puts the filter right above the scan `key` traces to; `None` if it reaches none that qualifies. */

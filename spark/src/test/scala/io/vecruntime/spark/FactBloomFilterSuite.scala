@@ -272,6 +272,48 @@ class FactBloomFilterSuite extends VectorQuerySuite {
     assert(salesBlooms(run(twice)) === 0)
   }
 
+  test("transitive reduction: a selective dimension above the shuffle join reduces the returns first (q93, #659)") {
+    val session = spark
+    import session.implicits._
+    // Returns with a reason (ticket numbers are multiples of 5, so one of 7 reasons occurs), and the reason
+    // dimension: q93 keeps one reason.
+    // Parquet, so the reason's filter stays a filter (a local relation's would be folded into its rows).
+    spark.table("store_returns").selectExpr("*", "sr_ticket_number % 35 AS sr_reason_sk")
+      .write.mode("overwrite").parquet(newTempPath("fbloom/returns_r"))
+    spark.read.parquet(newTempPath("fbloom/returns_r")).createOrReplaceTempView("fb_returns_r")
+    (0 until 35).map(i => (i.toLong, s"reason $i")).toDF("r_reason_sk", "r_reason_desc")
+      .write.mode("overwrite").parquet(newTempPath("fbloom/reason"))
+    spark.read.parquet(newTempPath("fbloom/reason")).createOrReplaceTempView("fb_reason")
+    val sql =
+      """SELECT ss_item_sk, sum(ss_quantity - sr_return_quantity) q, count(*) c, max(ss_pad) p
+        |FROM store_sales JOIN fb_returns_r ON ss_ticket_number = sr_ticket_number AND ss_item_sk = sr_item_sk
+        |JOIN fb_reason ON sr_reason_sk = r_reason_sk
+        |WHERE r_reason_desc = 'reason 10'
+        |GROUP BY ss_item_sk""".stripMargin
+    // Broadcast only the reason (tiny); the sales and returns stay a shuffle join.
+    val small = Seq(
+      "spark.sql.autoBroadcastJoinThreshold" -> "2000",
+      "spark.sql.optimizer.runtime.bloomFilter.applicationSideScanSizeThreshold" -> "0"
+    )
+    val df = withConf(small: _*) {
+      val expected = withPlugin(enabled = false)(spark.sql(sql).collect())
+      val d = withPlugin(enabled = true) { val x = spark.sql(sql); x.collect(); x }
+      assertRowsEqual(expected, d.collect(), 1e-9, sql)
+      assert(expected.nonEmpty)
+      d
+    }
+    // The returns' scan gets the reason's filter, and the sales get filters from the reduced returns.
+    def returnsProbe(p: org.apache.spark.sql.catalyst.plans.logical.LogicalPlan): Boolean =
+      p.collect { case f: org.apache.spark.sql.catalyst.plans.logical.Filter => f }
+        .exists(_.condition.collect { case b: BloomFilterMightContain => b }
+          .exists(_.valueExpression.references.exists(_.name == "sr_reason_sk")))
+    val plan = df.queryExecution.optimizedPlan
+    assert(returnsProbe(plan), plan.treeString)
+    assert(salesBlooms(df) >= 1, plan.treeString)
+    // (With the reduction off, Spark's own runtime filter adds the reason's filter at this tiny scale, so the switch
+    // is not observable here; at 1 TB it did not, and q93's returns got no filter.)
+  }
+
   test("sides of similar size get no filter") {
     val sql =
       "SELECT count(*), max(a.ss_pad) FROM store_sales a JOIN store_sales b ON a.ss_ticket_number = b.ss_ticket_number"

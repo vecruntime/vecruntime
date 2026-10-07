@@ -386,6 +386,15 @@ was built and applied, and the `catalog_sales` scan stage's task time doubled.
 No probe goes on a relation the plan reads more than once (q23b's CTE): it would cost the copies' exchange reuse.
 Off with `spark.vecruntime.optimizer.factBloomFilter.runtimeEvidence=false`.
 
+**Transitive reduction (#659).** A small, selectively filtered relation `D` broadcast-joined above a shuffle join,
+on a column of one of its inputs `C`, first gets a bloom filter of its key on `C`'s scan. `C` is then reduced and
+is the creation side of a filter onto the shuffle join's larger input -- the chain EMR Serverless applies in q93
+(a run-time filter on `sr_reason_sk` from one `reason`, then bloom filters onto `store_sales`). The inner join with
+`D` above keeps exactly the rows the filter can keep, so results are unchanged. Spark's own runtime filter leaves
+it out because the join with `D` is a broadcast. With run-time evidence, the plan-time size check only requires
+the application side to be the larger: the estimate of a reduced creation side is its base table's size.
+Off with `spark.vecruntime.optimizer.factBloomFilter.transitive=false`.
+
 **Shared creation-side exchange (#659).** The build subquery reads `BloomCreationRef`, a reference to the join
 input that the optimizer leaves alone. The query-stage preparation rule `ShareBloomCreationExchange` replaces its
 physical placeholder with that join input's own shuffle exchange, carrying the reference's logical link so the
