@@ -481,6 +481,9 @@ object ExpressionCompiler {
     // the operands themselves (an operand is evaluated once for its test and once for its value).
     case CaseWhen(branches, elseValue) => conditional(branches, elseValue, expr, input)
     case If(predicate, trueValue, falseValue) => conditional(Seq((predicate, trueValue)), Some(falseValue), expr, input)
+    // A boolean operand with a non-null boolean literal fallback: evaluate the operand once.
+    case Coalesce(Seq(c, Literal(fill: Boolean, BooleanType))) if c.dataType == BooleanType =>
+      compile(c, input).map(BoolNullFillExpr(_, fill))
     case Coalesce(children) if children.length >= 2 =>
       conditional(children.init.map(c => (IsNotNull(c), c)), Some(children.last), expr, input)
 

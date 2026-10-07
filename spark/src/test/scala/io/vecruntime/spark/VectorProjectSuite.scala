@@ -352,6 +352,21 @@ class VectorProjectSuite extends VectorQuerySuite {
     )
   }
 
+  test("COALESCE of a boolean with a boolean literal evaluates the operand once (#659)") {
+    checkVectorized(
+      "SELECT COALESCE(l > 3000, true) AS t, COALESCE(l > 3000, false) AS f, COALESCE(d > 5, i > 3, true) AS g FROM t",
+      Seq(Project)
+    )
+    checkVectorized("SELECT i FROM t WHERE COALESCE(l > 3000, true) AND i < 2000", Seq(Filter, Project))
+    // the operand is compiled once, under the null fill, not twice under a CASE blend
+    import org.apache.spark.sql.catalyst.expressions.{AttributeReference, Coalesce, GreaterThan, Literal}
+    import org.apache.spark.sql.types.LongType
+    val l = AttributeReference("l", LongType, nullable = true)()
+    val e = Coalesce(Seq(GreaterThan(l, Literal(3L)), Literal(true)))
+    val compiled = io.vecruntime.spark.expr.ExpressionCompiler.compile(e, Seq(l))
+    assert(compiled.exists(_.isInstanceOf[io.vecruntime.spark.expr.BoolNullFillExpr]), compiled)
+  }
+
   test("literal columns are materialised, dense or under a selection") {
     checkVectorized(
       "SELECT 1 AS one, i, 2.5D AS x, 7L AS l7, DATE '2020-01-02' AS day FROM t WHERE i > 5",
