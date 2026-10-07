@@ -18,6 +18,8 @@ version may change configuration keys or defaults, always noted here.
   broadcast dimension above a shuffle join reduces that join's input first, which then gets its filter (q93, q50).
   `FactBloomFilter` is on by default again, with run-time evidence (#659).
 - `FactBloomFilter`'s partitioned filters use split-block sub-filters (one cache line read per probe) instead of
+- `COALESCE(c, <boolean literal>)` over a boolean `c` evaluates `c` once; the general path evaluated each operand
+  twice, which doubled the cost of `FactBloomFilter`'s probe `coalesce(might_contain(...), true)` (#659).
   Spark's `BloomFilterImpl`, whose scattered reads made q93's 2.9G-row probe cost more than it saved (#659).
 - A logical rewrite that computes a substring or length of a join's smaller side below the join
   (`spark.vecruntime.optimizer.narrowBelowJoin.enabled`, on by default): the join carries the short result instead
