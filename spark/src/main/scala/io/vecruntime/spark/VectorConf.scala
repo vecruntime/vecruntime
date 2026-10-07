@@ -89,6 +89,12 @@ object VectorConf {
    */
   val FactBloomFilterMaxSelectivity = "spark.vecruntime.optimizer.factBloomFilter.maxSelectivity"
 
+  /**
+   * Total bits a FactBloomFilter filter may take (#653). A filter needing more, even at 4 bits a key, is declined:
+   * built saturated it would cost its build and prune nothing.
+   */
+  val FactBloomFilterMaxTotalBits = "spark.vecruntime.optimizer.factBloomFilter.maxTotalBits"
+
   /** The grouped aggregate emits its UTF8 keys dictionary-encoded, ids over the group table's own dictionary (#377). */
   val AggDictionaryKeys = "spark.vecruntime.agg.dictionaryKeys"
   val SortEnabled = "spark.vecruntime.exec.sort.enabled"
@@ -570,13 +576,16 @@ object VectorConf {
 
   /** The fact-to-fact bloom filter (#641); also off when the plugin is off. */
   def factBloomFilterEnabled(conf: SQLConf): Boolean =
-    isEnabled(conf) && bool(conf, FactBloomFilterEnabled, default = true)
+    isEnabled(conf) && bool(conf, FactBloomFilterEnabled, default = false)
 
   def factBloomFilterSizeRatio(conf: SQLConf): Int =
     math.max(2, conf.getConfString(FactBloomFilterSizeRatio, "10").trim.toInt)
 
   def factBloomFilterMergeBuckets(conf: SQLConf): Int =
     math.max(1, conf.getConfString(FactBloomFilterMergeBuckets, "32").trim.toInt)
+
+  def factBloomFilterMaxTotalBits(conf: SQLConf): Long =
+    math.max(64L, conf.getConfString(FactBloomFilterMaxTotalBits, (512L << 20).toString).trim.toLong)
 
   def factBloomFilterMaxSelectivity(conf: SQLConf): Double =
     math.min(1.0, math.max(0.0, conf.getConfString(FactBloomFilterMaxSelectivity, "0.5").trim.toDouble))

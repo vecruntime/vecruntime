@@ -152,19 +152,29 @@ object XxHash64Expr {
  * (`BloomFilterCache`) rather than once per task. A null filter (the build side produced none) gives a
  * null lane for every row, as Spark's does.
  */
-final case class BloomProbeExpr(filter: SubqueryLiteralExpr, hash: VectorExpr) extends VectorExpr {
+final case class BloomProbeExpr(filter: SubqueryLiteralExpr, hash: VectorExpr, partitioned: Boolean = false)
+    extends VectorExpr {
   override def dataType: DataType = BooleanType
   override def children: Seq[VectorExpr] = Seq(hash)
 
-  @transient private lazy val bloom: BloomFilter = filter.value match {
+  @transient private lazy val bloom: BloomFilter = if (partitioned) null
+  else filter.value match {
     case null => null
     case bytes: Array[Byte] => BloomFilterCache.get(bytes)
+  }
+
+  /** The sub-filters of a partitioned filter (#653); sub-filter `floorMod(h, length)`, null = no key there. */
+  @transient private lazy val parts: Array[BloomFilter] = if (!partitioned) null
+  else filter.value match {
+    case null => null
+    case bytes: Array[Byte] => BloomFilterCache.getPartitioned(bytes)
   }
 
   override def eval(ctx: EvalContext): VectorBuffers = {
     val n = ctx.numRows
     val b = bloom
-    if (b == null) return SubqueryLiteralExpr.nulls(BooleanType, ctx)
+    val ps = parts
+    if (b == null && ps == null) return SubqueryLiteralExpr.nulls(BooleanType, ctx)
     val h = hash.eval(ctx)
     val bits = ArrowLayout.allocateBitmap(ctx.arena, n)
     // Only rows still undecided are probed: under AND, `ctx.active` excludes rows an earlier conjunct already
@@ -174,7 +184,11 @@ final case class BloomProbeExpr(filter: SubqueryLiteralExpr, hash: VectorExpr) e
     var i = 0
     while (i < n) {
       if ((active == null || Bitmap.isSet(active, i)) && (h.validity() == null || Bitmap.isSet(h.validity(), i))) {
-        Bitmap.setTo(bits, i, b.mightContainLong(h.data().getAtIndex(VectorBuffers.LE_LONG, i)))
+        val v = h.data().getAtIndex(VectorBuffers.LE_LONG, i)
+        val hit =
+          if (ps == null) b.mightContainLong(v)
+          else { val f = ps(Math.floorMod(v, ps.length.toLong).toInt); f != null && f.mightContainLong(v) }
+        Bitmap.setTo(bits, i, hit)
       }
       i += 1
     }

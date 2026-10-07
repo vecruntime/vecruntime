@@ -22,8 +22,15 @@ import org.apache.spark.sql.catalyst.expressions.BloomFilterMightContain
 /** A bloom filter from a smaller fact onto a larger one it joins (#641), against Spark with the plugin off. */
 class FactBloomFilterSuite extends VectorQuerySuite {
 
+  override protected def afterAll(): Unit = {
+    try spark.conf.unset(VectorConf.FactBloomFilterEnabled)
+    finally super.afterAll()
+  }
+
   override protected def beforeAll(): Unit = {
     super.beforeAll()
+    // Off by default (1 TB: q18, q61, q23b slower with it); on for this suite, whose tests turn it off themselves.
+    spark.conf.set(VectorConf.FactBloomFilterEnabled, "true")
     val session = spark
     import session.implicits._
     // q93-like: sales with many tickets, returns for one ticket in twenty (about 20x smaller).
@@ -78,6 +85,55 @@ class FactBloomFilterSuite extends VectorQuerySuite {
     // Spark's own runtime filter adds none here: the creation side has no selective filter.
     val off = withConf(VectorConf.FactBloomFilterEnabled -> "false")(run(q93))
     assert(salesBlooms(off) === 0, off.queryExecution.optimizedPlan.treeString)
+  }
+
+  test("the probe joins the fact's own filter directly above the scan, keeping its partition pruning") {
+    import org.apache.spark.sql.catalyst.expressions.DynamicPruning
+    import org.apache.spark.sql.catalyst.plans.logical.Filter
+    import org.apache.spark.sql.execution.{FileSourceScanExec, FilterExec}
+    try {
+      // The sales partitioned by a date key and pruned through a filtered date table, as store_sales at 1 TB.
+      spark.table("store_sales").selectExpr("*", "ss_item_sk % 7 AS ss_date").write.partitionBy("ss_date")
+        .saveAsTable("fb_psales")
+      spark.range(0, 7).selectExpr("id AS d_date", "id % 2 AS d_odd").write.saveAsTable("fb_pdate")
+      val sql =
+        """SELECT ss_item_sk, sum(ss_quantity - sr_return_quantity) q, count(*) c, max(ss_pad) p
+          |FROM fb_psales JOIN fb_pdate ON ss_date = d_date
+          |JOIN (SELECT * FROM store_returns WHERE isnotnull(nullif(sr_return_quantity, 0))) r
+          |  ON ss_ticket_number = sr_ticket_number AND ss_item_sk = sr_item_sk
+          |WHERE d_odd = 1 AND ss_quantity > 2
+          |GROUP BY ss_item_sk""".stripMargin
+      run(sql) // results unchanged (broadcast-reuse pruning only, as by default)
+      // The physical planning, not run: a non-broadcast pruning subquery is what puts the expression in the plan.
+      withConf("spark.sql.optimizer.dynamicPartitionPruning.reuseBroadcastOnly" -> "false") {
+        shuffleOnly {
+          val qe = withPlugin(enabled = true)(spark.sql(sql).queryExecution)
+          val plan = qe.optimizedPlan
+          assert(salesBlooms(spark.sql(sql)) >= 1, plan.treeString)
+          assert(!plan.exists { case Filter(_, _: Filter) => true; case _ => false }, plan.treeString)
+          // The scan took the pruning expression as a partition filter; no row filter evaluates it.
+          val physical = qe.sparkPlan
+          assert(
+            physical.collect { case f: FileSourceScanExec => f }.exists(_.partitionFilters.exists(
+              _.isInstanceOf[DynamicPruning]
+            )),
+            physical.treeString
+          )
+          assert(
+            physical.collect { case f: FilterExec => f }.forall(!_.condition.exists(_.isInstanceOf[DynamicPruning])),
+            physical.treeString
+          )
+        }
+      }
+    } finally {
+      Seq("fb_psales", "fb_pdate").foreach { t =>
+        spark.sessionState.catalog.dropTable(
+          org.apache.spark.sql.catalyst.TableIdentifier(t),
+          ignoreIfNotExists = true,
+          purge = false
+        )
+      }
+    }
   }
 
   test("the filter's Final aggregate over a row exchange stays Spark's, not ours over RowToColumnar (#647)") {
@@ -202,6 +258,10 @@ class FactBloomFilterSuite extends VectorQuerySuite {
       assert(salesBloomKeys(run(sql)) === Set("ss_ticket_number"))
       // A stricter maxSelectivity than the ticket key's 0.2 declines it too.
       withConf(VectorConf.FactBloomFilterMaxSelectivity -> "0.1")(assert(salesBlooms(run(sql)) === 0))
+      // Unless the creation side is reduced by a filter: the statistics describe the whole table, not the
+      // reduced side, so the reduction's evidence still fires (as without statistics).
+      val reduced = q93.replace("store_sales", "fb_sales").replace("store_returns", "fb_returns")
+      withConf(VectorConf.FactBloomFilterMaxSelectivity -> "0.1")(assert(salesBlooms(run(reduced)) >= 1))
     } finally {
       Seq("fb_sales", "fb_returns").foreach { t =>
         spark.sessionState.catalog.dropTable(
@@ -211,5 +271,52 @@ class FactBloomFilterSuite extends VectorQuerySuite {
         )
       }
     }
+  }
+
+  /** Partitioned filters (#653) on the sales side's keys in the optimized plan. */
+  private def partitionedBlooms(df: DataFrame): Int =
+    df.queryExecution.optimizedPlan.collect { case f: org.apache.spark.sql.catalyst.plans.logical.Filter => f }
+      .flatMap(_.condition.collect { case p: org.apache.spark.sql.vecruntime.PartitionedBloomMightContain => p })
+      .size
+
+  test("a filter too large for one bloom_filter_agg is partitioned by hash bucket, results unchanged (#653)") {
+    // maxNumItems 100: the returns side's ~1300 keys need 50-item sub-filters, ~27 buckets.
+    withConf("spark.sql.optimizer.runtime.bloomFilter.maxNumItems" -> "100") {
+      val df = run(q93)
+      assert(partitionedBlooms(df) >= 1, df.queryExecution.optimizedPlan.treeString)
+      assert(salesBlooms(df) === 0, df.queryExecution.optimizedPlan.treeString) // no plain filter instead
+      // A total size cap the filter cannot meet even at 4 bits a key (~400 keys, 1024 bits): declined, not built
+      // saturated.
+      withConf(VectorConf.FactBloomFilterMaxTotalBits -> "1024") {
+        val small = run(q93)
+        assert(
+          partitionedBlooms(small) === 0 && salesBlooms(small) === 0,
+          small.queryExecution.optimizedPlan.treeString
+        )
+      }
+    }
+  }
+
+  test("partitioned filter: every key is found in its bucket's sub-filter; pack and unpack round-trip (#653)") {
+    import org.apache.spark.sql.vecruntime.PartitionedBloomFilter
+    import org.apache.spark.sql.catalyst.expressions.aggregate.BloomFilterAggregate
+    import org.apache.spark.util.sketch.BloomFilter
+    val buckets = 7
+    val keys = (0L until 20000L).map(i => org.apache.spark.sql.catalyst.expressions.XXH64.hashLong(i * 31L, 42L))
+    val subs = Array.tabulate(buckets) { b =>
+      val ks = keys.filter(h => Math.floorMod(h, buckets.toLong) == b)
+      if (b == 3) null // a bucket without keys
+      else { val f = BloomFilter.create(5000L, 40000L); ks.foreach(f.putLong); BloomFilterAggregate.serialize(f) }
+    }
+    val filters = PartitionedBloomFilter.unpack(PartitionedBloomFilter.pack(subs))
+    assert(filters.length == buckets && filters(3) == null)
+    assert(keys.filter(h => Math.floorMod(h, buckets.toLong) != 3).forall(PartitionedBloomFilter.mightContain(
+      filters,
+      _
+    )))
+    assert(keys.filter(h => Math.floorMod(h, buckets.toLong) == 3).forall(!PartitionedBloomFilter.mightContain(
+      filters,
+      _
+    )))
   }
 }

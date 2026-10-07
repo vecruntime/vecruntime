@@ -39,17 +39,19 @@ import org.apache.spark.util.sketch.BloomFilter
  */
 object BloomFilterCache {
 
-  private final case class Key(length: Int, hash: Long)
+  private final case class Key(kind: Int, length: Int, hash: Long)
 
-  /** Holds the bytes until the filter is built once, then drops them. */
-  private final class Entry(private var bytes: Array[Byte]) {
+  /** Holds the bytes until the value is parsed once, then drops them. */
+  private final class Entry(private var bytes: Array[Byte], parse: Array[Byte] => AnyRef) {
     val size: Long = bytes.length.toLong
-    lazy val filter: BloomFilter = {
-      val f = BloomFilter.readFrom(new ByteArrayInputStream(bytes))
+    lazy val value: AnyRef = {
+      val v = parse(bytes)
       bytes = null
-      f
+      v
     }
   }
+
+  private val readFilter: Array[Byte] => AnyRef = b => BloomFilter.readFrom(new ByteArrayInputStream(b))
 
   /** A quarter of the executor's max heap, at least 64 MB. */
   private[expr] val defaultBudget: Long = math.max(64L << 20, Runtime.getRuntime.maxMemory / 4)
@@ -62,14 +64,23 @@ object BloomFilterCache {
   private var builds = 0L
 
   /** The filter the bytes serialise; deserialised at most once per JVM while the entry stays cached. */
-  def get(bytes: Array[Byte]): BloomFilter = {
-    if (bytes.length > budget) return BloomFilter.readFrom(new ByteArrayInputStream(bytes))
-    val key = Key(bytes.length, XXH64.hashUnsafeBytes(bytes, Platform.BYTE_ARRAY_OFFSET, bytes.length, 42L))
+  def get(bytes: Array[Byte]): BloomFilter = cached(0, bytes, readFilter).asInstanceOf[BloomFilter]
+
+  /**
+   * The sub-filters of a partitioned filter (#653), parsed at most once per JVM in the same budget. A
+   * different kind in the key, so the same bytes read as a plain filter never collide with these.
+   */
+  def getPartitioned(bytes: Array[Byte]): Array[BloomFilter] =
+    cached(1, bytes, org.apache.spark.sql.vecruntime.PartitionedBloomFilter.unpack).asInstanceOf[Array[BloomFilter]]
+
+  private def cached(kind: Int, bytes: Array[Byte], parse: Array[Byte] => AnyRef): AnyRef = {
+    if (bytes.length > budget) return parse(bytes)
+    val key = Key(kind, bytes.length, XXH64.hashUnsafeBytes(bytes, Platform.BYTE_ARRAY_OFFSET, bytes.length, 42L))
     val entry = entries.synchronized {
       val e = entries.get(key)
       if (e != null) e
       else {
-        val n = new Entry(bytes)
+        val n = new Entry(bytes, parse)
         entries.put(key, n)
         total += n.size
         builds += 1
@@ -77,7 +88,7 @@ object BloomFilterCache {
         n
       }
     }
-    entry.filter // outside the map lock: other filters stay reachable while this one is read
+    entry.value // outside the map lock: other filters stay reachable while this one is read
   }
 
   private def evict(): Unit = {
