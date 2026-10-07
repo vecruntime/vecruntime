@@ -12,6 +12,10 @@ version may change configuration keys or defaults, always noted here.
   (`spark.vecruntime.optimizer.narrowBelowJoin.enabled`, on by default): the join carries the short result instead
   of the whole string. TPC-DS q23a's `substr(i_item_desc, 1, 30)` was computed on ~1.66G joined rows at 1 TB, each
   gathering the full description; it now runs once per item row (#635).
+- Eager aggregation below star joins (`spark.vecruntime.optimizer.aggregateBelowJoin.enabled`, on by default,
+  #657): an aggregate of `sum`/`count`/`min`/`max` over one fact table, grouped by the other join sides' columns,
+  first aggregates the fact by its join keys before the inner joins, when statistics show the keys reduce the
+  fact's rows at least `spark.vecruntime.optimizer.aggregateBelowJoin.minReduction` (4) times.
 - A runtime bloom filter from a smaller fact table onto a larger one it joins
   (`spark.vecruntime.optimizer.factBloomFilter.enabled`, off by default): a shuffle join whose filtered side is at
   least 10x larger (estimated bytes) than the side the filter is built from gets

@@ -56,6 +56,20 @@ private[vecruntime] object KeyStats extends PredicateHelper {
     case _ => None
   }
 
+  /**
+   * The row count of the single base relation under `plan` (through projections, filters and aliases), if its
+   * statistics report one: an upper bound of `plan`'s rows.
+   */
+  def baseRowCount(plan: LogicalPlan): Option[BigInt] = plan match {
+    case Project(_, child) => baseRowCount(child)
+    case Filter(_, child) => baseRowCount(child)
+    case SubqueryAlias(_, child) => baseRowCount(child)
+    case rel: LogicalRelation => rel.catalogTable.flatMap(_.stats).flatMap(_.rowCount)
+    case rel: DataSourceV2ScanRelation => rel.stats.rowCount
+    case rel: DataSourceV2Relation => rel.stats.rowCount
+    case _ => None
+  }
+
   private def fromStats(rel: LeafNode, a: Attribute): Option[BigInt] =
     rel.stats.attributeStats.get(a).flatMap(_.distinctCount)
 

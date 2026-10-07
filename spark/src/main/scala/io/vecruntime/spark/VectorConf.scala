@@ -68,6 +68,12 @@ object VectorConf {
   /** Logical rewrite (#635): a substring or length of one join side's string column computed below the join. */
   val NarrowBelowJoinEnabled = "spark.vecruntime.optimizer.narrowBelowJoin.enabled"
 
+  /** Logical rewrite (#657): a star join's fact side aggregated by its join keys before the joins. */
+  val AggregateBelowJoinEnabled = "spark.vecruntime.optimizer.aggregateBelowJoin.enabled"
+
+  /** Minimum row reduction (rows / estimated groups) the statistics must show for AggregateBelowJoin (#657). */
+  val AggregateBelowJoinMinReduction = "spark.vecruntime.optimizer.aggregateBelowJoin.minReduction"
+
   /**
    * Logical rewrite (#641): a runtime bloom filter on a shuffle join's much larger side, built from the other
    * side (a fact from a smaller fact), where Spark's own runtime filter needs a selective filtered scan.
@@ -573,6 +579,14 @@ object VectorConf {
   /** Narrowing projections below joins (#635); also off when the plugin is off. */
   def narrowBelowJoinEnabled(conf: SQLConf): Boolean =
     isEnabled(conf) && bool(conf, NarrowBelowJoinEnabled, default = true)
+
+  /** Eager aggregation below star joins (#657); also off when the plugin is off. */
+  def aggregateBelowJoinEnabled(conf: SQLConf): Boolean =
+    isEnabled(conf) && bool(conf, AggregateBelowJoinEnabled, default = true)
+
+  /** AggregateBelowJoin's required reduction, at least 1 (default 4). */
+  def aggregateBelowJoinMinReduction(conf: SQLConf): Double =
+    math.max(1.0, conf.getConfString(AggregateBelowJoinMinReduction, "4").trim.toDouble)
 
   /** The fact-to-fact bloom filter (#641); also off when the plugin is off. */
   def factBloomFilterEnabled(conf: SQLConf): Boolean =
