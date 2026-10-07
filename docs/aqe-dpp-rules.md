@@ -391,3 +391,9 @@ Declined: a `DISTINCT` or filtered aggregate, any other function (`avg`, `stddev
 more than one side, a column of `F` grouped by or used above other than as a join key, outer joins, and an `F`
 that is already an aggregate. Off with `spark.vecruntime.optimizer.aggregateBelowJoin.enabled=false`.
 
+Evidence of reduction is required: the rule fires only when statistics put the pre-aggregate's groups -- the
+product of its keys' distinct counts, an upper bound -- at most `1 / minReduction` (default 4) of the fact's
+rows, and declines without statistics. Measured at 1 TB without that check, the rewrite made q4, q11 and q74
+34-104 % slower: their `(customer_sk, sold_date_sk)` keys barely reduce the fact rows, so the pre-aggregate only
+added a stage and a shuffle (q23b, whose keys do reduce, was 20 % faster).
+

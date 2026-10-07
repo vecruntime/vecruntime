@@ -31,14 +31,31 @@ class AggregateBelowJoinSuite extends VectorQuerySuite {
     )
       .toDF("s_cust", "s_date", "s_amount", "s_qty", "s_null_cust")
       .write.mode("overwrite").parquet(newTempPath("abj/sales"))
-    spark.read.parquet(newTempPath("abj/sales")).createOrReplaceTempView("abj_sales")
+    spark.read.parquet(newTempPath("abj/sales")).write.mode("overwrite").saveAsTable("abj_sales")
+    spark.sql("ANALYZE TABLE abj_sales COMPUTE STATISTICS FOR ALL COLUMNS")
     (0 until 200).map(i => (i, s"customer-$i", s"first-${i % 17}", s"last-${i % 23}"))
       .toDF("c_sk", "c_id", "c_first", "c_last")
       .write.mode("overwrite").parquet(newTempPath("abj/customer"))
-    spark.read.parquet(newTempPath("abj/customer")).createOrReplaceTempView("abj_customer")
+    spark.read.parquet(newTempPath("abj/customer")).write.mode("overwrite").saveAsTable("abj_customer")
+    spark.sql("ANALYZE TABLE abj_customer COMPUTE STATISTICS FOR ALL COLUMNS")
     (0 until 30).map(i => (i, 2000 + i % 3)).toDF("d_sk", "d_year")
       .write.mode("overwrite").parquet(newTempPath("abj/date"))
-    spark.read.parquet(newTempPath("abj/date")).createOrReplaceTempView("abj_date")
+    spark.read.parquet(newTempPath("abj/date")).write.mode("overwrite").saveAsTable("abj_date")
+    spark.sql("ANALYZE TABLE abj_date COMPUTE STATISTICS FOR ALL COLUMNS")
+    // The same sales without statistics.
+    spark.read.parquet(newTempPath("abj/sales")).createOrReplaceTempView("abj_sales_nostats")
+  }
+
+  override protected def afterAll(): Unit = {
+    try {
+      Seq("abj_sales", "abj_customer", "abj_date").foreach { t =>
+        spark.sessionState.catalog.dropTable(
+          org.apache.spark.sql.catalyst.TableIdentifier(t),
+          ignoreIfNotExists = true,
+          purge = false
+        )
+      }
+    } finally super.afterAll()
   }
 
   private def run(sql: String): DataFrame = {
@@ -106,6 +123,14 @@ class AggregateBelowJoinSuite extends VectorQuerySuite {
       "SELECT d_year, sum(s_qty + c_sk) FROM abj_sales JOIN abj_customer ON s_cust = c_sk JOIN abj_date ON s_date = d_sk GROUP BY d_year"
     )
     assert(!preAggregated(both.queryExecution.optimizedPlan), both.queryExecution.optimizedPlan.treeString)
+  }
+
+  test("declined without statistics, or when the keys reduce the fact's rows less than minReduction") {
+    // 30000 sales rows, at most 200 x 30 = 6000 (customer, date) groups: a 5x reduction.
+    val noStats = run(q4Shape.replace("abj_sales", "abj_sales_nostats"))
+    assert(!preAggregated(noStats.queryExecution.optimizedPlan), noStats.queryExecution.optimizedPlan.treeString)
+    val strict = withConf(VectorConf.AggregateBelowJoinMinReduction -> "10")(run(q4Shape))
+    assert(!preAggregated(strict.queryExecution.optimizedPlan), strict.queryExecution.optimizedPlan.treeString)
   }
 
   test("the switch turns the rewrite off") {
