@@ -121,7 +121,8 @@ case class FactBloomFilter(session: SparkSession) extends Rule[LogicalPlan] with
    * With both keys' distinct counts known (Spark `ANALYZE ... FOR COLUMNS` in the catalog, or a DSv2 source
    * that reports them -- Iceberg from Puffin theta sketches), at most `ndv(creation) / ndv(application)` of
    * the application rows can find a match (containment): fire when that is at most `maxSelectivity`, sized by
-   * the creation key's distinct count, capped by the creation side's row estimate when it has one.
+   * the creation key's distinct count, capped by the creation side's row estimate when it has one. A higher
+   * ratio still fires when the creation side is reduced (below): the column statistics describe the whole table.
    *
    * Without distinct counts, fire only when the creation side is reduced below its base tables: a filter
    * other than `IS NOT NULL` somewhere under it. A whole, unfiltered table -- an entire dimension, whose keys
@@ -136,16 +137,21 @@ case class FactBloomFilter(session: SparkSession) extends Rule[LogicalPlan] with
   ): Option[Long] = {
     def clamp(n: BigInt): Long = n.max(1).min(BigInt(Long.MaxValue)).toLong
     val rowsEstimate = creation.stats.rowCount
+    def fromReduction: Option[Long] =
+      if (!KeyStats.reduced(creation)) None
+      else Some(clamp(rowsEstimate.getOrElse {
+        val width = math.max(8L, creation.output.map(_.dataType.defaultSize.toLong).sum + 8L)
+        creation.stats.sizeInBytes / width
+      }))
     (KeyStats.distinctCount(creation, creationKey), KeyStats.distinctCount(app, appKey)) match {
       case (Some(cNdv), Some(aNdv)) if aNdv > 0 =>
         val effective = rowsEstimate.fold(cNdv)(_.min(cNdv))
-        if (BigDecimal(effective) / BigDecimal(aNdv) <= BigDecimal(maxSelectivity)) Some(clamp(effective)) else None
-      case _ =>
-        if (!KeyStats.reduced(creation)) None
-        else Some(clamp(rowsEstimate.getOrElse {
-          val width = math.max(8L, creation.output.map(_.dataType.defaultSize.toLong).sum + 8L)
-          creation.stats.sizeInBytes / width
-        }))
+        if (BigDecimal(effective) / BigDecimal(aNdv) <= BigDecimal(maxSelectivity)) Some(clamp(effective))
+        // A column's distinct count is that of its whole table: a creation side reduced by a filter or a join keeps
+        // only some of those keys, which the column statistics cannot show. Statistics add evidence, never remove
+        // the evidence of a reduction (TPC-DS q93's returns, reduced by a join with one reason).
+        else fromReduction.map(n => clamp(BigInt(n).min(effective)))
+      case _ => fromReduction
     }
   }
 

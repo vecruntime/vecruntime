@@ -251,6 +251,10 @@ class FactBloomFilterSuite extends VectorQuerySuite {
       assert(salesBloomKeys(run(sql)) === Set("ss_ticket_number"))
       // A stricter maxSelectivity than the ticket key's 0.2 declines it too.
       withConf(VectorConf.FactBloomFilterMaxSelectivity -> "0.1")(assert(salesBlooms(run(sql)) === 0))
+      // Unless the creation side is reduced by a filter: the statistics describe the whole table, not the
+      // reduced side, so the reduction's evidence still fires (as without statistics).
+      val reduced = q93.replace("store_sales", "fb_sales").replace("store_returns", "fb_returns")
+      withConf(VectorConf.FactBloomFilterMaxSelectivity -> "0.1")(assert(salesBlooms(run(reduced)) >= 1))
     } finally {
       Seq("fb_sales", "fb_returns").foreach { t =>
         spark.sessionState.catalog.dropTable(
