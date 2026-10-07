@@ -70,8 +70,8 @@ object BloomFilterCache {
    * The sub-filters of a partitioned filter (#653), parsed at most once per JVM in the same budget. A
    * different kind in the key, so the same bytes read as a plain filter never collide with these.
    */
-  def getPartitioned(bytes: Array[Byte]): Array[BloomFilter] =
-    cached(1, bytes, org.apache.spark.sql.vecruntime.PartitionedBloomFilter.unpack).asInstanceOf[Array[BloomFilter]]
+  def getPartitioned(bytes: Array[Byte]): Array[Array[Int]] =
+    cached(1, bytes, org.apache.spark.sql.vecruntime.PartitionedBloomFilter.unpack).asInstanceOf[Array[Array[Int]]]
 
   private def cached(kind: Int, bytes: Array[Byte], parse: Array[Byte] => AnyRef): AnyRef = {
     if (bytes.length > budget) return parse(bytes)

@@ -494,15 +494,16 @@ class FactBloomFilterSuite extends VectorQuerySuite {
   }
 
   test("partitioned filter: every key is found in its bucket's sub-filter; pack and unpack round-trip (#653)") {
-    import org.apache.spark.sql.vecruntime.PartitionedBloomFilter
-    import org.apache.spark.sql.catalyst.expressions.aggregate.BloomFilterAggregate
-    import org.apache.spark.util.sketch.BloomFilter
+    import org.apache.spark.sql.vecruntime.{BlockedBloomFilter, PartitionedBloomFilter}
     val buckets = 7
     val keys = (0L until 20000L).map(i => org.apache.spark.sql.catalyst.expressions.XXH64.hashLong(i * 31L, 42L))
     val subs = Array.tabulate(buckets) { b =>
       val ks = keys.filter(h => Math.floorMod(h, buckets.toLong) == b)
       if (b == 3) null // a bucket without keys
-      else { val f = BloomFilter.create(5000L, 40000L); ks.foreach(f.putLong); BloomFilterAggregate.serialize(f) }
+      else {
+        val f = BlockedBloomFilter.create(40000L); ks.foreach(BlockedBloomFilter.put(f, _));
+        BlockedBloomFilter.serialize(f)
+      }
     }
     val filters = PartitionedBloomFilter.unpack(PartitionedBloomFilter.pack(subs))
     assert(filters.length == buckets && filters(3) == null)
@@ -514,5 +515,30 @@ class FactBloomFilterSuite extends VectorQuerySuite {
       filters,
       _
     )))
+  }
+
+  test("blocked filter: no false negatives, a false-positive rate near a split-block filter's, merge is the union") {
+    import org.apache.spark.sql.vecruntime.BlockedBloomFilter
+    def h(i: Long) = org.apache.spark.sql.catalyst.expressions.XXH64.hashLong(i, 42L)
+    val n = 100000
+    val a = BlockedBloomFilter.create(8L * n) // 8 bits a key, as the partitioned layout
+    (0 until n / 2).foreach(i => BlockedBloomFilter.put(a, h(i)))
+    val b = BlockedBloomFilter.create(8L * n)
+    (n / 2 until n).foreach(i => BlockedBloomFilter.put(b, h(i)))
+    BlockedBloomFilter.merge(a, b)
+    val f = BlockedBloomFilter.deserialize(BlockedBloomFilter.serialize(a))
+    assert(f.sameElements(a))
+    assert((0 until n).forall(i => BlockedBloomFilter.mightContain(f, h(i))))
+    val probes = 200000
+    val fp = (0 until probes).count(i => BlockedBloomFilter.mightContain(f, h(10000000L + i)))
+    // A split-block filter at 8 bits a key: about 3 % false positives (Spark's layout: about 2 %).
+    assert(fp.toDouble / probes < 0.05, s"false-positive rate ${fp.toDouble / probes}")
+    // Keys of one bucket of a partitioned filter (pmod(h, 7) == 3) still spread over the blocks.
+    val bucket = BlockedBloomFilter.create(8L * 2000)
+    val ks = (0L until 100000L).map(h).filter(x => Math.floorMod(x, 7L) == 3).take(2000)
+    ks.foreach(BlockedBloomFilter.put(bucket, _))
+    val others = (200000L until 400000L).map(h).filter(x => Math.floorMod(x, 7L) == 3)
+    val fp2 = others.count(BlockedBloomFilter.mightContain(bucket, _))
+    assert(fp2.toDouble / others.size < 0.05, s"false-positive rate within a bucket ${fp2.toDouble / others.size}")
   }
 }

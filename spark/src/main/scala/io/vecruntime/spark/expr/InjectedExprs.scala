@@ -164,7 +164,7 @@ final case class BloomProbeExpr(filter: SubqueryLiteralExpr, hash: VectorExpr, p
   }
 
   /** The sub-filters of a partitioned filter (#653); sub-filter `floorMod(h, length)`, null = no key there. */
-  @transient private lazy val parts: Array[BloomFilter] = if (!partitioned) null
+  @transient private lazy val parts: Array[Array[Int]] = if (!partitioned) null
   else filter.value match {
     case null => null
     case bytes: Array[Byte] => BloomFilterCache.getPartitioned(bytes)
@@ -187,7 +187,10 @@ final case class BloomProbeExpr(filter: SubqueryLiteralExpr, hash: VectorExpr, p
         val v = h.data().getAtIndex(VectorBuffers.LE_LONG, i)
         val hit =
           if (ps == null) b.mightContainLong(v)
-          else { val f = ps(Math.floorMod(v, ps.length.toLong).toInt); f != null && f.mightContainLong(v) }
+          else {
+            val f = ps(Math.floorMod(v, ps.length.toLong).toInt)
+            f != null && org.apache.spark.sql.vecruntime.BlockedBloomFilter.mightContain(f, v)
+          }
         Bitmap.setTo(bits, i, hit)
       }
       i += 1

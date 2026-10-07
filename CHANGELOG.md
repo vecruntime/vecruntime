@@ -10,14 +10,15 @@ version may change configuration keys or defaults, always noted here.
 
 - `FactBloomFilter` run-time evidence (`spark.vecruntime.optimizer.factBloomFilter.runtimeEvidence`, on): the
   filter's build counts the creation side's actual rows and declines -- a null filter that keeps every row --
-  when they are not `sizeRatio` times fewer than the application side's (#659). The rule itself stays off by
-  default until a 1 TB run shows no query slower.
+  when they are not `sizeRatio` times fewer than the application side's (#659).
 - `FactBloomFilter`'s build reads the join's own creation-side exchange
   (`spark.vecruntime.optimizer.factBloomFilter.shareExchange`, on, AQE only): the creation side is no longer
   scanned a second time for the filter (#659).
 - `FactBloomFilter` transitive reduction (`spark.vecruntime.optimizer.factBloomFilter.transitive`, on): a selective
   broadcast dimension above a shuffle join reduces that join's input first, which then gets its filter (q93, q50).
   `FactBloomFilter` is on by default again, with run-time evidence (#659).
+- `FactBloomFilter`'s partitioned filters use split-block sub-filters (one cache line read per probe) instead of
+  Spark's `BloomFilterImpl`, whose scattered reads made q93's 2.9G-row probe cost more than it saved (#659).
 - A logical rewrite that computes a substring or length of a join's smaller side below the join
   (`spark.vecruntime.optimizer.narrowBelowJoin.enabled`, on by default): the join carries the short result instead
   of the whole string. TPC-DS q23a's `substr(i_item_desc, 1, 30)` was computed on ~1.66G joined rows at 1 TB, each

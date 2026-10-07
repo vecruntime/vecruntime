@@ -228,10 +228,8 @@ case class FactBloomFilter(session: SparkSession) extends Rule[LogicalPlan] with
     val bucketed = Project(Seq(h.toAttribute, b), hashed)
     val shuffled =
       org.apache.spark.sql.catalyst.plans.logical.RepartitionByExpression(Seq(b.toAttribute), bucketed, buckets)
-    val sub = Alias(
-      new BloomFilterAggregate(h.toAttribute, Literal(items), Literal(bits)).toAggregateExpression(),
-      "bloomPart"
-    )()
+    // Each bucket's sub-filter is a split-block filter: its probe reads one cache line (#659).
+    val sub = Alias(BlockedBloomFilterAgg(h.toAttribute, bits).toAggregateExpression(), "bloomPart")()
     val rowsPart = Alias(Count(Literal(1)).toAggregateExpression(), "bloomRowsPart")()
     val perBucket =
       Aggregate(Seq(b.toAttribute), Seq(b.toAttribute, sub) ++ gate.map(_ => rowsPart), shuffled)

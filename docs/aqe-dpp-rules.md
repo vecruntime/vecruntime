@@ -351,6 +351,13 @@ filter that would need more is declined. The probe is vectorised and its sub-fil
 executor (`BloomFilterCache`). EMR Serverless sizes its own filters the same way (q93: `GenerateBloomFilter` for ~110M
 rows on `store_returns`' keys, shuffle 2.8 GB against our 41.8 GB).
 
+**Split-block sub-filters (#659).** Each sub-filter of a partitioned filter is a split-block bloom filter, the layout
+of Parquet and Impala: 256-bit blocks of eight 32-bit words, a key setting one bit in each word of the one block its
+remixed hash picks. A probe reads one 32-byte block -- a cache line -- where Spark's `BloomFilterImpl` reads its `k`
+bits anywhere in a multi-megabyte array. At 1 TB the probe was the filter's cost: q93's `store_sales` scan probes
+2.9G rows, and with Spark's layout spent 27 % more task time than without the filter, more than the 41 GB of
+shuffle it saved. At 8 bits a key the false-positive rate is about 3 % (Spark's: about 2 %).
+
 **Why the result is the same.** A bloom filter has no false negatives, and a row whose key the creation side
 does not hold cannot survive the join. False positives only let a non-matching row through to the join, which
 then drops it.
