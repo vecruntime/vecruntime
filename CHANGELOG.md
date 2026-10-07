@@ -8,12 +8,16 @@ version may change configuration keys or defaults, always noted here.
 
 ### Added
 
+- A logical rewrite that computes a substring or length of a join's smaller side below the join
+  (`spark.vecruntime.optimizer.narrowBelowJoin.enabled`, on by default): the join carries the short result instead
+  of the whole string. TPC-DS q23a's `substr(i_item_desc, 1, 30)` was computed on ~1.66G joined rows at 1 TB, each
+  gathering the full description; it now runs once per item row (#635).
 - Eager aggregation below star joins (`spark.vecruntime.optimizer.aggregateBelowJoin.enabled`, on by default,
   #657): an aggregate of `sum`/`count`/`min`/`max` over one fact table, grouped by the other join sides' columns,
   first aggregates the fact by its join keys before the inner joins, when statistics show the keys reduce the
   fact's rows at least `spark.vecruntime.optimizer.aggregateBelowJoin.minReduction` (4) times.
 - A runtime bloom filter from a smaller fact table onto a larger one it joins
-  (`spark.vecruntime.optimizer.factBloomFilter.enabled`, on by default): a shuffle join whose filtered side is at
+  (`spark.vecruntime.optimizer.factBloomFilter.enabled`, off by default): a shuffle join whose filtered side is at
   least 10x larger (estimated bytes) than the side the filter is built from gets
   `might_contain(bloom, xxhash64(key))` on the larger side. TPC-DS q93 filters `store_sales` by `store_returns`;
   Spark's own runtime filter only builds one from a selectively-filtered scan, and EMR Serverless does this.
@@ -43,6 +47,12 @@ version may change configuration keys or defaults, always noted here.
 
 ### Fixed
 
+- With column statistics, `FactBloomFilter` no longer declines a creation side that is reduced by a filter or a
+  join because the key's whole-table distinct count is high: statistics add evidence and never remove that of a
+  reduction (TPC-DS q93's returns, reduced by their join to one reason, got no filter with `ANALYZE` statistics).
+- `FactBloomFilter`'s probe on a fact scan that already has a filter is added to that filter instead of a second
+  one below it: Spark takes partition filters only from the filter directly over the relation, so the scan lost
+  its dynamic partition pruning and the stage ran row by row (TPC-DS q48, q13, q61, q18 and q23b at 1 TB).
 - TPC-DS q17 at 1 TB failed with `Cannot reserve additional contiguous bytes in the
   vectorized reader (integer overflow)`: the Final aggregate of a runtime bloom filter ran on our operator over
   Spark's `RowToColumnarExec`, which batches by row count the partial filters (one per creation-side map task, up
@@ -54,6 +64,14 @@ version may change configuration keys or defaults, always noted here.
 
 ### Changed
 
+- `spark.vecruntime.optimizer.factBloomFilter.enabled` defaults to `false`. Full 1 TB runs with `ANALYZE` statistics:
+  1197 s off, 1208 s on; the rule helps q49, q51, q28 and q50 but still slows q23b, q18, q61 and q13, whose
+  creation sides are filtered dimensions that prune little. It stays available to turn on.
+- `FactBloomFilter` builds a filter for many keys partitioned by hash bucket: the keys are shuffled by
+  `pmod(xxhash64(key), B)`, one sub-filter per bucket is built after the shuffle within Spark's caps, and the probe
+  tests its bucket's sub-filter. A single `bloom_filter_agg` for tens of millions of keys was capped at 8 MB and
+  saturated. Total size capped by `spark.vecruntime.optimizer.factBloomFilter.maxTotalBits`; larger filters are
+  declined (#653).
 - `FactBloomFilter` adds a filter only on evidence that it prunes: with distinct-count statistics for both keys
   (Spark `ANALYZE ... FOR COLUMNS`, or Iceberg's Puffin statistics through DSv2), when at most
   `spark.vecruntime.optimizer.factBloomFilter.maxSelectivity` (0.5) of the filtered side can match; without them,

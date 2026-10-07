@@ -65,6 +65,8 @@ object VectorConf {
    */
   val TransitiveDppEnabled = "spark.vecruntime.optimizer.transitiveDpp.enabled"
 
+  /** Logical rewrite (#635): a substring or length of one join side's string column computed below the join. */
+  val NarrowBelowJoinEnabled = "spark.vecruntime.optimizer.narrowBelowJoin.enabled"
   /** Logical rewrite (#657): a star join's fact side aggregated by its join keys before the joins. */
   val AggregateBelowJoinEnabled = "spark.vecruntime.optimizer.aggregateBelowJoin.enabled"
 
@@ -91,6 +93,12 @@ object VectorConf {
    * rows can find a match, `ndv(creation key) / ndv(application key)`.
    */
   val FactBloomFilterMaxSelectivity = "spark.vecruntime.optimizer.factBloomFilter.maxSelectivity"
+
+  /**
+   * Total bits a FactBloomFilter filter may take (#653). A filter needing more, even at 4 bits a key, is declined:
+   * built saturated it would cost its build and prune nothing.
+   */
+  val FactBloomFilterMaxTotalBits = "spark.vecruntime.optimizer.factBloomFilter.maxTotalBits"
 
   /** The grouped aggregate emits its UTF8 keys dictionary-encoded, ids over the group table's own dictionary (#377). */
   val AggDictionaryKeys = "spark.vecruntime.agg.dictionaryKeys"
@@ -567,6 +575,9 @@ object VectorConf {
   def transitiveDppEnabled(conf: SQLConf): Boolean =
     isEnabled(conf) && bool(conf, TransitiveDppEnabled, default = true)
 
+  /** Narrowing projections below joins (#635); also off when the plugin is off. */
+  def narrowBelowJoinEnabled(conf: SQLConf): Boolean =
+    isEnabled(conf) && bool(conf, NarrowBelowJoinEnabled, default = true)
   /** Eager aggregation below star joins (#657); also off when the plugin is off. */
   def aggregateBelowJoinEnabled(conf: SQLConf): Boolean =
     isEnabled(conf) && bool(conf, AggregateBelowJoinEnabled, default = true)
@@ -577,13 +588,16 @@ object VectorConf {
 
   /** The fact-to-fact bloom filter (#641); also off when the plugin is off. */
   def factBloomFilterEnabled(conf: SQLConf): Boolean =
-    isEnabled(conf) && bool(conf, FactBloomFilterEnabled, default = true)
+    isEnabled(conf) && bool(conf, FactBloomFilterEnabled, default = false)
 
   def factBloomFilterSizeRatio(conf: SQLConf): Int =
     math.max(2, conf.getConfString(FactBloomFilterSizeRatio, "10").trim.toInt)
 
   def factBloomFilterMergeBuckets(conf: SQLConf): Int =
     math.max(1, conf.getConfString(FactBloomFilterMergeBuckets, "32").trim.toInt)
+
+  def factBloomFilterMaxTotalBits(conf: SQLConf): Long =
+    math.max(64L, conf.getConfString(FactBloomFilterMaxTotalBits, (512L << 20).toString).trim.toLong)
 
   def factBloomFilterMaxSelectivity(conf: SQLConf): Double =
     math.min(1.0, math.max(0.0, conf.getConfString(FactBloomFilterMaxSelectivity, "0.5").trim.toDouble))

@@ -31,6 +31,7 @@ which shapes are worth handling.
 | `DppThroughAggregate` | `spark.vecruntime.optimizer.dppThroughAggregate.enabled` | q2, q59 |
 | `TransitiveDpp` | `spark.vecruntime.optimizer.transitiveDpp.enabled` | q72 |
 | `FactBloomFilter` | `spark.vecruntime.optimizer.factBloomFilter.enabled` | q16, q50, q93, q94 |
+| `NarrowBelowJoin` | `spark.vecruntime.optimizer.narrowBelowJoin.enabled` | q23a, q23b |
 
 The plugin changes no AQE setting. `DppThroughAggregate` and `TransitiveDpp` add dynamic partition pruning
 filters where Spark's DPP does not reach; Spark's own DPP settings are unchanged.
@@ -338,6 +339,18 @@ partial goes to one of `mergeBuckets` (32) groups merged in parallel, and `bloom
 one small task. Both levels use the same bits and hash count, so the OR is the single-level filter bit for bit
 (`FactBloomFilterSuite`); a group with no key gives null and is skipped.
 
+**Right-sized, partitioned filters (#653).** One `bloom_filter_agg` is capped by Spark at `maxNumItems` (4M) and
+`maxNumBits` (64M bits): for tens of millions of keys it is saturated and prunes nothing, and raising the caps makes
+every creation-side map task ship a full-size partial. Beyond `maxNumItems / 2` keys the filter is therefore
+partitioned: `h = xxhash64(key)` is repartitioned by `b = pmod(h, B)`, one `bloom_filter_agg(h)` per bucket runs after
+that shuffle (its distribution is already satisfied, so there is no per-map-task partial), and
+`partitioned_bloom_filter` packs the `B` sub-filters into one value. The probe `might_contain_partitioned` tests
+sub-filter `pmod(h, B)`; a key the creation side has always lands in its bucket, so there is no false negative.
+`B = ceil(keys / (maxNumItems / 2))`, 8 bits a key, fewer down to 4 to stay within `maxTotalBits` (512M bits); a
+filter that would need more is declined. The probe is vectorised and its sub-filters are deserialised once per
+executor (`BloomFilterCache`). EMR Serverless sizes its own filters the same way (q93: `GenerateBloomFilter` for ~110M
+rows on `store_returns`' keys, shuffle 2.8 GB against our 41.8 GB).
+
 **Why the result is the same.** A bloom filter has no false negatives, and a row whose key the creation side
 does not hold cannot survive the join. False positives only let a non-matching row through to the join, which
 then drops it.
@@ -362,6 +375,36 @@ Spark) and the declined shapes. The 1 TB numbers come with the PR.
 **Related.** `BloomProbeExpr` now skips rows an earlier conjunct already rejected (#635), so a probe this rule
 adds costs nothing on rows the scan's other filters drop.
 
+## `NarrowBelowJoin`: a substring or length of one join side's string computed below the join
+
+`spark/src/main/scala/org/apache/spark/sql/vecruntime/NarrowBelowJoin.scala`, issue #635.
+
+**Shape.** A projection directly over a join computes `substr(x, pos, len)` (also `left`/`right`), `length(x)` or
+`octet_length(x)`, with `pos`/`len` literal and `x` a string or binary column of the join's smaller side by
+estimated size.
+
+TPC-DS q23a groups `store_sales JOIN item` by `substr(i_item_desc, 1, 30)`. Spark's `PullOutGroupingExpressions`
+leaves the substring in a projection above the join, so at 1 TB each of ~1.66G joined rows gathered the whole
+description from the broadcast side and then cut 30 characters of it.
+
+**Rewrite.** The smaller side becomes `Project(columns still needed above or by the join condition, f(x) AS a, side)`
+and the projection above reads `a`: the join carries the short result, and `f` runs once per row of that side.
+
+**Why the result is the same.** `f` is deterministic and cannot fail, and a join only repeats or drops each side's
+rows without changing their values. On the null-supplying side of an outer join an unmatched row has `x` null, and
+`f(null)` is null, the value the padded row gets anyway.
+
+**Placement.** The session's last optimizer batch, after column pruning and filter push-down.
+
+**Declined:**
+- an expression over the larger side (the join already carries that side row for row);
+- an expression over both sides;
+- a non-narrowing expression (`upper` keeps the width);
+- the right side of a semi or anti join (not in the output).
+
+**Measured.** `NarrowBelowJoinSuite` covers the q23a shape, a plain projection with a length and a substring, the
+null-supplying side of an outer join, the declined shapes and the switch; results are compared with Spark with the
+plugin off. The 1 TB numbers come with the PR.
 ## `AggregateBelowJoin`: the fact aggregated by its join keys before a star join
 
 TPC-DS q4, q11 and q74 sum `store_sales` (and the catalog and web facts) per customer and year, grouped by seven

@@ -37,6 +37,9 @@ case class RegisterLateOptimizerRules(session: SparkSession) extends Rule[Logica
         if (!exp.extraOptimizations.exists(_.isInstanceOf[SharedAggregateInputs])) {
           exp.extraOptimizations = exp.extraOptimizations :+ SharedAggregateInputs(session)
         }
+        if (!exp.extraOptimizations.exists(_.isInstanceOf[NarrowBelowJoin])) {
+          exp.extraOptimizations = exp.extraOptimizations :+ NarrowBelowJoin(session)
+        }
         if (!exp.extraOptimizations.exists(_.isInstanceOf[AggregateBelowJoin])) {
           exp.extraOptimizations = exp.extraOptimizations :+ AggregateBelowJoin(session)
         }
