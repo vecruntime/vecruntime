@@ -46,6 +46,9 @@ version may change configuration keys or defaults, always noted here.
 
 ### Fixed
 
+- With column statistics, `FactBloomFilter` no longer declines a creation side that is reduced by a filter or a
+  join because the key's whole-table distinct count is high: statistics add evidence and never remove that of a
+  reduction (TPC-DS q93's returns, reduced by their join to one reason, got no filter with `ANALYZE` statistics).
 - `FactBloomFilter`'s probe on a fact scan that already has a filter is added to that filter instead of a second
   one below it: Spark takes partition filters only from the filter directly over the relation, so the scan lost
   its dynamic partition pruning and the stage ran row by row (TPC-DS q48, q13, q61, q18 and q23b at 1 TB).
