@@ -72,6 +72,14 @@ class AggregateBelowJoinSuite extends VectorQuerySuite {
     assert(preAggregated(df.queryExecution.optimizedPlan), df.queryExecution.optimizedPlan.treeString)
   }
 
+  test("an aggregate input that is also the join and grouping key stays available above the pre-aggregate") {
+    // SQLQueryTestSuite's order-by-and-having-on-top-of-aggregate-with-join: max over the natural-join key.
+    val df = run(
+      "SELECT c_first, max(s_cust) m, sum(s_qty) s FROM abj_sales JOIN abj_customer ON s_cust = c_sk GROUP BY c_first, s_cust"
+    )
+    assert(df.collect().nonEmpty)
+  }
+
   test("declined: grouped by a fact column, a distinct or avg aggregate, a non-equi join column, inputs on two sides") {
     val byFact = run(
       "SELECT s_qty, c_first, sum(s_amount) FROM abj_sales JOIN abj_customer ON s_cust = c_sk GROUP BY s_qty, c_first"

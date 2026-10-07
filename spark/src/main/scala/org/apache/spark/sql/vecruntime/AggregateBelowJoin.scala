@@ -116,7 +116,12 @@ case class AggregateBelowJoin(session: SparkSession) extends Rule[LogicalPlan] w
       // Above the pre-aggregate the inputs are gone; the partials take their place in the projection.
       descend(child, aggExprs, inputs, needed ++ computed, joinKeys, joins).map { case (c, m, parts) =>
         (
-          Project(list.filterNot(e => e.isInstanceOf[Attribute] && inputs.contains(e.toAttribute)) ++ parts, c),
+          Project(
+            list.filterNot(e =>
+              e.isInstanceOf[Attribute] && inputs.contains(e.toAttribute) && !needed.contains(e.toAttribute)
+            ) ++ parts,
+            c
+          ),
           m,
           parts
         )
