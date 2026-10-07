@@ -755,6 +755,20 @@ object ExpressionCompiler {
         }
       } yield BloomProbeExpr(filter, hash)
 
+    case b: org.apache.spark.sql.vecruntime.PartitionedBloomMightContain =>
+      // The partitioned filter of FactBloomFilter (#653): the same probe, its sub-filter picked by the hash.
+      for {
+        filter <- {
+          val f = b.filter
+          if (SubqueryLiteralExpr.isDeferred(f)) Right(SubqueryLiteralExpr(f))
+          else Left("partitioned bloom filter is not a subquery result")
+        }
+        hash <- compile(b.value, input).flatMap {
+          case h if h.vecType == VecType.INT64 && !h.isInstanceOf[LiteralExpr] => Right(h)
+          case _ => Left("bloom filter probe value is not a long lane")
+        }
+      } yield BloomProbeExpr(filter, hash, partitioned = true)
+
     case Pow(l, r) => binaryMath(TranscendentalKernels.Fn2.POW, l, r, "pow", input)
     case Atan2(l, r) => binaryMath(TranscendentalKernels.Fn2.ATAN2, l, r, "atan2", input)
     case Hypot(l, r) => binaryMath(TranscendentalKernels.Fn2.HYPOT, l, r, "hypot", input)

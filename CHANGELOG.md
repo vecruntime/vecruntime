@@ -43,6 +43,9 @@ version may change configuration keys or defaults, always noted here.
 
 ### Fixed
 
+- `FactBloomFilter`'s probe on a fact scan that already has a filter is added to that filter instead of a second
+  one below it: Spark takes partition filters only from the filter directly over the relation, so the scan lost
+  its dynamic partition pruning and the stage ran row by row (TPC-DS q48, q13, q61, q18 and q23b at 1 TB).
 - TPC-DS q17 at 1 TB failed with `Cannot reserve additional contiguous bytes in the
   vectorized reader (integer overflow)`: the Final aggregate of a runtime bloom filter ran on our operator over
   Spark's `RowToColumnarExec`, which batches by row count the partial filters (one per creation-side map task, up
@@ -54,6 +57,11 @@ version may change configuration keys or defaults, always noted here.
 
 ### Changed
 
+- `FactBloomFilter` builds a filter for many keys partitioned by hash bucket: the keys are shuffled by
+  `pmod(xxhash64(key), B)`, one sub-filter per bucket is built after the shuffle within Spark's caps, and the probe
+  tests its bucket's sub-filter. A single `bloom_filter_agg` for tens of millions of keys was capped at 8 MB and
+  saturated. Total size capped by `spark.vecruntime.optimizer.factBloomFilter.maxTotalBits`; larger filters are
+  declined (#653).
 - `FactBloomFilter` adds a filter only on evidence that it prunes: with distinct-count statistics for both keys
   (Spark `ANALYZE ... FOR COLUMNS`, or Iceberg's Puffin statistics through DSv2), when at most
   `spark.vecruntime.optimizer.factBloomFilter.maxSelectivity` (0.5) of the filtered side can match; without them,
