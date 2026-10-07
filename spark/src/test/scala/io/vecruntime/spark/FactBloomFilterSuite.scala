@@ -214,6 +214,13 @@ class FactBloomFilterSuite extends VectorQuerySuite {
     assert(returnsScans(shared) < returnsScans(separate), s"${shared.queryExecution.executedPlan}")
   }
 
+  test("a relation the plan reads twice gets no probe: its copies keep their exchange reuse (q23b)") {
+    val twice =
+      s"""SELECT * FROM ($q93) a JOIN (SELECT ss_item_sk k, count(*) n FROM store_sales GROUP BY ss_item_sk) b
+         |  ON a.ss_item_sk = b.k""".stripMargin
+    assert(salesBlooms(run(twice)) === 0)
+  }
+
   test("sides of similar size get no filter") {
     val sql =
       "SELECT count(*), max(a.ss_pad) FROM store_sales a JOIN store_sales b ON a.ss_ticket_number = b.ss_ticket_number"

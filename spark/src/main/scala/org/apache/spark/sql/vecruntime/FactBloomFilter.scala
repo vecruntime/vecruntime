@@ -76,10 +76,20 @@ import org.apache.spark.sql.internal.SQLConf
 case class FactBloomFilter(session: SparkSession) extends Rule[LogicalPlan] with PredicateHelper
     with JoinSelectionHelper {
 
+  /** Canonical forms of the relations the current plan reads more than once (set per `apply`). */
+  private var shared: Set[LogicalPlan] = Set.empty
+
   override def apply(plan: LogicalPlan): LogicalPlan = {
     val conf = session.sessionState.conf
     if (!VectorConf.factBloomFilterEnabled(conf) || !conf.runtimeFilterBloomFilterEnabled) return plan
     var budget = conf.getConf(SQLConf.RUNTIME_FILTER_NUMBER_THRESHOLD) - countBlooms(plan)
+    // Relations read more than once (a CTE referenced twice, q23b's store_sales): Spark reuses the exchanges over
+    // their identical copies, and a probe on one copy would make it differ and cost that reuse -- at 1 TB q23b's
+    // shuffle grew from 75 to 101 GB. Such a relation gets no probe.
+    // Copies are told apart by their attribute ids: the same relation inside a subquery of the plan (Spark's
+    // own runtime filter built from it) keeps its ids and is not a second read.
+    shared = plan.collect { case r: LogicalRelation => (r.canonicalized, r.output.map(_.exprId)) }
+      .groupBy(_._1).collect { case (c, copies) if copies.map(_._2).distinct.size > 1 => c }.toSet
     plan.transformUp {
       case j @ ExtractEquiJoinKeys(jt, leftKeys, rightKeys, _, _, left, right, hint)
           if budget > 0 && !canBroadcastBySize(left, conf) && !canBroadcastBySize(right, conf) &&
@@ -320,7 +330,9 @@ case class FactBloomFilter(session: SparkSession) extends Rule[LogicalPlan] with
       else if (jt == Inner && key.references.subsetOf(r.outputSet))
         onScan(r, key, threshold, mk).map(c => jn.copy(right = c))
       else None
-    case rel: LogicalRelation if key.references.subsetOf(rel.outputSet) && rel.stats.sizeInBytes >= BigInt(threshold) =>
+    case rel: LogicalRelation
+        if key.references.subsetOf(rel.outputSet) && rel.stats.sizeInBytes >= BigInt(threshold) &&
+          !shared.contains(rel.canonicalized) =>
       Some(Filter(mk(key), rel))
     case _ => None
   }
