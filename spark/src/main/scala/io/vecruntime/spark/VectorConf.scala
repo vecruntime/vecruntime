@@ -67,6 +67,7 @@ object VectorConf {
 
   /** Logical rewrite (#635): a substring or length of one join side's string column computed below the join. */
   val NarrowBelowJoinEnabled = "spark.vecruntime.optimizer.narrowBelowJoin.enabled"
+
   /** Logical rewrite (#657): a star join's fact side aggregated by its join keys before the joins. */
   val AggregateBelowJoinEnabled = "spark.vecruntime.optimizer.aggregateBelowJoin.enabled"
 
@@ -575,6 +576,7 @@ object VectorConf {
   /** Narrowing projections below joins (#635); also off when the plugin is off. */
   def narrowBelowJoinEnabled(conf: SQLConf): Boolean =
     isEnabled(conf) && bool(conf, NarrowBelowJoinEnabled, default = true)
+
   /** Eager aggregation below star joins (#657); also off when the plugin is off. */
   def aggregateBelowJoinEnabled(conf: SQLConf): Boolean =
     isEnabled(conf) && bool(conf, AggregateBelowJoinEnabled, default = true)
