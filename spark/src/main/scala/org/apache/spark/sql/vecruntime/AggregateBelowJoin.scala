@@ -158,7 +158,8 @@ case class AggregateBelowJoin(session: SparkSession) extends Rule[LogicalPlan] w
     case f if joins > 0 && inputs.subsetOf(f.outputSet) =>
       val keys = f.output.filter(needed.contains)
       // A star aggregation only: every fact column kept above is a join key, none is grouped by itself.
-      if (keys.isEmpty || !keys.forall(joinKeys.contains)) None else Some(preAggregate(f, keys, aggExprs))
+      if (keys.isEmpty || !keys.forall(joinKeys.contains) || !reduces(f, keys)) None
+      else Some(preAggregate(f, keys, aggExprs))
     case _ => None
   }
 
@@ -166,6 +167,23 @@ case class AggregateBelowJoin(session: SparkSession) extends Rule[LogicalPlan] w
   private def selective(p: LogicalPlan): Boolean = p.exists {
     case Filter(cond, _) => splitConjunctivePredicates(cond).exists(!_.isInstanceOf[IsNotNull])
     case _ => false
+  }
+
+  /**
+   * Evidence that grouping `f` by `keys` removes rows: statistics put the number of groups -- the product of
+   * the keys' distinct counts, an upper bound -- at most `1 / minReduction` of the base relation's rows. Without
+   * statistics, or when the keys are nearly unique together, the pre-aggregate would add a stage and a shuffle
+   * and save the joins little: at 1 TB, TPC-DS q4, q11 and q74's `(customer_sk, sold_date_sk)` keys made them
+   * 34-104 % slower, so the rule declines.
+   */
+  private def reduces(f: LogicalPlan, keys: Seq[Attribute]): Boolean = {
+    val minReduction = VectorConf.aggregateBelowJoinMinReduction(session.sessionState.conf)
+    val ndvs = keys.map(k => KeyStats.distinctCount(f, k))
+    (KeyStats.baseRowCount(f), ndvs.forall(_.isDefined)) match {
+      case (Some(rows), true) if rows > 0 =>
+        BigDecimal(ndvs.flatten.product) * BigDecimal(minReduction) <= BigDecimal(rows)
+      case _ => false
+    }
   }
 
   /** Whether `p` has a dynamic partition pruning filter on one of `keys`. */
