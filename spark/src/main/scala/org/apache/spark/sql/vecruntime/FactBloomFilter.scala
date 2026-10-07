@@ -196,7 +196,10 @@ case class FactBloomFilter(session: SparkSession) extends Rule[LogicalPlan] with
     val total = VectorConf.factBloomFilterMaxTotalBits(conf)
     val bitsPerItem = math.min(8L, total / items)
     if (bitsPerItem < 4) return None
-    val buckets = ((items + perBucket - 1) / perBucket).toInt
+    // A power of two, so the probe picks a row's sub-filter with a mask instead of a long division per row
+    // (`floorMod` was 9.6 % of q93's executor CPU at 1 TB, #659); `pmod(h, B)` equals `h & (B - 1)` then.
+    val needed = ((items + perBucket - 1) / perBucket).toInt
+    val buckets = if (Integer.bitCount(needed) == 1) needed else Integer.highestOneBit(needed) << 1
     val itemsPerBucket = (items + buckets - 1) / buckets
     val bitsPerBucket = math.min(itemsPerBucket * bitsPerItem, conf.getConf(SQLConf.RUNTIME_BLOOM_FILTER_MAX_NUM_BITS))
     Some((buckets, itemsPerBucket, bitsPerBucket))

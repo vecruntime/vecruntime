@@ -19,6 +19,8 @@ version may change configuration keys or defaults, always noted here.
   `FactBloomFilter` is on by default again, with run-time evidence (#659).
 - `FactBloomFilter`'s partitioned filters use split-block sub-filters (one cache line read per probe) instead of
   Spark's `BloomFilterImpl`, whose scattered reads made q93's 2.9G-row probe cost more than it saved (#659).
+- `FactBloomFilter`'s partitioned filters have a power-of-two number of sub-filters, so the probe picks one with a
+  mask instead of a long division per row (`floorMod` was 9.6 % of q93's executor CPU at 1 TB, #659).
 - A logical rewrite that computes a substring or length of a join's smaller side below the join
   (`spark.vecruntime.optimizer.narrowBelowJoin.enabled`, on by default): the join carries the short result instead
   of the whole string. TPC-DS q23a's `substr(i_item_desc, 1, 30)` was computed on ~1.66G joined rows at 1 TB, each
