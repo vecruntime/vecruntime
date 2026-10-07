@@ -140,7 +140,14 @@ case class ShareBloomCreationExchange(session: SparkSession) extends Rule[SparkP
                 val refs = refsIn(s)
                 // The reference must name this join's other side: its attributes are that side's output.
                 val names = refs.forall(r => AttributeSet(r.output).subsetOf(available) && r.output.nonEmpty)
+                // An exchange over a dynamically pruned scan cannot be shared: the subquery's own adaptive plan
+                // cannot reuse the join's broadcast for the pruning, drops it, and reads the whole table (q50's
+                // store_returns: 277M rows against 2M) in a stage of its own. Such a filter is dropped.
+                val pruned = exchange.exists(_.expressions.exists(_.exists(
+                  _.isInstanceOf[org.apache.spark.sql.catalyst.expressions.DynamicPruningExpression]
+                )))
                 if (!names) s
+                else if (pruned) Literal.create(null, BinaryType)
                 else {
                   val shared = Option(replaced.get(sq)).getOrElse {
                     // The exchange takes the reference's logical link: the subquery's AQE re-plans from its logical

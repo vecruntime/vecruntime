@@ -98,11 +98,14 @@ case class FactBloomFilter(session: SparkSession) extends Rule[LogicalPlan] with
             !hintToBroadcastLeft(hint) && !hintToBroadcastRight(hint) =>
         var newLeft = left
         var newRight = right
+        // One filter per side, on the first key that qualifies: the probe is a hash and a random bit read per row of
+        // the application scan, and a second key's filter prunes few rows the first has not (q93: two probes on
+        // store_sales' 2.9G rows cost 25 % more scan task time than the join they saved).
         leftKeys.zip(rightKeys).foreach { case (l, r) =>
-          if (budget > 0 && prunesLeft(jt)) {
+          if (budget > 0 && prunesLeft(jt) && (newLeft eq left)) {
             inject(newLeft, l, right, r).foreach { p => newLeft = p; budget -= 1 }
           }
-          if (budget > 0 && prunesRight(jt)) {
+          if (budget > 0 && prunesRight(jt) && (newRight eq right)) {
             inject(newRight, r, left, l).foreach { p => newRight = p; budget -= 1 }
           }
         }
