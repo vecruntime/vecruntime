@@ -375,6 +375,13 @@ Spark) and the declined shapes. The 1 TB numbers come with the PR.
 **Related.** `BloomProbeExpr` now skips rows an earlier conjunct already rejected (#635), so a probe this rule
 adds costs nothing on rows the scan's other filters drop.
 
+
+**Run-time evidence (#659).** Plan-time estimates of the creation side -- a filtered dimension, a join -- are
+what made q18, q61 and q23b slower with the rule at 1 TB. The filter's build therefore also counts the creation
+side's actual rows, and yields a null filter when they are not `sizeRatio` times fewer than the application
+side's estimated rows; the probe is `coalesce(might_contain(...), true)`, so a declined filter keeps every row.
+Off with `spark.vecruntime.optimizer.factBloomFilter.runtimeEvidence=false`.
+
 ## `NarrowBelowJoin`: a substring or length of one join side's string computed below the join
 
 `spark/src/main/scala/org/apache/spark/sql/vecruntime/NarrowBelowJoin.scala`, issue #635.

@@ -158,6 +158,43 @@ class FactBloomFilterSuite extends VectorQuerySuite {
     assert(overR2C.isEmpty, "a bloom aggregate reads RowToColumnarExec:\n" + overR2C.map(_.treeString).mkString("\n"))
   }
 
+  /** The values of the executed plan's scalar subqueries that build a bloom filter (null: declined at run time). */
+  private def builtFilters(df: DataFrame): Seq[Any] = {
+    object Plans extends org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanHelper
+    Plans.collectWithSubqueries(df.queryExecution.executedPlan) { case p => p }
+      .flatMap(_.expressions.flatMap(_.collect { case s: org.apache.spark.sql.execution.ScalarSubquery => s }))
+      .filter(_.dataType == org.apache.spark.sql.types.BinaryType)
+      .map(_.eval(null))
+  }
+
+  test("run-time evidence: a creation side not much smaller in actual rows yields a null filter, every row kept") {
+    // Every return row survives the filter (2000 rows): reduced in shape, not in rows. The application side is
+    // ~50x larger in bytes, so the plan-time size check passes at ratio 25, but 2000 x 25 rows exceed its
+    // estimated rows: the build declines at run time.
+    // `nullif(q, -1)` is never null (quantities are 0-2): every row kept, and Spark's own runtime filter does not
+    // count it as selective, so only this rule's filters are in the plan.
+    val weak = q93.replace("isnotnull(nullif(sr_return_quantity, 0))", "isnotnull(nullif(sr_return_quantity, -1))")
+    withConf(VectorConf.FactBloomFilterSizeRatio -> "25") {
+      val df = run(weak)
+      assert(salesBlooms(df) >= 1, df.queryExecution.optimizedPlan.treeString)
+      val built = builtFilters(df)
+      assert(built.nonEmpty && built.forall(_ == null), s"filters: $built\n${df.queryExecution.executedPlan}")
+    }
+    // Without the run-time check the same plan builds and applies the filter.
+    withConf(VectorConf.FactBloomFilterSizeRatio -> "25", VectorConf.FactBloomFilterRuntimeEvidence -> "false") {
+      val df = run(weak)
+      assert(builtFilters(df).exists(_ != null))
+    }
+  }
+
+  test("run-time evidence: q93's reduced returns still build their filter") {
+    // The application side's row estimate comes from its compressed file size, a few times below its 40000 rows
+    // here; ratio 2 keeps the ~1300 returns clearly under it.
+    val df = withConf(VectorConf.FactBloomFilterSizeRatio -> "2")(run(q93))
+    val built = builtFilters(df)
+    assert(built.nonEmpty && built.forall(_ != null), s"filters: $built")
+  }
+
   test("sides of similar size get no filter") {
     val sql =
       "SELECT count(*), max(a.ss_pad) FROM store_sales a JOIN store_sales b ON a.ss_ticket_number = b.ss_ticket_number"

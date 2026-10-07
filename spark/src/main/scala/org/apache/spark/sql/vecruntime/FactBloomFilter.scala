@@ -21,16 +21,20 @@ import org.apache.spark.sql.catalyst.expressions.{
   Alias,
   And,
   BloomFilterMightContain,
+  Coalesce,
   DynamicPruningSubquery,
   Expression,
+  GreaterThan,
+  If,
   Literal,
+  Multiply,
   Pmod,
   PredicateHelper,
   ScalarSubquery,
   SparkPartitionID,
   XxHash64
 }
-import org.apache.spark.sql.catalyst.expressions.aggregate.BloomFilterAggregate
+import org.apache.spark.sql.catalyst.expressions.aggregate.{BloomFilterAggregate, Count, Sum}
 import org.apache.spark.sql.catalyst.optimizer.{ColumnPruning, JoinSelectionHelper}
 import org.apache.spark.sql.catalyst.planning.ExtractEquiJoinKeys
 import org.apache.spark.sql.catalyst.plans.{Inner, JoinType, LeftOuter, LeftSemi, RightOuter}
@@ -112,7 +116,11 @@ case class FactBloomFilter(session: SparkSession) extends Rule[LogicalPlan] with
     val items = expectedItems(app, appKey, creation, creationKey, VectorConf.factBloomFilterMaxSelectivity(conf))
     if (items.isEmpty) return None
     val threshold = conf.getConf(SQLConf.RUNTIME_BLOOM_FILTER_APPLICATION_SIDE_SCAN_SIZE_THRESHOLD)
-    filterFor(creation, creationKey, items.get).flatMap(mk => onScan(app, appKey, threshold, mk))
+    val appRows = app.stats.rowCount.getOrElse {
+      val width = math.max(8L, app.output.map(_.dataType.defaultSize.toLong).sum + 8L)
+      app.stats.sizeInBytes / width
+    }
+    filterFor(creation, creationKey, items.get, appRows).flatMap(mk => onScan(app, appKey, threshold, mk))
   }
 
   /**
@@ -181,8 +189,14 @@ case class FactBloomFilter(session: SparkSession) extends Rule[LogicalPlan] with
    * already satisfied, so no per-map-task partial filters), packed into one value; the probe tests the bucket's
    * sub-filter.
    */
-  private def partitionedFilter(creation: LogicalPlan, key: Expression, buckets: Int, items: Long, bits: Long)
-      : Expression => Expression = { appExpr =>
+  private def partitionedFilter(
+      creation: LogicalPlan,
+      key: Expression,
+      buckets: Int,
+      items: Long,
+      bits: Long,
+      gate: Option[RuntimeGate]
+  ): Expression => Expression = { appExpr =>
     val h = Alias(new XxHash64(Seq(key)), "bloomHash")()
     val b = Alias(
       org.apache.spark.sql.catalyst.expressions.Cast(
@@ -199,23 +213,68 @@ case class FactBloomFilter(session: SparkSession) extends Rule[LogicalPlan] with
       new BloomFilterAggregate(h.toAttribute, Literal(items), Literal(bits)).toAggregateExpression(),
       "bloomPart"
     )()
-    val perBucket = Aggregate(Seq(b.toAttribute), Seq(b.toAttribute, sub), shuffled)
+    val rowsPart = Alias(Count(Literal(1)).toAggregateExpression(), "bloomRowsPart")()
+    val perBucket =
+      Aggregate(Seq(b.toAttribute), Seq(b.toAttribute, sub) ++ gate.map(_ => rowsPart), shuffled)
     val packed = PartitionedBloomFilterAgg(b.toAttribute, sub.toAttribute, buckets).toAggregateExpression()
-    val plan = Aggregate(Nil, Seq(Alias(packed, "bloomFilter")()), perBucket)
-    PartitionedBloomMightContain(ScalarSubquery(ColumnPruning(plan), Nil), new XxHash64(Seq(appExpr)))
+    val rows = gate.map(_ => Alias(Sum(rowsPart.toAttribute).toAggregateExpression(), "bloomRows")())
+    val plan = gatedPlan(Alias(packed, "bloomFilter")(), rows, gate, perBucket)
+    probe(PartitionedBloomMightContain(ScalarSubquery(ColumnPruning(plan), Nil), new XxHash64(Seq(appExpr))), gate)
   }
 
-  private def filterFor(creation: LogicalPlan, key: Expression, items: Long): Option[Expression => Expression] =
+  private def filterFor(creation: LogicalPlan, key: Expression, items: Long, appRows: BigInt)
+      : Option[Expression => Expression] = {
+    val conf = session.sessionState.conf
+    val gate =
+      if (VectorConf.factBloomFilterRuntimeEvidence(conf))
+        Some(RuntimeGate(BigInt(VectorConf.factBloomFilterSizeRatio(conf)), appRows))
+      else None
     layout(items).map {
-      case (1, n, _) => singleFilter(creation, key, n)
-      case (buckets, n, bits) => partitionedFilter(creation, key, buckets, n, bits)
+      case (1, n, _) => singleFilter(creation, key, n, gate)
+      case (buckets, n, bits) => partitionedFilter(creation, key, buckets, n, bits, gate)
     }
+  }
 
-  private def singleFilter(creation: LogicalPlan, key: Expression, items: Long): Expression => Expression = { appExpr =>
+  /**
+   * The run-time evidence check (#659): the filter's build also counts the creation side's actual rows, and
+   * yields a null filter -- which the probe passes every row through -- when they are not at least `ratio`
+   * times fewer than the application side's estimated rows. Estimates of the creation side (a filtered
+   * dimension, a join) are what made q18, q61 and q23b slower at 1 TB; its actual row count is known only once
+   * the build has read it.
+   */
+  private case class RuntimeGate(ratio: BigInt, appRows: BigInt) {
+    def apply(filter: Expression, rows: Expression): Expression = {
+      val limit = Literal((appRows / ratio).min(BigInt(Long.MaxValue)).toLong)
+      If(GreaterThan(rows, limit), Literal.create(null, filter.dataType), filter)
+    }
+  }
+
+  /** The final aggregate of a filter build: its filter, plus the gated filter when a gate is set. */
+  private def gatedPlan(
+      filter: Alias,
+      rows: Option[Alias],
+      gate: Option[RuntimeGate],
+      child: LogicalPlan,
+      grouping: Seq[Expression] = Nil
+  ): LogicalPlan = (gate, rows) match {
+    case (Some(g), Some(r)) =>
+      val agg = Aggregate(grouping, Seq(filter, r), child)
+      Project(Seq(Alias(g(filter.toAttribute, r.toAttribute), "bloomFilter")()), agg)
+    case _ => Aggregate(grouping, Seq(filter), child)
+  }
+
+  /** The probe: with a run-time gate, a null (declined) filter passes every row. */
+  private def probe(p: Expression, gate: Option[RuntimeGate]): Expression =
+    if (gate.isDefined) Coalesce(Seq(p, Literal(true))) else p
+
+  private def singleFilter(creation: LogicalPlan, key: Expression, items: Long, gate: Option[RuntimeGate])
+      : Expression => Expression = { appExpr =>
     val agg = new BloomFilterAggregate(new XxHash64(Seq(key)), Literal(items))
     val buckets = VectorConf.factBloomFilterMergeBuckets(session.sessionState.conf)
+    val count = Alias(Count(Literal(1)).toAggregateExpression(), "bloomRows")()
     val plan =
-      if (buckets <= 1) Aggregate(Nil, Seq(Alias(agg.toAggregateExpression(), "bloomFilter")()), creation)
+      if (buckets <= 1)
+        gatedPlan(Alias(agg.toAggregateExpression(), "bloomFilter")(), gate.map(_ => count), gate, creation)
       else {
         // Two levels (#646): one partial filter per creation-side task would all meet in a single task. Group
         // them by a bucket of the task's partition id, so `buckets` tasks each merge a share of them, then OR
@@ -223,13 +282,15 @@ case class FactBloomFilter(session: SparkSession) extends Rule[LogicalPlan] with
         val bucket = Alias(Pmod(SparkPartitionID(), Literal(buckets)), "bloomBucket")()
         val tagged = Project(creation.output :+ bucket, creation)
         val partial = Alias(agg.toAggregateExpression(), "bloomPartial")()
-        val byBucket = Aggregate(Seq(bucket.toAttribute), Seq(partial), tagged)
+        val rowsPart = Alias(Count(Literal(1)).toAggregateExpression(), "bloomRowsPart")()
+        val byBucket = Aggregate(Seq(bucket.toAttribute), Seq(partial) ++ gate.map(_ => rowsPart), tagged)
         val merged = BloomFilterMerge(partial.toAttribute).toAggregateExpression()
-        Aggregate(Nil, Seq(Alias(merged, "bloomFilter")()), byBucket)
+        val rows = gate.map(_ => Alias(Sum(rowsPart.toAttribute).toAggregateExpression(), "bloomRows")())
+        gatedPlan(Alias(merged, "bloomFilter")(), rows, gate, byBucket)
       }
     // Column pruning as Spark's own rule does: the subquery reads only the creation key.
     val subquery = ScalarSubquery(ColumnPruning(plan), Nil)
-    BloomFilterMightContain(subquery, new XxHash64(Seq(appExpr)))
+    probe(BloomFilterMightContain(subquery, new XxHash64(Seq(appExpr))), gate)
   }
 
   /** Puts the filter right above the scan `key` traces to; `None` if it reaches none that qualifies. */
@@ -260,6 +321,8 @@ case class FactBloomFilter(session: SparkSession) extends Rule[LogicalPlan] with
   private def hasFilterOn(cond: Expression, key: Expression): Boolean =
     splitConjunctivePredicates(cond).exists {
       case d: DynamicPruningSubquery => d.pruningKey.semanticEquals(key)
+      case Coalesce(Seq(BloomFilterMightContain(_, XxHash64(Seq(v), _)), _)) => v.semanticEquals(key)
+      case Coalesce(Seq(PartitionedBloomMightContain(_, XxHash64(Seq(v), _)), _)) => v.semanticEquals(key)
       case BloomFilterMightContain(_, XxHash64(Seq(v), _)) => v.semanticEquals(key)
       case PartitionedBloomMightContain(_, XxHash64(Seq(v), _)) => v.semanticEquals(key)
       case _ => false

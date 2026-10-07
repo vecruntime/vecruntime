@@ -8,6 +8,10 @@ version may change configuration keys or defaults, always noted here.
 
 ### Added
 
+- `FactBloomFilter` run-time evidence (`spark.vecruntime.optimizer.factBloomFilter.runtimeEvidence`, on): the
+  filter's build counts the creation side's actual rows and declines -- a null filter that keeps every row --
+  when they are not `sizeRatio` times fewer than the application side's (#659). The rule itself stays off by
+  default until a 1 TB run shows no query slower.
 - A logical rewrite that computes a substring or length of a join's smaller side below the join
   (`spark.vecruntime.optimizer.narrowBelowJoin.enabled`, on by default): the join carries the short result instead
   of the whole string. TPC-DS q23a's `substr(i_item_desc, 1, 30)` was computed on ~1.66G joined rows at 1 TB, each

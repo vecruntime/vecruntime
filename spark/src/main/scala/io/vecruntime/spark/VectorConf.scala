@@ -80,6 +80,9 @@ object VectorConf {
    */
   val FactBloomFilterEnabled = "spark.vecruntime.optimizer.factBloomFilter.enabled"
 
+  /** Run-time evidence (#659): the build counts the creation side's actual rows and declines when not much smaller. */
+  val FactBloomFilterRuntimeEvidence = "spark.vecruntime.optimizer.factBloomFilter.runtimeEvidence"
+
   /** How many times larger (estimated bytes) the filtered side must be than the side the filter is built from. */
   val FactBloomFilterSizeRatio = "spark.vecruntime.optimizer.factBloomFilter.sizeRatio"
 
@@ -591,6 +594,10 @@ object VectorConf {
   /** The fact-to-fact bloom filter (#641); also off when the plugin is off. */
   def factBloomFilterEnabled(conf: SQLConf): Boolean =
     isEnabled(conf) && bool(conf, FactBloomFilterEnabled, default = false)
+
+  /** FactBloomFilter's run-time row-count check (#659), default true. */
+  def factBloomFilterRuntimeEvidence(conf: SQLConf): Boolean =
+    bool(conf, FactBloomFilterRuntimeEvidence, default = true)
 
   def factBloomFilterSizeRatio(conf: SQLConf): Int =
     math.max(2, conf.getConfString(FactBloomFilterSizeRatio, "10").trim.toInt)
