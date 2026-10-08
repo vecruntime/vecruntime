@@ -605,9 +605,9 @@ object VectorConf {
   def aggregateBelowJoinEnabled(conf: SQLConf): Boolean =
     isEnabled(conf) && bool(conf, AggregateBelowJoinEnabled, default = true)
 
-  /** AggregateBelowJoin's required reduction, at least 1 (default 4). */
+  /** AggregateBelowJoin's required reduction (default 4); 0 skips the estimate (#675's measurement). */
   def aggregateBelowJoinMinReduction(conf: SQLConf): Double =
-    math.max(1.0, conf.getConfString(AggregateBelowJoinMinReduction, "4").trim.toDouble)
+    math.max(0.0, conf.getConfString(AggregateBelowJoinMinReduction, "4").trim.toDouble)
 
   /** AggregateBelowJoin declines without statistics (default true). */
   def aggregateBelowJoinRequireStatistics(conf: SQLConf): Boolean =
