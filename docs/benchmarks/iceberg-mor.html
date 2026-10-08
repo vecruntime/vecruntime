@@ -30,18 +30,6 @@ scan's filters, aggregates and joins on Arrow batches over Iceberg's own vectori
 selection — against plain Apache Spark, over both the <b>v2 delete encodings</b> (positional and equality delete files, #261)
 and the <b>v3 deletion vectors</b> (one roaring bitmap per data file in a Puffin blob, #262).</p>
 
-<div class="tldr"><b>TL;DR.</b> On the pure merge-and-aggregate probes, VecRuntime runs <b>1.0–1.4×</b> faster than Spark across every
-delete shape and share, and Q1 (a full scan-aggregate) <b>3.0–4.6×</b> faster. The margin does <b>not grow</b> with the delete
-share — it shrinks, because the delete merge costs a <b>fixed price per batch</b> (paid inside Iceberg's reader, in both engines)
-and a fixed price hurts the faster engine's ratio more. <b>Deletion vectors (v3) are the cheaper encoding</b> for both engines:
-the pure-merge probe costs Spark +15 ms and VecRuntime +17–22 ms over a clean table, against +21–40 ms for v2 position files.
-<b>Equality deletes (v2) are the expensive kind</b> and the one shape VecRuntime can lose (0.89× on <code>eq_10</code>): Iceberg
-evaluates the equality predicate row-at-a-time to build the mapping. Every checksum equalled Spark's, on all 90 cells.
-<br><br><b><a href="#cdc-cluster">CDC MERGE on the cluster</a></b> (~20 GB store_sales, 432M live rows, 20% position + 5% equality
-deletes, a 10% change batch touching every data file): VecRuntime is <b>not faster yet</b>. The MERGE runs at <b>0.96×</b> (v2) and
-<b>0.92×</b> (v3) of Spark and the reads at <b>0.89–1.06×</b>, although 7 of the MERGE's 8 operators and every read operator run
-columnar, through the columnar shuffle. Every v3 checksum equalled Spark's.</div>
-
 <h2 id="setup">What was measured</h2>
 <div class="note"><b>Scope.</b> This is the merge-on-read <i>merge cost</i> at TPC-H scale factor 1 on a single host, over Iceberg's
 JVM vectorized reader (<code>BatchScanExec</code>), which is the reader both engines use for v2 and v3. It is not the 1 TB

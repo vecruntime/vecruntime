@@ -120,7 +120,6 @@ def main():
     shuf = {e: sum(data[e][q].get("shuffleReadBytes", 0) for q in queries) / 1e12 for e in data}
     exe = {e: sum(data[e][q].get("executorRunTimeMs", 0) for q in queries) / 3.6e6 for e in data}
     faster = sum(1 for q in queries if V[q]["medianMs"] < S[q]["medianMs"])
-    rows_equal = sum(1 for q in queries if S[q].get("rows") == V[q].get("rows"))
     checksum_diff = [q for q in queries if S[q].get("checksum") != V[q].get("checksum")]
 
     def speed(q):
@@ -131,7 +130,6 @@ def main():
 
     geo = geomean([speed(q) for q in queries]); x86_geo = geomean([x86_speed(q) for q in queries])
     arch = {e: geomean([data[e][q]["medianMs"] / 1000 / X[e][q] for q in queries]) for e in data}
-    best, worst = max(queries, key=speed), min(queries, key=speed)
 
     def top(k=10):
         qs = sorted(queries, key=speed, reverse=True)[:k]
@@ -167,8 +165,6 @@ def main():
     conf_common = "\n".join(meta["common_conf"]); conf_v = "\n".join(meta["vector_conf"])
     platform = "".join(f"<li>{html.escape(x)}</li>" for x in meta["platform"])
     notes = "".join(f"<li>{html.escape(x)}</li>" for x in meta["notes"])
-    csum = ("every query" if not checksum_diff else
-            f"every query except {', '.join(checksum_diff)} (ties in the result, ordered differently by each engine)")
 
     page = f"""---
 layout: default
@@ -197,13 +193,6 @@ title: {json.dumps(meta["title"])}
 batches with the Java Vector API -- on the JVM, no native code -- and moves batches between executors over its own Arrow Flight shuffle.
 This page compares it against plain Apache Spark on the TPC-DS 1 TB workload on Amazon EKS with AWS Graviton4 (arm64) nodes, and sets both against
 the <a href="{meta["x86_page"]}">published x86 run</a> {html.escape(meta["x86_relation"])} (<a href="{meta["issue"]}">#253</a>).</p>
-
-<div class="tldr"><b>TL;DR.</b> On Graviton4, over the {n} TPC-DS queries at 1 TB, <b>VecRuntime</b> finished in <b>{tot["vector"]:,.0f} s</b> against Spark's
-{tot["spark"]:,.0f} s -- <b>{tot["spark"] / tot["vector"]:.2f}x</b>, {100 - 100 * tot["vector"] / tot["spark"]:.0f}% less runtime (geometric mean {geo:.2f}x),
-faster than Spark on {faster} of {n} queries (best {best}: {speed(best):.2f}x; largest regression {worst}: {100 / speed(worst) - 100:.0f}%).
-On the x86 nodes the same comparison is {x86tot["spark"] / x86tot["vector"]:.2f}x (geometric mean {x86_geo:.2f}x): the lead carries over to arm64.
-Both engines run faster on Graviton4 than on the m5.4xlarge nodes -- Spark's time is {arch["spark"]:.2f} of its x86 time and VecRuntime's
-{arch["vector"]:.2f}, per query (geometric mean). Row counts equal Spark's on {rows_equal} of {n} queries; checksums on {csum}.</div>
 
 <div class="cards">
 <div class="card"><div class="l">Apache Spark 4.1.3 on Graviton4</div><div class="n">{tot["spark"]:,.0f} s</div><div class="l">baseline, {n} queries (x86: {x86tot["spark"]:,.0f} s)</div></div>
