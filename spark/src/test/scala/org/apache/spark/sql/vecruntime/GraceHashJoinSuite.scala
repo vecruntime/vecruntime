@@ -235,7 +235,7 @@ class GraceHashJoinSuite extends AnyFunSuite {
   }
 
   /** A task context that records the completion listeners and runs them on `complete()`; nothing else. */
-  private final class RecordingTaskContext extends TaskContext {
+  private final class RecordingTaskContext extends org.apache.spark.sql.vecruntime.shims.TestTaskContextBase {
     private val completion = new ArrayBuffer[TaskCompletionListener]
     def listeners: Int = completion.size
     def complete(): Unit = completion.reverseIterator.foreach(_.onTaskCompletion(this))

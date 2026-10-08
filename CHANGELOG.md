@@ -8,6 +8,15 @@ version may change configuration keys or defaults, always noted here.
 
 ### Added
 
+- Spark 4.2 builds (`-Pspark-4.2`, #639): the profile switches Spark (4.2.0) and every version pinned to its
+  line (Scala 2.13.18, Arrow 19.0.0, Parquet 1.17.0, Hadoop 3.5.0, netty 4.2.13, protobuf 4.33.5), and the spark
+  module adds `src/main/spark-<line>` and `src/test/spark-<line>`. What differs is in one `SparkShims` object
+  per line: the sample seed (optional in 4.2), Spark 4.2's fdlibm `asinh` / `acosh` (new kernel variants, bit
+  for bit), and 4.2's own merging of differently filtered scalar subqueries (`MergeSubplans`), which
+  `MergeFilteredAggregates` does on 4.1. Comet and Iceberg stay 4.1-only until they publish 4.2 artifacts.
+- Every artifact names its Spark line: `vecruntime-kernels_<line>`, `vecruntime-spark_<line>_2.13`,
+  `vecruntime-shuffle_<line>_2.13` (and `vecruntime-benchmarks_<line>`, `vecruntime-iceberg-bridge_<line>_2.13`,
+  `vecruntime-spark-sql-tests_<line>_2.13`), with `<line>` 4.1 or 4.2 (#639).
 - Redundant grouping keys removed at run time (`spark.vecruntime.optimizer.removeRedundantGroupKeys.enabled`, on):
   when a built broadcast's single integral join key turns out unique and is grouped by (or its equal stream key
   is), the aggregate stops grouping by the broadcast side's other columns -- q23a/b's `substr(i_item_desc, 1, 30)`
@@ -91,6 +100,9 @@ version may change configuration keys or defaults, always noted here.
   a fine key). The filtered function now sees every batch, with the failing rows cleared.
 
 ### Changed
+
+- The Iceberg suites moved to `spark/src/test/iceberg`, added only by `-Piceberg`: a build without it now
+  compiles its tests (#639).
 
 - `spark.vecruntime.optimizer.factBloomFilter.enabled` defaults to `false`. Full 1 TB runs with `ANALYZE` statistics:
   1197 s off, 1208 s on; the rule helps q49, q51, q28 and q50 but still slows q23b, q18, q61 and q13, whose

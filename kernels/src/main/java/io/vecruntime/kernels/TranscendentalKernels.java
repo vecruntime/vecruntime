@@ -62,7 +62,14 @@ public final class TranscendentalKernels {
         SEC,
         CSC,
         DEGREES,
-        RADIANS
+        RADIANS,
+        /**
+         * Spark 4.2's {@code Asinh}: fdlibm's s_asinh.c (SPARK 4.2 replaced the
+         * log(x + sqrt(x*x + 1)) form).
+         */
+        ASINH_FDLIBM,
+        /** Spark 4.2's {@code Acosh}: fdlibm's e_acosh.c. */
+        ACOSH_FDLIBM
     }
 
     /** The binary functions. */
@@ -108,7 +115,47 @@ public final class TranscendentalKernels {
             case CSC -> 1 / Math.sin(x);
             case DEGREES -> Math.toDegrees(x);
             case RADIANS -> Math.toRadians(x);
+            case ASINH_FDLIBM -> asinhFdlibm(x);
+            case ACOSH_FDLIBM -> acoshFdlibm(x);
         };
+    }
+
+    /**
+     * Spark 4.2's {@code Asinh} body, operation for operation, so results match
+     * it bit for bit.
+     */
+    static double asinhFdlibm(double x) {
+        double ax = Math.abs(x);
+        double w;
+        if (Double.isInfinite(ax) || Double.isNaN(ax)) {
+            w = ax;
+        } else if (ax < 1.0 / (1 << 28)) {
+            w = ax;
+        } else if (ax > (1 << 28)) {
+            w = StrictMath.log(ax) + StrictMath.log(2.0);
+        } else if (ax > 2.0) {
+            w = StrictMath.log(2.0 * ax + 1.0 / (Math.sqrt(x * x + 1.0) + ax));
+        } else {
+            double t = x * x;
+            w = StrictMath.log1p(ax + t / (1.0 + Math.sqrt(1.0 + t)));
+        }
+        return Math.copySign(w, x);
+    }
+
+    /** Spark 4.2's {@code Acosh} body, operation for operation. */
+    static double acoshFdlibm(double x) {
+        if (x < 1.0) {
+            return Double.NaN;
+        } else if (x >= (1 << 28)) {
+            return StrictMath.log(x) + StrictMath.log(2.0);
+        } else if (x == 1.0) {
+            return 0.0;
+        } else if (x > 2.0) {
+            return StrictMath.log(2.0 * x - 1.0 / (x + Math.sqrt(x * x - 1.0)));
+        } else {
+            double t = x - 1.0;
+            return StrictMath.log1p(t + Math.sqrt(2.0 * t + t * t));
+        }
     }
 
     /**

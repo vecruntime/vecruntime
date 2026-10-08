@@ -8,23 +8,23 @@
     <version>0.0.7-SNAPSHOT</version>
   </parent>
 
-  <artifactId>vecruntime-benchmarks</artifactId>
+  <artifactId>vecruntime-benchmarks_${spark.line}</artifactId>
   <name>vecruntime-benchmarks</name>
   <description>JMH kernel microbenchmarks and TPC-H runner</description>
 
   <dependencies>
     <dependency>
       <groupId>io.github.vecruntime</groupId>
-      <artifactId>vecruntime-kernels</artifactId>
+      <artifactId>vecruntime-kernels_${spark.line}</artifactId>
     </dependency>
     <dependency>
       <!-- #288: the columnar shuffle (its own jar in a deployment, as here on the benchmark classpath). -->
       <groupId>io.github.vecruntime</groupId>
-      <artifactId>vecruntime-shuffle_${scala.binary.version}</artifactId>
+      <artifactId>vecruntime-shuffle_${spark.line}_${scala.binary.version}</artifactId>
     </dependency>
     <dependency>
       <groupId>io.github.vecruntime</groupId>
-      <artifactId>vecruntime-spark_${scala.binary.version}</artifactId>
+      <artifactId>vecruntime-spark_${spark.line}_${scala.binary.version}</artifactId>
     </dependency>
     <dependency>
       <groupId>org.openjdk.jmh</groupId>

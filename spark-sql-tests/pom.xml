@@ -14,7 +14,7 @@
     <version>0.0.7-SNAPSHOT</version>
   </parent>
 
-  <artifactId>vecruntime-spark-sql-tests_${scala.binary.version}</artifactId>
+  <artifactId>vecruntime-spark-sql-tests_${spark.line}_${scala.binary.version}</artifactId>
   <name>vecruntime :: Spark SQL test suite</name>
 
   <properties>
@@ -32,7 +32,7 @@
   <dependencies>
     <dependency>
       <groupId>io.github.vecruntime</groupId>
-      <artifactId>vecruntime-spark_${scala.binary.version}</artifactId>
+      <artifactId>vecruntime-spark_${spark.line}_${scala.binary.version}</artifactId>
       <scope>test</scope>
     </dependency>
     <dependency>

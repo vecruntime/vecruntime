@@ -43,18 +43,22 @@ jobs:
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
 
       - name: Build and deploy into a Maven-layout directory
-        # -am adds the parent POM the module POMs inherit from; -Pcomet,iceberg only affects which
-        # test sources compile (skipped); the shade plugin's dependency-reduced POM is what is deployed
-        # for the spark module, so consumers do not pull the kernels twice.
+        # Both Spark lines (#639), one after the other in this checkout, so `clean` before each: the
+        # incremental Scala compiler would reuse classes compiled against the other line. -am adds the
+        # parent POM (identical for both lines); -Pcomet,iceberg only affects which test sources compile
+        # (skipped). The POMs are flattened, so each line's artifacts name their own line's siblings.
         run: |
-          mvn -B -ntp -DskipTests -Pcomet,iceberg -pl kernels,spark,shuffle -am deploy \
+          mvn -B -ntp -DskipTests -Pcomet,iceberg -pl kernels,spark,shuffle -am clean deploy \
             -DaltDeploymentRepository="staging::file://$GITHUB_WORKSPACE/target/maven-repo"
+          mkdir -p target/release
+          cp spark/target/vecruntime-spark_4.1_2.13-${VERSION}.jar shuffle/target/vecruntime-shuffle_4.1_2.13-${VERSION}.jar target/release/
+          mvn -B -ntp -DskipTests -Pspark-4.2 -pl kernels,spark,shuffle -am clean deploy \
+            -DaltDeploymentRepository="staging::file://$GITHUB_WORKSPACE/target/maven-repo"
+          cp spark/target/vecruntime-spark_4.2_2.13-${VERSION}.jar shuffle/target/vecruntime-shuffle_4.2_2.13-${VERSION}.jar target/release/
           find target/maven-repo -type f | sort
 
       - name: Checksums
         run: |
-          mkdir -p target/release
-          cp spark/target/vecruntime-spark_2.13-${VERSION}.jar shuffle/target/vecruntime-shuffle_2.13-${VERSION}.jar target/release/
           (cd target/release && sha256sum *.jar > SHA256SUMS && cat SHA256SUMS)
 
       - name: Release notes from CHANGELOG.md
@@ -64,7 +68,7 @@ jobs:
             on && /^## / { exit }
             on { print }' CHANGELOG.md > target/release/notes.md
           [ -s target/release/notes.md ] || echo "Release ${VERSION}." > target/release/notes.md
-          printf '\n---\nMaven: repository `https://raw.githubusercontent.com/%s/maven-repo/`, artifacts `io.github.vecruntime:vecruntime-spark_2.13:%s` and `io.github.vecruntime:vecruntime-shuffle_2.13:%s`.\n' \
+          printf '\n---\nMaven: repository `https://raw.githubusercontent.com/%s/maven-repo/`, artifacts `io.github.vecruntime:vecruntime-spark_<line>_2.13:%s` and `io.github.vecruntime:vecruntime-shuffle_<line>_2.13:%s`, with `<line>` 4.1 or 4.2 (the Spark feature line of your cluster).\n' \
             "$GITHUB_REPOSITORY" "$VERSION" "$VERSION" >> target/release/notes.md
 
       - name: Publish to the maven-repo branch

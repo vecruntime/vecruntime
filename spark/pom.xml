@@ -8,7 +8,7 @@
     <version>0.0.7-SNAPSHOT</version>
   </parent>
 
-  <artifactId>vecruntime-spark_2.13</artifactId>
+  <artifactId>vecruntime-spark_${spark.line}_${scala.binary.version}</artifactId>
   <name>vecruntime-spark</name>
   <description>Spark SQL plugin: planner rules, columnar operators and buffer adapters</description>
 
@@ -24,7 +24,7 @@
   <dependencies>
     <dependency>
       <groupId>io.github.vecruntime</groupId>
-      <artifactId>vecruntime-kernels</artifactId>
+      <artifactId>vecruntime-kernels_${spark.line}</artifactId>
     </dependency>
     <dependency>
       <groupId>org.apache.arrow</groupId>
@@ -97,7 +97,7 @@
               <createDependencyReducedPom>true</createDependencyReducedPom>
               <artifactSet>
                 <includes>
-                  <include>io.github.vecruntime:vecruntime-kernels</include>
+                  <include>io.github.vecruntime:vecruntime-kernels_${spark.line}</include>
                 </includes>
               </artifactSet>
             </configuration>
@@ -111,6 +111,37 @@
         <configuration>
           <skipTests>true</skipTests>
         </configuration>
+      </plugin>
+      <plugin>
+        <!-- The sources of the targeted Spark line (#639): src/main/spark-4.1 or spark-4.2, and the tests'. -->
+        <groupId>org.codehaus.mojo</groupId>
+        <artifactId>build-helper-maven-plugin</artifactId>
+        <executions>
+          <execution>
+            <id>spark-line-sources</id>
+            <goals>
+              <goal>add-source</goal>
+            </goals>
+            <phase>generate-sources</phase>
+            <configuration>
+              <sources>
+                <source>src/main/spark-${spark.line}</source>
+              </sources>
+            </configuration>
+          </execution>
+          <execution>
+            <id>spark-line-test-sources</id>
+            <goals>
+              <goal>add-test-source</goal>
+            </goals>
+            <phase>generate-test-sources</phase>
+            <configuration>
+              <sources>
+                <source>src/test/spark-${spark.line}</source>
+              </sources>
+            </configuration>
+          </execution>
+        </executions>
       </plugin>
       <plugin>
         <groupId>org.scalatest</groupId>
@@ -164,6 +195,29 @@
           <scope>test</scope>
         </dependency>
       </dependencies>
+      <build>
+        <plugins>
+          <plugin>
+            <!-- The Iceberg suites compile against the runtime above, so only this profile adds them. -->
+            <groupId>org.codehaus.mojo</groupId>
+            <artifactId>build-helper-maven-plugin</artifactId>
+            <executions>
+              <execution>
+                <id>iceberg-test-sources</id>
+                <goals>
+                  <goal>add-test-source</goal>
+                </goals>
+                <phase>generate-test-sources</phase>
+                <configuration>
+                  <sources>
+                    <source>src/test/iceberg</source>
+                  </sources>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+        </plugins>
+      </build>
     </profile>
   </profiles>
 </project>
