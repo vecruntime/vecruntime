@@ -66,6 +66,10 @@ version may change configuration keys or defaults, always noted here.
 
 ### Fixed
 
+- The hash tables' per-thread scratch (`GroupKeyTable`'s key mirrors, probe keys and dictionary-id maps) is released
+  at the end of every task: it no longer keeps the last batch, dictionary and table, nor the arrays a build side or
+  a large aggregate grew it to, into the thread's next task and query. After TPC-DS SF10 on `local[8]` the live
+  `int[]` left over fell from 665 MB to 21 MB (#667).
 - With column statistics, `FactBloomFilter` no longer declines a creation side that is reduced by a filter or a
   join because the key's whole-table distinct count is high: statistics add evidence and never remove that of a
   reduction (TPC-DS q93's returns, reduced by their join to one reason, got no filter with `ANALYZE` statistics).

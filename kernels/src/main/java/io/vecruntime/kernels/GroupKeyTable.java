@@ -38,6 +38,109 @@ public final class GroupKeyTable {
 
     private static final int INITIAL_CAPACITY = 1024;
 
+    /**
+     * Largest per-thread scratch array (elements) that {@link
+     * #releaseThreadScratch} keeps for the thread's next task: enough for any
+     * batch, so batch-sized scratch is still reused, while the arrays a build
+     * side or a large aggregate grew to are dropped.
+     */
+    static final int KEEP_ELEMENTS = 1 << 16;
+
+    /**
+     * Ends the calling thread's use of the per-thread scratch ({@code Bound},
+     * {@code ProbeKeys}, {@code IdScratch}, #667): clears every reference to a
+     * batch, dictionary or table and drops the pooled arrays larger than {@link
+     * #KEEP_ELEMENTS}. The pools only grow while in use -- to the largest build
+     * side or batch the thread has seen -- and a task thread lives across tasks
+     * and queries, so without this a thread kept its largest scratch, and
+     * through {@code IdScratch}'s last table that table's own arrays, after its
+     * query ended (about 0.8 GB live after TPC-DS SF10 on {@code local[8]}).
+     * Called at the end of every task, on the task's thread; safe to call at
+     * any time no table is being assigned or probed on this thread.
+     */
+    public static void releaseThreadScratch() {
+        Bound.release();
+        ProbeKeys.release();
+        IdScratch.release();
+    }
+
+    /**
+     * For tests: the calling thread's scratch as (elements in its largest
+     * pooled array, number of batch / dictionary / table references it holds).
+     */
+    static long[] threadScratchFootprint() {
+        long largest = 0;
+        int refs = 0;
+        Bound b = Bound.SCRATCH.get();
+        largest = Math.max(
+                largest,
+                Math.max(largest(b.intPool),
+                        Math.max(largest(b.longPool), largest(b.wordPool))));
+        refs += nonNull(b.keys)
+                + nonNull(b.data)
+                + nonNull(b.offsets)
+                + nonNull(b.validity)
+                + nonNull(b.ids)
+                + nonNull(b.dictData)
+                + nonNull(b.dictOffsets)
+                + nonNull(b.ints)
+                + nonNull(b.longs)
+                + nonNull(b.validWords);
+        ProbeKeys p = ProbeKeys.SCRATCH.get();
+        largest = Math.max(
+                largest,
+                Math.max(largest(p.ints),
+                        Math.max(largest(p.longs), largest(p.validity))));
+        IdScratch s = IdScratch.SCRATCH.get();
+        largest = Math.max(largest,
+                Math.max(largest(s.ids), largest(s.entryIds)));
+        largest = Math.max(largest, Math.max(s.offs.length, Math.max(s.bytes.length, s.wordScratch.length)));
+        refs += nonNull(s.keys) + nonNull(s.lastDict) + nonNull(s.lastTable);
+        return new long[] {largest, refs};
+    }
+
+    private static long largest(int[][] pool) {
+        long m = 0;
+        for (int[] a : pool) {
+            m = Math.max(m, a == null ? 0 : a.length);
+        }
+        return m;
+    }
+
+    private static long largest(long[][] pool) {
+        long m = 0;
+        for (long[] a : pool) {
+            m = Math.max(m, a == null ? 0 : a.length);
+        }
+        return m;
+    }
+
+    private static int nonNull(Object[] refs) {
+        int n = 0;
+        for (Object o : refs) {
+            if (o != null) {
+                n++;
+            }
+        }
+        return n;
+    }
+
+    private static void trim(int[][] pool) {
+        for (int c = 0; c < pool.length; c++) {
+            if (pool[c] != null && pool[c].length > KEEP_ELEMENTS) {
+                pool[c] = null;
+            }
+        }
+    }
+
+    private static void trim(long[][] pool) {
+        for (int c = 0; c < pool.length; c++) {
+            if (pool[c] != null && pool[c].length > KEEP_ELEMENTS) {
+                pool[c] = null;
+            }
+        }
+    }
+
     private final VecType[] types;
     private int[] slots; // group id or -1
     private int mask;
@@ -368,6 +471,25 @@ public final class GroupKeyTable {
 
         private static final ThreadLocal<Bound> SCRATCH = ThreadLocal.withInitial(Bound::new);
 
+        /** See {@link GroupKeyTable#releaseThreadScratch}. */
+        static void release() {
+            Bound b = SCRATCH.get();
+            Arrays.fill(b.keys, null);
+            Arrays.fill(b.data, null);
+            Arrays.fill(b.offsets, null);
+            Arrays.fill(b.validity, null);
+            Arrays.fill(b.ids, null);
+            Arrays.fill(b.dictData, null);
+            Arrays.fill(b.dictOffsets, null);
+            Arrays.fill(b.ints, null);
+            Arrays.fill(b.longs, null);
+            Arrays.fill(b.validWords, null);
+            b.count = 0;
+            trim(b.intPool);
+            trim(b.longPool);
+            trim(b.wordPool);
+        }
+
         static Bound of(VectorBuffers[] keys, IdScratch idScratch) {
             Bound b = SCRATCH.get();
             int n = keys.length;
@@ -483,6 +605,14 @@ public final class GroupKeyTable {
         long[][] validity = new long[0][];
 
         private static final ThreadLocal<ProbeKeys> SCRATCH = ThreadLocal.withInitial(ProbeKeys::new);
+
+        /** See {@link GroupKeyTable#releaseThreadScratch}. */
+        static void release() {
+            ProbeKeys p = SCRATCH.get();
+            trim(p.ints);
+            trim(p.longs);
+            trim(p.validity);
+        }
 
         static ProbeKeys of(VectorBuffers[] keys, int n, VecType[] types) {
             for (int c = 0; c < keys.length; c++) {
@@ -647,6 +777,36 @@ public final class GroupKeyTable {
         }
 
         private static final ThreadLocal<IdScratch> SCRATCH = ThreadLocal.withInitial(IdScratch::new);
+
+        /**
+         * See {@link GroupKeyTable#releaseThreadScratch}. Forgetting the last
+         * dictionary and table also invalidates the entry maps (toIds rebuilds
+         * them when lastDict / lastTable differ), so a kept map is never reused
+         * against a table it was not made for.
+         */
+        static void release() {
+            IdScratch s = SCRATCH.get();
+            Arrays.fill(s.keys, null);
+            Arrays.fill(s.lastDict, null);
+            Arrays.fill(s.lastTable, null);
+            trim(s.ids);
+            for (int c = 0; c < s.entryIds.length; c++) {
+                if (s.entryIds[c] != null && s.entryIds[c].length > KEEP_ELEMENTS) {
+                    s.entryIds[c] = null;
+                    s.entryGen[c] = null;
+                    s.gen[c] = 0;
+                }
+            }
+            if (s.offs.length > KEEP_ELEMENTS) {
+                s.offs = new int[0];
+            }
+            if (s.bytes.length > KEEP_ELEMENTS) {
+                s.bytes = new byte[0];
+            }
+            if (s.wordScratch.length > KEEP_ELEMENTS) {
+                s.wordScratch = new long[0];
+            }
+        }
 
         static IdScratch get(int k) {
             IdScratch s = SCRATCH.get();
