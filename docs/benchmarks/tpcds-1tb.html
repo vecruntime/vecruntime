@@ -26,15 +26,6 @@ batches with the Java Vector API -- on the JVM, no native code -- and moves batc
 <a href="https://github.com/apache/datafusion-comet">Apache DataFusion Comet</a> offloads the same operators to a native Rust engine. This page
 compares both against plain Apache Spark on the TPC-DS 1 TB workload on Amazon EKS, all three on identical hardware, data and Spark settings.</p>
 
-<div class="tldr"><b>TL;DR.</b> Over the 103 TPC-DS queries at 1 TB, <b>VecRuntime</b> finished in <b>1,415 s</b> against Spark's
-2,963 s -- <b>2.09x</b>, 52% less runtime, faster than Spark on 100 of 103 queries
-(best q49: 5.75x; largest regression q99: 7%).
-<b>Comet</b> finished in 1,964 s -- 1.51x, 34% less, faster on 96 of 103
-(best q68: 2.81x; largest regression q43: 72%).
-Between the two, VecRuntime is faster on 74 of 103 queries and leads on the scan-bound queries and the heavy joins; Comet leads on q95, the heavy aggregates (q4, q11) and q18.
-Every engine returned Spark's results (q65: ties, ordered differently by every engine).
-<b>Comet Native Scan + VecRuntime</b> finished in 1,813 s -- 1.63x, 39% less, faster than Spark on 101 of 103 (best q29: 3.10x; largest regression q2: 26%), and faster than VecRuntime on its own reader on 29 of 103. Same operators and shuffle as VecRuntime, on Comet's Rust Parquet reader.</div>
-
 <div class="cards">
 <div class="card"><div class="l">Apache Spark 4.1.3</div><div class="n">2,963 s</div><div class="l">baseline, 103 queries</div></div>
 <div class="card"><div class="l">VecRuntime</div><div class="n">1,415 s</div><div class="l">2.09x · 52% less runtime</div></div>

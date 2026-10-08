@@ -26,13 +26,6 @@ batches with the Java Vector API -- on the JVM, no native code -- and moves batc
 This page compares it against plain Apache Spark on the TPC-DS 1 TB workload on Amazon EKS with AWS Graviton4 (arm64) nodes, and sets both against
 the <a href="tpcds-1tb.html">published x86 run</a> from the same day, with the same settings and the same single-AZ layout (its own cluster session) (<a href="https://github.com/vecruntime/vecruntime/issues/253">#253</a>).</p>
 
-<div class="tldr"><b>TL;DR.</b> On Graviton4, over the 103 TPC-DS queries at 1 TB, <b>VecRuntime</b> finished in <b>1,893 s</b> against Spark's
-2,470 s -- <b>1.31x</b>, 23% less runtime (geometric mean 1.31x),
-faster than Spark on 96 of 103 queries (best q6: 3.06x; largest regression q92: 103%).
-On the x86 nodes the same comparison is 1.37x (geometric mean 1.31x): the lead carries over to arm64.
-Both engines run faster on Graviton4 than on the m5.4xlarge nodes -- Spark's time is 0.76 of its x86 time and VecRuntime's
-0.76, per query (geometric mean). Row counts equal Spark's on 103 of 103 queries; checksums on every query except q65 (ties in the result, ordered differently by each engine).</div>
-
 <div class="cards">
 <div class="card"><div class="l">Apache Spark 4.1.3 on Graviton4</div><div class="n">2,470 s</div><div class="l">baseline, 103 queries (x86: 3,313 s)</div></div>
 <div class="card"><div class="l">VecRuntime on Graviton4</div><div class="n">1,893 s</div><div class="l">1.31x · 23% less runtime (x86: 2,420 s)</div></div>

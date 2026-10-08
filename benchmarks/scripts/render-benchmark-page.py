@@ -62,16 +62,11 @@ DEFAULT_META = {
     "results_doc": "https://github.com/vecruntime/vecruntime/blob/main/docs/results.md",
     "repo": "https://github.com/vecruntime/vecruntime",
     "run_doc": "https://github.com/vecruntime/vecruntime/blob/main/benchmarks/k8s/README.md",
-    # Appended to "Between the two, VecRuntime is faster on N of M queries": the per-run reading of where each leads.
-    "vector_vs_comet": " and leads on the heavy joins; Comet leads on the scan- and aggregate-bound ones",
-    # The closing sentence of the TL;DR: how the engines' results compare with Spark's in this run.
-    "results_line": "Every engine returned Spark's results (two footnoted exceptions).",
     # Per-query notes in the all-queries table.
     "query_notes": {"q65": "ties", "q64": "Comet: 0 rows (comet#6133)"},
     # The optional fourth engine (--mixed): Comet's native Parquet scan feeding VecRuntime's operators and shuffle.
     "mixed_label": "Comet Native Scan + VecRuntime",
     "mixed_conf": [],
-    "mixed_line": "",
 }
 
 ENGINES = [("spark", "Apache Spark 4.1.3", "#6b7280"), ("vector", "VecRuntime (plugin + Flight shuffle)", "#2563eb"), ("comet", "DataFusion Comet 1.0.0", "#f59e0b")]
@@ -149,7 +144,6 @@ def main():
     shuf = {e: sum(data[e][q].get("shuffleReadBytes", 0) for q in queries) / 1e12 for e, _, _ in all_engines}
     exe = {e: sum(data[e][q].get("executorRunTimeMs", 0) for q in queries) / 3.6e6 for e, _, _ in all_engines}
     faster = {e: sum(1 for q in queries if data[e][q]["medianMs"] < data["spark"][q]["medianMs"]) for e, _, _ in all_engines if e != "spark"}
-    v_lt_c = sum(1 for q in queries if data["vector"][q]["medianMs"] < data["comet"][q]["medianMs"])
     S, V, C = data["spark"], data["vector"], data["comet"]
 
     def speed(e, q):
@@ -165,8 +159,6 @@ def main():
 
     dist_v, dist_c = distribution(S, V, queries), distribution(S, C, queries)
     n = len(queries)
-    best_v = max(queries, key=lambda q: speed("vector", q)); worst_v = min(queries, key=lambda q: speed("vector", q))
-    best_c = max(queries, key=lambda q: speed("comet", q)); worst_c = min(queries, key=lambda q: speed("comet", q))
 
     chart_data = {
         "queries": queries,
@@ -195,15 +187,9 @@ def main():
         ("Dataset", meta["dataset"]), ("Cluster", meta["cluster"]), ("Executors", meta["executors"]), ("Storage", meta["storage"])], "kv")
     conf_common = "\n".join(meta["common_conf"]); conf_v = "\n".join(meta["vector_conf"]); conf_c = "\n".join(meta["comet_conf"])
     notes = "".join(f"<li>{html.escape(x)}</li>" for x in meta["notes"])
-    mx = {k: "" for k in ("tldr", "card", "row", "conf", "dist", "top", "cols")}
+    mx = {k: "" for k in ("card", "row", "conf", "dist", "top", "cols")}
     if a.mixed:
         e = "mixed"
-        best_m = max(queries, key=lambda q: speed(e, q)); worst_m = min(queries, key=lambda q: speed(e, q))
-        m_lt_v = sum(1 for q in queries if data[e][q]["medianMs"] < V[q]["medianMs"])
-        mixed_vs_vector = html.escape(meta.get("mixed_vs_vector", "VecRuntime on Spark's reader"), quote=False)
-        mx["tldr"] = (f"\n<b>{html.escape(mixed_label)}</b> finished in {tot[e]:,.0f} s -- {tot['spark'] / tot[e]:.2f}x, {100 - 100 * tot[e] / tot['spark']:.0f}% less, faster than Spark on {faster[e]} of {n}"
-                      f" (best {best_m}: {speed(e, best_m):.2f}x; largest regression {worst_m}: {100 / speed(e, worst_m) - 100:.0f}%), and faster than {mixed_vs_vector} on {m_lt_v} of {n}."
-                      + (f" {html.escape(meta['mixed_line'], quote=False)}" if meta["mixed_line"] else ""))
         mx["card"] = f'\n<div class="card"><div class="l">{html.escape(mixed_label)}</div><div class="n">{tot[e]:,.0f} s</div><div class="l">{tot["spark"] / tot[e]:.2f}x · {100 - 100 * tot[e] / tot["spark"]:.0f}% less runtime</div></div>'
         mx["row"] = [(html.escape(mixed_label), f"{tot[e]:,.1f}", f"<b>{tot['spark'] / tot[e]:.2f}x</b> ({100 - 100 * tot[e] / tot['spark']:.0f}% less)", f"{faster[e]} / {n}", f"{exe[e]:.1f}", f"{gc[e]:.2f}", f"{shuf[e]:.2f}")]
         mx["conf"] = f'\n<p>{html.escape(mixed_label)}:</p><pre>{html.escape(chr(10).join(meta["mixed_conf"]))}</pre>'
@@ -255,14 +241,6 @@ title: {json.dumps(meta["title"])}
 batches with the Java Vector API -- on the JVM, no native code -- and moves batches between executors over its own Arrow Flight shuffle.
 <a href="https://github.com/apache/datafusion-comet">Apache DataFusion Comet</a> offloads the same operators to a native Rust engine. This page
 compares both against plain Apache Spark on the TPC-DS 1 TB workload on Amazon EKS, all three on identical hardware, data and Spark settings.</p>
-
-<div class="tldr"><b>TL;DR.</b> Over the 103 TPC-DS queries at 1 TB, <b>VecRuntime</b> finished in <b>{tot["vector"]:,.0f} s</b> against Spark's
-{tot["spark"]:,.0f} s -- <b>{tot["spark"] / tot["vector"]:.2f}x</b>, {100 - 100 * tot["vector"] / tot["spark"]:.0f}% less runtime, faster than Spark on {faster["vector"]} of {n} queries
-(best {best_v}: {speed("vector", best_v):.2f}x; largest regression {worst_v}: {100 / speed("vector", worst_v) - 100:.0f}%).
-<b>Comet</b> finished in {tot["comet"]:,.0f} s -- {tot["spark"] / tot["comet"]:.2f}x, {100 - 100 * tot["comet"] / tot["spark"]:.0f}% less, faster on {faster["comet"]} of {n}
-(best {best_c}: {speed("comet", best_c):.2f}x; largest regression {worst_c}: {100 / speed("comet", worst_c) - 100:.0f}%).
-Between the two, VecRuntime is faster on {v_lt_c} of {n} queries{html.escape(meta["vector_vs_comet"])}.
-{html.escape(meta["results_line"], quote=False)}{mx["tldr"]}</div>
 
 <div class="cards">
 <div class="card"><div class="l">Apache Spark 4.1.3</div><div class="n">{tot["spark"]:,.0f} s</div><div class="l">baseline, 103 queries</div></div>
