@@ -181,20 +181,77 @@ final case class BloomProbeExpr(filter: SubqueryLiteralExpr, hash: VectorExpr, p
     // made false, whose result the AND discards. The probe is a hash and a random bit read per row (13.9%
     // of q24a's executor CPU at 1 TB, #635), so skipping those rows is the saving.
     val active = ctx.active
+    if (ps != null) {
+      BloomProbeExpr.probePartitioned(ps, h, active, n, bits)
+      return SegmentVectorBuffers.fixedWidth(VecType.BOOL, n, h.validity(), bits)
+    }
     var i = 0
     while (i < n) {
       if ((active == null || Bitmap.isSet(active, i)) && (h.validity() == null || Bitmap.isSet(h.validity(), i))) {
-        val v = h.data().getAtIndex(VectorBuffers.LE_LONG, i)
-        val hit =
-          if (ps == null) b.mightContainLong(v)
-          else {
-            val f = ps(Math.floorMod(v, ps.length.toLong).toInt)
-            f != null && org.apache.spark.sql.vecruntime.BlockedBloomFilter.mightContain(f, v)
-          }
-        Bitmap.setTo(bits, i, hit)
+        Bitmap.setTo(bits, i, b.mightContainLong(h.data().getAtIndex(VectorBuffers.LE_LONG, i)))
       }
       i += 1
     }
     SegmentVectorBuffers.fixedWidth(VecType.BOOL, n, h.validity(), bits)
+  }
+}
+
+object BloomProbeExpr {
+
+  /** Per-thread batch buffers of the partitioned probe, grown to the largest batch seen. */
+  private final class Scratch {
+    var hashes: Array[Long] = new Array[Long](0)
+    var xs: Array[Long] = new Array[Long](0)
+    var rows: Array[Int] = new Array[Int](0)
+    var out: Array[Long] = new Array[Long](0)
+    def ensure(n: Int): Scratch = {
+      if (hashes.length < n) {
+        hashes = new Array[Long](n); xs = new Array[Long](n); rows = new Array[Int](n)
+        out = new Array[Long]((n + 63) >>> 6)
+      }
+      this
+    }
+  }
+
+  private val scratch = ThreadLocal.withInitial[Scratch](() => new Scratch)
+
+  /**
+   * The partitioned filter's probe as one batch (#664): the probed rows' hashes copied out, then
+   * `BloomKernels.probe` -- a vector remix and one 256-bit block test per key, no branch per key -- and the result
+   * bits written back. With every row probed (no inactive or null row) the hashes are one bulk copy and the result
+   * whole bitmap words; otherwise only the probed rows are compacted and their bits scattered.
+   */
+  private[expr] def probePartitioned(
+      ps: Array[Array[Int]],
+      h: VectorBuffers,
+      active: java.lang.foreign.MemorySegment,
+      n: Int,
+      bits: java.lang.foreign.MemorySegment
+  ): Unit = {
+    val s = scratch.get().ensure(n)
+    val valid = h.validity()
+    if (active == null && valid == null) {
+      java.lang.foreign.MemorySegment.copy(h.data(), VectorBuffers.LE_LONG, 0L, s.hashes, 0, n)
+      io.vecruntime.kernels.BloomKernels.probe(ps, s.hashes, n, s.out, s.xs)
+      var w = 0
+      while (w < Bitmap.wordsFor(n)) { Bitmap.setWord(bits, w, n, s.out(w)); w += 1 }
+    } else {
+      var m = 0
+      var i = 0
+      while (i < n) {
+        if ((active == null || Bitmap.isSet(active, i)) && (valid == null || Bitmap.isSet(valid, i))) {
+          s.rows(m) = i
+          s.hashes(m) = h.data().getAtIndex(VectorBuffers.LE_LONG, i)
+          m += 1
+        }
+        i += 1
+      }
+      io.vecruntime.kernels.BloomKernels.probe(ps, s.hashes, m, s.out, s.xs)
+      var k = 0
+      while (k < m) {
+        if ((s.out(k >>> 6) & (1L << (k & 63))) != 0) Bitmap.set(bits, s.rows(k))
+        k += 1
+      }
+    }
   }
 }
