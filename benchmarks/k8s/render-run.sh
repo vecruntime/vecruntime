@@ -14,6 +14,7 @@
 # Environment (defaults for the sfi-iceberg-bench cluster's bench-xl group, m5.4xlarge):
 #   NAMESPACE (bench) SERVICE_ACCOUNT (sfi-engine) SUITE (tpcds | tpch)
 #   EXECUTORS (8) EXEC_CORES (14) EXEC_MEM (40g) EXEC_OVERHEAD (10g) DRIVER_CORES (2) DRIVER_MEM (8g)
+#   DRIVER_OVERHEAD (1g) DRIVER_MALLOC_ARENA_MAX (2; empty = glibc's default) EXEC_MALLOC_ARENA_MAX (unset)
 #   NODE_SELECTOR (workload=spark-xl; empty for none) OFFHEAP (32g, the comet configurations)
 #   EXEC_JAVA_OPTS (extra executor JVM options, e.g. a JFR recording: -XX:StartFlightRecording=duration=300s,filename=/tmp/exec.jfr,settings=profile)
 #   KEEP_EXECUTORS (unset; set to 1 to keep dead executor pods for their logs)
@@ -35,6 +36,9 @@ CONFIG="${1:?config}"; TABLES="${2:?tables}"; DATASET="${3:?dataset}"; OUT="${4:
 NAMESPACE="${NAMESPACE:-bench}"; SERVICE_ACCOUNT="${SERVICE_ACCOUNT:-sfi-engine}"; SUITE="${SUITE:-tpcds}"
 EXECUTORS="${EXECUTORS:-8}"; EXEC_CORES="${EXEC_CORES:-14}"; EXEC_MEM="${EXEC_MEM:-40g}"; EXEC_OVERHEAD="${EXEC_OVERHEAD:-10g}"
 DRIVER_CORES="${DRIVER_CORES:-2}"; DRIVER_MEM="${DRIVER_MEM:-8g}"; NODE_SELECTOR="${NODE_SELECTOR-workload=spark-xl}"
+# The driver container's room outside its heap (Spark's default is 10%, at least 384 MiB): the broadcast
+# collection's Arrow buffers, the native libraries' malloc and the JVM's own off-heap live there.
+DRIVER_OVERHEAD="${DRIVER_OVERHEAD:-1g}"
 MAIN=io.vecruntime.benchmarks.TpcdsRunner; [ "$SUITE" = tpch ] && MAIN=io.vecruntime.benchmarks.TpchRunner
 DIRECT_MEM="${DIRECT_MEM:-$(( ${EXEC_OVERHEAD%g} - 2 ))g}"
 
@@ -98,6 +102,20 @@ cat <<EOF
     # a GC: over a 100-query run with the default 30 min the files of finished queries filled a node's 20 GB
     # root disk and the kubelet evicted the executor (SF100 v4: q95-q99 lost to disk pressure).
     spark.cleaner.periodicGC.interval: "2min"
+    # The driver's native memory: with one glibc malloc arena per thread (up to 8 per CPU of the node) the
+    # driver's ~300 threads keep tens of 15-64 MB arenas at their peak after free(), outside the JVM's own
+    # accounting. On the 1 TB pass with ANALYZE statistics that was ~1.5 GB over the heap and the 4 GiB
+    # driver was OOM-killed at q48 (exit 137); with two arenas the same pass completed with the container
+    # 1-1.7 GB lower. DRIVER_MALLOC_ARENA_MAX (2; empty for glibc's default). Executors keep glibc's default
+    # unless EXEC_MALLOC_ARENA_MAX is set: their 13 task threads allocate natively in parallel.
+EOF
+if [ -n "${DRIVER_MALLOC_ARENA_MAX-2}" ]; then
+  echo "    spark.kubernetes.driverEnv.MALLOC_ARENA_MAX: \"${DRIVER_MALLOC_ARENA_MAX-2}\""
+fi
+if [ -n "${EXEC_MALLOC_ARENA_MAX:-}" ]; then
+  echo "    spark.executorEnv.MALLOC_ARENA_MAX: \"$EXEC_MALLOC_ARENA_MAX\""
+fi
+cat <<EOF
     # Arrow's Netty allocator is bounded by the JVM's direct-memory limit, which defaults to the heap size:
     # give it the overhead instead (DIRECT_MEM; default EXEC_OVERHEAD less 2g), or our kernels' and the
     # shuffle's buffers hit a 20 GiB wall inside a 50 GiB container.
@@ -153,6 +171,7 @@ cat <<EOF
   driver:
     cores: $DRIVER_CORES
     memory: "$DRIVER_MEM"
+    memoryOverhead: "$DRIVER_OVERHEAD"
     serviceAccount: $SERVICE_ACCOUNT
     labels:
       app: vecruntime-bench
