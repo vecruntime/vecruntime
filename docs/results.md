@@ -2910,10 +2910,42 @@ The x86 page (`docs/benchmarks/tpcds-1tb.html`) now shows this run.
   - **What it means for #559:** Spark's Parquet reader accounts for the scan-bound gap to Comet. A faster reader of our own would recover it without the native crossing's fixed cost.
 - **Against the earlier x86 run:** that run used a 128m advisory size and `minPartitionNum=208`, with Comet 1.0.0 failing q64. It measured Spark 3,309 s, ours 2,557 s (1.29x) and Comet 2,514 s.
 
-## x86 TPC-DS 1 TB with no locality wait, four engines in one session (2026-10-03)
+## x86 TPC-DS 1 TB, Spark and VecRuntime in one session, Comet from 2026-10-03 (2026-10-08)
 
-The x86 page (`docs/benchmarks/tpcds-1tb.html`) now shows this run. The result files and the page's
-metadata are in `benchmarks/results/tpcds-sf1000-2026-10-03/`.
+The x86 page (`docs/benchmarks/tpcds-1tb.html`) now shows this run, without the Comet Native Scan +
+VecRuntime column. The result files and the page's metadata are in `benchmarks/results/tpcds-sf1000-2026-10-08/`.
+
+**Setup:** as on 2026-10-03 (below), with these changes:
+- **Code:** main at `6bef04d`, image `d565-main-6bef04d`: `FactBloomFilter` on by default with run-time
+  evidence and transitive reduction (#659), its vectorised probe (#664). No table statistics.
+- **Spark and VecRuntime:** `spark.sql.adaptive.maxShuffledHashJoinLocalMapThreshold=64MB` (EMR's setting),
+  both 30 GB heap / 20 GB overhead, node group in us-east-1b.
+- **Comet:** its 1.0.0 leg of the 2026-10-03 session. A Comet leg in this session was stopped after 13
+  queries; on those it took 321 s against 221 s on 2026-10-03.
+
+**Totals:**
+
+| engine | total (s) | vs Spark | geomean | faster than Spark on | executor time (h) | GC (h) | shuffle read (TB) |
+|---|---|---|---|---|---|---|---|
+| Spark 4.1.3 | 3,131.6 | baseline | -- | -- | 79.4 | 0.42 | 0.94 |
+| VecRuntime (own reader) | 1,201.7 | 2.61x | 2.21x | 101 | 27.5 | 0.55 | 0.43 |
+| Comet 1.0.0 (2026-10-03) | 1,964.1 | 1.59x | 1.58x | 99 | 48.8 | 0.02 | 0.43 |
+
+- **Correctness:** every engine returned Spark's row counts on all 103 queries and Spark's checksums on all
+  but q65 (ties).
+- **Fastest engine per query:** VecRuntime 71, Comet 32, Spark 0. VecRuntime against Comet: 1.63x in total.
+- **Against 2026-10-03:** VecRuntime 1,414.8 -> 1,201.7 s (-15%); q93 41.6 -> 16.9 s, q95 81.9 -> 10.5 s,
+  q88 35.1 -> 5.4 s. VecRuntime's total was 1,212.9 s in a second run that day.
+- **Spark is slower than on 2026-10-03** (2,963.4 -> 3,131.6 s, +5.7%), two causes:
+  - The 64 MB threshold turns sort-merge joins into shuffled hash joins: q23b, q93, q23a, q64, q50 and q5
+    gain 165 s, q95 (its `web_sales` self-join, task CPU 6,247 -> 12,328 s), q94 and q72 lose 106 s.
+  - Its scan-bound queries (q88, q9, q28, q76, q80, q90, q96, q82, q85, q84) spent the same CPU time but
+    40-80% longer per task, +140 s: off-CPU task time over the suite 120k -> 160k s, consistent with S3
+    reads stalling (a 5 s DNS timeout amplified by the Analytics Accelerator's `BlobStore` cleanup lock was
+    found in a VecRuntime executor profile the same day; not profiled in Spark).
+- **Ours slower than Spark:** q49 (45.3 -> 59.4 s, the bloom filter's build wait, #660) and q18 (5.9 -> 6.2 s).
+
+## x86 TPC-DS 1 TB with no locality wait, four engines in one session (2026-10-03)
 
 **Setup:** as on 2026-10-02 (below), with these changes:
 - **Code:** main at `77283b2`, image `main-77283b2`. The native Parquet scan is the default (#609), our
