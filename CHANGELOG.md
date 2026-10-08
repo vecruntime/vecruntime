@@ -19,6 +19,10 @@ version may change configuration keys or defaults, always noted here.
   `FactBloomFilter` is on by default again, with run-time evidence (#659).
 - `FactBloomFilter`'s partitioned filters use split-block sub-filters (one cache line read per probe) instead of
   Spark's `BloomFilterImpl`, whose scattered reads made q93's 2.9G-row probe cost more than it saved (#659).
+- The partitioned bloom filter's probe is vectorised and batched (`BloomKernels.probe`, #664): the hashes are
+  remixed with 512-bit long vectors and each block is tested in one 256-bit op, with no branch per key. In JMH on
+  an AVX-512 host it is 2.7 to 4 times the per-key probe. On Graviton 4 (128-bit NEON/SVE) each block is tested as
+  two 128-bit halves, 1.5 to 2.2 times the per-key probe; without vectors it falls back to branch-free scalar code.
 - `COALESCE(c, <boolean literal>)` over a boolean `c` evaluates `c` once; the general path evaluated each operand
   twice, which doubled the cost of `FactBloomFilter`'s probe `coalesce(might_contain(...), true)` (#659).
 - `FactBloomFilter`'s partitioned filters have a power-of-two number of sub-filters, so the probe picks one with a

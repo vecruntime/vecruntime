@@ -17,6 +17,7 @@ package org.apache.spark.sql.vecruntime
 
 import java.nio.{ByteBuffer, ByteOrder}
 
+import io.vecruntime.kernels.BloomKernels
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.analysis.TypeCheckResult
 import org.apache.spark.sql.catalyst.expressions.Expression
@@ -36,49 +37,14 @@ import org.apache.spark.sql.types.{BinaryType, DataType, LongType}
  */
 object BlockedBloomFilter {
   private val Magic = 0x53424246 // "SBBF"
-  private val Salts =
-    Array(0x47b6137b, 0x44974d91, 0x8824ad5b, 0xa2b7289d, 0x705495c7, 0x2df1424b, 0x9efc4947, 0x5c6bfb31)
 
   /** The words of an empty filter of at least `bits` bits (whole 256-bit blocks, at least one). */
-  def create(bits: Long): Array[Int] = {
-    val blocks = math.max(1L, math.min((bits + 255) / 256, Int.MaxValue / 8L)).toInt
-    new Array[Int](blocks * 8)
-  }
+  def create(bits: Long): Array[Int] = BloomKernels.create(bits)
 
-  /** MurmurHash3's 64-bit finalizer: every output bit depends on every input bit. */
-  @inline private def mix(h: Long): Long = {
-    var x = h
-    x ^= x >>> 33; x *= 0xff51afd7ed558ccdL
-    x ^= x >>> 33; x *= 0xc4ceb9fe1a85ec53L
-    x ^ (x >>> 33)
-  }
+  // The layout and hashing are defined once, in the kernel (#664), so the vectorised probe and these agree.
+  def put(words: Array[Int], h: Long): Unit = BloomKernels.put(words, h)
 
-  /** The first word of the key's block: the upper 32 bits of the mixed hash, ranged onto the blocks. */
-  @inline private def blockBase(words: Array[Int], x: Long): Int =
-    ((((x >>> 32) * (words.length >>> 3).toLong) >>> 32).toInt) << 3
-
-  def put(words: Array[Int], h: Long): Unit = {
-    val x = mix(h)
-    val base = blockBase(words, x)
-    val key = x.toInt
-    var i = 0
-    while (i < 8) {
-      words(base + i) |= 1 << ((key * Salts(i)) >>> 27)
-      i += 1
-    }
-  }
-
-  def mightContain(words: Array[Int], h: Long): Boolean = {
-    val x = mix(h)
-    val base = blockBase(words, x)
-    val key = x.toInt
-    var i = 0
-    while (i < 8) {
-      if ((words(base + i) & (1 << ((key * Salts(i)) >>> 27))) == 0) return false
-      i += 1
-    }
-    true
-  }
+  def mightContain(words: Array[Int], h: Long): Boolean = BloomKernels.mightContain(words, h)
 
   /** ORs `other` into `into`; both have the same number of words (the same aggregate literals). */
   def merge(into: Array[Int], other: Array[Int]): Unit = {
