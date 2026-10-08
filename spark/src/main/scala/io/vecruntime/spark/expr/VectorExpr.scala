@@ -377,6 +377,29 @@ final case class IsNotNullExpr(child: VectorExpr) extends VectorExpr {
   }
 }
 
+/**
+ * `COALESCE(c, <boolean literal>)` for a boolean `c`: `c` evaluated ONCE, its null rows replaced by
+ * the literal. The general COALESCE path ([[CaseWhenExpr]]) evaluates an operand twice -- once for
+ * its `IS NOT NULL` test, once for its value -- which doubled the cost of FactBloomFilter's probe
+ * `coalesce(might_contain(f, h), true)` (hash and filter lookup per row, twice).
+ */
+final case class BoolNullFillExpr(child: VectorExpr, fill: Boolean) extends VectorExpr {
+  override def dataType: DataType = BooleanType
+  override def children: Seq[VectorExpr] = Seq(child)
+  override def eval(ctx: EvalContext): VectorBuffers = {
+    val a = child.eval(ctx)
+    if (a.validity() == null) a
+    else {
+      val n = ctx.numRows
+      val bits = ctx.bitmap()
+      // fill true: data | ~validity == ~(validity & ~data); fill false: data & validity
+      if (fill) { BitmapKernels.andNot(a.validity(), a.data(), bits, n); BitmapKernels.not(bits, bits, n) }
+      else BitmapKernels.and(a.data(), a.validity(), bits, n)
+      SegmentVectorBuffers.fixedWidth(VecType.BOOL, n, null, bits)
+    }
+  }
+}
+
 private[expr] object LogicalExprs {
 
   /**
