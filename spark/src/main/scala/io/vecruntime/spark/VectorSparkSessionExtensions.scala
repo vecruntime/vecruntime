@@ -43,6 +43,8 @@ class VectorSparkSessionExtensions extends (SparkSessionExtensions => Unit) {
     // FactBloomFilter's build over the join's own creation-side exchange (#659).
     extensions.injectPlannerStrategy(_ => org.apache.spark.sql.vecruntime.BloomCreationRefStrategy)
     extensions.injectQueryStagePrepRule(session => org.apache.spark.sql.vecruntime.ShareBloomCreationExchange(session))
+    // Adaptive re-optimisation, once a broadcast stage is built: grouping keys its unique key determines (#635).
+    extensions.injectRuntimeOptimizerRule(session => org.apache.spark.sql.vecruntime.RemoveRedundantGroupKeys(session))
     // Last optimizer batch ("User Provided Optimizers"), after Spark's final filter push-down, which
     // would move its pulled-up predicates back (#632). Extensions cannot inject there; the analyzer
     // runs before the first optimization, so a post-hoc resolution rule registers it once per session.

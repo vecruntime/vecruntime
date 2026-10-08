@@ -486,3 +486,25 @@ rows, and declines without statistics. Measured at 1 TB without that check, the 
 34-104 % slower: their `(customer_sk, sold_date_sk)` keys barely reduce the fact rows, so the pre-aggregate only
 added a stage and a shuffle (q23b, whose keys do reduce, was 20 % faster).
 
+
+## `RemoveRedundantGroupKeys`: grouping keys a unique broadcast key determines (#635)
+
+An adaptive (runtime) optimizer rule, the counterpart of EMR's `AQERemoveRedundantGroupKeys`. It runs when AQE
+re-optimises after a query stage finished, so a broadcast stage below an aggregate is already built and its keys
+can be checked on the data it actually holds.
+
+When a broadcast build side's join key `b` holds every value at most once, each joined row carries exactly one
+build row, so every build-side column is a function of `b` -- and, in an inner join, of the stream key equal to
+`b`. An aggregate that groups by `b` (or that stream key) and also by build-side columns forms the same groups
+without them: they are dropped from the grouping keys, and an output that still needs one reads it with
+`first()`. TPC-DS q23a/b's `frequent_ss_items` groups by `substr(i_item_desc, 1, 30), i_item_sk, d_date` over a
+join with `item` broadcast on `i_item_sk`; the rule leaves `(i_item_sk, d_date)`, which removes the 30-character
+string from the partial aggregate's hash table and from its shuffle. At SF10 that is 58 % fewer shuffle bytes
+over q23a, q23b, q39a and q39b, and q23a/q23b 26-30 % faster, with identical results.
+
+Nothing is assumed about the data. The broadcast relation sorts a copy of its key column once, on the driver,
+and reports uniqueness only for a single integral key (int, long, short, byte, date) on at most 16M rows; a key
+that repeats, a composite key, or a broadcast Spark planned itself leaves the plan unchanged. The dependency is
+carried through projections, filters and joins (the build side of an outer join is null-extended as a whole, so
+its columns stay functions of its key), not through aggregates, unions or windows. Off with
+`spark.vecruntime.optimizer.removeRedundantGroupKeys.enabled=false`.

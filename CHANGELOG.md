@@ -8,6 +8,11 @@ version may change configuration keys or defaults, always noted here.
 
 ### Added
 
+- Redundant grouping keys removed at run time (`spark.vecruntime.optimizer.removeRedundantGroupKeys.enabled`, on):
+  when a built broadcast's single integral join key turns out unique and is grouped by (or its equal stream key
+  is), the aggregate stops grouping by the broadcast side's other columns -- q23a/b's `substr(i_item_desc, 1, 30)`
+  key (#635, EMR's `AQERemoveRedundantGroupKeys`).
+
 - `FactBloomFilter` run-time evidence (`spark.vecruntime.optimizer.factBloomFilter.runtimeEvidence`, on): the
   filter's build counts the creation side's actual rows and declines -- a null filter that keeps every row --
   when they are not `sizeRatio` times fewer than the application side's (#659).
