@@ -19,6 +19,8 @@ version may change configuration keys or defaults, always noted here.
   `FactBloomFilter` is on by default again, with run-time evidence (#659).
 - `FactBloomFilter`'s partitioned filters use split-block sub-filters (one cache line read per probe) instead of
   Spark's `BloomFilterImpl`, whose scattered reads made q93's 2.9G-row probe cost more than it saved (#659).
+- `COALESCE(c, <boolean literal>)` over a boolean `c` evaluates `c` once; the general path evaluated each operand
+  twice, which doubled the cost of `FactBloomFilter`'s probe `coalesce(might_contain(...), true)` (#659).
 - `FactBloomFilter`'s partitioned filters have a power-of-two number of sub-filters, so the probe picks one with a
   mask instead of a long division per row (`floorMod` was 9.6 % of q93's executor CPU at 1 TB, #659).
 - A logical rewrite that computes a substring or length of a join's smaller side below the join
