@@ -23,6 +23,10 @@ version may change configuration keys or defaults, always noted here.
   remixed with 512-bit long vectors and each block is tested in one 256-bit op, with no branch per key. In JMH on
   an AVX-512 host it is 2.7 to 4 times the per-key probe; without 256-bit vectors it falls back to branch-free
   scalar code.
+- `COALESCE(c, <boolean literal>)` over a boolean `c` evaluates `c` once; the general path evaluated each operand
+  twice, which doubled the cost of `FactBloomFilter`'s probe `coalesce(might_contain(...), true)` (#659).
+- `FactBloomFilter`'s partitioned filters have a power-of-two number of sub-filters, so the probe picks one with a
+  mask instead of a long division per row (`floorMod` was 9.6 % of q93's executor CPU at 1 TB, #659).
 - A logical rewrite that computes a substring or length of a join's smaller side below the join
   (`spark.vecruntime.optimizer.narrowBelowJoin.enabled`, on by default): the join carries the short result instead
   of the whole string. TPC-DS q23a's `substr(i_item_desc, 1, 30)` was computed on ~1.66G joined rows at 1 TB, each

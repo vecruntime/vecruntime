@@ -346,7 +346,9 @@ partitioned: `h = xxhash64(key)` is repartitioned by `b = pmod(h, B)`, one `bloo
 that shuffle (its distribution is already satisfied, so there is no per-map-task partial), and
 `partitioned_bloom_filter` packs the `B` sub-filters into one value. The probe `might_contain_partitioned` tests
 sub-filter `pmod(h, B)`; a key the creation side has always lands in its bucket, so there is no false negative.
-`B = ceil(keys / (maxNumItems / 2))`, 8 bits a key, fewer down to 4 to stay within `maxTotalBits` (512M bits); a
+`B = ceil(keys / (maxNumItems / 2))` rounded up to a power of two, so the vectorised probe picks the sub-filter as
+`h & (B - 1)` (equal to `pmod(h, B)`) instead of a long division per row (#659); 8 bits a key, fewer down to 4 to
+stay within `maxTotalBits` (512M bits); a
 filter that would need more is declined. The probe is vectorised and its sub-filters are deserialised once per
 executor (`BloomFilterCache`). EMR Serverless sizes its own filters the same way (q93: `GenerateBloomFilter` for ~110M
 rows on `store_returns`' keys, shuffle 2.8 GB against our 41.8 GB).
