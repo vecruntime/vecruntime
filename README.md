@@ -27,27 +27,29 @@ In essence, **VecRuntime brings a DataFusion-Comet/Velox-style vectorized execut
 Version 0.0.6, a preview release under the Apache License 2.0 (see `LICENSE` and `NOTICE`). The
 plugin runs the whole of TPC-DS (103 queries) and TPC-H (22) with every operator accelerated and
 returns Spark's results; what it does not convert falls back to Spark, always with a recorded reason.
-Measured on the 1 TB TPC-DS Parquet dataset on EKS, eight 13-core executors with 50 GB each, all
-four engines back to back in one cluster session in one availability zone (2026-10-03), all queries
-once, the median of the measured iteration
+Measured on the 1 TB TPC-DS Parquet dataset on EKS, eight 13-core executors with 50 GB each, no table
+statistics, all queries once, the median of the measured iteration; Spark and VecRuntime back to back in
+one cluster session in one availability zone (2026-10-08), Comet 1.0.0 from the 2026-10-03 session on the
+same node type
 (`docs/results.md` has the per-query tables, the configurations and every study behind them):
 
 | engine | total, 103 queries | faster than Spark on | notes |
 |---|---:|---:|---|
-| Spark 4.1.3 | 2963 s | -- | 20 GB heap / 30 GB overhead; the reference |
-| Apache DataFusion Comet 1.0.0 | 1964 s | 96 | native scan, operators and shuffle |
-| Comet Native Scan + VecRuntime (Comet's native Parquet reader, our operators and shuffle) | 1813 s | 101 | the same operators as the row below, on Comet's reader |
-| **VecRuntime** (our Parquet reader, our operators, our Flight shuffle) | **1415 s** | **100** | 30 GB heap / 20 GB overhead; our Parquet reader is the default (#609); 2.09x Spark, 1.39x Comet |
+| Spark 4.1.3 | 3132 s | -- | 30 GB heap / 20 GB overhead; the reference |
+| Apache DataFusion Comet 1.0.0 | 1964 s | 99 | native scan, operators and shuffle; 2026-10-03 session |
+| **VecRuntime** (our Parquet reader, our operators, our Flight shuffle) | **1202 s** | **101** | 30 GB heap / 20 GB overhead; 2.61x Spark, 1.63x Comet |
 
 Every leg ran with the launcher's defaults: ACCP, the S3A read settings (#566), compact object
-headers (#578) and, since #608, no locality wait (`spark.locality.wait=0` for every engine). On its own
-Parquet reader (#559) the plugin leads the scan-bound queries (q88 35 s against Spark's 94 and Comet's 83;
-q9 32 against 77 and 52; q28 61 against 97 and 69) and the joins (q23b 92 against 274 and 133; q64 25
-against 89 and 55). Comet leads on q95, the heavy aggregates (q4 51 against our 62, q11 29 against 34),
-q65 and q18; against Spark the plugin is slower on q99 (9.0 against 8.4 s, #603), q96 and q12, each in
-`docs/results.md`. Every checksum equals Spark's except q65, whose result has ties that every engine
-orders differently. The 2026-10-02 run, with Spark's 3 s locality wait, measured Spark 3099 s and the
-plugin 1542 s; with Spark's own Parquet reader the 2026-09-30 run measured 2420 s, 1.37x Spark.
+headers (#578) and no locality wait (`spark.locality.wait=0`, #608); Spark and VecRuntime also with EMR's
+`spark.sql.adaptive.maxShuffledHashJoinLocalMapThreshold=64MB`. On its own Parquet reader (#559) the plugin
+leads the scan-bound queries (q88 5 s against Spark's 153 and Comet's 83; q9 15 against 104 and 52; q28 28
+against 120 and 69) and the joins (q95 11 against 180 and 55; q23b 86 against 221 and 133; q93 17 against 86
+and 77). Comet leads on q49 (38 s against our 59, the bloom filter's build wait, #660), q4 (51 against 55),
+q65, q44 and q18; against Spark the plugin is slower on q49 and q18 (6.2 against 5.9 s). Every checksum
+equals Spark's except q65, whose result has ties that every engine orders differently. Spark's total is
+higher than the 2026-10-03 session's 2963 s: its scan-bound queries waited longer on S3 at the same CPU
+time that day (q88 94 -> 153 s), while the plugin was stable within 1% across two runs; against the
+2026-10-03 Spark the plugin is 2.47x.
 
 The same comparison as a page with per-query charts: [Apache Spark vs VecRuntime vs DataFusion Comet on
 TPC-DS 1 TB](https://vecruntime.github.io/vecruntime/benchmarks/tpcds-1tb.html) (rendered from the result

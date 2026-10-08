@@ -1,0 +1,66 @@
+{
+  "title": "Apache Spark vs VecRuntime vs DataFusion Comet on TPC-DS 1 TB",
+  "dataset": "TPC-DS scale factor 1000 (1 TB), Parquet on Amazon S3 (103 query variants, one measured iteration each, no warm-up), no table statistics",
+  "cluster": "Amazon EKS 1.36; 9 x m5.4xlarge (16 vCPU, 64 GB, x86-64 with AVX-512); one node group in one availability zone (us-east-1b for Spark and VecRuntime on 2026-10-08, us-east-1a for Comet on 2026-10-03), the driver on the ninth node",
+  "executors": "8 executors x 13 cores x 50 GB each (Spark and VecRuntime: 30 GB heap / 20 GB overhead; Comet: 20 GB heap / 8 GB overhead / 22 GB off-heap); driver 2 cores x 4 GB",
+  "storage": "Amazon S3 through an S3 gateway VPC endpoint, Hadoop 3.4.3 S3A with the Analytics Accelerator input stream (the default in 3.4.3); fs.s3a.connection.maximum=1000, threads.max=256, max.total.tasks=128, Analytics Accelerator physicalio.thread.pool.size=192 for every engine (#566)",
+  "versions": {
+    "Spark": "4.1.3",
+    "Scala": "2.13",
+    "JDK": "Amazon Corretto 25, -XX:+UseCompactObjectHeaders and Amazon Corretto Crypto Provider on driver and executors (#578, #566)",
+    "VecRuntime": "main at 6bef04d (FactBloomFilter on by default with run-time evidence and transitive reduction #659, vectorised bloom probe #664)",
+    "Comet": "1.0.0",
+    "Hadoop": "3.4.3"
+  },
+  "common_conf": [
+    "spark.sql.shuffle.partitions=300",
+    "spark.sql.adaptive.maxShuffledHashJoinLocalMapThreshold=64MB   # Spark and VecRuntime (EMR's setting); not in the 2026-10-03 Comet leg",
+    "spark.locality.wait=0   # every engine (#608)",
+    "spark.eventLog.enabled=true",
+    "-XX:+UseCompactObjectHeaders, -Djava.security.properties=<ACCP first> (driver and executors, every engine)"
+  ],
+  "vector_conf": [
+    "spark.plugins=io.vecruntime.spark.VectorPlugin",
+    "spark.shuffle.manager=org.apache.spark.sql.vecruntime.shuffle.VectorShuffleManager",
+    "spark.vecruntime.scan.nativeParquet.enabled=true   # our Parquet reader, the default since #609",
+    "spark.vecruntime.optimizer.factBloomFilter.enabled=true   # the default (#659)",
+    "spark.vecruntime.exec.strictFloatingPoint=false   # Comet's default too",
+    "spark.vecruntime.shuffle.aqe.mapSizeScaling=true   # AQE sees Spark-scale map output sizes (#514)",
+    "spark.vecruntime.shuffle.aqe.sparkCompressionRatio=0   # the uncompressed-bytes ratio (#514)",
+    "AOT class-data cache off",
+    "--add-modules=jdk.incubator.vector --enable-native-access=ALL-UNNAMED (driver and executors)"
+  ],
+  "comet_conf": [
+    "spark.plugins=org.apache.spark.CometPlugin",
+    "spark.shuffle.manager=org.apache.spark.sql.comet.execution.shuffle.CometShuffleManager",
+    "spark.memory.offHeap.enabled=true",
+    "spark.memory.offHeap.size=22g",
+    "spark.comet.exec.enabled=true",
+    "spark.comet.scan.enabled=true",
+    "spark.comet.exec.shuffle.enabled=true",
+    "spark.comet.exec.shuffle.mode=auto",
+    "spark.comet.cast.allowIncompatible=true",
+    "spark.comet.explainFallback.enabled=true"
+  ],
+  "notes": [
+    "Every engine returned Spark's row counts on every query, and Spark's checksums on every query except q65, whose result has ties that every engine orders differently.",
+    "Spark and VecRuntime ran on 2026-10-08 in one cluster session on the same nine nodes, one after another, each alone on the cluster. The Comet column is Comet 1.0.0's leg of the 2026-10-03 session (same image settings, S3A settings and node type, another availability zone, without the 64 MB shuffled-hash-join threshold); a Comet leg in the 2026-10-08 session was stopped after 13 queries. S3 throughput varies between sessions, so the Comet comparison crosses sessions.",
+    "In the 2026-10-08 session Spark's scan-bound queries spent longer waiting on S3 than on 2026-10-03 at the same CPU time (q88 94.3 -> 153.2 s, q9 76.9 -> 104.1 s): Spark's total is 3,132 s against 2,963 s then. VecRuntime's reader, which reads the next files and row groups ahead, was stable within 1% across two runs that day.",
+    "The 64 MB shuffled-hash-join threshold moves Spark's own plans: sort-merge joins become shuffled hash joins in q93, q23a/b, q64 and q50 (faster) and in q95's web_sales self-join (179.9 s against 98.4 s without it).",
+    "Comet is the 1.0.0 release from Maven Central. The S3A settings, ACCP and compact object headers are the benchmark launcher's defaults since #566 and #578 and apply to all engines.",
+    "AQE is at its defaults for every engine apart from the shuffled-hash-join threshold."
+  ],
+  "methodology_html": "<p><b>Methodology.</b> Spark and VecRuntime ran one after another in one cluster session on 2026-10-08, on the same nine nodes, each alone on the cluster, over the same S3 data with the same Spark settings; Comet 1.0.0 is its leg of the 2026-10-03 session on the same node type. Each query ran once after the plan was compiled; the time is the wall-clock of the query's execution as the runner measures it.</p>",
+  "wins_html": "<p>The scan-bound queries are VecRuntime's, on its own Parquet reader: q88 5.4 s against Spark's 153.2 and Comet's 83.0; q90 4.4 against 38.9 and 27.8; q9 14.5 against 104.1 and 52.0; q28 27.6 against 120.2 and 69.2. So are the heavy joins: q95 10.5 against 179.9 and 54.6; q93 16.9 against 86.1 and 76.9; q23b 85.5 against 221.2 and 133.2; q64 25.6 against 65.1 and 54.7. Comet leads on q49 (38.0 s against VecRuntime's 59.4, the bloom filter's build wait of #660), the heavy aggregates (q4 51.4 against 54.6), q65, q44, q16 and q18. VecRuntime's losses to Spark are q49 (59.4 s against 45.3) and q18 (6.2 against 5.9).</p>",
+  "results_doc": "https://github.com/vecruntime/vecruntime/blob/main/docs/results.md",
+  "repo": "https://github.com/vecruntime/vecruntime",
+  "run_doc": "https://github.com/vecruntime/vecruntime/blob/main/benchmarks/k8s/README.md",
+  "vector_vs_comet": " and leads on the scan-bound queries and the heavy joins; Comet leads on q49, the heavy aggregates (q4) and q18",
+  "results_line": "Every engine returned Spark's results (q65: ties, ordered differently by every engine).",
+  "query_notes": {
+    "q65": "ties",
+    "q49": "#660"
+  },
+  "comet_label": "DataFusion Comet 1.0.0 (2026-10-03)",
+  "vector_label": "VecRuntime (own Parquet reader + Flight shuffle)"
+}
