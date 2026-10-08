@@ -181,6 +181,9 @@ final case class BloomProbeExpr(filter: SubqueryLiteralExpr, hash: VectorExpr, p
     // made false, whose result the AND discards. The probe is a hash and a random bit read per row (13.9%
     // of q24a's executor CPU at 1 TB, #635), so skipping those rows is the saving.
     val active = ctx.active
+    // FactBloomFilter sizes B as a power of two, so a mask picks the sub-filter (no long division per row);
+    // floorMod stays for any other count, e.g. a filter serialised before that.
+    val mask = if (ps != null && Integer.bitCount(ps.length) == 1) ps.length - 1L else -1L
     var i = 0
     while (i < n) {
       if ((active == null || Bitmap.isSet(active, i)) && (h.validity() == null || Bitmap.isSet(h.validity(), i))) {
@@ -188,7 +191,7 @@ final case class BloomProbeExpr(filter: SubqueryLiteralExpr, hash: VectorExpr, p
         val hit =
           if (ps == null) b.mightContainLong(v)
           else {
-            val f = ps(Math.floorMod(v, ps.length.toLong).toInt)
+            val f = ps((if (mask >= 0) v & mask else Math.floorMod(v, ps.length.toLong)).toInt)
             f != null && org.apache.spark.sql.vecruntime.BlockedBloomFilter.mightContain(f, v)
           }
         Bitmap.setTo(bits, i, hit)

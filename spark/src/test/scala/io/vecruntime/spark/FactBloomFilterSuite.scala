@@ -493,6 +493,22 @@ class FactBloomFilterSuite extends VectorQuerySuite {
     }
   }
 
+  test("a partitioned filter's bucket count is a power of two; masking the hash equals pmod (#659)") {
+    // ~27 buckets needed at maxNumItems 100 (previous test): rounded up to 32, so the probe masks the hash.
+    withConf("spark.sql.optimizer.runtime.bloomFilter.maxNumItems" -> "100") {
+      val df = run(q93)
+      val bs = df.queryExecution.optimizedPlan.collectWithSubqueries {
+        case a: org.apache.spark.sql.catalyst.plans.logical.Aggregate => a.aggregateExpressions
+      }.flatten.flatMap(_.collect { case p: org.apache.spark.sql.vecruntime.PartitionedBloomFilterAgg => p.numBuckets })
+      assert(bs.nonEmpty && bs.forall(b => Integer.bitCount(b) == 1), bs)
+    }
+    val hs = (0L until 10000L).map(i => org.apache.spark.sql.catalyst.expressions.XXH64.hashLong(i * 7919L, 42L)) ++
+      Seq(Long.MinValue, -1L, 0L, Long.MaxValue)
+    Seq(1, 2, 32, 1024).foreach { b =>
+      assert(hs.forall(h => (h & (b - 1L)) == Math.floorMod(h, b.toLong)), b)
+    }
+  }
+
   test("partitioned filter: every key is found in its bucket's sub-filter; pack and unpack round-trip (#653)") {
     import org.apache.spark.sql.vecruntime.{BlockedBloomFilter, PartitionedBloomFilter}
     val buckets = 7
