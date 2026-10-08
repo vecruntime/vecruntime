@@ -155,7 +155,12 @@ case class VectorLocalTableScanExec(output: Seq[Attribute], rows: Seq[InternalRo
 object VectorSamplePlanner {
   def plan(s: SampleExec): Either[String, VectorSampleExec] =
     if (s.withReplacement) Left("sampling with replacement (Poisson) not supported")
-    else Right(VectorSampleExec(s.lowerBound, s.upperBound, s.seed, s.child))
+    else Right(VectorSampleExec(
+      s.lowerBound,
+      s.upperBound,
+      org.apache.spark.sql.vecruntime.shims.SparkShims.sampleSeed(s),
+      s.child
+    ))
 
   def planLocalTableScan(l: LocalTableScanExec): Either[String, VectorLocalTableScanExec] =
     l.output.find(a => !TypeMapping.hasLane(a.dataType)) match {

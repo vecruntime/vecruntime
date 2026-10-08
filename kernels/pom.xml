@@ -8,7 +8,7 @@
     <version>0.0.7-SNAPSHOT</version>
   </parent>
 
-  <artifactId>vecruntime-kernels</artifactId>
+  <artifactId>vecruntime-kernels_${spark.line}</artifactId>
   <name>vecruntime-kernels</name>
   <description>Java Vector API kernels over Arrow-layout MemorySegment buffers (no Spark dependency)</description>
 

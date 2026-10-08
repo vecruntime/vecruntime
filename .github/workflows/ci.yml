@@ -18,9 +18,20 @@ permissions:
 
 jobs:
   test:
-    name: build and test (JDK 25)
+    # Both supported Spark lines (#639). 4.1 also runs the Comet and Iceberg suites; neither publishes
+    # Spark 4.2 artifacts yet. Each job is its own checkout, and `clean` runs first anyway: the
+    # incremental Scala compiler would reuse classes compiled against the other line.
+    name: build and test (Spark ${{ matrix.line }}, JDK 25)
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - line: '4.1'
+            profiles: comet,iceberg
+          - line: '4.2'
+            profiles: spark-4.2
     steps:
       - uses: actions/checkout@v4
 
@@ -36,13 +47,13 @@ jobs:
         # The Spark suites fork a JVM with -Xmx3g each (spark/pom.xml); the runner has 16 GB.
         env:
           MAVEN_OPTS: -Xmx2g
-        run: mvn -B -ntp -Pcomet,iceberg verify
+        run: mvn -B -ntp -P${{ matrix.profiles }} clean verify
 
       - name: Test reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: test-reports
+          name: test-reports-spark-${{ matrix.line }}
           if-no-files-found: ignore
           retention-days: 14
           path: |

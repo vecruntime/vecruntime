@@ -79,16 +79,24 @@ mvn verify                                          # kernels + Spark suites (Co
 mvn -Pcomet verify                                  # also runs the Comet-backed suites (see docs/comet.md)
 mvn -Piceberg verify                                # also runs the Iceberg suites (see docs/iceberg.md)
 mvn -Pcomet,iceberg verify                          # everything, including Comet's native Iceberg scan
+mvn -Pspark-4.2 verify                              # the same build against Spark 4.2 (no Comet or Iceberg yet)
 ```
 
-The plugin jar is `spark/target/vecruntime-spark_2.13-<version>.jar` (kernels shaded in, nothing
+vecruntime supports, in principle, the two latest official Spark feature lines: today 4.1 (the default
+build) and 4.2 (`-Pspark-4.2`). Each line's own code is in `spark/src/main/spark-<line>`. Comet and
+Iceberg publish no Spark 4.2 artifacts yet, so `-Pcomet` and `-Piceberg` are 4.1-only for now; the
+plugin itself does not depend on either. Run `mvn clean` when switching lines in one checkout: the
+incremental Scala compiler does not notice a different Spark version and would reuse the other line's
+classes.
+
+The plugin jar is `spark/target/vecruntime-spark_4.1_2.13-<version>.jar` (kernels shaded in, nothing
 else). Spark and Arrow are `provided`.
 
 ## Getting the jars
 
 Every release is on the [releases page](https://github.com/vecruntime/vecruntime/releases): the plugin
-jar (`vecruntime-spark_2.13-<version>.jar`), the columnar shuffle jar
-(`vecruntime-shuffle_2.13-<version>.jar`) and a `SHA256SUMS` file. The same artifacts, with their
+jar (`vecruntime-spark_4.1_2.13-<version>.jar`), the columnar shuffle jar
+(`vecruntime-shuffle_4.1_2.13-<version>.jar`) and a `SHA256SUMS` file. The same artifacts, with their
 POMs, are published to a Maven repository served from this repository's `maven-repo` branch -- no
 account or token needed:
 
@@ -103,17 +111,20 @@ account or token needed:
 <dependencies>
   <dependency>
     <groupId>io.github.vecruntime</groupId>
-    <artifactId>vecruntime-spark_2.13</artifactId>
-    <version>0.0.6</version>
+    <artifactId>vecruntime-spark_4.1_2.13</artifactId>
+    <version>0.0.7</version>
   </dependency>
   <!-- the columnar shuffle, if you run with spark.shuffle.manager=...VectorShuffleManager -->
   <dependency>
     <groupId>io.github.vecruntime</groupId>
-    <artifactId>vecruntime-shuffle_2.13</artifactId>
-    <version>0.0.6</version>
+    <artifactId>vecruntime-shuffle_4.1_2.13</artifactId>
+    <version>0.0.7</version>
   </dependency>
 </dependencies>
 ```
+
+Every artifact names the Spark line it is built for: `vecruntime-kernels_4.1`, `vecruntime-spark_4.1_2.13`
+and `vecruntime-shuffle_4.1_2.13`, and the same with `4.2`. Pick the one matching your cluster.
 
 The same coordinates work with `--packages` on `spark-submit`, `spark-shell`, `pyspark` and `spark-sql`,
 together with `--repositories` (only the VecRuntime jars are downloaded; everything else is `provided`):
@@ -121,14 +132,14 @@ together with `--repositories` (only the VecRuntime jars are downloaded; everyth
 ```bash
 spark-submit \
   --repositories https://raw.githubusercontent.com/vecruntime/vecruntime/maven-repo/ \
-  --packages io.github.vecruntime:vecruntime-spark_2.13:0.0.6 \
+  --packages io.github.vecruntime:vecruntime-spark_4.1_2.13:0.0.7 \
   --conf spark.plugins=io.vecruntime.spark.VectorPlugin \
   --conf spark.driver.extraJavaOptions="--add-modules=jdk.incubator.vector --enable-native-access=ALL-UNNAMED --sun-misc-unsafe-memory-access=allow" \
   --conf spark.executor.extraJavaOptions="--add-modules=jdk.incubator.vector --enable-native-access=ALL-UNNAMED --sun-misc-unsafe-memory-access=allow" \
   ...
 ```
 
-For the columnar shuffle add `io.github.vecruntime:vecruntime-shuffle_2.13:0.0.6` to `--packages`
+For the columnar shuffle add `io.github.vecruntime:vecruntime-shuffle_4.1_2.13:0.0.7` to `--packages`
 (comma-separated) and `--conf spark.shuffle.manager=org.apache.spark.sql.vecruntime.shuffle.VectorShuffleManager`;
 its Arrow Flight and gRPC dependencies come along.
 
@@ -144,7 +155,7 @@ spark-submit \
   --conf spark.plugins=io.vecruntime.spark.VectorPlugin \
   --conf spark.driver.extraJavaOptions="--add-modules=jdk.incubator.vector --enable-native-access=ALL-UNNAMED --sun-misc-unsafe-memory-access=allow" \
   --conf spark.executor.extraJavaOptions="--add-modules=jdk.incubator.vector --enable-native-access=ALL-UNNAMED --sun-misc-unsafe-memory-access=allow" \
-  --jars vecruntime-spark_2.13-0.0.6.jar \
+  --jars vecruntime-spark_4.1_2.13-0.0.7.jar \
   ...
 ```
 
@@ -327,8 +338,9 @@ measurements behind each item are in the linked docs and issues.
   --enable-native-access=ALL-UNNAMED` in both `extraJavaOptions`. The Vector API is an incubator
   module: its shape can change between JDK releases, so a JDK upgrade may need a rebuild of the
   kernels.
-- **Spark 4.1.x, Scala 2.13** only. Spark 4.1 on JDK 25 additionally needs Hadoop 3.4.3's client
-  jars in place of the bundled 3.4.2 (the section above).
+- **Spark 4.1.x or 4.2.x, Scala 2.13**, with the jar built for that line (`-Pspark-4.2` for 4.2). Spark
+  4.1 on JDK 25 additionally needs Hadoop 3.4.3's client jars in place of the bundled 3.4.2 (the section
+  above); Spark 4.2 bundles Hadoop 3.5.0, which does not.
 - **Memory:** a heap-heavy split. The operators keep their tables (aggregate keys, join builds, sort
   runs) on the heap and their batches in Arrow direct memory, so give the heap more than Spark's
   defaults would and bound direct memory explicitly: at 50 GB per 13-core executor the 1 TB runs

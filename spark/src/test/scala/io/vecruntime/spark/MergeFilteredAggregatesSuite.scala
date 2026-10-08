@@ -111,7 +111,10 @@ class MergeFilteredAggregatesSuite extends VectorQuerySuite {
         case ae: org.apache.spark.sql.catalyst.expressions.aggregate.AggregateExpression => ae.filter.toSeq
       }.flatten)) ++ p.subqueries.flatMap(filters)
     val sizes = filters(withPlugin(enabled = true)(df.queryExecution.optimizedPlan)).map(_.treeString.length)
-    assert(sizes.nonEmpty && sizes.max < 400, s"filter sizes: $sizes")
+    // Spark 4.2's MergeSubplans merges differently filtered subqueries itself, without aggregate FILTERs.
+    if (!org.apache.spark.sql.vecruntime.shims.SparkShims.sparkMergesFilteredSubqueries) {
+      assert(sizes.nonEmpty && sizes.max < 400, s"filter sizes: $sizes")
+    }
   }
 
   /** `store_sales` scans the executed plan runs, subqueries included, each reused one counted once. */

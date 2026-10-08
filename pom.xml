@@ -33,9 +33,11 @@
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <maven.compiler.release>25</maven.compiler.release>
 
-    <!-- Pinned to Apache Spark 4.1.3's pom.xml -->
+    <!-- Pinned to Apache Spark 4.1.3's pom.xml; -Pspark-4.2 switches every line-bound version (#639) -->
+    <spark.line>4.1</spark.line>
     <spark.version>4.1.3</spark.version>
     <netty.version>4.2.7.Final</netty.version>
+    <protobuf.version>4.33.0</protobuf.version>
     <jackson.version>2.21.2</jackson.version>
     <!-- Spark 4.1.3's -->
     <!-- Spark 4.1.3's -->
@@ -63,6 +65,7 @@
     <scala-maven-plugin.version>4.9.10</scala-maven-plugin.version>
     <scalatest-maven-plugin.version>2.2.0</scalatest-maven-plugin.version>
     <build-helper-maven-plugin.version>3.6.0</build-helper-maven-plugin.version>
+    <flatten-maven-plugin.version>1.8.0</flatten-maven-plugin.version>
     <!-- Formatting (#423): Spotless runs Netflix's jfmt over Java (a modular JAR fetched by dependency:copy at
          validate, run through the JDK's java on standard input) and scalafmt over Scala; `mvn spotless:check`
          fails the build on a file that is not formatted (bound to `verify`), `mvn spotless:apply` formats. -->
@@ -137,7 +140,7 @@
       <dependency>
         <groupId>com.google.protobuf</groupId>
         <artifactId>protobuf-java</artifactId>
-        <version>4.33.0</version>
+        <version>${protobuf.version}</version>
       </dependency>
       <dependency>
         <groupId>commons-codec</groupId>
@@ -146,17 +149,17 @@
       </dependency>
       <dependency>
         <groupId>io.github.vecruntime</groupId>
-        <artifactId>vecruntime-kernels</artifactId>
+        <artifactId>vecruntime-kernels_${spark.line}</artifactId>
         <version>${project.version}</version>
       </dependency>
       <dependency>
         <groupId>io.github.vecruntime</groupId>
-        <artifactId>vecruntime-shuffle_${scala.binary.version}</artifactId>
+        <artifactId>vecruntime-shuffle_${spark.line}_${scala.binary.version}</artifactId>
         <version>${project.version}</version>
       </dependency>
       <dependency>
         <groupId>io.github.vecruntime</groupId>
-        <artifactId>vecruntime-spark_${scala.binary.version}</artifactId>
+        <artifactId>vecruntime-spark_${spark.line}_${scala.binary.version}</artifactId>
         <version>${project.version}</version>
       </dependency>
       <dependency>
@@ -420,6 +423,9 @@
             <includes>
               <include>src/main/scala/**/*.scala</include>
               <include>src/test/scala/**/*.scala</include>
+              <include>src/main/spark-*/**/*.scala</include>
+              <include>src/test/spark-*/**/*.scala</include>
+              <include>src/test/iceberg/**/*.scala</include>
             </includes>
             <scalafmt>
               <version>${scalafmt.version}</version>
@@ -479,10 +485,57 @@
           </execution>
         </executions>
       </plugin>
+      <plugin>
+        <!--
+          The installed and published POMs carry ${spark.line} resolved (#639): an artifact id, and the
+          dependencies on the sibling modules, name the line the build was made for, so a 4.2 artifact never
+          resolves its siblings as 4.1 from the parent's default.
+        -->
+        <groupId>org.codehaus.mojo</groupId>
+        <artifactId>flatten-maven-plugin</artifactId>
+        <version>${flatten-maven-plugin.version}</version>
+        <configuration>
+          <flattenMode>oss</flattenMode>
+          <updatePomFile>true</updatePomFile>
+        </configuration>
+        <executions>
+          <execution>
+            <id>flatten</id>
+            <goals>
+              <goal>flatten</goal>
+            </goals>
+            <phase>process-resources</phase>
+          </execution>
+          <execution>
+            <id>flatten-clean</id>
+            <goals>
+              <goal>clean</goal>
+            </goals>
+            <phase>clean</phase>
+          </execution>
+        </executions>
+      </plugin>
     </plugins>
   </build>
 
   <profiles>
+    <profile>
+      <!--
+        Spark 4.2 (#639): the versions its pom pins, and the spark module's src/*/spark-4.2 sources.
+        Iceberg and Comet publish no 4.2 artifacts yet, so -Piceberg and -Pcomet stay 4.1-only.
+      -->
+      <id>spark-4.2</id>
+      <properties>
+        <arrow.version>19.0.0</arrow.version>
+        <hadoop.version>3.5.0</hadoop.version>
+        <netty.version>4.2.13.Final</netty.version>
+        <parquet.version>1.17.0</parquet.version>
+        <protobuf.version>4.33.5</protobuf.version>
+        <scala.version>2.13.18</scala.version>
+        <spark.line>4.2</spark.line>
+        <spark.version>4.2.0</spark.version>
+      </properties>
+    </profile>
     <!--
       Spark's own SQL golden-file suite with the plugin enabled (see spark-sql-tests/). Not part of
       the normal build: it takes far too long. benchmarks/scripts/run-spark-sql-tests.sh runs it.

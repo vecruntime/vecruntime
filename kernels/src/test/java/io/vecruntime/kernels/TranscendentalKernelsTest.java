@@ -88,6 +88,46 @@ class TranscendentalKernelsTest {
         assertEquals(Double.doubleToLongBits(expected), Double.doubleToLongBits(got), what + ": " + expected + " vs " + got);
     }
 
+    /**
+     * Spark 4.2.0's {@code Asinh} (mathExpressions.scala), transcribed: the
+     * reference for ASINH_FDLIBM.
+     */
+    private static double spark42Asinh(double x) {
+        double ax = Math.abs(x);
+        double w;
+        if (Double.isInfinite(ax) || Double.isNaN(ax)) {
+            w = ax;
+        } else if (ax < 1.0 / (1 << 28)) {
+            w = ax;
+        } else if (ax > (1 << 28)) {
+            w = StrictMath.log(ax) + StrictMath.log(2.0);
+        } else if (ax > 2.0) {
+            w = StrictMath.log(2.0 * ax + 1.0 / (Math.sqrt(x * x + 1.0) + ax));
+        } else {
+            double t = x * x;
+            w = StrictMath.log1p(ax + t / (1.0 + Math.sqrt(1.0 + t)));
+        }
+        return Math.copySign(w, x);
+    }
+
+    /** Spark 4.2.0's {@code Acosh}, transcribed. */
+    private static double spark42Acosh(double x) {
+        if (x < 1.0) {
+            return Double.NaN;
+        }
+        if (x >= (1 << 28)) {
+            return StrictMath.log(x) + StrictMath.log(2.0);
+        }
+        if (x == 1.0) {
+            return 0.0;
+        }
+        if (x > 2.0) {
+            return StrictMath.log(2.0 * x - 1.0 / (x + Math.sqrt(x * x - 1.0)));
+        }
+        double t = x - 1.0;
+        return StrictMath.log1p(t + Math.sqrt(2.0 * t + t * t));
+    }
+
     @Test
     void unaryFunctionsAreBitIdenticalToSparksCalls() {
         double[] xs = grid();
@@ -127,6 +167,8 @@ class TranscendentalKernelsTest {
                         case CSC -> 1 / Math.sin(x);
                         case DEGREES -> Math.toDegrees(x);
                         case RADIANS -> Math.toRadians(x);
+                        case ASINH_FDLIBM -> spark42Asinh(x);
+                        case ACOSH_FDLIBM -> spark42Acosh(x);
                     };
                     assertBits(expected, out.getAtIndex(VectorBuffers.LE_DOUBLE, i), fn + "(" + x + ")");
                 }

@@ -272,7 +272,8 @@ class VectorProjectSuite extends VectorQuerySuite {
       val cause =
         causes(e).find(_.isInstanceOf[ArithmeticException]).getOrElse(fail(s"expected ARITHMETIC_OVERFLOW, got $e"))
       assert(cause.getMessage.contains("ARITHMETIC_OVERFLOW"), cause.getMessage)
-      assert(cause.getMessage.contains(message), cause.getMessage)
+      // Spark 4.2's message says only "overflow"; 4.1's names the type.
+      if (!sparkSays42) assert(cause.getMessage.contains(message), cause.getMessage)
       if (hint.nonEmpty) assert(cause.getMessage.contains(hint), cause.getMessage)
     }
     // i ranges 0..19999, so i * 2147483 overflows an int for i >= 1000 and l * l a long for large l.
@@ -455,7 +456,10 @@ class VectorProjectSuite extends VectorQuerySuite {
     assertError("SELECT pmod(i, 0) AS p FROM t WHERE i < 10", "REMAINDER_BY_ZERO")
     assertError("SELECT i div (i - 5) AS q FROM t", "DIVIDE_BY_ZERO")
     assertError("SELECT abs(i - 2147483647 - 1) AS a FROM t WHERE i < 3", "ARITHMETIC_OVERFLOW")
-    assertError("SELECT abs(CAST(i AS BIGINT) - 9223372036854775807 - 1) AS a FROM t WHERE i < 3", "long overflow")
+    assertError(
+      "SELECT abs(CAST(i AS BIGINT) - 9223372036854775807 - 1) AS a FROM t WHERE i < 3",
+      if (sparkSays42) "ARITHMETIC_OVERFLOW" else "long overflow"
+    )
     assertError(
       "SELECT (CAST(i AS BIGINT) - 9223372036854775807 - 1) div -1 AS q FROM t WHERE i < 3",
       "Overflow in integral divide"
@@ -1265,6 +1269,9 @@ class VectorProjectSuite extends VectorQuerySuite {
 
   private def causes(t: Throwable): Seq[Throwable] =
     Iterator.iterate(t)(_.getCause).takeWhile(_ != null).take(10).toSeq
+
+  /** Spark 4.2 shortened the overflow message of exact arithmetic to "overflow" (#639). */
+  private def sparkSays42: Boolean = org.apache.spark.sql.vecruntime.shims.SparkShims.sparkLine == "4.2"
 
   test("nanvl evaluates its second argument only where the first is NaN, as Spark does") {
     // 1.0 / (d - d) divides by zero on every finite row; Spark never evaluates it there and neither may we.
