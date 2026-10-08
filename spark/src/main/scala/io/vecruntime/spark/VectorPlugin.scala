@@ -67,6 +67,14 @@ class VectorPlugin extends SparkPlugin {
     }
 
     override def shutdown(): Unit = org.apache.spark.sql.vecruntime.VectorShuffle.executorShutdown()
+
+    // Spark calls these on the task's own thread once the task ends (#667): the hash tables' per-thread
+    // scratch keeps no batch, dictionary or table, and none of the arrays a build side grew it to, into
+    // the thread's next task.
+    override def onTaskSucceeded(): Unit = io.vecruntime.kernels.GroupKeyTable.releaseThreadScratch()
+
+    override def onTaskFailed(failureReason: org.apache.spark.TaskFailedReason): Unit =
+      io.vecruntime.kernels.GroupKeyTable.releaseThreadScratch()
   }
 }
 
