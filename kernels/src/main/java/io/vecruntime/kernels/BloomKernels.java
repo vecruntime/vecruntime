@@ -43,8 +43,11 @@ import jdk.incubator.vector.VectorSpecies;
  * cache miss in a multi-megabyte filter -- are in flight together. On an
  * AVX-512 host it is 2.7 to 4 times {@link #mightContain} per key (JMH, {@code
  * BloomProbeBenchmark}). Packing two keys' masks into one 512-bit vector
- * measured slower than two 256-bit tests. Without 256-bit vectors the probe is
- * the same branch-free loop in scalar code.
+ * measured slower than two 256-bit tests. With 128-bit vectors only (Graviton 4:
+ * NEON, 128-bit SVE) a block is tested as two 4-lane halves with a scalar remix,
+ * since NEON has no 64-bit lane multiply: 1.5 to 2.2 times the per-key probe on
+ * a Graviton 4, where the 256-bit species is emulated and 10 times slower.
+ * Without vectors the probe is the same branch-free loop in scalar code.
  */
 public final class BloomKernels {
 
@@ -56,12 +59,21 @@ public final class BloomKernels {
     private static final VectorSpecies<Integer> I256 = IntVector.SPECIES_256;
     private static final VectorSpecies<Long> L = LongVector.SPECIES_PREFERRED;
     private static final IntVector SALT256 = IntVector.fromArray(I256, SALTS, 0);
+    private static final VectorSpecies<Integer> I128 = IntVector.SPECIES_128;
+    private static final IntVector SALT_LO = IntVector.fromArray(I128, SALTS, 0);
+    private static final IntVector SALT_HI = IntVector.fromArray(I128, SALTS, 4);
 
     /**
      * Whether 256-bit integer vectors are native here; otherwise {@link #probe}
-     * is scalar.
+     * uses 128-bit vectors where those are native, else scalar code.
      */
     static final boolean VECTOR = IntVector.SPECIES_PREFERRED.vectorBitSize() >= 256;
+
+    /**
+     * Whether 128-bit integer vectors are native here (Graviton: NEON / 128-bit
+     * SVE).
+     */
+    static final boolean VECTOR128 = IntVector.SPECIES_PREFERRED.vectorBitSize() >= 128;
 
     /**
      * MurmurHash3's 64-bit finalizer: every output bit depends on every input
@@ -134,6 +146,8 @@ public final class BloomKernels {
             long[] out, long[] xs) {
         if (VECTOR) {
             probeVector(parts, hashes, n, out, xs);
+        } else if (VECTOR128) {
+            probeVector128(parts, hashes, n, out);
         } else {
             probeScalar(parts, hashes, n, out);
         }
@@ -205,6 +219,38 @@ public final class BloomKernels {
             boolean hit = block.and(bits)
                                .eq(bits)
                                .allTrue();
+            out[i >>> 6] |= (hit ? 1L : 0L) << (i & 63);
+        }
+    }
+
+    /**
+     * 128-bit batch (Graviton: NEON / 128-bit SVE): a block is two 4-lane
+     * halves, each with its four bit masks from one multiply-and-shift; the key
+     * hits when neither half misses a bit. The remix is scalar, since NEON has
+     * no 64-bit lane multiply.
+     */
+    public static void probeVector128(int[][] parts, long[] hashes, int n,
+            long[] out) {
+        long mask = maskOf(parts.length);
+        Arrays.fill(out, 0, (n + 63) >>> 6, 0L);
+        IntVector one = IntVector.broadcast(I128, 1);
+        for (int i = 0; i < n; i++) {
+            long h = hashes[i];
+            int[] w = parts[part(h, parts.length, mask)];
+            if (w == null) {
+                continue;
+            }
+            long x = mix(h);
+            int base = blockBase(w.length, x);
+            IntVector k = IntVector.broadcast(I128, (int) x);
+            IntVector bitsLo = one.lanewise(VectorOperators.LSHL, k.mul(SALT_LO)
+                    .lanewise(VectorOperators.LSHR, 27));
+            IntVector bitsHi = one.lanewise(VectorOperators.LSHL, k.mul(SALT_HI)
+                    .lanewise(VectorOperators.LSHR, 27));
+            IntVector lo = IntVector.fromArray(I128, w, base);
+            IntVector hi = IntVector.fromArray(I128, w, base + 4);
+            IntVector missing = bitsLo.and(lo.not()).or(bitsHi.and(hi.not()));
+            boolean hit = missing.eq(0).allTrue();
             out[i >>> 6] |= (hit ? 1L : 0L) << (i & 63);
         }
     }

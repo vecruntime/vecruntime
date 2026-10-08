@@ -364,8 +364,10 @@ shuffle it saved. At 8 bits a key the false-positive rate is about 3 % (Spark's:
 (`BloomKernels.probe`). The probed rows' hashes are remixed in the widest long vectors (eight per op on AVX-512),
 then each key's block is tested in one 256-bit op: its eight bit masks from one multiply-and-shift by the salts, one
 compare with the block. There is no branch per key, so consecutive keys' block loads overlap. In JMH on an AVX-512
-host it is 2.7 to 4 times the per-key probe, including against a 16 MB filter. On a host without 256-bit vectors the
-same loop runs as branch-free scalar code. The layout and the results are unchanged.
+host it is 2.7 to 4 times the per-key probe, including against a 16 MB filter. On a host with 128-bit vectors only
+(Graviton 4: NEON, 128-bit SVE) each block is tested as two 4-lane halves with a scalar remix (NEON has no 64-bit
+lane multiply): 1.5 to 2.2 times the per-key probe there, where the 256-bit species would be emulated and ten times
+slower. Without vectors the same loop runs as branch-free scalar code. The layout and the results are unchanged.
 
 **Why the result is the same.** A bloom filter has no false negatives, and a row whose key the creation side
 does not hold cannot survive the join. False positives only let a non-matching row through to the join, which

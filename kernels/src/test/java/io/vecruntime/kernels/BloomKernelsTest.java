@@ -59,6 +59,8 @@ class BloomKernelsTest {
         assertArrayEquals(ref, got, "scalar");
         BloomKernels.probeVector(fs, hashes, n, got, xs);
         assertArrayEquals(ref, got, "vector");
+        BloomKernels.probeVector128(fs, hashes, n, got);
+        assertArrayEquals(ref, got, "vector128");
         BloomKernels.probe(fs, hashes, n, got, xs);
         assertArrayEquals(ref, got, "probe");
     }

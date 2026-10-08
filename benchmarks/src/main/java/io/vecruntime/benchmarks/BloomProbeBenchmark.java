@@ -107,6 +107,10 @@ public class BloomProbeBenchmark {
             check(ref, got, "scalar");
             BloomKernels.probeVector(filters, b, BATCH, got, xs);
             check(ref, got, "vector");
+            BloomKernels.probeVector128(filters, b, BATCH, got);
+            check(ref, got, "vector128");
+            BloomKernels.probe(filters, b, BATCH, got, xs);
+            check(ref, got, "probe");
         }
     }
 
@@ -137,6 +141,19 @@ public class BloomProbeBenchmark {
     @Benchmark
     public long[] vector() {
         BloomKernels.probeVector(filters, batch(), BATCH, out, xs);
+        return out;
+    }
+
+    @Benchmark
+    public long[] vector128() {
+        BloomKernels.probeVector128(filters, batch(), BATCH, out);
+        return out;
+    }
+
+    /** The dispatched probe: what the engine runs on this host. */
+    @Benchmark
+    public long[] probe() {
+        BloomKernels.probe(filters, batch(), BATCH, out, xs);
         return out;
     }
 }
