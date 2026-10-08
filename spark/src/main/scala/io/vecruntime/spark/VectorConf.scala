@@ -74,6 +74,9 @@ object VectorConf {
   /** Minimum row reduction (rows / estimated groups) the statistics must show for AggregateBelowJoin (#657). */
   val AggregateBelowJoinMinReduction = "spark.vecruntime.optimizer.aggregateBelowJoin.minReduction"
 
+  /** Whether AggregateBelowJoin declines when there are no statistics to show a reduction (#675; default true). */
+  val AggregateBelowJoinRequireStatistics = "spark.vecruntime.optimizer.aggregateBelowJoin.requireStatistics"
+
   /**
    * Adaptive rewrite (#635): grouping keys that are columns of a broadcast join's build side are dropped
    * when that side's join key is unique at run time and is itself a grouping key.
@@ -605,6 +608,10 @@ object VectorConf {
   /** AggregateBelowJoin's required reduction, at least 1 (default 4). */
   def aggregateBelowJoinMinReduction(conf: SQLConf): Double =
     math.max(1.0, conf.getConfString(AggregateBelowJoinMinReduction, "4").trim.toDouble)
+
+  /** AggregateBelowJoin declines without statistics (default true). */
+  def aggregateBelowJoinRequireStatistics(conf: SQLConf): Boolean =
+    bool(conf, AggregateBelowJoinRequireStatistics, default = true)
 
   /** Dropping grouping keys a unique broadcast key determines (#635); also off when the plugin is off. */
   def removeRedundantGroupKeysEnabled(conf: SQLConf): Boolean =

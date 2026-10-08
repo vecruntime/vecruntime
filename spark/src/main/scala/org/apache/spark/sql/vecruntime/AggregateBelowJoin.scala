@@ -182,7 +182,8 @@ case class AggregateBelowJoin(session: SparkSession) extends Rule[LogicalPlan] w
     (KeyStats.baseRowCount(f), ndvs.forall(_.isDefined)) match {
       case (Some(rows), true) if rows > 0 =>
         BigDecimal(ndvs.flatten.product) * BigDecimal(minReduction) <= BigDecimal(rows)
-      case _ => false
+      // No statistics to decide on (#675): decline unless the switch says the other guards are enough.
+      case _ => !VectorConf.aggregateBelowJoinRequireStatistics(session.sessionState.conf)
     }
   }
 
