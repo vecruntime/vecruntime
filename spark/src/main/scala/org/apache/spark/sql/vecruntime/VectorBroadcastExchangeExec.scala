@@ -56,6 +56,58 @@ final class VectorBroadcastBatches(
 
   def sizeInBytes: Long = streams.iterator.map(_.length.toLong).sum
 
+  @transient private lazy val uniqueByColumn = new java.util.concurrent.ConcurrentHashMap[Integer, java.lang.Boolean]()
+
+  /**
+   * Whether column `ordinal` (an integral key) holds no value twice among its non-null rows: the broadcast
+   * join's build keys are then unique, so every build-side column is a function of the key (#635,
+   * RemoveRedundantGroupKeys). Computed once per column on the process that holds the relation (the
+   * driver, for the adaptive rule), by sorting a copy of the keys; `false` when the column is not
+   * integral or the relation has more than `maxRows` rows (not worth the sort then).
+   */
+  def keysUnique(ordinal: Int, maxRows: Long = VectorBroadcastBatches.MaxUniqueCheckRows): Boolean = {
+    if (ordinal < 0 || ordinal >= types.length || numRows > maxRows) return false
+    types(ordinal) match {
+      case _: org.apache.spark.sql.types.IntegerType | _: org.apache.spark.sql.types.LongType |
+          _: org.apache.spark.sql.types.ShortType | _: org.apache.spark.sql.types.ByteType |
+          _: org.apache.spark.sql.types.DateType =>
+      case _ => return false
+    }
+    uniqueByColumn.computeIfAbsent(ordinal, _ => java.lang.Boolean.valueOf(computeUnique(ordinal))).booleanValue()
+  }
+
+  private def computeUnique(ordinal: Int): Boolean = {
+    var keys = new Array[Long](math.max(16, math.min(numRows, Int.MaxValue - 8).toInt))
+    var n = 0
+    val isLong = types(ordinal).isInstanceOf[org.apache.spark.sql.types.LongType]
+    val it = batches()
+    while (it.hasNext) {
+      val b = it.next()
+      val v = b.column(ordinal)
+      var r = 0
+      val rows = b.numRows()
+      while (r < rows) {
+        if (!v.isNullAt(r)) {
+          if (n == keys.length) keys = java.util.Arrays.copyOf(keys, keys.length * 2)
+          keys(n) = types(ordinal) match {
+            case _: org.apache.spark.sql.types.ShortType => v.getShort(r).toLong
+            case _: org.apache.spark.sql.types.ByteType => v.getByte(r).toLong
+            case _ => if (isLong) v.getLong(r) else v.getInt(r).toLong
+          }
+          n += 1
+        }
+        r += 1
+      }
+    }
+    java.util.Arrays.sort(keys, 0, n)
+    var i = 1
+    while (i < n) {
+      if (keys(i) == keys(i - 1)) return false
+      i += 1
+    }
+    true
+  }
+
   /**
    * Every batch of every stream, as the operators' column vectors. Each batch is closed when the next
    * one is taken or the iterator is exhausted, so a consumer copies what it keeps (the build table does).
@@ -101,6 +153,9 @@ final class VectorBroadcastBatches(
 }
 
 object VectorBroadcastBatches {
+
+  /** Above this many rows `keysUnique` answers false without looking (the sort's cost and memory). */
+  val MaxUniqueCheckRows: Long = 16L << 20
 
   private def toBatch(
       root: VectorSchemaRoot,

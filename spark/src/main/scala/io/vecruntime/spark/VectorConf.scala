@@ -75,6 +75,12 @@ object VectorConf {
   val AggregateBelowJoinMinReduction = "spark.vecruntime.optimizer.aggregateBelowJoin.minReduction"
 
   /**
+   * Adaptive rewrite (#635): grouping keys that are columns of a broadcast join's build side are dropped
+   * when that side's join key is unique at run time and is itself a grouping key.
+   */
+  val RemoveRedundantGroupKeysEnabled = "spark.vecruntime.optimizer.removeRedundantGroupKeys.enabled"
+
+  /**
    * Logical rewrite (#641): a runtime bloom filter on a shuffle join's much larger side, built from the other
    * side (a fact from a smaller fact), where Spark's own runtime filter needs a selective filtered scan.
    */
@@ -599,6 +605,10 @@ object VectorConf {
   /** AggregateBelowJoin's required reduction, at least 1 (default 4). */
   def aggregateBelowJoinMinReduction(conf: SQLConf): Double =
     math.max(1.0, conf.getConfString(AggregateBelowJoinMinReduction, "4").trim.toDouble)
+
+  /** Dropping grouping keys a unique broadcast key determines (#635); also off when the plugin is off. */
+  def removeRedundantGroupKeysEnabled(conf: SQLConf): Boolean =
+    isEnabled(conf) && bool(conf, RemoveRedundantGroupKeysEnabled, default = true)
 
   /** The fact-to-fact bloom filter (#641); also off when the plugin is off. */
   def factBloomFilterEnabled(conf: SQLConf): Boolean =

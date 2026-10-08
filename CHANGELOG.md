@@ -17,6 +17,10 @@ version may change configuration keys or defaults, always noted here.
 - Every artifact names its Spark line: `vecruntime-kernels_<line>`, `vecruntime-spark_<line>_2.13`,
   `vecruntime-shuffle_<line>_2.13` (and `vecruntime-benchmarks_<line>`, `vecruntime-iceberg-bridge_<line>_2.13`,
   `vecruntime-spark-sql-tests_<line>_2.13`), with `<line>` 4.1 or 4.2 (#639).
+- Redundant grouping keys removed at run time (`spark.vecruntime.optimizer.removeRedundantGroupKeys.enabled`, on):
+  when a built broadcast's single integral join key turns out unique and is grouped by (or its equal stream key
+  is), the aggregate stops grouping by the broadcast side's other columns -- q23a/b's `substr(i_item_desc, 1, 30)`
+  key (#635, EMR's `AQERemoveRedundantGroupKeys`).
 
 - `FactBloomFilter` run-time evidence (`spark.vecruntime.optimizer.factBloomFilter.runtimeEvidence`, on): the
   filter's build counts the creation side's actual rows and declines -- a null filter that keeps every row --
