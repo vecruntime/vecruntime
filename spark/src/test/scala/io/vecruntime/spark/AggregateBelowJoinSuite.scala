@@ -137,4 +137,65 @@ class AggregateBelowJoinSuite extends VectorQuerySuite {
     val df = withConf(VectorConf.AggregateBelowJoinEnabled -> "false")(run(q4Shape))
     assert(!preAggregated(df.queryExecution.optimizedPlan), df.queryExecution.optimizedPlan.treeString)
   }
+
+  // q4/q11/q74 at 1 TB (#675): the year CTE is read twice, each copy pruned to its year by dynamic partition
+  // pruning on the date-partitioned fact. A pre-aggregate that loses that pruning reads the whole fact for both
+  // copies (q4: 5.05 G input rows against 1.97 G); the result is the same, so only the scans show it.
+  private val yearCte =
+    """WITH year_total AS (
+      |  SELECT c_id, d_year, sum(s_amount) total
+      |  FROM abj_psales JOIN abj_customer ON s_cust = c_sk JOIN abj_date ON s_date = d_sk
+      |  GROUP BY c_id, d_year)
+      |SELECT t1.c_id, t1.total, t2.total FROM year_total t1 JOIN year_total t2 ON t1.c_id = t2.c_id
+      |WHERE t1.d_year = 2000 AND t2.d_year = 2001""".stripMargin
+
+  /** The fact scans of the final plan: (partition filters hold a dynamic pruning filter, files read). */
+  private def factScans(df: DataFrame): Seq[(Boolean, Long)] = {
+    val scans = new scala.collection.mutable.ArrayBuffer[org.apache.spark.sql.execution.FileSourceScanExec]()
+    def walk(p: org.apache.spark.sql.execution.SparkPlan): Unit = {
+      p match {
+        case a: org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanExec => walk(a.executedPlan)
+        case s: org.apache.spark.sql.execution.adaptive.QueryStageExec => walk(s.plan)
+        case v: org.apache.spark.sql.vecruntime.VectorParquetScanExec => scans += v.scan
+        case f: org.apache.spark.sql.execution.FileSourceScanExec => scans += f
+        case _ =>
+      }
+      p.children.foreach(walk)
+      p.subqueries.foreach(walk)
+    }
+    walk(df.queryExecution.executedPlan)
+    scans.toSeq.filter(_.tableIdentifier.exists(_.table == "abj_psales")).map { s =>
+      val dpp = s.partitionFilters.exists(
+        _.exists(_.isInstanceOf[org.apache.spark.sql.catalyst.expressions.DynamicPruningExpression])
+      )
+      (dpp, s.metrics.get("numFiles").map(_.value).getOrElse(-1L))
+    }
+  }
+
+  test("without statistics, a pre-aggregate keeps the dynamic partition pruning of each year copy (#675)") {
+    val session = spark
+    import session.implicits._
+    try {
+      spark.read.parquet(
+        newTempPath("abj/sales")
+      ).write.mode("overwrite").partitionBy("s_date").saveAsTable("abj_psales")
+      val off = withConf(VectorConf.AggregateBelowJoinEnabled -> "false") { val d = spark.sql(yearCte); d.collect(); d }
+      val on = withConf(VectorConf.AggregateBelowJoinRequireStatistics -> "false")(run(yearCte))
+      assertRowsEqual(off.collect(), on.collect(), 1e-9, yearCte)
+      assert(preAggregated(on.queryExecution.optimizedPlan), on.queryExecution.optimizedPlan.treeString)
+      val (before, after) = (factScans(off), factScans(on))
+      assert(before.nonEmpty && before.forall(_._1), s"the reference plan prunes each copy: $before")
+      assert(
+        after.size == before.size && after.forall(_._1),
+        s"rule off $before, rule on $after\n${on.queryExecution.executedPlan}"
+      )
+      assert(after.map(_._2).sum == before.map(_._2).sum, s"files read: rule off $before, rule on $after")
+    } finally {
+      spark.sessionState.catalog.dropTable(
+        org.apache.spark.sql.catalyst.TableIdentifier("abj_psales"),
+        ignoreIfNotExists = true,
+        purge = false
+      )
+    }
+  }
 }
