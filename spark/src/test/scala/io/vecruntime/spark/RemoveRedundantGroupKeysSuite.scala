@@ -54,7 +54,8 @@ class RemoveRedundantGroupKeysSuite extends VectorQuerySuite with AdaptiveSparkP
   /** The grouping-key counts of every aggregate in the final adaptive plan (inside query stages too). */
   private def aggregateKeyCounts(df: DataFrame): Seq[Int] =
     collect(df.queryExecution.executedPlan) {
-      case node if node.getClass.getSimpleName.contains("Aggregate") &&
+      case node
+          if node.getClass.getSimpleName.contains("Aggregate") &&
             node.getClass.getMethods.exists(m => m.getName == "groupingExpressions" && m.getParameterCount == 0) =>
         node.getClass.getMethod("groupingExpressions").invoke(node).asInstanceOf[Seq[_]].size
     }

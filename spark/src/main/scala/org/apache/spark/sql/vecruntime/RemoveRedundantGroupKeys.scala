@@ -113,7 +113,8 @@ case class RemoveRedundantGroupKeys(session: SparkSession) extends Rule[LogicalP
           case al @ Alias(at: Attribute, _) if d.determinants.contains(at) => al.toAttribute
         }
         val dependents = list.collect {
-          case ne if ne.deterministic && ne.references.nonEmpty && ne.references.subsetOf(d.dependents ++ d.determinants) =>
+          case ne
+              if ne.deterministic && ne.references.nonEmpty && ne.references.subsetOf(d.dependents ++ d.determinants) =>
             ne.toAttribute
         }
         if (dets.isEmpty) None else Some(Dependency(AttributeSet(dets), AttributeSet(dependents)))
