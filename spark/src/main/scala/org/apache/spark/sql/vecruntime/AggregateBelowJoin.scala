@@ -190,11 +190,12 @@ case class AggregateBelowJoin(session: SparkSession) extends Rule[LogicalPlan] w
   }
 
   /**
-   * Evidence that grouping `f` by `keys` removes rows: statistics put the number of groups -- the product of
-   * the keys' distinct counts, an upper bound -- at most `1 / minReduction` of the base relation's rows. Without
-   * statistics, or when the keys are nearly unique together, the pre-aggregate would add a stage and a shuffle
-   * and save the joins little: at 1 TB, TPC-DS q4, q11 and q74's `(customer_sk, sold_date_sk)` keys made them
-   * 34-104 % slower, so the rule declines.
+   * Optional evidence that grouping `f` by `keys` removes rows: with `minReduction` > 0, statistics must put the
+   * number of groups -- the product of the keys' distinct counts, an upper bound -- at most `1 / minReduction`
+   * of the base relation's rows; with `requireStatistics`, a fact without statistics is declined. Both are off by
+   * default (#675): at 1 TB they declined only queries the pre-aggregate speeds up (q4, q11, q74: 35-52 %
+   * faster), since the product of distinct counts ignores how the keys correlate. The 34-104 % slowdown that
+   * once justified them was lost partition pruning, which `factSubtree` fixes.
    */
   private def reduces(f: LogicalPlan, keys: Seq[Attribute]): Boolean = {
     val minReduction = VectorConf.aggregateBelowJoinMinReduction(session.sessionState.conf)

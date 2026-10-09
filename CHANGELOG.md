@@ -80,6 +80,11 @@ version may change configuration keys or defaults, always noted here.
 
 ### Fixed
 
+- `AggregateBelowJoin` keeps the fact's partition pruning (#675): the pre-aggregate went between the fact's scan
+  and its filters, so the dynamic pruning filter applied to the aggregate's output and the scan read every
+  partition (q4 at 1 TB without statistics: 5.05 G rows instead of 1.97 G). It now aggregates the fact's whole
+  subtree, its filters included; at 1 TB without statistics q4 -52 %, q11 -49 %, q74 -37 %, q23a -37 %, q23b -35 %
+  with the rule allowed to fire.
 - The hash tables' per-thread scratch (`GroupKeyTable`'s key mirrors, probe keys and dictionary-id maps) is released
   at the end of every task: it no longer keeps the last batch, dictionary and table, nor the arrays a build side or
   a large aggregate grew it to, into the thread's next task and query. After TPC-DS SF10 on `local[8]` the live
@@ -100,6 +105,13 @@ version may change configuration keys or defaults, always noted here.
   a fine key). The filtered function now sees every batch, with the failing rows cleared.
 
 ### Changed
+
+- `AggregateBelowJoin` no longer needs evidence of reduction (#675): `spark.vecruntime.optimizer.aggregateBelowJoin.minReduction`
+  defaults to `0` (was `4`) and the new `...aggregateBelowJoin.requireStatistics` to `false`, so the rule fires on
+  structure, with or without statistics. Both guards came from a 1 TB measurement whose slowdown was lost partition
+  pruning (fixed above); at 1 TB they declined only queries the rule speeds up. Without statistics q4 -52 %, q11
+  -49 %, q74 -37 %, q23a -37 %, q23b -35 % (nine queries -23.7 %); with statistics q4 -50 %, q11 -48 %, q74 -35 %,
+  q23a -12 %, q23b -13 % (-14.0 %); identical results.
 
 - The Iceberg suites moved to `spark/src/test/iceberg`, added only by `-Piceberg`: a build without it now
   compiles its tests (#639).

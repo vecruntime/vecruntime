@@ -125,10 +125,25 @@ class AggregateBelowJoinSuite extends VectorQuerySuite {
     assert(!preAggregated(both.queryExecution.optimizedPlan), both.queryExecution.optimizedPlan.treeString)
   }
 
-  test("declined without statistics, or when the keys reduce the fact's rows less than minReduction") {
+  test("by default fires without statistics and without a reduction estimate (#675)") {
+    val q = q4Shape.replace("abj_sales", "abj_sales_nostats")
+    val off = withConf(VectorConf.AggregateBelowJoinEnabled -> "false") { val d = spark.sql(q); d.collect(); d }
+    val noStats = run(q)
+    assert(preAggregated(noStats.queryExecution.optimizedPlan), noStats.queryExecution.optimizedPlan.treeString)
+    assertRowsEqual(off.collect(), noStats.collect(), 1e-9, q)
+    // With statistics, no reduction is required unless minReduction asks for one.
+    val withStats = run(q4Shape)
+    assert(preAggregated(withStats.queryExecution.optimizedPlan), withStats.queryExecution.optimizedPlan.treeString)
+  }
+
+  test("declined without statistics, or when the keys reduce the fact's rows less than minReduction, if asked") {
     // 30000 sales rows, at most 200 x 30 = 6000 (customer, date) groups: a 5x reduction.
-    val noStats = run(q4Shape.replace("abj_sales", "abj_sales_nostats"))
+    val noStats = withConf(VectorConf.AggregateBelowJoinRequireStatistics -> "true")(
+      run(q4Shape.replace("abj_sales", "abj_sales_nostats"))
+    )
     assert(!preAggregated(noStats.queryExecution.optimizedPlan), noStats.queryExecution.optimizedPlan.treeString)
+    val enough = withConf(VectorConf.AggregateBelowJoinMinReduction -> "4")(run(q4Shape))
+    assert(preAggregated(enough.queryExecution.optimizedPlan), enough.queryExecution.optimizedPlan.treeString)
     val strict = withConf(VectorConf.AggregateBelowJoinMinReduction -> "10")(run(q4Shape))
     assert(!preAggregated(strict.queryExecution.optimizedPlan), strict.queryExecution.optimizedPlan.treeString)
   }
@@ -180,7 +195,7 @@ class AggregateBelowJoinSuite extends VectorQuerySuite {
         newTempPath("abj/sales")
       ).write.mode("overwrite").partitionBy("s_date").saveAsTable("abj_psales")
       val off = withConf(VectorConf.AggregateBelowJoinEnabled -> "false") { val d = spark.sql(yearCte); d.collect(); d }
-      val on = withConf(VectorConf.AggregateBelowJoinRequireStatistics -> "false")(run(yearCte))
+      val on = run(yearCte)
       assertRowsEqual(off.collect(), on.collect(), 1e-9, yearCte)
       assert(preAggregated(on.queryExecution.optimizedPlan), on.queryExecution.optimizedPlan.treeString)
       val (before, after) = (factScans(off), factScans(on))
