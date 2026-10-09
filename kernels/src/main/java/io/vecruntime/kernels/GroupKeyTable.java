@@ -1150,6 +1150,85 @@ public final class GroupKeyTable {
             }
             return;
         }
+        if (slots.length < PROBE_BATCH_SLOTS) {
+            // In cache the two passes only add work (JMH, 4K groups: 9 -> 13.5 ns per row); probe row by row.
+            assignFastRows(b, n, hashes, outIds);
+            return;
+        }
+        // Batched probing: for PROBE_BATCH rows, first read each row's home slot (independent loads, so their
+        // cache misses overlap), then resolve the rows in order. Only a hit in the home slot is taken from the
+        // first pass -- a group's id never changes, so it stays right even if a later row of the same batch
+        // inserts or the table grows; anything else (empty slot, other key, collision chain) goes the full way,
+        // which now finds the home slot's line in cache.
+        int[] hit = probeHits;
+        if (types.length == 2) {
+            int[] k0 = b.ints[0];
+            int[] k1 = b.ints[1];
+            for (int i0 = 0; i0 < n; i0 += PROBE_BATCH) {
+                int end = Math.min(n, i0 + PROBE_BATCH);
+                long[] f = fast;
+                int m = mask;
+                for (int i = i0; i < end; i++) {
+                    long key = ((long) k0[i] << 32) | (k1[i] & 0xFFFFFFFFL);
+                    int p = HashKernels.finish(hashes[i]) & m;
+                    hit[i - i0] = f[2 * p] == key ? (int) f[2 * p + 1] : -1;
+                }
+                for (int i = i0; i < end; i++) {
+                    int g = hit[i - i0];
+                    outIds[i] = g >= 0 ? g : fastLookupOrInsert(((long) k0[i] << 32) | (k1[i] & 0xFFFFFFFFL), HashKernels.finish(hashes[i]), k0[i], k1[i],
+                            0L);
+                }
+            }
+        } else if (types[0] == VecType.INT32) {
+            int[] k0 = b.ints[0];
+            for (int i0 = 0; i0 < n; i0 += PROBE_BATCH) {
+                int end = Math.min(n, i0 + PROBE_BATCH);
+                long[] f = fast;
+                int m = mask;
+                for (int i = i0; i < end; i++) {
+                    int p = HashKernels.finish(hashes[i]) & m;
+                    hit[i - i0] = f[2 * p] == k0[i] ? (int) f[2 * p + 1] : -1;
+                }
+                for (int i = i0; i < end; i++) {
+                    int g = hit[i - i0];
+                    outIds[i] = g >= 0 ? g : fastLookupOrInsert(k0[i], HashKernels.finish(hashes[i]), k0[i], 0, 0L);
+                }
+            }
+        } else {
+            long[] k0 = b.longs[0];
+            for (int i0 = 0; i0 < n; i0 += PROBE_BATCH) {
+                int end = Math.min(n, i0 + PROBE_BATCH);
+                long[] f = fast;
+                int m = mask;
+                for (int i = i0; i < end; i++) {
+                    int p = HashKernels.finish(hashes[i]) & m;
+                    hit[i - i0] = f[2 * p] == k0[i] ? (int) f[2 * p + 1] : -1;
+                }
+                for (int i = i0; i < end; i++) {
+                    int g = hit[i - i0];
+                    outIds[i] = g >= 0 ? g : fastLookupOrInsert(k0[i], HashKernels.finish(hashes[i]), 0, 0, k0[i]);
+                }
+            }
+        }
+    }
+
+    /**
+     * Rows whose home slots {@link #assignFast} reads before resolving any of
+     * them.
+     */
+    private static final int PROBE_BATCH = 16;
+
+    /**
+     * Slot count from which {@link #assignFast} probes in batches: 64K slots is
+     * 1 MiB of {@link #fast}, past which a probe usually misses the cache.
+     */
+    static final int PROBE_BATCH_SLOTS = 1 << 16;
+
+    private final int[] probeHits = new int[PROBE_BATCH];
+
+    /** {@link #assignFast} for a table still in cache: one probe per row. */
+    private void assignFastRows(Bound b, int n, int[] hashes,
+            int[] outIds) {
         if (types.length == 2) {
             int[] k0 = b.ints[0];
             int[] k1 = b.ints[1];
@@ -1532,8 +1611,21 @@ public final class GroupKeyTable {
         return bytes;
     }
 
+    /**
+     * Slot count from which an inline-key table grows by four instead of two
+     * (#677): a partial aggregate over a million new groups per task rehashed
+     * ~20 times, each a pass of random writes over both slot arrays (~6% of
+     * q23a's {@code frequent_ss_items} stage at 1 TB). Growing by four halves
+     * the number of passes once the table is out of cache, for at most twice
+     * the slot memory at the step.
+     */
+    static final int FAST_GROW4_SLOTS = 1 << 17;
+
     private void rehash() {
-        int[] newSlots = new int[slots.length * 2];
+        int grow = fast != null && slots.length >= FAST_GROW4_SLOTS
+                ? 4
+                : 2;
+        int[] newSlots = new int[slots.length * grow];
         Arrays.fill(newSlots, -1);
         int newMask = newSlots.length - 1;
         long[] newFast = fast == null ? null : emptyFast(newSlots.length);

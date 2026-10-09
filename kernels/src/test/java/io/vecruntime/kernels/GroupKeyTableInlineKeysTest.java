@@ -75,7 +75,10 @@ class GroupKeyTableInlineKeysTest {
         "INT32, 2, validBitmap",
         "INT64, 1, validBitmap",
         "INT32, 1, selectedNoNulls",
-        "INT32, 2, selectedNoNulls"
+        "INT32, 2, selectedNoNulls",
+        // Past FAST_GROW4_SLOTS, where the table grows by four, with batched probes across those steps.
+        "INT32, 1, large",
+        "INT64, 1, large"
     })
     void groupsMatchTheReference(VecType t, int keys, String twist) {
         VecType[] types = keys == 2 ? new VecType[] {t, t} : new VecType[] {t};
@@ -83,7 +86,7 @@ class GroupKeyTableInlineKeysTest {
         Map<List<Long>, Integer> reference = new HashMap<>();
         Map<Integer, List<Long>> keyOfGroup = new HashMap<>();
         Random rnd = new Random(677 + keys * 31 + twist.hashCode());
-        int distinct = 30_000;
+        int distinct = twist.equals("large") ? 400_000 : 30_000;
         try (Arena arena = Arena.ofConfined()) {
             for (int b = 0; b < 40; b++) {
                 int n = b % 7 == 3 ? 17 : 4096;
