@@ -4,7 +4,7 @@
 
   <groupId>io.github.vecruntime</groupId>
   <artifactId>vecruntime-parent</artifactId>
-  <version>0.0.7-SNAPSHOT</version>
+  <version>0.0.7</version>
   <packaging>pom</packaging>
   <name>vecruntime</name>
   <description>JVM SIMD (Java Vector API) execution layer for Spark SQL</description>
