@@ -199,6 +199,14 @@ private[vecruntime] class VectorSortMergeJoinIterator(
   private val leftOuter = joinType == LeftOuter || joinType == FullOuter
   private val rightOuter = joinType == RightOuter || joinType == FullOuter
   private val leftOnly = joinType match { case LeftSemi | LeftAnti | _: ExistenceJoin => true; case _ => false }
+
+  /**
+   * A left-only join with no condition only asks whether an equal right run exists (#688): a left run
+   * facing one is matched as a whole, without visiting the right run's rows, and a right run spanning
+   * batches keeps only its key (one row) instead of a copy of every column. Walking the right run per
+   * left row cost q14a's INTERSECT 182 s in one task at 3 TB (~5 k left rows against a 30 M-row run).
+   */
+  private val existenceOnly = leftOnly && spec.condition.isEmpty
   private val numKeys = spec.leftKeys.length
   private val ascending = Array.fill(numKeys)(true)
   private val nullsFirst = Array.fill(numKeys)(true)
@@ -304,6 +312,25 @@ private[vecruntime] class VectorSortMergeJoinIterator(
     }
     val arena =
       Arena.ofConfined() // consumed on the task thread; a shared arena's close is a handshake with every thread, ruinous per run
+    if (existenceOnly) {
+      // Only the run's key is read (compareRuns, keyIsNull): keep its first row and pass over the
+      // rest of the run, batch after batch, without copying it.
+      val keyBuilders = rightRows.keys.map(k => new ColumnBuilder(arena, k.`type`(), 1))
+      val first = rangeSelection(rightRows.arena, rightRows.rows, from, from + 1)
+      var k = 0
+      while (k < keyBuilders.length) { keyBuilders(k).append(rightRows.keys(k), first, 1); k += 1 }
+      var rows = 0
+      var more = true
+      while (more) {
+        rows += to - from
+        rightRunIdx += 1
+        more = to == rightRows.rows && ensureRightBatch() && sameKey(keyBuilders, rightRows)
+        if (more) { from = 0; to = rightRows.runStarts(1) }
+      }
+      current.setCopy(Array.empty[VectorBuffers], keyBuilders.map(_.view()), rows, arena)
+      haveRun = true
+      return true
+    }
     val builders = rightRows.columns.map(c => new ColumnBuilder(arena, c.`type`(), to - from))
     val keyBuilders = rightRows.keys.map(k => new ColumnBuilder(arena, k.`type`(), to - from))
     var rows = 0
@@ -498,6 +525,11 @@ private[vecruntime] class VectorSortMergeJoinIterator(
    * batch; a wider right run spreads one left row over several chunks.
    */
   private def emitRun(left: SortedRows, from: Int, to: Int, right: RunCursor, leftMatched: MemorySegment): Unit = {
+    if (existenceOnly) {
+      // An equal right run exists: every left row of the run matches, whatever the run's length.
+      Bitmap.fillRange(leftMatched, from, to - from, true)
+      return
+    }
     val perRow = right.rows
     if (spec.condition.isDefined && (to - from).toLong * perRow <= OutputBatchSize) {
       // A short run under a condition: its pairs join the candidate buffer and are gathered and
