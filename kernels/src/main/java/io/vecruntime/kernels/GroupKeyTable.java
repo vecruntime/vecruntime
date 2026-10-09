@@ -349,8 +349,8 @@ public final class GroupKeyTable {
             HashKernels.mixColumn(key, hashes);
         }
         Bound b = Bound.of(keys, ids);
-        if (selection == null && fast != null && b.noNulls()) {
-            assignFast(b, n, hashes, outIds);
+        if (fast != null && b.noNulls(n, selection)) {
+            assignFast(b, n, hashes, outIds, selection);
             return size;
         }
         if (selection == null) {
@@ -551,13 +551,28 @@ public final class GroupKeyTable {
         }
 
         /**
-         * Whether no bound key column has a validity bitmap, so no row of the
-         * batch has a null key.
+         * Whether no row of the first {@code n} of the batch -- of those set in
+         * {@code selection}, when there is one -- has a null key. A nullable
+         * Parquet column carries a validity bitmap whether or not it holds a
+         * null, and a filtered batch can reach the aggregate as its columns
+         * plus a selection: the selected rows' bits decide, not the bitmap's
+         * presence (#677).
          */
-        boolean noNulls() {
+        boolean noNulls(int n, MemorySegment selection) {
+            int words = Bitmap.wordsFor(n);
             for (int c = 0; c < count; c++) {
-                if (validWords[c] != null) {
-                    return false;
+                long[] w = validWords[c];
+                if (w == null) {
+                    continue;
+                }
+                for (int i = 0; i < words; i++) {
+                    long need = selection == null ? -1L : Bitmap.wordAt(selection, i, n);
+                    if (i == words - 1 && (n & 63) != 0) {
+                        need &= (1L << (n & 63)) - 1;
+                    }
+                    if ((w[i] & need) != need) {
+                        return false;
+                    }
                 }
             }
             return true;
@@ -1076,6 +1091,14 @@ public final class GroupKeyTable {
     // ------------------------------------------------------------------ inline integer keys (#677)
 
     /**
+     * Package-private, for the tests: whether the table still probes its keys
+     * inline.
+     */
+    boolean inlineKeys() {
+        return fast != null;
+    }
+
+    /**
      * Whether {@code types} can be kept packed in {@link #fast}: one or two
      * INT32, or one INT64.
      */
@@ -1111,7 +1134,22 @@ public final class GroupKeyTable {
      * group id. One loop per key shape, so each stays monomorphic.
      */
     private void assignFast(Bound b, int n, int[] hashes,
-                            int[] outIds) {
+                            int[] outIds, MemorySegment selection) {
+        if (selection != null) {
+            // Unselected rows get -1 and never create a group; the selected ones go the same way below.
+            Arrays.fill(outIds, 0, n, -1);
+            for (int w = 0, words = Bitmap.wordsFor(n);
+                 w < words;
+                 w++) {
+                long bits = Bitmap.wordAt(selection, w, n);
+                while (bits != 0L) {
+                    int i = (w << 6) + Long.numberOfTrailingZeros(bits);
+                    bits &= bits - 1;
+                    outIds[i] = fastRow(b, i, HashKernels.finish(hashes[i]));
+                }
+            }
+            return;
+        }
         if (types.length == 2) {
             int[] k0 = b.ints[0];
             int[] k1 = b.ints[1];
@@ -1130,6 +1168,22 @@ public final class GroupKeyTable {
                 outIds[i] = fastLookupOrInsert(k0[i], HashKernels.finish(hashes[i]), 0, 0, k0[i]);
             }
         }
+    }
+
+    /** One row of a selected batch on the inline path. */
+    private int fastRow(Bound b, int i, int hash) {
+        if (types.length == 2) {
+            int x = b.ints[0][i];
+            int y = b.ints[1][i];
+            return fastLookupOrInsert(((long) x << 32) | (y & 0xFFFFFFFFL),
+                    hash, x, y, 0L);
+        }
+        if (types[0] == VecType.INT32) {
+            int x = b.ints[0][i];
+            return fastLookupOrInsert(x, hash, x, 0, 0L);
+        }
+        long l = b.longs[0][i];
+        return fastLookupOrInsert(l, hash, 0, 0, l);
     }
 
     /**

@@ -64,9 +64,19 @@ class GroupKeyTableInlineKeysTest {
 
     @ParameterizedTest
     @CsvSource({
-        "INT32, 1, none", "INT32, 2, none", "INT64, 1, none",
-        "INT32, 1, nullsLater", "INT32, 2, nullsLater", "INT64, 1, nullsLater",
-        "INT32, 2, selection"})
+        "INT32, 1, none",
+        "INT32, 2, none",
+        "INT64, 1, none",
+        "INT32, 1, nullsLater",
+        "INT32, 2, nullsLater",
+        "INT64, 1, nullsLater",
+        "INT32, 2, selection",
+        "INT32, 1, validBitmap",
+        "INT32, 2, validBitmap",
+        "INT64, 1, validBitmap",
+        "INT32, 1, selectedNoNulls",
+        "INT32, 2, selectedNoNulls"
+    })
     void groupsMatchTheReference(VecType t, int keys, String twist) {
         VecType[] types = keys == 2 ? new VecType[] {t, t} : new VecType[] {t};
         GroupKeyTable table = new GroupKeyTable(types);
@@ -77,15 +87,19 @@ class GroupKeyTableInlineKeysTest {
         try (Arena arena = Arena.ofConfined()) {
             for (int b = 0; b < 40; b++) {
                 int n = b % 7 == 3 ? 17 : 4096;
-                boolean withNulls = twist.equals("nullsLater") && b == 25;
-                boolean withSelection = twist.equals("selection") && b % 5 == 4;
+                // selectedNoNulls: an IS NOT NULL filter's output -- nulls only in rows the selection drops.
+                boolean filtered = twist.equals("selectedNoNulls");
+                boolean withNulls = (twist.equals("nullsLater") && b == 25) || filtered;
+                boolean withSelection = (twist.equals("selection") && b % 5 == 4) || filtered;
                 long[][] v = new long[keys][n];
                 boolean[][] nul = new boolean[keys][];
                 for (int c = 0; c < keys; c++) {
                     nul[c] = withNulls ? new boolean[n] : null;
                     for (int i = 0; i < n; i++) {
                         v[c][i] = value(rnd, t, distinct);
-                        if (withNulls && rnd.nextInt(5) == 0) {
+                        if (withNulls
+                                && rnd.nextInt(5) == 0
+                                && (!filtered || i % 3 == 0)) {
                             nul[c][i] = true;
                             v[c][i] = 0;
                         }
@@ -101,6 +115,11 @@ class GroupKeyTableInlineKeysTest {
                 VectorBuffers[] cols = new VectorBuffers[keys];
                 for (int c = 0; c < keys; c++) {
                     cols[c] = column(arena, t, v[c], nul[c]);
+                    if (twist.equals("validBitmap") && nul[c] == null) {
+                        // A nullable column with no null: the bitmap is there, every bit set.
+                        int[] all = java.util.stream.IntStream.range(0, n).toArray();
+                        cols[c] = SegmentVectorBuffers.fixedWidth(t, n, ArrowLayout.selectionFromIndices(arena, all, n, n), cols[c].data());
+                    }
                 }
                 MemorySegment selection = null;
                 boolean[] selected = new boolean[n];
@@ -152,6 +171,8 @@ class GroupKeyTableInlineKeysTest {
                 }
             }
         }
+        // The inline path stays on unless a null key group was created.
+        assertEquals(!twist.equals("nullsLater"), table.inlineKeys(), "inline keys after " + twist);
         // Every group's stored key is the tuple it was created for.
         for (Map.Entry<Integer, List<Long>> e : keyOfGroup.entrySet()) {
             int gid = e.getKey();
