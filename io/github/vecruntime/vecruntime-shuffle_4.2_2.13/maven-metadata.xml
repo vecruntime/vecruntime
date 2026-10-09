@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <metadata>
   <groupId>io.github.vecruntime</groupId>
-  <artifactId>vecruntime-parent</artifactId>
+  <artifactId>vecruntime-shuffle_4.2_2.13</artifactId>
   <versioning>
     <release>0.0.7</release>
     <versions>

@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd" xmlns="http://maven.apache.org/POM/4.0.0"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>io.github.vecruntime</groupId>
+  <artifactId>vecruntime-parent</artifactId>
+  <version>0.0.7</version>
+  <packaging>pom</packaging>
+  <name>vecruntime</name>
+  <description>JVM SIMD (Java Vector API) execution layer for Spark SQL</description>
+  <url>https://github.com/vecruntime/vecruntime</url>
+  <licenses>
+    <license>
+      <name>Apache License, Version 2.0</name>
+      <url>https://www.apache.org/licenses/LICENSE-2.0.txt</url>
+    </license>
+  </licenses>
+  <scm>
+    <connection>scm:git:https://github.com/vecruntime/vecruntime.git</connection>
+    <developerConnection>scm:git:git@github.com:vecruntime/vecruntime.git</developerConnection>
+    <url>https://github.com/vecruntime/vecruntime</url>
+  </scm>
+</project>

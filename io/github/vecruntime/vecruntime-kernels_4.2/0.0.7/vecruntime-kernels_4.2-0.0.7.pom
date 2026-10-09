@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd" xmlns="http://maven.apache.org/POM/4.0.0"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>io.github.vecruntime</groupId>
+  <artifactId>vecruntime-kernels_4.2</artifactId>
+  <version>0.0.7</version>
+  <name>vecruntime-kernels</name>
+  <description>Java Vector API kernels over Arrow-layout MemorySegment buffers (no Spark dependency)</description>
+  <url>https://github.com/vecruntime/vecruntime/vecruntime-kernels_4.2</url>
+  <licenses>
+    <license>
+      <name>Apache License, Version 2.0</name>
+      <url>https://www.apache.org/licenses/LICENSE-2.0.txt</url>
+    </license>
+  </licenses>
+  <scm>
+    <connection>scm:git:https://github.com/vecruntime/vecruntime.git/vecruntime-kernels_4.2</connection>
+    <developerConnection>scm:git:git@github.com:vecruntime/vecruntime.git/vecruntime-kernels_4.2</developerConnection>
+    <url>https://github.com/vecruntime/vecruntime/vecruntime-kernels_4.2</url>
+  </scm>
+</project>
