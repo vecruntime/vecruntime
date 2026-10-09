@@ -1,6 +1,6 @@
 title: vecruntime
 description: >-
-  A vectorized execution runtime for Apache Spark using Java
+  A vectorized execution runtime for Apache Spark SQL using Java
 # GitHub Pages serves this project site under /vecruntime.
 baseurl: "/vecruntime"
 url: "https://vecruntime.github.io"
@@ -34,8 +34,12 @@ nav:
         url: /expressions.html
       - title: Compatibility matrix
         url: /compatibility.html
+      - title: Running and tuning
+        url: /running.html
       - title: Configuration reference
         url: /configuration.html
+      - title: How it works
+        url: /how-it-works.html
       - title: Comet as the scan
         url: /comet.html
       - title: Apache Iceberg
@@ -46,6 +50,8 @@ nav:
     items:
       - title: Testing & correctness
         url: /testing.html
+      - title: Running the benchmarks
+        url: /benchmarking.html
   - section: Benchmarks
     items:
       - title: Results (lab notebook)

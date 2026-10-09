@@ -169,7 +169,7 @@ These matter only with Comet's jar on the classpath; see `docs/comet.md`.
   Flight server's buffers are Arrow direct memory, bounded by `-XX:MaxDirectMemorySize`, which
   defaults to the heap size: set it to the executor's memory overhead less what the JVM itself needs
   (the 1 TB campaign ran a 30 GB heap and 20 GB of overhead per 13-core executor, the cluster
-  manifests setting the bound to the overhead less 2 GB; see "Memory tuning" in `README.md`).
+  manifests setting the bound to the overhead less 2 GB; see [Memory tuning](running.html#memory-tuning)).
 - **Registering the plugin.** `spark.plugins=io.vecruntime.spark.VectorPlugin` registers the
   session extension and attaches the UI tab; alternatively
   `spark.sql.extensions=io.vecruntime.spark.VectorSparkSessionExtensions` injects the planner
@@ -186,4 +186,4 @@ These matter only with Comet's jar on the classpath; see `docs/comet.md`.
 - **Kernel tuning knobs** are JVM system properties, not Spark confs, because the kernels have no
   Spark dependency: `vecruntime.vectorBits`, `vecruntime.platform`, `vecruntime.agg.interleave`,
   `vecruntime.agg.maskPathMaxGroups`, `vecruntime.selection.minFraction`,
-  `vecruntime.agg.plainDictMaxEntries`; `README.md` describes each.
+  `vecruntime.agg.plainDictMaxEntries`; [Running and tuning](running.html) describes each.

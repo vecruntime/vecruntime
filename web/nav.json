@@ -1,7 +1,7 @@
 {
   "site": {
     "title": "VecRuntime",
-    "description": "A vectorized execution runtime for Apache Spark using Java",
+    "description": "A vectorized execution runtime for Apache Spark SQL using Java",
     "repo_url": "https://github.com/vecruntime/vecruntime",
     "baseurl": "/vecruntime"
   },
@@ -18,7 +18,9 @@
         { "title": "Supported operators", "url": "/operators.html" },
         { "title": "Supported expressions", "url": "/expressions.html" },
         { "title": "Compatibility matrix", "url": "/compatibility.html" },
+        { "title": "Running and tuning", "url": "/running.html" },
         { "title": "Configuration reference", "url": "/configuration.html" },
+        { "title": "How it works", "url": "/how-it-works.html" },
         { "title": "Planner rules (AQE, DPP)", "url": "/aqe-dpp-rules.html" },
         { "title": "Comet as the scan", "url": "/comet.html" },
         { "title": "Apache Iceberg", "url": "/iceberg.html" },
@@ -29,7 +31,8 @@
     {
       "section": "Testing",
       "items": [
-        { "title": "Testing & correctness", "url": "/testing.html" }
+        { "title": "Testing & correctness", "url": "/testing.html" },
+        { "title": "Running the benchmarks", "url": "/benchmarking.html" }
       ]
     },
     {
