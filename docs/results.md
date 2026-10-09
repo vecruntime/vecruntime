@@ -2811,9 +2811,29 @@ scaling with compression ratio 0.
 - **Speed:** we are faster than Spark on 90 of 103 queries (77 on 2026-09-26). Executor time is 52.2 h
   against 66.1 h, and shuffle read 0.47 TB against 0.94 TB.
 
+#### VecRuntime 0.0.7 (2026-10-09)
+
+The page now shows this run: release 0.0.7 (image `d565-v0.0.7-arm64`), `bench-g4-1b` (9 x m8g.4xlarge, one
+availability zone), the x86 run's current settings: both engines 30 GB heap / 20 GB overhead / 30 GB direct, 300
+shuffle partitions with AQE at its defaults, EMR's `maxShuffledHashJoinLocalMapThreshold=64MB`, off-heap column
+vectors, map-size scaling with ratio 0, no statistics. Spark had 20 GB heap / 30 GB overhead in the earlier runs.
+
+| | Spark (s) | ours (s) | speedup | geomean |
+|---|---|---|---|---|
+| Graviton4, one AZ, 0.0.7 (2026-10-09) | 2,472.8 | 706.8 | 3.50x | 2.55x |
+| x86 m5.4xlarge, main (2026-10-08, before #679 and #681) | 3,131.6 | 1,201.7 | 2.61x | 2.21x |
+
+- **Correctness:** row counts are equal on every query. Checksums are equal except q65 (ties).
+- **Speed:** we are faster than Spark on 101 of 103 queries; q47 (15.3 s against 10.0) and q57 (6.8 against 4.4)
+  are slower. Executor time is 15.3 h against 63.2 h.
+- **Largest queries:** q23b 140.1 -> 17.7 s, q88 134.0 -> 3.9, q28 122.1 -> 20.8, q23a 115.9 -> 16.8,
+  q9 106.2 -> 7.9, q24a 98.9 -> 47.1.
+- **Builds differ:** the x86 row predates 0.0.7's AggregateBelowJoin fix (#679) and inline-key aggregation (#681).
+  Compare the speedups over each architecture's Spark, not the two VecRuntime totals.
+
 #### One availability zone, main cb755d1 (2026-09-30)
 
-The page now shows this run. The changes from 2026-09-29:
+This run was on the page until 2026-10-09. The changes from 2026-09-29:
 - **Topology:** all nine nodes are in one availability zone (node group `bench-g4-1b`, us-east-1b; the earlier node groups spread 5/4 over two zones).
 - **Storage path:** S3 goes through a gateway VPC endpoint.
 - **Build:** main cb755d1 (#554, dictionary ids decoded in place), image `main-cb755d1-arm64`.
