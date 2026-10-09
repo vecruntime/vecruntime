@@ -147,6 +147,20 @@ public final class GroupKeyTable {
     private int size;
     private int[] groupHashes = new int[INITIAL_CAPACITY];
 
+    /**
+     * Integer keys inline in the slot array (#677): {@code fast[2 * pos]} is
+     * the packed key of the group in slot {@code pos} -- one INT32 or INT64
+     * value, or two INT32 values high and low -- and {@code fast[2 * pos + 1]}
+     * its id ({@code -1} empty), mirroring {@link #slots}. A probe then reads
+     * one cache line instead of the slot, the group's hash and each key column
+     * of the group, which with a million groups were three or four misses per
+     * row (q23a's partial aggregates at 1 TB: 43-92 ns per row against 14-18
+     * with the table in cache). Only for one or two INT32 keys or one INT64
+     * key, and only while no group has a null key: the first null drops it
+     * and the table probes the general way from then on.
+     */
+    private long[] fast;
+
     private final int[][] intKeys; // INT32 and BOOL (0/1)
     private final long[][] longKeys; // INT64 and FLOAT64 (raw bits); the low limb of DECIMAL128
     private final long[][] hiKeys; // the high limb of DECIMAL128
@@ -232,6 +246,9 @@ public final class GroupKeyTable {
         this.slots = new int[INITIAL_CAPACITY * 2];
         Arrays.fill(slots, -1);
         this.mask = slots.length - 1;
+        if (fastKeys(types)) {
+            this.fast = emptyFast(slots.length);
+        }
         int k = types.length;
         intKeys = new int[k][];
         longKeys = new long[k][];
@@ -332,6 +349,10 @@ public final class GroupKeyTable {
             HashKernels.mixColumn(key, hashes);
         }
         Bound b = Bound.of(keys, ids);
+        if (fast != null && b.noNulls(n, selection)) {
+            assignFast(b, n, hashes, outIds, selection);
+            return size;
+        }
         if (selection == null) {
             for (int i = 0; i < n; i++) {
                 outIds[i] = lookupOrInsert(b, i, HashKernels.finish(hashes[i]));
@@ -527,6 +548,34 @@ public final class GroupKeyTable {
                 b.mirror(c, k, dict);
             }
             return b;
+        }
+
+        /**
+         * Whether no row of the first {@code n} of the batch -- of those set in
+         * {@code selection}, when there is one -- has a null key. A nullable
+         * Parquet column carries a validity bitmap whether or not it holds a
+         * null, and a filtered batch can reach the aggregate as its columns
+         * plus a selection: the selected rows' bits decide, not the bitmap's
+         * presence (#677).
+         */
+        boolean noNulls(int n, MemorySegment selection) {
+            int words = Bitmap.wordsFor(n);
+            for (int c = 0; c < count; c++) {
+                long[] w = validWords[c];
+                if (w == null) {
+                    continue;
+                }
+                for (int i = 0; i < words; i++) {
+                    long need = selection == null ? -1L : Bitmap.wordAt(selection, i, n);
+                    if (i == words - 1 && (n & 63) != 0) {
+                        need &= (1L << (n & 63)) - 1;
+                    }
+                    if ((w[i] & need) != need) {
+                        return false;
+                    }
+                }
+            }
+            return true;
         }
 
         /** Fills column {@code c}'s heap mirrors (see the fields). */
@@ -1039,6 +1088,227 @@ public final class GroupKeyTable {
         return HashKernels.finish(h);
     }
 
+    // ------------------------------------------------------------------ inline integer keys (#677)
+
+    /**
+     * Package-private, for the tests: whether the table still probes its keys
+     * inline.
+     */
+    boolean inlineKeys() {
+        return fast != null;
+    }
+
+    /**
+     * Whether {@code types} can be kept packed in {@link #fast}: one or two
+     * INT32, or one INT64.
+     */
+    private static boolean fastKeys(VecType[] types) {
+        if (types.length == 1) {
+            return types[0] == VecType.INT32 || types[0] == VecType.INT64;
+        }
+        return types.length == 2 && types[0] == VecType.INT32 && types[1] == VecType.INT32;
+    }
+
+    private static long[] emptyFast(int slotCount) {
+        long[] f = new long[2 * slotCount];
+        for (int p = 1; p < f.length; p += 2) {
+            f[p] = -1L;
+        }
+        return f;
+    }
+
+    /**
+     * Group {@code gid}'s packed key, from the stored key columns (no group of
+     * a fast table is null).
+     */
+    private long packedKey(int gid) {
+        if (types.length == 2) {
+            return ((long) intKeys[0][gid] << 32) | (intKeys[1][gid] & 0xFFFFFFFFL);
+        }
+        return types[0] == VecType.INT32 ? intKeys[0][gid] : longKeys[0][gid];
+    }
+
+    /**
+     * {@link #assign} over a fast table and a batch with no null key: the
+     * packed key is compared in the slot, so a hit reads nothing indexed by
+     * group id. One loop per key shape, so each stays monomorphic.
+     */
+    private void assignFast(Bound b, int n, int[] hashes,
+                            int[] outIds, MemorySegment selection) {
+        if (selection != null) {
+            // Unselected rows get -1 and never create a group; the selected ones go the same way below.
+            Arrays.fill(outIds, 0, n, -1);
+            for (int w = 0, words = Bitmap.wordsFor(n);
+                 w < words;
+                 w++) {
+                long bits = Bitmap.wordAt(selection, w, n);
+                while (bits != 0L) {
+                    int i = (w << 6) + Long.numberOfTrailingZeros(bits);
+                    bits &= bits - 1;
+                    outIds[i] = fastRow(b, i, HashKernels.finish(hashes[i]));
+                }
+            }
+            return;
+        }
+        if (slots.length < PROBE_BATCH_SLOTS) {
+            // In cache the two passes only add work (JMH, 4K groups: 9 -> 13.5 ns per row); probe row by row.
+            assignFastRows(b, n, hashes, outIds);
+            return;
+        }
+        // Batched probing: for PROBE_BATCH rows, first read each row's home slot (independent loads, so their
+        // cache misses overlap), then resolve the rows in order. Only a hit in the home slot is taken from the
+        // first pass -- a group's id never changes, so it stays right even if a later row of the same batch
+        // inserts or the table grows; anything else (empty slot, other key, collision chain) goes the full way,
+        // which now finds the home slot's line in cache.
+        int[] hit = probeHits;
+        if (types.length == 2) {
+            int[] k0 = b.ints[0];
+            int[] k1 = b.ints[1];
+            for (int i0 = 0; i0 < n; i0 += PROBE_BATCH) {
+                int end = Math.min(n, i0 + PROBE_BATCH);
+                long[] f = fast;
+                int m = mask;
+                for (int i = i0; i < end; i++) {
+                    long key = ((long) k0[i] << 32) | (k1[i] & 0xFFFFFFFFL);
+                    int p = HashKernels.finish(hashes[i]) & m;
+                    hit[i - i0] = f[2 * p] == key ? (int) f[2 * p + 1] : -1;
+                }
+                for (int i = i0; i < end; i++) {
+                    int g = hit[i - i0];
+                    outIds[i] = g >= 0 ? g : fastLookupOrInsert(((long) k0[i] << 32) | (k1[i] & 0xFFFFFFFFL), HashKernels.finish(hashes[i]), k0[i], k1[i],
+                            0L);
+                }
+            }
+        } else if (types[0] == VecType.INT32) {
+            int[] k0 = b.ints[0];
+            for (int i0 = 0; i0 < n; i0 += PROBE_BATCH) {
+                int end = Math.min(n, i0 + PROBE_BATCH);
+                long[] f = fast;
+                int m = mask;
+                for (int i = i0; i < end; i++) {
+                    int p = HashKernels.finish(hashes[i]) & m;
+                    hit[i - i0] = f[2 * p] == k0[i] ? (int) f[2 * p + 1] : -1;
+                }
+                for (int i = i0; i < end; i++) {
+                    int g = hit[i - i0];
+                    outIds[i] = g >= 0 ? g : fastLookupOrInsert(k0[i], HashKernels.finish(hashes[i]), k0[i], 0, 0L);
+                }
+            }
+        } else {
+            long[] k0 = b.longs[0];
+            for (int i0 = 0; i0 < n; i0 += PROBE_BATCH) {
+                int end = Math.min(n, i0 + PROBE_BATCH);
+                long[] f = fast;
+                int m = mask;
+                for (int i = i0; i < end; i++) {
+                    int p = HashKernels.finish(hashes[i]) & m;
+                    hit[i - i0] = f[2 * p] == k0[i] ? (int) f[2 * p + 1] : -1;
+                }
+                for (int i = i0; i < end; i++) {
+                    int g = hit[i - i0];
+                    outIds[i] = g >= 0 ? g : fastLookupOrInsert(k0[i], HashKernels.finish(hashes[i]), 0, 0, k0[i]);
+                }
+            }
+        }
+    }
+
+    /**
+     * Rows whose home slots {@link #assignFast} reads before resolving any of
+     * them.
+     */
+    private static final int PROBE_BATCH = 16;
+
+    /**
+     * Slot count from which {@link #assignFast} probes in batches: 64K slots is
+     * 1 MiB of {@link #fast}, past which a probe usually misses the cache.
+     */
+    static final int PROBE_BATCH_SLOTS = 1 << 16;
+
+    private final int[] probeHits = new int[PROBE_BATCH];
+
+    /** {@link #assignFast} for a table still in cache: one probe per row. */
+    private void assignFastRows(Bound b, int n, int[] hashes,
+            int[] outIds) {
+        if (types.length == 2) {
+            int[] k0 = b.ints[0];
+            int[] k1 = b.ints[1];
+            for (int i = 0; i < n; i++) {
+                long key = ((long) k0[i] << 32) | (k1[i] & 0xFFFFFFFFL);
+                outIds[i] = fastLookupOrInsert(key, HashKernels.finish(hashes[i]), k0[i], k1[i], 0L);
+            }
+        } else if (types[0] == VecType.INT32) {
+            int[] k0 = b.ints[0];
+            for (int i = 0; i < n; i++) {
+                outIds[i] = fastLookupOrInsert(k0[i], HashKernels.finish(hashes[i]), k0[i], 0, 0L);
+            }
+        } else {
+            long[] k0 = b.longs[0];
+            for (int i = 0; i < n; i++) {
+                outIds[i] = fastLookupOrInsert(k0[i], HashKernels.finish(hashes[i]), 0, 0, k0[i]);
+            }
+        }
+    }
+
+    /** One row of a selected batch on the inline path. */
+    private int fastRow(Bound b, int i, int hash) {
+        if (types.length == 2) {
+            int x = b.ints[0][i];
+            int y = b.ints[1][i];
+            return fastLookupOrInsert(((long) x << 32) | (y & 0xFFFFFFFFL),
+                    hash, x, y, 0L);
+        }
+        if (types[0] == VecType.INT32) {
+            int x = b.ints[0][i];
+            return fastLookupOrInsert(x, hash, x, 0, 0L);
+        }
+        long l = b.longs[0][i];
+        return fastLookupOrInsert(l, hash, 0, 0, l);
+    }
+
+    /**
+     * The group of packed {@code key}, inserting it with its column values
+     * {@code a}/{@code b} or {@code l}.
+     */
+    private int fastLookupOrInsert(long key, int hash, int a,
+            int b, long l) {
+        long[] f = fast;
+        int m = mask;
+        int pos = hash & m;
+        while (true) {
+            int gid = (int) f[2 * pos + 1];
+            if (gid < 0) {
+                return fastInsert(key, hash, pos, a, b, l);
+            }
+            if (f[2 * pos] == key) {
+                return gid;
+            }
+            pos = (pos + 1) & m;
+        }
+    }
+
+    private int fastInsert(long key, int hash, int pos,
+                           int a, int b, long l) {
+        int gid = size;
+        ensureGroupCapacity(gid + 1);
+        groupHashes[gid] = hash;
+        if (types.length == 2) {
+            intKeys[0][gid] = a;
+            intKeys[1][gid] = b;
+        } else if (types[0] == VecType.INT32) {
+            intKeys[0][gid] = a;
+        } else {
+            longKeys[0][gid] = l;
+        }
+        slots[pos] = gid;
+        fast[2 * pos] = key;
+        fast[2 * pos + 1] = gid;
+        size++;
+        if (size * 10L > (long) slots.length * 7L) {
+            rehash();
+        }
+        return gid;
+    }
+
     private int lookupOrInsert(Bound keys, int row, int hash) {
         int pos = hash & mask;
         while (true) {
@@ -1267,11 +1537,28 @@ public final class GroupKeyTable {
             }
         }
         slots[pos] = gid;
+        if (fast != null) {
+            if (anyNullKey(gid)) {
+                fast = null; // a null key cannot be packed: the general probe from now on
+            } else {
+                fast[2 * pos] = packedKey(gid);
+                fast[2 * pos + 1] = gid;
+            }
+        }
         size++;
         if (size * 10L > (long) slots.length * 7L) {
             rehash();
         }
         return gid;
+    }
+
+    private boolean anyNullKey(int gid) {
+        for (int c = 0; c < types.length; c++) {
+            if (nulls[c].get(gid)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private void ensureGroupCapacity(int needed) {
@@ -1307,7 +1594,9 @@ public final class GroupKeyTable {
      * headroom.
      */
     public long memoryBytes() {
-        long bytes = 4L * slots.length + 4L * groupHashes.length;
+        long bytes = 4L * slots.length
+                + 4L * groupHashes.length
+                + (fast == null ? 0L : 8L * fast.length);
         for (int c = 0; c < types.length; c++) {
             switch (types[c]) {
                 case INT32, BOOL -> bytes += 4L * intKeys[c].length;
@@ -1322,18 +1611,37 @@ public final class GroupKeyTable {
         return bytes;
     }
 
+    /**
+     * Slot count from which an inline-key table grows by four instead of two
+     * (#677): a partial aggregate over a million new groups per task rehashed
+     * ~20 times, each a pass of random writes over both slot arrays (~6% of
+     * q23a's {@code frequent_ss_items} stage at 1 TB). Growing by four halves
+     * the number of passes once the table is out of cache, for at most twice
+     * the slot memory at the step.
+     */
+    static final int FAST_GROW4_SLOTS = 1 << 17;
+
     private void rehash() {
-        int[] newSlots = new int[slots.length * 2];
+        int grow = fast != null && slots.length >= FAST_GROW4_SLOTS
+                ? 4
+                : 2;
+        int[] newSlots = new int[slots.length * grow];
         Arrays.fill(newSlots, -1);
         int newMask = newSlots.length - 1;
+        long[] newFast = fast == null ? null : emptyFast(newSlots.length);
         for (int gid = 0; gid < size; gid++) {
             int pos = groupHashes[gid] & newMask;
             while (newSlots[pos] >= 0) {
                 pos = (pos + 1) & newMask;
             }
             newSlots[pos] = gid;
+            if (newFast != null) {
+                newFast[2 * pos] = packedKey(gid);
+                newFast[2 * pos + 1] = gid;
+            }
         }
         slots = newSlots;
+        fast = newFast;
         mask = newMask;
     }
 
