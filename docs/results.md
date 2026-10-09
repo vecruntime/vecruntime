@@ -11,7 +11,7 @@ Measured on an Apple M3 Pro (11 cores: 5 performance + 6 efficiency, 18 GB), mac
 different (8 double lanes per operation, native `compress`), and the kernels take those paths
 automatically; they have not been measured there.
 
-Every number below is reproducible with the commands in the README; the JMH text report and the
+Every number below is reproducible with the commands in [Running the benchmarks](benchmarking.html); the JMH text report and the
 `benchmarks/results/*.jsonl` files are the raw sources.
 
 ## Kernel microbenchmarks (JMH)

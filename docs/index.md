@@ -1,7 +1,7 @@
 ---
 layout: default
 title: Overview
-description: A vectorized execution runtime for Apache Spark using Java
+description: A vectorized execution runtime for Apache Spark SQL using Java
 ---
 
 # VecRuntime
@@ -108,6 +108,8 @@ DataFusion Comet 1.0.0's 1,964 s (2026-10-03 session). The per-query tables and 
 
 ## Reference
 
+- [Running and tuning](running.html) -- `spark-submit`, the columnar shuffle, memory tuning, requirements
+  and known limitations; [How it works](how-it-works.html) -- the design notes behind the operators.
 - [Configuration](configuration.html) -- every `spark.vecruntime.*` key with its default.
 - [Operators](operators.html), [Expressions](expressions.html) -- what converts, under which
   conditions, and why the rest falls back.

@@ -118,7 +118,7 @@ under test.
   commit.
 - **Small, scoped diffs; docs in step.** Match the language split (Scala for planner, operators and
   expression compilation; Java for kernels and anything touching `MemorySegment` in a hot loop),
-  document every new key in `README.md` and `docs/configuration.md`, note a changed default in
+  document every new key in `docs/running.md` and `docs/configuration.md`, note a changed default in
   `CHANGELOG.md`, and never lower a test count without saying why in the commit.
 
 ## 4. `kernels/` (Java, the Vector API)
