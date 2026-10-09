@@ -20,7 +20,10 @@ import java.lang.foreign.Arena;
 import io.vecruntime.kernels.VectorBuffers;
 import io.vecruntime.spark.adapter.ColumnVectorAdapters;
 import org.apache.arrow.memory.BufferAllocator;
+import org.apache.arrow.vector.IntVector;
+import org.apache.arrow.vector.VarCharVector;
 import org.apache.spark.sql.types.DataType;
+import org.apache.spark.sql.types.DataTypes;
 import org.apache.spark.sql.types.Decimal;
 import org.apache.spark.sql.vectorized.ColumnVector;
 import org.apache.spark.sql.vectorized.ColumnarArray;
@@ -79,11 +82,99 @@ public final class DeferredGatherColumnVector extends ColumnVector {
         return (name, dt, ids, allocator) -> {
             try (Arena arena = Arena.ofConfined()) {
                 VectorBuffers in = ColumnVectorAdapters.adapt(column, numRows, arena);
+                if (DataTypes.StringType.equals(dt)) { // not a collated string: the dictionary column is plain StringType
+                    ColumnVector d = gatherDictionary(name, in, numRows, ids, allocator);
+                    if (d != null) {
+                        return d;
+                    }
+                }
                 return ArrowOutput.gather(name, dt, in, ids, 0, ids.length,
                         allocator);
             }
         };
     }
+
+    /**
+     * A probe string column whose rows repeat (#687): a probe row matching many
+     * build rows appears once per match, and a gather copied its bytes into
+     * every output row, which an aggregate grouping on the column then hashed
+     * and looked up row by row again. q24a at 3 TB: 367 M join rows from 0.7 M
+     * probe rows, 43 % of the slow task in the gather and 32 % in mapping the
+     * gathered strings to group ids. Here the distinct probe rows the batch
+     * uses become a dictionary and the rows ids into it, so the bytes are
+     * copied once per distinct row and a dictionary-aware consumer works per
+     * entry. Null (gather the bytes) unless the rows repeat at least {@link
+     * #MIN_REPEAT} times on average: below that the dictionary costs more than
+     * it saves.
+     */
+    static ColumnVector gatherDictionary(String name, VectorBuffers in, int numRows,
+            int[] ids, BufferAllocator allocator) {
+        int n = ids.length;
+        if (n < MIN_REPEAT || in.type() != io.vecruntime.kernels.VecType.UTF8) {
+            return null;
+        }
+        int maxDistinct = n / MIN_REPEAT;
+        int[] slot = new int[numRows]; // source row -> entry + 1 (0: not seen)
+        int[] rows = new int[maxDistinct]; // entry -> source row
+        int[] codes = new int[n]; // output row -> entry, -1 null
+        int distinct = 0;
+        for (int i = 0; i < n; i++) {
+            int r = ids[i];
+            if (r < 0 || in.isNull(r)) {
+                codes[i] = -1;
+                continue;
+            }
+            int e = slot[r] - 1;
+            if (e < 0) {
+                if (distinct == maxDistinct) {
+                    return null;
+                }
+                e = distinct++;
+                rows[e] = r;
+                slot[r] = e + 1;
+            }
+            codes[i] = e;
+        }
+        byte[][] values = new byte[distinct][];
+        long bytes = 0;
+        for (int e = 0; e < distinct; e++) {
+            values[e] = in.getUtf8Bytes(rows[e]);
+            bytes += values[e].length;
+        }
+        VarCharVector dictionary = new VarCharVector("dict", allocator);
+        IntVector indices = new IntVector(name, allocator);
+        try {
+            dictionary.allocateNew(Math.max(1L, bytes), Math.max(1, distinct));
+            for (int e = 0; e < distinct; e++) {
+                dictionary.set(e, values[e]);
+            }
+            dictionary.setValueCount(distinct);
+            indices.allocateNew(n);
+            for (int i = 0; i < n; i++) {
+                if (codes[i] < 0) {
+                    indices.setNull(i);
+                } else {
+                    indices.set(i, codes[i]);
+                }
+            }
+            indices.setValueCount(n);
+        } catch (RuntimeException e) {
+            indices.close();
+            dictionary.close();
+            throw e;
+        }
+        DICTIONARY_GATHERED.increment();
+        return new VectorDictionaryColumnVector(indices, dictionary);
+    }
+
+    /**
+     * The average repetition of a probe row below which a string column is
+     * gathered as bytes.
+     */
+    static final int MIN_REPEAT = 4;
+
+    /** Probe string columns gathered as a dictionary (#687), for tests. */
+    public static final java.util.concurrent.atomic.LongAdder DICTIONARY_GATHERED = new java.util.concurrent.atomic.LongAdder();
 
     /**
      * Rows {@code ids[from..to)} of {@code source} (#603 step 2: a build column

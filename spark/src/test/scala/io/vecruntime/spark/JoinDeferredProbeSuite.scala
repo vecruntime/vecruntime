@@ -125,6 +125,27 @@ class JoinDeferredProbeSuite extends VectorQuerySuite {
     withConf(VectorConf.JoinBuildDictionaryMax -> "64") { limitLeaks() }
   }
 
+  test("probe strings repeated by many matches go out as a dictionary of the probe rows (#687)") {
+    // The small side probes a broadcast of the fact table: each probe row matches ~400 build rows, so its
+    // strings repeat ~400 times in the output. Grouped on, carried through an outer join, with null strings.
+    val queries = Seq(
+      "SELECT /*+ BROADCAST(f) */ d1.name, count(*), sum(f.v) FROM dp_d1 d1 JOIN dp_fact f ON d1.k = f.k1 GROUP BY d1.name",
+      "SELECT /*+ BROADCAST(f) */ d4.g, f.s, count(*) FROM dp_d4 d4 JOIN dp_fact f ON d4.k = f.k1 GROUP BY d4.g, f.s",
+      "SELECT /*+ BROADCAST(f) */ d4.g, upper(d4.g), f.v FROM dp_d4 d4 LEFT JOIN dp_fact f ON d4.k = f.k1 AND f.v < 600 " +
+        "WHERE d4.g IS NULL OR d4.g <> 'g3'",
+      "SELECT /*+ BROADCAST(f, d2) */ d1.name, d2.name, count(*) FROM dp_d1 d1 JOIN dp_fact f ON d1.k = f.k1 " +
+        "JOIN dp_d2 d2 ON f.k2 = d2.k GROUP BY d1.name, d2.name"
+    )
+    val before = DeferredGatherColumnVector.DICTIONARY_GATHERED.sum()
+    queries.foreach(q => checkVectorized(q, Seq(Bhj)))
+    assert(DeferredGatherColumnVector.DICTIONARY_GATHERED.sum() > before, "no probe column went out as a dictionary")
+    withConf(VectorConf.JoinBuildDictionaryMax -> "0") { queries.foreach(q => checkVectorized(q, Seq(Bhj))) }
+    val root = VectorAllocators.root()
+    val held = root.getAllocatedMemory
+    checkVectorized(queries.head + " ORDER BY 1 LIMIT 5", Seq(Bhj))
+    assert(root.getAllocatedMemory === held, s"allocated ${root.getAllocatedMemory} vs $held before")
+  }
+
   private def limitLeaks(): Unit = {
     val root = VectorAllocators.root()
     val before = root.getAllocatedMemory
