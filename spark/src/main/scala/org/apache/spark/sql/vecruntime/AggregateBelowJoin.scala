@@ -111,6 +111,13 @@ case class AggregateBelowJoin(session: SparkSession) extends Rule[LogicalPlan] w
       joinKeys: AttributeSet,
       joins: Int
   ): Option[(LogicalPlan, Map[AggregateExpression, Expression], Seq[Attribute])] = p match {
+    // The fact's own subtree -- its scan with its filters and projections, no join or aggregate -- is aggregated
+    // as a whole, its filters inside. Descending past them put the pre-aggregate below the fact's dynamic
+    // partition pruning filter: the pruning then filtered the aggregate's output instead of the scan, the copies
+    // of a CTE read per year became one scan of every partition (q4 at 1 TB: 5.05 G input rows against 1.97 G,
+    // #675).
+    case f if joins > 0 && inputs.subsetOf(f.outputSet) && factSubtree(f) =>
+      leaf(f, aggExprs, needed, joinKeys)
     case Project(list, child) if list.forall(passThrough(_, inputs)) =>
       val computed = AttributeSet(list.collect { case al: Alias => al }.flatMap(_.references))
       // Above the pre-aggregate the inputs are gone; the partials take their place in the projection.
@@ -155,12 +162,25 @@ case class AggregateBelowJoin(session: SparkSession) extends Rule[LogicalPlan] w
         }
       else None
     case _: Aggregate => None // already aggregated: a pre-aggregate of this rule, or the plan's own
-    case f if joins > 0 && inputs.subsetOf(f.outputSet) =>
-      val keys = f.output.filter(needed.contains)
-      // A star aggregation only: every fact column kept above is a join key, none is grouped by itself.
-      if (keys.isEmpty || !keys.forall(joinKeys.contains) || !reduces(f, keys)) None
-      else Some(preAggregate(f, keys, aggExprs))
+    case f if joins > 0 && inputs.subsetOf(f.outputSet) => leaf(f, aggExprs, needed, joinKeys)
     case _ => None
+  }
+
+  /** A subtree without joins or aggregates: the fact as it is read, scanned, filtered and projected. */
+  private def factSubtree(p: LogicalPlan): Boolean =
+    !p.exists(n => n.isInstanceOf[Join] || n.isInstanceOf[Aggregate])
+
+  /** The pre-aggregate over the fact subtree `f`, when its kept columns are join keys and it reduces. */
+  private def leaf(
+      f: LogicalPlan,
+      aggExprs: Seq[AggregateExpression],
+      needed: AttributeSet,
+      joinKeys: AttributeSet
+  ): Option[(LogicalPlan, Map[AggregateExpression, Expression], Seq[Attribute])] = {
+    val keys = f.output.filter(needed.contains)
+    // A star aggregation only: every fact column kept above is a join key, none is grouped by itself.
+    if (keys.isEmpty || !keys.forall(joinKeys.contains) || !reduces(f, keys)) None
+    else Some(preAggregate(f, keys, aggExprs))
   }
 
   /** Whether `p` has a filter other than IS NOT NULL checks (a selective dimension). */
@@ -170,11 +190,12 @@ case class AggregateBelowJoin(session: SparkSession) extends Rule[LogicalPlan] w
   }
 
   /**
-   * Evidence that grouping `f` by `keys` removes rows: statistics put the number of groups -- the product of
-   * the keys' distinct counts, an upper bound -- at most `1 / minReduction` of the base relation's rows. Without
-   * statistics, or when the keys are nearly unique together, the pre-aggregate would add a stage and a shuffle
-   * and save the joins little: at 1 TB, TPC-DS q4, q11 and q74's `(customer_sk, sold_date_sk)` keys made them
-   * 34-104 % slower, so the rule declines.
+   * Optional evidence that grouping `f` by `keys` removes rows: with `minReduction` > 0, statistics must put the
+   * number of groups -- the product of the keys' distinct counts, an upper bound -- at most `1 / minReduction`
+   * of the base relation's rows; with `requireStatistics`, a fact without statistics is declined. Both are off by
+   * default (#675): at 1 TB they declined only queries the pre-aggregate speeds up (q4, q11, q74: 35-52 %
+   * faster), since the product of distinct counts ignores how the keys correlate. The 34-104 % slowdown that
+   * once justified them was lost partition pruning, which `factSubtree` fixes.
    */
   private def reduces(f: LogicalPlan, keys: Seq[Attribute]): Boolean = {
     val minReduction = VectorConf.aggregateBelowJoinMinReduction(session.sessionState.conf)
@@ -182,7 +203,8 @@ case class AggregateBelowJoin(session: SparkSession) extends Rule[LogicalPlan] w
     (KeyStats.baseRowCount(f), ndvs.forall(_.isDefined)) match {
       case (Some(rows), true) if rows > 0 =>
         BigDecimal(ndvs.flatten.product) * BigDecimal(minReduction) <= BigDecimal(rows)
-      case _ => false
+      // No statistics to decide on (#675): decline unless the switch says the other guards are enough.
+      case _ => !VectorConf.aggregateBelowJoinRequireStatistics(session.sessionState.conf)
     }
   }
 

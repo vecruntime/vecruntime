@@ -71,8 +71,11 @@ object VectorConf {
   /** Logical rewrite (#657): a star join's fact side aggregated by its join keys before the joins. */
   val AggregateBelowJoinEnabled = "spark.vecruntime.optimizer.aggregateBelowJoin.enabled"
 
-  /** Minimum row reduction (rows / estimated groups) the statistics must show for AggregateBelowJoin (#657). */
+  /** Minimum row reduction (rows / estimated groups) statistics must show for AggregateBelowJoin; 0 = none. */
   val AggregateBelowJoinMinReduction = "spark.vecruntime.optimizer.aggregateBelowJoin.minReduction"
+
+  /** Whether AggregateBelowJoin declines when there are no statistics to show a reduction (#675; default false). */
+  val AggregateBelowJoinRequireStatistics = "spark.vecruntime.optimizer.aggregateBelowJoin.requireStatistics"
 
   /**
    * Adaptive rewrite (#635): grouping keys that are columns of a broadcast join's build side are dropped
@@ -602,9 +605,16 @@ object VectorConf {
   def aggregateBelowJoinEnabled(conf: SQLConf): Boolean =
     isEnabled(conf) && bool(conf, AggregateBelowJoinEnabled, default = true)
 
-  /** AggregateBelowJoin's required reduction, at least 1 (default 4). */
+  /**
+   * AggregateBelowJoin's required reduction (rows / estimated groups); default 0, no estimate (#675: at 1 TB
+   * the estimate declined q4, q11 and q74, which the pre-aggregate makes 35-50 % faster).
+   */
   def aggregateBelowJoinMinReduction(conf: SQLConf): Double =
-    math.max(1.0, conf.getConfString(AggregateBelowJoinMinReduction, "4").trim.toDouble)
+    math.max(0.0, conf.getConfString(AggregateBelowJoinMinReduction, "0").trim.toDouble)
+
+  /** AggregateBelowJoin declines without statistics (default false, #675). */
+  def aggregateBelowJoinRequireStatistics(conf: SQLConf): Boolean =
+    bool(conf, AggregateBelowJoinRequireStatistics, default = false)
 
   /** Dropping grouping keys a unique broadcast key determines (#635); also off when the plugin is off. */
   def removeRedundantGroupKeysEnabled(conf: SQLConf): Boolean =
