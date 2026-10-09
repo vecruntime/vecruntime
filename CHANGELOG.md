@@ -4,7 +4,19 @@ All notable changes to vecruntime. The format follows [Keep a Changelog](https:/
 the project uses [semantic versioning](https://semver.org/) once it reaches 1.0 -- until then a minor
 version may change configuration keys or defaults, always noted here.
 
-## Unreleased
+## 0.0.7 -- 2026-10-09
+
+Spark 4.2 builds, and every artifact now names its Spark line (`vecruntime-spark_4.1_2.13`,
+`vecruntime-spark_4.2_2.13`). New plan rewrites, on by default:
+- eager aggregation below star joins;
+- a runtime bloom filter from a smaller fact table onto a larger one, with run-time evidence and vectorised
+  split-block probes;
+- run-time removal of redundant grouping keys;
+- dynamic partition pruning through aggregates and through a second join key;
+- merged filtered aggregates, shared aggregate inputs and existence-only self-joins as aggregates.
+
+Hash aggregation keeps one or two integer keys inline, with batched probing on large tables. TPC-DS 1 TB on
+x86, 2026-10-08: 1,202 s, 2.61x Spark (3,132 s) and 1.63x Comet 1.0.0 (`docs/results.md`).
 
 ### Added
 
@@ -116,9 +128,12 @@ version may change configuration keys or defaults, always noted here.
 - The Iceberg suites moved to `spark/src/test/iceberg`, added only by `-Piceberg`: a build without it now
   compiles its tests (#639).
 
-- `spark.vecruntime.optimizer.factBloomFilter.enabled` defaults to `false`. Full 1 TB runs with `ANALYZE` statistics:
-  1197 s off, 1208 s on; the rule helps q49, q51, q28 and q50 but still slows q23b, q18, q61 and q13, whose
-  creation sides are filtered dimensions that prune little. It stays available to turn on.
+- `spark.vecruntime.optimizer.factBloomFilter.enabled` is on by default. It was off for a while during this
+  cycle, after full 1 TB runs with `ANALYZE` statistics measured 1197 s off and 1208 s on; it was turned back
+  on once the run-time evidence (#659) let it decline filters that do not prune.
+- Hash aggregation keeps one or two INT32 keys, or one INT64 key, inline in `GroupKeyTable`'s slot array. Past
+  64 K slots it probes in batches of 16 rows, and past 128 K slots it grows by four (#681). At 1 TB, without
+  statistics: q23a -8 %, q23b -6 %, nine high-cardinality queries -1.5 %, identical results.
 - `FactBloomFilter` builds a filter for many keys partitioned by hash bucket: the keys are shuffled by
   `pmod(xxhash64(key), B)`, one sub-filter per bucket is built after the shuffle within Spark's caps, and the probe
   tests its bucket's sub-filter. A single `bloom_filter_agg` for tens of millions of keys was capped at 8 MB and

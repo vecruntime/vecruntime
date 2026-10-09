@@ -24,7 +24,7 @@ In essence, **VecRuntime brings a DataFusion-Comet/Velox-style vectorized execut
 
 ## Status
 
-Version 0.0.6, a preview release under the Apache License 2.0 (see `LICENSE` and `NOTICE`). The
+Version 0.0.7, a preview release under the Apache License 2.0 (see `LICENSE` and `NOTICE`). The
 plugin runs the whole of TPC-DS (103 queries) and TPC-H (22) with every operator accelerated and
 returns Spark's results; what it does not convert falls back to Spark, always with a recorded reason.
 Measured on the 1 TB TPC-DS Parquet dataset on EKS, eight 13-core executors with 50 GB each, no table
