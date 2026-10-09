@@ -147,6 +147,20 @@ public final class GroupKeyTable {
     private int size;
     private int[] groupHashes = new int[INITIAL_CAPACITY];
 
+    /**
+     * Integer keys inline in the slot array (#677): {@code fast[2 * pos]} is
+     * the packed key of the group in slot {@code pos} -- one INT32 or INT64
+     * value, or two INT32 values high and low -- and {@code fast[2 * pos + 1]}
+     * its id ({@code -1} empty), mirroring {@link #slots}. A probe then reads
+     * one cache line instead of the slot, the group's hash and each key column
+     * of the group, which with a million groups were three or four misses per
+     * row (q23a's partial aggregates at 1 TB: 43-92 ns per row against 14-18
+     * with the table in cache). Only for one or two INT32 keys or one INT64
+     * key, and only while no group has a null key: the first null drops it
+     * and the table probes the general way from then on.
+     */
+    private long[] fast;
+
     private final int[][] intKeys; // INT32 and BOOL (0/1)
     private final long[][] longKeys; // INT64 and FLOAT64 (raw bits); the low limb of DECIMAL128
     private final long[][] hiKeys; // the high limb of DECIMAL128
@@ -232,6 +246,9 @@ public final class GroupKeyTable {
         this.slots = new int[INITIAL_CAPACITY * 2];
         Arrays.fill(slots, -1);
         this.mask = slots.length - 1;
+        if (fastKeys(types)) {
+            this.fast = emptyFast(slots.length);
+        }
         int k = types.length;
         intKeys = new int[k][];
         longKeys = new long[k][];
@@ -332,6 +349,10 @@ public final class GroupKeyTable {
             HashKernels.mixColumn(key, hashes);
         }
         Bound b = Bound.of(keys, ids);
+        if (selection == null && fast != null && b.noNulls()) {
+            assignFast(b, n, hashes, outIds);
+            return size;
+        }
         if (selection == null) {
             for (int i = 0; i < n; i++) {
                 outIds[i] = lookupOrInsert(b, i, HashKernels.finish(hashes[i]));
@@ -527,6 +548,19 @@ public final class GroupKeyTable {
                 b.mirror(c, k, dict);
             }
             return b;
+        }
+
+        /**
+         * Whether no bound key column has a validity bitmap, so no row of the
+         * batch has a null key.
+         */
+        boolean noNulls() {
+            for (int c = 0; c < count; c++) {
+                if (validWords[c] != null) {
+                    return false;
+                }
+            }
+            return true;
         }
 
         /** Fills column {@code c}'s heap mirrors (see the fields). */
@@ -1039,6 +1073,109 @@ public final class GroupKeyTable {
         return HashKernels.finish(h);
     }
 
+    // ------------------------------------------------------------------ inline integer keys (#677)
+
+    /**
+     * Whether {@code types} can be kept packed in {@link #fast}: one or two
+     * INT32, or one INT64.
+     */
+    private static boolean fastKeys(VecType[] types) {
+        if (types.length == 1) {
+            return types[0] == VecType.INT32 || types[0] == VecType.INT64;
+        }
+        return types.length == 2 && types[0] == VecType.INT32 && types[1] == VecType.INT32;
+    }
+
+    private static long[] emptyFast(int slotCount) {
+        long[] f = new long[2 * slotCount];
+        for (int p = 1; p < f.length; p += 2) {
+            f[p] = -1L;
+        }
+        return f;
+    }
+
+    /**
+     * Group {@code gid}'s packed key, from the stored key columns (no group of
+     * a fast table is null).
+     */
+    private long packedKey(int gid) {
+        if (types.length == 2) {
+            return ((long) intKeys[0][gid] << 32) | (intKeys[1][gid] & 0xFFFFFFFFL);
+        }
+        return types[0] == VecType.INT32 ? intKeys[0][gid] : longKeys[0][gid];
+    }
+
+    /**
+     * {@link #assign} over a fast table and a batch with no null key: the
+     * packed key is compared in the slot, so a hit reads nothing indexed by
+     * group id. One loop per key shape, so each stays monomorphic.
+     */
+    private void assignFast(Bound b, int n, int[] hashes,
+                            int[] outIds) {
+        if (types.length == 2) {
+            int[] k0 = b.ints[0];
+            int[] k1 = b.ints[1];
+            for (int i = 0; i < n; i++) {
+                long key = ((long) k0[i] << 32) | (k1[i] & 0xFFFFFFFFL);
+                outIds[i] = fastLookupOrInsert(key, HashKernels.finish(hashes[i]), k0[i], k1[i], 0L);
+            }
+        } else if (types[0] == VecType.INT32) {
+            int[] k0 = b.ints[0];
+            for (int i = 0; i < n; i++) {
+                outIds[i] = fastLookupOrInsert(k0[i], HashKernels.finish(hashes[i]), k0[i], 0, 0L);
+            }
+        } else {
+            long[] k0 = b.longs[0];
+            for (int i = 0; i < n; i++) {
+                outIds[i] = fastLookupOrInsert(k0[i], HashKernels.finish(hashes[i]), 0, 0, k0[i]);
+            }
+        }
+    }
+
+    /**
+     * The group of packed {@code key}, inserting it with its column values
+     * {@code a}/{@code b} or {@code l}.
+     */
+    private int fastLookupOrInsert(long key, int hash, int a,
+            int b, long l) {
+        long[] f = fast;
+        int m = mask;
+        int pos = hash & m;
+        while (true) {
+            int gid = (int) f[2 * pos + 1];
+            if (gid < 0) {
+                return fastInsert(key, hash, pos, a, b, l);
+            }
+            if (f[2 * pos] == key) {
+                return gid;
+            }
+            pos = (pos + 1) & m;
+        }
+    }
+
+    private int fastInsert(long key, int hash, int pos,
+                           int a, int b, long l) {
+        int gid = size;
+        ensureGroupCapacity(gid + 1);
+        groupHashes[gid] = hash;
+        if (types.length == 2) {
+            intKeys[0][gid] = a;
+            intKeys[1][gid] = b;
+        } else if (types[0] == VecType.INT32) {
+            intKeys[0][gid] = a;
+        } else {
+            longKeys[0][gid] = l;
+        }
+        slots[pos] = gid;
+        fast[2 * pos] = key;
+        fast[2 * pos + 1] = gid;
+        size++;
+        if (size * 10L > (long) slots.length * 7L) {
+            rehash();
+        }
+        return gid;
+    }
+
     private int lookupOrInsert(Bound keys, int row, int hash) {
         int pos = hash & mask;
         while (true) {
@@ -1267,11 +1404,28 @@ public final class GroupKeyTable {
             }
         }
         slots[pos] = gid;
+        if (fast != null) {
+            if (anyNullKey(gid)) {
+                fast = null; // a null key cannot be packed: the general probe from now on
+            } else {
+                fast[2 * pos] = packedKey(gid);
+                fast[2 * pos + 1] = gid;
+            }
+        }
         size++;
         if (size * 10L > (long) slots.length * 7L) {
             rehash();
         }
         return gid;
+    }
+
+    private boolean anyNullKey(int gid) {
+        for (int c = 0; c < types.length; c++) {
+            if (nulls[c].get(gid)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private void ensureGroupCapacity(int needed) {
@@ -1307,7 +1461,9 @@ public final class GroupKeyTable {
      * headroom.
      */
     public long memoryBytes() {
-        long bytes = 4L * slots.length + 4L * groupHashes.length;
+        long bytes = 4L * slots.length
+                + 4L * groupHashes.length
+                + (fast == null ? 0L : 8L * fast.length);
         for (int c = 0; c < types.length; c++) {
             switch (types[c]) {
                 case INT32, BOOL -> bytes += 4L * intKeys[c].length;
@@ -1326,14 +1482,20 @@ public final class GroupKeyTable {
         int[] newSlots = new int[slots.length * 2];
         Arrays.fill(newSlots, -1);
         int newMask = newSlots.length - 1;
+        long[] newFast = fast == null ? null : emptyFast(newSlots.length);
         for (int gid = 0; gid < size; gid++) {
             int pos = groupHashes[gid] & newMask;
             while (newSlots[pos] >= 0) {
                 pos = (pos + 1) & newMask;
             }
             newSlots[pos] = gid;
+            if (newFast != null) {
+                newFast[2 * pos] = packedKey(gid);
+                newFast[2 * pos + 1] = gid;
+            }
         }
         slots = newSlots;
+        fast = newFast;
         mask = newMask;
     }
 
