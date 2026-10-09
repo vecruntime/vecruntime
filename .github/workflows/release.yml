@@ -47,15 +47,23 @@ jobs:
         # incremental Scala compiler would reuse classes compiled against the other line. -am adds the
         # parent POM (identical for both lines); -Pcomet,iceberg only affects which test sources compile
         # (skipped). The POMs are flattened, so each line's artifacts name their own line's siblings.
+        # The staging repository and the release jars live outside target/ while both lines build: -am puts
+        # the root POM in the reactor, so the second `clean` deletes the root target/, and with it anything
+        # the first line had staged there (v0.0.7's first run failed on that). They move into target/ for the
+        # later steps once both builds are done.
         run: |
+          STAGE="$RUNNER_TEMP/stage"
+          mkdir -p "$STAGE/maven-repo" "$STAGE/release"
           mvn -B -ntp -DskipTests -Pcomet,iceberg -pl kernels,spark,shuffle -am clean deploy \
-            -DaltDeploymentRepository="staging::file://$GITHUB_WORKSPACE/target/maven-repo"
-          mkdir -p target/release
-          cp spark/target/vecruntime-spark_4.1_2.13-${VERSION}.jar shuffle/target/vecruntime-shuffle_4.1_2.13-${VERSION}.jar target/release/
+            -DaltDeploymentRepository="staging::file://$STAGE/maven-repo"
+          cp spark/target/vecruntime-spark_4.1_2.13-${VERSION}.jar shuffle/target/vecruntime-shuffle_4.1_2.13-${VERSION}.jar "$STAGE/release/"
           mvn -B -ntp -DskipTests -Pspark-4.2 -pl kernels,spark,shuffle -am clean deploy \
-            -DaltDeploymentRepository="staging::file://$GITHUB_WORKSPACE/target/maven-repo"
-          cp spark/target/vecruntime-spark_4.2_2.13-${VERSION}.jar shuffle/target/vecruntime-shuffle_4.2_2.13-${VERSION}.jar target/release/
-          find target/maven-repo -type f | sort
+            -DaltDeploymentRepository="staging::file://$STAGE/maven-repo"
+          cp spark/target/vecruntime-spark_4.2_2.13-${VERSION}.jar shuffle/target/vecruntime-shuffle_4.2_2.13-${VERSION}.jar "$STAGE/release/"
+          mkdir -p target
+          cp -R "$STAGE/maven-repo" target/maven-repo
+          cp -R "$STAGE/release" target/release
+          find target/maven-repo target/release -type f | sort
 
       - name: Checksums
         run: |
