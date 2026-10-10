@@ -17,6 +17,7 @@
 #   DRIVER_OVERHEAD (1g) DRIVER_MALLOC_ARENA_MAX (2; empty = glibc's default) EXEC_MALLOC_ARENA_MAX (unset)
 #   NODE_SELECTOR (workload=spark-xl; empty for none) OFFHEAP (32g, the comet configurations)
 #   EXEC_JAVA_OPTS (extra executor JVM options, e.g. a JFR recording: -XX:StartFlightRecording=duration=300s,filename=/tmp/exec.jfr,settings=profile)
+#   DRIVER_JAVA_OPTS (extra driver JVM options, appended to spark.driver.extraJavaOptions)
 #   KEEP_EXECUTORS (unset; set to 1 to keep dead executor pods for their logs)
 #   ACCP (1; 0 = the JDK's own crypto: 1 puts Amazon Corretto Crypto Provider first for the S3 TLS cipher and
 #     SigV4 hashing, -Djava.security.properties=/opt/spark/accp/accp.security, #566; needs an image with it)
@@ -160,6 +161,12 @@ elif [ "${AOT_CACHE:-0}" = "1" ]; then
 fi
 if [ -z "${SEEN[spark.executor.extraJavaOptions]+x}" ]; then ORDER+=("spark.executor.extraJavaOptions"); fi
 SEEN[spark.executor.extraJavaOptions]="$EXEC_OPTS"
+# DRIVER_JAVA_OPTS: extra driver JVM options appended to the engine's own (#672: a native-allocation
+# profile of the driver), so the module flags in spark.driver.extraJavaOptions stay.
+if [ -n "${DRIVER_JAVA_OPTS:-}" ]; then
+  if [ -z "${SEEN[spark.driver.extraJavaOptions]+x}" ]; then ORDER+=("spark.driver.extraJavaOptions"); fi
+  SEEN[spark.driver.extraJavaOptions]="${SEEN[spark.driver.extraJavaOptions]:+${SEEN[spark.driver.extraJavaOptions]} }$DRIVER_JAVA_OPTS"
+fi
 for k in "${ORDER[@]}"; do
   v="${SEEN[$k]}"
   v="${v//\"/\\\"}"   # YAML: the value quoted, embedded double quotes escaped
