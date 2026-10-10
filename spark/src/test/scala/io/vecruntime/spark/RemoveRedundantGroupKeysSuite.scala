@@ -96,6 +96,16 @@ class RemoveRedundantGroupKeysSuite extends VectorQuerySuite with AdaptiveSparkP
     )
   }
 
+  test("a broadcast whose relation future lags its completion still drops the keys (#697)") {
+    // AQE marks the broadcast stage materialised when its completion promise is fulfilled, a moment before
+    // relationFuture returns. Widen that window: the rule must still see the built relation.
+    val df = org.apache.spark.sql.vecruntime.BroadcastTestHooks.withDelayAfterCompletion(500) {
+      run(frequentItems("rrgk_item"))
+    }
+    val counts = aggregateKeyCounts(df)
+    assert(counts.nonEmpty && counts.forall(_ <= 2), s"grouping keys per aggregate: $counts")
+  }
+
   test("off by configuration") {
     withConf(VectorConf.RemoveRedundantGroupKeysEnabled -> "false") {
       val df = run(frequentItems("rrgk_item"))

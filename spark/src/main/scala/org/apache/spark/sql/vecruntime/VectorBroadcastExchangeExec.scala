@@ -306,6 +306,7 @@ case class VectorBroadcastExchangeExec(mode: BroadcastMode, child: SparkPlan)
         val executionId = sparkContext.getLocalProperty(SQLExecution.EXECUTION_ID_KEY)
         SQLMetrics.postDriverMetricUpdates(sparkContext, executionId, metrics.values.toSeq)
         promise.trySuccess(broadcasted)
+        VectorBroadcastExchangeExec.afterCompletionForTests()
         broadcasted
       } catch {
         case oe: OutOfMemoryError =>
@@ -389,6 +390,13 @@ object VectorBroadcastExchangeExec {
     ExecutionContext.fromExecutorService(
       ThreadUtils.newDaemonCachedThreadPool("vecruntime-broadcast-exchange", 128)
     )
+
+  /**
+   * Tests only (#697): runs after the completion promise is fulfilled and before `relationFuture`'s body
+   * returns, so a test can widen the window in which AQE sees the stage materialised while
+   * `relationFuture` is not yet done. A no-op otherwise.
+   */
+  @volatile private[vecruntime] var afterCompletionForTests: () => Unit = () => ()
 
   /** Our exchange under a join's build side: bare, as an adaptive query stage, or reused (either way). */
   def unapply(p: SparkPlan): Option[VectorBroadcastExchangeExec] = p match {
