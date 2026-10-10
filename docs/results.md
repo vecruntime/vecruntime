@@ -2749,7 +2749,10 @@ The page is `docs/benchmarks/tpcds-3tb-graviton.html`; the result files are in
 - **Behind Gluten:** q24a 104.6 / 83.1 s and q24b 102.1 / 81.7 (#692), q47 30.1 / 18.3 (#693), q78 49.0 / 46.4
   (#689), q87 13.5 / 11.2, q38 13.3 / 11.1, q1 6.1 / 4.7; the rest within a second.
 - **Correctness:** no Spark baseline at 3 TB. The two runs agree on rows and checksums on every query except
-  q39a, 19,301 rows at 900 and 19,302 at 200 (#695: most likely a group at the `cov > 1` boundary).
+  q39a, 19,301 rows at 900 and 19,302 at 200. One group's coefficient of variation is exactly 1, and the merge
+  order of its partial moments (shuffle-block arrival) decides between 1.0 and 1.0000000000000002, so q39a's row
+  count can differ by ±1 between runs of the same configuration (repeat runs at 200: 19,301, 19,301, 19,302).
+  Spark's `CentralMomentAgg` is order-dependent in the same way; Spark returned 19,301 in the one run made (#695).
 - **Noise:** one q23b in the 900-partition tuning check took 69.5 s instead of about 39: one scan task waited
   30 s on S3 (0.08 s of CPU).
 

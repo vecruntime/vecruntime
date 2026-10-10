@@ -63,7 +63,7 @@ DEFAULT_META = {
         "At 200 partitions VecRuntime needs the larger overhead (35 GB + 23 GB): with 44 GB + 14 GB an executor exceeded its container in q93.",
         "There is no Apache Spark baseline at 3 TB, so result checksums are not compared against Spark here; VecRuntime's results match Spark's on the 1 TB runs and in the test suites.",
     ],
-    "partition_diff_note": "19,301 rows at 900 partitions, 19,302 at 200 -- most likely a group at the query's cov > 1 boundary, where the order of the floating-point additions decides it; under investigation in #695.",
+    "partition_diff_note": "19,301 rows at 900 partitions, 19,302 at 200. One group's coefficient of variation is exactly 1, so the order in which the final aggregate merges its partial moments (the order shuffle blocks arrive) decides whether it computes 1.0 or 1.0000000000000002, and only the second passes the query's cov > 1. Its row count can therefore differ by one between runs of the same configuration: repeat runs at 200 partitions returned 19,301, 19,301 and 19,302, and Spark's own CentralMomentAgg is order-dependent in the same way (Spark returned 19,301 in the one run made). See #695.",
     "results_doc": "https://github.com/vecruntime/vecruntime/blob/main/docs/results.md",
     "repo": "https://github.com/vecruntime/vecruntime",
     "doeks": "https://github.com/awslabs/data-on-eks",
