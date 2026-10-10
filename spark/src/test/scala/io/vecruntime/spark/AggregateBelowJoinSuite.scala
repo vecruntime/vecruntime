@@ -253,6 +253,40 @@ class AggregateBelowJoinSuite extends VectorQuerySuite {
     }
   }
 
+  test("#693: an aggregate used twice in one copy of a CTE keeps the copies alike, so the exchange is reused") {
+    // q47's shape: `sum(...)` is a result and the input of a window over the same aggregate. The copy that keeps
+    // the window has the sum twice (two result ids); a pre-aggregate with a partial per copy of it made that copy's
+    // exchange differ from the other's, and the copy ran again instead of reusing the exchange.
+    val q =
+      """WITH v AS (
+        |  SELECT c_first, d_year, sum(s_qty) s, avg(sum(s_qty)) OVER (PARTITION BY c_first) w
+        |  FROM abj_sales JOIN abj_customer ON s_cust = c_sk JOIN abj_date ON s_date = d_sk
+        |  GROUP BY c_first, d_year)
+        |SELECT a.c_first, a.d_year, a.s, a.w, b.s FROM v a JOIN v b ON a.c_first = b.c_first AND a.d_year = b.d_year + 1""".stripMargin
+    def computedPreAggregates(df: DataFrame): Int = {
+      var n = 0
+      def walk(p: org.apache.spark.sql.execution.SparkPlan): Unit = p match {
+        case a: org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanExec => walk(a.executedPlan)
+        case s: org.apache.spark.sql.execution.adaptive.QueryStageExec => walk(s.plan)
+        case _: org.apache.spark.sql.execution.exchange.ReusedExchangeExec => // computed elsewhere
+        case other =>
+          other match {
+            case a: org.apache.spark.sql.vecruntime.VectorHashAggregateExec if a.localPreAggregate => n += 1
+            case _ =>
+          }
+          other.children.foreach(walk)
+      }
+      walk(df.queryExecution.executedPlan)
+      n
+    }
+    val df = run(q)
+    val pre = df.queryExecution.optimizedPlan.collect {
+      case a: Aggregate => a.aggregateExpressions.count(_.name.startsWith("_pre_agg_"))
+    }.filter(_ > 0)
+    assert(pre.nonEmpty && pre.forall(_ == 1), s"one partial per distinct function: $pre")
+    assert(computedPreAggregates(df) == 1, df.queryExecution.executedPlan.toString)
+  }
+
   test("the switch turns the rewrite off") {
     val df = withConf(VectorConf.AggregateBelowJoinEnabled -> "false")(run(q4Shape))
     assert(!preAggregated(df.queryExecution.optimizedPlan), df.queryExecution.optimizedPlan.treeString)

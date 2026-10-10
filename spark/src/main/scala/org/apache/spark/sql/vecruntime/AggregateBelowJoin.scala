@@ -81,7 +81,14 @@ case class AggregateBelowJoin(session: SparkSession) extends Rule[LogicalPlan] w
       })
 
   private def rewrite(a: Aggregate): Option[LogicalPlan] = {
-    val aggExprs = a.aggregateExpressions.flatMap(_.collect { case ae: AggregateExpression => ae }).distinct
+    // Semantically distinct, as Spark's own planning dedups them (#693): q47's `sum(ss_sales_price)` is both a
+    // result and a window input, two expressions with different result ids. Kept apart they became two partials
+    // in that copy of the CTE only, its exchange no longer matched the other copies' and the copy was recomputed
+    // instead of reused (1 TB: the pre-aggregate and the top aggregate ran twice).
+    val aggExprs = a.aggregateExpressions.flatMap(_.collect { case ae: AggregateExpression => ae })
+      .foldLeft(Vector.empty[AggregateExpression])((kept, ae) =>
+        if (kept.exists(_.semanticEquals(ae))) kept else kept :+ ae
+      )
     if (aggExprs.isEmpty || !aggExprs.forall(supported)) return None
     val inputs = AttributeSet(aggExprs.flatMap(_.references))
     if (inputs.isEmpty) return None // only count(*): no side to choose by its inputs
@@ -90,7 +97,8 @@ case class AggregateBelowJoin(session: SparkSession) extends Rule[LogicalPlan] w
       AttributeSet(a.aggregateExpressions.flatMap(e => stripAggs(e).references))
     descend(a.child, aggExprs, inputs, outside, AttributeSet.empty, 0).map { case (newChild, combine, _) =>
       val newAggs = a.aggregateExpressions.map(_.transformDown {
-        case ae: AggregateExpression if combine.contains(ae) => combine(ae)
+        case ae: AggregateExpression if combine.keys.exists(_.semanticEquals(ae)) =>
+          combine.collectFirst { case (k, v) if k.semanticEquals(ae) => v }.get
       }.asInstanceOf[NamedExpression])
       a.copy(aggregateExpressions = newAggs, child = newChild)
     }
