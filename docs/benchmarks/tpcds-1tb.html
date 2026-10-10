@@ -44,7 +44,7 @@ compares both against plain Apache Spark on the TPC-DS 1 TB workload on Amazon E
 <table class="kv"><thead><tr><th>Component</th><th>Version</th></tr></thead><tbody><tr><td>Spark</td><td>4.1.3</td></tr><tr><td>Scala</td><td>2.13</td></tr><tr><td>JDK</td><td>Amazon Corretto 25, -XX:+UseCompactObjectHeaders and Amazon Corretto Crypto Provider on driver and executors (#578, #566)</td></tr><tr><td>VecRuntime</td><td>main at 6bef04d (FactBloomFilter on by default with run-time evidence and transitive reduction #659, vectorised bloom probe #664)</td></tr><tr><td>Comet</td><td>1.0.0</td></tr><tr><td>Hadoop</td><td>3.4.3</td></tr></tbody></table>
 <h3>Configuration</h3>
 <p>Common to all three engines:</p><pre>spark.sql.shuffle.partitions=300
-spark.sql.adaptive.maxShuffledHashJoinLocalMapThreshold=64MB   # Spark and VecRuntime (EMR&#x27;s setting); not in the 2026-10-03 Comet leg
+spark.sql.adaptive.maxShuffledHashJoinLocalMapThreshold=64MB   # Spark and VecRuntime; not in the 2026-10-03 Comet leg
 spark.locality.wait=0   # every engine (#608)
 spark.eventLog.enabled=true
 -XX:+UseCompactObjectHeaders, -Djava.security.properties=&lt;ACCP first&gt; (driver and executors, every engine)</pre>

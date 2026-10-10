@@ -58,7 +58,7 @@ was compiled; the time is the wall-clock of the query's execution as the runner 
 <table class="kv"><thead><tr><th>Component</th><th>Version</th></tr></thead><tbody><tr><td>Spark</td><td>4.1.3</td></tr><tr><td>Scala</td><td>2.13</td></tr><tr><td>JDK</td><td>Amazon Corretto 25.0.4.1 (aarch64)</td></tr><tr><td>VecRuntime</td><td>0.0.7 (the release's arm64 image)</td></tr><tr><td>Hadoop</td><td>3.4.3</td></tr></tbody></table>
 <h3>Configuration</h3>
 <p>Common to both engines:</p><pre>spark.sql.shuffle.partitions=300 (AQE at Spark&#x27;s defaults: advisory partition size 64 MB, no minPartitionNum)
-spark.sql.adaptive.maxShuffledHashJoinLocalMapThreshold=64MB   # EMR&#x27;s setting
+spark.sql.adaptive.maxShuffledHashJoinLocalMapThreshold=64MB
 spark.sql.columnVector.offheap.enabled=true
 the launcher&#x27;s defaults: ACCP, the S3A read settings, compact object headers, spark.locality.wait=0
 spark.eventLog.enabled=true</pre>
