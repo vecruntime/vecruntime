@@ -56,6 +56,47 @@ object FlightShuffle extends Logging {
   val BackendKey: String = org.apache.spark.sql.vecruntime.shuffle.VectorShuffleBackend.Key
   val BindHostKey = "spark.vecruntime.shuffle.flight.bindHost"
   val ThreadsKey = "spark.vecruntime.shuffle.flight.threads"
+  val ChunkBytesKey = "spark.vecruntime.shuffle.flight.chunkBytes"
+  val ChannelsPerPeerKey = "spark.vecruntime.shuffle.flight.channelsPerPeer"
+  val ClientWindowKey = "spark.vecruntime.shuffle.flight.clientWindow"
+  val BackpressureBytesKey = "spark.vecruntime.shuffle.flight.backpressureBytes"
+
+  /**
+   * The transport's tunables, for tuning it on large nodes: what the defaults were before they
+   * were keys, so an unset key changes nothing. `chunkBytes` is the bytes per gRPC message;
+   * `channelsPerPeer` the gRPC channels (TCP connections) a JVM opens to one remote executor, streams
+   * spread over them round-robin; `clientWindow` a fixed HTTP/2 flow-control window for the client's
+   * channels, `0` leaving gRPC's own window, which grows with the measured bandwidth-delay product;
+   * `backpressureBytes` above `0` makes the server wait, before each message, until the stream's
+   * queued outbound bytes are under that many (gRPC's `isReady`), where `0` sends without waiting and
+   * lets Netty buffer whatever the client has not read yet.
+   */
+  final case class Transport(chunkBytes: Int, channelsPerPeer: Int, clientWindow: Int, backpressureBytes: Int)
+
+  object Transport {
+    val Default: Transport = Transport(ChunkBytes, 1, 0, 0)
+
+    def apply(conf: SparkConf): Transport = {
+      def bytes(key: String, default: Long): Int = {
+        val v = conf.getSizeAsBytes(key, default.toString)
+        require(v >= 0 && v <= Int.MaxValue, s"$key=$v is out of range [0, ${Int.MaxValue}]")
+        v.toInt
+      }
+      val t = Transport(
+        chunkBytes = bytes(ChunkBytesKey, ChunkBytes.toLong),
+        channelsPerPeer = conf.getInt(ChannelsPerPeerKey, 1),
+        clientWindow = bytes(ClientWindowKey, 0L),
+        backpressureBytes = bytes(BackpressureBytesKey, 0L)
+      )
+      require(t.chunkBytes >= InitialChunkBytes, s"$ChunkBytesKey=${t.chunkBytes} is below $InitialChunkBytes")
+      require(t.channelsPerPeer >= 1, s"$ChannelsPerPeerKey=${t.channelsPerPeer} must be at least 1")
+      t
+    }
+  }
+
+  /** A server builder with the transport's server-side settings applied. */
+  def configure(builder: FlightServer.Builder, t: Transport): FlightServer.Builder =
+    if (t.backpressureBytes > 0) builder.backpressureThreshold(t.backpressureBytes) else builder
 
   def backend(conf: SparkConf): String =
     org.apache.spark.sql.vecruntime.shuffle.VectorShuffleBackend.backendName(conf).toLowerCase
@@ -137,7 +178,9 @@ object FlightShuffle extends Logging {
       blockData: (Int, Long, Int, Int) => org.apache.spark.network.buffer.ManagedBuffer,
       allocator: BufferAllocator,
       /** Bytes per gRPC message; a parameter so the transport benchmark can sweep it (default [[ChunkBytes]]). */
-      chunkBytes: Int = ChunkBytes
+      chunkBytes: Int = ChunkBytes,
+      /** Wait for gRPC's `isReady` before each message ([[Transport.backpressureBytes]] above 0). */
+      waitForReady: Boolean = false
   ) extends NoOpFlightProducer {
 
     /** A producer serving single partitions: `blockData(shuffleId, mapId, reduce)`. */
@@ -159,6 +202,16 @@ object FlightShuffle extends Logging {
       val root = VectorSchemaRoot.create(BytesSchema, allocator)
       val vector = root.getVector(0).asInstanceOf[org.apache.arrow.vector.VarBinaryVector]
       var current = -1L
+      val backpressure =
+        if (waitForReady) { val b = new BackpressureStrategy.CallbackBackpressureStrategy; b.register(listener); b }
+        else null
+      // Whether the client is still there to send to: with backpressure on, waits until the stream's
+      // queued bytes are under the threshold; a cancelled stream ends the call quietly.
+      def ready(): Boolean = backpressure == null || {
+        var r = backpressure.waitForListener(1000L)
+        while (r == BackpressureStrategy.WaitResult.TIMEOUT) r = backpressure.waitForListener(1000L)
+        r == BackpressureStrategy.WaitResult.READY
+      }
       try {
         listener.start(root)
         // The chunk buffer grows with the bytes -- 64 KB, doubling up to `chunkBytes` -- instead of being
@@ -174,7 +227,19 @@ object FlightShuffle extends Logging {
         // decode and one flow-control round trip apiece: at 1 TB / 1000 partitions the reduce tasks
         // spent a third of their time waiting on those. The message is filled across map outputs and
         // sent when [[ChunkBytes]] are in it or the range is done.
-        mapIds.foreach { mapId =>
+        // False once a waited-for stream turns out cancelled: nothing more is read or sent.
+        var alive = true
+        def send(): Unit = if (ready()) {
+          vector.reset()
+          vector.setSafe(0, chunk, 0, filled)
+          vector.setValueCount(1)
+          root.setRowCount(1)
+          listener.putNext()
+          filled = 0
+        } else alive = false
+        val maps = mapIds.iterator
+        while (alive && maps.hasNext) {
+          val mapId = maps.next()
           current = mapId
           // One lookup and one open per map for the task's whole partition range (#411): the
           // partitions are consecutive in the data file, and an empty one is a zero-length span.
@@ -183,21 +248,14 @@ object FlightShuffle extends Logging {
           val in = io.vecruntime.shuffle.PartitionedIpcFile.blockStream(buf)
           try {
             var more = true
-            while (more) {
+            while (more && alive) {
               val r = in.read(chunk, filled, chunk.length - filled)
               if (r < 0) more = false
               else {
                 filled += r
                 if (filled == chunk.length && chunk.length < chunkBytes) {
                   chunk = java.util.Arrays.copyOf(chunk, math.min(chunkBytes, chunk.length * 2))
-                } else if (filled == chunk.length) {
-                  vector.reset()
-                  vector.setSafe(0, chunk, 0, filled)
-                  vector.setValueCount(1)
-                  root.setRowCount(1)
-                  listener.putNext()
-                  filled = 0
-                }
+                } else if (filled == chunk.length) send()
               }
             }
           } finally {
@@ -205,14 +263,8 @@ object FlightShuffle extends Logging {
             buf.release()
           }
         }
-        if (filled > 0) {
-          vector.reset()
-          vector.setSafe(0, chunk, 0, filled)
-          vector.setValueCount(1)
-          root.setRowCount(1)
-          listener.putNext()
-        }
-        listener.completed()
+        if (alive && filled > 0) send()
+        if (alive) listener.completed()
       } catch {
         case e: Exception =>
           logWarning(
@@ -246,6 +298,7 @@ object FlightShuffle extends Logging {
     private val allocator = VectorAllocators.newChild("flight-shuffle-server")
     private val host = conf.get(BindHostKey, hostname)
     private val threads = conf.getInt(ThreadsKey, math.max(4, Runtime.getRuntime.availableProcessors()))
+    private val transport = Transport(conf)
     private val executor =
       Executors.newFixedThreadPool(threads, r => { val t = new Thread(r, "flight-shuffle"); t.setDaemon(true); t })
     private val server: FlightServer = {
@@ -262,9 +315,12 @@ object FlightShuffle extends Logging {
           (s: Int, m: Long, start: Int, end: Int) =>
             if (end == start + 1) resolver().getBlockData(ShuffleBlockId(s, m, start), None)
             else resolver().getBlockData(org.apache.spark.storage.ShuffleBlockBatchId(s, m, start, end), None),
-          allocator
+          allocator,
+          transport.chunkBytes,
+          waitForReady = transport.backpressureBytes > 0
         )
       ).executor(executor)
+      configure(builder, transport)
       secret(conf) match {
         case Some(s) => builder.headerAuthenticator(new SecretAuthenticator(s))
         case None if conf.getBoolean("spark.authenticate", false) =>
@@ -276,7 +332,7 @@ object FlightShuffle extends Logging {
       builder.build()
     }
     server.start()
-    logInfo(s"flight shuffle server listening on $host:${server.getPort}")
+    logInfo(s"flight shuffle server listening on $host:${server.getPort} ($threads threads, $transport)")
 
     def location: FlightLocation = FlightLocation(host, server.getPort)
 
@@ -289,16 +345,42 @@ object FlightShuffle extends Logging {
     }
   }
 
-  /** Client side: one client per remote executor, pooled per JVM; the token attached to every call. */
+  /**
+   * Client side: `channelsPerPeer` clients per remote executor (one by default), pooled per JVM, each
+   * its own gRPC channel and TCP connection; a stream takes the next one round-robin. The token is
+   * attached to every call.
+   */
   object Clients {
     private val allocator = VectorAllocators.newChild("flight-shuffle-client")
-    private val clients = new ConcurrentHashMap[FlightLocation, FlightClient]()
+    private val clients = new ConcurrentHashMap[(FlightLocation, Int, Int), FlightClient]()
+    private val turns = new ConcurrentHashMap[FlightLocation, java.util.concurrent.atomic.AtomicInteger]()
 
-    def client(loc: FlightLocation): FlightClient =
-      clients.computeIfAbsent(
-        loc,
-        l => FlightClient.builder(allocator, Location.forGrpcInsecure(l.host, l.port)).build()
-      )
+    /** The client a stream to `loc` uses, the transport's settings read from `conf`. */
+    def client(loc: FlightLocation, conf: SparkConf): FlightClient = client(loc, Transport(conf))
+
+    def client(loc: FlightLocation): FlightClient = client(loc, Transport.Default)
+
+    def client(loc: FlightLocation, t: Transport): FlightClient = {
+      val index =
+        if (t.channelsPerPeer == 1) 0
+        else Math.floorMod(
+          turns.computeIfAbsent(loc, _ => new java.util.concurrent.atomic.AtomicInteger).getAndIncrement(),
+          t.channelsPerPeer
+        )
+      clients.computeIfAbsent((loc, index, t.clientWindow), k => newClient(k._1, t.clientWindow))
+    }
+
+    private def newClient(l: FlightLocation, window: Int): FlightClient = {
+      val location = Location.forGrpcInsecure(l.host, l.port)
+      if (window == 0) FlightClient.builder(allocator, location).build()
+      else {
+        // A fixed window turns off gRPC's bandwidth-delay-product tuning of it, which is the point.
+        val channel = new org.apache.arrow.flight.grpc.NettyClientBuilder(allocator, location).build()
+          .flowControlWindow(window)
+          .build()
+        FlightGrpcUtils.createFlightClient(allocator, channel)
+      }
+    }
 
     def callOptions(conf: SparkConf): Array[CallOption] = secret(conf) match {
       case Some(s) => Array(new CredentialCallOption(new BearerCredentialWriter(s)))
@@ -467,7 +549,7 @@ final class FlightBlockStream(
 
   private val stream: FlightStream = {
     val start = System.nanoTime()
-    val s = FlightShuffle.Clients.client(location).getStream(
+    val s = FlightShuffle.Clients.client(location, conf).getStream(
       FlightShuffle.ticket(shuffleId, reduce, endReduce, mapIds),
       FlightShuffle.Clients.callOptions(conf): _*
     )

@@ -155,19 +155,26 @@ Both feed `PartitionedIpcFile.StreamReader`, the one decoder:
 One `FlightServer` per executor over gRPC on Spark's Netty (`flight-core` lives in `shuffle/` so the
 plugin jar never carries gRPC). `Producer.getStream` parses the ticket and, per map id, asks the
 block resolver for the range's `ManagedBuffer` (a file segment), prepends the dictionary section and
-copies the bytes into a one-column `VarBinary` root, one row per chunk of `ChunkBytes` (4 MB). Not as
+copies the bytes into a one-column `VarBinary` root, one row per chunk of
+`spark.vecruntime.shuffle.flight.chunkBytes` (4 MB). Not as
 Flight record batches (#338: Flight's own framing sends dictionaries once per stream, ours replace
 them within one) and not one message per map output (#416: 2,000 map outputs as 2,000 gRPC messages
 of a few KB each cost a Flight decode and a flow-control round trip apiece -- a third of a reduce
 task's time at 1 TB / 1000 partitions); the chunk fills across map outputs and is sent when full or
 when the range ends. The server's executor pool is `spark.vecruntime.shuffle.flight.threads`
-(default `max(4, cores)`).
+(default `max(4, cores)`). The server sends without waiting for the client by default, Netty
+buffering what the client has not read yet; `spark.vecruntime.shuffle.flight.backpressureBytes` makes
+it wait, before each message, until the stream's queued bytes are under that many.
 
 Client side, `FlightBlockStream` wraps the stream in a `ReadableByteChannel` (`ChunkChannel`) the
 `StreamReader` pulls from as it needs bytes, so decode overlaps transfer. The decoder is created on
 the first `hasNext`, not in the constructor (#416): opening seven servers' streams back to back and
 waiting for each first message inside the constructor serialised the waits. Clients are pooled per
-JVM per remote location.
+JVM per remote location: one gRPC channel (one TCP connection) each by default, carrying every stream
+the JVM's reduce tasks open to that executor; `spark.vecruntime.shuffle.flight.channelsPerPeer` opens
+several and the streams take them in turn. The channels' HTTP/2 flow-control window is gRPC's own,
+which grows with the measured bandwidth-delay product; `spark.vecruntime.shuffle.flight.clientWindow`
+fixes it instead.
 
 **Security.** With `spark.authenticate` on, every call carries Spark's shuffle secret as a bearer
 token and an unauthenticated `DoGet` is refused; the server refuses to start when auth is on but no
@@ -205,7 +212,10 @@ blocks, …)` returns batch iterators for one executor's blocks. Three implement
 | `spark.vecruntime.shuffle.writer.memoryLimit` | 1 GB | the writer allocator's hard limit (backstop; flushes happen long before) |
 | `spark.vecruntime.shuffle.flight.threads` | `max(4, cores)` | server executor pool: concurrent `DoGet`s an executor serves |
 | `spark.vecruntime.shuffle.flight.bindHost` | block manager host | server bind address |
-| `Producer(chunkBytes)` | 4 MB | bytes per gRPC message (constructor parameter; benchmark sweep) |
+| `spark.vecruntime.shuffle.flight.chunkBytes` | 4 MB | bytes per gRPC message (at least 64 KB, the chunk buffer's first size) |
+| `spark.vecruntime.shuffle.flight.channelsPerPeer` | 1 | gRPC channels (TCP connections) per remote executor, streams spread round-robin |
+| `spark.vecruntime.shuffle.flight.clientWindow` | 0 (gRPC's, auto-tuned) | a fixed HTTP/2 flow-control window for the client's channels |
+| `spark.vecruntime.shuffle.flight.backpressureBytes` | 0 (no wait) | queued outbound bytes per stream above which the server waits before the next message |
 | `-Dvecruntime.shuffle.reader.coalesceRows` | 1024 | rows a reader accumulates before handing a batch to the operators |
 
 ## 8. Measuring it
@@ -224,6 +234,15 @@ chunking, decode, threads -- not bandwidth; that is what the knobs above change.
 `benchmarks/scripts/run-flight-bench.sh` (Spark is a provided dependency, so the jar alone will not
 do); each run writes a JSON file, an A/B is two runs and a diff. Host noise on a shared box is
 several percent: compare against a measured band.
+
+**Across the network** -- `FlightNetBench`: the same fixture's servers on one node, reduce tasks
+on another, so bandwidth, the flow-control window against the link's round trip, connections per peer
+and server threads against a NIC are on the path. The client checks every row comes back, then
+drives `concurrency` reduce tasks for `seconds` per run and prints one JSON line per run (GB/s,
+client CPU seconds per GB, fetch wait); `channelsPerPeer`, `clientWindow`, `concurrency` and
+`rangeWidth` take comma-separated lists swept as a grid, the server's `threads`, `chunkBytes` and
+`backpressureBytes` are one value per server. `benchmarks/k8s/render-flight-net.sh` renders the server
+pod, its headless Service and the client Job on another node (pod anti-affinity).
 
 **On the cluster** -- the TPC-DS matrix (`benchmarks/k8s/run-matrix.sh`) with event logs, read per
 stage: shuffle write time and bytes of the map stage, fetch wait and executor time of the reduce

@@ -53,6 +53,64 @@ import org.apache.spark.sql.vectorized.{ColumnVector, ColumnarBatch}
 object FlightBench {
   val Servers = 2
 
+  /** The fixture's row schema for a `strings` mode; a remote client derives it from the same parameter. */
+  def schemaFor(strings: String): StructType = {
+    val numbers = Seq(
+      StructField("k1", LongType),
+      StructField("k2", LongType),
+      StructField("i1", IntegerType),
+      StructField("i2", IntegerType),
+      StructField("d1", DoubleType),
+      StructField("d2", DoubleType)
+    )
+    val texts = strings match {
+      case "none" => Nil
+      case "low" => Seq(StructField("s_low", StringType))
+      case "high" => Seq(StructField("s_high", StringType))
+      case "mixed" => Seq(StructField("s_low", StringType), StructField("s_high", StringType))
+      case other => throw new IllegalArgumentException(s"strings=$other")
+    }
+    StructType(numbers ++ texts)
+  }
+
+  def codecFor(compression: String): Option[CompressionUtil.CodecType] = compression match {
+    case "zstd" => Some(CompressionUtil.CodecType.ZSTD)
+    case "none" => None
+    case other => throw new IllegalArgumentException(s"compression=$other")
+  }
+
+  /**
+   * A reduce task against `locations`: one stream per server for partitions `[reduce, reduce + width)`,
+   * opened together (#347), drained in turn. Returns the rows read; the bytes land in `metrics`.
+   */
+  def reduceTask(
+      locations: Seq[FlightLocation],
+      mapIds: Seq[Long],
+      reduce: Int,
+      width: Int,
+      schema: StructType,
+      codec: Option[CompressionUtil.CodecType],
+      conf: SparkConf,
+      allocator: BufferAllocator,
+      metrics: org.apache.spark.shuffle.ShuffleReadMetricsReporter,
+      touch: java.util.function.Consumer[ColumnarBatch]
+  ): Long = {
+    val streams = locations.map(l =>
+      new FlightBlockStream(l, 0, mapIds, reduce, reduce + width, schema, codec, conf, allocator, metrics)
+    )
+    var rows = 0L
+    try streams.foreach { s => while (s.hasNext) { val b = s.next(); rows += b.numRows(); touch.accept(b) } }
+    finally streams.foreach(_.close())
+    rows
+  }
+
+  /**
+   * The map files of `Servers` executors and a Flight server serving each. On the loopback interface
+   * by default (the JMH benchmark); [[FlightNetBench]] binds them to `bindHost` on fixed ports from
+   * `basePort` and hands their locations at `advertiseHost` to a client on another node. `transport`
+   * carries the `spark.vecruntime.shuffle.flight.*` keys, for the servers here and the client of
+   * [[reduceTask]].
+   */
   final class Fixture(
       partitions: Int,
       maps: Int,
@@ -60,36 +118,42 @@ object FlightBench {
       strings: String,
       compression: String,
       serverThreads: Int,
-      chunkBytes: Int
+      chunkBytes: Int,
+      bindHost: String,
+      advertiseHost: String,
+      basePort: Int,
+      transport: SparkConf
   ) extends AutoCloseable {
 
-    val schema: StructType = {
-      val numbers = Seq(
-        StructField("k1", LongType),
-        StructField("k2", LongType),
-        StructField("i1", IntegerType),
-        StructField("i2", IntegerType),
-        StructField("d1", DoubleType),
-        StructField("d2", DoubleType)
-      )
-      val texts = strings match {
-        case "none" => Nil
-        case "low" => Seq(StructField("s_low", StringType))
-        case "high" => Seq(StructField("s_high", StringType))
-        case "mixed" => Seq(StructField("s_low", StringType), StructField("s_high", StringType))
-        case other => throw new IllegalArgumentException(s"strings=$other")
-      }
-      StructType(numbers ++ texts)
-    }
-    val codec: Option[CompressionUtil.CodecType] = compression match {
-      case "zstd" => Some(CompressionUtil.CodecType.ZSTD)
-      case "none" => None
-      case other => throw new IllegalArgumentException(s"compression=$other")
-    }
+    def this(
+        partitions: Int,
+        maps: Int,
+        rowsPerMap: Int,
+        strings: String,
+        compression: String,
+        serverThreads: Int,
+        chunkBytes: Int
+    ) = this(
+      partitions,
+      maps,
+      rowsPerMap,
+      strings,
+      compression,
+      serverThreads,
+      chunkBytes,
+      "127.0.0.1",
+      "127.0.0.1",
+      0,
+      new SparkConf(false)
+    )
+
+    val schema: StructType = schemaFor(strings)
+    val codec: Option[CompressionUtil.CodecType] = codecFor(compression)
     val allocator: BufferAllocator = new RootAllocator()
     private val dir: Path = Files.createTempDirectory("svflightbench")
     private val transportConf = new TransportConf("shuffle", MapConfigProvider.EMPTY)
-    private val conf = new SparkConf(false)
+    private val conf = transport
+    private val settings = FlightShuffle.Transport(transport)
     private val metrics = new org.apache.spark.executor.TempShuffleReadMetrics()
     private val lowWords: Array[String] = Array.tabulate(50)(i => f"nation_$i%02d")
 
@@ -110,17 +174,21 @@ object FlightBench {
       val producer = new FlightShuffle.Producer(
         (_: Int, mapId: Long, start: Int, end: Int) => blockData(server, mapId.toInt, start, end),
         allocator,
-        chunkBytes
+        chunkBytes,
+        waitForReady = settings.backpressureBytes > 0
       )
-      val s = FlightServer.builder(
-        allocator,
-        Location.forGrpcInsecure("127.0.0.1", 0),
-        producer
-      ).executor(pools(server)).build()
+      val s = FlightShuffle.configure(
+        FlightServer.builder(
+          allocator,
+          Location.forGrpcInsecure(bindHost, if (basePort == 0) 0 else basePort + server),
+          producer
+        ).executor(pools(server)),
+        settings
+      ).build()
       s.start()
       s
     }
-    val locations: Array[FlightLocation] = servers.map(s => FlightLocation("127.0.0.1", s.getPort))
+    val locations: Array[FlightLocation] = servers.map(s => FlightLocation(advertiseHost, s.getPort))
     val mapIds: Seq[Long] = (0 until maps).map(_.toLong)
 
     /** The reduce range's bytes of one map file as the resolver serves them: one file segment (#411). */
@@ -176,20 +244,13 @@ object FlightBench {
     }
 
     /** A reduce task: one stream per executor for partitions `[reduce, reduce + width)`, opened together (#347), drained in turn. */
-    def reduceTask(reduce: Int, width: Int, touch: java.util.function.Consumer[ColumnarBatch]): Long = {
-      val streams = locations.map(l =>
-        new FlightBlockStream(l, 0, mapIds, reduce, reduce + width, schema, codec, conf, allocator, metrics)
-      )
-      var rows = 0L
-      try streams.foreach { s => while (s.hasNext) { val b = s.next(); rows += b.numRows(); touch.accept(b) } }
-      finally streams.foreach(_.close())
-      rows
-    }
+    def reduceTask(reduce: Int, width: Int, touch: java.util.function.Consumer[ColumnarBatch]): Long =
+      FlightBench.reduceTask(locations.toSeq, mapIds, reduce, width, schema, codec, conf, allocator, metrics, touch)
 
     /** The same tickets, the bytes consumed without decoding: the transport alone. */
     def rawTransport(reduce: Int, width: Int): Long = {
       val ticket = FlightShuffle.ticket(0, reduce, reduce + width, mapIds)
-      val streams = locations.map(l => FlightShuffle.Clients.client(l).getStream(ticket))
+      val streams = locations.map(l => FlightShuffle.Clients.client(l, settings).getStream(ticket))
       var bytes = 0L
       try streams.foreach { s =>
           while (s.next()) {
