@@ -92,8 +92,8 @@ the [Configuration reference](configuration.html) for every `spark.vecruntime.*`
 
 Version 0.0.7, a preview release under the Apache License 2.0. The plugin runs the whole of TPC-DS
 (103 queries) and TPC-H (22) with every operator accelerated and returns Spark's results. On the
-1 TB TPC-DS Parquet dataset on EKS (2026-10-08, no table statistics), VecRuntime finished the 103 queries
-in 1,202 s against Spark's 3,132 s in the same session (2.61x, faster on 101 of 103 queries) and Apache
+1 TB TPC-DS Parquet dataset on EKS (2026-10-10, no table statistics), VecRuntime finished the 103 queries
+in 1,012 s against Spark's 2,997 s in the same session (2.96x, faster on 100 of 103 queries) and Apache
 DataFusion Comet 1.0.0's 1,964 s (2026-10-03 session). The per-query tables and configurations are on the
 [TPC-DS 1 TB page](benchmarks/tpcds-1tb.html).
 
