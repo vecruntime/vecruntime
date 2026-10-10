@@ -30,7 +30,8 @@ Version 0.0.7, a preview release under the Apache License 2.0 (see `LICENSE` and
 the whole of TPC-DS (103 queries) and TPC-H (22) and returns Spark's results. Benchmark results, with the
 hardware and settings behind them, are on the [project site](https://vecruntime.github.io/vecruntime/):
 [TPC-DS 1 TB on x86](https://vecruntime.github.io/vecruntime/benchmarks/tpcds-1tb.html),
-[TPC-DS 1 TB on AWS Graviton4](https://vecruntime.github.io/vecruntime/benchmarks/tpcds-1tb-graviton.html), and
+[TPC-DS 1 TB on AWS Graviton4](https://vecruntime.github.io/vecruntime/benchmarks/tpcds-1tb-graviton.html),
+[TPC-DS 3 TB against Gluten + Velox and DataFusion Comet](https://vecruntime.github.io/vecruntime/benchmarks/tpcds-3tb-graviton.html), and
 the full lab notebook in [docs/results.md](docs/results.md). `CHANGELOG.md` has what each release carries.
 
 ## Requirements

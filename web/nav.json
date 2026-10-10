@@ -40,6 +40,7 @@
       "items": [
         { "title": "TPC-DS 1 TB (x86)", "url": "/benchmarks/tpcds-1tb.html" },
         { "title": "TPC-DS 1 TB (Graviton4)", "url": "/benchmarks/tpcds-1tb-graviton.html" },
+        { "title": "TPC-DS 3 TB vs Gluten and Comet", "url": "/benchmarks/tpcds-3tb-graviton.html" },
         { "title": "Iceberg merge-on-read", "url": "/benchmarks/iceberg-mor.html" }
       ]
     }

@@ -103,6 +103,8 @@ DataFusion Comet 1.0.0's 1,964 s (2026-10-03 session). The per-query tables and 
   103 queries on Amazon EKS, the three engines on identical hardware and data, per-query charts and tables.
 - [Apache Spark vs VecRuntime on TPC-DS 1 TB, AWS Graviton4](benchmarks/tpcds-1tb-graviton.html) --
   the same run on arm64 nodes (Neoverse V2, SVE2), set against the x86 run.
+- [VecRuntime vs Gluten + Velox vs DataFusion Comet on TPC-DS 3 TB, AWS Graviton4](benchmarks/tpcds-3tb-graviton.html) --
+  the awslabs data-on-eks 3 TB benchmark's data, nodes and executor layout, against its published Gluten and Comet results.
 - [Iceberg merge-on-read: VecRuntime vs Apache Spark](benchmarks/iceberg-mor.html) -- the v2
   delete-file and v3 deletion-vector merge cost at TPC-H SF1, against OSS Spark.
 

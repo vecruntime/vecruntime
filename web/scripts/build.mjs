@@ -61,6 +61,7 @@ const MD_PAGES = [
 const BENCH_PAGES = [
   "tpcds-1tb.html",
   "tpcds-1tb-graviton.html",
+  "tpcds-3tb-graviton.html",
   "iceberg-mor.html",
 ];
 

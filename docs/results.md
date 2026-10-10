@@ -2710,6 +2710,50 @@ frequency and double-pumping questions, `vpcompress` latency, whether decision 5
 Every switch above reads `Platform`, so those pools are a measurement away, not a code change.
 
 
+## TPC-DS 3 TB against Gluten + Velox and DataFusion Comet, the data-on-eks benchmark (2026-10-10)
+
+The page is `docs/benchmarks/tpcds-3tb-graviton.html`; the result files are in
+`benchmarks/results/tpcds-sf3000-doeks-2026-10-10/` (our two runs, and data-on-eks's published per-query CSVs).
+
+**Setup:**
+- **Data:** TPC-DS SF3000 generated with data-on-eks's generator image
+  (`spark3.5.3-scala2.12-java17-python3-ubuntu-tpcds:v2`) and arguments (`parquet 3000 200 true true true`)
+  unchanged: 24 tables, 996 GB of Parquet on S3, no table statistics.
+- **Nodes:** 12 x r8gd.12xlarge (Graviton4, 48 vCPU, 384 GB), local NVMe as RAID0 for shuffle and spill, as data-on-eks.
+- **Executors:** 23 x 5 cores x 58 GB, as data-on-eks (their Gluten / Comet: 20 GB heap + 6 GB overhead + 32 GB
+  off-heap). Ours: `-XX:+UseParallelGC` as theirs, otherwise our bench settings (ACCP, the S3A read settings,
+  `maxShuffledHashJoinLocalMapThreshold=64MB`).
+- **Code:** 0.0.7 + #690 (#688) + #691 (#687), arm64 image `d565-b687-b90c204-arm64`; Spark 4.1.3, Corretto 25.
+  Gluten 1.6.0 and Comet 0.16.0 ran on Spark 3.5.8 / JDK 17 in data-on-eks's runs; their numbers are the
+  published means, not re-run here.
+
+**Tuning round** (10 heavy queries, 900 partitions, 0.0.7): heap / overhead 24/34 679.4 s, 35/23 784.4 s,
+44/14 640.2 s; without q14a and q24a 288.3 / 281.0 / 274.9 s, so 44/14. It found two problems:
+- **q14a** (#688): the merge join walked the whole right run for every left row of an INTERSECT's semi join;
+  224.2 s, 71.9 s with the hash join forced, 67.4 s with #690.
+- **q24a** (#687): a hash join producing 367 M rows in one task from 0.7 M probe rows, its probe strings gathered
+  into every row and mapped to group ids row by row; 141.1 s, 98.3 s with #691.
+
+**Totals** (103 queries, image with both fixes):
+
+| engine | total (s) | vs Gluten | vs Comet | geomean vs Gluten / Comet | faster than Gluten / Comet on |
+|---|---:|---:|---:|---:|---:|
+| VecRuntime, 900 partitions, 44/14 | 1,200.0 | 1.87x | 2.06x | 1.78x / 1.74x | 90 / 91 |
+| VecRuntime, 200 partitions, 35/23 | 1,258.0 | 1.78x | 1.96x | 1.77x / 1.74x | 92 / 92 |
+| Gluten + Velox 1.6.0 | 2,239.9 | | | | |
+| Comet 0.16.0 | 2,467.5 | | | | |
+
+- **200 partitions:** data-on-eks's setting. 44/14 OOM-killed an executor in q93 there (exit 137), so the run
+  is at 35/23. 4.8 % slower in total than 900; q67 33.8 -> 60.2 s, q78 49.0 -> 68.8, q47 30.1 -> 46.2 (168 GB of
+  spill), q17 4.4 -> 13.8 (#694); q16 19.5 -> 9.3, q23a/b about -10 %.
+- **Behind Gluten:** q24a 104.6 / 83.1 s and q24b 102.1 / 81.7 (#692), q47 30.1 / 18.3 (#693), q78 49.0 / 46.4
+  (#689), q87 13.5 / 11.2, q38 13.3 / 11.1, q1 6.1 / 4.7; the rest within a second.
+- **Correctness:** no Spark baseline at 3 TB. The two runs agree on rows and checksums on every query except
+  q39a, 19,301 rows at 900 and 19,302 at 200 (#695: most likely a group at the `cov > 1` boundary).
+- **Noise:** one q23b in the 900-partition tuning check took 69.5 s instead of about 39: one scan task waited
+  30 s on S3 (0.08 s of CPU).
+
+
 ## Graviton4 (#253): the kernels on SVE, and TPC-DS 1 TB against Spark
 
 Nodes: `m8g.4xlarge` (AWS Graviton4, Neoverse V2, `sve sve2 svebitperm`). Corretto 25.0.4.1 runs there with `UseSVE = 2` and `MaxVectorSize = 16`, so the Vector API's species are 128 bits wide, as on NEON.
