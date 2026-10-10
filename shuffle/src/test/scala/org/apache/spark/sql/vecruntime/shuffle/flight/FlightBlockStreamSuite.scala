@@ -297,4 +297,93 @@ class FlightBlockStreamSuite extends AnyFunSuite {
     )
     intercept[org.apache.arrow.memory.OutOfMemoryException] { oom.hasNext }
   }
+
+  test("the transport keys: unset is the previous behaviour, out-of-range values are refused") {
+    assert(FlightShuffle.Transport(new SparkConf(false)) === FlightShuffle.Transport.Default)
+    assert(FlightShuffle.Transport.Default === FlightShuffle.Transport(4 << 20, 1, 0, 0))
+    val set = new SparkConf(false)
+      .set(FlightShuffle.ChunkBytesKey, "1m")
+      .set(FlightShuffle.ChannelsPerPeerKey, "4")
+      .set(FlightShuffle.ClientWindowKey, "16m")
+      .set(FlightShuffle.BackpressureBytesKey, "32m")
+    assert(FlightShuffle.Transport(set) === FlightShuffle.Transport(1 << 20, 4, 16 << 20, 32 << 20))
+    Seq(
+      FlightShuffle.ChunkBytesKey -> "1k",
+      FlightShuffle.ChunkBytesKey -> "4g",
+      FlightShuffle.ChannelsPerPeerKey -> "0"
+    ).foreach { case (k, v) =>
+      intercept[IllegalArgumentException](FlightShuffle.Transport(new SparkConf(false).set(k, v)))
+    }
+  }
+
+  test(
+    "small messages, server backpressure, several channels per peer and a fixed client window carry the same rows"
+  ) {
+    val allocator = new RootAllocator()
+    val dir = Files.createTempDirectory("svflight")
+    val path = dir.resolve("block.ipc")
+    val one = mutable.ArrayBuffer.empty[(Int, String)]
+    val writer = new PartitionedIpcWriter(schema, 1, allocator, path, 1L << 20, batchRows = 500)
+    val arena = Arena.ofConfined()
+    try {
+      Seq("alpha", "beta", "gamma").foreach { prefix =>
+        val (b, rows) = batch(arena, allocator, 500, prefix)
+        try { writer.write(b, new Array[Int](500)); one ++= rows }
+        finally b.close()
+      }
+      writer.finish()
+    } finally { arena.close(); writer.close() }
+    val block = PartitionedIpcFile.blockBytes(path, 0, 1)
+    // Enough map outputs that the stream is many 64 KB messages: backpressure is waited for between them.
+    val mapIds = (0L until 256L).toSeq
+    assert(block.length.toLong * mapIds.size > 4L * FlightShuffle.InitialChunkBytes)
+
+    val conf = new SparkConf(false)
+      .set(FlightShuffle.ChunkBytesKey, FlightShuffle.InitialChunkBytes.toString)
+      .set(FlightShuffle.BackpressureBytesKey, FlightShuffle.InitialChunkBytes.toString)
+      .set(FlightShuffle.ChannelsPerPeerKey, "3")
+      .set(FlightShuffle.ClientWindowKey, "128k")
+    val t = FlightShuffle.Transport(conf)
+    val producer = new FlightShuffle.Producer(
+      (_: Int, _: Long, _: Int, _: Int) => new NioManagedBuffer(ByteBuffer.wrap(block)),
+      allocator,
+      t.chunkBytes,
+      waitForReady = true
+    )
+    val server = FlightShuffle.configure(
+      FlightServer.builder(allocator, Location.forGrpcInsecure("127.0.0.1", 0), producer),
+      t
+    ).build()
+    server.start()
+    try {
+      val location = FlightLocation("127.0.0.1", server.getPort)
+      val clients = (1 to 4).map { _ =>
+        val metrics = new org.apache.spark.executor.TempShuffleReadMetrics()
+        val stream = new FlightBlockStream(
+          location,
+          0,
+          mapIds,
+          0,
+          schema,
+          conf,
+          FlightShuffle.Clients.allocatorForReads,
+          metrics
+        )
+        try {
+          val got = mutable.ArrayBuffer.empty[(Int, String)]
+          while (stream.hasNext) {
+            val b = stream.next()
+            (0 until b.numRows()).foreach(r => got += ((b.column(0).getInt(r), b.column(1).getUTF8String(r).toString)))
+          }
+          assert(got === mapIds.flatMap(_ => one), "every map output's rows, in order")
+          assert(metrics.remoteBytesRead === block.length.toLong * mapIds.size)
+        } finally stream.close()
+        FlightShuffle.Clients.client(location, t)
+      }
+      assert(clients.distinct.size === 3, "streams to one peer take its three channels in turn")
+    } finally {
+      server.close()
+      allocator.close()
+    }
+  }
 }

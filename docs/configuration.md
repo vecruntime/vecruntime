@@ -147,6 +147,10 @@ section) and the shuffle jar is on the classpath.
 | `spark.vecruntime.shuffle.reduceLocality.enabled` | `false` | boolean | Whether the reduce tasks of our shuffle report preferred locations: the hosts holding most of their map output, as Spark's `spark.shuffle.reduceLocality.enabled` does for its own. Off by default (#559). A shuffled join intersects both sides' preferred hosts, often down to one host; its 13 slots then run the whole stage while the other tasks wait out `spark.locality.wait` (3 s), and the next stage repeats it over that host's output. A reducer reads its own executor's blocks locally, so locality saves some network fetch, but at 1 TB the wait cost far more. 1 TB TPC-DS, two legs each way: q81 -67%, q31 -42%, q87 -37%, q18 -24%, q30 -22%, q95 +2.5%, checksums equal. With it on, Spark's own flag still applies. |
 | `spark.vecruntime.shuffle.flight.bindHost` | the executor's block manager host | host name | The address the executor's Flight server binds to; change it when the executor's advertised host is not the one it can bind. |
 | `spark.vecruntime.shuffle.flight.threads` | `max(4, available processors)` | int | Serving threads of the executor's Flight server. |
+| `spark.vecruntime.shuffle.flight.chunkBytes` | `4m` | size, at least `64k` | Bytes per gRPC message the Flight server sends; a stream's chunk buffer starts at 64 KB and doubles up to this. |
+| `spark.vecruntime.shuffle.flight.channelsPerPeer` | `1` | int, at least 1 | gRPC channels (TCP connections) an executor opens to each remote executor's Flight server; the streams of its reduce tasks take them in turn. |
+| `spark.vecruntime.shuffle.flight.clientWindow` | `0` | size | A fixed HTTP/2 flow-control window for those channels; `0` keeps gRPC's own window, which grows with the measured bandwidth-delay product. |
+| `spark.vecruntime.shuffle.flight.backpressureBytes` | `0` | size | Above `0`, the Flight server waits before each message until the stream's queued outbound bytes are under this many; `0` sends without waiting and lets Netty buffer what the client has not read. |
 
 ## Comet integration
 
