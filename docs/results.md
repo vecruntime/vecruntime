@@ -2862,7 +2862,7 @@ scaling with compression ratio 0.
 
 The page now shows this run: release 0.0.7 (image `d565-v0.0.7-arm64`), `bench-g4-1b` (9 x m8g.4xlarge, one
 availability zone), the x86 run's current settings: both engines 30 GB heap / 20 GB overhead / 30 GB direct, 300
-shuffle partitions with AQE at its defaults, EMR's `maxShuffledHashJoinLocalMapThreshold=64MB`, off-heap column
+shuffle partitions with AQE at its defaults, `maxShuffledHashJoinLocalMapThreshold=64MB`, off-heap column
 vectors, map-size scaling with ratio 0, no statistics. Spark had 20 GB heap / 30 GB overhead in the earlier runs.
 
 | | Spark (s) | ours (s) | speedup | geomean |
@@ -2985,7 +2985,7 @@ VecRuntime column. The result files and the page's metadata are in `benchmarks/r
 **Setup:** as on 2026-10-03 (below), with these changes:
 - **Code:** main at `6bef04d`, image `d565-main-6bef04d`: `FactBloomFilter` on by default with run-time
   evidence and transitive reduction (#659), its vectorised probe (#664). No table statistics.
-- **Spark and VecRuntime:** `spark.sql.adaptive.maxShuffledHashJoinLocalMapThreshold=64MB` (EMR's setting),
+- **Spark and VecRuntime:** `spark.sql.adaptive.maxShuffledHashJoinLocalMapThreshold=64MB`,
   both 30 GB heap / 20 GB overhead, node group in us-east-1b.
 - **Comet:** its 1.0.0 leg of the 2026-10-03 session. A Comet leg in this session was stopped after 13
   queries; on those it took 321 s against 221 s on 2026-10-03.

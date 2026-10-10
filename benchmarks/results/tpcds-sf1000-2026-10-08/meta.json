@@ -14,7 +14,7 @@
   },
   "common_conf": [
     "spark.sql.shuffle.partitions=300",
-    "spark.sql.adaptive.maxShuffledHashJoinLocalMapThreshold=64MB   # Spark and VecRuntime (EMR's setting); not in the 2026-10-03 Comet leg",
+    "spark.sql.adaptive.maxShuffledHashJoinLocalMapThreshold=64MB   # Spark and VecRuntime; not in the 2026-10-03 Comet leg",
     "spark.locality.wait=0   # every engine (#608)",
     "spark.eventLog.enabled=true",
     "-XX:+UseCompactObjectHeaders, -Djava.security.properties=<ACCP first> (driver and executors, every engine)"

@@ -19,10 +19,6 @@ Each rule here follows the same contract:
 - It runs the gate, the SQL golden suite, and TPC-DS SF1 checksums against Spark. A performance claim
   carries a 1 TB A/B with control queries (AGENTS.md section 10).
 
-The rules came out of a 1 TB TPC-DS comparison with EMR Serverless (emr-spark-8.1.0, 6 x 16 vCPU,
-2026-10-05). EMR's own Spark extension rewrites the same shapes; its plans are the reference for
-which shapes are worth handling.
-
 | Rule | Switch (default `true`) | Queries it changes in TPC-DS |
 |---|---|---|
 | `SelfJoinToAggregate` | `spark.vecruntime.optimizer.selfJoinToAggregate.enabled` | q95 |
@@ -242,12 +238,12 @@ rule off, plus the two declined shapes and the switch. Results are compared with
 At 1 TB on 2026-10-06, `main` 35e797d against the rule, with legs alternated (3 iterations each). Times are
 median seconds, and checksums are identical:
 
-| Query | `main` | With the rule | EMR Serverless |
-|---|---:|---:|---:|
-| q59 | 13.7 / 13.3 | 6.4 / 6.2 | 6.0 |
-| q2 | 14.1 / 13.2 | 4.5 / 4.3 | 11.0 |
-| q67 (control) | 58.4 / 59.7 | 57.5 / 58.4 | |
-| q18 (control) | 4.15 / 4.12 | 4.17 / 4.09 | |
+| Query | `main` | With the rule |
+|---|---:|---:|
+| q59 | 13.7 / 13.3 | 6.4 / 6.2 |
+| q2 | 14.1 / 13.2 | 4.5 / 4.3 |
+| q67 (control) | 58.4 / 59.7 | 57.5 / 58.4 |
+| q18 (control) | 4.15 / 4.12 | 4.17 / 4.09 |
 
 ## `TransitiveDpp`: dynamic partition pruning through a second join key
 
@@ -260,8 +256,8 @@ median seconds, and checksums are identical:
 - `x` traces, through projections, filters and inner joins, to a join-free subtree `S` of `X` that has one.
 
 TPC-DS q72 is this shape. `inventory` joins `date_dim d2` on `inv_date_sk = d2.d_date_sk AND
-d1.d_week_seq = d2.d_week_seq`, and `d1` is restricted to one `d_year`. EMR Serverless prunes `inventory`
-there; we did not.
+d1.d_week_seq = d2.d_week_seq`, and `d1` is restricted to one `d_year`. Without the rule, `inventory` is read
+in full.
 
 **Why Spark does not prune it.** `PartitionPruning` finds `inv_date_sk` as a partition column, but the
 filtering side, `d2`, has no selective predicate (`hasPartitionPruningFilter`). What makes `d2` selective
@@ -305,7 +301,7 @@ semi, or the null-supplying side of an outer join), where:
 - that scan has no dynamic pruning or bloom filter on the key yet.
 
 TPC-DS q93 is this shape: `store_sales` (2.9G rows at 1 TB) joined to `store_returns` (~290M) on ticket and
-item. EMR Serverless filters `store_sales` by `store_returns`' keys before the shuffle; we and Spark did not.
+item. Without the rule, all of `store_sales` is shuffled into the join, though most of it has no match.
 
 **Why Spark does not add it.** `InjectRuntimeFilter.extractSelectiveFilterOverScan` requires a selective
 `Filter` directly over the creation-side scan. `store_returns` has none of its own, so Spark builds nothing
@@ -350,8 +346,7 @@ sub-filter `pmod(h, B)`; a key the creation side has always lands in its bucket,
 `h & (B - 1)` (equal to `pmod(h, B)`) instead of a long division per row (#659); 8 bits a key, fewer down to 4 to
 stay within `maxTotalBits` (512M bits); a
 filter that would need more is declined. The probe is vectorised and its sub-filters are deserialised once per
-executor (`BloomFilterCache`). EMR Serverless sizes its own filters the same way (q93: `GenerateBloomFilter` for ~110M
-rows on `store_returns`' keys, shuffle 2.8 GB against our 41.8 GB).
+executor (`BloomFilterCache`).
 
 **Split-block sub-filters (#659).** Each sub-filter of a partitioned filter is a split-block bloom filter, the layout
 of Parquet and Impala: 256-bit blocks of eight 32-bit words, a key setting one bit in each word of the one block its
@@ -406,8 +401,8 @@ Off with `spark.vecruntime.optimizer.factBloomFilter.runtimeEvidence=false`.
 
 **Transitive reduction (#659).** A small, selectively filtered relation `D` broadcast-joined above a shuffle join,
 on a column of one of its inputs `C`, first gets a bloom filter of its key on `C`'s scan. `C` is then reduced and
-is the creation side of a filter onto the shuffle join's larger input -- the chain EMR Serverless applies in q93
-(a run-time filter on `sr_reason_sk` from one `reason`, then bloom filters onto `store_sales`). The inner join with
+is the creation side of a filter onto the shuffle join's larger input. In q93 that is a filter on `sr_reason_sk`
+from one `reason`, then bloom filters onto `store_sales`. The inner join with
 `D` above keeps exactly the rows the filter can keep, so results are unchanged. Spark's own runtime filter leaves
 it out because the join with `D` is a broadcast. With run-time evidence, the plan-time size check only requires
 the application side to be the larger: the estimate of a reduced creation side is its base table's size.
@@ -417,8 +412,7 @@ Off with `spark.vecruntime.optimizer.factBloomFilter.transitive=false`.
 input that the optimizer leaves alone. The query-stage preparation rule `ShareBloomCreationExchange` replaces its
 physical placeholder with that join input's own shuffle exchange, carrying the reference's logical link so the
 subquery's re-planning keeps it. AQE's stage cache then materialises the exchange once, for the join and for the
-filter, and the build is a read of a stage the join computes anyway (EMR Serverless's `GenerateBloomFilter` over a
-`ReusedExchange`). A reference no shuffle join claims turns its filter into null, which every row passes. Off with
+filter, and the build is a read of a stage the join computes anyway. A reference no shuffle join claims turns its filter into null, which every row passes. Off with
 `spark.vecruntime.optimizer.factBloomFilter.shareExchange=false`.
 
 ## `NarrowBelowJoin`: a substring or length of one join side's string computed below the join
@@ -456,8 +450,7 @@ plugin off. The 1 TB numbers come with the PR.
 TPC-DS q4, q11 and q74 sum `store_sales` (and the catalog and web facts) per customer and year, grouped by seven
 `customer` strings and `d_year`, after joining `customer` and `date_dim`. Spark aggregates after the joins, so
 every fact row is joined and then hashed on the strings: at 1 TB each of q4's fact stages shuffled 6.1 GB
-(537M rows) against 0.7 GB on EMR Serverless, which aggregates `(ss_customer_sk, ss_sold_date_sk)` directly
-above the scan.
+(537M rows). Aggregating `(ss_customer_sk, ss_sold_date_sk)` directly above the scan avoids that.
 
 Shape (logical, in the late optimizer batch):
 
@@ -505,7 +498,7 @@ the product, and the estimate declined exactly the queries the pre-aggregate spe
 
 ## `RemoveRedundantGroupKeys`: grouping keys a unique broadcast key determines (#635)
 
-An adaptive (runtime) optimizer rule, the counterpart of EMR's `AQERemoveRedundantGroupKeys`. It runs when AQE
+An adaptive (runtime) optimizer rule. It runs when AQE
 re-optimises after a query stage finished, so a broadcast stage below an aggregate is already built and its keys
 can be checked on the data it actually holds.
 
