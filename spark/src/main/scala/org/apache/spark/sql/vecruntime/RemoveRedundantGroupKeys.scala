@@ -182,12 +182,18 @@ case class RemoveRedundantGroupKeys(session: SparkSession) extends Rule[LogicalP
   }
 
   private def isUnique(e: VectorBroadcastExchangeExec, ordinal: Int): Boolean =
+    // Read the broadcast from `completionFuture`, the promise AQE waits on to mark the stage materialised
+    // (#697). `relationFuture` completes a moment later -- its body returns after fulfilling the promise --
+    // so a re-optimisation in between saw `relationFuture.isDone == false` and kept every grouping key.
     try {
-      val f = e.relationFuture
-      f.isDone && (f.get().value match {
-        case v: VectorBroadcastBatches => v.keysUnique(ordinal)
+      e.completionFuture.value match {
+        case Some(scala.util.Success(b)) =>
+          b.value match {
+            case v: VectorBroadcastBatches => v.keysUnique(ordinal)
+            case _ => false
+          }
         case _ => false
-      })
+      }
     } catch {
       case scala.util.control.NonFatal(_) => false
     }
