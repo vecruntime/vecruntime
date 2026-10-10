@@ -9,8 +9,7 @@ description: A vectorized execution runtime for Apache Spark SQL using Java
 A Spark SQL plugin that runs Filter, Project, HashAggregate, Sort, Window (`ROWS` and `RANGE`
 frames), Range, Expand, Generate, the limits, Union and the hash, sort-merge and nested-loop joins on
 Arrow-layout batches with the Java Vector API -- on the JVM, no native code -- with its own columnar
-shuffle over Arrow Flight. Source, releases and the README:
-[github.com/vecruntime/vecruntime](https://github.com/vecruntime/vecruntime).
+shuffle over Arrow Flight.
 
 VecRuntime accelerates Spark SQL workloads by executing core operators directly on Arrow-layout
 columnar batches using the Java Vector API (`jdk.incubator.vector`), bringing SIMD-optimized
@@ -91,11 +90,7 @@ the [Configuration reference](configuration.html) for every `spark.vecruntime.*`
 ## Status
 
 Version 0.0.7, a preview release under the Apache License 2.0. The plugin runs the whole of TPC-DS
-(103 queries) and TPC-H (22) with every operator accelerated and returns Spark's results. On the
-1 TB TPC-DS Parquet dataset on EKS (2026-10-10, no table statistics), VecRuntime finished the 103 queries
-in 1,012 s against Spark's 2,997 s in the same session (2.96x, faster on 100 of 103 queries) and Apache
-DataFusion Comet 1.0.0's 1,964 s (2026-10-03 session). The per-query tables and configurations are on the
-[TPC-DS 1 TB page](benchmarks/tpcds-1tb.html).
+(103 queries) and TPC-H (22) with every operator accelerated and returns Spark's results.
 
 ## Benchmarks
 

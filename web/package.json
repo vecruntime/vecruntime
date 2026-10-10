@@ -3,7 +3,7 @@
   "version": "0.0.1",
   "private": true,
   "type": "module",
-  "description": "A vectorized execution runtime for Apache Spark using Java",
+  "description": "A vectorized execution runtime for Apache Spark SQL using Java",
   "license": "Apache-2.0",
   "scripts": {
     "build": "node scripts/build.mjs",
