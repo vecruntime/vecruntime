@@ -77,6 +77,12 @@ object VectorConf {
   /** Whether AggregateBelowJoin declines when there are no statistics to show a reduction (#675; default false). */
   val AggregateBelowJoinRequireStatistics = "spark.vecruntime.optimizer.aggregateBelowJoin.requireStatistics"
 
+  /** Whether AggregateBelowJoin's pre-aggregate is one per task with no exchange (#693; default true). */
+  val AggregateBelowJoinLocal = "spark.vecruntime.optimizer.aggregateBelowJoin.local"
+
+  /** Rows of a task after which a local pre-aggregate that does not reduce gives up (#693; 0 = only at the budget). */
+  val AggregateBelowJoinProbeRows = "spark.vecruntime.optimizer.aggregateBelowJoin.probeRows"
+
   /**
    * Adaptive rewrite (#635): grouping keys that are columns of a broadcast join's build side are dropped
    * when that side's join key is unique at run time and is itself a grouping key.
@@ -615,6 +621,17 @@ object VectorConf {
   /** AggregateBelowJoin declines without statistics (default false, #675). */
   def aggregateBelowJoinRequireStatistics(conf: SQLConf): Boolean =
     bool(conf, AggregateBelowJoinRequireStatistics, default = false)
+
+  /** AggregateBelowJoin's pre-aggregate local to each task (default true, #693); false plans Spark's two stages. */
+  def aggregateBelowJoinLocal(conf: SQLConf): Boolean = bool(conf, AggregateBelowJoinLocal, default = true)
+
+  /**
+   * The rows a local pre-aggregate reads before it judges its reduction (default 262144, 32 batches of 8192):
+   * fewer groups than rows / `spark.vecruntime.agg.passThroughRatio` keeps it aggregating, more sends the rest
+   * of the task through one batch at a time (#693). 0 judges only when the table reaches its memory budget.
+   */
+  def aggregateBelowJoinProbeRows(conf: SQLConf): Long =
+    math.max(0L, conf.getConfString(AggregateBelowJoinProbeRows, "262144").trim.toLong)
 
   /** Dropping grouping keys a unique broadcast key determines (#635); also off when the plugin is off. */
   def removeRedundantGroupKeysEnabled(conf: SQLConf): Boolean =

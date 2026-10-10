@@ -42,6 +42,8 @@ class VectorSparkSessionExtensions extends (SparkSessionExtensions => Unit) {
     extensions.injectPlannerStrategy(session => VectorWriteDeltaStrategy(session))
     // FactBloomFilter's build over the join's own creation-side exchange (#659).
     extensions.injectPlannerStrategy(_ => org.apache.spark.sql.vecruntime.BloomCreationRefStrategy)
+    // AggregateBelowJoin's pre-aggregate as one aggregate per task, no exchange (#693).
+    extensions.injectPlannerStrategy(session => org.apache.spark.sql.vecruntime.LocalPreAggregateStrategy(session))
     extensions.injectQueryStagePrepRule(session => org.apache.spark.sql.vecruntime.ShareBloomCreationExchange(session))
     // Adaptive re-optimisation, once a broadcast stage is built: grouping keys its unique key determines (#635).
     extensions.injectRuntimeOptimizerRule(session => org.apache.spark.sql.vecruntime.RemoveRedundantGroupKeys(session))

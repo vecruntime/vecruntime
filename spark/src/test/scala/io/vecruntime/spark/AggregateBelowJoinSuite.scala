@@ -148,6 +148,145 @@ class AggregateBelowJoinSuite extends VectorQuerySuite {
     assert(!preAggregated(strict.queryExecution.optimizedPlan), strict.queryExecution.optimizedPlan.treeString)
   }
 
+  /** Every node of the final plan, through adaptive stages and subqueries. */
+  private def nodes(df: DataFrame): Seq[org.apache.spark.sql.execution.SparkPlan] = {
+    val all = new scala.collection.mutable.ArrayBuffer[org.apache.spark.sql.execution.SparkPlan]()
+    def walk(p: org.apache.spark.sql.execution.SparkPlan): Unit = {
+      p match {
+        case a: org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanExec => walk(a.executedPlan)
+        case s: org.apache.spark.sql.execution.adaptive.QueryStageExec => walk(s.plan)
+        case _ => all += p
+      }
+      p.children.foreach(walk)
+      p.subqueries.foreach(walk)
+    }
+    walk(df.queryExecution.executedPlan)
+    all.toSeq
+  }
+
+  private def isExchange(p: org.apache.spark.sql.execution.SparkPlan): Boolean =
+    p.isInstanceOf[org.apache.spark.sql.execution.exchange.Exchange] ||
+      p.isInstanceOf[org.apache.spark.sql.execution.adaptive.QueryStageExec]
+
+  /** The local pre-aggregates of the final plan, each checked to read the fact with no exchange in between. */
+  private def localPreAggregates(df: DataFrame): Seq[org.apache.spark.sql.vecruntime.VectorHashAggregateExec] = {
+    val local = nodes(df).collect {
+      case a: org.apache.spark.sql.vecruntime.VectorHashAggregateExec if a.localPreAggregate => a
+    }
+    local.foreach(a => assert(!a.child.exists(isExchange), s"an exchange below the local pre-aggregate:\n$a"))
+    local
+  }
+
+  test("#693: the pre-aggregate is one per task -- no exchange of the fact on its keys -- and it reduces") {
+    val df = run(q4Shape)
+    val local = localPreAggregates(df)
+    assert(local.size == 1, nodes(df).mkString("\n"))
+    val out = local.head.metrics("numOutputRows").value
+    // 30000 rows, 6000 (customer, date) pairs: the tables a task emits hold far fewer rows than it read.
+    assert(out > 0 && out < 30000 / 2, s"$out groups out of 30000 rows")
+    // Spark's two stages are what `local=false` restores: a Partial, the exchange, a Final.
+    val global = withConf(VectorConf.AggregateBelowJoinLocal -> "false")(run(q4Shape))
+    assert(localPreAggregates(global).isEmpty)
+    assert(preAggregated(global.queryExecution.optimizedPlan), global.queryExecution.optimizedPlan.treeString)
+  }
+
+  // q47's shape at 1 TB: grouped by (item, store, date) the fact barely repeats a key. Here every row has its own
+  // (s_item, s_cust) pair, so the pre-aggregate cannot reduce anything.
+  private val uniqueKeys =
+    """SELECT c_first, i_brand, sum(s_amount) total, count(s_qty) n, max(s_qty) hi
+      |FROM abj_usales JOIN abj_customer ON s_cust = c_sk JOIN abj_item ON s_item = i_sk
+      |GROUP BY c_first, i_brand""".stripMargin
+
+  private def withUniqueKeyTables[T](body: => T): T = {
+    val session = spark
+    import session.implicits._
+    try {
+      (0 until 30000).map(i => (i, i % 200, BigDecimal(i % 89) / 3, (i % 11).toLong))
+        .toDF("s_item", "s_cust", "s_amount", "s_qty")
+        .repartition(1)
+        .write.mode("overwrite").saveAsTable("abj_usales")
+      spark.sql("ANALYZE TABLE abj_usales COMPUTE STATISTICS FOR ALL COLUMNS")
+      (0 until 30000).map(i => (i, s"brand-${i % 50}")).toDF("i_sk", "i_brand")
+        .write.mode("overwrite").saveAsTable("abj_item")
+      spark.sql("ANALYZE TABLE abj_item COMPUTE STATISTICS FOR ALL COLUMNS")
+      body
+    } finally {
+      Seq("abj_usales", "abj_item").foreach { t =>
+        spark.sessionState.catalog.dropTable(
+          org.apache.spark.sql.catalyst.TableIdentifier(t),
+          ignoreIfNotExists = true,
+          purge = false
+        )
+      }
+    }
+  }
+
+  test("#693: keys that do not repeat -- the local pre-aggregate gives up after its first rows, results unchanged") {
+    withUniqueKeyTables {
+      // A probe of 2000 rows: the first table goes out after the first batch and the rest passes through.
+      val df = withConf(VectorConf.AggregateBelowJoinProbeRows -> "2000")(
+        run(uniqueKeys)
+      )
+      val local = localPreAggregates(df)
+      assert(local.size == 1, nodes(df).mkString("\n"))
+      assert(local.head.localProbe, "statistics cannot prove a reduction here: the aggregate is judged early")
+      assert(
+        local.head.metrics("spills").value >= 1,
+        s"the first table went out at the probe: ${local.head.metrics.map { case (k, v) => k -> v.value }}\n${df.queryExecution.executedPlan}"
+      )
+      assert(local.head.metrics("numOutputRows").value == 30000L, "nothing reduced, every row passed")
+    }
+  }
+
+  test("#693: with statistics, a proven reduction is not judged early; without them, or unproven, it is") {
+    // With statistics: at most 200 x 30 = 6000 groups for 30000 rows, 5x -- proven, judged at the budget only.
+    val proven = run(q4Shape)
+    assert(localPreAggregates(proven).map(_.localProbe) == Seq(false), proven.queryExecution.executedPlan.toString)
+    // The same data without statistics: nothing proven, the first rows decide.
+    val q = q4Shape.replace("abj_sales", "abj_sales_nostats")
+    val unproven = run(q)
+    assert(localPreAggregates(unproven).map(_.localProbe) == Seq(true), unproven.queryExecution.executedPlan.toString)
+    // Statistics that bound the groups above the rows prove nothing either (q47's case, and q4's at 1 TB).
+    withUniqueKeyTables {
+      val unique = run(uniqueKeys)
+      assert(localPreAggregates(unique).map(_.localProbe) == Seq(true), unique.queryExecution.executedPlan.toString)
+    }
+  }
+
+  test("#693: an aggregate used twice in one copy of a CTE keeps the copies alike, so the exchange is reused") {
+    // q47's shape: `sum(...)` is a result and the input of a window over the same aggregate. The copy that keeps
+    // the window has the sum twice (two result ids); a pre-aggregate with a partial per copy of it made that copy's
+    // exchange differ from the other's, and the copy ran again instead of reusing the exchange.
+    val q =
+      """WITH v AS (
+        |  SELECT c_first, d_year, sum(s_qty) s, avg(sum(s_qty)) OVER (PARTITION BY c_first) w
+        |  FROM abj_sales JOIN abj_customer ON s_cust = c_sk JOIN abj_date ON s_date = d_sk
+        |  GROUP BY c_first, d_year)
+        |SELECT a.c_first, a.d_year, a.s, a.w, b.s FROM v a JOIN v b ON a.c_first = b.c_first AND a.d_year = b.d_year + 1""".stripMargin
+    def computedPreAggregates(df: DataFrame): Int = {
+      var n = 0
+      def walk(p: org.apache.spark.sql.execution.SparkPlan): Unit = p match {
+        case a: org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanExec => walk(a.executedPlan)
+        case s: org.apache.spark.sql.execution.adaptive.QueryStageExec => walk(s.plan)
+        case _: org.apache.spark.sql.execution.exchange.ReusedExchangeExec => // computed elsewhere
+        case other =>
+          other match {
+            case a: org.apache.spark.sql.vecruntime.VectorHashAggregateExec if a.localPreAggregate => n += 1
+            case _ =>
+          }
+          other.children.foreach(walk)
+      }
+      walk(df.queryExecution.executedPlan)
+      n
+    }
+    val df = run(q)
+    val pre = df.queryExecution.optimizedPlan.collect {
+      case a: Aggregate => a.aggregateExpressions.count(_.name.startsWith("_pre_agg_"))
+    }.filter(_ > 0)
+    assert(pre.nonEmpty && pre.forall(_ == 1), s"one partial per distinct function: $pre")
+    assert(computedPreAggregates(df) == 1, df.queryExecution.executedPlan.toString)
+  }
+
   test("the switch turns the rewrite off") {
     val df = withConf(VectorConf.AggregateBelowJoinEnabled -> "false")(run(q4Shape))
     assert(!preAggregated(df.queryExecution.optimizedPlan), df.queryExecution.optimizedPlan.treeString)

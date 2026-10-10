@@ -91,7 +91,11 @@ case class VectorHashAggregateExec(
     aggregateAttributes: Seq[Attribute],
     resultExpressions: Seq[NamedExpression],
     child: SparkPlan,
-    strictFloatingPoint: Boolean = true
+    strictFloatingPoint: Boolean = true,
+    /** [[AggregateBelowJoin]]'s pre-aggregate, one per task (#693): its groups may be split at will. */
+    localPreAggregate: Boolean = false,
+    /** Judge a local pre-aggregate on its first rows (statistics did not prove it reduces them). */
+    localProbe: Boolean = true
 ) extends VectorExec with PartitioningPreservingUnaryExecNode {
 
   override def output: Seq[Attribute] = resultExpressions.map(_.toAttribute)
@@ -201,6 +205,12 @@ case class VectorHashAggregateExec(
         a.isInstanceOf[io.vecruntime.spark.agg.SparkObjectAgg] && aggregateExpressions(i).mode == Complete
       }
     if (objectComplete) return AggSpillPolicy.InMemory
+    // A local pre-aggregate (#693): the top aggregate recombines any split of its groups, so it emits and
+    // starts over like a partial one -- past the budget, or once its first rows show they do not reduce.
+    if (localPreAggregate && groupingExpressions.nonEmpty) {
+      val probe = if (localProbe) VectorConf.aggregateBelowJoinProbeRows(conf) else 0L
+      return AggSpillPolicy.EmitAndReset(if (threshold > 0) threshold else Long.MaxValue, passThrough, probe)
+    }
     if (threshold <= 0 || groupingExpressions.isEmpty) AggSpillPolicy.InMemory
     else if (aggregateExpressions.isEmpty) {
       // Keys only (a distinct): before the exchange it emits keys, after it it merges them -- either way re-readable.
@@ -515,6 +525,12 @@ private[vecruntime] class VectorGroupedAggregateIterator(
   private var fillRows = 0L
   // Pass-through: the input has shown it does not reduce, so each batch goes out as its own table.
   private var passThrough = false
+  // The early judgement of a local pre-aggregate (#693): rows after which the first table goes out.
+  private val probeRows: Long = policy match {
+    case AggSpillPolicy.EmitAndReset(_, _, probe) => probe
+    case _ => 0L
+  }
+  private var probed = probeRows <= 0
 
   /** Consumes `source` into the table until it is exhausted (true) or the table passes `budget` (false; 0 = no budget). */
   private def fill(source: Iterator[ColumnarBatch], budget: Long): Boolean = {
@@ -523,6 +539,11 @@ private[vecruntime] class VectorGroupedAggregateIterator(
       fillRows += batch.numRows()
       consume(batch)
       if (passThrough) return !source.hasNext
+      if (!probed && fillRows >= probeRows) {
+        probed = true
+        // A table out now is judged by `advance` as one past the budget: not reduced, the rest passes through.
+        if (source.hasNext) return false
+      }
       if (budget > 0 && overBudget(budget)) return false
     }
     true
@@ -563,7 +584,7 @@ private[vecruntime] class VectorGroupedAggregateIterator(
           if (inputDone) return false
           fill(input, 0L)
           inputDone = true
-        case AggSpillPolicy.EmitAndReset(budget, ratio) =>
+        case AggSpillPolicy.EmitAndReset(budget, ratio, _) =>
           if (inputDone) return false
           reset()
           inputDone = fill(input, budget)
@@ -613,7 +634,7 @@ private[vecruntime] class VectorGroupedAggregateIterator(
     fillRows += batch.numRows()
     consume(batch)
     policy match {
-      case AggSpillPolicy.EmitAndReset(budget, _) if budget > 0 && overBudget(budget) =>
+      case AggSpillPolicy.EmitAndReset(budget, _, _) if budget > 0 && overBudget(budget) =>
         spillMetrics.foreach { case (spills, groups) => spills += 1; groups += table.size() }
         val out = Seq.newBuilder[ColumnarBatch]
         var from = 0

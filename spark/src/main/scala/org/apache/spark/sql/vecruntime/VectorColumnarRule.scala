@@ -829,6 +829,10 @@ case class VectorExecRule(session: SparkSession) extends Rule[SparkPlan] with Lo
         ) match {
           // A partial aggregate over our Expand (ROLLUP, CUBE, GROUPING SETS): aggregate the finest grouping
           // once and roll the partials up, instead of hashing every input row once per grouping set (#383).
+          // AggregateBelowJoin's pre-aggregate, planned one per task (#693): free to split its groups.
+          case Right(v) if LocalPreAggregate.isLocal(original) || LocalPreAggregate.isLocal(a) =>
+            val mark = LocalPreAggregate.mark(original).orElse(LocalPreAggregate.mark(a)).get
+            v.copy(localPreAggregate = true, localProbe = !mark.provenReduction)
           case Right(v) if VectorConf.rollupRewriteEnabled(conf) =>
             RollupRewrite(v, VectorConf.strictFloatingPoint(conf))
           case Right(v) => v
