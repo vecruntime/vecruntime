@@ -110,6 +110,41 @@ class VectorParquetScanPlanSuite extends VectorQuerySuite {
     }
   }
 
+  test("file partitions are planned as Spark's, without building the wrapped scan's reader (#672)") {
+    withPlugin(enabled = false) {
+      val path = newTempPath("p_split")
+      spark.sql("SELECT CAST(id AS INT) AS i, CAST(id % 3 AS INT) AS k FROM range(0, 60000)")
+        .repartition(4).write.mode("overwrite").partitionBy("k").parquet(path)
+      spark.read.parquet(path).createOrReplaceTempView("p_split")
+    }
+    // Small splits, so files are split and bin-packed across several partitions.
+    withConf(
+      VectorConf.ScanNativeParquet -> "true",
+      "spark.sql.files.maxPartitionBytes" -> "8192",
+      "spark.sql.files.openCostInBytes" -> "1024"
+    ) {
+      val df = withPlugin(enabled = true)(spark.sql("SELECT i, k FROM p_split WHERE k <> 1"))
+      df.collect()
+      val node = PlanUtils.allNodes(finalPlan(df)).collectFirst { case n: VectorParquetScanExec => n }
+        .getOrElse(fail("native node expected"))
+      val rdd = node.executeColumnar()
+      val sc = spark.sparkContext
+      // Broadcast ids are sequential: no broadcast may be made between two probes but our planning.
+      val before = sc.broadcast(0).id
+      val ours = rdd.partitions
+      val after = sc.broadcast(0).id
+      assert(after === before + 1, "planning the partitions must not broadcast (Spark's reader is not built)")
+      def files(ps: Array[org.apache.spark.Partition]) = ps.toSeq.map {
+        case fp: org.apache.spark.sql.execution.datasources.FilePartition =>
+          (fp.index, fp.files.toSeq.map(f => (f.urlEncodedPath, f.start, f.length, f.partitionValues.getInt(0))))
+        case other => fail(s"unexpected partition ${other.getClass}")
+      }
+      val spark0 = node.scan.inputRDD.partitions
+      assert(ours.length > 2, s"expected split files, got ${ours.length} partitions")
+      assert(files(ours) === files(spark0))
+    }
+  }
+
   test("flag on, unsupported column: Spark's scan stays with a recorded reason") {
     write("p_nested", "SELECT CAST(id AS INT) AS i, named_struct('a', id) AS st FROM range(0, 1000)")
     withConf(VectorConf.ScanNativeParquet -> "true") {
