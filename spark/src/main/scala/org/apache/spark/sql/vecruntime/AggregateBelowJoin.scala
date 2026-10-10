@@ -59,6 +59,9 @@ import org.apache.spark.sql.catalyst.rules.Rule
  * may differ in the last digits, as any reordering of a sum does). A null key forms its own group, which the
  * inner join drops as it drops each of the group's rows.
  *
+ * The pre-aggregate is local (#693, [[LocalPreAggregate]]): one per task, no exchange of the fact on its keys,
+ * and given up on in a task whose first rows show it does not reduce them.
+ *
  * Runs in the session's last optimizer batch ([[RegisterLateOptimizerRules]]). A pre-aggregate is never
  * pre-aggregated again (its subtree is an `Aggregate`). Off with
  * `spark.vecruntime.optimizer.aggregateBelowJoin.enabled=false` and with the plugin.
@@ -180,7 +183,7 @@ case class AggregateBelowJoin(session: SparkSession) extends Rule[LogicalPlan] w
     val keys = f.output.filter(needed.contains)
     // A star aggregation only: every fact column kept above is a join key, none is grouped by itself.
     if (keys.isEmpty || !keys.forall(joinKeys.contains) || !reduces(f, keys)) None
-    else Some(preAggregate(f, keys, aggExprs))
+    else Some(preAggregate(f, keys, aggExprs, provenReduction(f, keys)))
   }
 
   /** Whether `p` has a filter other than IS NOT NULL checks (a selective dimension). */
@@ -208,6 +211,29 @@ case class AggregateBelowJoin(session: SparkSession) extends Rule[LogicalPlan] w
     }
   }
 
+  /**
+   * Whether statistics prove the pre-aggregate reduces (#693): the product of the keys' distinct counts -- an
+   * upper bound on the groups -- times the pass-through ratio at most the base relation's rows. Statistics can
+   * prove a reduction but never disprove one (the product ignores how the keys correlate: q4's
+   * `(customer, date)` is bounded at 7x its fact's rows and reduces it 60x), so an unproven pre-aggregate is
+   * planned too, and judged on its first rows at run time; a proven one is only judged at its memory budget, so
+   * a task whose first rows happen not to repeat a key does not give it up.
+   */
+  private def provenReduction(f: LogicalPlan, keys: Seq[Attribute]): Boolean = {
+    val ratio = math.max(
+      1.0,
+      session.sessionState.conf.getConfString(
+        AggSpillPolicy.PassThroughKey,
+        AggSpillPolicy.DefaultPassThroughRatio.toString
+      ).toDouble
+    )
+    val ndvs = keys.map(k => KeyStats.distinctCount(f, k))
+    (KeyStats.baseRowCount(f), ndvs.forall(_.isDefined)) match {
+      case (Some(rows), true) if rows > 0 => BigDecimal(ndvs.flatten.product) * BigDecimal(ratio) <= BigDecimal(rows)
+      case _ => false
+    }
+  }
+
   /** Whether `p` has a dynamic partition pruning filter on one of `keys`. */
   private def partitionPruned(p: LogicalPlan, keys: AttributeSet): Boolean = p.exists {
     case Filter(cond, _) =>
@@ -225,8 +251,12 @@ case class AggregateBelowJoin(session: SparkSession) extends Rule[LogicalPlan] w
   }
 
   /** `Aggregate(keys, keys ++ partials, f)` and, per top aggregate expression, how its partials combine. */
-  private def preAggregate(f: LogicalPlan, keys: Seq[Attribute], aggExprs: Seq[AggregateExpression])
-      : (LogicalPlan, Map[AggregateExpression, Expression], Seq[Attribute]) = {
+  private def preAggregate(
+      f: LogicalPlan,
+      keys: Seq[Attribute],
+      aggExprs: Seq[AggregateExpression],
+      proven: Boolean
+  ): (LogicalPlan, Map[AggregateExpression, Expression], Seq[Attribute]) = {
     val parts = aggExprs.zipWithIndex.map { case (ae, i) => ae -> Alias(ae, s"_pre_agg_$i")() }
     val combine: Map[AggregateExpression, Expression] = parts.map { case (ae, al) =>
       val partial = al.toAttribute
@@ -239,6 +269,9 @@ case class AggregateBelowJoin(session: SparkSession) extends Rule[LogicalPlan] w
       }
       ae -> combined
     }.toMap
-    (Aggregate(keys, keys ++ parts.map(_._2), f), combine, parts.map(_._2.toAttribute))
+    val pre = Aggregate(keys, keys ++ parts.map(_._2), f)
+    // Planned one per task, no exchange (#693): see LocalPreAggregate.
+    pre.setTagValue(LocalPreAggregate.Tag, LocalPreAggregate.Mark(provenReduction = proven))
+    (pre, combine, parts.map(_._2.toAttribute))
   }
 }

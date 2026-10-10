@@ -290,10 +290,15 @@ object AggSpillPolicy {
    * Buffer-emitting modes (Partial, PartialMerge): emit the table as output and start over -- the next stage
    * merges. `passThroughRatio` (#376): once a full table has reduced its input by less than this factor, the
    * rest of the input goes out one batch at a time -- a partial aggregate that does not reduce only costs
-   * memory and copies; 0 keeps aggregating whatever the ratio.
+   * memory and copies; 0 keeps aggregating whatever the ratio. `probeRows` above 0 judges the ratio early as
+   * well, once the first table has read that many rows (a local pre-aggregate, #693): the table goes out then
+   * and, if it did not reduce, the rest passes through.
    */
-  final case class EmitAndReset(thresholdBytes: Long, passThroughRatio: Double = DefaultPassThroughRatio)
-      extends AggSpillPolicy
+  final case class EmitAndReset(
+      thresholdBytes: Long,
+      passThroughRatio: Double = DefaultPassThroughRatio,
+      probeRows: Long = 0L
+  ) extends AggSpillPolicy
 
   /** Result modes merging buffers (Final): spill the table into `buckets` and merge one bucket at a time. */
   final case class GraceHash(thresholdBytes: Long, buckets: Int) extends AggSpillPolicy

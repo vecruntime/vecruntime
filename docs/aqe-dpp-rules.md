@@ -495,6 +495,21 @@ with identical results, and q14a, q24a, q67 and q18 (where the rule does not fir
 distinct counts ignores how the keys correlate: q4's `(customer_sk, sold_date_sk)` pairs are far fewer than
 the product, and the estimate declined exactly the queries the pre-aggregate speeds up most.
 
+**Local, and judged at run time (#693).** Planned as Spark plans an aggregate, the pre-aggregate was a partial
+aggregate, an exchange of the fact on its keys and a final one. Where the keys barely repeat that exchange is the
+whole cost: grouping `store_sales` by `(item, store, date)` removes about 1 % of its rows, and q47 and q57 at 1 TB
+took 23.7 and 11.3 s with the rule against 6.5-7.2 and 4.0-4.1 s without it. The pre-aggregate need not be
+global: the top aggregate recombines its partials and the joins treat every row of a group alike, so any split of
+the fact's rows into groups that share their keys gives the same result. So the pre-aggregate is planned as one
+aggregate per task with no exchange (`LocalPreAggregateStrategy`, a `Complete` aggregate with no required
+distribution), and ours emits and starts over as a partial aggregate does: past its memory budget, and after its
+first `probeRows` rows (262,144). A table whose rows were fewer than `spark.vecruntime.agg.passThroughRatio`
+(1.5) times its groups shows the task does not reduce, and the rest of the task passes one batch at a time.
+Statistics can prove a reduction -- the groups' upper bound times that ratio at most the rows -- but never
+disprove one, so they never decline the rewrite; a proven pre-aggregate is judged only at its budget, so a task
+whose first rows happen not to repeat a key keeps aggregating. `aggregateBelowJoin.local=false` restores Spark's
+two stages.
+
 
 ## `RemoveRedundantGroupKeys`: grouping keys a unique broadcast key determines (#635)
 
