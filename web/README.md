@@ -57,7 +57,7 @@ GitHub Pages **project** site uses, so links and assets resolve exactly as they 
 - **Overview / home** (`../docs/index.md`) — rendered with the animated-terminal hero.
 - **User guide** — `operators.md`, `expressions.md`, `configuration.md`, `comet.md`, `iceberg.md`,
   `flight-shuffle.md`.
-- **Benchmarks** — the three generated benchmark pages. `docs/results.md` (the lab notebook) stays in
+- **Benchmarks** — the four generated benchmark pages. `docs/results.md` (the lab notebook) stays in
   the repository but is not published; links to it from the site go to the file on GitHub.
 
 Doc content is read straight from `../docs/*.md`. To change wording, edit those Markdown files (they
@@ -65,12 +65,12 @@ serve both this site and the Jekyll site) and rebuild.
 
 ### Benchmark pages stay generated
 
-`../docs/benchmarks/{tpcds-1tb,tpcds-1tb-graviton,iceberg-mor}.html` are generated artifacts. This
+`../docs/benchmarks/{tpcds-1tb,tpcds-1tb-graviton,tpcds-3tb-graviton,iceberg-mor}.html` are generated artifacts. This
 build does **not** recompute any number: it strips the Jekyll front matter, rewrites the one Liquid
 `relative_url` link they carry, lifts their Chart.js `<script>` into `<head>`, and wraps the body in
 this site's shell. Every figure is copied through byte-for-byte identical to the `../docs/` page.
 
-The two Python generators grew an **optional** `web/` output mode that does the same wrapping at
+The Python generators have an **optional** `web/` output mode that does the same wrapping at
 generation time, without changing their `docs/` output:
 
 ```bash
@@ -85,6 +85,13 @@ benchmarks/scripts/render-graviton-page.py \
   --x86-page docs/benchmarks/tpcds-1tb.html \
   --out   docs/benchmarks/tpcds-1tb-graviton.html \
   --web-out web/site/benchmarks/tpcds-1tb-graviton.html --web-base /vecruntime
+
+R=benchmarks/results/tpcds-sf3000-doeks-2026-10-10
+benchmarks/scripts/render-doeks-page.py \
+  --vector $R/vecruntime-p900.jsonl --vector-alt $R/vecruntime-p200.jsonl \
+  --gluten $R/doeks-gluten-velox-1.6.0-arm64.csv --comet $R/doeks-comet-0.16.0.csv \
+  --out   docs/benchmarks/tpcds-3tb-graviton.html \
+  --web-out web/site/benchmarks/tpcds-3tb-graviton.html --web-base /vecruntime
 ```
 
 For a normal `npm run build` you do **not** need to run the generators: it transforms the committed
