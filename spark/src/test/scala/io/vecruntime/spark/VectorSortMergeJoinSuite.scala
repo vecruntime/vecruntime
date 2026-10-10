@@ -141,6 +141,31 @@ class VectorSortMergeJoinSuite extends VectorQuerySuite {
     )
   }
 
+  test("semi, anti and existence joins against a long duplicated-key right run (#688)") {
+    // q14a's INTERSECT at 3 TB: a few left rows per key against right runs of millions of rows with few
+    // distinct keys. Without a condition the join only needs the run to exist; it must not walk it per
+    // left row. Here the right runs span many batches (and keys absent on one side or the other).
+    val big = newTempPath("smj/big")
+    spark
+      .range(0, 400000)
+      .selectExpr("cast(id % 7 as int) as k", "cast(id as int) as w")
+      .write
+      .mode("overwrite")
+      .parquet(big)
+    spark.read.parquet(big).createOrReplaceTempView("bigr")
+    val small = "(SELECT cast(v % 11 as int) AS k, v FROM a) s"
+    withConf("spark.sql.parquet.columnarReaderBatchSize" -> "512") {
+      for (jt <- Seq("LEFT SEMI", "LEFT ANTI")) {
+        checkOrdered(s"SELECT s.k, s.v FROM $small $jt JOIN bigr ON s.k = bigr.k")
+        // With a condition the pairs are still tested.
+        checkOrdered(s"SELECT s.k, s.v FROM $small $jt JOIN bigr ON s.k = bigr.k AND bigr.w % 1000 = s.v % 1000")
+      }
+      checkOrdered(s"SELECT s.v, EXISTS (SELECT 1 FROM bigr WHERE bigr.k = s.k) AS e FROM $small")
+      // INTERSECT, the null-safe semi join of q14a.
+      checkOrdered("SELECT k FROM (SELECT cast(v % 11 as int) AS k FROM a) INTERSECT SELECT k FROM bigr")
+    }
+  }
+
   test("a parent relying on the join's ordering converts: a window on the key, a same-key chain") {
     withConf(merge: _*) {
       // The window's partition is the join key: it needs the join's ordering and gets it, no sort between.
