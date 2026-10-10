@@ -17,7 +17,10 @@ package org.apache.spark.sql.execution.vector
 
 import scala.jdk.CollectionConverters._
 
-import org.apache.spark.sql.execution.FileSourceScanExec
+import org.apache.hadoop.fs.Path
+
+import org.apache.spark.sql.execution.{FileSourceScanExec, ListingPartition, PartitionedFileUtil, ScanFileListing}
+import org.apache.spark.sql.execution.datasources.{BucketingUtils, FilePartition}
 import org.apache.spark.sql.sources.Filter
 
 /**
@@ -41,6 +44,63 @@ object FileScanAccess {
     } catch {
       case _: Throwable => Seq.empty
     }
+  }
+
+  /**
+   * The scan's file partitions for a non-bucketed read, planned exactly as `FileSourceScanExec.createReadRDD`
+   * plans them (Spark 4.1 / 4.2: the same code in both), but WITHOUT materialising `scan.inputRDD` (#672).
+   * Building `inputRDD` calls `ParquetFileFormat.buildReaderWithPartitionValues`, which broadcasts the whole
+   * Hadoop conf for a reader we never run; `Configuration.write` gzips every key and value with a fresh
+   * zlib stream, about 2,000 short-lived 45 KB mallocs per broadcast, on the driver, per planned scan.
+   *
+   * `dynamicallySelectedPartitions` is `protected` in the trait (public in the compiled class) and is read
+   * reflectively, like [[pushedDownFilters]]. None for a bucketed scan, or when the accessor is missing: the
+   * caller then falls back to `scan.inputRDD.partitions`.
+   */
+  def filePartitions(scan: FileSourceScanExec): Option[Seq[FilePartition]] =
+    if (scan.bucketedScan) None
+    else dynamicallySelectedPartitions(scan).map(planReadPartitions(scan, _))
+
+  private def dynamicallySelectedPartitions(scan: FileSourceScanExec): Option[ScanFileListing] =
+    try {
+      val m = scan.getClass.getMethod("dynamicallySelectedPartitions")
+      m.setAccessible(true)
+      Option(m.invoke(scan)).collect { case l: ScanFileListing => l }
+    } catch {
+      // NoSuchMethodException / IllegalAccessException only: an exception the listing itself throws (a
+      // subquery that has not finished, a file-listing failure) must surface, as it would from inputRDD.
+      case _: NoSuchMethodException | _: IllegalAccessException => None
+      case e: java.lang.reflect.InvocationTargetException if e.getCause != null => throw e.getCause
+    }
+
+  /** `FileSourceScanExec.createReadRDD`'s partition planning, without its reader. */
+  private def planReadPartitions(scan: FileSourceScanExec, selected: ScanFileListing): Seq[FilePartition] = {
+    val relation = scan.relation
+    val session = relation.sparkSession
+    val maxSplitBytes = FilePartition.maxSplitBytes(session, selected)
+    val shouldProcess: Path => Boolean = scan.optionalBucketSet match {
+      case Some(bucketSet) if session.sessionState.conf.bucketingEnabled =>
+        // Do not prune the file if bucket file name is invalid (as Spark).
+        filePath => BucketingUtils.getBucketId(filePath.getName).forall(bucketSet.get)
+      case _ => _ => true
+    }
+    val splitFiles = selected.filePartitionIterator.flatMap { partition =>
+      val ListingPartition(partitionVals, _, fileStatusIterator) = partition
+      fileStatusIterator.flatMap { file =>
+        val filePath = file.getPath
+        if (shouldProcess(filePath)) {
+          val isSplitable = relation.fileFormat.isSplitable(session, relation.options, filePath)
+          PartitionedFileUtil.splitFiles(
+            file = file,
+            filePath = filePath,
+            isSplitable = isSplitable,
+            maxSplitBytes = maxSplitBytes,
+            partitionValues = partitionVals
+          )
+        } else Seq.empty
+      }
+    }.toArray.sortBy(_.length)(implicitly[Ordering[Long]].reverse)
+    FilePartition.getFilePartitions(session, splitFiles.toSeq, maxSplitBytes)
   }
 
   /**

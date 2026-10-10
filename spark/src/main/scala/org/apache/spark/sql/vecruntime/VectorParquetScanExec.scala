@@ -304,10 +304,16 @@ private[vecruntime] final class VectorParquetRDD(
     filterColumns: Array[Boolean]
 ) extends RDD[ColumnarBatch](sc, Nil) {
 
-  // Reuse the wrapped scan's file partitions verbatim (DPP / bucketing / splitting applied). Read lazily
-  // inside getPartitions -- not in the constructor -- so a dynamic-partition-pruning subquery has finished
-  // before `scan.inputRDD` is materialised (accessing it early throws "dynamicpruning has not finished").
-  override protected def getPartitions: Array[Partition] = scan.inputRDD.partitions
+  // The wrapped scan's file partitions (DPP / bucketing / splitting applied). Read lazily inside
+  // getPartitions -- not in the constructor -- so a dynamic-partition-pruning subquery has finished before
+  // the selected partitions are evaluated (reading them early throws "dynamicpruning has not finished").
+  // A non-bucketed scan is planned as Spark plans it without building `scan.inputRDD`, whose Parquet reader
+  // broadcasts the whole Hadoop conf a second time on the driver (#672); a bucketed one reuses inputRDD's.
+  override protected def getPartitions: Array[Partition] =
+    org.apache.spark.sql.execution.vector.FileScanAccess.filePartitions(scan) match {
+      case Some(parts) => parts.toArray[Partition]
+      case None => scan.inputRDD.partitions
+    }
 
   // The hosts FileScanRDD would prefer: up to three holding the most of the partition's bytes, `localhost`
   // dropped (S3A reports it for every block, so on S3 this is empty and the task NO_PREF, as Spark's).
