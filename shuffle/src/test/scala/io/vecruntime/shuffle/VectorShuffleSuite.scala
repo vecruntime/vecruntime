@@ -158,6 +158,57 @@ class VectorShuffleSuite extends AnyFunSuite with BeforeAndAfterAll {
     assert(rows(enabled = true) === rows(enabled = false))
   }
 
+  /**
+   * Arrays, maps and structs holding them cross our exchange as nested lanes (#705), as payload: on
+   * the per-partition path (7 partitions) and the staged one (300), every row reaches the partition
+   * Spark's exchange puts it in with Spark's nested value -- null values, null elements, empty arrays
+   * and maps, arrays of arrays, arrays of structs, maps of arrays, arrays of binary.
+   */
+  /** A value as text, binary by content (an `Array[Byte]` prints its identity), through arrays, maps and structs. */
+  private def show(v: Any): String = v match {
+    case null => "null"
+    case b: Array[Byte] => b.map("%02x".format(_)).mkString("0x", "", "")
+    case r: org.apache.spark.sql.Row => r.toSeq.map(show).mkString("[", ",", "]")
+    case m: scala.collection.Map[_, _] => m.map { case (k, x) => show(k) + "->" + show(x) }.mkString("{", ",", "}")
+    case s: scala.collection.Seq[_] => s.map(show).mkString("(", ",", ")")
+    case x => x.toString
+  }
+
+  test("array, map and nested struct columns cross our exchange as nested lanes") {
+    val path = tempDir.resolve("nested").toString
+    spark.range(0, 6000).selectExpr(
+      "cast(id as int) as k",
+      "case when id % 7 = 0 then null when id % 11 = 0 then array() " +
+        "else array(cast(id as int), null, cast(-id as int)) end as ai",
+      "case when id % 5 = 0 then null else array(concat('k', id), null, '') end as sa",
+      "case when id % 13 = 0 then null else array(array(id, null), array(), null) end as aa",
+      "case when id % 6 = 0 then null when id % 8 = 0 then map() " +
+        "else map(concat('a', id % 50), cast(id as double) / 3, 'b', null) end as m",
+      "map(cast(id % 9 as int), array(cast(id % 4 as decimal(9,2)), null)) as ma",
+      "case when id % 4 = 0 then null else named_struct('x', cast(id as bigint), " +
+        "'y', array(date_add(date'2020-01-01', cast(id % 400 as int)), null)) end as sn",
+      "array(named_struct('p', id % 3 = 0, 'q', cast(id as decimal(30,4))), null) as asx",
+      "case when id % 10 = 0 then null else array(unhex(hex(id)), null, unhex('FF00')) end as abin"
+    ).write.mode("overwrite").parquet(path)
+    spark.read.parquet(path).createOrReplaceTempView("nested")
+    Seq(7, 300).foreach { n =>
+      def df = spark.table("nested").repartition(n, org.apache.spark.sql.functions.col("k"))
+      val plan = collectPlan(df)
+      assert(
+        exchanges(plan).nonEmpty && exchanges(plan).forall(_.isInstanceOf[VectorShuffleExchangeExec]),
+        s"expected only our exchange in\n$plan"
+      )
+      def rows(enabled: Boolean): Seq[String] = {
+        spark.sessionState.conf.setConfString("spark.vecruntime.enabled", enabled.toString)
+        try df.selectExpr("spark_partition_id() as p", "*").collect().map(r => show(r)).toSeq.sorted
+        finally spark.sessionState.conf.setConfString("spark.vecruntime.enabled", "true")
+      }
+      assert(rows(enabled = true) === rows(enabled = false), s"$n partitions")
+    }
+    // A grouped aggregate over our exchange still carries the nested column as a buffer.
+    checkAgainstSpark("select k % 10 g, count(*) c, max(size(ai)) s from nested group by k % 10")
+  }
+
   test("hash keys that are expressions (q47's self-join on rn + 1) are materialised under our exchange") {
     // A sort-merge self-join whose one side partitions on `k + 1`: without the materialised key the
     // exchange stayed Spark's, with a row Sort and a RowToColumnar over it.

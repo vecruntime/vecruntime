@@ -366,9 +366,12 @@ object VectorShuffleExchangeExec {
    */
   def supports(partitioning: Partitioning, output: Seq[Attribute]): Boolean = {
     def laneKey(dt: org.apache.spark.sql.types.DataType) = io.vecruntime.spark.adapter.TypeMapping.hasLane(dt)
-    def column(dt: org.apache.spark.sql.types.DataType) = io.vecruntime.shuffle.StructFlattening.supported(dt)
+    def key(dt: org.apache.spark.sql.types.DataType) = io.vecruntime.shuffle.StructFlattening.supported(dt)
+    // Arrays, maps and structs over them cross as nested lanes (#705): payload, never keys.
+    def column(dt: org.apache.spark.sql.types.DataType) =
+      key(dt) || io.vecruntime.spark.adapter.TypeMapping.nestedTypeOf(dt) != null
     output.forall(a => column(a.dataType)) && (partitioning match {
-      case h: HashPartitioning => h.expressions.forall(e => e.isInstanceOf[Attribute] && column(e.dataType))
+      case h: HashPartitioning => h.expressions.forall(e => e.isInstanceOf[Attribute] && key(e.dataType))
       case _: RoundRobinPartitioning => true
       case SinglePartition => true
       case r: RangePartitioning => r.ordering.forall(o => laneKey(o.dataType))

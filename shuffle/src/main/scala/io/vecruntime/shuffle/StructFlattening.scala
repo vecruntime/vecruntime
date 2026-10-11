@@ -41,6 +41,12 @@ object StructFlattening {
   final case class Leaf(flat: Int) extends Node
   final case class Struct(dataType: StructType, validity: Int, children: IndexedSeq[Node]) extends Node
 
+  /**
+   * Whether a top-level struct is flattened into lanes: one whose leaves all have lanes. A struct
+   * holding an array or a map crosses whole as a nested lane (#705) instead.
+   */
+  def flattens(dt: DataType): Boolean = dt.isInstanceOf[StructType] && supported(dt)
+
   /** Whether a column can cross the shuffle: a lane, or a struct of such columns. */
   def supported(dt: DataType): Boolean = dt match {
     case s: StructType => s.fields.forall(f => supported(f.dataType))
@@ -52,7 +58,7 @@ object StructFlattening {
    * before). Every struct must be [[supported]].
    */
   def plan(schema: StructType): Option[Layout] =
-    if (!schema.fields.exists(_.dataType.isInstanceOf[StructType])) None
+    if (!schema.fields.exists(f => flattens(f.dataType))) None
     else {
       val extra = scala.collection.mutable.ArrayBuffer.empty[StructField]
       val width = schema.fields.length
@@ -69,13 +75,13 @@ object StructFlattening {
       }
       val top = schema.fields.zipWithIndex.map { case (f, i) =>
         f.dataType match {
-          case s: StructType => Struct(s, i, s.fields.map(child).toIndexedSeq)
+          case s: StructType if flattens(s) => Struct(s, i, s.fields.map(child).toIndexedSeq)
           case _ => Leaf(i): Node
         }
       }.toIndexedSeq
       val topFields = schema.fields.map { f =>
         f.dataType match {
-          case _: StructType => StructField(f.name, BooleanType, nullable = false)
+          case s: StructType if flattens(s) => StructField(f.name, BooleanType, nullable = false)
           case _ => f
         }
       }
