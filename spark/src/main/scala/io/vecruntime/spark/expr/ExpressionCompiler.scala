@@ -84,6 +84,11 @@ import org.apache.spark.sql.catalyst.expressions.{
   DayOfYear,
   Divide,
   ElementAt,
+  ArrayContains,
+  ArrayMax,
+  ArrayMin,
+  ArrayPosition,
+  MapKeys,
   Elt,
   EndsWith,
   EqualNullSafe,
@@ -353,6 +358,12 @@ object ExpressionCompiler {
       elementAccess(child, arg, ElementAccessExpr.OneBased, failOnError, e, input)
     case e @ ElementAt(child, key, None, _) if child.dataType.isInstanceOf[MapType] =>
       elementAccess(child, key, ElementAccessExpr.MapKey, failOnError = false, e, input)
+    // Scans of each row's elements over the nested lane (#705): `map_contains_key` is array_contains over map_keys.
+    case e @ ArrayContains(MapKeys(child), v) => arrayScan(child, ArrayScanExpr.Contains, v, e, input)
+    case e @ ArrayContains(child, v) => arrayScan(child, ArrayScanExpr.Contains, v, e, input)
+    case e @ ArrayPosition(child, v) => arrayScan(child, ArrayScanExpr.Position, v, e, input)
+    case e @ ArrayMin(child) => arrayScan(child, ArrayScanExpr.Min, null, e, input)
+    case e @ ArrayMax(child) => arrayScan(child, ArrayScanExpr.Max, null, e, input)
     case g: GetArrayStructFields =>
       Left(s"array of struct fields ${g.sql} not supported (#50: only struct fields are read)")
 
@@ -908,6 +919,38 @@ object ExpressionCompiler {
       for (_ <- argOk; p <- nestedColumnPath(container, input); a <- compile(arg, input))
         yield ElementAccessExpr(p._1, p._2, container.dataType, mode, a, failOnError, e.origin.context)
     }
+  }
+
+  /**
+   * `array_contains`, `array_position`, `array_min`, `array_max` -- and `map_contains_key`, a contains
+   * over `map_keys` (#705): the container a column or a struct field of one with a nested lane, the
+   * elements on a lane they compare on, the value of the element type.
+   */
+  private def arrayScan(
+      container: Expression,
+      kind: ArrayScanExpr.Kind,
+      arg: Expression,
+      e: Expression,
+      input: Seq[Attribute]
+  ): Result = {
+    val what = e.prettyName
+    val elementType = container.dataType match {
+      case a: ArrayType => a.elementType
+      case m: MapType => m.keyType
+      case other => other
+    }
+    val lane = TypeMapping.vecTypeOf(elementType)
+    if (TypeMapping.nestedTypeOf(container.dataType) == null)
+      Left(s"$what over ${container.dataType.simpleString} not supported (a leaf without a lane)")
+    else if (elementType.isInstanceOf[StringType] && elementType != StringType)
+      Left(s"$what over collated ${elementType.simpleString} elements not supported")
+    else if (lane == null || !ElementAccessExpr.keyLane(lane) || !TypeMapping.isSupported(elementType))
+      Left(s"$what over ${elementType.simpleString} elements not supported")
+    else if (arg != null && arg.dataType != elementType)
+      Left(s"$what of a ${arg.dataType.simpleString} in ${elementType.simpleString} elements not supported")
+    else
+      for (p <- nestedColumnPath(container, input); a <- if (arg == null) Right(null) else compile(arg, input))
+        yield ArrayScanExpr(p._1, p._2, container.dataType, kind, a)
   }
 
   def nestedColumnPath(e: Expression, input: Seq[Attribute]): Either[String, (Int, Seq[Int])] = e match {
