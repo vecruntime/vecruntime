@@ -366,20 +366,12 @@ object VectorShuffleExchangeExec {
    */
   def supports(partitioning: Partitioning, output: Seq[Attribute]): Boolean = {
     def laneKey(dt: org.apache.spark.sql.types.DataType) = io.vecruntime.spark.adapter.TypeMapping.hasLane(dt)
-    def containsBinary(dt: org.apache.spark.sql.types.DataType): Boolean = dt match {
-      case _: org.apache.spark.sql.types.BinaryType => true
-      case s: org.apache.spark.sql.types.StructType => s.fields.exists(f => containsBinary(f.dataType))
-      case _ => false
-    }
-    // BINARY has a UTF8 lane (#705) but the writer dictionary-encodes UTF8 columns as strings; it keeps
-    // Spark's exchange until the writer carries it.
-    def column(dt: org.apache.spark.sql.types.DataType) =
-      io.vecruntime.shuffle.StructFlattening.supported(dt) && !containsBinary(dt)
+    def column(dt: org.apache.spark.sql.types.DataType) = io.vecruntime.shuffle.StructFlattening.supported(dt)
     output.forall(a => column(a.dataType)) && (partitioning match {
       case h: HashPartitioning => h.expressions.forall(e => e.isInstanceOf[Attribute] && column(e.dataType))
       case _: RoundRobinPartitioning => true
       case SinglePartition => true
-      case r: RangePartitioning => r.ordering.forall(o => laneKey(o.dataType) && !containsBinary(o.dataType))
+      case r: RangePartitioning => r.ordering.forall(o => laneKey(o.dataType))
       case _ => false
     })
   }
