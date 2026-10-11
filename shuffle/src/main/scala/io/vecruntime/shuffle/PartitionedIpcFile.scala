@@ -220,6 +220,7 @@ object PartitionedIpcFile {
     case LongType => new ArrowType.Int(64, true)
     case TimestampType => new ArrowType.Timestamp(TimeUnit.MICROSECOND, "UTC")
     case TimestampNTZType => new ArrowType.Timestamp(TimeUnit.MICROSECOND, null) // micros, no zone (#705)
+    case BinaryType => ArrowType.Utf8.INSTANCE // the UTF8 lane's layout, always plain (#705)
     case DoubleType => new ArrowType.FloatingPoint(FloatingPointPrecision.DOUBLE)
     case BooleanType => ArrowType.Bool.INSTANCE
     case StringType => new ArrowType.Int(32, true) // the indices of the dictionary encoding
@@ -534,7 +535,7 @@ object PartitionedIpcFile {
      */
     private final class Pending(c: Int) {
       private val dt = types(c)
-      private val isString = dt == StringType
+      private val isString = dt == StringType || dt == BinaryType // BINARY: variable width, plain (#705)
       private val isBool = dt == BooleanType
       private val width: Int = if (isString || isBool) 0 else PartitionedIpcWriter.byteWidth(dt)
       private val field: Field = if (plain(c) != null) plain(c) else fields(c)

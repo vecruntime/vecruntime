@@ -287,6 +287,33 @@ class VectorShuffleSuite extends AnyFunSuite with BeforeAndAfterAll {
     } finally sc.removeSparkListener(listener)
   }
 
+  /**
+   * BINARY (#705) crosses our exchange on the UTF8 lane, always plain: as a hash key every row lands
+   * where Spark puts it (both hash the bytes with hashUnsafeBytes), as a range key in Spark's unsigned
+   * byte order, and as a payload it reads back byte for byte -- including bytes above 0x7f.
+   */
+  test("binary columns, hash keys and range keys cross our exchange") {
+    val path = tempDir.resolve("bin").toString
+    spark.range(0, 20000).selectExpr(
+      "cast(id % 97 as int) as k",
+      "case when id % 13 = 0 then null when id % 29 = 0 then x'' " +
+        "else unhex(lpad(hex((id * 2654435761) % 3001), 6, 'F')) end as b"
+    ).write.mode("overwrite").parquet(path)
+    spark.read.parquet(path).createOrReplaceTempView("bin")
+    val grouped = "select hex(b) h, count(*) c, max(k) mk from bin group by b" // hex: rows compare as strings
+    assertOurExchange(spark.sql(grouped))
+    checkAgainstSpark(grouped)
+    checkAgainstSpark("select k, count(distinct b) nb from bin group by k")
+    checkAgainstSpark("select spark_partition_id() p, hex(b) h from (select /*+ REPARTITION(6, b) */ b from bin)")
+    val ordered = "select hex(b) h, k from bin order by b desc nulls last, k limit 3000"
+    val ours = spark.sql(ordered).collect().toSeq
+    spark.sessionState.conf.setConfString("spark.vecruntime.enabled", "false")
+    try assert(ours === spark.sql(ordered).collect().toSeq)
+    finally spark.sessionState.conf.setConfString("spark.vecruntime.enabled", "true")
+    val plan = collectPlan(spark.sql("select b, k from bin order by b, k"))
+    assert(exchanges(plan).exists(_.isInstanceOf[VectorShuffleExchangeExec]), s"$plan")
+  }
+
   test("range partitioning: a global order by is Spark's rows in Spark's order") {
     val sql = "select s, x, k from t order by s desc, x, k limit 5000"
     val ours = spark.sql(sql).collect().toSeq
