@@ -35,7 +35,24 @@ public enum VecType {
      * wider than 18 digits. The lane is deliberately scalar: no {@code Species}
      * covers it and every kernel walks it limb by limb (#28, option 1).
      */
-    DECIMAL128(16);
+    DECIMAL128(16),
+    /**
+     * Arrow List: int32 offsets (length + 1 entries) into one child column, the
+     * elements ({@link VectorBuffers#children()}, #705). No data buffer of its
+     * own.
+     */
+    LIST(-2),
+    /**
+     * Arrow Map, a list of key/value entries: int32 offsets (length + 1
+     * entries) into two child columns of the same length, the keys and the
+     * values, in that order (#705).
+     */
+    MAP(-2),
+    /**
+     * Arrow Struct: one child column per field, each of the struct's length;
+     * validity only (#705).
+     */
+    STRUCT(-2);
 
     private final int byteWidth;
 
@@ -53,5 +70,13 @@ public enum VecType {
 
     public boolean isFixedWidth() {
         return byteWidth > 0;
+    }
+
+    /**
+     * A nested lane (#705): {@link #LIST}, {@link #MAP} or {@link #STRUCT}, its
+     * values in child columns.
+     */
+    public boolean isNested() {
+        return byteWidth == -2;
     }
 }

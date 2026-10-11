@@ -195,6 +195,7 @@ class ColumnBuilderTest {
             case BOOL -> col.getBoolean(i);
             case UTF8 -> col.getString(i);
             case DECIMAL128 -> col.getDecimal128(i);
+            case LIST, MAP, STRUCT -> throw new IllegalStateException("no nested lane here (#705)");
         };
     }
 

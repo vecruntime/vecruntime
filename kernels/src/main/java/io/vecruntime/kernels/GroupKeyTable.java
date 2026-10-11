@@ -273,6 +273,7 @@ public final class GroupKeyTable {
                     longKeys[c] = new long[INITIAL_CAPACITY];
                     hiKeys[c] = new long[INITIAL_CAPACITY];
                 }
+                case LIST, MAP, STRUCT -> throw new IllegalStateException("no nested lane here (#705)");
                 case UTF8 -> {
                     strCol[c] = s++;
                     if (dictionaryLimit > 0) {
@@ -1359,6 +1360,7 @@ public final class GroupKeyTable {
                         return false;
                     }
                 }
+                case LIST, MAP, STRUCT -> throw new IllegalStateException("no nested lane here (#705)");
                 case UTF8 -> {
                     if (record[c] ? !recordEquals(c, gid, keys, row) : strIds[c][gid] != keys.getId(c, row)) {
                         return false;
@@ -1503,6 +1505,7 @@ public final class GroupKeyTable {
                             case INT64, FLOAT64 -> HashKernels.fold(longKeys[c][gid]);
                             case DECIMAL128 -> HashKernels.fold(Decimal128.hash(hiKeys[c][gid], longKeys[c][gid]));
                             case UTF8 -> record[c] ? HashKernels.hashBytes(recSeg[c], recOff[c][gid], recOff[c][gid + 1] - recOff[c][gid]) : strIds[c][gid];
+                            case LIST, MAP, STRUCT -> throw new IllegalStateException("no nested grouping keys (#705)");
                         };
             }
             h = HashKernels.mix32(h, v);
@@ -1527,6 +1530,7 @@ public final class GroupKeyTable {
                     longKeys[c][gid] = isNull ? 0L : Decimal128.lo(keys.data[c], row);
                     hiKeys[c][gid] = isNull ? 0L : Decimal128.hi(keys.data[c], row);
                 }
+                case LIST, MAP, STRUCT -> throw new IllegalStateException("no nested lane here (#705)");
                 case UTF8 -> {
                     if (record[c]) {
                         appendRecord(c, gid, keys, row, isNull);
@@ -1575,6 +1579,7 @@ public final class GroupKeyTable {
                     longKeys[c] = Arrays.copyOf(longKeys[c], cap);
                     hiKeys[c] = Arrays.copyOf(hiKeys[c], cap);
                 }
+                case LIST, MAP, STRUCT -> throw new IllegalStateException("no nested lane here (#705)");
                 case UTF8 -> {
                     if (record[c]) {
                         recOff[c] = Arrays.copyOf(recOff[c], cap + 1);
@@ -1602,6 +1607,7 @@ public final class GroupKeyTable {
                 case INT32, BOOL -> bytes += 4L * intKeys[c].length;
                 case INT64, FLOAT64 -> bytes += 8L * longKeys[c].length;
                 case DECIMAL128 -> bytes += 16L * longKeys[c].length;
+                case LIST, MAP, STRUCT -> throw new IllegalStateException("no nested lane here (#705)");
                 case UTF8 -> bytes += record[c] ? 4L * recOff[c].length + recBytes[c].length : 4L * strIds[c].length + dicts[c].memoryBytes();
             }
         }
@@ -1778,6 +1784,7 @@ public final class GroupKeyTable {
                     Decimal128.set(data, o, hiKeys[c][from + o], longKeys[c][from + o]);
                 }
             }
+            case LIST, MAP, STRUCT -> throw new IllegalStateException("no nested lane here (#705)");
             case UTF8 -> {
                 if (record[c]) {
                     // Groups are appended in id order, so [from, to) is one contiguous range of the arena.

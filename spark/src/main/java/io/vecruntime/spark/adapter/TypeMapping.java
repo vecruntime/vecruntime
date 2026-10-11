@@ -107,4 +107,50 @@ public final class TypeMapping {
     public static boolean isWideDecimal(DataType dt) {
         return dt instanceof DecimalType d && d.precision() > MAX_DECIMAL_PRECISION;
     }
+
+    /**
+     * The nested lane of an array, map or struct type (#705): {@link
+     * VecType#LIST}, {@link VecType#MAP} or {@link VecType#STRUCT} when every
+     * leaf below it has a lane ({@link #hasLane}) or is itself such a nested
+     * type; {@code null} otherwise (and for any non-nested type). Deliberately
+     * separate from {@link #vecTypeOf}: operators keep carrying nested columns
+     * as Spark's vectors, and only the consumers of nested lanes (nested
+     * expressions, the shuffle) ask for one.
+     */
+    public static VecType nestedTypeOf(DataType dt) {
+        if (dt instanceof org.apache.spark.sql.types.ArrayType a) {
+            return carriesNested(a.elementType()) ? VecType.LIST : null;
+        }
+        if (dt instanceof org.apache.spark.sql.types.MapType m) {
+            return carriesNested(m.keyType()) && carriesNested(m.valueType())
+                    ? VecType.MAP
+                    : null;
+        }
+        if (dt instanceof org.apache.spark.sql.types.StructType s) {
+            for (org.apache.spark.sql.types.StructField f : s.fields()) {
+                if (!carriesNested(f.dataType())) {
+                    return null;
+                }
+            }
+            return VecType.STRUCT;
+        }
+        return null;
+    }
+
+    /**
+     * Whether a value of {@code dt} can sit inside a nested lane: a lane, or a
+     * nested lane.
+     */
+    public static boolean carriesNested(DataType dt) {
+        return hasLane(dt) || nestedTypeOf(dt) != null;
+    }
+
+    /**
+     * The lane of any type that has one, flat ({@link #vecTypeOf}) or nested
+     * ({@link #nestedTypeOf}).
+     */
+    public static VecType laneOf(DataType dt) {
+        VecType t = vecTypeOf(dt);
+        return t != null ? t : nestedTypeOf(dt);
+    }
 }
