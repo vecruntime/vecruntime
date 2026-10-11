@@ -1230,6 +1230,9 @@ object AggBufferColumns {
         case v: java.lang.Double =>
           io.vecruntime.kernels.Bitmap.set(validity, o);
           data.set(VectorBuffers.LE_DOUBLE, o.toLong << 3, v.doubleValue())
+        case v: java.lang.Float => // a float value rides the FLOAT64 lane, widened exactly (#712)
+          io.vecruntime.kernels.Bitmap.set(validity, o);
+          data.set(VectorBuffers.LE_DOUBLE, o.toLong << 3, v.doubleValue())
         case v: java.lang.Long =>
           io.vecruntime.kernels.Bitmap.set(validity, o); data.set(VectorBuffers.LE_LONG, o.toLong << 3, v.longValue())
         case v: java.lang.Integer =>

@@ -243,7 +243,7 @@ object AggregateSpill {
     case LongType | TimestampType | TimestampNTZType => KeyKind.LONG
     case d: DecimalType if d.precision <= TypeMapping.MAX_DECIMAL_PRECISION => KeyKind.LONG
     case _: DecimalType => KeyKind.DECIMAL128
-    case DoubleType => KeyKind.DOUBLE
+    case DoubleType | FloatType => KeyKind.DOUBLE // a float key is its widened double (#712): buckets stay internal
     case BooleanType => KeyKind.BOOL
     case StringType => KeyKind.UTF8
     case other => throw new IllegalArgumentException(s"no spill key kind for $other")
@@ -251,7 +251,8 @@ object AggregateSpill {
 
   /** Whether every grouping key type can be bucketed. */
   def supportsKeys(types: Seq[DataType]): Boolean = types.forall {
-    case IntegerType | DateType | LongType | TimestampType | TimestampNTZType | DoubleType | BooleanType | StringType |
+    case IntegerType | DateType | LongType | TimestampType | TimestampNTZType | DoubleType | FloatType | BooleanType |
+        StringType |
         _: DecimalType =>
       true
     case _ => false
@@ -263,6 +264,7 @@ object AggregateSpill {
     case d: VectorDecimalColumnVector => d.vector()
     // A tinyint/smallint column rides an INT32 lane in an IntVector (#327).
     case n: io.vecruntime.spark.arrow.VectorNarrowIntColumnVector => n.vector()
+    case f: io.vecruntime.spark.arrow.VectorFloatColumnVector => f.vector() // #712
     case other =>
       throw new IllegalStateException(s"a spilled column must be a plain vector, not ${other.getClass.getSimpleName}")
   }
