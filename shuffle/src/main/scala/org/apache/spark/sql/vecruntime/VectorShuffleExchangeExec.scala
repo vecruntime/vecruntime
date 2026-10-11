@@ -366,25 +366,15 @@ object VectorShuffleExchangeExec {
    */
   def supports(partitioning: Partitioning, output: Seq[Attribute]): Boolean = {
     def laneKey(dt: org.apache.spark.sql.types.DataType) = io.vecruntime.spark.adapter.TypeMapping.hasLane(dt)
-    def containsBinary(dt: org.apache.spark.sql.types.DataType): Boolean = dt match {
-      case _: org.apache.spark.sql.types.BinaryType => true
-      case s: org.apache.spark.sql.types.StructType => s.fields.exists(f => containsBinary(f.dataType))
-      case a: org.apache.spark.sql.types.ArrayType => containsBinary(a.elementType)
-      case m: org.apache.spark.sql.types.MapType => containsBinary(m.keyType) || containsBinary(m.valueType)
-      case _ => false
-    }
-    // BINARY has a UTF8 lane (#705) but the writer dictionary-encodes UTF8 columns as strings; it keeps
-    // Spark's exchange until the writer carries it.
-    def key(dt: org.apache.spark.sql.types.DataType) =
-      io.vecruntime.shuffle.StructFlattening.supported(dt) && !containsBinary(dt)
+    def key(dt: org.apache.spark.sql.types.DataType) = io.vecruntime.shuffle.StructFlattening.supported(dt)
     // Arrays, maps and structs over them cross as nested lanes (#705): payload, never keys.
     def column(dt: org.apache.spark.sql.types.DataType) =
-      key(dt) || (io.vecruntime.spark.adapter.TypeMapping.nestedTypeOf(dt) != null && !containsBinary(dt))
+      key(dt) || io.vecruntime.spark.adapter.TypeMapping.nestedTypeOf(dt) != null
     output.forall(a => column(a.dataType)) && (partitioning match {
       case h: HashPartitioning => h.expressions.forall(e => e.isInstanceOf[Attribute] && key(e.dataType))
       case _: RoundRobinPartitioning => true
       case SinglePartition => true
-      case r: RangePartitioning => r.ordering.forall(o => laneKey(o.dataType) && !containsBinary(o.dataType))
+      case r: RangePartitioning => r.ordering.forall(o => laneKey(o.dataType))
       case _ => false
     })
   }

@@ -47,7 +47,16 @@ import org.apache.arrow.vector.{FieldVector, IntVector, VarCharVector, VectorSch
 import org.apache.arrow.vector.compression.CompressionUtil
 import org.apache.arrow.vector.ipc.message.IpcOption
 import org.apache.arrow.vector.types.pojo.{Field, Schema}
-import org.apache.spark.sql.types.{ArrayType, BooleanType, IntegerType, MapType, StringType, StructField, StructType}
+import org.apache.spark.sql.types.{
+  ArrayType,
+  BinaryType,
+  BooleanType,
+  IntegerType,
+  MapType,
+  StringType,
+  StructField,
+  StructType
+}
 import org.apache.spark.sql.vectorized.{ColumnarBatch, ColumnVector}
 
 /**
@@ -161,7 +170,8 @@ final class PartitionedIpcWriter(
     /** A nested column (#705) builds through its own builder; every method below hands over to it. */
     private val nest: NestedBuilder =
       if (PartitionedIpcFile.isNested(field.dataType)) new NestedBuilder(field) else null
-    private val stringField = field.dataType == StringType
+    // BINARY (#705) is offsets and bytes like a string, always plain: it is never dictionary-encoded or staged as ids.
+    private val stringField = field.dataType == StringType || field.dataType == BinaryType
 
     /** A string column holds plain strings, or staging ids (#377) when its input arrives as INT32 ids; settled by the first rows. */
     private var idsMode = false
@@ -975,7 +985,9 @@ final class PartitionedIpcWriter(
     while (col < buffers.length) {
       val b = buffers(col)
       plain(col) = if (b.`type`() != VecType.UTF8) b
-      else {
+      else if (idColumns(col) == null) { // BINARY (#705): plain bytes, a dictionary-encoded batch decoded
+        if (b.isDictionaryEncoded()) ArrowOutput.decodeDictionary(b, scratch) else b
+      } else {
         if (!frozen(col)) idColumns(col).map(b, n)
         else if (b.isDictionaryEncoded()) ArrowOutput.decodeDictionary(b, scratch)
         else b

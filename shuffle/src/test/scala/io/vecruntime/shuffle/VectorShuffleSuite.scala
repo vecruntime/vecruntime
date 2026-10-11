@@ -162,8 +162,18 @@ class VectorShuffleSuite extends AnyFunSuite with BeforeAndAfterAll {
    * Arrays, maps and structs holding them cross our exchange as nested lanes (#705), as payload: on
    * the per-partition path (7 partitions) and the staged one (300), every row reaches the partition
    * Spark's exchange puts it in with Spark's nested value -- null values, null elements, empty arrays
-   * and maps, arrays of arrays, arrays of structs, maps of arrays.
+   * and maps, arrays of arrays, arrays of structs, maps of arrays, arrays of binary.
    */
+  /** A value as text, binary by content (an `Array[Byte]` prints its identity), through arrays, maps and structs. */
+  private def show(v: Any): String = v match {
+    case null => "null"
+    case b: Array[Byte] => b.map("%02x".format(_)).mkString("0x", "", "")
+    case r: org.apache.spark.sql.Row => r.toSeq.map(show).mkString("[", ",", "]")
+    case m: scala.collection.Map[_, _] => m.map { case (k, x) => show(k) + "->" + show(x) }.mkString("{", ",", "}")
+    case s: scala.collection.Seq[_] => s.map(show).mkString("(", ",", ")")
+    case x => x.toString
+  }
+
   test("array, map and nested struct columns cross our exchange as nested lanes") {
     val path = tempDir.resolve("nested").toString
     spark.range(0, 6000).selectExpr(
@@ -177,7 +187,8 @@ class VectorShuffleSuite extends AnyFunSuite with BeforeAndAfterAll {
       "map(cast(id % 9 as int), array(cast(id % 4 as decimal(9,2)), null)) as ma",
       "case when id % 4 = 0 then null else named_struct('x', cast(id as bigint), " +
         "'y', array(date_add(date'2020-01-01', cast(id % 400 as int)), null)) end as sn",
-      "array(named_struct('p', id % 3 = 0, 'q', cast(id as decimal(30,4))), null) as asx"
+      "array(named_struct('p', id % 3 = 0, 'q', cast(id as decimal(30,4))), null) as asx",
+      "case when id % 10 = 0 then null else array(unhex(hex(id)), null, unhex('FF00')) end as abin"
     ).write.mode("overwrite").parquet(path)
     spark.read.parquet(path).createOrReplaceTempView("nested")
     Seq(7, 300).foreach { n =>
@@ -189,7 +200,7 @@ class VectorShuffleSuite extends AnyFunSuite with BeforeAndAfterAll {
       )
       def rows(enabled: Boolean): Seq[String] = {
         spark.sessionState.conf.setConfString("spark.vecruntime.enabled", enabled.toString)
-        try df.selectExpr("spark_partition_id() as p", "*").collect().map(_.toString).toSeq.sorted
+        try df.selectExpr("spark_partition_id() as p", "*").collect().map(r => show(r)).toSeq.sorted
         finally spark.sessionState.conf.setConfString("spark.vecruntime.enabled", "true")
       }
       assert(rows(enabled = true) === rows(enabled = false), s"$n partitions")
@@ -325,6 +336,33 @@ class VectorShuffleSuite extends AnyFunSuite with BeforeAndAfterAll {
       // A normal query (its execution live while its stages run) is untouched.
       checkAgainstSpark("select k, count(*) c, sum(x) sx from t group by k")
     } finally sc.removeSparkListener(listener)
+  }
+
+  /**
+   * BINARY (#705) crosses our exchange on the UTF8 lane, always plain: as a hash key every row lands
+   * where Spark puts it (both hash the bytes with hashUnsafeBytes), as a range key in Spark's unsigned
+   * byte order, and as a payload it reads back byte for byte -- including bytes above 0x7f.
+   */
+  test("binary columns, hash keys and range keys cross our exchange") {
+    val path = tempDir.resolve("bin").toString
+    spark.range(0, 20000).selectExpr(
+      "cast(id % 97 as int) as k",
+      "case when id % 13 = 0 then null when id % 29 = 0 then x'' " +
+        "else unhex(lpad(hex((id * 2654435761) % 3001), 6, 'F')) end as b"
+    ).write.mode("overwrite").parquet(path)
+    spark.read.parquet(path).createOrReplaceTempView("bin")
+    val grouped = "select hex(b) h, count(*) c, max(k) mk from bin group by b" // hex: rows compare as strings
+    assertOurExchange(spark.sql(grouped))
+    checkAgainstSpark(grouped)
+    checkAgainstSpark("select k, count(distinct b) nb from bin group by k")
+    checkAgainstSpark("select spark_partition_id() p, hex(b) h from (select /*+ REPARTITION(6, b) */ b from bin)")
+    val ordered = "select hex(b) h, k from bin order by b desc nulls last, k limit 3000"
+    val ours = spark.sql(ordered).collect().toSeq
+    spark.sessionState.conf.setConfString("spark.vecruntime.enabled", "false")
+    try assert(ours === spark.sql(ordered).collect().toSeq)
+    finally spark.sessionState.conf.setConfString("spark.vecruntime.enabled", "true")
+    val plan = collectPlan(spark.sql("select b, k from bin order by b, k"))
+    assert(exchanges(plan).exists(_.isInstanceOf[VectorShuffleExchangeExec]), s"$plan")
   }
 
   test("range partitioning: a global order by is Spark's rows in Spark's order") {
