@@ -488,6 +488,7 @@ public final class ScalarReference {
             case BOOL -> src.getBoolean(i);
             case UTF8 -> src.getString(i);
             case DECIMAL128 -> src.getDecimal128(i);
+            case LIST, MAP, STRUCT -> throw new UnsupportedOperationException("nested lane in the scalar reference (#705)");
         };
     }
 

@@ -66,6 +66,15 @@ public interface VectorBuffers {
     /** Dictionary for dictionary-encoded UTF8; {@code null} otherwise. */
     VectorBuffers dictionary();
 
+    /**
+     * The child columns of a nested lane (#705): the elements of a {@link
+     * VecType#LIST}, the keys and the values of a {@link VecType#MAP}, the
+     * fields of a {@link VecType#STRUCT}. Empty for every other lane.
+     */
+    default java.util.List<VectorBuffers> children() {
+        return java.util.List.of();
+    }
+
     default boolean hasNulls() {
         return validity() != null;
     }
@@ -152,6 +161,22 @@ public interface VectorBuffers {
         int n = to - from;
         MemorySegment validity = validity() == null ? null : sliceBitmap(validity(), from, n);
         switch (type()) {
+            case LIST, MAP -> {
+                // Offsets are absolute positions in the children, which a slice keeps whole.
+                return new NestedVectorBuffers(
+                        type(),
+                        n,
+                        validity,
+                        offsets().asSlice((long) from << 2, ((long) n + 1) << 2),
+                        children());
+            }
+            case STRUCT -> {
+                java.util.List<VectorBuffers> fields = new java.util.ArrayList<>(children().size());
+                for (VectorBuffers f : children()) {
+                    fields.add(f.slice(from, to));
+                }
+                return new NestedVectorBuffers(VecType.STRUCT, n, validity, null, fields);
+            }
             case UTF8 -> {
                 if (isDictionaryEncoded()) {
                     return SegmentVectorBuffers.dictionaryUtf8(

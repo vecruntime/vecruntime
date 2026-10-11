@@ -43,6 +43,7 @@ class SelectKernelsTest {
             case BOOL -> v.getBoolean(i);
             case UTF8 -> v.getString(i);
             case DECIMAL128 -> v.getDecimal128(i);
+            case LIST, MAP, STRUCT -> throw new IllegalStateException("no nested lane here (#705)");
         };
     }
 
