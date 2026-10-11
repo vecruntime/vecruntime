@@ -377,6 +377,8 @@ public final class ArrowOutput {
             lv.setSafe(0, ((Number) value).longValue());
         } else if (v instanceof TimeStampMicroTZVector tv) {
             tv.setSafe(0, ((Number) value).longValue());
+        } else if (v instanceof org.apache.arrow.vector.TimeStampMicroVector tv) {
+            tv.setSafe(0, ((Number) value).longValue());
         } else if (v instanceof Float8Vector fv) {
             fv.setSafe(0, ((Number) value).doubleValue());
         } else if (v instanceof BitVector bv) {

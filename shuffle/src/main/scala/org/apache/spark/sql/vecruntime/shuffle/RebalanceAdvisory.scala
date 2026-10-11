@@ -57,7 +57,7 @@ object RebalanceAdvisory {
   private def arrowFixed(dt: DataType): Double = 1.0 / 8 + (dt match {
     case s: StructType => s.fields.map(f => arrowFixed(f.dataType)).sum
     case BooleanType => 1.0 / 8
-    case LongType | TimestampType | DoubleType => 8.0
+    case LongType | TimestampType | TimestampNTZType | DoubleType => 8.0
     case d: DecimalType => if (d.precision > Decimal.MAX_LONG_DIGITS) 16.0 else 8.0
     case _: StringType | _: BinaryType => 4.0
     case _ => 4.0 // INT32 lanes: int, date, byte, short

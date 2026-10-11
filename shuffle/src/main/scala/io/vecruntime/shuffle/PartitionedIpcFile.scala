@@ -219,6 +219,7 @@ object PartitionedIpcFile {
     case DateType => new ArrowType.Date(DateUnit.DAY)
     case LongType => new ArrowType.Int(64, true)
     case TimestampType => new ArrowType.Timestamp(TimeUnit.MICROSECOND, "UTC")
+    case TimestampNTZType => new ArrowType.Timestamp(TimeUnit.MICROSECOND, null) // micros, no zone (#705)
     case DoubleType => new ArrowType.FloatingPoint(FloatingPointPrecision.DOUBLE)
     case BooleanType => ArrowType.Bool.INSTANCE
     case StringType => new ArrowType.Int(32, true) // the indices of the dictionary encoding

@@ -220,6 +220,7 @@ import org.apache.spark.sql.types.{
   LongType,
   MapType,
   StringType,
+  TimestampNTZType,
   TimestampType
 }
 
@@ -236,7 +237,8 @@ object ExpressionCompiler {
 
   /** Types whose literals can be used as compare / IN operands. */
   private def isLiteralType(dt: DataType): Boolean = dt match {
-    case IntegerType | LongType | DoubleType | DateType | TimestampType | StringType | ByteType | ShortType =>
+    case IntegerType | LongType | DoubleType | DateType | TimestampType | TimestampNTZType | StringType | ByteType |
+        ShortType =>
       true // byte and short literals ride the int lane (#327)
     case d: DecimalType => TypeMapping.isSupported(d)
     case _ => false

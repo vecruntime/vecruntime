@@ -240,7 +240,7 @@ object AggregateSpill {
   /** The same key kinds as the shuffle's hash partitioning, so the buckets are Spark's hashes over the same lanes. */
   def keyKind(dt: DataType): KeyKind = dt match {
     case IntegerType | DateType => KeyKind.INT
-    case LongType | TimestampType => KeyKind.LONG
+    case LongType | TimestampType | TimestampNTZType => KeyKind.LONG
     case d: DecimalType if d.precision <= TypeMapping.MAX_DECIMAL_PRECISION => KeyKind.LONG
     case _: DecimalType => KeyKind.DECIMAL128
     case DoubleType => KeyKind.DOUBLE
@@ -251,7 +251,8 @@ object AggregateSpill {
 
   /** Whether every grouping key type can be bucketed. */
   def supportsKeys(types: Seq[DataType]): Boolean = types.forall {
-    case IntegerType | DateType | LongType | TimestampType | DoubleType | BooleanType | StringType | _: DecimalType =>
+    case IntegerType | DateType | LongType | TimestampType | TimestampNTZType | DoubleType | BooleanType | StringType |
+        _: DecimalType =>
       true
     case _ => false
   }
