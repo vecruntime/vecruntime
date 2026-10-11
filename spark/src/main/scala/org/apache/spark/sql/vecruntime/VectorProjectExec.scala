@@ -74,7 +74,7 @@ case class VectorProjectExec(projectList: Seq[NamedExpression], child: SparkPlan
         case Right((ordinal, path)) => NestedColumnRef(ordinal, path, passed.dataType)
         case Left(reason) => throw new IllegalStateException(s"cannot pass through ${e.sql}: $reason")
       }
-    } else VectorProjectExec.constantSlot(e).getOrElse(ExpressionCompiler.compile(e, child.output) match {
+    } else VectorProjectExec.constantSlot(e).getOrElse(ExpressionCompiler.compileProjection(e, child.output) match {
       case Right(v) => v
       case Left(reason) => throw new IllegalStateException(s"cannot vectorize projection ${e.sql}: $reason")
     })
@@ -190,6 +190,14 @@ private[vecruntime] class VectorProjectIterator(
                 BorrowedColumnVector.of(batch.column(ordinal))
               case lit: LiteralExpr if lit.value == null => ArrowOutput.nulls(name, dt, outRows, allocator)
               case lit: LiteralExpr => ArrowOutput.constant(name, dt, lit.value, outRows, allocator)
+              case e if TypeMapping.nestedTypeOf(dt) != null =>
+                // An array result (#705): the lane handed to Spark, viewed through the selection if one applies.
+                val col = io.vecruntime.spark.arrow.VectorNestedColumnVector.of(name, dt, e.eval(ctx), allocator)
+                if (compactTo == null) col
+                else {
+                  if (foreignRows == null) foreignRows = RemappedColumnVector.rowsOf(compactTo, ctx.numRows, outRows)
+                  RemappedColumnVector.owning(col, foreignRows)
+                }
               case e if compactTo != null => ArrowOutput.compact(name, dt, e.eval(ctx), compactTo, outRows, allocator)
               case e => ArrowOutput.copy(name, dt, e.eval(ctx), allocator)
             }

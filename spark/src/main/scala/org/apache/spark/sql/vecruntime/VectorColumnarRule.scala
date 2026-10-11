@@ -933,13 +933,15 @@ case class VectorExecRule(session: SparkSession) extends Rule[SparkPlan] with Lo
     val failures = p.projectList.filterNot(e =>
       VectorProjectExec.isPassThrough(e) || VectorProjectExec.constantSlot(e).isDefined
     ).flatMap { e =>
-      val compiled = ExpressionCompiler.compile(e, p.child.output)
-      // A decimal output wider than 18 digits is a DECIMAL128 lane when its expression compiled (#258).
+      val compiled = ExpressionCompiler.compileProjection(e, p.child.output)
+      // A decimal output wider than 18 digits is a DECIMAL128 lane when its expression compiled (#258);
+      // an array result is a nested lane (#705).
       val typeCheck =
         if (
           TypeMapping.isSupported(
             e.dataType
-          ) || (e.dataType.isInstanceOf[org.apache.spark.sql.types.DecimalType] && TypeMapping.hasLane(e.dataType))
+          ) || (e.dataType.isInstanceOf[org.apache.spark.sql.types.DecimalType] && TypeMapping.hasLane(e.dataType)) ||
+          TypeMapping.nestedTypeOf(e.dataType) != null
         ) Right(())
         else Left(s"unsupported output type ${e.dataType.simpleString} for ${e.name}")
       compiled.flatMap(_ => typeCheck).left.toOption.map(r => s"${e.sql}: $r")
