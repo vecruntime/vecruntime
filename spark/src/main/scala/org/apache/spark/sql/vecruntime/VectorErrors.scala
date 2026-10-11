@@ -40,6 +40,10 @@ object VectorErrors {
   def invalidArrayIndex(index: Int, count: Int, context: QueryContext): ArrayIndexOutOfBoundsException =
     QueryExecutionErrors.invalidArrayIndexError(index, count, context)
 
+  /** `element_at(arr, i)` with `|i|` past the array in ANSI mode: Spark's INVALID_ARRAY_INDEX_IN_ELEMENT_AT. */
+  def invalidElementAtIndex(index: Int, count: Int, context: QueryContext): ArrayIndexOutOfBoundsException =
+    QueryExecutionErrors.invalidElementAtIndexError(index, count, context)
+
   /** `split_part` with part 0: Spark's INVALID_INDEX_OF_ZERO, raised regardless of ANSI mode. */
   def invalidIndexOfZero(context: QueryContext): RuntimeException =
     QueryExecutionErrors.invalidIndexOfZeroError(context)

@@ -119,9 +119,8 @@ class VectorProjectSuite extends VectorQuerySuite {
         ).toSeq
     }
     assert(fields.sortBy(_._1) == expected.sortBy(_._1))
-    // Reading into an array or a map is still refused, with the expression named; so is grouping by the struct.
-    checkFallback("SELECT i, arr[0] AS a0 FROM nested", Seq(Project), "array element access")
-    checkFallback("SELECT i, mp['k'] AS k FROM nested", Seq(Project), "map value access")
+    // Reading into an array or a map compiles since #705 (VectorElementAccessSuite); grouping by the struct is refused.
+    checkVectorized("SELECT i, arr[0] AS a0, mp['k'] AS k FROM nested", Seq(Project))
     checkFallback(
       "SELECT st, count(*) AS n FROM nested GROUP BY st",
       Seq(classOf[VectorHashAggregateExec]),

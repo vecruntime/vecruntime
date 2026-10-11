@@ -344,8 +344,15 @@ object ExpressionCompiler {
       else nestedColumnPath(s.child, input).map { case (ordinal, path) =>
         SizeExpr(ordinal, path, isMap, s.legacySizeOfNull)
       }
-    case g: GetArrayItem => Left(s"array element access ${g.sql} not supported (#50: only struct fields are read)")
-    case g: GetMapValue => Left(s"map value access ${g.sql} not supported (#50: only struct fields are read)")
+    // One element of an array / one value of a map per row, over the column's nested lane (#705).
+    case g @ GetArrayItem(child, ordinal, failOnError) =>
+      elementAccess(child, ordinal, ElementAccessExpr.ZeroBased, failOnError, g, input)
+    case g @ GetMapValue(child, key) =>
+      elementAccess(child, key, ElementAccessExpr.MapKey, failOnError = false, g, input)
+    case e @ ElementAt(child, arg, None, failOnError) if child.dataType.isInstanceOf[ArrayType] =>
+      elementAccess(child, arg, ElementAccessExpr.OneBased, failOnError, e, input)
+    case e @ ElementAt(child, key, None, _) if child.dataType.isInstanceOf[MapType] =>
+      elementAccess(child, key, ElementAccessExpr.MapKey, failOnError = false, e, input)
     case g: GetArrayStructFields =>
       Left(s"array of struct fields ${g.sql} not supported (#50: only struct fields are read)")
 
@@ -864,6 +871,45 @@ object ExpressionCompiler {
    * A nested column as (input ordinal, chain of struct-field ordinals): a bare column, or a struct field
    * of one at any depth. Shared with the operators that read Spark's vectors directly (the generate).
    */
+  /**
+   * `arr[i]`, `element_at(arr, i)`, `map[k]`, `element_at(map, k)` (#705): the container must be a
+   * column or a struct field of one with a nested lane, the result a lane (a nested result -- an
+   * element that is itself an array -- is a later step), and a map key one the lookup compares.
+   */
+  private def elementAccess(
+      container: Expression,
+      arg: Expression,
+      mode: ElementAccessExpr.Mode,
+      failOnError: Boolean,
+      e: Expression,
+      input: Seq[Attribute]
+  ): Result = {
+    val what = e.prettyName
+    if (TypeMapping.nestedTypeOf(container.dataType) == null)
+      Left(s"$what over ${container.dataType.simpleString} not supported (a leaf without a lane)")
+    else if (!TypeMapping.isSupported(e.dataType))
+      Left(s"$what with a ${e.dataType.simpleString} result not supported (#705: nested and wide results come later)")
+    else {
+      val argOk = mode match {
+        case ElementAccessExpr.MapKey =>
+          val kt = container.dataType.asInstanceOf[MapType].keyType
+          val lane = TypeMapping.vecTypeOf(kt)
+          if (kt.isInstanceOf[StringType] && kt != StringType)
+            Left(s"$what on a collated ${kt.simpleString} key not supported")
+          else if (lane == null || !ElementAccessExpr.keyLane(lane) || !TypeMapping.isSupported(kt))
+            Left(s"$what on a ${kt.simpleString} key not supported")
+          else Right(())
+        case _ =>
+          arg.dataType match {
+            case IntegerType | LongType | ShortType | ByteType => Right(())
+            case other => Left(s"$what with a ${other.simpleString} index not supported")
+          }
+      }
+      for (_ <- argOk; p <- nestedColumnPath(container, input); a <- compile(arg, input))
+        yield ElementAccessExpr(p._1, p._2, container.dataType, mode, a, failOnError, e.origin.context)
+    }
+  }
+
   def nestedColumnPath(e: Expression, input: Seq[Attribute]): Either[String, (Int, Seq[Int])] = e match {
     case a: AttributeReference =>
       val ordinal = input.indexWhere(_.exprId == a.exprId)
