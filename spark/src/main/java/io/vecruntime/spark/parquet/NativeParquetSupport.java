@@ -118,6 +118,6 @@ public final class NativeParquetSupport {
      * carry it as a foreign column).
      */
     public static boolean isForeign(DataType dt) {
-        return dt instanceof FloatType || dt instanceof BinaryType;
+        return dt instanceof FloatType;
     }
 }

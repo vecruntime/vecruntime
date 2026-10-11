@@ -232,6 +232,30 @@ object ExpressionCompiler {
 
   type Result = Either[String, VectorExpr]
 
+  /** Whether the expression itself or one of its direct children is BINARY (#705). */
+  private def binaryOperand(e: Expression): Boolean =
+    e.dataType == BinaryType || e.children.exists(_.dataType == BinaryType)
+
+  /**
+   * Expressions whose result over BINARY is the same as over a binary-collation string of the same
+   * bytes: references, comparisons (unsigned byte order in both), null tests and the conditionals that
+   * pick a value. Everything else over binary is refused (#705).
+   */
+  private def binaryNeutral(e: Expression): Boolean = e match {
+    case _: AttributeReference | _: BoundReference | _: Alias => true
+    case _: EqualTo | _: LessThan | _: LessThanOrEqual | _: GreaterThan | _: GreaterThanOrEqual => true
+    case Not(_: EqualTo) | _: EqualNullSafe => true
+    case _: IsNull | _: IsNotNull => true
+    case _: Coalesce | _: If | _: CaseWhen => true
+    case Literal(null, _) => true
+    // Handled below with their own binary rules: a cast reaches the cast matrix (no binary target or
+    // source is in it), a digest takes only `cast(string as binary)`, and a bloom probe reads its binary
+    // filter as a subquery result, never as a lane.
+    case _: Cast | _: Md5 | _: Sha1 | _: Sha2 | _: Crc32 => true
+    case _: BloomFilterMightContain | _: org.apache.spark.sql.vecruntime.PartitionedBloomMightContain => true
+    case _ => false
+  }
+
   private val comparableTypes: Set[VecType] =
     Set(VecType.INT32, VecType.INT64, VecType.FLOAT64, VecType.UTF8, VecType.DECIMAL128)
 
@@ -282,6 +306,12 @@ object ExpressionCompiler {
   }
 
   def compile(expr: Expression, input: Seq[Attribute]): Result = expr match {
+    // BINARY rides the UTF8 lane (#705), and the string kernels read characters, so only expressions
+    // that compare, test or carry a value may touch a binary operand: anything else over binary (length,
+    // substring, lpad, casts, hashes, ...) would count UTF-8 characters where Spark counts bytes.
+    case e if binaryOperand(e) && !binaryNeutral(e) =>
+      Left(s"unsupported ${e.prettyName} over binary")
+
     // A scalar subquery result in any reference-free shape (the ScalarSubquery, a struct field of a
     // merged one, a CASE over such fields): a literal by the time the operator runs, read then.
     case e if SubqueryLiteralExpr.isDeferred(e) =>

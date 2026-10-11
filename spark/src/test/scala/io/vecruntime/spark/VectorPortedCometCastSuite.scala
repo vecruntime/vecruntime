@@ -258,7 +258,7 @@ class VectorPortedCometCastSuite extends VectorQuerySuite {
     )
   }
 
-  test("cast to binary falls back (no lane)") {
-    castFallback("cs_num", "binary", "unsupported cast target binary")
+  test("cast to binary falls back (binary has a lane since #705, the cast does not)") {
+    castFallback("cs_num", "binary", "unsupported cast string -> binary")
   }
 }

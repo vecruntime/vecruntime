@@ -81,8 +81,8 @@ public final class ArrowVectorBuffers implements VectorBuffers {
             // Arrow Decimal128: 16-byte little-endian values, our DECIMAL128 layout as is.
             return VecType.DECIMAL128;
         }
-        if (v instanceof VarCharVector) {
-            return VecType.UTF8;
+        if (v instanceof VarCharVector || v instanceof org.apache.arrow.vector.VarBinaryVector) {
+            return VecType.UTF8; // BINARY shares the layout (#705)
         }
         return null;
     }
@@ -120,14 +120,14 @@ public final class ArrowVectorBuffers implements VectorBuffers {
      */
     public static ArrowVectorBuffers forWrite(ValueVector v, int length, org.apache.spark.sql.types.DataType sparkType) {
         ArrowVectorBuffers b;
-        if (vecTypeOf(v) == null && (v instanceof org.apache.arrow.vector.Float4Vector || v instanceof org.apache.arrow.vector.VarBinaryVector)) {
+        if (vecTypeOf(v) == null && v instanceof org.apache.arrow.vector.Float4Vector) {
             // A column with no engine lane, written by the native Parquet scan on the lane of the same layout
-            // (#559): FLOAT's 4-byte bits on INT32, BINARY's offsets and bytes on UTF8. Deliberately not in
-            // vecTypeOf, so no reader of an incoming vector ever takes these for an INT32 or UTF8 lane.
+            // (#559): FLOAT's 4-byte bits on INT32. Deliberately not in vecTypeOf, so no reader of an incoming
+            // vector ever takes it for an INT32 lane. (BINARY has had the UTF8 lane since #705.)
             if (v.getValidityBuffer().capacity() < Bitmap.bytesFor(length)) {
                 throw new IllegalStateException("vector not allocated for " + length + " elements");
             }
-            VecType lane = v instanceof org.apache.arrow.vector.Float4Vector ? VecType.INT32 : VecType.UTF8;
+            VecType lane = VecType.INT32;
             b = wrap(v, lane, length, ArrowSegments.of(v.getValidityBuffer()));
         } else {
             b = forWrite(v, length);

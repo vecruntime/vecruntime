@@ -62,7 +62,9 @@ import org.apache.spark.sql.catalyst.expressions.{
   SpecialFrameBoundary,
   UnboundedFollowing => UnboundedFollowingBound
 }
+import org.apache.spark.unsafe.types.UTF8String
 import org.apache.spark.sql.types.{
+  BinaryType,
   ByteType,
   ShortType,
   DateType,
@@ -1672,6 +1674,7 @@ private[vecruntime] class VectorWindowOffsetIterator(
       case DoubleType => java.lang.Double.valueOf(col.getDouble(r))
       case BooleanType => java.lang.Boolean.valueOf(col.getBoolean(r))
       case StringType => col.getUTF8String(r).clone()
+      case BinaryType => col.getBinary(r) // #705: Spark's internal value for binary
       case d: SparkDecimalType if d.precision > TypeMapping.MAX_DECIMAL_PRECISION =>
         col.getDecimal(
           r,

@@ -896,14 +896,18 @@ public final class SparkColumnVectorBuffers {
         return SegmentVectorBuffers.utf8(numRows, validity, offsets, data);
     }
 
-    /** Any other column vector: one {@link UTF8String} per row. */
+    /**
+     * Any other column vector: one {@link UTF8String} per row (BINARY: its
+     * bytes, #705).
+     */
     private static VectorBuffers copyUtf8(ColumnVector cv, int numRows, Arena arena,
             MemorySegment validity) {
+        boolean binary = cv.dataType() instanceof org.apache.spark.sql.types.BinaryType;
         UTF8String[] strings = new UTF8String[numRows];
         long total = 0;
         for (int i = 0; i < numRows; i++) {
             if (validity == null || Bitmap.isSet(validity, i)) {
-                strings[i] = cv.getUTF8String(i);
+                strings[i] = binary ? UTF8String.fromBytes(cv.getBinary(i)) : cv.getUTF8String(i);
                 total += strings[i].numBytes();
             }
         }
