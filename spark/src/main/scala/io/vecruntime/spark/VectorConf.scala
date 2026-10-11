@@ -626,12 +626,12 @@ object VectorConf {
   def aggregateBelowJoinLocal(conf: SQLConf): Boolean = bool(conf, AggregateBelowJoinLocal, default = true)
 
   /**
-   * The rows a local pre-aggregate reads before it judges its reduction (default 262144, 32 batches of 8192):
+   * The rows a local pre-aggregate reads before it judges its reduction (default 16384, 2 batches of 8192; #708):
    * fewer groups than rows / `spark.vecruntime.agg.passThroughRatio` keeps it aggregating, more sends the rest
    * of the task through one batch at a time (#693). 0 judges only when the table reaches its memory budget.
    */
   def aggregateBelowJoinProbeRows(conf: SQLConf): Long =
-    math.max(0L, conf.getConfString(AggregateBelowJoinProbeRows, "262144").trim.toLong)
+    math.max(0L, conf.getConfString(AggregateBelowJoinProbeRows, "16384").trim.toLong)
 
   /** Dropping grouping keys a unique broadcast key determines (#635); also off when the plugin is off. */
   def removeRedundantGroupKeysEnabled(conf: SQLConf): Boolean =
