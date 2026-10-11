@@ -155,12 +155,23 @@ object ElementAccessExpr {
 
   /** Key lanes a map lookup compares (map keys are never null). */
   def keyLane(t: VecType): Boolean =
-    t == VecType.INT32 || t == VecType.INT64 || t == VecType.UTF8 || t == VecType.BOOL
+    t == VecType.INT32 || t == VecType.INT64 || t == VecType.UTF8 || t == VecType.BOOL ||
+      t == VecType.FLOAT64 || t == VecType.DECIMAL128
+
+  /**
+   * Spark's equality for doubles (`SQLOrderingUtil.compareDoubles == 0`): `==`, so -0.0 equals 0.0,
+   * and every NaN equals every NaN.
+   */
+  private[expr] def sameDouble(a: Double, b: Double): Boolean = a == b || (a.isNaN && b.isNaN)
 
   private[expr] def sameKey(keys: VectorBuffers, j: Int, key: VectorBuffers, r: Int): Boolean = keys.`type`() match {
     case VecType.INT32 => keys.getInt(j) == key.getInt(r)
     case VecType.INT64 => keys.getLong(j) == key.getLong(r)
     case VecType.BOOL => keys.getBoolean(j) == key.getBoolean(r)
+    case VecType.FLOAT64 => sameDouble(keys.getDouble(j), key.getDouble(r))
+    case VecType.DECIMAL128 =>
+      io.vecruntime.kernels.Decimal128.hi(keys.data(), j) == io.vecruntime.kernels.Decimal128.hi(key.data(), r) &&
+      io.vecruntime.kernels.Decimal128.lo(keys.data(), j) == io.vecruntime.kernels.Decimal128.lo(key.data(), r)
     case VecType.UTF8 =>
       val ks = keys.offsets().get(VectorBuffers.LE_INT, j.toLong << 2)
       val ke = keys.offsets().get(VectorBuffers.LE_INT, (j + 1).toLong << 2)
@@ -175,6 +186,9 @@ object ElementAccessExpr {
   def literalLane(lit: LiteralExpr, arena: Arena): VectorBuffers = lit.vecType match {
     case VecType.INT32 => ArrowLayout.ofInts(arena, Array(lit.number.intValue()), null)
     case VecType.INT64 => ArrowLayout.ofLongs(arena, Array(lit.number.longValue()), null)
+    case VecType.FLOAT64 => ArrowLayout.ofDoubles(arena, Array(lit.number.doubleValue()), null)
+    case VecType.DECIMAL128 =>
+      ArrowLayout.ofDecimal128(arena, Array(lit.number.asInstanceOf[java.math.BigInteger]), null)
     case VecType.UTF8 =>
       ArrowLayout.ofStrings(arena, Array(new String(lit.utf8Bytes, java.nio.charset.StandardCharsets.UTF_8)))
     case other => throw new IllegalStateException(s"no literal $other index or key")

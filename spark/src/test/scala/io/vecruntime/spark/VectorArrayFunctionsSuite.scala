@@ -82,7 +82,10 @@ class VectorArrayFunctionsSuite extends VectorQuerySuite {
     )
   }
 
-  test("double elements keep Spark's operator, with the reason") {
-    checkFallback("SELECT array_contains(adbl, 1.0d) FROM arrays", Seq(Project), "double elements not supported")
+  test("double elements compare too") {
+    checkVectorized(
+      "SELECT array_contains(adbl, 1.0d) c FROM arrays",
+      Seq(Project)
+    ) // doubles compare since #705 (VectorFractionalElementsSuite)
   }
 }
