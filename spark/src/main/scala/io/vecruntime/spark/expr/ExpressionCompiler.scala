@@ -86,6 +86,7 @@ import org.apache.spark.sql.catalyst.expressions.{
   ElementAt,
   ArrayContains,
   ArrayFilter,
+  Slice,
   ArrayTransform,
   MapValues,
   ArrayExists,
@@ -229,6 +230,7 @@ import org.apache.spark.sql.types.{
   DateType,
   DecimalType,
   DoubleType,
+  FloatType,
   IntegerType,
   LongType,
   MapType,
@@ -275,8 +277,8 @@ object ExpressionCompiler {
   /** Types whose literals can be used as compare / IN operands. */
   private def isLiteralType(dt: DataType): Boolean = dt match {
     case IntegerType | LongType | DoubleType | DateType | TimestampType | TimestampNTZType | StringType | ByteType |
-        ShortType =>
-      true // byte and short literals ride the int lane (#327)
+        ShortType | FloatType =>
+      true // byte and short literals ride the int lane (#327), float ones the double lane (#712)
     case d: DecimalType => TypeMapping.isSupported(d)
     case _ => false
   }
@@ -396,7 +398,9 @@ object ExpressionCompiler {
     // NaNs and both zeros compare equal. The key tables compare bits, so the normalisation is a real
     // pass over doubles (the marker around it is an identity); floats are not a supported lane type.
     case KnownFloatingPointNormalized(child) => compile(child, input)
-    case NormalizeNaNAndZero(child) if child.dataType == DoubleType => compile(child, input).map(NormalizeDoubleExpr(_))
+    // A float is normalised on its widened double: the canonical NaN and +0.0 narrow back to float's own (#712).
+    case NormalizeNaNAndZero(child) if child.dataType == DoubleType || child.dataType == FloatType =>
+      compile(child, input).map(NormalizeDoubleExpr(_))
     case NormalizeNaNAndZero(child) => Left(s"NormalizeNaNAndZero over ${child.dataType.simpleString} not supported")
 
     case EqualTo(l, r) => comparison(CompareOp.EQ, l, r, input)
@@ -410,7 +414,8 @@ object ExpressionCompiler {
     case InSet(value, hset) => inSet(value, hset, input)
     case EqualNullSafe(l, r) => nullSafeEquality(l, r, input)
     case IsNaN(child) =>
-      if (child.dataType != DoubleType) Left(s"isnan over ${child.dataType.simpleString}")
+      if (child.dataType != DoubleType && child.dataType != FloatType)
+        Left(s"isnan over ${child.dataType.simpleString}")
       else numericChild(child, input, "isnan").map(IsNaNExpr(_))
 
     case StartsWith(l, r) => stringMatch(StringMatchKernels.Kind.PREFIX, l, r, input)
@@ -615,6 +620,20 @@ object ExpressionCompiler {
     // compiles as usual and only its overflow error is renamed to the table-insert one.
     case CheckOverflowInTableInsert(cast: Cast, columnName) =>
       compile(cast, input).map(ce => TableInsertOverflowExpr(ce, cast.child.dataType, cast.dataType, columnName))
+
+    // FLOAT (#712): to double is the widened lane as it is; to float from an int lane or a double rounds to
+    // single precision once, as Spark's `toFloat`. Every other cast from or to float stays with Spark: a long
+    // rounds once in Spark and twice through a double, and a float prints shorter than its double.
+    case c: Cast if c.child.dataType == FloatType || c.dataType == FloatType =>
+      compile(c.child, input).flatMap {
+        case _: LiteralExpr => Left("cast of a literal")
+        case ce => (c.child.dataType, c.dataType) match {
+            case (FloatType, DoubleType) => Right(RetypeExpr(ce, DoubleType))
+            case (DoubleType, FloatType) => Right(RoundFloatExpr(ce))
+            case (IntegerType | ShortType | ByteType, FloatType) => Right(RoundFloatExpr(CastExpr(ce, DoubleType)))
+            case (f, t) => Left(s"unsupported cast ${f.simpleString} -> ${t.simpleString} (#712)")
+          }
+      }
 
     case c: Cast if TypeMapping.isDecimal(c.child.dataType) || TypeMapping.isDecimal(c.dataType) =>
       decimalCast(c, input)
@@ -906,12 +925,13 @@ object ExpressionCompiler {
       mode: ElementAccessExpr.Mode,
       failOnError: Boolean,
       e: Expression,
-      input: Seq[Attribute]
+      input: Seq[Attribute],
+      nestedResult: Boolean = false
   ): Result = {
     val what = e.prettyName
     if (TypeMapping.nestedTypeOf(container.dataType) == null)
       Left(s"$what over ${container.dataType.simpleString} not supported (a leaf without a lane)")
-    else if (!TypeMapping.isSupported(e.dataType))
+    else if (!TypeMapping.isSupported(e.dataType) && !(nestedResult && TypeMapping.nestedTypeOf(e.dataType) != null))
       Left(s"$what with a ${e.dataType.simpleString} result not supported (#705: nested and wide results come later)")
     else {
       val argOk = mode match {
@@ -1055,10 +1075,31 @@ object ExpressionCompiler {
     case e @ ArrayTransform(child, LambdaFunction(body, vars, _)) =>
       lambdaArray(child, vars, body, keep = false, e, input)
     case e @ ArrayFilter(child, LambdaFunction(body, vars, _)) => lambdaArray(child, vars, body, keep = true, e, input)
+    // Element access whose element is itself an array, map or struct: the element gathered as a nested lane.
+    case g @ GetArrayItem(child, ordinal, failOnError) =>
+      elementAccess(child, ordinal, ElementAccessExpr.ZeroBased, failOnError, g, input, nestedResult = true)
+    case g @ GetMapValue(child, key) =>
+      elementAccess(child, key, ElementAccessExpr.MapKey, failOnError = false, g, input, nestedResult = true)
+    case e @ ElementAt(child, arg, None, failOnError) if child.dataType.isInstanceOf[ArrayType] =>
+      elementAccess(child, arg, ElementAccessExpr.OneBased, failOnError, e, input, nestedResult = true)
+    case e @ ElementAt(child, key, None, _) if child.dataType.isInstanceOf[MapType] =>
+      elementAccess(child, key, ElementAccessExpr.MapKey, failOnError = false, e, input, nestedResult = true)
+    case e @ Slice(child, start, length) => slice(child, start, length, e, input)
     // Anything else keeps the reason the ordinary compiler gives it (element access with a nested
     // element, a struct constructor, ...).
     case other => compile(other, input)
   }
+
+  /** `slice(arr, start, length)` (#705): a column or a struct field of one with a nested lane, int bounds. */
+  private def slice(container: Expression, start: Expression, length: Expression, e: Expression, input: Seq[Attribute])
+      : Result =
+    if (TypeMapping.nestedTypeOf(container.dataType) == null)
+      Left(s"slice over ${container.dataType.simpleString} not supported")
+    else if (start.dataType != IntegerType || length.dataType != IntegerType)
+      Left(s"slice with ${start.dataType.simpleString} / ${length.dataType.simpleString} bounds not supported")
+    else
+      for (p <- nestedColumnPath(container, input); s <- compile(start, input); l <- compile(length, input))
+        yield SliceExpr(p._1, p._2, container.dataType, s, l, e.dataType)
 
   private def mapPart(container: Expression, values: Boolean, e: Expression, input: Seq[Attribute]): Result =
     if (TypeMapping.nestedTypeOf(container.dataType) == null)
@@ -1191,6 +1232,8 @@ object ExpressionCompiler {
     else if (TypeMapping.isDecimal(l.dataType)) Left(s"$what over ${l.dataType.simpleString} not supported")
     else if (kind == DivideLikeExpr.Div && TypeMapping.vecTypeOf(l.dataType) == VecType.FLOAT64)
       Left("div over double not supported")
+    // A float remainder is exact on the widened doubles; pmod adds the divisor in float arithmetic first (#712).
+    else if (kind == DivideLikeExpr.Pmod && l.dataType == FloatType) Left("pmod over float not supported")
     else
       for {
         le <- compile(l, input)
@@ -1467,6 +1510,10 @@ object ExpressionCompiler {
       re <- compile(r, input)
       _ <- checkArithmetic(op, le, re, l, r, mode)
     } yield e.dataType match {
+      // float arithmetic (#712): computed on the widened doubles, then rounded to single precision -- for
+      // + - * a double holds more than 2p + 2 bits, so one rounding of the exact double result is IEEE's.
+      case FloatType =>
+        RoundFloatExpr(ArithExpr(op, le, re, DoubleType, ansiDivideByZero = false, e.origin.context))
       // tinyint / smallint arithmetic (#327): exact on the int lane (two bytes or shorts never overflow an
       // int), then narrowed into the declared type -- Spark wraps in legacy mode, raises in ANSI, nulls in try.
       case ByteType | ShortType =>

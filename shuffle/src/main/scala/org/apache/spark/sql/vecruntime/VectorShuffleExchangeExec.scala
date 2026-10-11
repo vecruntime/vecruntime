@@ -366,17 +366,28 @@ object VectorShuffleExchangeExec {
    */
   def supports(partitioning: Partitioning, output: Seq[Attribute]): Boolean = {
     def laneKey(dt: org.apache.spark.sql.types.DataType) = io.vecruntime.spark.adapter.TypeMapping.hasLane(dt)
-    def key(dt: org.apache.spark.sql.types.DataType) = io.vecruntime.shuffle.StructFlattening.supported(dt)
-    // Arrays, maps and structs over them cross as nested lanes (#705): payload, never keys.
+    // A float key would hash its widened double, where Spark hashes the float's own bits (#712): float
+    // columns cross as payload, a float hash or range key keeps Spark's exchange.
+    def containsFloat(dt: org.apache.spark.sql.types.DataType): Boolean = dt match {
+      case _: org.apache.spark.sql.types.FloatType => true
+      case s: org.apache.spark.sql.types.StructType => s.fields.exists(f => containsFloat(f.dataType))
+      case a: org.apache.spark.sql.types.ArrayType => containsFloat(a.elementType)
+      case m: org.apache.spark.sql.types.MapType => containsFloat(m.keyType) || containsFloat(m.valueType)
+      case _ => false
+    }
+    // Arrays, maps and structs over them cross as nested lanes (#705).
     def column(dt: org.apache.spark.sql.types.DataType) =
-      key(dt) || io.vecruntime.spark.adapter.TypeMapping.nestedTypeOf(dt) != null
+      io.vecruntime.shuffle.StructFlattening.supported(dt) ||
+        io.vecruntime.spark.adapter.TypeMapping.nestedTypeOf(dt) != null
     output.forall(a => column(a.dataType)) && (partitioning match {
       // A nested key (an array, or a struct holding one) hashes as Spark's Murmur3Hash does (NestedKeyHash, #705).
-      case h: HashPartitioning => h.expressions.forall(e => e.isInstanceOf[Attribute] && column(e.dataType))
+      case h: HashPartitioning =>
+        h.expressions.forall(e => e.isInstanceOf[Attribute] && column(e.dataType) && !containsFloat(e.dataType))
       case _: RoundRobinPartitioning => true
       case SinglePartition => true
       // Range ids come from Spark's partitioner over the rows, so a nested sort key reads as Spark's (#705).
-      case r: RangePartitioning => r.ordering.forall(o => laneKey(o.dataType) || column(o.dataType))
+      case r: RangePartitioning =>
+        r.ordering.forall(o => (laneKey(o.dataType) || column(o.dataType)) && !containsFloat(o.dataType))
       case _ => false
     })
   }

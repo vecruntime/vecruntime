@@ -28,6 +28,7 @@ import io.vecruntime.spark.arrow.{
   VectorArrowColumnVector,
   VectorDecimalColumnVector,
   VectorDictionaryColumnVector,
+  VectorFloatColumnVector,
   VectorNarrowIntColumnVector,
   VectorNestedColumnVector
 }
@@ -222,7 +223,7 @@ object PartitionedIpcFile {
     case TimestampType => new ArrowType.Timestamp(TimeUnit.MICROSECOND, "UTC")
     case TimestampNTZType => new ArrowType.Timestamp(TimeUnit.MICROSECOND, null) // micros, no zone (#705)
     case BinaryType => ArrowType.Utf8.INSTANCE // the UTF8 lane's layout, always plain (#705)
-    case DoubleType => new ArrowType.FloatingPoint(FloatingPointPrecision.DOUBLE)
+    case DoubleType | FloatType => new ArrowType.FloatingPoint(FloatingPointPrecision.DOUBLE) // FLOAT: its lane (#712)
     case BooleanType => ArrowType.Bool.INSTANCE
     case StringType => new ArrowType.Int(32, true) // the indices of the dictionary encoding
     case d: DecimalType if d.precision <= TypeMapping.MAX_DECIMAL_PRECISION => new ArrowType.Int(64, true)
@@ -434,6 +435,7 @@ object PartitionedIpcFile {
         case d: DecimalType if d.precision <= TypeMapping.MAX_DECIMAL_PRECISION =>
           new VectorDecimalColumnVector(moved.asInstanceOf[org.apache.arrow.vector.BigIntVector], d)
         case ByteType | ShortType => new VectorNarrowIntColumnVector(moved.asInstanceOf[IntVector], dt) // #327
+        case FloatType => new VectorFloatColumnVector(moved.asInstanceOf[org.apache.arrow.vector.Float8Vector]) // #712
         case _ => new VectorArrowColumnVector(moved)
       }
       c += 1
@@ -883,6 +885,7 @@ object PartitionedIpcFile {
       case d: DecimalType if d.precision <= TypeMapping.MAX_DECIMAL_PRECISION =>
         new VectorDecimalColumnVector(moved.asInstanceOf[org.apache.arrow.vector.BigIntVector], d)
       case ByteType | ShortType => new VectorNarrowIntColumnVector(moved.asInstanceOf[IntVector], types(c)) // #327
+      case FloatType => new VectorFloatColumnVector(moved.asInstanceOf[org.apache.arrow.vector.Float8Vector]) // #712
       case _ => new VectorArrowColumnVector(moved)
     }
 

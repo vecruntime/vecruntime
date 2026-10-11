@@ -297,12 +297,35 @@ class SparkColumnVectorBuffersSuite extends SparkVectorFunSuite {
   }
 
   test("unsupported Spark types are rejected") {
-    val cv = new OnHeapColumnVector(4, FloatType)
+    val cv = new OnHeapColumnVector(4, CalendarIntervalType)
     try {
-      assert(!TypeMapping.isSupported(FloatType))
+      assert(!TypeMapping.isSupported(CalendarIntervalType))
       val arena = Arena.ofConfined()
       try intercept[UnsupportedOperationException](SparkColumnVectorBuffers.copy(cv, 4, arena))
       finally arena.close()
+    } finally cv.close()
+  }
+
+  test("a float column widens exactly into the FLOAT64 lane (#712)") {
+    val values = Array(1.1f, Float.NaN, -0.0f, Float.MinPositiveValue, Float.MaxValue, Float.NegativeInfinity)
+    val cv = new OnHeapColumnVector(values.length + 1, FloatType)
+    try {
+      values.indices.foreach(i => cv.putFloat(i, values(i)))
+      cv.putNull(values.length)
+      assert(TypeMapping.vecTypeOf(FloatType) == io.vecruntime.kernels.VecType.FLOAT64)
+      val arena = Arena.ofConfined()
+      try {
+        val lane = SparkColumnVectorBuffers.copy(cv, values.length + 1, arena)
+        assert(lane.`type`() == io.vecruntime.kernels.VecType.FLOAT64)
+        values.indices.foreach { i =>
+          assert(
+            java.lang.Double.doubleToRawLongBits(lane.getDouble(i)) ==
+              java.lang.Double.doubleToRawLongBits(values(i).toDouble),
+            s"row $i"
+          )
+        }
+        assert(lane.isNull(values.length))
+      } finally arena.close()
     } finally cv.close()
   }
 
