@@ -674,7 +674,11 @@ public final class NativeParquetColumnReader {
             v.close();
             v = pooled();
         }
-        BaseFixedWidthVector nv = (BaseFixedWidthVector) ArrowOutput.newVector(name, sparkType, allocator);
+        // FLOAT is decoded as its own 4-byte bits (#559) into a Float4Vector; the operators widen it to the
+        // FLOAT64 lane on the way in (#712), and every other type is the lane's own vector.
+        BaseFixedWidthVector nv = sparkType instanceof org.apache.spark.sql.types.FloatType
+                ? new org.apache.arrow.vector.Float4Vector(name, allocator)
+                : (BaseFixedWidthVector) ArrowOutput.newVector(name, sparkType, allocator);
         nv.allocateNew(rows);
         return nv;
     }

@@ -98,7 +98,7 @@ public final class NestedColumns {
         return switch (t) {
             case INT32 -> new IntNode(dt, expected);
             case INT64 -> new LongNode(dt, expected);
-            case FLOAT64 -> new DoubleNode(expected);
+            case FLOAT64 -> new DoubleNode(dt instanceof org.apache.spark.sql.types.FloatType, expected);
             case BOOL -> new BoolNode(expected);
             case UTF8 -> new BytesNode(dt instanceof BinaryType, expected);
             case DECIMAL128 -> new Decimal128Node((DecimalType) dt, expected);
@@ -230,8 +230,12 @@ public final class NestedColumns {
     private static final class DoubleNode extends Node {
         private double[] values;
 
-        DoubleNode(int expected) {
+        /** A FLOAT leaf (#712): read as float, widened into the FLOAT64 lane. */
+        private final boolean single;
+
+        DoubleNode(boolean single, int expected) {
             super(expected);
+            this.single = single;
             values = new double[nulls.length];
         }
 
@@ -247,7 +251,7 @@ public final class NestedColumns {
 
         @Override
         void appendValue(SpecializedGetters g, int ordinal) {
-            values[rows] = g.getDouble(ordinal);
+            values[rows] = single ? g.getFloat(ordinal) : g.getDouble(ordinal);
         }
 
         @Override

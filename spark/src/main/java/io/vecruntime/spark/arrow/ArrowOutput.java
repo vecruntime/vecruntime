@@ -73,7 +73,8 @@ public final class ArrowOutput {
         if (dt instanceof TimestampType) {
             return new TimeStampMicroTZVector(name, allocator, "UTC");
         }
-        if (dt instanceof DoubleType) {
+        if (dt instanceof DoubleType || dt instanceof org.apache.spark.sql.types.FloatType) {
+            // FLOAT's lane is FLOAT64 (#712): its vector is the lane's, VectorFloatColumnVector narrows on read.
             return new Float8Vector(name, allocator);
         }
         if (dt instanceof BooleanType) {
@@ -94,9 +95,6 @@ public final class ArrowOutput {
             return new DecimalVector(name, allocator, d.precision(), d.scale());
         }
         // Types with no engine lane that the native Parquet scan emits (#559): Spark's ArrowColumnVector reads them.
-        if (dt instanceof org.apache.spark.sql.types.FloatType) {
-            return new org.apache.arrow.vector.Float4Vector(name, allocator);
-        }
         if (dt instanceof org.apache.spark.sql.types.TimestampNTZType) {
             return new org.apache.arrow.vector.TimeStampMicroVector(name, allocator);
         }
@@ -154,6 +152,9 @@ public final class ArrowOutput {
         }
         if (VectorNarrowIntColumnVector.isNarrow(sparkType) && v instanceof IntVector iv) {
             return new VectorNarrowIntColumnVector(iv, sparkType); // #327
+        }
+        if (sparkType instanceof org.apache.spark.sql.types.FloatType && v instanceof Float8Vector fv) {
+            return new VectorFloatColumnVector(fv); // #712
         }
         return new VectorArrowColumnVector(v);
     }

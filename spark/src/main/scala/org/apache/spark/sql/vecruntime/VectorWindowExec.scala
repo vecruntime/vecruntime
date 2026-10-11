@@ -79,7 +79,7 @@ import org.apache.spark.sql.catalyst.expressions.{CurrentRow, EvalMode, RangeFra
 import org.apache.spark.sql.catalyst.plans.physical.{AllTuples, ClusteredDistribution, Distribution, Partitioning}
 import org.apache.spark.sql.execution.SparkPlan
 import org.apache.spark.sql.execution.window.{Final, Partial, WindowExec, WindowGroupLimitExec, WindowGroupLimitMode}
-import org.apache.spark.sql.types.{DataType, DecimalType, DoubleType, LongType}
+import org.apache.spark.sql.types.{DataType, DecimalType, DoubleType, FloatType, LongType}
 import org.apache.spark.sql.vectorized.{ColumnarBatch, ColumnVector}
 
 import scala.collection.mutable
@@ -804,7 +804,7 @@ object VectorWindowPlanner {
   }
   private val addDouble: Combine = nullSafe((p, c) =>
     java.lang.Double.valueOf(
-      p.asInstanceOf[java.lang.Double].doubleValue() + c.asInstanceOf[java.lang.Double].doubleValue()
+      p.asInstanceOf[Number].doubleValue() + c.asInstanceOf[Number].doubleValue()
     )
   )
   private def extreme(isMin: Boolean): Combine = nullSafe { (p, c) =>
@@ -932,7 +932,7 @@ object VectorWindowPlanner {
   def plan(w: WindowExec): Either[String, VectorWindowExec] = {
     val keys = w.partitionSpec ++ w.orderSpec.map(_.child)
     val keyFailures = keys.flatMap { k =>
-      if (k.dataType == DoubleType)
+      if (k.dataType == DoubleType || k.dataType == FloatType)
         Some(s"window key ${k.sql}: double keys not supported (Spark compares them after NaN and zero normalisation)")
       else if (!TypeMapping.hasLane(k.dataType)) Some(s"window key type ${k.dataType.simpleString} not supported")
       else ExpressionCompiler.compileLaneColumn(k, w.child.output).left.toOption.map(r => s"window key ${k.sql}: $r")
@@ -1403,7 +1403,7 @@ object VectorWindowGroupLimitPlanner {
       case Right(_) =>
         val keys = g.partitionSpec ++ g.orderSpec.map(_.child)
         val keyFailures = keys.flatMap { k =>
-          if (k.dataType == DoubleType) Some(
+          if (k.dataType == DoubleType || k.dataType == FloatType) Some(
             s"window key ${k.sql}: double keys not supported (Spark compares them after NaN and zero normalisation)"
           )
           else if (!TypeMapping.hasLane(k.dataType)) Some(s"window key type ${k.dataType.simpleString} not supported")
@@ -1672,6 +1672,7 @@ private[vecruntime] class VectorWindowOffsetIterator(
       case ShortType => java.lang.Short.valueOf(col.getShort(r))
       case LongType | TimestampType | TimestampNTZType => java.lang.Long.valueOf(col.getLong(r))
       case DoubleType => java.lang.Double.valueOf(col.getDouble(r))
+      case FloatType => java.lang.Float.valueOf(col.getFloat(r)) // #712
       case BooleanType => java.lang.Boolean.valueOf(col.getBoolean(r))
       case StringType => col.getUTF8String(r).clone()
       case BinaryType => col.getBinary(r) // #705: Spark's internal value for binary
@@ -1733,7 +1734,8 @@ private[vecruntime] class VectorWindowOffsetIterator(
     case VectorWindowPlanner.SlidingSum => new SlidingState {
         var sum = 0.0; var count = 0L
         def reset(): Unit = { sum = 0.0; count = 0L }
-        def add(v: Any): Unit = if (v != null) { sum += v.asInstanceOf[java.lang.Double].doubleValue(); count += 1 }
+        def add(v: Any): Unit =
+          if (v != null) { sum += v.asInstanceOf[Number].doubleValue(); count += 1 } // a float input widens (#712)
         def result: Any = if (count == 0) null else java.lang.Double.valueOf(sum)
       }
     case VectorWindowPlanner.SlidingCount => new SlidingState {
