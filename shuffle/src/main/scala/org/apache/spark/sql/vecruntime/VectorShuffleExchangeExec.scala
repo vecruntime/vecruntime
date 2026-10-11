@@ -126,7 +126,16 @@ case class VectorShuffleExchangeExec(
 
   @transient override lazy val mapOutputStatisticsFuture: Future[MapOutputStatistics] =
     if (inputRDD.getNumPartitions == 0) Future.successful(null)
-    else recordsByPartition match {
+    else if (VectorShuffleExchangeExec.executionEnded(sparkContext, conf)) {
+      // #694: the query this stage belongs to has already returned (AQE finished on a plan that no longer
+      // reads it, e.g. an empty relation), and the stage is only now being submitted -- typically held back
+      // until its runtime-filter subqueries finished. Running it would only occupy the cluster under the
+      // next query; nothing waits for the result.
+      logInfo(s"Not submitting shuffle stage of exchange #$id: its SQL execution already ended (#694)")
+      Future.failed(
+        new IllegalStateException(s"shuffle stage of exchange #$id not submitted: its SQL execution ended (#694)")
+      )
+    } else recordsByPartition match {
       case Some(acc) => VectorShuffleExchangeExec.submitRowSizedMapStage(sparkContext, shuffleDependency, acc)
       case None if VectorShuffleExchangeExec.mapSizesScaled(shuffleOrigin, conf) =>
         val compression = VectorShuffleExchangeExec.sparkCompression(conf)
@@ -220,6 +229,20 @@ case class VectorShuffleExchangeExec(
 }
 
 object VectorShuffleExchangeExec {
+
+  /** #694 kill switch: `false` submits a late stage as Spark does. */
+  val SkipEndedExecutionStages = "spark.vecruntime.shuffle.skipEndedExecutionStages"
+
+  /**
+   * Whether the SQL execution of the calling thread (`spark.sql.execution.id`, captured into the
+   * materialization future) has already ended: `SQLExecution` drops an execution from its registry when
+   * the query returns. A thread with no execution id is never considered ended.
+   */
+  private[vecruntime] def executionEnded(sc: org.apache.spark.SparkContext, conf: SQLConf): Boolean =
+    conf.getConfString(SkipEndedExecutionStages, "true").trim.toBoolean && {
+      val id = sc.getLocalProperty(SQLExecution.EXECUTION_ID_KEY)
+      id != null && scala.util.Try(id.toLong).toOption.exists(SQLExecution.getQueryExecution(_) == null)
+    }
 
   /** `false` turns the row-proportional sizing of rebalance exchanges off (#20). */
   val RebalanceRowSizingKey = "spark.vecruntime.shuffle.rebalance.rowSizing"

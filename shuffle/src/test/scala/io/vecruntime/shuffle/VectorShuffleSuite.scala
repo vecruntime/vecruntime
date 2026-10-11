@@ -234,6 +234,59 @@ class VectorShuffleSuite extends AnyFunSuite with BeforeAndAfterAll {
     assert(exchanges(plan).exists(_.isInstanceOf[VectorShuffleExchangeExec]), s"$plan")
   }
 
+  /**
+   * #694: a shuffle stage first submitted after its SQL execution ended (AQE returned on a plan that
+   * no longer read it) is not run -- it would only occupy the cluster under the next query. A stage
+   * submitted while its execution is live, or with no execution at all, runs as before.
+   */
+  test("a shuffle stage submitted after its SQL execution ended does not run (#694)") {
+    import java.util.concurrent.atomic.AtomicInteger
+    import org.apache.spark.scheduler.{SparkListener, SparkListenerJobStart}
+    import org.apache.spark.sql.execution.SQLExecution
+    val jobs = new AtomicInteger
+    val listener = new SparkListener {
+      override def onJobStart(e: SparkListenerJobStart): Unit = jobs.incrementAndGet()
+    }
+    def exchange(): VectorShuffleExchangeExec = {
+      spark.sessionState.conf.setConfString("spark.sql.adaptive.enabled", "false")
+      try {
+        val plan = spark.sql("select k, count(*) c from t group by k").queryExecution.executedPlan
+        nodes(plan).collectFirst { case e: VectorShuffleExchangeExec => e }.getOrElse(fail(s"no exchange in\n$plan"))
+      } finally spark.sessionState.conf.setConfString("spark.sql.adaptive.enabled", "true")
+    }
+    val sc = spark.sparkContext
+    sc.addSparkListener(listener)
+    try {
+      // An execution id that is not (any longer) registered: the stage is not submitted.
+      val ended = exchange()
+      sc.setLocalProperty(SQLExecution.EXECUTION_ID_KEY, Long.MaxValue.toString)
+      try {
+        val f = ended.mapOutputStatisticsFuture
+        assert(f.isCompleted && f.value.exists(_.isFailure), "a stage of an ended execution was submitted")
+      } finally sc.setLocalProperty(SQLExecution.EXECUTION_ID_KEY, null)
+      _root_.org.apache.spark.sql.vecruntime.shuffle.ListenerBusWait(sc)
+      assert(jobs.get === 0)
+      // No execution id at all (an RDD action outside SQL): submitted as before.
+      val stats =
+        scala.concurrent.Await.result(exchange().mapOutputStatisticsFuture, scala.concurrent.duration.Duration.Inf)
+      assert(stats != null && stats.bytesByPartitionId.sum > 0)
+      _root_.org.apache.spark.sql.vecruntime.shuffle.ListenerBusWait(sc)
+      assert(jobs.get === 1)
+      // The kill switch runs the late stage as Spark does.
+      spark.sessionState.conf.setConfString(VectorShuffleExchangeExec.SkipEndedExecutionStages, "false")
+      sc.setLocalProperty(SQLExecution.EXECUTION_ID_KEY, Long.MaxValue.toString)
+      try scala.concurrent.Await.result(exchange().mapOutputStatisticsFuture, scala.concurrent.duration.Duration.Inf)
+      finally {
+        sc.setLocalProperty(SQLExecution.EXECUTION_ID_KEY, null)
+        spark.sessionState.conf.unsetConf(VectorShuffleExchangeExec.SkipEndedExecutionStages)
+      }
+      _root_.org.apache.spark.sql.vecruntime.shuffle.ListenerBusWait(sc)
+      assert(jobs.get === 2)
+      // A normal query (its execution live while its stages run) is untouched.
+      checkAgainstSpark("select k, count(*) c, sum(x) sx from t group by k")
+    } finally sc.removeSparkListener(listener)
+  }
+
   test("range partitioning: a global order by is Spark's rows in Spark's order") {
     val sql = "select s, x, k from t order by s desc, x, k limit 5000"
     val ours = spark.sql(sql).collect().toSeq
