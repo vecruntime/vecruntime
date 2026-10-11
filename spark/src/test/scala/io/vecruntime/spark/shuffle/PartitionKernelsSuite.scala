@@ -85,6 +85,29 @@ class PartitionKernelsSuite extends AnyFunSuite {
     )
   }
 
+  private def floatKey(arena: Arena, n: Int): Key = {
+    val nl = nulls(n, 0.2)
+    val specials = Array(
+      0.0f,
+      -0.0f,
+      Float.NaN,
+      java.lang.Float.intBitsToFloat(0x7fc00123),
+      Float.PositiveInfinity,
+      Float.MinPositiveValue,
+      Float.MaxValue,
+      -1.5f
+    )
+    val v = Array.fill(n)(if (rnd.nextInt(4) == 0) specials(rnd.nextInt(specials.length))
+    else rnd.nextGaussian().toFloat * 1e6f)
+    // FLOAT rides the FLOAT64 lane (#712): the buffers hold the widened doubles, Spark hashes the floats.
+    Key(
+      ArrowLayout.ofDoubles(arena, v.map(_.toDouble), nl),
+      v.indices.map(i => if (nl(i)) null else Float.box(v(i))).toArray,
+      FloatType,
+      KeyKind.FLOAT
+    )
+  }
+
   private def boolKey(arena: Arena, n: Int): Key = {
     val nl = nulls(n, 0.2)
     val v = Array.fill(n)(rnd.nextBoolean())
@@ -193,7 +216,8 @@ class PartitionKernelsSuite extends AnyFunSuite {
         boolKey(arena, n),
         stringKey(arena, n),
         dictionaryStringKey(arena, n),
-        wideDecimalKey(arena, n)
+        wideDecimalKey(arena, n),
+        floatKey(arena, n)
       )
       all.foreach(k => check(Seq(k), 8))
       check(all, 200)
