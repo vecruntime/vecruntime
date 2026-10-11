@@ -23,7 +23,9 @@ import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.expressions.{Attribute, Explode, Generator, PosExplode}
 import org.apache.spark.sql.catalyst.plans.physical.Partitioning
 import org.apache.spark.sql.execution.{GenerateExec, SparkPlan}
+import org.apache.spark.unsafe.types.UTF8String
 import org.apache.spark.sql.types.{
+  BinaryType,
   ArrayType,
   BooleanType,
   DataType,
@@ -158,6 +160,7 @@ private[vecruntime] class VectorGenerateIterator(
       case DoubleType => java.lang.Double.valueOf(arr.getDouble(k))
       case BooleanType => java.lang.Boolean.valueOf(arr.getBoolean(k))
       case StringType => arr.getUTF8String(k)
+      case BinaryType => arr.getBinary(k) // #705: Spark's internal value for binary
       case d: DecimalType => java.lang.Long.valueOf(arr.getDecimal(k, d.precision, d.scale).toUnscaledLong)
       case other => throw new IllegalStateException(s"unexpected element type $other")
     }

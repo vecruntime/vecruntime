@@ -70,6 +70,20 @@ public final class VectorArrowColumnVector extends ArrowColumnVector {
         return valueVector;
     }
 
+    /**
+     * A BINARY column rides the UTF8 lane (#705), so an output written by a
+     * string kernel is a {@code VarCharVector} even when the attribute is
+     * binary; Spark then reads it with {@code getBinary}, which its string
+     * accessor does not implement. The bytes are the value.
+     */
+    @Override
+    public byte[] getBinary(int rowId) {
+        if (valueVector instanceof org.apache.arrow.vector.VarCharVector v) {
+            return v.isNull(rowId) ? null : v.get(rowId);
+        }
+        return super.getBinary(rowId);
+    }
+
     public boolean ownsMemory() {
         return owns;
     }

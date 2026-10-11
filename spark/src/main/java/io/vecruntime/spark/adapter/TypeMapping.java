@@ -16,6 +16,7 @@
 package io.vecruntime.spark.adapter;
 
 import io.vecruntime.kernels.VecType;
+import org.apache.spark.sql.types.BinaryType;
 import org.apache.spark.sql.types.BooleanType;
 import org.apache.spark.sql.types.ByteType;
 import org.apache.spark.sql.types.DataType;
@@ -60,6 +61,12 @@ public final class TypeMapping {
             // string (STRING COLLATE UTF8_LCASE, ...) has no lane and the operator falls back -- Spark's
             // own RowToColumnarExec cannot convert one either.
             return st.isUTF8BinaryCollation() ? VecType.UTF8 : null;
+        }
+        if (dt instanceof BinaryType) {
+            // BINARY (#705): offsets and bytes, the UTF8 lane's layout. Equality, ordering (unsigned bytes) and
+            // grouping are the same as a binary-collation string's; functions that read characters accept only
+            // StringType (ExpressionCompiler), so over binary they stay Spark's.
+            return VecType.UTF8;
         }
         if (dt instanceof DecimalType d) {
             // Unscaled value in long lanes, like Spark's own WritableColumnVector for Decimal(p <= 18);

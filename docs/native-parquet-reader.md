@@ -79,8 +79,8 @@ A few rules hold the design together:
 
 | | Decoded natively | Notes |
 |---|---|---|
-| Types with an engine lane | `boolean`, `tinyint`, `smallint`, `int`, `bigint`, `double`, `date`, `timestamp` and `timestamp_ntz` (INT64 `MICROS`/`MILLIS`), `decimal` up to precision 38, UTF8 `string` with the default collation | `NativeParquetSupport.isReadable`; the planner and the reader share this check |
-| Types carried without a lane | `float`, `binary` | Decoded on the lane of the same layout and emitted as Arrow vectors Spark reads; operators carry them, and an operator that computes on one stays Spark's |
+| Types with an engine lane | `boolean`, `tinyint`, `smallint`, `int`, `bigint`, `double`, `date`, `timestamp` and `timestamp_ntz` (INT64 `MICROS`/`MILLIS`), `decimal` up to precision 38, UTF8 `string` with the default collation, `binary` (UTF8 lane, #705) | `NativeParquetSupport.isReadable`; the planner and the reader share this check |
+| Types carried without a lane | `float` | Decoded on the lane of the same layout and emitted as Arrow vectors Spark reads; operators carry them, and an operator that computes on one stays Spark's |
 | Physical storage | INT32, INT64, DOUBLE, FLOAT, BOOLEAN, BINARY; `FIXED_LEN_BYTE_ARRAY` for decimals and binary | Checked per file at open (`physicalMatches`), including the decimal scale |
 | Encodings | `PLAIN`, `PLAIN_DICTIONARY`, `RLE_DICTIONARY`; `RLE` for booleans; `DELTA_BINARY_PACKED` on INT32/INT64; `DELTA_LENGTH_BYTE_ARRAY` on BINARY; `DELTA_BYTE_ARRAY` on BINARY and `FIXED_LEN_BYTE_ARRAY`; `BYTE_STREAM_SPLIT` on INT32/INT64/FLOAT/DOUBLE; definition levels in `RLE`/`BIT_PACKED` | `VectorParquetScanExec.supportsEncoding` |
 | Calendar | Files whose datetime rebase mode resolves to `CORRECTED` | Resolved per file from the footer and the session, as Spark resolves it |
@@ -214,7 +214,7 @@ The corpus approach follows Hardwood (`hardwood-hq/hardwood`), as does bounding 
   - BINARY on the UTF8 path: `PLAIN`, dictionary, DLBA, DBA, and `FIXED_LEN_BYTE_ARRAY` read as binary;
   - TIMESTAMP_NTZ on INT64: micros, MILLIS scaled with Spark's overflow check, only from a column not adjusted to UTC; a UTC-adjusted column falls over to Spark's reader, which refuses it.
 
-  They are emitted as Arrow `Float4Vector` / `VarBinaryVector` / `TimeStampMicroVector`, which Spark's `ArrowColumnVector` reads. FLOAT and BINARY stay out of `TypeMapping` and `ArrowVectorBuffers.vecTypeOf`, so no operator takes them for an INT32 or UTF8 lane. TIMESTAMP_NTZ has had an INT64 lane since #705: operators compare, hash, sort and carry it as they do a timestamp, and expressions that read the session time zone accept only `timestamp`, so over `timestamp_ntz` they stay Spark's.
+  They are emitted as Arrow `Float4Vector` / `VarBinaryVector` / `TimeStampMicroVector`, which Spark's `ArrowColumnVector` reads. FLOAT stays out of `TypeMapping` and `ArrowVectorBuffers.vecTypeOf`, so no operator takes it for an INT32 lane (#712 tracks a lane for it). BINARY has had the UTF8 lane since #705, and TIMESTAMP_NTZ the INT64 lane: operators compare, hash, sort and carry them, and the expressions that read characters or the session time zone accept only `string` / `timestamp`, so over these they stay Spark's.
 
   Filters and projections carry them as foreign columns; an operator that computes on one stays Spark's, reading our batches as it reads Spark's scan. A table with such a column no longer keeps all its other columns on Spark's reader.
   - **Tests:**

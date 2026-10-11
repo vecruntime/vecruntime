@@ -79,7 +79,10 @@ public final class ArrowOutput {
         if (dt instanceof BooleanType) {
             return new BitVector(name, allocator);
         }
-        if (dt instanceof StringType) {
+        if (dt instanceof StringType || dt instanceof org.apache.spark.sql.types.BinaryType) {
+            // BINARY rides the UTF8 lane (#705): the same vector class as every UTF8 kernel output, so
+            // outputs, broadcasts and transfers never mix VarChar and VarBinary; VectorArrowColumnVector
+            // answers getBinary over it.
             return new VarCharVector(name, allocator);
         }
         if (dt instanceof DecimalType d && d.precision() <= TypeMapping.MAX_DECIMAL_PRECISION) {
@@ -93,9 +96,6 @@ public final class ArrowOutput {
         // Types with no engine lane that the native Parquet scan emits (#559): Spark's ArrowColumnVector reads them.
         if (dt instanceof org.apache.spark.sql.types.FloatType) {
             return new org.apache.arrow.vector.Float4Vector(name, allocator);
-        }
-        if (dt instanceof org.apache.spark.sql.types.BinaryType) {
-            return new org.apache.arrow.vector.VarBinaryVector(name, allocator);
         }
         if (dt instanceof org.apache.spark.sql.types.TimestampNTZType) {
             return new org.apache.arrow.vector.TimeStampMicroVector(name, allocator);
@@ -623,8 +623,9 @@ public final class ArrowOutput {
      */
     public static ColumnVector constant(String name, DataType dt, Object value,
             int length, BufferAllocator allocator) {
-        if (dt instanceof StringType) {
-            byte[] bytes = ((org.apache.spark.unsafe.types.UTF8String) value).getBytes();
+        if (dt instanceof StringType || dt instanceof org.apache.spark.sql.types.BinaryType) {
+            // A BINARY constant (#705) is its bytes on the UTF8 lane; VectorArrowColumnVector reads them back.
+            byte[] bytes = value instanceof byte[] raw ? raw : ((org.apache.spark.unsafe.types.UTF8String) value).getBytes();
             ArrowVectorBuffers out = allocateUtf8(name, length, (long) bytes.length * length, allocator);
             MemorySegment offsets = out.offsets();
             MemorySegment data = out.data();
