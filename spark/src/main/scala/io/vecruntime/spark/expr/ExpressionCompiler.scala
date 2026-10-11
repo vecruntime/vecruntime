@@ -85,9 +85,14 @@ import org.apache.spark.sql.catalyst.expressions.{
   Divide,
   ElementAt,
   ArrayContains,
+  ArrayFilter,
+  Slice,
+  ArrayTransform,
+  MapValues,
   ArrayExists,
   ArrayForAll,
   LambdaFunction,
+  NamedExpression,
   NamedLambdaVariable,
   ArrayMax,
   ArrayMin,
@@ -920,12 +925,13 @@ object ExpressionCompiler {
       mode: ElementAccessExpr.Mode,
       failOnError: Boolean,
       e: Expression,
-      input: Seq[Attribute]
+      input: Seq[Attribute],
+      nestedResult: Boolean = false
   ): Result = {
     val what = e.prettyName
     if (TypeMapping.nestedTypeOf(container.dataType) == null)
       Left(s"$what over ${container.dataType.simpleString} not supported (a leaf without a lane)")
-    else if (!TypeMapping.isSupported(e.dataType))
+    else if (!TypeMapping.isSupported(e.dataType) && !(nestedResult && TypeMapping.nestedTypeOf(e.dataType) != null))
       Left(s"$what with a ${e.dataType.simpleString} result not supported (#705: nested and wide results come later)")
     else {
       val argOk = mode match {
@@ -1003,42 +1009,126 @@ object ExpressionCompiler {
       Left(s"$what over ${container.dataType.simpleString} not supported")
     else if (!TypeMapping.isSupported(elementType))
       Left(s"$what over ${elementType.simpleString} elements not supported")
+    else
+      for (
+        p <- nestedColumnPath(container, input);
+        l <- lambdaOverElements(Seq(variable), body, what, input)
+      )
+        yield
+          if (l._1.dataType != BooleanType) throw new IllegalStateException(s"$what lambda of ${l._1.dataType}")
+          else ArrayPredicateExpr(p._1, p._2, container.dataType, forAll, l._1, l._2, followThreeValuedLogic)
+  }
+
+  /**
+   * A lambda over array elements (#705) compiled as an ordinary expression: its variables -- the
+   * element, and the element's int index when it takes two -- become inputs 0 (and 1), the outer
+   * lane columns the body reads follow. Returns the body and the outer columns' input ordinals. A
+   * nested lambda, or an outer column without a lane, is refused.
+   */
+  private def lambdaOverElements(
+      variables: Seq[NamedExpression],
+      body: Expression,
+      what: String,
+      input: Seq[Attribute]
+  ): Either[String, (VectorExpr, Seq[Int])] = {
+    val vars = variables.collect { case v: NamedLambdaVariable => v }
+    val ids = vars.map(_.exprId).toSet
+    if (vars.length != variables.length || vars.isEmpty || vars.length > 2)
+      Left(s"$what with a lambda of ${variables.length} arguments not supported")
+    else if (vars.length == 2 && vars(1).dataType != IntegerType)
+      Left(s"$what with an index of ${vars(1).dataType.simpleString} not supported")
     else if (
-      body.find(e =>
-        e.isInstanceOf[NamedLambdaVariable] && e.asInstanceOf[NamedLambdaVariable].exprId != variable.exprId
-      ).nonEmpty
-    )
-      Left(s"$what with a nested lambda not supported")
+      body.find {
+        case v: NamedLambdaVariable => !ids.contains(v.exprId)
+        case _: LambdaFunction => true
+        case _ => false
+      }.nonEmpty
+    ) Left(s"$what with a nested lambda not supported")
     else {
       val outerAttrs = body.collect { case a: AttributeReference => a }.distinct
       outerAttrs.find(a => !TypeMapping.isSupported(a.dataType)) match {
         case Some(a) =>
           Left(s"$what reading the outer column ${a.name} of type ${a.dataType.simpleString} not supported")
         case None =>
-          val lambdaAttr =
-            AttributeReference(variable.name, variable.dataType, variable.nullable)(exprId = variable.exprId)
-          val replaced = body.transform { case v: NamedLambdaVariable if v.exprId == variable.exprId => lambdaAttr }
+          val lambdaAttrs = vars.map(v => AttributeReference(v.name, v.dataType, v.nullable)(exprId = v.exprId))
+          val byId = vars.map(_.exprId).zip(lambdaAttrs).toMap
+          val replaced = body.transform { case v: NamedLambdaVariable if byId.contains(v.exprId) => byId(v.exprId) }
           val outerOrdinals = outerAttrs.map(a => input.indexWhere(_.exprId == a.exprId))
           if (outerOrdinals.exists(_ < 0)) Left(s"$what over an unbound outer column")
-          else
-            for (
-              p <- nestedColumnPath(container, input);
-              compiled <- compile(replaced, lambdaAttr +: outerAttrs)
-            )
-              yield
-                if (compiled.dataType != BooleanType)
-                  throw new IllegalStateException(s"$what lambda of ${compiled.dataType}")
-                else ArrayPredicateExpr(
-                  p._1,
-                  p._2,
-                  container.dataType,
-                  forAll,
-                  compiled,
-                  outerOrdinals,
-                  followThreeValuedLogic
-                )
+          else compile(replaced, lambdaAttrs ++ outerAttrs).map(c => (c, outerOrdinals))
       }
     }
+  }
+
+  /**
+   * A projection that may have an array result (#705, nested results): `map_keys`, `map_values`,
+   * `transform` and `filter` build an array lane; everything else is [[compile]].
+   */
+  def compileProjection(expr: Expression, input: Seq[Attribute]): Result =
+    if (TypeMapping.nestedTypeOf(expr.dataType) == null) compile(expr, input)
+    else compileNested(expr, input)
+
+  private def compileNested(expr: Expression, input: Seq[Attribute]): Result = expr match {
+    case Alias(child, _) => compileNested(child, input)
+    case e @ MapKeys(child) => mapPart(child, values = false, e, input)
+    case e @ MapValues(child) => mapPart(child, values = true, e, input)
+    case e @ ArrayTransform(child, LambdaFunction(body, vars, _)) =>
+      lambdaArray(child, vars, body, keep = false, e, input)
+    case e @ ArrayFilter(child, LambdaFunction(body, vars, _)) => lambdaArray(child, vars, body, keep = true, e, input)
+    // Element access whose element is itself an array, map or struct: the element gathered as a nested lane.
+    case g @ GetArrayItem(child, ordinal, failOnError) =>
+      elementAccess(child, ordinal, ElementAccessExpr.ZeroBased, failOnError, g, input, nestedResult = true)
+    case g @ GetMapValue(child, key) =>
+      elementAccess(child, key, ElementAccessExpr.MapKey, failOnError = false, g, input, nestedResult = true)
+    case e @ ElementAt(child, arg, None, failOnError) if child.dataType.isInstanceOf[ArrayType] =>
+      elementAccess(child, arg, ElementAccessExpr.OneBased, failOnError, e, input, nestedResult = true)
+    case e @ ElementAt(child, key, None, _) if child.dataType.isInstanceOf[MapType] =>
+      elementAccess(child, key, ElementAccessExpr.MapKey, failOnError = false, e, input, nestedResult = true)
+    case e @ Slice(child, start, length) => slice(child, start, length, e, input)
+    // Anything else keeps the reason the ordinary compiler gives it (element access with a nested
+    // element, a struct constructor, ...).
+    case other => compile(other, input)
+  }
+
+  /** `slice(arr, start, length)` (#705): a column or a struct field of one with a nested lane, int bounds. */
+  private def slice(container: Expression, start: Expression, length: Expression, e: Expression, input: Seq[Attribute])
+      : Result =
+    if (TypeMapping.nestedTypeOf(container.dataType) == null)
+      Left(s"slice over ${container.dataType.simpleString} not supported")
+    else if (start.dataType != IntegerType || length.dataType != IntegerType)
+      Left(s"slice with ${start.dataType.simpleString} / ${length.dataType.simpleString} bounds not supported")
+    else
+      for (p <- nestedColumnPath(container, input); s <- compile(start, input); l <- compile(length, input))
+        yield SliceExpr(p._1, p._2, container.dataType, s, l, e.dataType)
+
+  private def mapPart(container: Expression, values: Boolean, e: Expression, input: Seq[Attribute]): Result =
+    if (TypeMapping.nestedTypeOf(container.dataType) == null)
+      Left(s"${e.prettyName} over ${container.dataType.simpleString} not supported")
+    else nestedColumnPath(container, input).map { case (o, path) =>
+      MapPartExpr(o, path, container.dataType, values, e.dataType)
+    }
+
+  private def lambdaArray(
+      container: Expression,
+      vars: Seq[NamedExpression],
+      body: Expression,
+      keep: Boolean,
+      e: Expression,
+      input: Seq[Attribute]
+  ): Result = {
+    val what = e.prettyName
+    val elementType = container.dataType match { case a: ArrayType => a.elementType; case other => other }
+    if (!container.dataType.isInstanceOf[ArrayType] || TypeMapping.nestedTypeOf(container.dataType) == null)
+      Left(s"$what over ${container.dataType.simpleString} not supported")
+    else if (!TypeMapping.isSupported(elementType))
+      Left(s"$what over ${elementType.simpleString} elements not supported")
+    else if (!keep && !TypeMapping.isSupported(body.dataType))
+      Left(s"$what to ${body.dataType.simpleString} elements not supported")
+    else
+      for (p <- nestedColumnPath(container, input); l <- lambdaOverElements(vars, body, what, input))
+        yield
+          if (keep) ArrayFilterExpr(p._1, p._2, container.dataType, l._1, l._2, vars.length == 2, e.dataType)
+          else TransformExpr(p._1, p._2, container.dataType, l._1, l._2, vars.length == 2, e.dataType)
   }
 
   def nestedColumnPath(e: Expression, input: Seq[Attribute]): Either[String, (Int, Seq[Int])] = e match {
