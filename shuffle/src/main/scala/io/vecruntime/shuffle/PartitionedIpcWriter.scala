@@ -30,6 +30,7 @@ import io.vecruntime.kernels.{
   ScatterKernels,
   SegmentVectorBuffers,
   StringDictionary,
+  NestedVectorBuffers,
   VecType,
   VectorBuffers
 }
@@ -46,7 +47,7 @@ import org.apache.arrow.vector.{FieldVector, IntVector, VarCharVector, VectorSch
 import org.apache.arrow.vector.compression.CompressionUtil
 import org.apache.arrow.vector.ipc.message.IpcOption
 import org.apache.arrow.vector.types.pojo.{Field, Schema}
-import org.apache.spark.sql.types.{BooleanType, IntegerType, StringType, StructType}
+import org.apache.spark.sql.types.{ArrayType, BooleanType, IntegerType, MapType, StringType, StructField, StructType}
 import org.apache.spark.sql.vectorized.{ColumnarBatch, ColumnVector}
 
 /**
@@ -154,8 +155,12 @@ final class PartitionedIpcWriter(
    * batch made a set of vectors per partition -- allocated, filled, appended into the batch and freed
    * for ~40 rows at 200 partitions, 3,600 vectors per batch for an 18-column table.
    */
-  private final class Builder(val column: Int, val shared: Boolean = false) {
-    private val field = schema.fields(column)
+  private final class Builder(val column: Int, val shared: Boolean = false, leaf: StructField = null) {
+    private val field = if (leaf != null) leaf else schema.fields(column)
+
+    /** A nested column (#705) builds through its own builder; every method below hands over to it. */
+    private val nest: NestedBuilder =
+      if (PartitionedIpcFile.isNested(field.dataType)) new NestedBuilder(field) else null
     private val stringField = field.dataType == StringType
 
     /** A string column holds plain strings, or staging ids (#377) when its input arrives as INT32 ids; settled by the first rows. */
@@ -201,6 +206,7 @@ final class PartitionedIpcWriter(
 
     /** Appends the rows of `in` selected by `mask` (`count` of them). */
     def append(in: VectorBuffers, mask: MemorySegment, count: Int, scratch: Arena): Long = {
+      if (nest != null) throw new UnsupportedOperationException("a nested column is appended by index")
       settle(in)
       val bytes = if (isString) CompactKernels.selectedUtf8Bytes(in, mask) else 0L
       ensure(count, bytes)
@@ -251,6 +257,7 @@ final class PartitionedIpcWriter(
      * no per-element compaction -- since every row of the input is staged whatever its partition.
      */
     def appendAll(in: VectorBuffers, n: Int): Long = {
+      if (nest != null) { val b = nest.appendAll(in, n); rows = nest.rows; return b }
       settle(in)
       val srcOff = in.offsets()
       val start = if (isString) srcOff.get(VectorBuffers.LE_INT, 0L) else 0
@@ -289,7 +296,7 @@ final class PartitionedIpcWriter(
     var mayHaveNulls = false
 
     /** A column the staged flush partitions by scatter (#20): fixed width, BOOL, or a string column's ids; not plain strings. */
-    def scatters: Boolean = !isString
+    def scatters: Boolean = nest == null && !isString
 
     /**
      * Appends rows `from until from + count` of `in`, a fixed-width, BOOL or id column laid out as
@@ -297,6 +304,7 @@ final class PartitionedIpcWriter(
      * copy for a column with no nulls.
      */
     def appendRange(in: VectorBuffers, from: Int, count: Int, allValid: Boolean): Long = {
+      if (nest != null) throw new UnsupportedOperationException("a nested column does not scatter")
       settle(in)
       ensure(count, 0L)
       if (isBool) Bitmap.copyBitsFrom(in.data(), from, buffers.data(), rows, count)
@@ -309,6 +317,7 @@ final class PartitionedIpcWriter(
 
     /** Appends rows `idx(from until to)` of `in` (the index-list path, #353). */
     def appendIndexed(in: VectorBuffers, idx: Array[Int], from: Int, to: Int, scratch: Arena): Long = {
+      if (nest != null) { val b = nest.appendIndexed(in, idx, from, to, scratch); rows = nest.rows; return b }
       settle(in)
       val count = to - from
       val bytes = if (isString) GatherKernels.gatherUtf8Bytes(in, idx, from, to) else 0L
@@ -343,16 +352,19 @@ final class PartitionedIpcWriter(
 
     /** The finished vector (value count set), the builder emptied for the next batch. */
     def take(): FieldVector = {
+      if (nest != null) { val v = nest.take(); rows = 0; return v }
       val v = finish()
       vector = null; buffers = null; rows = 0; dataBytes = 0L
       v
     }
 
     /** The staged rows as buffers to gather from (value count set); the builder keeps them. */
-    def finished(): VectorBuffers = { finish(); buffers }
+    def finished(): VectorBuffers = if (nest != null) nest.finished() else { finish(); buffers }
 
     /** The finished vector (value count set), still the builder's: `recycle` or `close` follows the flush. */
     def finish(): FieldVector = {
+      if (nest != null) return nest.finish()
+      if (vector == null) ensure(0, 0L) // a nested value's child with no elements yet
       val v = vector
       v match {
         case vw: VarCharVector => vw.setLastSet(rows - 1); vw.setValueCount(rows)
@@ -362,7 +374,8 @@ final class PartitionedIpcWriter(
     }
 
     /** Bytes the vector's buffers hold, used or not. */
-    def capacityBytes: Long = if (vector == null) 0L
+    def capacityBytes: Long = if (nest != null) nest.capacityBytes
+    else if (vector == null) 0L
     else {
       var t = 0L; val bs = vector.getBuffers(false); var i = 0; while (i < bs.length) { t += bs(i).capacity(); i += 1 };
       t
@@ -378,6 +391,7 @@ final class PartitionedIpcWriter(
      */
     def recycle(): Unit = {
       mayHaveNulls = false
+      if (nest != null) { nest.recycle(); rows = 0; return }
       if (vector == null) return
       if (shared) { vector.reset(); rows = 0; dataBytes = 0L; return }
       val cap = capacityBytes
@@ -390,6 +404,7 @@ final class PartitionedIpcWriter(
     private var retained = false
 
     def close(): Unit = {
+      if (nest != null) { nest.close(); rows = 0; return }
       if (retained) { retainedBytes -= capacityBytes; retained = false }
       if (vector != null) vector.close()
       vector = null; buffers = null; rows = 0; dataBytes = 0L; mayHaveNulls = false
@@ -413,6 +428,193 @@ final class PartitionedIpcWriter(
       idsMode = false
       buffers = ArrowVectorBuffers.forWrite(vector, vector.getValueCapacity, field.dataType)
       dataBytes = decoded.getOffsetBuffer.getInt(rows.toLong << 2)
+    }
+  }
+
+  /**
+   * One nested column (#705) of a pending record batch: Arrow's list, map or struct layout built from
+   * a nested lane. The column's own validity and offsets accumulate on the heap; its children are
+   * [[Builder]]s of their own (leaves, or nested again) that receive each row's elements by index --
+   * a list's or map's rows expand into their element positions, a struct's rows are the children's.
+   * `finish` assembles the Arrow vector by moving the children's vectors under it; `finished` hands
+   * the staged rows back as a nested lane to gather from.
+   */
+  private final class NestedBuilder(field: StructField) {
+    private val lane: VecType = io.vecruntime.spark.adapter.TypeMapping.nestedTypeOf(field.dataType)
+    require(lane != null, s"no nested lane for ${field.dataType.simpleString}")
+    private val repeated = lane != VecType.STRUCT
+    private val children: Array[Builder] = field.dataType match {
+      case a: ArrayType => Array(new Builder(-1, shared = true, StructField("element", a.elementType)))
+      case m: MapType => Array(
+          new Builder(-1, shared = true, StructField("key", m.keyType, nullable = false)),
+          new Builder(-1, shared = true, StructField("value", m.valueType))
+        )
+      case s: StructType => s.fields.map(f => new Builder(-1, shared = true, StructField(f.name, f.dataType)))
+      case other => throw new IllegalArgumentException(s"not a nested type: $other")
+    }
+    var rows: Int = 0
+    private var nulls = 0
+    private var valid = new Array[Long](4)
+    private var offs = new Array[Int](257)
+    private var elems = new Array[Int](256)
+    private var ident = new Array[Int](0)
+    private var out: FieldVector = _
+    private var fin: Arena = _
+
+    private def grow(count: Int): Unit = {
+      val words = (rows + count + 63) >>> 6
+      if (valid.length < words) valid = java.util.Arrays.copyOf(valid, math.max(words, valid.length * 2))
+      if (repeated && offs.length < rows + count + 1)
+        offs = java.util.Arrays.copyOf(offs, math.max(rows + count + 1, offs.length * 2))
+    }
+
+    def appendIndexed(in: VectorBuffers, idx: Array[Int], from: Int, to: Int, scratch: Arena): Long = {
+      val n = in.asInstanceOf[NestedVectorBuffers]
+      val count = to - from
+      grow(count)
+      var k = 0
+      val base = if (repeated) offs(rows) else 0
+      var i = from
+      while (i < to) {
+        val r = idx(i)
+        val row = rows + (i - from)
+        val present = !n.isNull(r)
+        if (present) valid(row >>> 6) |= 1L << (row & 63)
+        else { valid(row >>> 6) &= ~(1L << (row & 63)); nulls += 1 }
+        if (repeated) {
+          if (present) {
+            val st = n.start(r)
+            val e = n.end(r)
+            if (elems.length < k + (e - st))
+              elems = java.util.Arrays.copyOf(elems, math.max(k + (e - st), elems.length * 2))
+            var j = st
+            while (j < e) { elems(k) = j; k += 1; j += 1 }
+          }
+          offs(row + 1) = base + k
+        }
+        i += 1
+      }
+      var bytes = ((count + 7) >>> 3).toLong + (if (repeated) count.toLong << 2 else 0L)
+      var c = 0
+      while (c < children.length) {
+        bytes += (if (repeated) children(c).appendIndexed(n.children().get(c), elems, 0, k, scratch)
+                  else children(c).appendIndexed(n.children().get(c), idx, from, to, scratch))
+        c += 1
+      }
+      rows += count
+      bytes
+    }
+
+    def appendAll(in: VectorBuffers, n: Int): Long = {
+      if (ident.length < n) ident = Array.tabulate(math.max(n, ident.length * 2))(identity)
+      val scratch = Arena.ofConfined()
+      try appendIndexed(in, ident, 0, n, scratch)
+      finally scratch.close()
+    }
+
+    /** The staged rows as a nested lane (valid until the next `recycle` or `close`). */
+    def finished(): VectorBuffers = {
+      if (fin != null) fin.close()
+      fin = Arena.ofConfined()
+      val validity = if (nulls == 0) null
+      else {
+        val words = (rows + 63) >>> 6
+        val seg = fin.allocate(math.max(words, 1).toLong << 3, 8)
+        MemorySegment.copy(valid, 0, seg, PartitionedIpcWriter.LeLong, 0L, words)
+        seg
+      }
+      val offsets = if (!repeated) null
+      else {
+        val seg = fin.allocate((rows + 1).toLong << 2, 4)
+        MemorySegment.copy(offs, 0, seg, VectorBuffers.LE_INT, 0L, rows + 1)
+        seg
+      }
+      val kids: Array[VectorBuffers] = children.map(b => b.finished().slice(0, b.rows))
+      new NestedVectorBuffers(lane, rows, validity, offsets, java.util.List.of(kids: _*))
+    }
+
+    /** The column's own buffers -- validity, then the offsets of a list or map -- loaded into `v`. */
+    private def loadOwn(v: FieldVector): Unit = {
+      val words = math.max((rows + 63) >>> 6, 1)
+      val validity = allocator.buffer(words.toLong << 3)
+      var w = 0
+      while (w < words) { validity.setLong(w.toLong << 3, if (w < valid.length) valid(w) else 0L); w += 1 }
+      val own = new java.util.ArrayList[org.apache.arrow.memory.ArrowBuf](2)
+      own.add(validity)
+      if (repeated) {
+        val o = allocator.buffer((rows + 1).toLong << 2)
+        var i = 0
+        while (i <= rows) { o.setInt(i.toLong << 2, offs(i)); i += 1 }
+        own.add(o)
+      }
+      try v.loadFieldBuffers(new org.apache.arrow.vector.ipc.message.ArrowFieldNode(rows, nulls), own)
+      finally own.forEach(b => b.close())
+    }
+
+    private def moveInto(target: FieldVector, kid: FieldVector): Unit = kid.makeTransferPair(target).transfer()
+
+    /** The column's Arrow vector (value counts set), still the builder's until `recycle`, `close` or `take`. */
+    def finish(): FieldVector = {
+      if (out != null) { out.close(); out = null }
+      val kids = children.map(_.finish())
+      import org.apache.arrow.vector.complex.{ListVector, MapVector, StructVector}
+      import org.apache.arrow.vector.types.pojo.{ArrowType, FieldType}
+      val v: FieldVector = lane match {
+        case VecType.LIST =>
+          val lv = ListVector.empty(field.name, allocator)
+          moveInto(lv.addOrGetVector[FieldVector](kids(0).getField.getFieldType).getVector, kids(0))
+          loadOwn(lv)
+          lv
+        case VecType.MAP =>
+          val mv = MapVector.empty(field.name, allocator, false)
+          val entries = mv.addOrGetVector[StructVector](FieldType.notNullable(ArrowType.Struct.INSTANCE)).getVector
+          moveInto(entries.addOrGet(MapVector.KEY_NAME, kids(0).getField.getFieldType, classOf[FieldVector]), kids(0))
+          moveInto(entries.addOrGet(MapVector.VALUE_NAME, kids(1).getField.getFieldType, classOf[FieldVector]), kids(1))
+          // The entries are never null: a zero null count loads an all-set validity.
+          entries.loadFieldBuffers(
+            new org.apache.arrow.vector.ipc.message.ArrowFieldNode(kids(0).getValueCount, 0),
+            java.util.List.of(allocator.getEmpty)
+          )
+          loadOwn(mv)
+          mv
+        case _ =>
+          val sv = StructVector.empty(field.name, allocator)
+          val fs = field.dataType.asInstanceOf[StructType].fields
+          var f = 0
+          while (f < fs.length) {
+            moveInto(sv.addOrGet(fs(f).name, kids(f).getField.getFieldType, classOf[FieldVector]), kids(f)); f += 1
+          }
+          loadOwn(sv)
+          sv
+      }
+      // The children's vectors now belong to `v`: their builders start again from nothing.
+      children.foreach(_.close())
+      out = v
+      v
+    }
+
+    /** The finished vector handed over (the caller owns it), the builder emptied. */
+    def take(): FieldVector = { val v = finish(); out = null; reset(); v }
+
+    def capacityBytes: Long =
+      children.map(_.capacityBytes).sum + (valid.length.toLong << 3) + (offs.length.toLong << 2)
+
+    private def reset(): Unit = {
+      java.util.Arrays.fill(valid, 0, math.min(valid.length, (rows + 63) >>> 6), 0L)
+      rows = 0; nulls = 0
+      if (fin != null) { fin.close(); fin = null }
+    }
+
+    def recycle(): Unit = {
+      if (out != null) { out.close(); out = null }
+      children.foreach(_.recycle())
+      reset()
+    }
+
+    def close(): Unit = {
+      if (out != null) { out.close(); out = null }
+      children.foreach(_.close())
+      reset()
     }
   }
 
@@ -753,7 +955,7 @@ final class PartitionedIpcWriter(
     val scratch = Arena.ofConfined()
     try {
       val buffers: Array[VectorBuffers] =
-        Array.tabulate(batch.numCols())(c => ColumnVectorAdapters.adapt(batch.column(c), n, scratch))
+        Array.tabulate(batch.numCols())(c => PartitionedIpcWriter.adapt(batch.column(c), n, scratch))
       write(buffers, n, ids, scratch)
     } finally scratch.close()
   }
@@ -1214,6 +1416,16 @@ final class PartitionedIpcWriter(
 }
 
 object PartitionedIpcWriter {
+
+  /** Little-endian longs: a validity bitmap's words. */
+  private[shuffle] val LeLong: java.lang.foreign.ValueLayout.OfLong =
+    java.lang.foreign.ValueLayout.JAVA_LONG_UNALIGNED.withOrder(java.nio.ByteOrder.LITTLE_ENDIAN)
+
+  /** A column as the writer takes it: its lane, or for an array, map or struct its nested lane (#705). */
+  def adapt(cv: ColumnVector, n: Int, arena: Arena): VectorBuffers =
+    if (PartitionedIpcFile.isNested(cv.dataType()))
+      io.vecruntime.spark.adapter.NestedColumns.adapt(cv, cv.dataType(), n, arena)
+    else ColumnVectorAdapters.adapt(cv, n, arena)
 
   /**
    * The staged flush scatters only when the rows change partition at least once per this many rows

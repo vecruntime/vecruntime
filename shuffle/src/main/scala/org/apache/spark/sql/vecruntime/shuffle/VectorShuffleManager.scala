@@ -282,8 +282,8 @@ final class VectorShuffleWriter(
             val buffers = Array.tabulate(batch.numCols()) { c =>
               val cv = batch.column(c)
               // A struct has no lane of its own: StructFlattening writes its validity and leaves.
-              if (cv.dataType().isInstanceOf[org.apache.spark.sql.types.StructType]) null
-              else ColumnVectorAdapters.adapt(cv, n, arena)
+              if (io.vecruntime.shuffle.StructFlattening.flattens(cv.dataType())) null
+              else io.vecruntime.shuffle.PartitionedIpcWriter.adapt(cv, n, arena) // nested lanes too (#705)
             }
             // Trailing columns beyond the written ones hold materialised hash keys: partitioned on, not written.
             val flat = dep.layout match {
