@@ -371,10 +371,12 @@ object VectorShuffleExchangeExec {
     def column(dt: org.apache.spark.sql.types.DataType) =
       key(dt) || io.vecruntime.spark.adapter.TypeMapping.nestedTypeOf(dt) != null
     output.forall(a => column(a.dataType)) && (partitioning match {
-      case h: HashPartitioning => h.expressions.forall(e => e.isInstanceOf[Attribute] && key(e.dataType))
+      // A nested key (an array, or a struct holding one) hashes as Spark's Murmur3Hash does (NestedKeyHash, #705).
+      case h: HashPartitioning => h.expressions.forall(e => e.isInstanceOf[Attribute] && column(e.dataType))
       case _: RoundRobinPartitioning => true
       case SinglePartition => true
-      case r: RangePartitioning => r.ordering.forall(o => laneKey(o.dataType))
+      // Range ids come from Spark's partitioner over the rows, so a nested sort key reads as Spark's (#705).
+      case r: RangePartitioning => r.ordering.forall(o => laneKey(o.dataType) || column(o.dataType))
       case _ => false
     })
   }
@@ -431,7 +433,14 @@ object VectorShuffleExchangeExec {
         val ordinals = expressions.map { case a: Attribute => output.indexWhere(_.exprId == a.exprId) }.toArray
         require(ordinals.forall(_ >= 0), s"hash key not in the child's output: $expressions")
         val flat = ordinals.flatMap(flatOrdinals)
-        VectorPartitioning.Hash(flat, flat.map(f => VectorPartitioning.keyKind(flatType(f))), n)
+        def isNested(f: Int) = io.vecruntime.shuffle.PartitionedIpcFile.isNested(flatType(f))
+        val nested = flat.map(f => if (isNested(f)) flatType(f) else null)
+        VectorPartitioning.Hash(
+          flat,
+          flat.map(f => if (isNested(f)) null else VectorPartitioning.keyKind(flatType(f))),
+          n,
+          if (nested.exists(_ != null)) nested else null
+        )
       case RoundRobinPartitioning(n) => VectorPartitioning.RoundRobin(n)
       case SinglePartition => VectorPartitioning.Single
       case RangePartitioning(sortingExpressions, numPartitions) =>

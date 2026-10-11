@@ -50,7 +50,13 @@ sealed trait VectorPartitioning extends Serializable {
 object VectorPartitioning {
 
   /** Spark's `HashPartitioning`: `Pmod(Murmur3Hash(keys), n)` over key columns of the batch. */
-  final case class Hash(keyOrdinals: Array[Int], kinds: Array[KeyKind], numPartitions: Int) extends VectorPartitioning
+  final case class Hash(
+      keyOrdinals: Array[Int],
+      kinds: Array[KeyKind],
+      numPartitions: Int,
+      /** Per key, the Spark type of a nested key column (#705), hashed by NestedKeyHash; null for a lane. */
+      nestedTypes: Array[DataType] = null
+  ) extends VectorPartitioning
   final case class RoundRobin(numPartitions: Int) extends VectorPartitioning
   case object Single extends VectorPartitioning { val numPartitions = 1 }
 
@@ -321,7 +327,18 @@ final class VectorShuffleWriter(
   private def partitionIds(batch: ColumnarBatch, buffers: Array[VectorBuffers], n: Int): Array[Int] = {
     val ids = new Array[Int](n)
     dep.partitioning match {
-      case VectorPartitioning.Hash(ordinals, kinds, num) =>
+      case VectorPartitioning.Hash(ordinals, kinds, num, nested) if nested != null && nested.exists(_ != null) =>
+        // A nested key (#705): the keys mixed in order, lanes by their kernels, nested ones as Spark hashes them.
+        val hashes = Array.fill(n)(PartitionKernels.SPARK_SEED)
+        var k = 0
+        while (k < ordinals.length) {
+          val b = buffers(ordinals(k))
+          if (nested(k) != null) io.vecruntime.shuffle.NestedKeyHash.mix(b, nested(k), hashes, n)
+          else PartitionKernels.mixColumn(b, kinds(k), hashes, n)
+          k += 1
+        }
+        io.vecruntime.shuffle.NestedKeyHash.ids(hashes, n, num, ids)
+      case VectorPartitioning.Hash(ordinals, kinds, num, _) =>
         val keys = ordinals.map(o => buffers(o))
         PartitionKernels.hashPartitionIds(keys, kinds, n, num, new Array[Int](n), ids)
       case VectorPartitioning.RoundRobin(num) =>

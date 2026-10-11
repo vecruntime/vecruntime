@@ -174,6 +174,45 @@ class VectorShuffleSuite extends AnyFunSuite with BeforeAndAfterAll {
     case x => x.toString
   }
 
+  /**
+   * Nested hash and range keys (#705): an array, an array of arrays, an array of strings and a struct
+   * holding an array hash as Spark's Murmur3Hash does (NestedKeyHash) -- every row in Spark's partition,
+   * alone and with a flat key -- and a global order by an array runs through our exchange in Spark's order.
+   */
+  test("array and struct-of-array hash keys and array range keys cross our exchange") {
+    val path = tempDir.resolve("nested-keys").toString
+    spark.range(0, 4000).selectExpr(
+      "cast(id as int) as k",
+      "case when id % 9 = 0 then null when id % 7 = 0 then array() " +
+        "else array(cast(id % 13 as int), null, cast(id % 5 as int)) end as ai",
+      "case when id % 11 = 0 then null else array(array(id % 3, null), array()) end as aa",
+      "case when id % 6 = 0 then null else array(concat('s', id % 17), null, '') end as sa",
+      "named_struct('x', cast(id % 4 as double), 'y', array(cast(id % 3 as decimal(9,2)), null), " +
+        "'z', cast(id % 2 = 0 as boolean)) as st"
+    ).write.mode("overwrite").parquet(path)
+    spark.read.parquet(path).createOrReplaceTempView("nk")
+    def rows(df: => DataFrame, enabled: Boolean): Seq[String] = {
+      spark.sessionState.conf.setConfString("spark.vecruntime.enabled", enabled.toString)
+      try df.selectExpr("spark_partition_id() as p", "*").collect().map(r => show(r)).toSeq.sorted
+      finally spark.sessionState.conf.setConfString("spark.vecruntime.enabled", "true")
+    }
+    Seq(Seq("ai"), Seq("aa"), Seq("sa"), Seq("st"), Seq("ai", "k"), Seq("k", "st", "sa")).foreach { keys =>
+      def df = spark.table("nk").repartition(7, keys.map(org.apache.spark.sql.functions.col): _*)
+      val plan = collectPlan(df)
+      assert(
+        exchanges(plan).nonEmpty && exchanges(plan).forall(_.isInstanceOf[VectorShuffleExchangeExec]),
+        s"$keys: $plan"
+      )
+      assert(rows(df, enabled = true) === rows(df, enabled = false), keys.mkString(","))
+    }
+    val ordered = "select ai, k from nk order by ai desc nulls last, k"
+    assertOurExchange(spark.sql(ordered))
+    val ours = spark.sql(ordered).collect().map(r => show(r)).toSeq
+    spark.sessionState.conf.setConfString("spark.vecruntime.enabled", "false")
+    try assert(ours === spark.sql(ordered).collect().map(r => show(r)).toSeq)
+    finally spark.sessionState.conf.setConfString("spark.vecruntime.enabled", "true")
+  }
+
   test("array, map and nested struct columns cross our exchange as nested lanes") {
     val path = tempDir.resolve("nested").toString
     spark.range(0, 6000).selectExpr(
