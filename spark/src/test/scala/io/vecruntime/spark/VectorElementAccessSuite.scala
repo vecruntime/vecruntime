@@ -125,7 +125,8 @@ class VectorElementAccessSuite extends VectorQuerySuite {
   }
 
   test("a nested result and a map with an unsupported key keep Spark's operator, with the reason") {
-    checkFallback("SELECT i, aa[0] a FROM access", Seq(Project), "result not supported")
+    // An element that is itself an array is a nested result (VectorNestedAccessSuite); a wide decimal one is not.
+    checkVectorized("SELECT i, aa[0] a FROM access", Seq(Project))
     checkFallback("SELECT i, md[1.0d] v FROM access", Seq(Project), "key not supported")
   }
 }
