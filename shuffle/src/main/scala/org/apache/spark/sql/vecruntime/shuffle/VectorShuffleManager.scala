@@ -74,7 +74,7 @@ object VectorPartitioning {
       case _: DecimalType => KeyKind.DECIMAL128
       case DoubleType => KeyKind.DOUBLE
       case BooleanType => KeyKind.BOOL
-      case StringType => KeyKind.UTF8
+      case StringType | BinaryType => KeyKind.UTF8 // Spark hashes both with hashUnsafeBytes (#705)
       case other => throw new IllegalArgumentException(s"no shuffle key kind for $other")
     }
   }
