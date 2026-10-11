@@ -86,6 +86,7 @@ import org.apache.spark.sql.catalyst.expressions.{
   ElementAt,
   ArrayContains,
   ArrayFilter,
+  Slice,
   ArrayTransform,
   MapValues,
   ArrayExists,
@@ -906,12 +907,13 @@ object ExpressionCompiler {
       mode: ElementAccessExpr.Mode,
       failOnError: Boolean,
       e: Expression,
-      input: Seq[Attribute]
+      input: Seq[Attribute],
+      nestedResult: Boolean = false
   ): Result = {
     val what = e.prettyName
     if (TypeMapping.nestedTypeOf(container.dataType) == null)
       Left(s"$what over ${container.dataType.simpleString} not supported (a leaf without a lane)")
-    else if (!TypeMapping.isSupported(e.dataType))
+    else if (!TypeMapping.isSupported(e.dataType) && !(nestedResult && TypeMapping.nestedTypeOf(e.dataType) != null))
       Left(s"$what with a ${e.dataType.simpleString} result not supported (#705: nested and wide results come later)")
     else {
       val argOk = mode match {
@@ -1055,10 +1057,31 @@ object ExpressionCompiler {
     case e @ ArrayTransform(child, LambdaFunction(body, vars, _)) =>
       lambdaArray(child, vars, body, keep = false, e, input)
     case e @ ArrayFilter(child, LambdaFunction(body, vars, _)) => lambdaArray(child, vars, body, keep = true, e, input)
+    // Element access whose element is itself an array, map or struct: the element gathered as a nested lane.
+    case g @ GetArrayItem(child, ordinal, failOnError) =>
+      elementAccess(child, ordinal, ElementAccessExpr.ZeroBased, failOnError, g, input, nestedResult = true)
+    case g @ GetMapValue(child, key) =>
+      elementAccess(child, key, ElementAccessExpr.MapKey, failOnError = false, g, input, nestedResult = true)
+    case e @ ElementAt(child, arg, None, failOnError) if child.dataType.isInstanceOf[ArrayType] =>
+      elementAccess(child, arg, ElementAccessExpr.OneBased, failOnError, e, input, nestedResult = true)
+    case e @ ElementAt(child, key, None, _) if child.dataType.isInstanceOf[MapType] =>
+      elementAccess(child, key, ElementAccessExpr.MapKey, failOnError = false, e, input, nestedResult = true)
+    case e @ Slice(child, start, length) => slice(child, start, length, e, input)
     // Anything else keeps the reason the ordinary compiler gives it (element access with a nested
     // element, a struct constructor, ...).
     case other => compile(other, input)
   }
+
+  /** `slice(arr, start, length)` (#705): a column or a struct field of one with a nested lane, int bounds. */
+  private def slice(container: Expression, start: Expression, length: Expression, e: Expression, input: Seq[Attribute])
+      : Result =
+    if (TypeMapping.nestedTypeOf(container.dataType) == null)
+      Left(s"slice over ${container.dataType.simpleString} not supported")
+    else if (start.dataType != IntegerType || length.dataType != IntegerType)
+      Left(s"slice with ${start.dataType.simpleString} / ${length.dataType.simpleString} bounds not supported")
+    else
+      for (p <- nestedColumnPath(container, input); s <- compile(start, input); l <- compile(length, input))
+        yield SliceExpr(p._1, p._2, container.dataType, s, l, e.dataType)
 
   private def mapPart(container: Expression, values: Boolean, e: Expression, input: Seq[Attribute]): Result =
     if (TypeMapping.nestedTypeOf(container.dataType) == null)

@@ -15,7 +15,7 @@
  */
 package io.vecruntime.spark.expr
 
-import io.vecruntime.kernels.{ArrowLayout, NestedVectorBuffers, SegmentVectorBuffers, VecType, VectorBuffers}
+import io.vecruntime.kernels.{ArrowLayout, Bitmap, NestedVectorBuffers, SegmentVectorBuffers, VecType, VectorBuffers}
 import org.apache.spark.sql.types.DataType
 
 /**
@@ -126,5 +126,65 @@ private[expr] object NestedResults {
         SegmentVectorBuffers.fixedWidth(t, m, validity, ArrowLayout.allocateBitmap(ctx.arena, math.max(m, 1)))
       case _ => SegmentVectorBuffers.fixedWidth(t, m, validity, ArrowLayout.allocateData(ctx.arena, t, math.max(m, 1)))
     }
+  }
+}
+
+/**
+ * `slice(arr, start, length)` (#705): the elements from the one-based `start` (negative: from the end)
+ * for `length` of them, under new offsets, the elements gathered once for the batch whatever their
+ * lane (nested ones too). A start past either end is an empty array; a null array, start or length is
+ * null. `start = 0` and a negative `length` raise Spark's errors, for active rows, whatever ANSI says.
+ */
+final case class SliceExpr(
+    inputOrdinal: Int,
+    path: Seq[Int],
+    arrayType: DataType,
+    start: VectorExpr,
+    length: VectorExpr,
+    dataType: DataType
+) extends VectorExpr {
+  private val steps = path.toArray
+  override def children: Seq[VectorExpr] = Seq(start, length)
+
+  private def operand(e: VectorExpr, ctx: EvalContext): (VectorBuffers, Boolean) = e match {
+    case lit: LiteralExpr => (ElementAccessExpr.literalLane(lit, ctx.arena), true)
+    case other => (other.eval(ctx), false)
+  }
+
+  override def eval(ctx: EvalContext): VectorBuffers = {
+    val n = ctx.numRows
+    val (lane, nulls) = NestedInput.read(ctx, inputOrdinal, steps, arrayType)
+    val (s, sLit) = operand(start, ctx)
+    val (l, lLit) = operand(length, ctx)
+    val active = ctx.active
+    val validity = ctx.bitmap()
+    val offsets = ArrowLayout.allocateOffsets(ctx.arena, n)
+    val elements = lane.children().get(0)
+    val kept = new Array[Int](math.max(elements.length(), 1))
+    var k = 0
+    var r = 0
+    while (r < n) {
+      val sr = if (sLit) 0 else r
+      val lr = if (lLit) 0 else r
+      if (!nulls(r) && !s.isNull(sr) && !l.isNull(lr)) {
+        val st = s.getInt(sr)
+        val len = l.getInt(lr)
+        val live = active == null || Bitmap.isSet(active, r)
+        if (live && st == 0) throw org.apache.spark.sql.vecruntime.VectorErrors.sliceStartZero()
+        if (live && len < 0) throw org.apache.spark.sql.vecruntime.VectorErrors.sliceNegativeLength(len)
+        Bitmap.set(validity, r)
+        val size = lane.size(r)
+        val from = if (st > 0) st - 1 else size + st
+        if (live && from >= 0 && from < size && len > 0) {
+          val to = math.min(size.toLong, from.toLong + len).toInt
+          var j = lane.start(r) + from
+          val end = lane.start(r) + to
+          while (j < end) { kept(k) = j; k += 1; j += 1 }
+        }
+      }
+      offsets.set(VectorBuffers.LE_INT, (r + 1).toLong << 2, k)
+      r += 1
+    }
+    NestedVectorBuffers.list(n, validity, offsets, ElementAccessExpr.gather(elements, kept, k, ctx.arena))
   }
 }

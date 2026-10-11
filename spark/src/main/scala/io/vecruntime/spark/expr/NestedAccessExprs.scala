@@ -181,7 +181,47 @@ object ElementAccessExpr {
   }
 
   /** Rows `idx` of `child` (-1 = null) as a lane of `n` rows. */
-  def gather(child: VectorBuffers, idx: Array[Int], n: Int, arena: Arena): VectorBuffers = {
+  def gather(child: VectorBuffers, idx: Array[Int], n: Int, arena: Arena): VectorBuffers =
+    if (child.`type`().isNested()) gatherNested(child.asInstanceOf[NestedVectorBuffers], idx, n, arena)
+    else gatherLeaf(child, idx, n, arena)
+
+  /**
+   * Rows `idx` of a nested lane (-1 = null), as a nested lane of `n` rows (#705): a list's or map's
+   * rows become new offsets over their children gathered at the elements' positions, a struct's fields
+   * are gathered at the same rows -- recursively, down to the leaves.
+   */
+  def gatherNested(v: NestedVectorBuffers, idx: Array[Int], n: Int, arena: Arena): VectorBuffers = {
+    val validity = ArrowLayout.allocateBitmap(arena, math.max(n, 1))
+    var i = 0
+    while (i < n) { if (idx(i) >= 0 && !v.isNull(idx(i))) Bitmap.set(validity, i); i += 1 }
+    if (v.`type`() == VecType.STRUCT) {
+      val fields = new java.util.ArrayList[VectorBuffers](v.children().size())
+      v.children().forEach(c => fields.add(gather(c, idx, n, arena)))
+      new NestedVectorBuffers(VecType.STRUCT, n, validity, null, fields)
+    } else {
+      val offsets = ArrowLayout.allocateOffsets(arena, n)
+      var total = 0
+      i = 0
+      while (i < n) { if (Bitmap.isSet(validity, i)) total += v.size(idx(i)); i += 1 }
+      val elems = new Array[Int](math.max(total, 1))
+      var k = 0
+      i = 0
+      while (i < n) {
+        if (Bitmap.isSet(validity, i)) {
+          var j = v.start(idx(i))
+          val end = v.end(idx(i))
+          while (j < end) { elems(k) = j; k += 1; j += 1 }
+        }
+        offsets.set(VectorBuffers.LE_INT, (i + 1).toLong << 2, k)
+        i += 1
+      }
+      val kids = new java.util.ArrayList[VectorBuffers](v.children().size())
+      v.children().forEach(c => kids.add(gather(c, elems, k, arena)))
+      new NestedVectorBuffers(v.`type`(), n, validity, offsets, kids)
+    }
+  }
+
+  private def gatherLeaf(child: VectorBuffers, idx: Array[Int], n: Int, arena: Arena): VectorBuffers = {
     val validity = ArrowLayout.allocateBitmap(arena, n)
     child.`type`() match {
       case VecType.UTF8 =>

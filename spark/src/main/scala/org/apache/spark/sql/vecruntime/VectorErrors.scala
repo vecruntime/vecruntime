@@ -44,6 +44,13 @@ object VectorErrors {
   def invalidElementAtIndex(index: Int, count: Int, context: QueryContext): ArrayIndexOutOfBoundsException =
     QueryExecutionErrors.invalidElementAtIndexError(index, count, context)
 
+  /** `slice` with start 0: Spark's INVALID_PARAMETER_VALUE.START, raised regardless of ANSI mode. */
+  def sliceStartZero(): RuntimeException = QueryExecutionErrors.unexpectedValueForStartInFunctionError("slice")
+
+  /** `slice` with a negative length: Spark's INVALID_PARAMETER_VALUE.LENGTH, raised regardless of ANSI mode. */
+  def sliceNegativeLength(length: Int): RuntimeException =
+    QueryExecutionErrors.unexpectedValueForLengthInFunctionError("slice", length)
+
   /** `split_part` with part 0: Spark's INVALID_INDEX_OF_ZERO, raised regardless of ANSI mode. */
   def invalidIndexOfZero(context: QueryContext): RuntimeException =
     QueryExecutionErrors.invalidIndexOfZeroError(context)
