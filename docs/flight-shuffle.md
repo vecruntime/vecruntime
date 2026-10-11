@@ -242,7 +242,8 @@ drives `concurrency` reduce tasks for `seconds` per run and prints one JSON line
 client CPU seconds per GB, fetch wait); `channelsPerPeer`, `clientWindow`, `concurrency` and
 `rangeWidth` take comma-separated lists swept as a grid, the server's `threads`, `chunkBytes` and
 `backpressureBytes` are one value per server. `benchmarks/k8s/render-flight-net.sh` renders the server
-pod, its headless Service and the client Job on another node (pod anti-affinity).
+pod, its headless Service and the client Job on another node (pod anti-affinity). The measurements on Graviton4, two-node and at TPC-DS 1 TB, are on
+[the Flight shuffle transport page](benchmarks/flight-shuffle-transport.html).
 
 **On the cluster** -- the TPC-DS matrix (`benchmarks/k8s/run-matrix.sh`) with event logs, read per
 stage: shuffle write time and bytes of the map stage, fetch wait and executor time of the reduce
