@@ -36,6 +36,7 @@ import org.apache.spark.sql.types.{
   ShortType,
   StringType,
   StructType,
+  TimestampNTZType,
   TimestampType
 }
 import org.apache.spark.sql.vectorized.{ColumnarBatch, ColumnVector}
@@ -96,7 +97,7 @@ object VectorRowStages {
           case IntegerType | DateType => v.putInt(i, row.getInt(c))
           case ByteType => v.putByte(i, row.getByte(c))
           case ShortType => v.putShort(i, row.getShort(c))
-          case LongType | TimestampType => v.putLong(i, row.getLong(c))
+          case LongType | TimestampType | TimestampNTZType => v.putLong(i, row.getLong(c))
           case DoubleType => v.putDouble(i, row.getDouble(c))
           case d: DecimalType => v.putDecimal(i, row.getDecimal(c, d.precision, d.scale), d.precision)
           case StringType => val b = row.getUTF8String(c).getBytes; v.putByteArray(i, b, 0, b.length)

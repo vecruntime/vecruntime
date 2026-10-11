@@ -51,7 +51,8 @@ class PartitionedIpcSuite extends AnyFunSuite with BeforeAndAfterAll {
     StructField("s", StringType),
     StructField("sd", StringType), // dictionary encoded at the source
     StructField("dec", DecimalType(12, 2)),
-    StructField("wide", DecimalType(30, 4))
+    StructField("wide", DecimalType(30, 4)),
+    StructField("ntz", TimestampNTZType) // micros on the INT64 lane, no zone (#705)
   ))
 
   /** One row as Spark-visible values (null = SQL null), for comparison. */
@@ -77,6 +78,7 @@ class PartitionedIpcSuite extends AnyFunSuite with BeforeAndAfterAll {
     val nsd = nulls(n); val ids = Array.fill(n)(rnd.nextInt(dict.length))
     val ndec = nulls(n); val vdec = Array.fill(n)(rnd.nextLong() % 1000000000000L)
     val nw = nulls(n); val vw = Array.fill(n)(new BigInteger(90, rnd.self).subtract(BigInteger.ONE.shiftLeft(89)))
+    val nn = nulls(n); val vn = Array.fill(n)(rnd.nextLong() / 1000)
 
     val buffers: Array[VectorBuffers] = Array(
       ArrowLayout.ofInts(arena, vi, ni),
@@ -91,7 +93,8 @@ class PartitionedIpcSuite extends AnyFunSuite with BeforeAndAfterAll {
         SegmentVectorBuffers.dictionaryUtf8(n, idb.validity(), idb.data(), ArrowLayout.ofStrings(arena, dict))
       } else ArrowLayout.ofStrings(arena, ids.indices.map(i => if (nsd(i)) null else dict(ids(i))).toArray),
       ArrowLayout.ofLongs(arena, vdec, ndec),
-      ArrowLayout.ofDecimal128(arena, vw, nw)
+      ArrowLayout.ofDecimal128(arena, vw, nw),
+      ArrowLayout.ofLongs(arena, vn, nn)
     )
     val all = arena.allocate(io.vecruntime.kernels.Bitmap.bytesFor(n), 8)
     io.vecruntime.kernels.Bitmap.fill(all, n, true)
@@ -110,7 +113,8 @@ class PartitionedIpcSuite extends AnyFunSuite with BeforeAndAfterAll {
         vs(r),
         if (nsd(r)) null else dict(ids(r)),
         if (ndec(r)) null else Decimal(vdec(r), 12, 2),
-        if (nw(r)) null else Decimal(new java.math.BigDecimal(vw(r), 4), 30, 4)
+        if (nw(r)) null else Decimal(new java.math.BigDecimal(vw(r), 4), 30, 4),
+        if (nn(r)) null else vn(r)
       )
     }
     (new ColumnarBatch(columns, n), rows)
@@ -122,7 +126,7 @@ class PartitionedIpcSuite extends AnyFunSuite with BeforeAndAfterAll {
       if (cv.isNullAt(r)) null
       else schema.fields(c).dataType match {
         case IntegerType | DateType => cv.getInt(r)
-        case LongType | TimestampType => cv.getLong(r)
+        case LongType | TimestampType | TimestampNTZType => cv.getLong(r)
         case DoubleType => cv.getDouble(r)
         case BooleanType => cv.getBoolean(r)
         case StringType => cv.getUTF8String(r).toString

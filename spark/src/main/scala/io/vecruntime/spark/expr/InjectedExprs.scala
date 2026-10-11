@@ -28,6 +28,7 @@ import org.apache.spark.sql.types.{
   IntegerType,
   LongType,
   StringType,
+  TimestampNTZType,
   TimestampType
 }
 import org.apache.spark.unsafe.Platform
@@ -119,14 +120,15 @@ object XxHash64Expr {
   private[expr] val UTF8 = 4
 
   def supports(dt: DataType): Boolean = dt match {
-    case IntegerType | DateType | LongType | TimestampType | DoubleType | BooleanType | StringType => true
+    case IntegerType | DateType | LongType | TimestampType | TimestampNTZType | DoubleType | BooleanType | StringType =>
+      true
     case d: DecimalType => d.precision <= 18
     case _ => false
   }
 
   private[expr] def kindOf(dt: DataType): Int = dt match {
     case IntegerType | DateType => INT
-    case LongType | TimestampType | _: DecimalType => LONG
+    case LongType | TimestampType | TimestampNTZType | _: DecimalType => LONG
     case DoubleType => DOUBLE
     case BooleanType => BOOL
     case StringType => UTF8

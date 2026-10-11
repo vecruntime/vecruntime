@@ -34,6 +34,7 @@ import org.apache.spark.sql.types.{
   LongType,
   MapType,
   StringType,
+  TimestampNTZType,
   TimestampType
 }
 import org.apache.spark.sql.vectorized.{ColumnarArray, ColumnarBatch, ColumnVector}
@@ -153,7 +154,7 @@ private[vecruntime] class VectorGenerateIterator(
     if (arr.isNullAt(k)) null
     else dt match {
       case IntegerType | DateType => java.lang.Integer.valueOf(arr.getInt(k))
-      case LongType | TimestampType => java.lang.Long.valueOf(arr.getLong(k))
+      case LongType | TimestampType | TimestampNTZType => java.lang.Long.valueOf(arr.getLong(k))
       case DoubleType => java.lang.Double.valueOf(arr.getDouble(k))
       case BooleanType => java.lang.Boolean.valueOf(arr.getBoolean(k))
       case StringType => arr.getUTF8String(k)

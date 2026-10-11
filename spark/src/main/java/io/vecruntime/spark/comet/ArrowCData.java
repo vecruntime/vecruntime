@@ -307,6 +307,9 @@ public final class ArrowCData {
         if (dt instanceof TimestampType) {
             return "tsu:UTC";
         }
+        if (dt instanceof org.apache.spark.sql.types.TimestampNTZType) {
+            return "tsu:"; // micros, no zone (#705)
+        }
         if (dt instanceof DoubleType) {
             return "g";
         }

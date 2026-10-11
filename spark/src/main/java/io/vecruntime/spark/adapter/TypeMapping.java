@@ -26,6 +26,7 @@ import org.apache.spark.sql.types.IntegerType;
 import org.apache.spark.sql.types.LongType;
 import org.apache.spark.sql.types.ShortType;
 import org.apache.spark.sql.types.StringType;
+import org.apache.spark.sql.types.TimestampNTZType;
 import org.apache.spark.sql.types.TimestampType;
 
 /** Spark logical type to kernel physical type. */
@@ -43,7 +44,9 @@ public final class TypeMapping {
             // (VectorNarrowIntColumnVector) hands Spark the declared type back.
             return VecType.INT32;
         }
-        if (dt instanceof LongType || dt instanceof TimestampType) {
+        if (dt instanceof LongType || dt instanceof TimestampType || dt instanceof TimestampNTZType) {
+            // TIMESTAMP_NTZ is the same micros as TIMESTAMP, without a zone (#705): kernels compare, hash and
+            // sort it as a long; expressions that read the session time zone accept only TimestampType.
             return VecType.INT64;
         }
         if (dt instanceof DoubleType) {

@@ -207,6 +207,33 @@ class VectorShuffleSuite extends AnyFunSuite with BeforeAndAfterAll {
     assert(ids.toSeq === (0L until 20000L))
   }
 
+  /**
+   * TIMESTAMP_NTZ (#705) rides the INT64 lane: as a hash key it lands where Spark's exchange puts it
+   * (Spark hashes it as a long), as a range key the order is Spark's, and as a payload it reads back.
+   */
+  test("timestamp_ntz columns, hash keys and range keys cross our exchange") {
+    val path = tempDir.resolve("ntz").toString
+    spark.range(0, 20000).selectExpr(
+      "cast(id % 97 as int) as k",
+      "case when id % 11 = 0 then null else " +
+        "cast(timestamp_micros((id % 3000 - 200) * 917000000001L) as timestamp_ntz) end as n"
+    ).write.mode("overwrite").parquet(path)
+    spark.read.parquet(path).createOrReplaceTempView("ntz")
+    val grouped = "select n, count(*) c, max(k) mk from ntz group by n"
+    assertOurExchange(spark.sql(grouped))
+    checkAgainstSpark(grouped)
+    checkAgainstSpark("select k, min(n) mn, max(n) mx from ntz group by k")
+    // Each row's reduce partition is Spark's: spark_partition_id() over a repartition by the key.
+    checkAgainstSpark("select spark_partition_id() p, n from (select /*+ REPARTITION(6, n) */ n from ntz)")
+    val ordered = "select n, k from ntz order by n desc nulls last, k limit 3000"
+    val ours = spark.sql(ordered).collect().toSeq
+    spark.sessionState.conf.setConfString("spark.vecruntime.enabled", "false")
+    try assert(ours === spark.sql(ordered).collect().toSeq)
+    finally spark.sessionState.conf.setConfString("spark.vecruntime.enabled", "true")
+    val plan = collectPlan(spark.sql("select n, k from ntz order by n, k"))
+    assert(exchanges(plan).exists(_.isInstanceOf[VectorShuffleExchangeExec]), s"$plan")
+  }
+
   test("range partitioning: a global order by is Spark's rows in Spark's order") {
     val sql = "select s, x, k from t order by s desc, x, k limit 5000"
     val ours = spark.sql(sql).collect().toSeq

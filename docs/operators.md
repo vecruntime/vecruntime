@@ -27,7 +27,7 @@ strings in the **Fallback reasons** column are therefore a contract: change one 
 this page change with it.
 
 **Supported types** are the `VecType` lanes the kernels compute on: `boolean`; `int` and `date`
-(INT32); `bigint`, `timestamp` and `decimal(p <= 18)` as the unscaled value (INT64); `double`
+(INT32); `bigint`, `timestamp`, `timestamp_ntz` (#705) and `decimal(p <= 18)` as the unscaled value (INT64); `double`
 (FLOAT64); `string` (UTF8). A sixth lane, DECIMAL128, holds `decimal(19 <= p <= 38)` as two
 little-endian 64-bit limbs (Arrow's `Decimal128` layout, scalar only -- no kernel uses a vector
 species on it; #28, option 1). The lane is carried (#257: a wide decimal column is adapted from

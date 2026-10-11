@@ -1242,7 +1242,8 @@ object PartitionedIpcWriter {
   def byteWidth(dt: org.apache.spark.sql.types.DataType): Int = dt match {
     case org.apache.spark.sql.types.IntegerType | org.apache.spark.sql.types.DateType | org.apache.spark.sql.types.ByteType | org.apache.spark.sql.types.ShortType =>
       4 // narrow ints ride INT32 lanes (#327)
-    case org.apache.spark.sql.types.LongType | org.apache.spark.sql.types.TimestampType | org.apache.spark.sql.types.DoubleType =>
+    case org.apache.spark.sql.types.LongType | org.apache.spark.sql.types.TimestampType |
+        org.apache.spark.sql.types.TimestampNTZType | org.apache.spark.sql.types.DoubleType =>
       8
     case d: org.apache.spark.sql.types.DecimalType if d.precision <= 18 => 8
     case _: org.apache.spark.sql.types.DecimalType => 16

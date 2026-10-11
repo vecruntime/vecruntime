@@ -68,6 +68,7 @@ import org.apache.spark.sql.types.{
   DateType,
   IntegerType,
   StringType,
+  TimestampNTZType,
   TimestampType,
   BooleanType,
   DecimalType => SparkDecimalType
@@ -549,7 +550,8 @@ object VectorWindowPlanner {
 
   /** Whether a lane the RANGE kernels read: an integral (int32/int64) or double lane, not a string, boolean or decimal. */
   private def rangeLane(dt: DataType): Boolean = dt match {
-    case ByteType | ShortType | IntegerType | DateType | LongType | TimestampType | DoubleType => true
+    case ByteType | ShortType | IntegerType | DateType | LongType | TimestampType | TimestampNTZType | DoubleType =>
+      true
     case _ => false
   }
 
@@ -1666,7 +1668,7 @@ private[vecruntime] class VectorWindowOffsetIterator(
       case IntegerType | DateType => java.lang.Integer.valueOf(col.getInt(r))
       case ByteType => java.lang.Byte.valueOf(col.getByte(r)) // #327: the int lane read back as the declared type
       case ShortType => java.lang.Short.valueOf(col.getShort(r))
-      case LongType | TimestampType => java.lang.Long.valueOf(col.getLong(r))
+      case LongType | TimestampType | TimestampNTZType => java.lang.Long.valueOf(col.getLong(r))
       case DoubleType => java.lang.Double.valueOf(col.getDouble(r))
       case BooleanType => java.lang.Boolean.valueOf(col.getBoolean(r))
       case StringType => col.getUTF8String(r).clone()
