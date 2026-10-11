@@ -37,12 +37,26 @@ public final class RemappedColumnVector extends ColumnVector {
 
     private final ColumnVector inner;
     private final int[] rows;
+    private final boolean owns;
     private int numNulls = -1;
 
     private RemappedColumnVector(ColumnVector inner, int[] rows) {
+        this(inner, rows, false);
+    }
+
+    private RemappedColumnVector(ColumnVector inner, int[] rows, boolean owns) {
         super(inner.dataType());
         this.inner = inner;
         this.rows = rows;
+        this.owns = owns;
+    }
+
+    /**
+     * The view of a column the caller made for this batch alone (a computed
+     * nested result, #705): closing the view closes it.
+     */
+    public static ColumnVector owning(ColumnVector cv, int[] rows) {
+        return new RemappedColumnVector(cv, rows, true);
     }
 
     /**
@@ -79,7 +93,11 @@ public final class RemappedColumnVector extends ColumnVector {
     }
 
     @Override
-    public void close() {}
+    public void close() {
+        if (owns) {
+            inner.close();
+        }
+    }
 
     @Override
     public boolean hasNull() {
