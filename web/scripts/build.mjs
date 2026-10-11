@@ -14,7 +14,7 @@
 //
 //   * Markdown docs (../docs/*.md) are converted with markdown-it and wrapped in the shared shell.
 //   * index.md becomes the home page: its body drops below an animated-terminal hero.
-//   * The three benchmark pages (../docs/benchmarks/*.html) are GENERATED artifacts. This build does
+//   * The benchmark pages (../docs/benchmarks/*.html) are GENERATED artifacts. This build does
 //     NOT recompute them; it strips their Jekyll front matter and rewrites the one Liquid link they
 //     carry, then wraps them in the same shell. Every number is copied through untouched, so the
 //     figures are byte-identical to the docs/ pages (verified in build output).
@@ -63,6 +63,7 @@ const BENCH_PAGES = [
   "tpcds-1tb-graviton.html",
   "tpcds-3tb-graviton.html",
   "iceberg-mor.html",
+  "flight-shuffle-transport.html",
 ];
 
 // Docs kept in the repository but not published on the site. A link to one of them -- from a
