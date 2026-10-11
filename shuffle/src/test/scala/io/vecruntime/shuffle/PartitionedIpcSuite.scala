@@ -52,7 +52,8 @@ class PartitionedIpcSuite extends AnyFunSuite with BeforeAndAfterAll {
     StructField("sd", StringType), // dictionary encoded at the source
     StructField("dec", DecimalType(12, 2)),
     StructField("wide", DecimalType(30, 4)),
-    StructField("ntz", TimestampNTZType) // micros on the INT64 lane, no zone (#705)
+    StructField("ntz", TimestampNTZType), // micros on the INT64 lane, no zone (#705)
+    StructField("bin", BinaryType) // bytes on the UTF8 lane, always plain (#705)
   ))
 
   /** One row as Spark-visible values (null = SQL null), for comparison. */
@@ -79,6 +80,9 @@ class PartitionedIpcSuite extends AnyFunSuite with BeforeAndAfterAll {
     val ndec = nulls(n); val vdec = Array.fill(n)(rnd.nextLong() % 1000000000000L)
     val nw = nulls(n); val vw = Array.fill(n)(new BigInteger(90, rnd.self).subtract(BigInteger.ONE.shiftLeft(89)))
     val nn = nulls(n); val vn = Array.fill(n)(rnd.nextLong() / 1000)
+    // Bytes above 0x7f and invalid UTF-8 sequences, an empty value, nulls.
+    val vbin = Array.fill[Array[Byte]](n)(if (rnd.nextDouble() < 0.15) null
+    else Array.fill(rnd.nextInt(7))(rnd.nextInt(256).toByte))
 
     val buffers: Array[VectorBuffers] = Array(
       ArrowLayout.ofInts(arena, vi, ni),
@@ -94,7 +98,10 @@ class PartitionedIpcSuite extends AnyFunSuite with BeforeAndAfterAll {
       } else ArrowLayout.ofStrings(arena, ids.indices.map(i => if (nsd(i)) null else dict(ids(i))).toArray),
       ArrowLayout.ofLongs(arena, vdec, ndec),
       ArrowLayout.ofDecimal128(arena, vw, nw),
-      ArrowLayout.ofLongs(arena, vn, nn)
+      ArrowLayout.ofLongs(arena, vn, nn), {
+        val offs = vbin.scanLeft(0)((o, v) => o + (if (v == null) 0 else v.length))
+        ArrowLayout.ofUtf8(arena, vbin.filter(_ != null).flatten, offs, n, vbin.map(_ == null))
+      }
     )
     val all = arena.allocate(io.vecruntime.kernels.Bitmap.bytesFor(n), 8)
     io.vecruntime.kernels.Bitmap.fill(all, n, true)
@@ -114,7 +121,8 @@ class PartitionedIpcSuite extends AnyFunSuite with BeforeAndAfterAll {
         if (nsd(r)) null else dict(ids(r)),
         if (ndec(r)) null else Decimal(vdec(r), 12, 2),
         if (nw(r)) null else Decimal(new java.math.BigDecimal(vw(r), 4), 30, 4),
-        if (nn(r)) null else vn(r)
+        if (nn(r)) null else vn(r),
+        if (vbin(r) == null) null else vbin(r).toSeq
       )
     }
     (new ColumnarBatch(columns, n), rows)
@@ -130,6 +138,7 @@ class PartitionedIpcSuite extends AnyFunSuite with BeforeAndAfterAll {
         case DoubleType => cv.getDouble(r)
         case BooleanType => cv.getBoolean(r)
         case StringType => cv.getUTF8String(r).toString
+        case BinaryType => cv.getBinary(r).toSeq
         case d: DecimalType => cv.getDecimal(r, d.precision, d.scale)
       }
     }
