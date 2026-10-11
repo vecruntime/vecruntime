@@ -243,11 +243,13 @@ class VectorPortedCometCastSuite extends VectorQuerySuite {
   // it pins that these do NOT silently produce a wrong accelerated result.
   // ---------------------------------------------------------------------------
 
-  test("cast to float has no lane and falls back") {
-    // FLOAT32 is not a lane in this project; the cast target is unsupported.
+  test("cast double -> float rides the FLOAT64 lane, cast bigint -> float falls back") {
+    // FLOAT rides the FLOAT64 lane (#712): double -> float rounds once, as Spark's toFloat. A bigint
+    // rounds once in Spark and twice through a double, so it stays Spark's.
     // (tinyint / smallint are deliberately NOT asserted here: #327 compiles int -> byte/short via
     // NarrowIntExpr onto the int lane, so they are not a clean cast-target fallback.)
-    castFallback("cd", "float", "unsupported cast target float")
+    castOk("cd", "float")
+    castFallback("cl", "float", "unsupported cast bigint -> float (#712)")
   }
 
   test("cast string -> decimal falls back (Spark's Decimal.fromString not reproduced yet)") {
