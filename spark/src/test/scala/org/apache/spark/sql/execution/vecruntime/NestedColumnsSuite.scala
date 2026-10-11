@@ -76,7 +76,10 @@ class NestedColumnsSuite extends SparkVectorFunSuite {
     assert(TypeMapping.nestedTypeOf(IntegerType) == null)
     assert(TypeMapping.vecTypeOf(ArrayType(IntegerType)) == null, "operators keep carrying nested columns")
     assert(TypeMapping.nestedTypeOf(ArrayType(CalendarIntervalType)) == null)
-    assert(TypeMapping.nestedTypeOf(MapType(StringType, ArrayType(FloatType))) == null, "float has no lane (#712)")
+    assert(
+      TypeMapping.nestedTypeOf(MapType(StringType, ArrayType(FloatType))) == VecType.MAP,
+      "float leaves ride FLOAT64 (#712)"
+    )
     assert(TypeMapping.laneOf(MapType(StringType, IntegerType)) == VecType.MAP)
   }
 
