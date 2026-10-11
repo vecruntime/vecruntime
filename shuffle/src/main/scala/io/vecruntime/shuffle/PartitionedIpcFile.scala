@@ -28,7 +28,8 @@ import io.vecruntime.spark.arrow.{
   VectorArrowColumnVector,
   VectorDecimalColumnVector,
   VectorDictionaryColumnVector,
-  VectorNarrowIntColumnVector
+  VectorNarrowIntColumnVector,
+  VectorNestedColumnVector
 }
 import org.apache.arrow.memory.BufferAllocator
 import org.apache.arrow.vector.{FieldVector, IntVector, VarCharVector}
@@ -241,12 +242,48 @@ object PartitionedIpcFile {
   def arrowField(name: String, dt: DataType, ordinal: Int, dictionary: Boolean = true): Field = {
     val metadata = new JHashMap[String, String]()
     metadata.put(TypeKey, dt.json)
+    // A nested lane (#705) crosses as Arrow's list / map / struct over plain children: no dictionary
+    // below the top level, a string leaf is UTF8.
+    def child(n: String, t: DataType, nullable: Boolean = true): Field = {
+      val f = arrowField(n, t, -1, dictionary = false)
+      if (nullable) f else new Field(n, new FieldType(false, f.getType, null, f.getMetadata), f.getChildren)
+    }
+    dt match {
+      case a: ArrayType =>
+        return new Field(
+          name,
+          new FieldType(true, ArrowType.List.INSTANCE, null, metadata),
+          java.util.List.of(child("element", a.elementType))
+        )
+      case m: MapType =>
+        val entries = new Field(
+          "entries",
+          new FieldType(false, ArrowType.Struct.INSTANCE, null, null),
+          java.util.List.of(child("key", m.keyType, nullable = false), child("value", m.valueType))
+        )
+        return new Field(
+          name,
+          new FieldType(true, new ArrowType.Map(false), null, metadata),
+          java.util.List.of(entries)
+        )
+      case s: StructType =>
+        return new Field(
+          name,
+          new FieldType(true, ArrowType.Struct.INSTANCE, null, metadata),
+          s.fields.map(f => child(f.name, f.dataType)).toSeq.asJava
+        )
+      case _ =>
+    }
     val (arrow, encoding) =
       if (dt == StringType && dictionary) (arrowType(dt), dictionaryEncoding(ordinal))
       else if (dt == StringType) (ArrowType.Utf8.INSTANCE, null)
       else (arrowType(dt), null)
     new Field(name, new FieldType(true, arrow, encoding, metadata), null)
   }
+
+  /** A column the shuffle carries as an Arrow list, map or struct (#705); a flattened struct never reaches the streams. */
+  def isNested(dt: DataType): Boolean =
+    dt.isInstanceOf[ArrayType] || dt.isInstanceOf[MapType] || dt.isInstanceOf[StructType]
 
   def arrowSchema(schema: StructType): Schema =
     new Schema(schema.fields.zipWithIndex.map { case (f, i) => arrowField(f.name, f.dataType, i) }.toSeq.asJava)
@@ -386,6 +423,7 @@ object PartitionedIpcFile {
       val moved = source.getField.createVector(allocator)
       source.makeTransferPair(moved).transfer()
       columns(c) = dt match {
+        case nested if isNested(nested) => VectorNestedColumnVector.ofArrow(moved, nested)
         case StringType if field.getDictionary != null =>
           val dict = dictionary(field.getDictionary.getId)
           val copy = new VarCharVector(field.getName + ".dictionary", allocator)
@@ -440,6 +478,9 @@ object PartitionedIpcFile {
       else null
     }
     private val types: Array[DataType] = schema.fields.map(_.dataType)
+
+    /** A nested column (#705) is not coalesced: every record batch reaches the operators as it arrives. */
+    private val hasNested: Boolean = types.exists(PartitionedIpcFile.isNested)
 
     /** Column ordinal of a dictionary id (#dictionaryEncoding: id = ordinal + 1), or -1. */
     private def columnOf(id: Long): Int =
@@ -537,7 +578,8 @@ object PartitionedIpcFile {
       private val dt = types(c)
       private val isString = dt == StringType || dt == BinaryType // BINARY: variable width, plain (#705)
       private val isBool = dt == BooleanType
-      private val width: Int = if (isString || isBool) 0 else PartitionedIpcWriter.byteWidth(dt)
+      private val width: Int =
+        if (isString || isBool || PartitionedIpcFile.isNested(dt)) 0 else PartitionedIpcWriter.byteWidth(dt)
       private val field: Field = if (plain(c) != null) plain(c) else fields(c)
       var vector: FieldVector = _
       private var buffers: ArrowVectorBuffers = _
@@ -794,7 +836,9 @@ object PartitionedIpcFile {
           try {
             val (root, loader) = rootFor(encoded)
             loader.load(batch)
-            if (root.getRowCount < CoalesceRows && (encoded.isEmpty || root.getRowCount < PassEncodedRows)) {
+            if (
+              !hasNested && root.getRowCount < CoalesceRows && (encoded.isEmpty || root.getRowCount < PassEncodedRows)
+            ) {
               // A small batch (a block of a few dozen rows at 1000 partitions) is appended to the
               // pending batch instead of reaching the operators on its own: their per-batch costs --
               // kernel set-up, a hash table's probe round, an output batch per input batch -- were
@@ -830,6 +874,7 @@ object PartitionedIpcFile {
 
     /** The Spark column over a vector of ours (moved out of a root or taken from the pending batch). */
     private def wrap(moved: FieldVector, c: Int, dictionaryEncoded: Boolean): ColumnVector = types(c) match {
+      case dt if PartitionedIpcFile.isNested(dt) => VectorNestedColumnVector.ofArrow(moved, dt)
       case StringType if dictionaryEncoded =>
         // The batch shares the column's current dictionary (#416): one reference, released when the batch closes.
         val shared = dictionary(c)
