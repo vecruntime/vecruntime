@@ -1055,7 +1055,9 @@ object ExpressionCompiler {
     case e @ ArrayTransform(child, LambdaFunction(body, vars, _)) =>
       lambdaArray(child, vars, body, keep = false, e, input)
     case e @ ArrayFilter(child, LambdaFunction(body, vars, _)) => lambdaArray(child, vars, body, keep = true, e, input)
-    case other => Left(s"unsupported expression ${other.prettyName} with a ${other.dataType.simpleString} result")
+    // Anything else keeps the reason the ordinary compiler gives it (element access with a nested
+    // element, a struct constructor, ...).
+    case other => compile(other, input)
   }
 
   private def mapPart(container: Expression, values: Boolean, e: Expression, input: Seq[Attribute]): Result =
