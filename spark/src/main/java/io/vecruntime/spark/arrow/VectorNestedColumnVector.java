@@ -23,6 +23,9 @@ import io.vecruntime.kernels.NestedVectorBuffers;
 import io.vecruntime.kernels.VecType;
 import io.vecruntime.kernels.VectorBuffers;
 import org.apache.arrow.memory.BufferAllocator;
+import org.apache.arrow.vector.FieldVector;
+import org.apache.arrow.vector.complex.ListVector;
+import org.apache.arrow.vector.complex.StructVector;
 import org.apache.spark.sql.types.ArrayType;
 import org.apache.spark.sql.types.DataType;
 import org.apache.spark.sql.types.Decimal;
@@ -50,9 +53,21 @@ public final class VectorNestedColumnVector extends ColumnVector {
     private final int[] offsets;
     private final ColumnVector[] children;
 
+    /**
+     * The Arrow vector this column reads (its own validity and offsets),
+     * released with it; null over a lane.
+     */
+    private final FieldVector owner;
+
     private VectorNestedColumnVector(DataType type, int length, boolean[] nulls,
             int[] offsets, ColumnVector[] children) {
+        this(type, length, nulls, offsets, children, null);
+    }
+
+    private VectorNestedColumnVector(DataType type, int length, boolean[] nulls,
+            int[] offsets, ColumnVector[] children, FieldVector owner) {
         super(type);
+        this.owner = owner;
         this.length = length;
         this.nulls = nulls;
         int c = 0;
@@ -117,6 +132,56 @@ public final class VectorNestedColumnVector extends ColumnVector {
         return new VectorNestedColumnVector(dt, len, nulls, offsets, children);
     }
 
+    /**
+     * The Spark column over an Arrow list, map or struct vector of Spark type
+     * {@code dt} (the shuffle's read side, #705), its leaves read through
+     * {@link ArrowOutput#wrap}; takes ownership of {@code v}.
+     */
+    public static ColumnVector ofArrow(FieldVector v, DataType dt) {
+        if (isLeaf(dt)) {
+            return new NullSafe(ArrowOutput.wrap(v, dt), dt);
+        }
+        int len = v.getValueCount();
+        boolean[] nulls = null;
+        if (v.getNullCount() > 0) {
+            nulls = new boolean[len];
+            for (int i = 0; i < len; i++) {
+                nulls[i] = v.isNull(i);
+            }
+        }
+        if (dt instanceof StructType s) {
+            StructVector sv = (StructVector) v;
+            StructField[] fs = s.fields();
+            ColumnVector[] children = new ColumnVector[fs.length];
+            for (int f = 0; f < fs.length; f++) {
+                children[f] = ofArrow((FieldVector) sv.getChildByOrdinal(f), fs[f].dataType());
+            }
+            return new VectorNestedColumnVector(dt, len, nulls, null, children, v);
+        }
+        ListVector lv = (ListVector) v;
+        int[] offsets = new int[len + 1];
+        if (len > 0) {
+            for (int i = 0; i <= len; i++) {
+                offsets[i] = lv.getOffsetBuffer().getInt((long) i * ListVector.OFFSET_WIDTH);
+            }
+        }
+        ColumnVector[] children;
+        if (dt instanceof MapType m) {
+            StructVector entries = (StructVector) lv.getDataVector();
+            children = new ColumnVector[] {ofArrow((FieldVector) entries.getChildByOrdinal(0), m.keyType()), ofArrow((FieldVector) entries.getChildByOrdinal(1), m.valueType())};
+        } else if (dt instanceof ArrayType a) {
+            children = new ColumnVector[] {ofArrow(lv.getDataVector(), a.elementType())};
+        } else {
+            throw new IllegalArgumentException("an Arrow nested vector of Spark type " + dt.simpleString());
+        }
+        return new VectorNestedColumnVector(dt, len, nulls, offsets, children, v);
+    }
+
+    /** Whether a Spark type is a leaf (not an array, map or struct). */
+    private static boolean isLeaf(DataType dt) {
+        return !(dt instanceof ArrayType || dt instanceof MapType || dt instanceof StructType);
+    }
+
     public int length() {
         return length;
     }
@@ -125,6 +190,9 @@ public final class VectorNestedColumnVector extends ColumnVector {
     public void close() {
         for (ColumnVector c : children) {
             c.close();
+        }
+        if (owner != null) {
+            owner.close();
         }
     }
 
