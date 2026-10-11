@@ -62,3 +62,5 @@ nav:
         url: /benchmarks/tpcds-1tb-graviton.html
       - title: "Iceberg merge-on-read"
         url: /benchmarks/iceberg-mor.html
+      - title: "Flight shuffle transport (Graviton4)"
+        url: /benchmarks/flight-shuffle-transport.html

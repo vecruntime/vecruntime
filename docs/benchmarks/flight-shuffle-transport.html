@@ -1,0 +1,142 @@
+---
+layout: default
+title: 'Arrow Flight shuffle transport on Graviton4'
+---
+<style>
+.bench { --good:#16a34a; --bad:#dc2626; }
+:root[data-theme="dark"] .bench { --good:#3fb950; --bad:#f85149; }
+.doc:has(.bench) { max-width: none; }
+.bench .lede { color: var(--muted); }
+.bench .tldr { background: var(--card); border-left: 4px solid var(--accent); padding: 14px 18px; border-radius: 6px; margin: 1.2em 0; }
+.bench table th, .bench table td { text-align: right; } .bench table th:first-child, .bench table td:first-child { text-align: left; }
+.bench table td { font-variant-numeric: tabular-nums; }
+.bench .win { color: var(--good); font-weight: 600; } .bench .loss { color: var(--bad); }
+.bench .note { background: var(--card); border-left: 3px solid var(--muted); padding: 2px 14px; border-radius: 4px; margin: 1em 0; }
+.bench .foot { color: var(--muted); font-size: .85rem; margin-top: 3em; }
+</style>
+<div class="bench">
+<h1>Arrow Flight shuffle transport on Graviton4</h1>
+<p class="lede">VecRuntime's columnar shuffle serves each executor's map outputs from an Arrow Flight server; a reduce task opens one
+<code>DoGet</code> per remote executor and decodes the Arrow IPC stream as it arrives (<a href="../flight-shuffle.html">how it works</a>).
+This page is every experiment on that transport between two Graviton4 nodes: how many rows per second one executor's reduce tasks
+can pull from another, and which of the transport's settings move it.</p>
+
+<div class="tldr"><b>In short.</b> With the defaults one executor pulls <b>31 M rows/s</b> on r8gd.12xlarge and
+<b>26 M rows/s</b> on m8g.4xlarge, held at about 10 Gbit/s by EC2's per-connection limit: the client keeps one TCP
+connection per remote executor. Two connections (<code>spark.vecruntime.shuffle.flight.channelsPerPeer=2</code>) lift it to
+<b>39</b> (r8gd, +28%) and <b>46</b> (m8g, +76%,
+the instance's 15 Gbit/s); past that the limit is the client's zstd decode (r8gd) or the NIC (m8g). Server threads, the HTTP/2
+window and server backpressure do not matter once connections are not the limit; 1 MB messages help where the network has room
+(r8gd: 46 M rows/s with four connections) and nowhere else. At TPC-DS 1 TB on nine m8g.4xlarge none of this shows: the shuffle-heavy queries take 144.1, 143.9 and 142.9 s with the defaults, two connections and four connections with 1 MB messages, so <b>the defaults stay</b>.</div>
+
+<h2 id="setup">Setup</h2>
+<table>
+<tr><th>Component</th><th style="text-align:left">Configuration</th></tr>
+<tr><td>Benchmark</td><td style="text-align:left"><code>FlightNetBench</code> (benchmarks module): the
+<code>FlightBench</code> fixture -- two Flight servers standing in for two executors, each serving the map files of 16 map tasks
+of 1 M rows written by the real shuffle writer at 200 reduce partitions, zstd -- on one node, and reduce tasks
+(<code>FlightBlockStream</code>, the production client: one <code>DoGet</code> per server for the task's partition, batches
+decoded) on another. Rows: two longs, two ints, two doubles, a 50-value string and a near-distinct string.</td></tr>
+<tr><td>Nodes</td><td style="text-align:left">Two nodes of one EKS node group in one availability zone, no placement group;
+server pod and client pod on different nodes (pod anti-affinity), one executor's cores each: 5 on r8gd.12xlarge (the 3 TB
+campaign's executors), 13 on m8g.4xlarge (the 1 TB campaign's). JDK 25, 8 GB heap, image of main 51c90ed4 (arm64).</td></tr>
+<tr><td>Protocol</td><td style="text-align:left">The client first reads every partition once and checks every row the servers
+wrote comes back. Then, per combination, three runs of 30 s with <code>concurrency</code> reduce tasks in flight; the first run
+(cold JIT and connections) is dropped and the median of the other two reported. M rows/s is decoded rows; Gbit/s the bytes
+on the wire; CPU-s/GB is process CPU over wire bytes, client and server.</td></tr>
+<tr><td>Settings swept</td><td style="text-align:left">Client: <code>spark.vecruntime.shuffle.flight.channelsPerPeer</code>
+(gRPC channels, i.e. TCP connections, per remote executor), <code>clientWindow</code> (a fixed HTTP/2 flow-control window;
+0 = gRPC's own, which grows with the measured bandwidth-delay product), reduce tasks in flight. Server, one changed at a time:
+<code>threads</code>, <code>chunkBytes</code> (bytes per gRPC message), <code>backpressureBytes</code>, and the shuffle's
+compression. All keys are in <a href="../configuration.html">Configuration</a>.</td></tr>
+</table>
+
+<h2 id="r8gd">r8gd.12xlarge (48 vCPU Graviton4, up to 22.5 Gbit/s, 5-core pods)</h2>
+<p>Server defaults. M rows/s per reduce-side executor; <span class="win">green</span>: at least 15 % above the default (one connection, gRPC window, 5 tasks), <span class="loss">red</span>: at least 13 % below.</p>
+<table><tr><th>connections per peer</th><th>window</th><th>5 tasks</th><th>10 tasks</th><th>Gbit/s</th><th>client CPU-s/GB</th><th>server CPU-s/GB</th></tr>
+<tr><td>1</td><td>gRPC (auto)</td><td>30.9</td><td>30.9</td><td>9.9</td><td>2.55</td><td>0.89</td></tr>
+<tr><td>1</td><td>1 MB</td><td>30.7</td><td>30.9</td><td>9.8</td><td>2.61</td><td>0.87</td></tr>
+<tr><td>1</td><td>16 MB</td><td>30.9</td><td>30.9</td><td>9.9</td><td>2.56</td><td>0.87</td></tr>
+<tr><td>2</td><td>gRPC (auto)</td><td class="win">39.4</td><td class="win">46.1</td><td>12.6</td><td>2.63</td><td>0.87</td></tr>
+<tr><td>2</td><td>1 MB</td><td class="win">39.8</td><td class="win">46.5</td><td>12.8</td><td>2.74</td><td>0.91</td></tr>
+<tr><td>2</td><td>16 MB</td><td class="win">39.9</td><td class="win">47.2</td><td>12.8</td><td>2.60</td><td>0.88</td></tr>
+<tr><td>4</td><td>gRPC (auto)</td><td class="win">39.7</td><td class="win">46.0</td><td>12.7</td><td>2.74</td><td>0.9</td></tr>
+<tr><td>4</td><td>1 MB</td><td class="win">39.8</td><td class="win">46.3</td><td>12.8</td><td>2.73</td><td>0.94</td></tr>
+<tr><td>4</td><td>16 MB</td><td class="win">39.9</td><td class="win">46.2</td><td>12.8</td><td>2.69</td><td>0.9</td></tr>
+</table>
+<p>One server setting changed at a time (5 tasks):</p>
+<table><tr><th>server</th><th>1 conn, gRPC window</th><th>1 conn, 16 MB</th><th>4 conn, gRPC window</th><th>4 conn, 16 MB</th><th>Gbit/s (4 conn)</th><th>client CPU-s/GB (4 conn)</th><th>server CPU-s/GB (4 conn)</th></tr>
+<tr><td>defaults (threads = cores, 4 MB messages)</td><td>30.9</td><td>30.9</td><td class="win">39.7</td><td class="win">39.9</td><td>12.7</td><td>2.74</td><td>0.9</td></tr>
+<tr><td>server threads x4</td><td>30.9</td><td>30.9</td><td class="win">39.8</td><td class="win">40.3</td><td>12.8</td><td>2.68</td><td>0.76</td></tr>
+<tr><td>1 MB messages (chunkBytes=1m)</td><td>30.9</td><td>30.9</td><td class="win">46.5</td><td class="win">46.8</td><td>14.9</td><td>2.69</td><td>0.61</td></tr>
+<tr><td>16 MB messages (chunkBytes=16m)</td><td>30.8</td><td>30.9</td><td class="win">39.6</td><td class="win">39.5</td><td>12.7</td><td>2.73</td><td>0.87</td></tr>
+<tr><td>server backpressure 32 MB (backpressureBytes=32m)</td><td class="loss">25.1</td><td>30.9</td><td class="win">39.3</td><td class="win">39.4</td><td>12.6</td><td>2.73</td><td>0.96</td></tr>
+<tr><td>no compression (shuffle.compression=none)</td><td class="loss">21.3</td><td class="loss">21.3</td><td class="win">47.3</td><td class="win">47.8</td><td>22.0</td><td>0.66</td><td>0.83</td></tr>
+</table>
+<h2 id="g4">m8g.4xlarge (16 vCPU Graviton4, up to 15 Gbit/s, 13-core pods)</h2>
+<p>Server defaults. M rows/s per reduce-side executor; <span class="win">green</span>: at least 15 % above the default (one connection, gRPC window, 13 tasks), <span class="loss">red</span>: at least 13 % below.</p>
+<table><tr><th>connections per peer</th><th>window</th><th>13 tasks</th><th>26 tasks</th><th>Gbit/s</th><th>client CPU-s/GB</th><th>server CPU-s/GB</th></tr>
+<tr><td>1</td><td>gRPC (auto)</td><td>26.2</td><td>26.2</td><td>8.4</td><td>2.83</td><td>1.35</td></tr>
+<tr><td>1</td><td>1 MB</td><td class="win">30.9</td><td class="win">30.8</td><td>9.9</td><td>2.76</td><td>0.79</td></tr>
+<tr><td>1</td><td>16 MB</td><td class="win">30.9</td><td class="win">30.9</td><td>9.9</td><td>2.73</td><td>0.81</td></tr>
+<tr><td>2</td><td>gRPC (auto)</td><td class="win">46.1</td><td class="win">46.0</td><td>14.8</td><td>2.79</td><td>0.77</td></tr>
+<tr><td>2</td><td>1 MB</td><td class="win">30.9</td><td class="win">30.9</td><td>9.9</td><td>2.78</td><td>0.75</td></tr>
+<tr><td>2</td><td>16 MB</td><td class="win">44.8</td><td class="win">44.1</td><td>14.4</td><td>2.75</td><td>0.68</td></tr>
+<tr><td>4</td><td>gRPC (auto)</td><td class="win">46.4</td><td class="win">46.3</td><td>14.9</td><td>2.90</td><td>0.72</td></tr>
+<tr><td>4</td><td>1 MB</td><td class="win">46.1</td><td class="win">45.7</td><td>14.8</td><td>3.00</td><td>0.79</td></tr>
+<tr><td>4</td><td>16 MB</td><td class="win">46.3</td><td class="win">46.3</td><td>14.9</td><td>2.84</td><td>0.69</td></tr>
+</table>
+<p>One server setting changed at a time (13 tasks):</p>
+<table><tr><th>server</th><th>1 conn, gRPC window</th><th>1 conn, 16 MB</th><th>4 conn, gRPC window</th><th>4 conn, 16 MB</th><th>Gbit/s (4 conn)</th><th>client CPU-s/GB (4 conn)</th><th>server CPU-s/GB (4 conn)</th></tr>
+<tr><td>defaults (threads = cores, 4 MB messages)</td><td>26.2</td><td class="win">30.9</td><td class="win">46.4</td><td class="win">46.3</td><td>14.9</td><td>2.90</td><td>0.72</td></tr>
+<tr><td>server threads x4</td><td class="win">30.8</td><td class="win">30.9</td><td class="win">46.2</td><td class="win">46.3</td><td>14.8</td><td>2.91</td><td>0.78</td></tr>
+<tr><td>1 MB messages (chunkBytes=1m)</td><td>23.2</td><td>25.4</td><td class="win">46.3</td><td class="win">46.4</td><td>14.9</td><td>3.09</td><td>0.71</td></tr>
+<tr><td>16 MB messages (chunkBytes=16m)</td><td class="win">30.9</td><td>26.1</td><td class="win">46.3</td><td class="win">46.4</td><td>14.9</td><td>3.06</td><td>0.73</td></tr>
+<tr><td>server backpressure 32 MB (backpressureBytes=32m)</td><td>27.6</td><td class="win">30.9</td><td class="win">46.3</td><td class="win">46.4</td><td>14.8</td><td>2.94</td><td>0.77</td></tr>
+<tr><td>no compression (shuffle.compression=none)</td><td class="loss">21.3</td><td class="loss">21.3</td><td class="win">31.9</td><td class="win">31.9</td><td>14.9</td><td>0.85</td><td>0.85</td></tr>
+</table>
+<h2 id="findings">What the numbers say</h2>
+<ul>
+<li><b>One connection per remote executor is the limit with the defaults.</b> Every one-connection row sits at about
+10 Gbit/s whatever the window, the threads or the number of tasks: EC2 caps a single flow outside a cluster placement group at
+5 Gbit/s, and the client reads from two servers. A second connection per server lifts the rate on both instance types;
+a fourth adds nothing more.</li>
+<li><b>Past that, the client's decode is the limit on r8gd and the NIC on m8g.</b> At 2.6-2.8 CPU-seconds per GB of zstd
+stream, five r8gd cores decode about 15 Gbit/s, where the two- and four-connection rows stop; m8g.4xlarge's 13 cores have room,
+and its rows stop at the instance's 15 Gbit/s.</li>
+<li><b>Without zstd</b> the client spends a quarter of the CPU per byte, but the stream is about twice the bytes: r8gd reaches
+its 22 Gbit/s line rate and the most rows per second, m8g fills its NIC with fewer rows than with zstd. Compression stays the
+default; <code>none</code> pays only where the network has the headroom and the cores do not.</li>
+<li><b>1 MB messages</b> cut server CPU per byte by about a third and, on r8gd with four connections, raise the rate where the
+network is not the bound; with one connection they are slower (more messages through one flow-control window).
+<b>16 MB messages, four times the server threads and server backpressure</b> change nothing measurable; backpressure on one
+connection is slower.</li>
+<li><b>The flow-control window</b> matters only for a single connection on m8g, where a fixed window holds 10 Gbit/s that
+gRPC's own sometimes does not; with several connections every window gives the same rate.</li>
+</ul>
+<div class="note"><b>Caveats.</b> Two nodes, one pair of servers, 30-second runs: m8g.4xlarge's 15 Gbit/s is a burst rate, and
+a whole shuffle stage longer than the burst credits sees less. This measures one reduce-side executor against two map-side
+ones; in a cluster every executor serves and reads at once, so the 1 TB A/B below is the ruler for defaults.</div>
+
+<h2 id="tpcds">TPC-DS 1 TB on 9 x m8g.4xlarge</h2>
+<p>9 x m8g.4xlarge (8 executors x 13 cores), image of main 51c90ed4 (arm64), no table statistics; legs alternated c1 c2 c4m c4m c2 c1, 2 iterations + 1 warm-up per leg; mean of the two legs' medians, seconds; <span class="win">green</span> / <span class="loss">red</span>: 10 % faster / slower than the defaults. Identical results in every leg.</p>
+<table><tr><th>query</th><th>defaults (1 connection, 4 MB messages)</th><th>2 connections per peer</th><th>4 connections, 1 MB messages</th></tr>
+<tr><td>q67</td><td>30.7</td><td>31.2</td><td>31.4</td></tr>
+<tr><td>q78</td><td>22.5</td><td>23.0</td><td>22.6</td></tr>
+<tr><td>q64</td><td>14.4</td><td>14.2</td><td>13.9</td></tr>
+<tr><td>q23a</td><td>21.6</td><td>21.7</td><td>21.8</td></tr>
+<tr><td>q14a</td><td>36.5</td><td>36.7</td><td>34.9</td></tr>
+<tr><td>q4</td><td>18.4</td><td>17.1</td><td>18.3</td></tr>
+<tr><td>q3</td><td>1.5</td><td>1.6</td><td>1.4</td></tr>
+<tr><td>q55</td><td>0.6</td><td>0.6</td><td>0.6</td></tr>
+<tr><td>shuffle-heavy total (first six)</td><td>144.1</td><td>143.9</td><td>142.9</td></tr>
+</table>
+<p>No setting moves the shuffle-heavy queries by 10 %: the six total 144.1, 143.9 and 142.9 s, within 1 %, and the spread between the two legs of one setting (q14a 34.8-38.2 s with the defaults) is larger than the differences between settings. In a cluster every executor serves and reads at once over many connections, so the per-connection cap the two-node benchmark hits is not what holds a stage back; the defaults stay. The two-node numbers above still say where to look on hosts with fewer, larger executors or a faster NIC.</p>
+<h2 id="reproduce">Reproducing</h2>
+<pre><code>benchmarks/k8s/render-flight-net.sh &lt;image&gt; \
+  "partitions=200 maps=16 rowsPerMap=1000000 threads=5" \
+  "partitions=200 maps=16 rowsPerMap=1000000 seconds=30 runs=3 channelsPerPeer=1,2,4 clientWindow=0,1m,16m concurrency=5,10" \
+  | kubectl apply -f -
+kubectl -n bench logs job/flight-net-client     # one JSON line per run</code></pre>
+<p class="foot">Copyright 2026-2027 Angel Conde and the vecruntime contributors. Measured 2026-10-10/11.</p>
+</div>
