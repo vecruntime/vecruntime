@@ -85,6 +85,10 @@ import org.apache.spark.sql.catalyst.expressions.{
   Divide,
   ElementAt,
   ArrayContains,
+  ArrayExists,
+  ArrayForAll,
+  LambdaFunction,
+  NamedLambdaVariable,
   ArrayMax,
   ArrayMin,
   ArrayPosition,
@@ -364,6 +368,11 @@ object ExpressionCompiler {
     case e @ ArrayPosition(child, v) => arrayScan(child, ArrayScanExpr.Position, v, e, input)
     case e @ ArrayMin(child) => arrayScan(child, ArrayScanExpr.Min, null, e, input)
     case e @ ArrayMax(child) => arrayScan(child, ArrayScanExpr.Max, null, e, input)
+    // Higher-order predicates: the lambda compiled over the element lane (#705).
+    case ArrayExists(child, LambdaFunction(body, Seq(v: NamedLambdaVariable), _), followThreeValuedLogic) =>
+      arrayPredicate(child, v, body, forAll = false, followThreeValuedLogic, "exists", input)
+    case ArrayForAll(child, LambdaFunction(body, Seq(v: NamedLambdaVariable), _)) =>
+      arrayPredicate(child, v, body, forAll = true, followThreeValuedLogic = true, "forall", input)
     case g: GetArrayStructFields =>
       Left(s"array of struct fields ${g.sql} not supported (#50: only struct fields are read)")
 
@@ -951,6 +960,67 @@ object ExpressionCompiler {
     else
       for (p <- nestedColumnPath(container, input); a <- if (arg == null) Right(null) else compile(arg, input))
         yield ArrayScanExpr(p._1, p._2, container.dataType, kind, a)
+  }
+
+  /**
+   * `exists` / `forall` (#705): the array a column or a struct field of one with a nested lane, its
+   * elements on a lane, and the lambda body an expression we compile with the lambda variable as
+   * input 0 and the outer lane columns it reads after it. A nested lambda, or a body reading an outer
+   * column without a lane, stays with Spark.
+   */
+  private def arrayPredicate(
+      container: Expression,
+      variable: NamedLambdaVariable,
+      body: Expression,
+      forAll: Boolean,
+      followThreeValuedLogic: Boolean,
+      what: String,
+      input: Seq[Attribute]
+  ): Result = {
+    val elementType = container.dataType match {
+      case a: ArrayType => a.elementType
+      case other => other
+    }
+    if (!container.dataType.isInstanceOf[ArrayType] || TypeMapping.nestedTypeOf(container.dataType) == null)
+      Left(s"$what over ${container.dataType.simpleString} not supported")
+    else if (!TypeMapping.isSupported(elementType))
+      Left(s"$what over ${elementType.simpleString} elements not supported")
+    else if (
+      body.find(e =>
+        e.isInstanceOf[NamedLambdaVariable] && e.asInstanceOf[NamedLambdaVariable].exprId != variable.exprId
+      ).nonEmpty
+    )
+      Left(s"$what with a nested lambda not supported")
+    else {
+      val outerAttrs = body.collect { case a: AttributeReference => a }.distinct
+      outerAttrs.find(a => !TypeMapping.isSupported(a.dataType)) match {
+        case Some(a) =>
+          Left(s"$what reading the outer column ${a.name} of type ${a.dataType.simpleString} not supported")
+        case None =>
+          val lambdaAttr =
+            AttributeReference(variable.name, variable.dataType, variable.nullable)(exprId = variable.exprId)
+          val replaced = body.transform { case v: NamedLambdaVariable if v.exprId == variable.exprId => lambdaAttr }
+          val outerOrdinals = outerAttrs.map(a => input.indexWhere(_.exprId == a.exprId))
+          if (outerOrdinals.exists(_ < 0)) Left(s"$what over an unbound outer column")
+          else
+            for (
+              p <- nestedColumnPath(container, input);
+              compiled <- compile(replaced, lambdaAttr +: outerAttrs)
+            )
+              yield
+                if (compiled.dataType != BooleanType)
+                  throw new IllegalStateException(s"$what lambda of ${compiled.dataType}")
+                else ArrayPredicateExpr(
+                  p._1,
+                  p._2,
+                  container.dataType,
+                  forAll,
+                  compiled,
+                  outerOrdinals,
+                  followThreeValuedLogic
+                )
+      }
+    }
   }
 
   def nestedColumnPath(e: Expression, input: Seq[Attribute]): Either[String, (Int, Seq[Int])] = e match {
