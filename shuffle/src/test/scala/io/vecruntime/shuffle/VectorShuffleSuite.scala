@@ -262,6 +262,35 @@ class VectorShuffleSuite extends AnyFunSuite with BeforeAndAfterAll {
    * TIMESTAMP_NTZ (#705) rides the INT64 lane: as a hash key it lands where Spark's exchange puts it
    * (Spark hashes it as a long), as a range key the order is Spark's, and as a payload it reads back.
    */
+  /**
+   * FLOAT (#712) crosses our exchange as payload on its FLOAT64 lane and comes back as float; a float hash
+   * or range key keeps Spark's exchange, because Spark hashes the float's own bits.
+   */
+  test("float columns cross our exchange as payload; float keys keep Spark's exchange") {
+    val path = tempDir.resolve("floats").toString
+    spark.range(0, 5000).selectExpr(
+      "cast(id as int) as k",
+      "case when id % 31 = 1 then cast('NaN' as float) when id % 31 = 2 then cast(-0.0 as float) " +
+        "when id % 31 = 3 then cast('-Infinity' as float) when id % 7 = 0 then null " +
+        "else cast(id / 3.0 as float) end as f",
+      "named_struct('x', cast(id % 5 as float), 'y', cast(id as int)) as st"
+    ).write.mode("overwrite").parquet(path)
+    spark.read.parquet(path).createOrReplaceTempView("fl")
+    def rows(df: => DataFrame, enabled: Boolean): Seq[String] = {
+      spark.sessionState.conf.setConfString("spark.vecruntime.enabled", enabled.toString)
+      try df.selectExpr("spark_partition_id() as p", "*").collect().map(_.toString).toSeq.sorted
+      finally spark.sessionState.conf.setConfString("spark.vecruntime.enabled", "true")
+    }
+    def byK = spark.table("fl").repartition(5, org.apache.spark.sql.functions.col("k"))
+    val plan = collectPlan(byK)
+    assert(exchanges(plan).nonEmpty && exchanges(plan).forall(_.isInstanceOf[VectorShuffleExchangeExec]), s"$plan")
+    assert(rows(byK, enabled = true) === rows(byK, enabled = false))
+    def byF = spark.table("fl").repartition(5, org.apache.spark.sql.functions.col("f"))
+    assert(exchanges(collectPlan(byF)).forall(_.isInstanceOf[ShuffleExchangeExec]), "a float hash key is Spark's")
+    assert(rows(byF, enabled = true) === rows(byF, enabled = false))
+    checkAgainstSpark("select f, count(*) c, max(k) m from fl group by f")
+  }
+
   test("timestamp_ntz columns, hash keys and range keys cross our exchange") {
     val path = tempDir.resolve("ntz").toString
     spark.range(0, 20000).selectExpr(

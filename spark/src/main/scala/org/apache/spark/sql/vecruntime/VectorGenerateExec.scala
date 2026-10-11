@@ -32,6 +32,7 @@ import org.apache.spark.sql.types.{
   DateType,
   DecimalType,
   DoubleType,
+  FloatType,
   IntegerType,
   LongType,
   MapType,
@@ -158,6 +159,7 @@ private[vecruntime] class VectorGenerateIterator(
       case IntegerType | DateType => java.lang.Integer.valueOf(arr.getInt(k))
       case LongType | TimestampType | TimestampNTZType => java.lang.Long.valueOf(arr.getLong(k))
       case DoubleType => java.lang.Double.valueOf(arr.getDouble(k))
+      case FloatType => java.lang.Float.valueOf(arr.getFloat(k)) // #712
       case BooleanType => java.lang.Boolean.valueOf(arr.getBoolean(k))
       case StringType => arr.getUTF8String(k)
       case BinaryType => arr.getBinary(k) // #705: Spark's internal value for binary

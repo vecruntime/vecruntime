@@ -54,6 +54,9 @@ public final class BorrowedColumnVector extends ColumnVector {
         if (cv instanceof VectorNarrowIntColumnVector n) {
             return n.borrow();
         }
+        if (cv instanceof VectorFloatColumnVector f) {
+            return f.borrow();
+        }
         if (cv instanceof BorrowedColumnVector b) {
             return b;
         }

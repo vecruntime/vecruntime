@@ -96,6 +96,15 @@ public final class ColumnVectorAdapters {
         if (cv instanceof io.vecruntime.spark.arrow.DeferredGatherColumnVector d) {
             return adapt(d.gathered(), numRows, scratch); // a join's not-yet-gathered probe column (#603)
         }
+        if (cv instanceof io.vecruntime.spark.arrow.VectorFloatColumnVector f) {
+            return ArrowVectorBuffers.forRead(f.vector()); // a FLOAT64 lane under a FLOAT type (#712)
+        }
+        if (cv.dataType() instanceof org.apache.spark.sql.types.FloatType) {
+            // Any other float column -- the native scan's Float4Vector, Spark's own vectors, another
+            // engine's -- widens into the FLOAT64 lane (#712) through getFloat, which decodes dictionaries.
+            COPIED_COLUMNS.increment();
+            return SparkColumnVectorBuffers.copy(cv, numRows, scratch);
+        }
         if (cv instanceof VectorArrowColumnVector v) {
             return ArrowVectorBuffers.forRead(v.getValueVector());
         }
@@ -127,7 +136,8 @@ public final class ColumnVectorAdapters {
         if (cv instanceof VectorArrowColumnVector
                 || cv instanceof VectorDictionaryColumnVector
                 || cv instanceof VectorDecimalColumnVector
-                || cv instanceof VectorNarrowIntColumnVector) {
+                || cv instanceof VectorNarrowIntColumnVector
+                || cv instanceof io.vecruntime.spark.arrow.VectorFloatColumnVector) {
             return true;
         }
         try (Arena scratch = Arena.ofConfined()) {

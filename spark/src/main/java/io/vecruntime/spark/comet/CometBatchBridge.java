@@ -101,7 +101,8 @@ public final class CometBatchBridge {
      * {@link TypeMapping#isSupported} does not apply.
      */
     public static boolean isSupported(DataType dt) {
-        return TypeMapping.hasLane(dt);
+        // FLOAT rides an 8-byte lane (#712) that is not Comet's 4-byte float: it does not cross.
+        return TypeMapping.hasLane(dt) && !(dt instanceof org.apache.spark.sql.types.FloatType);
     }
 
     /**

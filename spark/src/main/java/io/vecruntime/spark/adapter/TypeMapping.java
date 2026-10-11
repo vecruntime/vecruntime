@@ -23,6 +23,7 @@ import org.apache.spark.sql.types.DataType;
 import org.apache.spark.sql.types.DateType;
 import org.apache.spark.sql.types.DecimalType;
 import org.apache.spark.sql.types.DoubleType;
+import org.apache.spark.sql.types.FloatType;
 import org.apache.spark.sql.types.IntegerType;
 import org.apache.spark.sql.types.LongType;
 import org.apache.spark.sql.types.ShortType;
@@ -51,6 +52,13 @@ public final class TypeMapping {
             return VecType.INT64;
         }
         if (dt instanceof DoubleType) {
+            return VecType.FLOAT64;
+        }
+        if (dt instanceof FloatType) {
+            // FLOAT rides the FLOAT64 lane (#712): every float widens exactly, comparisons, min / max and
+            // sorts are exact on the widened value, the compiler rounds float arithmetic and casts back to
+            // single precision after every operation, and the output wrapper (VectorFloatColumnVector)
+            // hands Spark the declared type back.
             return VecType.FLOAT64;
         }
         if (dt instanceof BooleanType) {

@@ -366,15 +366,24 @@ object VectorShuffleExchangeExec {
    */
   def supports(partitioning: Partitioning, output: Seq[Attribute]): Boolean = {
     def laneKey(dt: org.apache.spark.sql.types.DataType) = io.vecruntime.spark.adapter.TypeMapping.hasLane(dt)
-    def key(dt: org.apache.spark.sql.types.DataType) = io.vecruntime.shuffle.StructFlattening.supported(dt)
+    // A float key would hash its widened double, where Spark hashes the float's own bits (#712): float
+    // columns cross as payload, a float hash or range key keeps Spark's exchange.
+    def containsFloat(dt: org.apache.spark.sql.types.DataType): Boolean = dt match {
+      case _: org.apache.spark.sql.types.FloatType => true
+      case s: org.apache.spark.sql.types.StructType => s.fields.exists(f => containsFloat(f.dataType))
+      case _ => false
+    }
+    def key(dt: org.apache.spark.sql.types.DataType) =
+      io.vecruntime.shuffle.StructFlattening.supported(dt) && !containsFloat(dt)
     // Arrays, maps and structs over them cross as nested lanes (#705): payload, never keys.
     def column(dt: org.apache.spark.sql.types.DataType) =
-      key(dt) || io.vecruntime.spark.adapter.TypeMapping.nestedTypeOf(dt) != null
+      io.vecruntime.shuffle.StructFlattening.supported(dt) ||
+        io.vecruntime.spark.adapter.TypeMapping.nestedTypeOf(dt) != null
     output.forall(a => column(a.dataType)) && (partitioning match {
       case h: HashPartitioning => h.expressions.forall(e => e.isInstanceOf[Attribute] && key(e.dataType))
       case _: RoundRobinPartitioning => true
       case SinglePartition => true
-      case r: RangePartitioning => r.ordering.forall(o => laneKey(o.dataType))
+      case r: RangePartitioning => r.ordering.forall(o => laneKey(o.dataType) && !containsFloat(o.dataType))
       case _ => false
     })
   }

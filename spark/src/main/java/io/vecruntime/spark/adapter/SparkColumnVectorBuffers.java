@@ -101,6 +101,16 @@ public final class SparkColumnVectorBuffers {
         if (cv.dataType() instanceof DecimalType dec) {
             return copyDecimal(cv, dec, numRows, arena, validity);
         }
+        if (cv.dataType() instanceof org.apache.spark.sql.types.FloatType) {
+            // FLOAT widens into the FLOAT64 lane (#712), exactly; getFloat decodes a Parquet dictionary.
+            MemorySegment data = ArrowLayout.allocateData(arena, VecType.FLOAT64, numRows);
+            for (int i = 0; i < numRows; i++) {
+                if (validity == null || Bitmap.isSet(validity, i)) {
+                    data.setAtIndex(VectorBuffers.LE_DOUBLE, i, cv.getFloat(i));
+                }
+            }
+            return SegmentVectorBuffers.fixedWidth(VecType.FLOAT64, numRows, validity, data);
+        }
         if (cv.dataType() instanceof ByteType || cv.dataType() instanceof ShortType) {
             // TINYINT / SMALLINT widen into the INT32 lane (#327); the per-row getters decode a Parquet
             // dictionary, which the bulk ones do not, and the int fast paths below would read the wrong array.
