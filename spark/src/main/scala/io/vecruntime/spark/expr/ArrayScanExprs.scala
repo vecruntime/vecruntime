@@ -32,8 +32,8 @@ import org.apache.spark.sql.vectorized.ColumnVector
  *  - `Min` / `Max`: `array_min(arr)` / `array_max(arr)`. The least / greatest non-null element (strings
  *    by unsigned bytes, booleans false < true), null when there is none.
  *
- * Elements compare on INT32, INT64, BOOL and UTF8 lanes (Spark's equality on those is the lane's own;
- * doubles, whose NaN and signed zeros Spark's ordering folds, stay with Spark).
+ * Elements compare on INT32, INT64, BOOL and UTF8 lanes, doubles as Spark orders them (-0.0 equals 0.0,
+ * NaN equals NaN and is the greatest), and wide decimals on their two limbs.
  */
 final case class ArrayScanExpr(
     inputOrdinal: Int,
@@ -141,6 +141,19 @@ object ArrayScanExpr {
     case VecType.INT32 => Integer.compare(v.getInt(i), v.getInt(j))
     case VecType.INT64 => java.lang.Long.compare(v.getLong(i), v.getLong(j))
     case VecType.BOOL => java.lang.Boolean.compare(v.getBoolean(i), v.getBoolean(j))
+    // Spark's double ordering: -0.0 equals 0.0, NaN is greater than everything and equal to itself.
+    case VecType.FLOAT64 =>
+      val a = v.getDouble(i); val b = v.getDouble(j)
+      if (a == b || (a.isNaN && b.isNaN)) 0 else if (a.isNaN) 1 else if (b.isNaN) -1 else java.lang.Double.compare(a, b)
+    case VecType.DECIMAL128 =>
+      val d = v.data()
+      val c =
+        java.lang.Long.compare(io.vecruntime.kernels.Decimal128.hi(d, i), io.vecruntime.kernels.Decimal128.hi(d, j))
+      if (c != 0) c
+      else java.lang.Long.compareUnsigned(
+        io.vecruntime.kernels.Decimal128.lo(d, i),
+        io.vecruntime.kernels.Decimal128.lo(d, j)
+      )
     case VecType.UTF8 =>
       val o = v.offsets()
       val is = o.get(VectorBuffers.LE_INT, i.toLong << 2)
