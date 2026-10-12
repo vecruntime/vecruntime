@@ -73,6 +73,7 @@ object VectorPartitioning {
         KeyKind.LONG
       case _: DecimalType => KeyKind.DECIMAL128
       case DoubleType => KeyKind.DOUBLE
+      case FloatType => KeyKind.FLOAT // the float's own bits, narrowed from its FLOAT64 lane (#712)
       case BooleanType => KeyKind.BOOL
       case StringType | BinaryType => KeyKind.UTF8 // Spark hashes both with hashUnsafeBytes (#705)
       case other => throw new IllegalArgumentException(s"no shuffle key kind for $other")

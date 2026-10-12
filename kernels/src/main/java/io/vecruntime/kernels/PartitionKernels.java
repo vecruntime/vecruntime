@@ -70,7 +70,14 @@ public final class PartitionKernels {
          * DecimalType with precision > 18: {@code
          * hashUnsafeBytes(unscaled.toByteArray())}.
          */
-        DECIMAL128
+        DECIMAL128,
+        /**
+         * FloatType on its FLOAT64 lane (#712): the widened double narrowed
+         * back, then {@code hashInt(floatToIntBits(normalize(f)))} -- Spark
+         * hashes a float's own 32 bits, both zeros as 0 and every NaN as the
+         * canonical one.
+         */
+        FLOAT
     }
 
     private static final int C1 = 0xcc9e2d51;
@@ -148,6 +155,14 @@ public final class PartitionKernels {
     }
 
     /**
+     * The bits Spark hashes for a float: 0 for both zeros, the canonical NaN
+     * for every NaN.
+     */
+    public static int floatBits(float v) {
+        return v == 0.0f ? 0 : Float.floatToIntBits(v);
+    }
+
+    /**
      * Spark's {@code normalize} for doubles before hashing: {@code -0.0} to
      * {@code 0.0}, one NaN.
      */
@@ -214,6 +229,15 @@ public final class PartitionKernels {
                 }
             }
             case UTF8 -> mixUtf8(col, hashes, n, validity);
+            case FLOAT -> {
+                MemorySegment d = col.data();
+                for (int i = 0; i < n; i++) {
+                    if (validity == null || Bitmap.isSet(validity, i)) {
+                        float f = (float) d.get(VectorBuffers.LE_DOUBLE, (long) i << 3);
+                        hashes[i] = hashInt(floatBits(f), hashes[i]);
+                    }
+                }
+            }
             case DECIMAL128 -> {
                 MemorySegment d = col.data();
                 for (int i = 0; i < n; i++) {

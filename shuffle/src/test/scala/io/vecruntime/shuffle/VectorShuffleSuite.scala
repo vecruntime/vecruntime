@@ -263,10 +263,10 @@ class VectorShuffleSuite extends AnyFunSuite with BeforeAndAfterAll {
    * (Spark hashes it as a long), as a range key the order is Spark's, and as a payload it reads back.
    */
   /**
-   * FLOAT (#712) crosses our exchange as payload on its FLOAT64 lane and comes back as float; a float hash
-   * or range key keeps Spark's exchange, because Spark hashes the float's own bits.
+   * FLOAT (#712) crosses our exchange on its FLOAT64 lane and comes back as float; a float hash key hashes
+   * the float's own bits, as Spark does, and a range key keeps Spark's order.
    */
-  test("float columns cross our exchange as payload; float keys keep Spark's exchange") {
+  test("float columns, hash keys and range keys cross our exchange") {
     val path = tempDir.resolve("floats").toString
     spark.range(0, 5000).selectExpr(
       "cast(id as int) as k",
@@ -285,9 +285,21 @@ class VectorShuffleSuite extends AnyFunSuite with BeforeAndAfterAll {
     val plan = collectPlan(byK)
     assert(exchanges(plan).nonEmpty && exchanges(plan).forall(_.isInstanceOf[VectorShuffleExchangeExec]), s"$plan")
     assert(rows(byK, enabled = true) === rows(byK, enabled = false))
-    def byF = spark.table("fl").repartition(5, org.apache.spark.sql.functions.col("f"))
-    assert(exchanges(collectPlan(byF)).forall(_.isInstanceOf[ShuffleExchangeExec]), "a float hash key is Spark's")
-    assert(rows(byF, enabled = true) === rows(byF, enabled = false))
+    // Float hash keys (top level and in a struct) hash the float's own bits (KeyKind.FLOAT): every row lands
+    // in Spark's partition, NaN, both zeros and -Infinity included.
+    Seq("f", "st").foreach { c =>
+      def byF = spark.table("fl").repartition(5, org.apache.spark.sql.functions.col(c))
+      val fp = collectPlan(byF)
+      assert(exchanges(fp).nonEmpty && exchanges(fp).forall(_.isInstanceOf[VectorShuffleExchangeExec]), s"$c: $fp")
+      assert(rows(byF, enabled = true) === rows(byF, enabled = false), c)
+    }
+    // A float range key: Spark's order, through our exchange.
+    val ordered = "select f, k from fl order by f desc nulls last, k"
+    assertOurExchange(spark.sql(ordered))
+    val ours = spark.sql(ordered).collect().map(_.toString).toSeq
+    spark.sessionState.conf.setConfString("spark.vecruntime.enabled", "false")
+    try assert(ours === spark.sql(ordered).collect().map(_.toString).toSeq)
+    finally spark.sessionState.conf.setConfString("spark.vecruntime.enabled", "true")
     checkAgainstSpark("select f, count(*) c, max(k) m from fl group by f")
   }
 
