@@ -982,13 +982,20 @@ object ExpressionCompiler {
       Left(s"$what over ${container.dataType.simpleString} not supported (a leaf without a lane)")
     else if (elementType.isInstanceOf[StringType] && elementType != StringType)
       Left(s"$what over collated ${elementType.simpleString} elements not supported")
-    else if (lane == null || !ElementAccessExpr.keyLane(lane) || !TypeMapping.isSupported(elementType))
+    else if (lane == null || !ElementAccessExpr.keyLane(lane) || !TypeMapping.hasLane(elementType))
+      Left(s"$what over ${elementType.simpleString} elements not supported")
+    // array_min / array_max return an element: a wide decimal one has no output lane here.
+    else if (arg == null && !TypeMapping.isSupported(elementType))
       Left(s"$what over ${elementType.simpleString} elements not supported")
     else if (arg != null && arg.dataType != elementType)
       Left(s"$what of a ${arg.dataType.simpleString} in ${elementType.simpleString} elements not supported")
     else
-      for (p <- nestedColumnPath(container, input); a <- if (arg == null) Right(null) else compile(arg, input))
-        yield ArrayScanExpr(p._1, p._2, container.dataType, kind, a)
+      for (
+        p <- nestedColumnPath(container, input);
+        a <- if (arg == null) Right(null)
+        else if (isWideDecimal(arg.dataType)) wideOperand(arg, input)
+        else compile(arg, input)
+      ) yield ArrayScanExpr(p._1, p._2, container.dataType, kind, a)
   }
 
   /**
