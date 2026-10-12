@@ -85,7 +85,11 @@ import org.apache.spark.sql.catalyst.expressions.{
   Divide,
   ElementAt,
   ArrayContains,
+  ArrayAggregate,
   ArrayFilter,
+  MapFilter,
+  TransformValues,
+  ZipWith,
   Slice,
   ArrayTransform,
   MapValues,
@@ -374,6 +378,7 @@ object ExpressionCompiler {
     case e @ ArrayPosition(child, v) => arrayScan(child, ArrayScanExpr.Position, v, e, input)
     case e @ ArrayMin(child) => arrayScan(child, ArrayScanExpr.Min, null, e, input)
     case e @ ArrayMax(child) => arrayScan(child, ArrayScanExpr.Max, null, e, input)
+    case e: ArrayAggregate => arrayAggregate(e, input)
     // Higher-order predicates: the lambda compiled over the element lane (#705).
     case ArrayExists(child, LambdaFunction(body, Seq(v: NamedLambdaVariable), _), followThreeValuedLogic) =>
       arrayPredicate(child, v, body, forAll = false, followThreeValuedLogic, "exists", input)
@@ -1029,13 +1034,16 @@ object ExpressionCompiler {
       variables: Seq[NamedExpression],
       body: Expression,
       what: String,
-      input: Seq[Attribute]
+      input: Seq[Attribute],
+      secondIsIndex: Boolean = true
   ): Either[String, (VectorExpr, Seq[Int])] = {
     val vars = variables.collect { case v: NamedLambdaVariable => v }
     val ids = vars.map(_.exprId).toSet
     if (vars.length != variables.length || vars.isEmpty || vars.length > 2)
       Left(s"$what with a lambda of ${variables.length} arguments not supported")
-    else if (vars.length == 2 && vars(1).dataType != IntegerType)
+    else if (vars.exists(v => !TypeMapping.isSupported(v.dataType)))
+      Left(s"$what over ${vars.map(_.dataType.simpleString).mkString(", ")} variables not supported")
+    else if (secondIsIndex && vars.length == 2 && vars(1).dataType != IntegerType)
       Left(s"$what with an index of ${vars(1).dataType.simpleString} not supported")
     else if (
       body.find {
@@ -1085,9 +1093,116 @@ object ExpressionCompiler {
     case e @ ElementAt(child, key, None, _) if child.dataType.isInstanceOf[MapType] =>
       elementAccess(child, key, ElementAccessExpr.MapKey, failOnError = false, e, input, nestedResult = true)
     case e @ Slice(child, start, length) => slice(child, start, length, e, input)
+    case e @ ZipWith(l, r, LambdaFunction(body, vars, _)) => zipWith(l, r, vars, body, e, input)
+    case e @ MapFilter(child, LambdaFunction(body, vars, _)) => mapLambda(child, vars, body, filter = true, e, input)
+    case e @ TransformValues(child, LambdaFunction(body, vars, _)) =>
+      mapLambda(child, vars, body, filter = false, e, input)
     // Anything else keeps the reason the ordinary compiler gives it (element access with a nested
     // element, a struct constructor, ...).
     case other => compile(other, input)
+  }
+
+  /** `zip_with(a, b, (x, y) -> f)` (#705): two arrays with nested lanes, a lambda with a lane result. */
+  private def zipWith(
+      l: Expression,
+      r: Expression,
+      vars: Seq[NamedExpression],
+      body: Expression,
+      e: Expression,
+      input: Seq[Attribute]
+  ): Result =
+    if (TypeMapping.nestedTypeOf(l.dataType) == null || TypeMapping.nestedTypeOf(r.dataType) == null)
+      Left(s"zip_with over ${l.dataType.simpleString} and ${r.dataType.simpleString} not supported")
+    else if (vars.length != 2) Left("zip_with with a lambda of other than two arguments")
+    else if (!TypeMapping.isSupported(body.dataType)) Left(s"zip_with to ${body.dataType.simpleString} not supported")
+    else
+      for (
+        lp <- nestedColumnPath(l, input); rp <- nestedColumnPath(r, input);
+        lam <- lambdaOverElements(vars, body, "zip_with", input, secondIsIndex = false)
+      ) yield ZipWithExpr(lp, l.dataType, rp, r.dataType, lam._1, lam._2, e.dataType)
+
+  /** `map_filter` / `transform_values` (#705): a map with a nested lane, the lambda over key and value. */
+  private def mapLambda(
+      container: Expression,
+      vars: Seq[NamedExpression],
+      body: Expression,
+      filter: Boolean,
+      e: Expression,
+      input: Seq[Attribute]
+  ): Result = {
+    val what = e.prettyName
+    if (!container.dataType.isInstanceOf[MapType] || TypeMapping.nestedTypeOf(container.dataType) == null)
+      Left(s"$what over ${container.dataType.simpleString} not supported")
+    else if (vars.length != 2) Left(s"$what with a lambda of other than two arguments")
+    else if (!filter && !TypeMapping.isSupported(body.dataType))
+      Left(s"$what to ${body.dataType.simpleString} values not supported")
+    else
+      for (
+        p <- nestedColumnPath(container, input);
+        lam <- lambdaOverElements(vars, body, what, input, secondIsIndex = false)
+      ) yield MapLambdaExpr(p._1, p._2, container.dataType, lam._1, lam._2, filter, e.dataType)
+  }
+
+  /**
+   * `aggregate(arr, zero, (acc, x) -> merge, acc -> finish)` (#705): the array a column or a struct
+   * field of one with a nested lane, the accumulator and the result on lanes. The merge is compiled as
+   * `if(live, merge, acc)` over the accumulator, the element and a live flag (ArrayAggregateExpr folds
+   * position by position across the batch); the finish over the accumulator, or nothing for identity.
+   */
+  private def arrayAggregate(e: ArrayAggregate, input: Seq[Attribute]): Result = e match {
+    case ArrayAggregate(
+          container,
+          zero,
+          LambdaFunction(mb, Seq(acc: NamedLambdaVariable, x: NamedLambdaVariable), _),
+          LambdaFunction(fb, Seq(acc2: NamedLambdaVariable), _)
+        ) =>
+      def nested(b: Expression, ids: Set[org.apache.spark.sql.catalyst.expressions.ExprId]) = b.find {
+        case v: NamedLambdaVariable => !ids.contains(v.exprId)
+        case _: LambdaFunction => true
+        case _ => false
+      }.nonEmpty
+      def outerOf(b: Expression): Either[String, (Seq[AttributeReference], Seq[Int])] = {
+        val attrs = b.collect { case a: AttributeReference => a }.distinct
+        attrs.find(a => !TypeMapping.isSupported(a.dataType)) match {
+          case Some(a) => Left(s"aggregate reading the outer column ${a.name} of type ${a.dataType.simpleString}")
+          case None =>
+            val ords = attrs.map(a => input.indexWhere(_.exprId == a.exprId))
+            if (ords.exists(_ < 0)) Left("aggregate over an unbound outer column") else Right((attrs, ords))
+        }
+      }
+      val elementType = container.dataType match { case a: ArrayType => a.elementType; case o => o }
+      if (!container.dataType.isInstanceOf[ArrayType] || TypeMapping.nestedTypeOf(container.dataType) == null)
+        Left(s"aggregate over ${container.dataType.simpleString} not supported")
+      else if (
+        !TypeMapping.isSupported(elementType) || !TypeMapping.isSupported(acc.dataType) ||
+        !TypeMapping.isSupported(e.dataType)
+      )
+        Left(s"aggregate of ${elementType.simpleString} into ${acc.dataType.simpleString} not supported")
+      else if (nested(mb, Set(acc.exprId, x.exprId)) || nested(fb, Set(acc2.exprId)))
+        Left("aggregate with a nested lambda not supported")
+      else {
+        val accAttr = AttributeReference(acc.name, acc.dataType, acc.nullable)(exprId = acc.exprId)
+        val xAttr = AttributeReference(x.name, x.dataType, x.nullable)(exprId = x.exprId)
+        val liveAttr = AttributeReference("__live", BooleanType, nullable = false)()
+        val merged = mb.transform {
+          case v: NamedLambdaVariable if v.exprId == acc.exprId => accAttr
+          case v: NamedLambdaVariable if v.exprId == x.exprId => xAttr
+        }
+        for {
+          mo <- outerOf(mb)
+          mergeC <- compile(If(liveAttr, merged, accAttr), Seq(accAttr, xAttr, liveAttr) ++ mo._1)
+          zeroC <- compile(zero, input)
+          p <- nestedColumnPath(container, input)
+          fin <- fb match {
+            case v: NamedLambdaVariable if v.exprId == acc2.exprId => Right(None)
+            case _ =>
+              val acc2Attr = AttributeReference(acc2.name, acc2.dataType, acc2.nullable)(exprId = acc2.exprId)
+              val f = fb.transform { case v: NamedLambdaVariable if v.exprId == acc2.exprId => acc2Attr }
+              for (fo <- outerOf(fb); fc <- compile(f, acc2Attr +: fo._1)) yield Some((fc, fo._2))
+          }
+        } yield ArrayAggregateExpr(p._1, p._2, container.dataType, zeroC, mergeC, mo._2, fin, e.dataType)
+      }
+    case other => Left(s"aggregate of shape ${other.sql} not supported")
   }
 
   /** `slice(arr, start, length)` (#705): a column or a struct field of one with a nested lane, int bounds. */

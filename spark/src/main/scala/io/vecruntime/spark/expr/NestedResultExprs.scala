@@ -111,6 +111,44 @@ final case class ArrayFilterExpr(
 
 private[expr] object NestedResults {
 
+  /** A literal as a constant lane of `n` rows (an `aggregate`'s zero, #705). */
+  def constant(lit: LiteralExpr, n: Int, ctx: EvalContext): VectorBuffers = lit.vecType match {
+    case VecType.INT32 =>
+      val d = ArrowLayout.allocateData(ctx.arena, VecType.INT32, math.max(n, 1))
+      val v = lit.number.intValue(); var i = 0
+      while (i < n) { d.setAtIndex(VectorBuffers.LE_INT, i.toLong, v); i += 1 }
+      SegmentVectorBuffers.fixedWidth(VecType.INT32, n, null, d)
+    case VecType.INT64 =>
+      val d = ArrowLayout.allocateData(ctx.arena, VecType.INT64, math.max(n, 1))
+      val v = lit.number.longValue(); var i = 0
+      while (i < n) { d.setAtIndex(VectorBuffers.LE_LONG, i.toLong, v); i += 1 }
+      SegmentVectorBuffers.fixedWidth(VecType.INT64, n, null, d)
+    case VecType.FLOAT64 =>
+      val d = ArrowLayout.allocateData(ctx.arena, VecType.FLOAT64, math.max(n, 1))
+      val v = lit.number.doubleValue(); var i = 0
+      while (i < n) { d.setAtIndex(VectorBuffers.LE_DOUBLE, i.toLong, v); i += 1 }
+      SegmentVectorBuffers.fixedWidth(VecType.FLOAT64, n, null, d)
+    case VecType.UTF8 =>
+      val b = lit.utf8Bytes
+      val offsets = ArrowLayout.allocateOffsets(ctx.arena, n)
+      val data = ArrowLayout.allocateBytes(ctx.arena, math.max(b.length.toLong * n, 1L))
+      var i = 0
+      while (i < n) {
+        java.lang.foreign.MemorySegment.copy(
+          b,
+          0,
+          data,
+          java.lang.foreign.ValueLayout.JAVA_BYTE,
+          i.toLong * b.length,
+          b.length
+        )
+        offsets.set(VectorBuffers.LE_INT, (i + 1).toLong << 2, (i + 1) * b.length)
+        i += 1
+      }
+      SegmentVectorBuffers.utf8(n, null, offsets, data)
+    case other => throw new IllegalStateException(s"no constant $other lane")
+  }
+
   /** An all-null lane of `m` rows (the answers of a lambda no live element ran). */
   def nulls(t: VecType, m: Int, ctx: EvalContext): VectorBuffers = {
     val validity = ArrowLayout.allocateBitmap(ctx.arena, math.max(m, 1))
