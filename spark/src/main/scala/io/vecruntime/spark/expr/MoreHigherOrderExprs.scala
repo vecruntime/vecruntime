@@ -45,11 +45,7 @@ private[expr] object ElementLambda {
       body: VectorExpr,
       outers: Array[Int]
   ): VectorBuffers = {
-    val gathered = outers.map { o =>
-      val in = ctx.input(o)
-      val plain = if (in.isDictionaryEncoded()) ArrowOutput.decodeDictionary(in, ctx.arena) else in
-      ElementAccessExpr.gather(plain, rowOf, m, ctx.arena)
-    }
+    val gathered = outers.map(o => ElementAccessExpr.gather(NestedInput.outerLane(ctx, o), rowOf, m, ctx.arena))
     val k = lanes.length
     val inner = new EvalContext(ctx.arena, m, (o: Int) => if (o < k) lanes(o) else gathered(o - k), selection, selected)
     body.eval(inner)

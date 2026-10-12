@@ -79,6 +79,20 @@ private[expr] object NestedInput {
     (v, nulls)
   }
 
+  /**
+   * Outer input `o` of a lambda body as a lane to gather per element (#705): a nested column (an
+   * array, map or struct a nested lambda reads) is adapted from the batch's own vector, since the
+   * context only adapts leaf lanes; in an element context it is already a lane. Dictionaries decoded.
+   */
+  def outerLane(ctx: EvalContext, o: Int): VectorBuffers = {
+    val cv = ctx.column(o)
+    val in =
+      if (cv != null && io.vecruntime.spark.adapter.TypeMapping.nestedTypeOf(cv.dataType()) != null)
+        NestedColumns.adapt(cv, cv.dataType(), ctx.numRows, ctx.arena)
+      else ctx.input(o)
+    if (in.isDictionaryEncoded()) ArrowOutput.decodeDictionary(in, ctx.arena) else in
+  }
+
   /** A validity bitmap of the rows that are not null (null when none is). */
   def validity(ctx: EvalContext, nulls: Array[Boolean]): java.lang.foreign.MemorySegment =
     if (!nulls.contains(true)) null
@@ -143,11 +157,7 @@ private[expr] object LambdaElements {
     }
     val answers = if (selected == 0) null
     else {
-      val gathered = outers.map { o =>
-        val in = ctx.input(o)
-        val plain = if (in.isDictionaryEncoded()) ArrowOutput.decodeDictionary(in, ctx.arena) else in
-        ElementAccessExpr.gather(plain, rowOf, m, ctx.arena)
-      }
+      val gathered = outers.map(o => ElementAccessExpr.gather(NestedInput.outerLane(ctx, o), rowOf, m, ctx.arena))
       val indexLane = if (index == null) null else SegmentVectorBuffers.fixedWidth(VecType.INT32, m, null, index)
       val first = if (withIndex) 2 else 1
       val inner = new EvalContext(
