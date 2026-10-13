@@ -1991,6 +1991,17 @@ public final class ColumnChunkDecoder {
                     valueCount, false, encoding);
         }
 
+        /**
+         * A v1 page whose definition levels start at {@code offset} of {@code
+         * data} and that ends {@code length} bytes later: a repeated column's
+         * page past its repetition levels (#568), which the caller decodes.
+         */
+        public static Page v1At(byte[] data, int offset, int length,
+                                int valueCount, ParquetPageDecoder.Encoding encoding) {
+            return new Page(data, offset, length, 0, 0, 0,
+                    valueCount, false, encoding);
+        }
+
         public static Page v2(byte[] data, int levelsLength, int valueCount,
                               ParquetPageDecoder.Encoding encoding) {
             return new Page(data, 0, data.length, 0, levelsLength, levelsLength,

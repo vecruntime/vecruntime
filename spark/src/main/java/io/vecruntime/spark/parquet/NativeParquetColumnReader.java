@@ -103,6 +103,19 @@ public final class NativeParquetColumnReader implements NativeParquetColumn {
     private PageReader pages;
     private int rowGroupRows;
 
+    // #568: a repeated leaf -- a list's element, a map's key or value. The decoder then walks ENTRIES, one per
+    // (repetition, definition) level pair, not rows; NativeParquetListReader maps entries to rows from the
+    // levels kept here. Pages are pulled ahead of the decoder (a batch's rows may run past the page in hand),
+    // each into its own buffer, and queued for it.
+    private final boolean repeated;
+    private final int repBitWidth;
+    private final ArrayDeque<ColumnChunkDecoder.Page> pendingPages = new ArrayDeque<>();
+    private int[] reps = new int[0];
+    private int[] defs = new int[0];
+    private int levelStart; // the first entry not decoded yet
+    private int levelEnd; // entries whose levels have been read
+    private int rowsEmitted; // rows of the row group emitted
+
     // A small pool of released batch vectors to reuse (bounded; extras are closed). Guarded by its own
     // monitor: with decode-ahead (#606) the producer thread borrows while the task thread releases. On JDK 25 a
     // monitor no longer pins a virtual thread (JEP 491).
@@ -118,6 +131,8 @@ public final class NativeParquetColumnReader implements NativeParquetColumn {
         this.sparkType = sparkType;
         this.name = name;
         this.maxDefLevel = column.getMaxDefinitionLevel();
+        this.repeated = column.getMaxRepetitionLevel() > 0;
+        this.repBitWidth = ParquetPageDecoder.bitWidth(column.getMaxRepetitionLevel());
         this.allocator = allocator;
         this.narrowBits = sparkType instanceof org.apache.spark.sql.types.ByteType
                 ? 8
@@ -220,7 +235,8 @@ public final class NativeParquetColumnReader implements NativeParquetColumn {
     public void startRowGroup(PageReader pages, int rowGroupRows) {
         this.pages = pages;
         this.rowGroupRows = rowGroupRows;
-        decoder.startChunk(rowGroupRows);
+        startRepeatedChunk();
+        decoder.startChunk(repeated ? (int) pages.getTotalValueCount() : rowGroupRows);
         releaseChunkDictionary();
         VectorBuffers dict = decodeDictionary(pages);
         if (dict != null) {
@@ -332,6 +348,9 @@ public final class NativeParquetColumnReader implements NativeParquetColumn {
     /** Rows still unemitted in the current row group. */
     @Override
     public int rowsRemaining() {
+        if (repeated) {
+            return rowGroupRows - rowsEmitted;
+        }
         return rowGroupRows - decoder.rowsDone();
     }
 
@@ -357,7 +376,7 @@ public final class NativeParquetColumnReader implements NativeParquetColumn {
             int filled = 0;
             while (filled < n) {
                 if (decoder.needsPage()) {
-                    decoder.feedPage(toKernelPage(requirePage()));
+                    decoder.feedPage(nextKernelPage());
                 }
                 filled += decoder.readBatch(n - filled, filled);
             }
@@ -370,7 +389,7 @@ public final class NativeParquetColumnReader implements NativeParquetColumn {
             int filled = 0;
             while (filled < n) {
                 if (decoder.needsPage()) {
-                    decoder.feedPage(toKernelPage(requirePage()));
+                    decoder.feedPage(nextKernelPage());
                 }
                 filled += decoder.readBatch(n - filled, filled);
             }
@@ -378,6 +397,243 @@ public final class NativeParquetColumnReader implements NativeParquetColumn {
             return binaryDecimal ? flushDecimal(n, nulls) : flushBool(n, nulls);
         }
         return fillFixed(n, /* modeA= */ true);
+    }
+
+    // ----- repeated leaves (#568: lists and maps) -----
+
+    private void startRepeatedChunk() {
+        if (!repeated) {
+            return;
+        }
+        pendingPages.clear();
+        levelStart = 0;
+        levelEnd = 0;
+        rowsEmitted = 0;
+    }
+
+    /**
+     * The next page for the decoder: a queued one for a repeated leaf, else the
+     * next of the chunk.
+     */
+    private ColumnChunkDecoder.Page nextKernelPage() {
+        if (!repeated) {
+            return toKernelPage(requirePage());
+        }
+        if (pendingPages.isEmpty() && !pullPage()) {
+            throw new IllegalStateException("ran out of pages for " + java.util.Arrays.toString(column.getPath()));
+        }
+        return pendingPages.poll();
+    }
+
+    /**
+     * Reads the chunk's next page into its own buffer: its repetition and
+     * definition levels are appended to the kept levels, and the page past its
+     * repetition levels is queued for the decoder. False at the chunk's end.
+     */
+    private boolean pullPage() {
+        DataPage page = pages.readPage();
+        if (page == null) {
+            return false;
+        }
+        int n = page.getValueCount();
+        makeRoom(n);
+        ColumnChunkDecoder.Page kernel;
+        if (page instanceof DataPageV1 v1) {
+            byte[] buf = bytes(v1.getBytes());
+            int repLen = readLeInt(buf, 0);
+            readLevels(buf, 4, repLen, repBitWidth, reps, n);
+            int defAt = 4 + repLen;
+            readLevels(buf, defAt + 4, readLeInt(buf, defAt),
+                    ParquetPageDecoder.bitWidth(maxDefLevel), defs, n);
+            kernel = ColumnChunkDecoder.Page.v1At(buf, defAt, buf.length - defAt, n,
+                    encoding(v1.getValueEncoding()));
+        } else {
+            DataPageV2 v2 = (DataPageV2) page;
+            byte[] rep = bytes(v2.getRepetitionLevels());
+            byte[] def = bytes(v2.getDefinitionLevels());
+            byte[] data = bytes(v2.getData());
+            readLevels(rep, 0, rep.length, repBitWidth, reps, n);
+            readLevels(def, 0, def.length, ParquetPageDecoder.bitWidth(maxDefLevel), defs,
+                    n);
+            byte[] buf = new byte[def.length + data.length];
+            System.arraycopy(def, 0, buf, 0, def.length);
+            System.arraycopy(data, 0, buf, def.length, data.length);
+            kernel = ColumnChunkDecoder.Page.v2At(buf, 0, def.length, def.length, data.length, n,
+                    encoding(v2.getDataEncoding()));
+        }
+        levelEnd += n;
+        pendingPages.add(kernel);
+        return true;
+    }
+
+    /** Room for {@code n} more kept levels: drops the decoded ones, then grows. */
+    private void makeRoom(int n) {
+        if (levelStart > 0) {
+            int live = levelEnd - levelStart;
+            System.arraycopy(reps, levelStart, reps, 0, live);
+            System.arraycopy(defs, levelStart, defs, 0, live);
+            levelStart = 0;
+            levelEnd = live;
+        }
+        if (reps.length < levelEnd + n) {
+            int cap = Math.max(levelEnd + n, 2 * reps.length);
+            reps = java.util.Arrays.copyOf(reps, cap);
+            defs = java.util.Arrays.copyOf(defs, cap);
+        }
+    }
+
+    /**
+     * Decodes {@code n} levels of an RLE/bit-packed stream into {@code dst} at
+     * the kept levels' end.
+     */
+    private void readLevels(byte[] src, int offset, int length,
+                            int bitWidth, int[] dst, int n) {
+        if (bitWidth == 0) {
+            java.util.Arrays.fill(dst, levelEnd, levelEnd + n, 0);
+            return;
+        }
+        io.vecruntime.kernels.parquet.RleBitPackingReader.overArray(src, offset, length, bitWidth, unpackerFor(bitWidth)).readInts(dst, levelEnd, n);
+    }
+
+    private static int readLeInt(byte[] b, int at) {
+        return (b[at] & 0xFF)
+                | (b[at + 1] & 0xFF) << 8
+                | (b[at + 2] & 0xFF) << 16
+                | (b[at + 3] & 0xFF) << 24;
+    }
+
+    /**
+     * The entries that make up the next {@code n} rows of a repeated leaf: an
+     * entry with repetition level 0 starts a row. Reads pages ahead until the
+     * row after them starts or the chunk ends; their levels are then at {@link
+     * #levelOffset} of {@link #repLevels} / {@link #defLevels}.
+     */
+    int entriesForRows(int n) {
+        int rows = 0;
+        int seen = 0; // entries scanned, from levelStart (pullPage may move levelStart to 0)
+        while (true) {
+            int[] r = reps;
+            int i = levelStart + seen;
+            int end = levelEnd;
+            while (i < end) {
+                if (r[i] == 0) {
+                    if (rows == n) {
+                        return i - levelStart;
+                    }
+                    rows++;
+                }
+                i++;
+            }
+            seen = i - levelStart;
+            if (!pullPage()) {
+                return seen;
+            }
+        }
+    }
+
+    int[] repLevels() {
+        return reps;
+    }
+
+    int[] defLevels() {
+        return defs;
+    }
+
+    int levelOffset() {
+        return levelStart;
+    }
+
+    /**
+     * Decodes the next {@code entries} entries of a repeated leaf -- {@code
+     * rows} rows, as {@link #entriesForRows} counted them -- keeping only the
+     * entries that are elements (definition level {@code >= elementDef}), back
+     * to back: a null or empty list has an entry but no element. An element is
+     * null where its level is below the leaf's maximum.
+     */
+    FieldVector readElements(int rows, int entries, int elementDef) {
+        int from = levelStart;
+        int[] d = defs;
+        int elements = 0;
+        for (int k = 0; k < entries; k++) {
+            if (d[from + k] >= elementDef) {
+                elements++;
+            }
+        }
+        decoder.startBatch(elements);
+        boolean staged = type == VecType.UTF8 || type == VecType.BOOL || binaryDecimal;
+        BaseFixedWidthVector fixed = null;
+        ArrowVectorBuffers out = null;
+        MemorySegment data = null;
+        MemorySegment validity = null;
+        if (!staged) {
+            fixed = (BaseFixedWidthVector) borrowFixed(elements);
+            out = ArrowVectorBuffers.forWrite(fixed, elements, sparkType);
+            data = out.data();
+            validity = out.validity();
+            validity.asSlice(0L, (long) ((elements + 63) >>> 6) * 8).fill((byte) 0);
+        }
+        int k = 0;
+        int at = 0;
+        while (k < entries) {
+            boolean element = d[from + k] >= elementDef;
+            int j = k + 1;
+            while (j < entries && (d[from + j] >= elementDef) == element) {
+                j++;
+            }
+            int len = j - k;
+            int done = 0;
+            while (done < len) {
+                if (decoder.needsPage()) {
+                    decoder.feedPage(nextKernelPage());
+                }
+                int m;
+                if (!element) {
+                    m = decoder.skip(len - done);
+                } else if (staged) {
+                    m = decoder.readBatch(len - done, at);
+                } else {
+                    m = decoder.readBatchDirectA(len - done, at, data, validity);
+                }
+                if (element) {
+                    at += m;
+                }
+                done += m;
+            }
+            k = j;
+        }
+        levelStart += entries;
+        rowsEmitted += rows;
+        boolean nulls = decoder.batchNullCount() > 0;
+        if (type == VecType.UTF8) {
+            return flushUtf8(elements, nulls);
+        }
+        if (staged) {
+            return binaryDecimal ? flushDecimal(elements, nulls) : flushBool(elements, nulls);
+        }
+        if (narrowBits != 0) {
+            narrow(data, elements, narrowBits);
+        }
+        if (millis) {
+            millisToMicros(data, nulls ? validity : null, elements);
+        }
+        ArrowOutput.finish(out, elements, !nulls);
+        return fixed;
+    }
+
+    /**
+     * Skips the next {@code entries} entries ({@code rows} rows) of a repeated
+     * leaf.
+     */
+    void skipEntries(int rows, int entries) {
+        int done = 0;
+        while (done < entries) {
+            if (decoder.needsPage()) {
+                decoder.feedPage(nextKernelPage());
+            }
+            done += decoder.skip(entries - done);
+        }
+        levelStart += entries;
+        rowsEmitted += rows;
     }
 
     // ----- late materialization (#611) -----
@@ -401,10 +657,14 @@ public final class NativeParquetColumnReader implements NativeParquetColumn {
      */
     @Override
     public void skipRows(int n) {
+        if (repeated) {
+            skipEntries(n, entriesForRows(n));
+            return;
+        }
         int done = 0;
         while (done < n) {
             if (decoder.needsPage()) {
-                decoder.feedPage(toKernelPage(requirePage()));
+                decoder.feedPage(nextKernelPage());
             }
             done += decoder.skip(n - done);
         }
@@ -482,7 +742,7 @@ public final class NativeParquetColumnReader implements NativeParquetColumn {
             int done = 0;
             while (done < j - i) {
                 if (decoder.needsPage()) {
-                    decoder.feedPage(toKernelPage(requirePage()));
+                    decoder.feedPage(nextKernelPage());
                 }
                 done += step.apply(sel, j - i - done, i + done);
             }
@@ -574,7 +834,7 @@ public final class NativeParquetColumnReader implements NativeParquetColumn {
         int filled = 0;
         while (filled < n) {
             if (decoder.needsPage()) {
-                decoder.feedPage(toKernelPage(requirePage()));
+                decoder.feedPage(nextKernelPage());
             }
             filled += modeA ? decoder.readBatchDirectA(n - filled, filled, data, validity) : decoder.readBatchDirectB(n - filled, filled, nio, validity);
         }
@@ -634,7 +894,7 @@ public final class NativeParquetColumnReader implements NativeParquetColumn {
         int filled = 0;
         while (filled < n) {
             if (decoder.needsPage()) {
-                decoder.feedPage(toKernelPage(requirePage()));
+                decoder.feedPage(nextKernelPage());
             }
             filled += decoder.readBatch(n - filled, filled);
         }
