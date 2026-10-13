@@ -62,8 +62,23 @@ final case class TransformExpr(
   override def eval(ctx: EvalContext): VectorBuffers = {
     val ev = LambdaElements.evaluate(ctx, inputOrdinal, steps, arrayType, body, outers, withIndex)
     val m = ev.lane.children().get(0).length()
-    val child = if (ev.answers != null) ev.answers else NestedResults.nulls(body.vecType, m, ctx)
+    val child = if (ev.answers != null) ev.answers else NestedResults.nullsOf(body.dataType, m, ctx)
     NestedVectorBuffers.list(ctx.numRows, NestedInput.validity(ctx, ev.nulls), ev.lane.offsets(), child)
+  }
+}
+
+/**
+ * A nested column, or a nested struct field of one, as its value (#705): a lambda returning its own
+ * array element (`l -> l`), or a struct's array field (`s -> s.v`), under a higher-order function whose
+ * result is then nested too. Ancestor structs' nulls are folded in.
+ */
+final case class NestedValueExpr(inputOrdinal: Int, path: Seq[Int], dataType: DataType) extends VectorExpr {
+  private val steps = path.toArray
+  override def children: Seq[VectorExpr] = Nil
+
+  override def eval(ctx: EvalContext): VectorBuffers = {
+    val (lane, nulls) = NestedInput.read(ctx, inputOrdinal, steps, dataType)
+    NestedResults.withValidity(lane, NestedInput.validity(ctx, nulls))
   }
 }
 
@@ -110,6 +125,49 @@ final case class ArrayFilterExpr(
 }
 
 private[expr] object NestedResults {
+
+  /**
+   * An all-null lane of `m` rows of Spark type `dt`, nested or not (a lambda with a nested result that
+   * no live element ran, #705): a list or map with every row null and no elements, a struct with every
+   * row and field null.
+   */
+  def nullsOf(dt: DataType, m: Int, ctx: EvalContext): VectorBuffers = dt match {
+    case a: org.apache.spark.sql.types.ArrayType =>
+      NestedVectorBuffers.list(
+        m,
+        ArrowLayout.allocateBitmap(ctx.arena, math.max(m, 1)),
+        ArrowLayout.allocateOffsets(ctx.arena, m),
+        nullsOf(a.elementType, 0, ctx)
+      )
+    case mt: org.apache.spark.sql.types.MapType =>
+      NestedVectorBuffers.map(
+        m,
+        ArrowLayout.allocateBitmap(ctx.arena, math.max(m, 1)),
+        ArrowLayout.allocateOffsets(ctx.arena, m),
+        nullsOf(mt.keyType, 0, ctx),
+        nullsOf(mt.valueType, 0, ctx)
+      )
+    case s: org.apache.spark.sql.types.StructType =>
+      val fields = new java.util.ArrayList[VectorBuffers]()
+      s.fields.foreach(f => fields.add(nullsOf(f.dataType, m, ctx)))
+      NestedVectorBuffers.struct(m, ArrowLayout.allocateBitmap(ctx.arena, math.max(m, 1)), fields)
+    case other => nulls(io.vecruntime.spark.adapter.TypeMapping.vecTypeOf(other), m, ctx)
+  }
+
+  /** `lane` with `validity` (its ancestors' nulls folded in) as its own. */
+  def withValidity(lane: NestedVectorBuffers, validity: java.lang.foreign.MemorySegment): NestedVectorBuffers =
+    lane.`type`() match {
+      case VecType.LIST => NestedVectorBuffers.list(lane.length(), validity, lane.offsets(), lane.children().get(0))
+      case VecType.MAP =>
+        NestedVectorBuffers.map(
+          lane.length(),
+          validity,
+          lane.offsets(),
+          lane.children().get(0),
+          lane.children().get(1)
+        )
+      case _ => NestedVectorBuffers.struct(lane.length(), validity, lane.children())
+    }
 
   /** A literal as a constant lane of `n` rows (an `aggregate`'s zero, #705). */
   def constant(lit: LiteralExpr, n: Int, ctx: EvalContext): VectorBuffers = lit.vecType match {

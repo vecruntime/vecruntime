@@ -109,7 +109,7 @@ final case class ZipWithExpr(
     val x = ElementAccessExpr.gather(a.children().get(0), ia, total, ctx.arena)
     val y = ElementAccessExpr.gather(b.children().get(0), ib, total, ctx.arena)
     val answers =
-      if (selected == 0) NestedResults.nulls(body.vecType, total, ctx)
+      if (selected == 0) NestedResults.nullsOf(body.dataType, total, ctx)
       else ElementLambda.run(ctx, Array(x, y), rowOf, total, selection, selected, body, outers)
     NestedVectorBuffers.list(n, NestedInput.validity(ctx, nulls), offsets, answers)
   }
@@ -160,7 +160,7 @@ final case class MapLambdaExpr(
       else ElementLambda.run(ctx, Array(keys, values), rowOf, m, selection, selected, body, outers)
     val validity = NestedInput.validity(ctx, nulls)
     if (!filter) {
-      val v = if (answers != null) answers else NestedResults.nulls(body.vecType, m, ctx)
+      val v = if (answers != null) answers else NestedResults.nullsOf(body.dataType, m, ctx)
       NestedVectorBuffers.map(n, validity, lane.offsets(), keys, v)
     } else {
       val offsets = ArrowLayout.allocateOffsets(ctx.arena, n)
