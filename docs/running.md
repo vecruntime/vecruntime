@@ -224,8 +224,9 @@ measurements behind each item are in the linked docs and issues.
 - `ObjectHashAggregateExec` functions we do not carry (`percentile*`, `collect_top_k`, `listagg`, ...);
   `collect_list`, `collect_set` and `bloom_filter_agg` are converted (#57). `SortAggregateExec` over
   non-string buffers (#57); cached tables, `InMemoryTableScanExec` (#55).
-- Nested-type accessors and constructors: `arr[i]`, `map[key]`, struct/array/map construction, the
-  lambda function families (#50); struct fields and pass-through nested columns work.
+- Nested-type constructors from scalar values (`named_struct`, `array`, `map`, ...). Struct fields,
+  `arr[i]`, `map[key]`, the array and map functions and lambdas -- a lambda returning an array, a map
+  or a struct included (#705) -- work.
 - Python UDFs (#65) and the Parquet write path, `DataWritingCommandExec` (#64).
 - Decimal window aggregates over sliding frames (#28), `IGNORE NULLS` (#58), `RANGE` window offsets over decimal or timestamp (interval) order keys.
 - The window operator holds its whole partition in memory (the sort and the joins spill; the window
