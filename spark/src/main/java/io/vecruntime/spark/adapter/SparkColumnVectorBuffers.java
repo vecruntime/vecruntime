@@ -318,6 +318,11 @@ public final class SparkColumnVectorBuffers {
         if (!cv.hasNull()) {
             return null;
         }
+        if (cv instanceof WritableColumnVector w && w.isAllNull()) {
+            // A column the file does not hold (Spark's reader: setAllNull, e.g. a struct field added since): every
+            // row is null, but its nulls array was never written -- read raw, it would say every row is present.
+            return ArrowLayout.allocateBitmap(arena, numRows);
+        }
         byte[] heap = heapNulls(cv, numRows);
         if (heap != null && heap.length < numRows) {
             heap = null;

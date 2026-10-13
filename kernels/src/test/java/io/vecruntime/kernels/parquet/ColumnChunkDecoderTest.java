@@ -76,6 +76,79 @@ class ColumnChunkDecoderTest {
     // ---------------------------------------------------------------- streaming: batch spans pages / runs
 
     @Test
+    void batchLevelsAreKeptAcrossPagesAndBatchesForAStructLeaf() {
+        // #568: a leaf under an optional struct (max definition level 2): 0 = struct null, 1 = leaf null,
+        // 2 = present. Two v1 PLAIN pages, batches of 300 that start and end inside pages: each batch's kept
+        // levels must be the input's, its null count the rows below 2, and its values the present ones.
+        Random rnd = new Random(568);
+        int rows = 2000;
+        int[] levels = new int[rows];
+        for (int i = 0; i < rows; i++) {
+            levels[i] = rnd.nextInt(3);
+        }
+        int[] split = {0, 1100, rows};
+        List<ColumnChunkDecoder.Page> pages = new ArrayList<>();
+        for (int p = 0; p + 1 < split.length; p++) {
+            int[] lv = java.util.Arrays.copyOfRange(levels, split[p], split[p + 1]);
+            byte[] enc = RleBitPackingReaderTest.encode(lv, 2, false);
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            for (int b = 0; b < 4; b++) {
+                out.write((enc.length >>> (8 * b)) & 0xFF);
+            }
+            out.writeBytes(enc);
+            for (int i = split[p];
+                 i < split[p + 1];
+                 i++) {
+                if (levels[i] == 2) {
+                    for (int b = 0; b < 4; b++) {
+                        out.write((i >>> (8 * b)) & 0xFF); // the value is its row number
+                    }
+                }
+            }
+            byte[] page = out.toByteArray();
+            pages.add(ColumnChunkDecoder.Page.v1(page, page.length, lv.length, ParquetPageDecoder.Encoding.PLAIN));
+        }
+        int batch = 300;
+        ColumnChunkDecoder d = new ColumnChunkDecoder(VecType.INT32, 2, batch,
+                bw -> (src, sp, dst, dp) -> refUnpack8(src, sp, dst, dp, bw));
+        d.setRecordLevels(true);
+        d.startChunk(rows);
+        int next = 0;
+        try (Arena arena = Arena.ofConfined()) {
+            for (int start = 0; start < rows; start += batch) {
+                int n = Math.min(batch, rows - start);
+                d.startBatch(n);
+                int filled = 0;
+                while (filled < n) {
+                    if (d.needsPage()) {
+                        d.feedPage(pages.get(next++));
+                    }
+                    filled += d.readBatch(n - filled, filled);
+                }
+                int[] kept = d.batchLevels();
+                int nulls = 0;
+                for (int r = 0; r < n; r++) {
+                    assertEquals(levels[start + r], kept[r], "level of row " + (start + r));
+                    if (levels[start + r] < 2) {
+                        nulls++;
+                    }
+                }
+                assertEquals(nulls, d.batchNullCount(), "nulls of the batch at " + start);
+                MemorySegment data = arena.allocate((long) n * 4);
+                MemorySegment validity = arena.allocate(8L * ((n + 63) >>> 6));
+                d.flushFixed(n, data, validity);
+                for (int r = 0; r < n; r++) {
+                    boolean present = (validity.get(ValueLayout.JAVA_BYTE, r >>> 3) & (1 << (r & 7))) != 0;
+                    assertEquals(levels[start + r] == 2, present, "validity of row " + (start + r));
+                    if (present) {
+                        assertEquals(start + r, data.get(LE_INT, (long) r * 4), "value of row " + (start + r));
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
     void batchSpansPagesWhenBatchSizeDoesNotDividePageSize() {
         // 5 pages of 1000 rows each; batch size 384 does not divide 1000, so most batches start and end
         // inside a page and several span a page boundary. PLAIN, nullable. Compared against the input.

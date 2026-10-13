@@ -126,6 +126,10 @@ public final class ColumnChunkDecoder {
     private byte[] utf8Data; // UTF8: gathered bytes for the batch
     private int utf8Len; // bytes written into utf8Data this batch
     private int batchNulls; // nulls in the current batch (from the definition levels)
+    // #568: the batch's raw definition levels, kept when a struct reader derives its ancestors' validity from
+    // them (a leaf under a struct: level >= the struct's own definition level means the struct is present).
+    private boolean recordLevels;
+    private int[] batchLevels = new int[0];
 
     // ---- current-page state (resumable) ----
     private byte[] pageData;
@@ -217,6 +221,36 @@ public final class ColumnChunkDecoder {
             if (validityWords == null || validityWords.length < words) {
                 validityWords = new long[words];
             }
+            if (recordLevels && batchLevels.length < batchRows) {
+                batchLevels = new int[batchRows];
+            }
+        }
+    }
+
+    /**
+     * Keep each batch's raw definition levels ({@link #batchLevels}), for a
+     * reader that derives its ancestors' validity from a leaf's levels (#568:
+     * a struct is present where its first leaf's level reaches the struct's
+     * own definition level). Off by default; only for a column with
+     * definition levels. Set before the first batch.
+     */
+    public void setRecordLevels(boolean on) {
+        this.recordLevels = on && maxDefLevel > 0;
+    }
+
+    /**
+     * The definition level of each row of the batch being filled, rows {@code
+     * [0, rows)} (valid until the next {@link #startBatch}); empty unless
+     * {@link #setRecordLevels} is on. Rows filled by {@link #readBatch},
+     * {@link #readBatchDirectA} and {@link #readBatchDirectB} only.
+     */
+    public int[] batchLevels() {
+        return batchLevels;
+    }
+
+    private void keepLevels(int dstBase, int m) {
+        if (recordLevels) {
+            System.arraycopy(pageLevels, pageRow, batchLevels, dstBase, m);
         }
     }
 
@@ -549,6 +583,7 @@ public final class ColumnChunkDecoder {
             presentCount = m;
             present = null;
         } else {
+            keepLevels(dstBase, m);
             present = idScratchPresent(m);
             presentCount = buildValidityAndPresent(dstBase, m, present);
             if (presentCount == m) {
@@ -787,6 +822,7 @@ public final class ColumnChunkDecoder {
             presentCount = m;
             present = null;
         } else {
+            keepLevels(dstBase, m);
             present = idScratchPresent(m);
             presentCount = buildValidityDirect(dstBase, m, present, outValidity);
             if (presentCount == m) {
@@ -823,6 +859,7 @@ public final class ColumnChunkDecoder {
             presentCount = m;
             present = null;
         } else {
+            keepLevels(dstBase, m);
             present = idScratchPresent(m);
             presentCount = buildValidityDirect(dstBase, m, present, outValidity);
             if (presentCount == m) {

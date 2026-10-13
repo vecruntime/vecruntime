@@ -19,7 +19,7 @@ import scala.jdk.CollectionConverters._
 
 import io.vecruntime.spark.adapter.TypeMapping
 import io.vecruntime.spark.arrow.{ArrowOutput, SelectedColumnarBatch, VectorAllocators}
-import io.vecruntime.spark.parquet.NativeParquetColumnReader
+import io.vecruntime.spark.parquet.{NativeParquetColumn, NativeParquetColumnReader, NativeParquetStructReader}
 import org.apache.hadoop.conf.Configuration
 import org.apache.parquet.HadoopReadOptions
 import org.apache.parquet.filter2.compat.FilterCompat
@@ -395,7 +395,7 @@ private[vecruntime] final class VectorParquetPartitionReader(
 
   // Per-file state.
   private var reader: ParquetFileReader = _
-  private var columnReaders: Array[NativeParquetColumnReader] = _
+  private var columnReaders: Array[NativeParquetColumn] = _
   private var rowGroupIndex = 0
   private var partitionValues: InternalRow = _ // this file's partition values (for constant columns)
 
@@ -408,8 +408,8 @@ private[vecruntime] final class VectorParquetPartitionReader(
   private var lateOff = false
   private var lateDenseRun = 0
   private var emitted: ColumnarBatch = _
-  private var emittedVectors: Array[org.apache.arrow.vector.FieldVector] = _ // batch-owned data vectors to release
-  private var emittedReaders: Array[NativeParquetColumnReader] =
+  private var emittedVectors: Array[AnyRef] = _ // batch-owned data vectors to release
+  private var emittedReaders: Array[NativeParquetColumn] =
     _ // the readers that made them (#612: an id batch must go back to its own)
   private var emittedPartitionVectors: Array[ColumnVector] = _ // batch-owned partition constant columns to close
   private var fallback: Iterator[ColumnarBatch] = _ // Spark's reader for a file we cannot decode
@@ -482,7 +482,7 @@ private[vecruntime] final class VectorParquetPartitionReader(
     }
     val n = math.min(batchSize, rgRows - rgOffset)
     val columns = new Array[ColumnVector](attrs.length)
-    val dataVectors = new Array[org.apache.arrow.vector.FieldVector](dataColumnCount)
+    val dataVectors = new Array[AnyRef](dataColumnCount)
     // With a decode filter, a column skipped whole is a null vector the batch owns, closed with the constants.
     val partitionVectors =
       new Array[ColumnVector](partitionSchema.length + (if (decodeFilter == null) 0 else dataColumnCount))
@@ -549,7 +549,7 @@ private[vecruntime] final class VectorParquetPartitionReader(
   private def applyDecodeFilter(
       n: Int,
       columns: Array[ColumnVector],
-      dataVectors: Array[org.apache.arrow.vector.FieldVector],
+      dataVectors: Array[AnyRef],
       owned: Array[ColumnVector]
   ): SelectedColumnarBatch =
     EvalContexts.withBatch(new ColumnarBatch(columns, n)) { ctx =>
@@ -562,7 +562,7 @@ private[vecruntime] final class VectorParquetPartitionReader(
       while (c < dataColumnCount) {
         if (!filterColumns(c)) {
           val r = columnReaders(c)
-          if (count == 0) {
+          if (count == 0 && !attrs(c)._2.isInstanceOf[StructType]) {
             r.skipRows(n)
             val (name, dt) = attrs(c)
             val v = ArrowOutput.nulls(name, dt, n, allocator)
@@ -755,22 +755,27 @@ private[vecruntime] final class VectorParquetPartitionReader(
     installedFirst = p.firstStore
     installedFirstPending = p.firstRead
     val columns = p.clipped.getColumns
-    columnReaders = new Array[NativeParquetColumnReader](dataColumnCount)
-    // Map each required data column to its clipped ColumnDescriptor by leaf name (flat schema only).
+    columnReaders = new Array[NativeParquetColumn](dataColumnCount)
+    // Map each required data column to its clipped ColumnDescriptor by leaf name; a struct (#568) to its group.
     var i = 0
     while (i < dataColumnCount) {
       val field = requiredSchema.fields(i)
-      val cd = columns.asScala.find(_.getPath()(0).equalsIgnoreCase(field.name))
-        .getOrElse(throw new IllegalStateException(s"column ${field.name} missing from clipped schema"))
-      columnReaders(i) =
-        new NativeParquetColumnReader(
-          cd,
-          io.vecruntime.spark.parquet.NativeParquetSupport.decodeLane(field.dataType),
-          field.dataType,
-          field.name,
-          batchSize,
-          allocator
-        )
+      columnReaders(i) = field.dataType match {
+        case st: StructType =>
+          val name = topLevelName(p.clipped, field.name)
+          NativeParquetStructReader.create(p.clipped, Array(name), st, field.name, batchSize, allocator)
+        case dt =>
+          val cd = columns.asScala.find(_.getPath()(0).equalsIgnoreCase(field.name))
+            .getOrElse(throw new IllegalStateException(s"column ${field.name} missing from clipped schema"))
+          new NativeParquetColumnReader(
+            cd,
+            io.vecruntime.spark.parquet.NativeParquetSupport.decodeLane(dt),
+            dt,
+            field.name,
+            batchSize,
+            allocator
+          )
+      }
       columnReaders(i).setPoolLimit(poolLimit)
       columnReaders(i).setDictionaryIds(dictionaryStrings)
       i += 1
@@ -778,6 +783,10 @@ private[vecruntime] final class VectorParquetPartitionReader(
     buildPartitionColumns(p.file)
     metrics.numFiles += 1
   }
+
+  /** The clipped schema's own name for the top-level column `name` (the file's spelling of it). */
+  private def topLevelName(clipped: MessageType, name: String): String =
+    clipped.getFields.asScala.find(_.getName.equalsIgnoreCase(name)).map(_.getName).getOrElse(name)
 
   /** Record this file's partition values; per-batch constant columns are built from them in next(). */
   private def buildPartitionColumns(file: PartitionedFile): Unit = {
@@ -787,7 +796,7 @@ private[vecruntime] final class VectorParquetPartitionReader(
   private def startRowGroup(store: org.apache.parquet.column.page.PageReadStore, rowCount: Int): Unit = {
     var c = 0
     while (c < dataColumnCount) {
-      columnReaders(c).startRowGroup(store.getPageReader(columnReaders(c).column()), rowCount)
+      columnReaders(c).startRowGroup(store, rowCount)
       c += 1
     }
   }
@@ -902,12 +911,31 @@ private[vecruntime] final class VectorParquetPartitionReader(
     var f = 0
     while (f < requiredSchema.length) {
       val field = requiredSchema.fields(f)
-      val cd = clipped.getColumns.asScala.find(_.getPath()(0).equalsIgnoreCase(field.name))
-      if (cd.isDefined && !VectorParquetScanExec.physicalMatches(field.dataType, cd.get.getPrimitiveType)) {
-        return true
+      field.dataType match {
+        case st: StructType =>
+          // #568: every leaf of the struct, in the clipped group's order, stored as its lane needs.
+          var ok = true
+          val shape = NativeParquetStructReader.forEachLeaf(
+            clipped,
+            Array(topLevelName(clipped, field.name)),
+            st,
+            (cd: org.apache.parquet.column.ColumnDescriptor, dt: org.apache.spark.sql.types.DataType) =>
+              if (!VectorParquetScanExec.physicalMatches(dt, cd.getPrimitiveType)) ok = false
+          )
+          if (!shape || !ok) return true
+        case dt =>
+          val cd = clipped.getColumns.asScala.find(_.getPath()(0).equalsIgnoreCase(field.name))
+          if (cd.isDefined && !VectorParquetScanExec.physicalMatches(dt, cd.get.getPrimitiveType)) {
+            return true
+          }
       }
       f += 1
     }
+    // A requested column the file does not hold (a field added since the file was written): clipping adds it to
+    // the requested schema with no column chunk behind it. Spark's reader fills it with nulls; ours has nothing
+    // to decode, so the file falls over.
+    val fileSchema = footer.getFileMetaData.getSchema
+    if (clipped.getColumns.asScala.exists(cd => !fileSchema.containsPath(cd.getPath))) return true
     val blocks = footer.getBlocks
     var b = 0
     while (b < blocks.size()) {
@@ -932,9 +960,13 @@ private[vecruntime] final class VectorParquetPartitionReader(
   }
 
   /** Whether any requested column holds dates or timestamps: the only columns a calendar rebase touches. */
-  private val hasDatetime: Boolean = requiredSchema.fields.exists(f =>
-    f.dataType == org.apache.spark.sql.types.DateType || f.dataType == org.apache.spark.sql.types.TimestampType
-  )
+  private val hasDatetime: Boolean = {
+    def datetime(dt: org.apache.spark.sql.types.DataType): Boolean = dt match {
+      case s: StructType => s.fields.exists(f => datetime(f.dataType)) // #568: a struct's leaves too
+      case t => t == org.apache.spark.sql.types.DateType || t == org.apache.spark.sql.types.TimestampType
+    }
+    requiredSchema.fields.exists(f => datetime(f.dataType))
+  }
 
   /**
    * This file's rebase modes and INT96 time-zone conversion, resolved as Spark's `ParquetFileFormat` resolves
@@ -1064,9 +1096,9 @@ private[vecruntime] object VectorParquetPartitionReader {
    */
   final class OwnedBatch(
       val batch: ColumnarBatch,
-      val vectors: Array[org.apache.arrow.vector.FieldVector],
+      val vectors: Array[AnyRef],
       val partitionVectors: Array[ColumnVector],
-      val readers: Array[io.vecruntime.spark.parquet.NativeParquetColumnReader],
+      val readers: Array[io.vecruntime.spark.parquet.NativeParquetColumn],
       val recycled: Boolean
   )
 
@@ -1293,8 +1325,13 @@ object VectorParquetScanPlanner {
     if (!relation.fileFormat.isInstanceOf[org.apache.spark.sql.execution.datasources.parquet.ParquetFileFormat]) {
       return Some("scan is not Parquet")
     }
-    // Nested / complex required columns are not supported (flat only).
-    val nested = scan.requiredSchema.fields.find(f => !f.dataType.isInstanceOf[AtomicType])
+    // Arrays and maps (anywhere in a column) need repetition levels, which the reader does not decode; a struct of
+    // readable fields is read natively (#568).
+    val nested = scan.requiredSchema.fields.find(f =>
+      !f.dataType.isInstanceOf[AtomicType] &&
+        !(f.dataType.isInstanceOf[StructType] &&
+          io.vecruntime.spark.parquet.NativeParquetSupport.isReadable(f.dataType))
+    )
     nested.foreach(f => return Some(s"nested or complex column ${f.name}:${f.dataType.simpleString}"))
     // Every required column must be a type the native reader actually decodes -- ONE shared source of truth
     // (NativeParquetSupport) so the plan-time check and the runtime decoder cannot drift. Excludes FLOAT,

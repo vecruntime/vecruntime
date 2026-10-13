@@ -58,6 +58,19 @@ public final class NativeParquetSupport {
 
     /** Whether the native reader can decode a column of this type. */
     public static boolean isReadable(DataType dt) {
+        if (dt instanceof org.apache.spark.sql.types.StructType st) {
+            // #568: a struct whose fields are all readable -- leaves or structs; an array or a map anywhere under
+            // it needs repetition levels, which the reader does not decode yet.
+            if (st.fields().length == 0) {
+                return false;
+            }
+            for (org.apache.spark.sql.types.StructField f : st.fields()) {
+                if (!isReadable(f.dataType())) {
+                    return false;
+                }
+            }
+            return true;
+        }
         if (dt instanceof IntegerType || dt instanceof DateType) {
             return true; // INT32 physical, INT32 lane
         }
