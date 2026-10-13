@@ -7,7 +7,7 @@ title: Native Parquet reader
 
 This page is the design note for VecRuntime's own Parquet scan, #559. It covers what the scan does today, how it is put together, what it does not decode yet, and the work that is left.
 
-**In short (2026-10-03):** the scan reads every flat Parquet type and every encoding parquet-java's v1 and v2 writers produce. Only `INT96` timestamps and nested types (structs, lists, maps) go to Spark's reader: `INT96` per file, nested per plan. On the 1 TB TPC-DS run of 2026-10-02 it took VecRuntime to 1,542 s for the 103 queries, against 3,099 s for Spark, 1,999 s for Comet and 1,954 s for Comet's reader under our operators.
+**In short (2026-10-03):** the scan reads every flat Parquet type and every encoding parquet-java's v1 and v2 writers produce. Structs are read natively too (#568). Only `INT96` timestamps, lists and maps go to Spark's reader: `INT96` per file, lists and maps per plan. On the 1 TB TPC-DS run of 2026-10-02 it took VecRuntime to 1,542 s for the 103 queries, against 3,099 s for Spark, 1,999 s for Comet and 1,954 s for Comet's reader under our operators.
 
 The scan is **on by default** since 0.0.6 (`spark.vecruntime.scan.nativeParquet.enabled`), except in a session where Comet's scan is active: Comet's plugin or extension registered, with `spark.comet.enabled` and `spark.comet.scan.enabled` not false. There Comet's reader stays the scan unless the key is set. Setting the key to `false` brings back Spark's vectorized reader under our operators. Its configuration keys are in the [Configuration reference](configuration.html), and the planner's fallback reasons are on the [Operators](operators.html) page.
 
@@ -85,12 +85,12 @@ A few rules hold the design together:
 | Encodings | `PLAIN`, `PLAIN_DICTIONARY`, `RLE_DICTIONARY`; `RLE` for booleans; `DELTA_BINARY_PACKED` on INT32/INT64; `DELTA_LENGTH_BYTE_ARRAY` on BINARY; `DELTA_BYTE_ARRAY` on BINARY and `FIXED_LEN_BYTE_ARRAY`; `BYTE_STREAM_SPLIT` on INT32/INT64/FLOAT/DOUBLE; definition levels in `RLE`/`BIT_PACKED` | `VectorParquetScanExec.supportsEncoding` |
 | Calendar | Files whose datetime rebase mode resolves to `CORRECTED` | Resolved per file from the footer and the session, as Spark resolves it |
 | Data pages | v1 and v2 | v2 levels and data are read separately |
-| Schema | Flat only | Nested types keep Spark's scan |
+| Schema | Flat columns and structs (#568), structs of structs included | A list or a map anywhere in a column keeps Spark's scan for the plan |
 | Codecs | Whatever parquet-java decompresses (snappy, zstd, gzip, lz4, …) | Decompression is done by parquet-java |
 
 What happens when a column is not supported:
-- **Spark's scan for the whole plan:** a nested column, a type with no decode path (a string with a non-default collation, say), or a bucketed scan. The planner records the reason, so VecRuntime's operators still run above Spark's scan.
-- **Spark's reader for that one file**, with that file's own rebase modes and INT96 conversion: an `INT96` timestamp, a date or timestamp that needs a calendar rebase, a UTC-adjusted column read as `timestamp_ntz`, a decimal stored with another scale, or an encoding on a physical type the decoder has no path for (`BYTE_STREAM_SPLIT` on `FIXED_LEN_BYTE_ARRAY`, say). The rest of the scan stays native.
+- **Spark's scan for the whole plan:** a list or a map (anywhere in a column, a struct's field included), a type with no decode path (a string with a non-default collation, say), or a bucketed scan. The planner records the reason, so VecRuntime's operators still run above Spark's scan.
+- **Spark's reader for that one file**, with that file's own rebase modes and INT96 conversion: an `INT96` timestamp, a date or timestamp that needs a calendar rebase, a UTC-adjusted column read as `timestamp_ntz`, a struct field the file does not hold, a decimal stored with another scale, or an encoding on a physical type the decoder has no path for (`BYTE_STREAM_SPLIT` on `FIXED_LEN_BYTE_ARRAY`, say). The rest of the scan stays native.
 
 ## Status at 1 TB TPC-DS
 
@@ -240,7 +240,16 @@ The corpus approach follows Hardwood (`hardwood-hq/hardwood`), as does bounding 
     - `VectorParquetScanSuite`: `decimal(20|25|38)` round trips (v1 dictionary, `PLAIN`, v2 `DELTA_BYTE_ARRAY`, legacy format) and the rescale fallback.
     - The corpus files `fixed_length_decimal*` and `byte_array_decimal` are now read natively.
   - **JMH** (`V2EncodingsBenchmark` `flba-dec38`, x86, one 20,000-value page): 13.5 pages per ms. parquet-java's `FixedLenByteArrayPlainValuesReader.readBytes` does 13.7, but it only slices the bytes and does no conversion. Before the big-endian long reads this path measured 3.4.
-- **Nested types** (structs, lists, maps). Need repetition levels and Arrow list and struct builders. This is the largest item and needs its own design.
+- **Structs** (#568): **done**, structs of structs included, over every leaf type and encoding above. A struct has no column chunk of its own; Parquet records its nulls in its leaves' definition levels. `NativeParquetStructReader` holds one reader per field (a leaf's `NativeParquetColumnReader`, or another struct reader), and each leaf decodes its rows straight into its own batch vector, as a flat column does. The struct is present on a row where its first leaf's level reaches the struct's own definition level (the optional groups from the root down to it), so `ColumnChunkDecoder` keeps that one leaf's batch levels (`setRecordLevels`) and the struct reader turns them into the struct's nulls in one pass. That is how Spark's vectorized reader computes them too. The batch is Spark's struct column over the fields' columns (`VectorNestedColumnVector.struct`), which our operators read through `getStruct` / `getChild`.
+  - **Per file**, `forEachLeaf` walks the clipped group in the struct's field order and checks each leaf's physical type against its lane (`physicalMatches`). A shape it cannot follow (a field matched by id under another name, a repeated group) falls the file over. So does a requested column the file does not hold: Spark's reader fills it with nulls. Dates and timestamps under a struct count for the calendar-rebase check, and an `INT96` leaf falls the file over as at top level.
+  - **Strings** under a struct are read by value, not as dictionary ids (#612).
+  - **Tests** (`NativeParquetStructSuite`), each against Spark's row-based reader, with the native scan asserted to decode the row groups itself:
+    - Spark-written files: every lane type as a field, nulls at the struct and at the leaf, a struct of structs, v1 and v2 pages, dictionary on and off. Nested schema pruning, filters and aggregates on fields, a shuffle.
+    - parquet-java's `ExampleParquetWriter`: required groups, required leaves under optional groups, and an optional group under a required one, which Spark does not write. v1 and v2, dictionary on and off.
+    - Hardwood's `NestedSchemaTest` struct-of-struct shape, and the `apache/parquet-testing` deep struct from arrow-rs (required groups of required leaves; its unsigned `INT64` fields are a decimal on Spark's side, so selecting them keeps that file on Spark's reader).
+    - Fallbacks with Spark's rows: a struct holding a list or a map (the plan), a struct field the file lacks, and an `INT96` timestamp in a struct (the file). Field names resolve case-insensitively.
+  - **JMH:** no new decode kernel. The leaves are the flat decoders measured above, and the struct adds one pass over one leaf's levels per batch.
+- **Lists and maps.** These need repetition levels into Arrow list and map vectors (offsets plus a child), matching what `VectorGenerateExec` and `SizeExpr` consume. They keep Spark's scan until then.
 
 ### Performance
 

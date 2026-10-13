@@ -1,0 +1,75 @@
+/*
+ * Copyright 2026-2027 Angel Conde and the vecruntime contributors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package io.vecruntime.spark.parquet;
+
+import java.lang.foreign.MemorySegment;
+
+import org.apache.parquet.column.page.PageReadStore;
+import org.apache.spark.sql.vectorized.ColumnVector;
+
+/**
+ * One top-level column of the native Parquet scan: a leaf column chunk
+ * ({@link NativeParquetColumnReader}) or a struct over leaf chunks ({@link
+ * NativeParquetStructReader}, #568). A batch is an opaque handle the column
+ * made: the scan wraps it as Spark's column ({@link #wrap}) and hands it back
+ * ({@link #release}) when the batch is done.
+ */
+public interface NativeParquetColumn {
+
+    /**
+     * Begin a row group of {@code rows} rows: each leaf takes its page reader
+     * from {@code store}.
+     */
+    void startRowGroup(PageReadStore store, int rows);
+
+    /**
+     * The next {@code n} rows of the row group, as a batch handle the caller
+     * owns.
+     */
+    Object readBatch(int n);
+
+    /**
+     * {@link #readBatch} decoding only the rows set in {@code selection} (#611);
+     * the other rows are null or zero, and the batch's selection excludes them.
+     */
+    Object readBatchSelected(int n, MemorySegment selection);
+
+    /** Whether {@link #readBatchSelected} can beat decoding the batch whole. */
+    boolean decodesSelectedFaster();
+
+    /** Skips the next {@code n} rows of the row group without decoding them. */
+    void skipRows(int n);
+
+    /** The batch as Spark's column. */
+    ColumnVector wrap(Object batch);
+
+    /** Returns a batch's memory to the column (pooled or closed). */
+    void release(Object batch);
+
+    /** How many released vectors each leaf keeps for reuse. */
+    void setPoolLimit(int limit);
+
+    /**
+     * Emit dictionary-encoded strings as dictionary ids (#612), where the
+     * column allows it.
+     */
+    void setDictionaryIds(boolean enabled);
+
+    /** Rows still unemitted in the current row group. */
+    int rowsRemaining();
+
+    void close();
+}

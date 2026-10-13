@@ -76,7 +76,7 @@ import org.apache.spark.sql.types.DataType;
  * <p>Not thread safe: one reader per column per task. Slice 1 supports {@code
  * PLAIN} and {@code RLE_DICTIONARY}/{@code PLAIN_DICTIONARY} value encodings.
  */
-public final class NativeParquetColumnReader {
+public final class NativeParquetColumnReader implements NativeParquetColumn {
 
     private final ColumnDescriptor column;
     private final VecType type;
@@ -177,6 +177,41 @@ public final class NativeParquetColumnReader {
         return u;
     }
 
+    @Override
+    public void startRowGroup(org.apache.parquet.column.page.PageReadStore store, int rows) {
+        startRowGroup(store.getPageReader(column), rows);
+    }
+
+    @Override
+    public org.apache.spark.sql.vectorized.ColumnVector wrap(Object batch) {
+        return wrap((FieldVector) batch);
+    }
+
+    @Override
+    public void release(Object batch) {
+        release((FieldVector) batch);
+    }
+
+    /**
+     * Keep each batch's definition levels (#568): a struct reader derives the
+     * struct's validity from its first leaf's levels.
+     */
+    void setRecordLevels(boolean on) {
+        decoder.setRecordLevels(on);
+    }
+
+    /**
+     * The last batch's definition levels, rows {@code [0, n)}; see {@link
+     * #setRecordLevels}.
+     */
+    int[] batchLevels() {
+        return decoder.batchLevels();
+    }
+
+    int maxDefinitionLevel() {
+        return maxDefLevel;
+    }
+
     /**
      * Begin a new row group of {@code rowGroupRows} rows on this column's {@code
      * pages}. Decodes the chunk's dictionary page once (if present) and resets the
@@ -234,6 +269,7 @@ public final class NativeParquetColumnReader {
      * they do over Spark's scan. Only for a UTF8 string column read through the
      * UTF8 path (not binary, not a fixed-length or byte-array decimal).
      */
+    @Override
     public void setDictionaryIds(boolean enabled) {
         boolean ok = enabled
                 && type == VecType.UTF8
@@ -294,6 +330,7 @@ public final class NativeParquetColumnReader {
     }
 
     /** Rows still unemitted in the current row group. */
+    @Override
     public int rowsRemaining() {
         return rowGroupRows - decoder.rowsDone();
     }
@@ -313,6 +350,7 @@ public final class NativeParquetColumnReader {
      * intermediate copies" requirement. UTF8 stays on the staging path (its two
      * passes already size one data buffer and bulk-copy offsets+bytes once).
      */
+    @Override
     public FieldVector readBatch(int n) {
         decoder.startBatch(n);
         if (type == VecType.UTF8) {
@@ -352,6 +390,7 @@ public final class NativeParquetColumnReader {
      * run of one or a few rows -- costs more than it saves (1 TB q44: twice the
      * executor time at ~0.1% scattered survivors).
      */
+    @Override
     public boolean decodesSelectedFaster() {
         return type == VecType.UTF8;
     }
@@ -360,6 +399,7 @@ public final class NativeParquetColumnReader {
      * Skips the next {@code n} rows of the row group without decoding them into
      * any vector.
      */
+    @Override
     public void skipRows(int n) {
         int done = 0;
         while (done < n) {
@@ -377,6 +417,7 @@ public final class NativeParquetColumnReader {
      * selection excludes them. Runs of unselected rows are skipped in the page
      * streams.
      */
+    @Override
     public FieldVector readBatchSelected(int n, java.lang.foreign.MemorySegment selection) {
         decoder.startBatch(n);
         if (type == VecType.UTF8 || type == VecType.BOOL || binaryDecimal) {
@@ -735,6 +776,7 @@ public final class NativeParquetColumnReader {
      * How many released vectors the pool keeps (decode-ahead keeps more batches
      * in flight).
      */
+    @Override
     public void setPoolLimit(int limit) {
         synchronized (pool) {
             maxPool = Math.max(1, limit);
@@ -822,6 +864,7 @@ public final class NativeParquetColumnReader {
      * Releases the pool. The scratch arena is automatic: the GC frees it once
      * the reader is unreachable. A vector released after this is closed, not pooled.
      */
+    @Override
     public void close() {
         synchronized (pool) {
             closed = true;

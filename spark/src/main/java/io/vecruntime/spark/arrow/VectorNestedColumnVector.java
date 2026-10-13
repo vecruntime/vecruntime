@@ -182,6 +182,22 @@ public final class VectorNestedColumnVector extends ColumnVector {
         return !(dt instanceof ArrayType || dt instanceof MapType || dt instanceof StructType);
     }
 
+    /**
+     * A struct column of {@code length} rows over the field columns {@code
+     * children} (the native Parquet scan's struct, #568): {@code nulls} marks
+     * the null rows, or is absent when no row is null. A leaf field is read
+     * null-safe, as under {@link #of}; closing the struct closes its fields.
+     */
+    public static ColumnVector struct(StructType dt, int length, boolean[] nulls,
+            ColumnVector[] children) {
+        StructField[] fs = dt.fields();
+        ColumnVector[] kids = new ColumnVector[children.length];
+        for (int f = 0; f < kids.length; f++) {
+            kids[f] = isLeaf(fs[f].dataType()) ? new NullSafe(children[f], fs[f].dataType()) : children[f];
+        }
+        return new VectorNestedColumnVector(dt, length, nulls, null, kids);
+    }
+
     public int length() {
         return length;
     }
