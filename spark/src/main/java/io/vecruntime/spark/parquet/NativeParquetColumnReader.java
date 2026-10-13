@@ -114,6 +114,7 @@ public final class NativeParquetColumnReader implements NativeParquetColumn {
     private int[] defs = new int[0];
     private int levelStart; // the first entry not decoded yet
     private int levelEnd; // entries whose levels have been read
+    private boolean chunkHead; // the chunk's leading orphan entries are not dropped yet
     private int rowsEmitted; // rows of the row group emitted
 
     // A small pool of released batch vectors to reuse (bounded; extras are closed). Guarded by its own
@@ -409,6 +410,7 @@ public final class NativeParquetColumnReader implements NativeParquetColumn {
         levelStart = 0;
         levelEnd = 0;
         rowsEmitted = 0;
+        chunkHead = true;
     }
 
     /**
@@ -503,12 +505,37 @@ public final class NativeParquetColumnReader implements NativeParquetColumn {
     }
 
     /**
+     * Drops the entries a chunk opens with that start no row (repetition level
+     * above 0, as in parquet-testing's bad_data/ARROW-GH-45185): parquet-java's
+     * record reader skips them, so Spark's scan has no row for them either.
+     */
+    private void dropOrphanHead() {
+        if (!chunkHead) {
+            return;
+        }
+        chunkHead = false;
+        int k = 0;
+        while (true) {
+            while (levelStart + k < levelEnd && reps[levelStart + k] != 0) {
+                k++;
+            }
+            if (levelStart + k < levelEnd || !pullPage()) {
+                break;
+            }
+        }
+        if (k > 0) {
+            skipLevels(0, k);
+        }
+    }
+
+    /**
      * The entries that make up the next {@code n} rows of a repeated leaf: an
      * entry with repetition level 0 starts a row. Reads pages ahead until the
      * row after them starts or the chunk ends; their levels are then at {@link
      * #levelOffset} of {@link #repLevels} / {@link #defLevels}.
      */
     int entriesForRows(int n) {
+        dropOrphanHead();
         int rows = 0;
         int seen = 0; // entries scanned, from levelStart (pullPage may move levelStart to 0)
         while (true) {
@@ -551,6 +578,7 @@ public final class NativeParquetColumnReader implements NativeParquetColumn {
      * null where its level is below the leaf's maximum.
      */
     FieldVector readElements(int rows, int entries, int elementDef) {
+        dropOrphanHead();
         int from = levelStart;
         int[] d = defs;
         int elements = 0;
@@ -625,6 +653,11 @@ public final class NativeParquetColumnReader implements NativeParquetColumn {
      * leaf.
      */
     void skipEntries(int rows, int entries) {
+        dropOrphanHead();
+        skipLevels(rows, entries);
+    }
+
+    private void skipLevels(int rows, int entries) {
         int done = 0;
         while (done < entries) {
             if (decoder.needsPage()) {
