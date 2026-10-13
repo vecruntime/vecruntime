@@ -35,6 +35,11 @@ private[expr] object NestedInput {
       containerType: DataType
   ): (NestedVectorBuffers, Array[Boolean]) = {
     val n = ctx.numRows
+    if (ctx.column(ordinal) == null) {
+      // A lambda body's element context (#705, nested lambdas): the input is already a lane.
+      val (leaf, nulls) = walkLane(ctx, ordinal, steps)
+      return (leaf.asInstanceOf[NestedVectorBuffers], nulls)
+    }
     var cv: ColumnVector = ctx.column(ordinal)
     val ancestors = new scala.collection.mutable.ArrayBuffer[ColumnVector]
     var s = 0
@@ -51,6 +56,41 @@ private[expr] object NestedInput {
       r += 1
     }
     (lane, nulls)
+  }
+
+  /**
+   * Input `ordinal` taken as a lane (no batch column behind it -- a lambda body's element context) and
+   * walked down the struct fields `steps`: the field's lane, and per row whether it or any ancestor
+   * struct is null.
+   */
+  def walkLane(ctx: EvalContext, ordinal: Int, steps: Array[Int]): (VectorBuffers, Array[Boolean]) = {
+    val n = ctx.numRows
+    var v = ctx.input(ordinal)
+    val nulls = new Array[Boolean](n)
+    var s = 0
+    while (s < steps.length) {
+      var r = 0
+      while (r < n) { if (v.isNull(r)) nulls(r) = true; r += 1 }
+      v = v.asInstanceOf[NestedVectorBuffers].children().get(steps(s))
+      s += 1
+    }
+    var r = 0
+    while (r < n) { if (v.isNull(r)) nulls(r) = true; r += 1 }
+    (v, nulls)
+  }
+
+  /**
+   * Outer input `o` of a lambda body as a lane to gather per element (#705): a nested column (an
+   * array, map or struct a nested lambda reads) is adapted from the batch's own vector, since the
+   * context only adapts leaf lanes; in an element context it is already a lane. Dictionaries decoded.
+   */
+  def outerLane(ctx: EvalContext, o: Int): VectorBuffers = {
+    val cv = ctx.column(o)
+    val in =
+      if (cv != null && io.vecruntime.spark.adapter.TypeMapping.nestedTypeOf(cv.dataType()) != null)
+        NestedColumns.adapt(cv, cv.dataType(), ctx.numRows, ctx.arena)
+      else ctx.input(o)
+    if (in.isDictionaryEncoded()) ArrowOutput.decodeDictionary(in, ctx.arena) else in
   }
 
   /** A validity bitmap of the rows that are not null (null when none is). */
@@ -117,11 +157,7 @@ private[expr] object LambdaElements {
     }
     val answers = if (selected == 0) null
     else {
-      val gathered = outers.map { o =>
-        val in = ctx.input(o)
-        val plain = if (in.isDictionaryEncoded()) ArrowOutput.decodeDictionary(in, ctx.arena) else in
-        ElementAccessExpr.gather(plain, rowOf, m, ctx.arena)
-      }
+      val gathered = outers.map(o => ElementAccessExpr.gather(NestedInput.outerLane(ctx, o), rowOf, m, ctx.arena))
       val indexLane = if (index == null) null else SegmentVectorBuffers.fixedWidth(VecType.INT32, m, null, index)
       val first = if (withIndex) 2 else 1
       val inner = new EvalContext(

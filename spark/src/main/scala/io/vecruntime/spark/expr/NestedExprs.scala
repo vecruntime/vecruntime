@@ -31,7 +31,17 @@ import org.apache.spark.sql.vectorized.ColumnVector
 final case class StructFieldExpr(inputOrdinal: Int, path: Seq[Int], dataType: DataType) extends VectorExpr {
   private val steps = path.toArray
 
-  override def eval(ctx: EvalContext): VectorBuffers = {
+  override def eval(ctx: EvalContext): VectorBuffers =
+    if (ctx.column(inputOrdinal) == null) laneField(ctx) else columnField(ctx)
+
+  /** In a lambda body's element context (#705) the struct is a lane: walk its fields. */
+  private def laneField(ctx: EvalContext): VectorBuffers = {
+    val (leaf, nulls) = NestedInput.walkLane(ctx, inputOrdinal, steps)
+    val validity = NestedInput.validity(ctx, nulls)
+    if (validity == null) leaf else StructFieldExpr.withValidity(leaf, validity)
+  }
+
+  private def columnField(ctx: EvalContext): VectorBuffers = {
     val n = ctx.numRows
     var cv: ColumnVector = ctx.column(inputOrdinal)
     var parentNulls: java.lang.foreign.MemorySegment = null // bitmap of rows whose every ancestor is non-null
@@ -72,7 +82,29 @@ final case class SizeExpr(inputOrdinal: Int, path: Seq[Int], isMap: Boolean, leg
   private val steps = path.toArray
   override def dataType: DataType = org.apache.spark.sql.types.IntegerType
 
-  override def eval(ctx: EvalContext): VectorBuffers = {
+  override def eval(ctx: EvalContext): VectorBuffers =
+    if (ctx.column(inputOrdinal) == null) laneSize(ctx) else columnSize(ctx)
+
+  /** In a lambda body's element context (#705) the array or map is a lane: sizes from its offsets. */
+  private def laneSize(ctx: EvalContext): VectorBuffers = {
+    val n = ctx.numRows
+    val (leaf, nulls) = NestedInput.walkLane(ctx, inputOrdinal, steps)
+    val lane = leaf.asInstanceOf[io.vecruntime.kernels.NestedVectorBuffers]
+    val data = io.vecruntime.kernels.ArrowLayout.allocateData(ctx.arena, VecType.INT32, n)
+    val validity = if (legacySizeOfNull) null else ctx.bitmap()
+    var r = 0
+    while (r < n) {
+      if (nulls(r)) { if (legacySizeOfNull) data.set(VectorBuffers.LE_INT, r.toLong << 2, -1) }
+      else {
+        data.set(VectorBuffers.LE_INT, r.toLong << 2, lane.size(r))
+        if (validity != null) Bitmap.set(validity, r)
+      }
+      r += 1
+    }
+    SegmentVectorBuffers.fixedWidth(VecType.INT32, n, validity, data)
+  }
+
+  private def columnSize(ctx: EvalContext): VectorBuffers = {
     val n = ctx.numRows
     var cv: ColumnVector = ctx.column(inputOrdinal)
     val ancestors = new scala.collection.mutable.ArrayBuffer[ColumnVector]
@@ -122,6 +154,14 @@ final case class NestedValidityExpr(inputOrdinal: Int, path: Seq[Int]) extends V
 
   override def eval(ctx: EvalContext): VectorBuffers = {
     val n = ctx.numRows
+    if (ctx.column(inputOrdinal) == null) {
+      // A lambda body's element context (#705): the value is a lane.
+      val (_, nulls) = NestedInput.walkLane(ctx, inputOrdinal, steps)
+      val v = ctx.bitmap()
+      var r = 0
+      while (r < n) { if (!nulls(r)) Bitmap.set(v, r); r += 1 }
+      return SegmentVectorBuffers.fixedWidth(VecType.BOOL, n, v, v)
+    }
     var cv: ColumnVector = ctx.column(inputOrdinal)
     val ancestors = new scala.collection.mutable.ArrayBuffer[ColumnVector]
     var s = 0

@@ -87,11 +87,15 @@ class VectorHigherOrderSuite extends VectorQuerySuite {
     }
   }
 
-  test("a nested lambda keeps Spark's operator, with the reason") {
+  test("a nested lambda reading the outer lambda's variable and an outer array runs vectorized") {
+    checkVectorized("SELECT i, exists(ai, x -> exists(al, l -> l = x)) e FROM hof", Seq(Project))
+  }
+
+  test("a lambda with a nested result keeps Spark's operator, with the reason") {
     checkFallback(
-      "SELECT exists(ai, x -> exists(al, l -> l = x)) FROM hof",
+      "SELECT transform(al, l -> transform(ai, x -> x)) FROM hof",
       Seq(Project),
-      "not supported"
+      "elements not supported"
     )
   }
 }

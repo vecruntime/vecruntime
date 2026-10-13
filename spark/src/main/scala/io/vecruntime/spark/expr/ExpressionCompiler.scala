@@ -1019,7 +1019,7 @@ object ExpressionCompiler {
     }
     if (!container.dataType.isInstanceOf[ArrayType] || TypeMapping.nestedTypeOf(container.dataType) == null)
       Left(s"$what over ${container.dataType.simpleString} not supported")
-    else if (!TypeMapping.isSupported(elementType))
+    else if (!laneOrNested(elementType))
       Left(s"$what over ${elementType.simpleString} elements not supported")
     else
       for (
@@ -1029,6 +1029,22 @@ object ExpressionCompiler {
         yield
           if (l._1.dataType != BooleanType) throw new IllegalStateException(s"$what lambda of ${l._1.dataType}")
           else ArrayPredicateExpr(p._1, p._2, container.dataType, forAll, l._1, l._2, followThreeValuedLogic)
+  }
+
+  /** A value a lambda can read: a leaf with a lane, or an array / map / struct with a nested lane (#705). */
+  private def laneOrNested(dt: DataType): Boolean =
+    TypeMapping.isSupported(dt) || TypeMapping.nestedTypeOf(dt) != null
+
+  /**
+   * Every lambda variable `body` reads is one of `ids` or bound by a lambda inside `body` (#705, nested
+   * lambdas): an inner lambda is compiled by its own higher-order function, which binds its variables
+   * and reads ours as outer columns.
+   */
+  private def lambdaScoped(body: Expression, ids: Set[org.apache.spark.sql.catalyst.expressions.ExprId]): Boolean = {
+    val bound = ids ++ body.collect { case l: LambdaFunction =>
+      l.arguments.collect { case v: NamedLambdaVariable => v.exprId }
+    }.flatten
+    body.find { case v: NamedLambdaVariable => !bound.contains(v.exprId); case _ => false }.isEmpty
   }
 
   /**
@@ -1048,20 +1064,14 @@ object ExpressionCompiler {
     val ids = vars.map(_.exprId).toSet
     if (vars.length != variables.length || vars.isEmpty || vars.length > 2)
       Left(s"$what with a lambda of ${variables.length} arguments not supported")
-    else if (vars.exists(v => !TypeMapping.isSupported(v.dataType)))
+    else if (vars.exists(v => !laneOrNested(v.dataType)))
       Left(s"$what over ${vars.map(_.dataType.simpleString).mkString(", ")} variables not supported")
     else if (secondIsIndex && vars.length == 2 && vars(1).dataType != IntegerType)
       Left(s"$what with an index of ${vars(1).dataType.simpleString} not supported")
-    else if (
-      body.find {
-        case v: NamedLambdaVariable => !ids.contains(v.exprId)
-        case _: LambdaFunction => true
-        case _ => false
-      }.nonEmpty
-    ) Left(s"$what with a nested lambda not supported")
+    else if (!lambdaScoped(body, ids)) Left(s"$what reading a lambda variable it does not bind")
     else {
       val outerAttrs = body.collect { case a: AttributeReference => a }.distinct
-      outerAttrs.find(a => !TypeMapping.isSupported(a.dataType)) match {
+      outerAttrs.find(a => !laneOrNested(a.dataType)) match {
         case Some(a) =>
           Left(s"$what reading the outer column ${a.name} of type ${a.dataType.simpleString} not supported")
         case None =>
@@ -1163,14 +1173,10 @@ object ExpressionCompiler {
           LambdaFunction(mb, Seq(acc: NamedLambdaVariable, x: NamedLambdaVariable), _),
           LambdaFunction(fb, Seq(acc2: NamedLambdaVariable), _)
         ) =>
-      def nested(b: Expression, ids: Set[org.apache.spark.sql.catalyst.expressions.ExprId]) = b.find {
-        case v: NamedLambdaVariable => !ids.contains(v.exprId)
-        case _: LambdaFunction => true
-        case _ => false
-      }.nonEmpty
+      def nested(b: Expression, ids: Set[org.apache.spark.sql.catalyst.expressions.ExprId]) = !lambdaScoped(b, ids)
       def outerOf(b: Expression): Either[String, (Seq[AttributeReference], Seq[Int])] = {
         val attrs = b.collect { case a: AttributeReference => a }.distinct
-        attrs.find(a => !TypeMapping.isSupported(a.dataType)) match {
+        attrs.find(a => !laneOrNested(a.dataType)) match {
           case Some(a) => Left(s"aggregate reading the outer column ${a.name} of type ${a.dataType.simpleString}")
           case None =>
             val ords = attrs.map(a => input.indexWhere(_.exprId == a.exprId))
@@ -1181,12 +1187,12 @@ object ExpressionCompiler {
       if (!container.dataType.isInstanceOf[ArrayType] || TypeMapping.nestedTypeOf(container.dataType) == null)
         Left(s"aggregate over ${container.dataType.simpleString} not supported")
       else if (
-        !TypeMapping.isSupported(elementType) || !TypeMapping.isSupported(acc.dataType) ||
+        !laneOrNested(elementType) || !TypeMapping.isSupported(acc.dataType) ||
         !TypeMapping.isSupported(e.dataType)
       )
         Left(s"aggregate of ${elementType.simpleString} into ${acc.dataType.simpleString} not supported")
       else if (nested(mb, Set(acc.exprId, x.exprId)) || nested(fb, Set(acc2.exprId)))
-        Left("aggregate with a nested lambda not supported")
+        Left("aggregate reading a lambda variable it does not bind")
       else {
         val accAttr = AttributeReference(acc.name, acc.dataType, acc.nullable)(exprId = acc.exprId)
         val xAttr = AttributeReference(x.name, x.dataType, x.nullable)(exprId = x.exprId)
@@ -1242,7 +1248,7 @@ object ExpressionCompiler {
     val elementType = container.dataType match { case a: ArrayType => a.elementType; case other => other }
     if (!container.dataType.isInstanceOf[ArrayType] || TypeMapping.nestedTypeOf(container.dataType) == null)
       Left(s"$what over ${container.dataType.simpleString} not supported")
-    else if (!TypeMapping.isSupported(elementType))
+    else if (!laneOrNested(elementType))
       Left(s"$what over ${elementType.simpleString} elements not supported")
     else if (!keep && !TypeMapping.isSupported(body.dataType))
       Left(s"$what to ${body.dataType.simpleString} elements not supported")

@@ -70,26 +70,21 @@ final case class ElementAccessExpr(
 
   override def eval(ctx: EvalContext): VectorBuffers = {
     val n = ctx.numRows
-    var cv: ColumnVector = ctx.column(inputOrdinal)
-    val ancestors = new scala.collection.mutable.ArrayBuffer[ColumnVector]
-    var s = 0
-    while (s < steps.length) { if (cv.hasNull) ancestors += cv; cv = cv.getChild(steps(s)); s += 1 }
-    val parents = ancestors.toArray
-    val lane = NestedColumns.adapt(cv, containerType, n, ctx.arena).asInstanceOf[NestedVectorBuffers]
+    val (lane, nulls) = NestedInput.read(ctx, inputOrdinal, steps, containerType)
     // A literal index or key is one row read for every row.
     val literal = arg.isInstanceOf[LiteralExpr]
     val a = if (literal) ElementAccessExpr.literalLane(arg.asInstanceOf[LiteralExpr], ctx.arena) else arg.eval(ctx)
     val idx = new Array[Int](n)
     val active = ctx.active
     mode match {
-      case ElementAccessExpr.MapKey => resolveKeys(lane, a, literal, parents, idx, n, ctx.arena)
+      case ElementAccessExpr.MapKey => resolveKeys(lane, a, literal, nulls, idx, n, ctx.arena)
       case _ =>
         val wide = a.`type`() == VecType.INT64
         var r = 0
         while (r < n) {
           val ar = if (literal) 0 else r
           idx(r) =
-            if (a.isNull(ar) || lane.isNull(r) || isNullIn(parents, r)) -1
+            if (a.isNull(ar) || nulls(r)) -1
             else {
               // Spark reads the index as an Int (`intValue`), so a long ordinal truncates as there.
               val i = if (wide) a.getLong(ar).toInt else a.getInt(ar)
@@ -115,18 +110,12 @@ final case class ElementAccessExpr(
     ElementAccessExpr.gather(child, idx, n, ctx.arena)
   }
 
-  private def isNullIn(parents: Array[ColumnVector], r: Int): Boolean = {
-    var p = 0
-    while (p < parents.length) { if (parents(p).isNullAt(r)) return true; p += 1 }
-    false
-  }
-
   /** The position of each row's first entry whose key equals the row's key, or -1. */
   private def resolveKeys(
       lane: NestedVectorBuffers,
       key: VectorBuffers,
       literal: Boolean,
-      parents: Array[ColumnVector],
+      nulls: Array[Boolean],
       idx: Array[Int],
       n: Int,
       arena: Arena
@@ -137,7 +126,7 @@ final case class ElementAccessExpr(
     while (r < n) {
       idx(r) = -1
       val kr = if (literal) 0 else r
-      if (!k.isNull(kr) && !lane.isNull(r) && !isNullIn(parents, r)) {
+      if (!k.isNull(kr) && !nulls(r)) {
         var j = lane.start(r)
         val end = lane.end(r)
         while (j < end && idx(r) < 0) { if (ElementAccessExpr.sameKey(keys, j, k, kr)) idx(r) = j; j += 1 }

@@ -60,17 +60,9 @@ final case class ArrayScanExpr(
 
   override def eval(ctx: EvalContext): VectorBuffers = {
     val n = ctx.numRows
-    var cv: ColumnVector = ctx.column(inputOrdinal)
-    val ancestors = new scala.collection.mutable.ArrayBuffer[ColumnVector]
-    var s = 0
-    while (s < steps.length) { if (cv.hasNull) ancestors += cv; cv = cv.getChild(steps(s)); s += 1 }
-    val parents = ancestors.toArray
-    val lane = NestedColumns.adapt(cv, containerType, n, ctx.arena).asInstanceOf[NestedVectorBuffers]
+    val (lane, nulls) = NestedInput.read(ctx, inputOrdinal, steps, containerType)
     val elements = lane.children().get(0)
-    def containerNull(r: Int): Boolean =
-      lane.isNull(r) || {
-        var p = 0; var hit = false; while (p < parents.length && !hit) { hit = parents(p).isNullAt(r); p += 1 }; hit
-      }
+    def containerNull(r: Int): Boolean = nulls(r)
 
     kind match {
       case ArrayScanExpr.Min | ArrayScanExpr.Max =>
