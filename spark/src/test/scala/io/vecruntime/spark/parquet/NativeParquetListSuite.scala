@@ -413,7 +413,101 @@ class NativeParquetListSuite extends VectorQuerySuite {
     }
   }
 
-  test("a list inside a struct and a list of structs holding a list keep Spark's scan, with Spark's rows") {
+  for (legacy <- Seq(false, true); v2 <- Seq(false, true); dictionary <- Seq(true, false)) {
+    test(
+      s"Spark-written lists and maps inside structs, nulls at the struct and inside (legacy=$legacy, v2=$v2, dictionary=$dictionary)"
+    ) {
+      val path = newTempPath(s"sl-$legacy-$v2-$dictionary")
+      withConf(
+        "spark.sql.parquet.writeLegacyFormat" -> legacy.toString,
+        "parquet.writer.version" -> (if (v2) "v2" else "v1"),
+        "parquet.enable.dictionary" -> dictionary.toString
+      ) {
+        withPlugin(enabled = false) {
+          spark.range(0, 5000).selectExpr(
+            "id",
+            // A struct whose FIRST field is a list (its nulls come from the list's levels), then a leaf and a map.
+            "case when id % 11 = 0 then null else named_struct(" +
+              "'tags', case when id % 4 = 0 then null else transform(sequence(0, cast(id % 3 as int)), " +
+              "k -> case when k = 1 then null else concat('t', (id + k) % 7) end) end, " +
+              "'n', cast(id as int), " +
+              "'attrs', case when id % 5 = 0 then null else map_from_arrays(" +
+              "transform(sequence(0, cast(id % 2 as int)), k -> concat('a', k)), " +
+              "transform(sequence(0, cast(id % 2 as int)), k -> case when k = 1 then null else id + k end)) end) end as s",
+            // A struct holding a struct holding a list of lists.
+            "named_struct('inner', case when id % 6 = 0 then null else named_struct(" +
+              "'ll', transform(sequence(0, cast(id % 2 as int)), k -> array(cast(id + k as int), null)))  end, " +
+              "'x', id % 9) as d"
+          ).repartition(2).write.mode("overwrite").parquet(path)
+        }
+      }
+      withPlugin(enabled = false)(spark.read.parquet(path).createOrReplaceTempView("t"))
+      check("SELECT * FROM t")
+      check("SELECT id, s.tags, size(s.tags), s.n, s.attrs['a0'] a0, map_keys(s.attrs) k FROM t")
+      check("SELECT id, d.inner.ll, flatten(d.inner.ll) f, d.x FROM t WHERE s IS NULL OR s.n % 3 = 1")
+      check("SELECT id, tag FROM t LATERAL VIEW explode(s.tags) e AS tag")
+      check("SELECT d.x, count(*), sum(size(s.tags)) FROM t GROUP BY d.x")
+    }
+  }
+
+  test("parquet-java structs holding a three-level LIST, a legacy two-level list and a MAP") {
+    import org.apache.parquet.column.ParquetProperties.WriterVersion
+    val schema = org.apache.parquet.schema.MessageTypeParser.parseMessageType(
+      """message m { required int32 id;
+        |  optional group s {
+        |    optional group l (LIST) { repeated group list { optional int32 element; } }
+        |    required int32 n;
+        |    optional group legacy (LIST) { repeated binary array (STRING); }
+        |    optional group m (MAP) { repeated group key_value { required binary key (STRING); optional int64 value; } }
+        |  } }""".stripMargin
+    )
+    for (version <- Seq(WriterVersion.PARQUET_1_0, WriterVersion.PARQUET_2_0)) {
+      val path = newTempPath(s"pj-sl-$version")
+      new java.io.File(path).mkdirs()
+      val writer = org.apache.parquet.hadoop.example.ExampleParquetWriter
+        .builder(new org.apache.hadoop.fs.Path(path + "/part-0.parquet"))
+        .withConf(new org.apache.hadoop.conf.Configuration())
+        .withType(schema)
+        .withWriterVersion(version)
+        .withPageSize(1024)
+        .withRowGroupSize(16 * 1024L)
+        .build()
+      val factory = new org.apache.parquet.example.data.simple.SimpleGroupFactory(schema)
+      try {
+        for (k <- 0 until 4000) {
+          val g = factory.newGroup().append("id", k)
+          if (k % 7 != 0) {
+            val s = g.addGroup("s")
+            if (k % 3 != 0) {
+              val l = s.addGroup("l")
+              for (j <- 0 until k % 4) {
+                val e = l.addGroup("list")
+                if ((k + j) % 5 != 0) e.append("element", k * 10 + j)
+              }
+            }
+            s.append("n", k)
+            if (k % 4 != 1) {
+              val lg = s.addGroup("legacy")
+              for (j <- 0 until k % 3) lg.append("array", s"v${(k + j) % 9}")
+            }
+            if (k % 5 != 2) {
+              val m = s.addGroup("m")
+              for (j <- 0 until k % 3) {
+                val kv = m.addGroup("key_value").append("key", s"k$j")
+                if ((k + j) % 4 != 0) kv.append("value", (k * 100 + j).toLong)
+              }
+            }
+          }
+          writer.write(g)
+        }
+      } finally writer.close()
+      withPlugin(enabled = false)(spark.read.parquet(path).createOrReplaceTempView("t"))
+      check("SELECT * FROM t")
+      check("SELECT id, s.l, s.legacy, s.m['k1'] FROM t WHERE id % 5 = 3")
+    }
+  }
+
+  test("a list of structs holding a list, a list of lists of structs and a map of structs keep Spark's scan") {
     val path = newTempPath("deep-lists")
     spark.range(0, 400).selectExpr(
       "cast(id as int) as id",
@@ -422,13 +516,14 @@ class NativeParquetListSuite extends VectorQuerySuite {
       "named_struct('l', array(id)) as sl",
       "array(named_struct('l', array(id))) as lsl",
       "array(array(named_struct('a', id))) as lls",
+      "map(cast(id as int), named_struct('a', id)) as ms",
       "array(cast(id as int), 7) as flat"
     ).write.mode("overwrite").parquet(path)
     withPlugin(enabled = false)(spark.read.parquet(path).createOrReplaceTempView("t"))
     check("SELECT * FROM t", native = false)
-    check("SELECT id, sl FROM t", native = false)
     check("SELECT id, lsl FROM t", native = false)
-    check("SELECT id, lls FROM t", native = false) // a list of lists of structs
-    check("SELECT id, flat, ls, ll FROM t") // lists of leaves, of structs of leaves, of lists of leaves: native
+    check("SELECT id, lls FROM t", native = false)
+    check("SELECT id, ms FROM t", native = false)
+    check("SELECT id, flat, ls, ll, sl FROM t") // each of these is read natively
   }
 }

@@ -208,7 +208,7 @@ class NativeParquetStructSuite extends VectorQuerySuite {
     check("SELECT roll_num.min, roll_num.max, PC_CUR.sum, BIA_3.mean, BIA_3.variance FROM t")
   }
 
-  test("a struct holding an array or a map keeps Spark's scan, with Spark's rows") {
+  test("a struct holding an array and a map is read natively, with Spark's rows (#568)") {
     val path = newTempPath("struct-of-list")
     spark.range(0, 500).selectExpr(
       "cast(id as int) as id",
@@ -216,9 +216,8 @@ class NativeParquetStructSuite extends VectorQuerySuite {
       "named_struct('a', cast(id as int)) as flat"
     ).write.mode("overwrite").parquet(path)
     withPlugin(enabled = false)(spark.read.parquet(path).createOrReplaceTempView("t"))
-    check("SELECT * FROM t", native = false)
-    // Only the flat struct required: read natively.
-    check("SELECT id, flat FROM t")
+    check("SELECT * FROM t")
+    check("SELECT id, s.tags, s.m['k'], flat FROM t")
   }
 
   test("a struct field the file lacks (schema evolution) falls the file over to Spark's reader, with nulls") {

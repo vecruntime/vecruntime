@@ -76,7 +76,7 @@ import org.apache.spark.sql.types.DataType;
  * <p>Not thread safe: one reader per column per task. Slice 1 supports {@code
  * PLAIN} and {@code RLE_DICTIONARY}/{@code PLAIN_DICTIONARY} value encodings.
  */
-public final class NativeParquetColumnReader implements NativeParquetColumn {
+public final class NativeParquetColumnReader implements NativeParquetColumn, RowLevels {
 
     private final ColumnDescriptor column;
     private final VecType type;
@@ -206,6 +206,16 @@ public final class NativeParquetColumnReader implements NativeParquetColumn {
     @Override
     public void release(Object batch) {
         release((FieldVector) batch);
+    }
+
+    @Override
+    public int[] rowLevels() {
+        return batchLevels();
+    }
+
+    @Override
+    public void recordRowLevels() {
+        setRecordLevels(true);
     }
 
     /**

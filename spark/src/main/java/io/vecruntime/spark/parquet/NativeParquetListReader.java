@@ -56,7 +56,7 @@ import org.apache.spark.sql.vectorized.ColumnVector;
  * lists and lists inside structs repeat more than once or mix repeated and
  * unrepeated leaves; they keep Spark's scan.
  */
-public final class NativeParquetListReader implements NativeParquetColumn {
+public final class NativeParquetListReader implements NativeParquetColumn, RowLevels {
 
     private final DataType type;
     private final NativeParquetColumnReader first; // the element, or the key
@@ -67,6 +67,7 @@ public final class NativeParquetListReader implements NativeParquetColumn {
     // level at which an element's struct is present (elementDef when the repeated group is the struct itself).
     private final NativeParquetColumnReader[] fields;
     private final int structDef;
+    private int[] rowLevels = new int[0]; // each row's first-entry level, last batch
 
     private NativeParquetListReader(DataType type, NativeParquetColumnReader first, NativeParquetColumnReader second,
             int listDef, int elementDef) {
@@ -104,12 +105,22 @@ public final class NativeParquetListReader implements NativeParquetColumn {
      */
     public static NativeParquetColumn create(MessageType clipped, String top, DataType type,
             String name, int batchRows, BufferAllocator allocator) {
+        return create(clipped, new String[] {top}, type, name, batchRows,
+                allocator);
+    }
+
+    /**
+     * The reader of the list or map at {@code path} (a top-level field, or a
+     * struct's field, #568).
+     */
+    public static NativeParquetColumn create(MessageType clipped, String[] path, DataType type,
+            String name, int batchRows, BufferAllocator allocator) {
         if (NativeParquetNestedListReader.arrayDepth(type) > 1) {
             // #568: a list of lists, any depth, over one leaf.
-            return NativeParquetNestedListReader.create(clipped, top, (ArrayType) type, name, batchRows,
+            return NativeParquetNestedListReader.create(clipped, path, (ArrayType) type, name, batchRows,
                     allocator);
         }
-        List<ColumnDescriptor> leaves = leavesUnder(clipped, top);
+        List<ColumnDescriptor> leaves = leavesUnder(clipped, path);
         ColumnDescriptor a = leaves.get(0);
         String[] rep = repeatedPath(clipped, a.getPath());
         int elementDef = clipped.getMaxDefinitionLevel(rep);
@@ -163,15 +174,34 @@ public final class NativeParquetListReader implements NativeParquetColumn {
         throw new IllegalStateException("struct field " + field + " missing from the clipped list");
     }
 
-    /** The leaf columns under the top-level field {@code top}, in schema order. */
-    private static List<ColumnDescriptor> leavesUnder(MessageType clipped, String top) {
+    /**
+     * The leaf columns at or under {@code path} (a bare repeated primitive is
+     * its own leaf), in schema order.
+     */
+    static List<ColumnDescriptor> leavesUnder(MessageType clipped, String[] path) {
         List<ColumnDescriptor> out = new ArrayList<>();
         for (ColumnDescriptor cd : clipped.getColumns()) {
-            if (cd.getPath()[0].equals(top)) {
+            String[] p = cd.getPath();
+            if (p.length >= path.length && java.util.Arrays.equals(java.util.Arrays.copyOf(p, path.length), path)) {
                 out.add(cd);
             }
         }
         return out;
+    }
+
+    /**
+     * The node at {@code path} in the clipped schema, or null when a step is
+     * missing.
+     */
+    static Type nodeAt(MessageType clipped, String[] path) {
+        Type t = clipped;
+        for (String s : path) {
+            if (t.isPrimitive() || !t.asGroupType().containsField(s)) {
+                return null;
+            }
+            t = t.asGroupType().getType(s);
+        }
+        return t;
     }
 
     /** The path down to the one repeated node on a leaf's path. */
@@ -196,17 +226,26 @@ public final class NativeParquetListReader implements NativeParquetColumn {
      */
     public static boolean forEachLeaf(MessageType clipped, String top, DataType type,
             BiConsumer<ColumnDescriptor, DataType> leaf) {
+        return forEachLeaf(clipped, new String[] {top}, type, leaf);
+    }
+
+    /**
+     * {@link #forEachLeaf(MessageType, String, DataType, BiConsumer)} for the
+     * list or map at {@code path}.
+     */
+    public static boolean forEachLeaf(MessageType clipped, String[] path, DataType type,
+            BiConsumer<ColumnDescriptor, DataType> leaf) {
         if (NativeParquetNestedListReader.arrayDepth(type) > 1) {
-            return NativeParquetNestedListReader.forEachLeaf(clipped, top, (ArrayType) type, leaf);
+            return NativeParquetNestedListReader.forEachLeaf(clipped, path, (ArrayType) type, leaf);
         }
-        if (!clipped.containsField(top)) {
+        Type node = nodeAt(clipped, path);
+        if (node == null) {
             return false;
         }
-        Type node = clipped.getType(top);
         if (node.isPrimitive() && !node.isRepetition(Type.Repetition.REPEATED)) {
             return false;
         }
-        List<ColumnDescriptor> leaves = leavesUnder(clipped, top);
+        List<ColumnDescriptor> leaves = leavesUnder(clipped, path);
         for (ColumnDescriptor cd : leaves) {
             if (cd.getMaxRepetitionLevel() != 1) {
                 return false;
@@ -321,6 +360,9 @@ public final class NativeParquetListReader implements NativeParquetColumn {
         int[] d = first.defLevels();
         int off = first.levelOffset();
         int[] offsets = new int[n + 1];
+        if (rowLevels.length < n) {
+            rowLevels = new int[n];
+        }
         boolean[] nulls = null;
         int row = -1;
         int count = 0;
@@ -330,6 +372,7 @@ public final class NativeParquetListReader implements NativeParquetColumn {
             if (r[off + k] == 0) {
                 row++;
                 offsets[row] = count;
+                rowLevels[row] = def;
                 if (def < listDef) {
                     if (nulls == null) {
                         nulls = new boolean[n];
@@ -478,4 +521,13 @@ public final class NativeParquetListReader implements NativeParquetColumn {
     private NativeParquetColumnReader[] others() {
         return fields == null ? new NativeParquetColumnReader[0] : java.util.Arrays.copyOfRange(fields, 1, fields.length);
     }
+
+    @Override
+    public int[] rowLevels() {
+        return rowLevels;
+    }
+
+    /** Always kept: one store per row while the offsets are built. */
+    @Override
+    public void recordRowLevels() {}
 }

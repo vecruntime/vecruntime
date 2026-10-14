@@ -48,23 +48,24 @@ import org.apache.spark.sql.vectorized.ColumnVector;
  * map is not read here: those need repetition levels, and the planner keeps
  * Spark's scan for them.
  */
-public final class NativeParquetStructReader implements NativeParquetColumn {
+public final class NativeParquetStructReader implements NativeParquetColumn, RowLevels {
 
     private final StructType type;
     private final NativeParquetColumn[] fields;
-    // The leaf whose definition levels give this struct's validity, and the level at which the struct is present;
+    // The field whose per-row levels give this struct's validity (its first: a leaf, a struct, a list or a map --
+    // each carries the same information about the struct), and the level at which the struct is present;
     // null / 0 when no group from the root down to the struct is optional (never null).
-    private final NativeParquetColumnReader levelLeaf;
+    private final RowLevels levelSource;
     private final int defLevel;
 
-    private NativeParquetStructReader(StructType type, NativeParquetColumn[] fields, NativeParquetColumnReader levelLeaf,
+    private NativeParquetStructReader(StructType type, NativeParquetColumn[] fields, RowLevels levelSource,
             int defLevel) {
         this.type = type;
         this.fields = fields;
-        this.levelLeaf = defLevel > 0 ? levelLeaf : null;
+        this.levelSource = defLevel > 0 ? levelSource : null;
         this.defLevel = defLevel;
-        if (this.levelLeaf != null) {
-            this.levelLeaf.setRecordLevels(true);
+        if (this.levelSource != null) {
+            this.levelSource.recordRowLevels();
         }
     }
 
@@ -79,34 +80,34 @@ public final class NativeParquetStructReader implements NativeParquetColumn {
         GroupType group = clipped.getType(path).asGroupType();
         StructField[] fs = type.fields();
         NativeParquetColumn[] fields = new NativeParquetColumn[fs.length];
-        NativeParquetColumnReader first = null;
         for (int i = 0; i < fs.length; i++) {
             String[] childPath = child(path, group.getType(i)
                     .getName());
             DataType dt = fs[i].dataType();
             String childName = name + "." + fs[i].name();
             if (dt instanceof StructType st) {
-                NativeParquetStructReader s = create(clipped, childPath, st, childName, batchRows, allocator);
-                fields[i] = s;
-                if (first == null) {
-                    first = s.firstLeaf();
-                }
+                fields[i] = create(clipped, childPath, st, childName, batchRows, allocator);
+            } else if (dt instanceof org.apache.spark.sql.types.ArrayType || dt instanceof org.apache.spark.sql.types.MapType) {
+                // #568: a list or map field, read by the list reader at its path under the struct.
+                fields[i] = NativeParquetListReader.create(clipped, childPath, dt, childName, batchRows, allocator);
             } else {
                 ColumnDescriptor cd = clipped.getColumnDescription(childPath);
-                NativeParquetColumnReader leaf = new NativeParquetColumnReader(cd, NativeParquetSupport.decodeLane(dt), dt, childName, batchRows,
+                fields[i] = new NativeParquetColumnReader(cd, NativeParquetSupport.decodeLane(dt), dt, childName, batchRows,
                         allocator);
-                fields[i] = leaf;
-                if (first == null) {
-                    first = leaf;
-                }
             }
         }
-        return new NativeParquetStructReader(type, fields, first, clipped.getMaxDefinitionLevel(path));
+        return new NativeParquetStructReader(type, fields, (RowLevels) fields[0],
+                clipped.getMaxDefinitionLevel(path));
     }
 
-    private NativeParquetColumnReader firstLeaf() {
-        NativeParquetColumn f = fields[0];
-        return f instanceof NativeParquetStructReader s ? s.firstLeaf() : (NativeParquetColumnReader) f;
+    @Override
+    public int[] rowLevels() {
+        return levelSource != null ? levelSource.rowLevels() : ((RowLevels) fields[0]).rowLevels();
+    }
+
+    @Override
+    public void recordRowLevels() {
+        ((RowLevels) fields[0]).recordRowLevels();
     }
 
     private static String[] child(String[] path, String name) {
@@ -142,11 +143,21 @@ public final class NativeParquetStructReader implements NativeParquetColumn {
         }
         for (int i = 0; i < fs.length; i++) {
             Type ct = group.getType(i);
-            if (!ct.getName().equalsIgnoreCase(fs[i].name()) || ct.isRepetition(Type.Repetition.REPEATED)) {
+            DataType dt = fs[i].dataType();
+            if (!ct.getName().equalsIgnoreCase(fs[i].name())) {
                 return false;
             }
             String[] childPath = child(path, ct.getName());
-            DataType dt = fs[i].dataType();
+            if (dt instanceof org.apache.spark.sql.types.ArrayType || dt instanceof org.apache.spark.sql.types.MapType) {
+                // #568: a list or map field (a LIST / MAP group, or a bare repeated field) has its own shape check.
+                if (!NativeParquetListReader.forEachLeaf(clipped, childPath, dt, leaf)) {
+                    return false;
+                }
+                continue;
+            }
+            if (ct.isRepetition(Type.Repetition.REPEATED)) {
+                return false;
+            }
             if (dt instanceof StructType st) {
                 if (!forEachLeaf(clipped, childPath, st, leaf)) {
                     return false;
@@ -195,11 +206,11 @@ public final class NativeParquetStructReader implements NativeParquetColumn {
             releaseFields(kids);
             throw e;
         }
-        // Read after every field: the level leaf may be under a nested field, and its levels stay valid until
+        // Read after every field: the level source may be under a nested field, and its levels stay valid until
         // its next batch.
         boolean[] nulls = null;
-        if (levelLeaf != null) {
-            int[] levels = levelLeaf.batchLevels();
+        if (levelSource != null) {
+            int[] levels = levelSource.rowLevels();
             int d = defLevel;
             for (int r = 0; r < n; r++) {
                 if (levels[r] < d) {
