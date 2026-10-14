@@ -120,6 +120,18 @@ public final class NativeParquetColumnReader implements NativeParquetColumn, Row
     private PageReader pages;
     private int rowGroupRows;
 
+    // #568 column-index page filtering: the row group's selected rows as ranges [start, end) of absolute row
+    // indexes, when the store was filtered by the column index (its pages are only those overlapping the
+    // ranges, each with its first row index); null otherwise. `gap` is the absolute index of the decoder's next
+    // row less decoder.rowsDone() (the rows of the pages dropped before it).
+    private long[] rangeStart;
+    private long[] rangeEnd;
+    private int range;
+    private long inRange;
+    private long gap;
+    private int selectedRows;
+    private int selectedDone;
+
     // #568: a repeated leaf -- a list's element, a map's key or value. The decoder then walks ENTRIES, one per
     // (repetition, definition) level pair, not rows; NativeParquetListReader maps entries to rows from the
     // levels kept here. Pages are pulled ahead of the decoder (a batch's rows may run past the page in hand),
@@ -334,7 +346,138 @@ public final class NativeParquetColumnReader implements NativeParquetColumn, Row
 
     @Override
     public void startRowGroup(org.apache.parquet.column.page.PageReadStore store, int rows) {
-        startRowGroup(store.getPageReader(column), rows);
+        setRanges(repeated ? java.util.Optional.empty() : store.getRowIndexes(), rows);
+        startPages(store.getPageReader(column), rows);
+    }
+
+    /**
+     * The selected rows of a row group filtered by the column index (#568), as
+     * ranges; none when every row is read.
+     */
+    private void setRanges(java.util.Optional<java.util.PrimitiveIterator.OfLong> indexes, int rows) {
+        rangeStart = null;
+        rangeEnd = null;
+        range = 0;
+        inRange = 0;
+        gap = 0;
+        selectedRows = rows;
+        selectedDone = 0;
+        if (indexes.isEmpty()) {
+            return;
+        }
+        java.util.PrimitiveIterator.OfLong it = indexes.get();
+        long[] starts = new long[16];
+        long[] ends = new long[16];
+        int k = 0;
+        while (it.hasNext()) {
+            long r = it.nextLong();
+            if (k > 0 && ends[k - 1] == r) {
+                ends[k - 1] = r + 1;
+                continue;
+            }
+            if (k == starts.length) {
+                starts = java.util.Arrays.copyOf(starts, 2 * k);
+                ends = java.util.Arrays.copyOf(ends, 2 * k);
+            }
+            starts[k] = r;
+            ends[k] = r + 1;
+            k++;
+        }
+        rangeStart = java.util.Arrays.copyOf(starts, k);
+        rangeEnd = java.util.Arrays.copyOf(ends, k);
+    }
+
+    /**
+     * Moves the decoder to absolute row {@code target}: skips rows within pages,
+     * and over pages the column index dropped.
+     */
+    private void alignTo(long target) {
+        while (decoder.rowsDone() + gap < target) {
+            if (decoder.needsPage()) {
+                decoder.feedPage(nextKernelPage());
+                continue;
+            }
+            decoder.skip((int) Math.min(target - decoder.rowsDone() - gap, Integer.MAX_VALUE));
+        }
+    }
+
+    /**
+     * Walks the next {@code n} selected rows run by run: aligns the decoder to
+     * each run's first row and calls {@code read} (rows read, page-bounded) to
+     * decode it at its batch position.
+     */
+    private void forRanges(int n, java.util.function.IntBinaryOperator read) {
+        int at = 0;
+        while (at < n) {
+            long next = rangeStart[range] + inRange;
+            alignTo(next);
+            int len = (int) Math.min(n - at, rangeEnd[range] - next);
+            int done = 0;
+            while (done < len) {
+                if (decoder.needsPage()) {
+                    decoder.feedPage(nextKernelPage());
+                }
+                done += read.applyAsInt(len - done, at + done);
+            }
+            at += len;
+            advance(len);
+        }
+    }
+
+    /**
+     * Moves the selected-row cursor {@code n} rows on (the decoder follows at
+     * the next read).
+     */
+    private void advance(int n) {
+        long left = n;
+        while (left > 0) {
+            long room = rangeEnd[range] - rangeStart[range] - inRange;
+            if (left < room) {
+                inRange += left;
+                break;
+            }
+            left -= room;
+            range++;
+            inRange = 0;
+        }
+        selectedDone += n;
+    }
+
+    /**
+     * {@link #readBatch} over a row group filtered by the column index: its
+     * next {@code n} selected rows.
+     */
+    private FieldVector readFiltered(int n) {
+        decoder.startBatch(n);
+        if (type == VecType.UTF8 || type == VecType.BOOL || binaryDecimal || int96) {
+            forRanges(n, decoder::readBatch);
+            boolean nulls = decoder.batchNullCount() > 0;
+            if (type == VecType.UTF8) {
+                return decoder.batchIsDictionaryIds() ? flushIds(n, nulls) : flushUtf8(n, nulls);
+            }
+            return int96
+                    ? flushInt96(n, nulls)
+                    : binaryDecimal ? flushDecimal(n, nulls) : flushBool(n, nulls);
+        }
+        BaseFixedWidthVector v = (BaseFixedWidthVector) borrowFixed(n);
+        ArrowVectorBuffers out = ArrowVectorBuffers.forWrite(v, n, sparkType);
+        java.lang.foreign.MemorySegment data = out.data();
+        java.lang.foreign.MemorySegment validity = maxDefLevel > 0 ? out.validity() : null;
+        if (validity != null) {
+            validity.asSlice(0L, (long) ((n + 63) >>> 6) * 8).fill((byte) 0);
+        }
+        forRanges(n, (len, at) -> decoder.readBatchDirectA(len, at, data, validity));
+        boolean hasNulls = decoder.batchNullCount() > 0;
+        if (narrowBits != 0) {
+            narrow(data, n, narrowBits);
+        }
+        if (millis) {
+            millisToMicros(data, hasNulls ? validity : null, n);
+        }
+        rebaseLane(data, hasNulls ? validity : null, n);
+        widenLane(data, hasNulls ? validity : null, n);
+        io.vecruntime.spark.arrow.ArrowOutput.finish(out, n, !hasNulls);
+        return v;
     }
 
     @Override
@@ -383,10 +526,18 @@ public final class NativeParquetColumnReader implements NativeParquetColumn, Row
      * decoder; {@link #readBatch} then streams the pages.
      */
     public void startRowGroup(PageReader pages, int rowGroupRows) {
+        setRanges(java.util.Optional.empty(), rowGroupRows);
+        startPages(pages, rowGroupRows);
+    }
+
+    private void startPages(PageReader pages, int rowGroupRows) {
         this.pages = pages;
         this.rowGroupRows = rowGroupRows;
         startRepeatedChunk();
-        decoder.startChunk(repeated ? (int) pages.getTotalValueCount() : rowGroupRows);
+        // Filtered by the column index, the pages hold more rows than the selection: no row-count bound.
+        decoder.startChunk(repeated
+                ? (int) pages.getTotalValueCount()
+                : rangeStart != null ? Integer.MAX_VALUE : rowGroupRows);
         releaseChunkDictionary();
         VectorBuffers dict = decodeDictionary(pages);
         if (dict != null) {
@@ -500,6 +651,9 @@ public final class NativeParquetColumnReader implements NativeParquetColumn, Row
     /** Rows still unemitted in the current row group. */
     @Override
     public int rowsRemaining() {
+        if (rangeStart != null) {
+            return selectedRows - selectedDone;
+        }
         if (repeated) {
             return rowGroupRows - rowsEmitted;
         }
@@ -523,6 +677,9 @@ public final class NativeParquetColumnReader implements NativeParquetColumn, Row
      */
     @Override
     public FieldVector readBatch(int n) {
+        if (rangeStart != null) {
+            return readFiltered(n);
+        }
         decoder.startBatch(n);
         if (type == VecType.UTF8) {
             int filled = 0;
@@ -572,7 +729,12 @@ public final class NativeParquetColumnReader implements NativeParquetColumn, Row
      */
     private ColumnChunkDecoder.Page nextKernelPage() {
         if (!repeated) {
-            return toKernelPage(requirePage());
+            DataPage page = requirePage();
+            if (rangeStart != null && page.getFirstRowIndex().isPresent()) {
+                // Every earlier page is consumed here, so the decoder's next row is this page's first.
+                gap = page.getFirstRowIndex().get() - decoder.rowsDone();
+            }
+            return toKernelPage(page);
         }
         if (pendingPages.isEmpty() && !pullPage()) {
             throw new IllegalStateException("ran out of pages for " + java.util.Arrays.toString(column.getPath()));
@@ -825,7 +987,7 @@ public final class NativeParquetColumnReader implements NativeParquetColumn, Row
      */
     @Override
     public boolean decodesSelectedFaster() {
-        return type == VecType.UTF8;
+        return type == VecType.UTF8 && rangeStart == null;
     }
 
     /**
@@ -834,6 +996,10 @@ public final class NativeParquetColumnReader implements NativeParquetColumn, Row
      */
     @Override
     public void skipRows(int n) {
+        if (rangeStart != null) {
+            advance(n);
+            return;
+        }
         if (repeated) {
             skipEntries(n, entriesForRows(n));
             return;
@@ -856,6 +1022,9 @@ public final class NativeParquetColumnReader implements NativeParquetColumn, Row
      */
     @Override
     public FieldVector readBatchSelected(int n, java.lang.foreign.MemorySegment selection) {
+        if (rangeStart != null) {
+            return readBatch(n); // the batch's selection excludes the other rows
+        }
         decoder.startBatch(n);
         if (type == VecType.UTF8 || type == VecType.BOOL || binaryDecimal || int96) {
             forRuns(n, selection,

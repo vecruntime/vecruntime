@@ -49,7 +49,22 @@ public final class NativeParquetRowIndexColumn implements NativeParquetColumn {
         this.base = store.getRowIndexOffset().orElseThrow(() -> new IllegalStateException("the row group carries no row index offset"));
         this.position = 0;
         this.rows = rows;
+        // #568: a row group filtered by the column index emits only its selected rows; their indexes in the group.
+        this.selected = null;
+        java.util.Optional<java.util.PrimitiveIterator.OfLong> indexes = store.getRowIndexes();
+        if (indexes.isPresent()) {
+            long[] s = new long[rows];
+            java.util.PrimitiveIterator.OfLong it = indexes.get();
+            for (int i = 0;
+                 i < rows && it.hasNext();
+                 i++) {
+                s[i] = it.nextLong();
+            }
+            this.selected = s;
+        }
     }
+
+    private long[] selected;
 
     @Override
     public Object readBatch(int n) {
@@ -58,7 +73,8 @@ public final class NativeParquetRowIndexColumn implements NativeParquetColumn {
             v.allocateNew(n);
             long first = base + position;
             for (int i = 0; i < n; i++) {
-                v.set(i, first + i);
+                v.set(i,
+                        selected != null ? base + selected[position + i] : first + i);
             }
             v.setValueCount(n);
         } catch (RuntimeException | Error e) {

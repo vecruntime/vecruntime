@@ -769,12 +769,15 @@ private[vecruntime] final class VectorParquetPartitionReader(
         .builder(hadoopConf, path)
         .withRange(start, end)
         .withRecordFilter(rowGroupFilter(clipped, footer))
-        // Row groups only: with the column index on, readNextFilteredRowGroup also drops PAGES outside the
-        // filter's row ranges, and each column's remaining pages start at different rows. The decoder reads
-        // a column's pages back to back against the row group's row count, so that would misalign the
-        // columns (an overrun error, or rows from different positions). Statistics and dictionary pruning of
-        // whole row groups stay; the predicate is applied by the Filter above the scan.
-        .useColumnIndexFilter(false)
+        // Column-index page filtering (#568): readNextFilteredRowGroup then drops the PAGES outside the filter's row
+        // ranges, and the store carries the selected row indexes; each flat leaf follows them (its pages carry
+        // their first row index), so every column emits the same selected rows. A repeated leaf (a list or map)
+        // counts entries, not rows, so a file with one keeps whole row groups. Parquet's own switch
+        // (`parquet.filter.columnindex.enabled`) turns it off. The predicate is still applied above the scan.
+        .useColumnIndexFilter(
+          hadoopConf.getBoolean(org.apache.parquet.hadoop.ParquetInputFormat.COLUMN_INDEX_FILTERING_ENABLED, true) &&
+            clipped.getColumns.asScala.forall(_.getMaxRepetitionLevel == 0)
+        )
         .build()
       r = ParquetFileReader.open(inputFile, footer, readOpts, stream)
       stream = null
