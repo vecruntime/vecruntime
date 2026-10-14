@@ -94,8 +94,10 @@ public final class NativeParquetSupport {
         if (dt instanceof DoubleType) {
             return true; // DOUBLE physical, FLOAT64 lane
         }
-        if (dt instanceof StringType st) {
-            return st.isUTF8BinaryCollation(); // UTF8; a collated string has no lane
+        if (dt instanceof StringType) {
+            // UTF8; a collated string (#568) has no engine lane but the same bytes: decoded on the UTF8 lane and
+            // emitted as an Arrow string vector, which operators carry as a column without a lane (decodeLane).
+            return true;
         }
         if (dt instanceof DecimalType d) {
             // p <= 18: the INT64 lane (INT32 / INT64 widened, or FIXED_LEN_BYTE_ARRAY / BINARY bytes converted);
@@ -124,6 +126,9 @@ public final class NativeParquetSupport {
         }
         if (dt instanceof BinaryType) {
             return VecType.UTF8;
+        }
+        if (dt instanceof StringType) {
+            return VecType.UTF8; // a collated string too: the same bytes, no engine lane (#568)
         }
         if (dt instanceof TimestampNTZType) {
             return VecType.INT64;

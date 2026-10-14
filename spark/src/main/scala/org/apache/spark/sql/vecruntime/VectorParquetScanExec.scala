@@ -1607,11 +1607,9 @@ object VectorParquetScanPlanner {
     }
     // The datetime rebase mode is resolved per file at open (VectorParquetPartitionReader.fallbackModes): a
     // file that needs a rebase, or whose mode is EXCEPTION, is read by Spark's reader with its own modes.
-    // Bucketed scans: leave to Spark unless bucketing is disabled for this scan (reproducing Spark's
-    // bucket-to-partition mapping ourselves is out of slice 1).
-    if (relation.bucketSpec.isDefined && !scan.disableBucketedScan) {
-      return Some("bucketed scan")
-    }
+    // Bucketed scans (#568) read natively: the scan reports Spark's own outputPartitioning (HashPartitioning over
+    // the bucket columns) and reads Spark's own bucketed FilePartitions (`scan.inputRDD.partitions`: one per bucket,
+    // pruned by optionalBucketSet, coalesced when Spark coalesces them), so each task reads its bucket's files.
     None
   }
 }
