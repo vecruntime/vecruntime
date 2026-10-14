@@ -81,8 +81,16 @@ private[vecruntime] final class DecodeAheadIterator(
     peeked = null
     current = o
     currentRecycledPending = o.recycled
+    // input_file_name() (#568): the files are opened on the producer thread, so the task thread's holder is set
+    // here, from the file of the batch it takes, as FileScanRDD sets it per file.
+    if (o.file != null && (o.file ne lastFile)) {
+      org.apache.spark.rdd.InputFileBlockHolder.set(o.file.urlEncodedPath, o.file.start, o.file.length)
+      lastFile = o.file
+    }
     o.batch
   }
+
+  private var lastFile: org.apache.spark.sql.execution.datasources.PartitionedFile = _
 
   private def take(): AnyRef =
     if (!started) {

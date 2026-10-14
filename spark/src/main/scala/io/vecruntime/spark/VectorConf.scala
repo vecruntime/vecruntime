@@ -195,6 +195,8 @@ object VectorConf {
 
   /** VectorParquetScanExec read-ahead (#559/#566): row groups of the current file read ahead, `0` off. */
   val ScanNativeParquetPrefetchRowGroups = "spark.vecruntime.scan.nativeParquet.prefetchRowGroups"
+  val ScanNativeParquetPrefetchMaxBytes = "spark.vecruntime.scan.nativeParquet.prefetchMaxBytes"
+  val ScanNativeParquetPrefetchExecutorMaxBytes = "spark.vecruntime.scan.nativeParquet.prefetchExecutorMaxBytes"
 
   /** VectorParquetScanExec decode-ahead (#606): batches decoded ahead on a producer thread, `0` off. */
   val ScanNativeParquetDecodeAhead = "spark.vecruntime.scan.nativeParquet.decodeAhead"
@@ -531,6 +533,29 @@ object VectorConf {
    */
   def scanNativeParquetPrefetchRowGroups(conf: SQLConf): Int =
     intIn(conf, ScanNativeParquetPrefetchRowGroups, 2, 16)
+
+  /**
+   * #568: the most compressed bytes one task's read-ahead (files opened ahead and row groups read ahead)
+   * keeps in flight, on top of the depths above, so wide row groups cannot multiply its memory by the depth.
+   * A file is counted at its split's length, a row group at its requested column chunks' size. One file or
+   * row group ahead is always allowed, so the read-ahead never stops altogether. `0` or less: no cap.
+   * Default 256 MiB.
+   */
+  def scanNativeParquetPrefetchMaxBytes(conf: SQLConf): Long =
+    byteCap(conf, ScanNativeParquetPrefetchMaxBytes, 256L << 20)
+
+  /**
+   * #568: the same cap over every task of the executor: no task starts another read-ahead while the
+   * executor's in flight would pass it (each task still keeps one ahead). `0` or less: no cap. Default 2 GiB.
+   */
+  def scanNativeParquetPrefetchExecutorMaxBytes(conf: SQLConf): Long =
+    byteCap(conf, ScanNativeParquetPrefetchExecutorMaxBytes, 2L << 30)
+
+  private def byteCap(conf: SQLConf, key: String, default: Long): Long = {
+    val explicit = conf.getConfString(key, "").trim
+    val v = if (explicit.nonEmpty) org.apache.spark.network.util.JavaUtils.byteStringAsBytes(explicit) else default
+    if (v <= 0) Long.MaxValue else v
+  }
 
   /**
    * Decode-ahead (#606): how many batches `VectorParquetScanExec` decodes ahead of the task thread, on a

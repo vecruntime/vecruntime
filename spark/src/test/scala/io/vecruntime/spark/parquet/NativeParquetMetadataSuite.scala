@@ -157,16 +157,19 @@ class NativeParquetMetadataSuite extends VectorQuerySuite {
     }
   }
 
-  test("input_file_name() under decode-ahead keeps Spark's scan, with the reason") {
-    withConf(VectorConf.ScanNativeParquetDecodeAhead -> "2") {
-      val q = s"SELECT i, input_file_name() FROM parquet.`$flat`"
-      val expected = reference(q)
-      val df = withPlugin(enabled = true)(spark.sql(q))
-      assert(rows(df) == expected)
-      val plan = finalPlan(df)
-      assert(PlanUtils.allNodes(plan).collect { case s: VectorParquetScanExec => s }.isEmpty)
-      val reasons = VectorFallback.reasons(plan).map(_._2).mkString("; ")
-      assert(reasons.contains("input_file_name() under decode-ahead"), reasons)
+  test("input_file_name() and its block siblings under decode-ahead, read natively (#568)") {
+    for ((k, threads) <- Seq("1" -> "virtual", "4" -> "platform")) {
+      withConf(
+        VectorConf.ScanNativeParquetDecodeAhead -> k,
+        VectorConf.ScanNativeParquetDecodeAheadThreads -> threads
+      ) {
+        check(s"SELECT i, input_file_name(), input_file_block_start(), input_file_block_length() FROM parquet.`$flat`")
+        withConf("spark.sql.files.maxPartitionBytes" -> (16 * 1024).toString) {
+          // Many splits per file and several files per task: the holder must follow the batch being consumed.
+          check(s"SELECT i, input_file_name(), input_file_block_start() FROM parquet.`$flat`")
+        }
+        check(s"SELECT input_file_name(), count(*), min(i), max(i) FROM parquet.`$flat` GROUP BY 1")
+      }
     }
   }
 
