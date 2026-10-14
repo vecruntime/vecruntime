@@ -441,7 +441,9 @@ public final class NativeParquetColumnReader implements NativeParquetColumn, Row
                 && type == VecType.UTF8
                 && !binaryDecimal
                 && fixedLength == 0
-                && sparkType instanceof org.apache.spark.sql.types.StringType;
+                && sparkType instanceof org.apache.spark.sql.types.StringType st
+                // A collated string (#568) is carried to Spark's operators, which compare it by collation: values.
+                && st.isUTF8BinaryCollation();
         this.dictionaryIds = ok;
         if (type == VecType.UTF8) {
             decoder.setEmitDictionaryIds(ok);

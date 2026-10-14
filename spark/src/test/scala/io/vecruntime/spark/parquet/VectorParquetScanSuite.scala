@@ -1131,12 +1131,12 @@ class VectorParquetScanSuite extends VectorQuerySuite {
   // ---------------------------------------------------------------- fallbacks
 
   test(
-    "fallback: a list of collated strings keeps Spark's scan with a recorded reason (every nesting of readable types is native, #568)"
+    "fallback: a list of intervals keeps Spark's scan with a recorded reason (every nesting of readable types is native, #568)"
   ) {
     val path = newTempPath("t_nested")
     withPlugin(enabled = false) {
       spark.sql(
-        "SELECT CAST(id AS INT) AS i, array(collate(CAST(id AS STRING), 'UNICODE_CI')) AS st FROM range(0, 1000)"
+        "SELECT CAST(id AS INT) AS i, array(make_dt_interval(0, 0, 0, id)) AS st FROM range(0, 1000)"
       )
         .write.mode("overwrite").parquet(path)
       spark.read.parquet(path).createOrReplaceTempView("t_nested")
