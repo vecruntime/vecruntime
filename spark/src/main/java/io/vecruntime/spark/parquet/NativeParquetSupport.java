@@ -58,46 +58,14 @@ public final class NativeParquetSupport {
 
     /** Whether the native reader can decode a column of this type. */
     public static boolean isReadable(DataType dt) {
+        // #568: nested types are readable when every leaf below them is: lists, maps and structs at any depth.
         if (dt instanceof org.apache.spark.sql.types.ArrayType at) {
-            // #568: a list of a leaf, of a struct of leaves, or of lists (any depth) ending in a leaf.
-            if (at.elementType() instanceof org.apache.spark.sql.types.ArrayType inner) {
-                DataType e = inner;
-                while (e instanceof org.apache.spark.sql.types.ArrayType a) {
-                    e = a.elementType();
-                }
-                return isReadableLeaf(e);
-            }
-            if (at.elementType() instanceof org.apache.spark.sql.types.StructType st) {
-                if (st.fields().length == 0) {
-                    return false;
-                }
-                for (org.apache.spark.sql.types.StructField f : st.fields()) {
-                    if (!isReadableLeaf(f.dataType())) {
-                        return false;
-                    }
-                }
-                return true;
-            }
-            return isReadableLeaf(at.elementType());
+            return isReadable(at.elementType());
         }
         if (dt instanceof org.apache.spark.sql.types.MapType mt) {
-            if (mt.valueType() instanceof org.apache.spark.sql.types.StructType st) {
-                // #568: a map of structs of leaves.
-                if (st.fields().length == 0 || !isReadableLeaf(mt.keyType())) {
-                    return false;
-                }
-                for (org.apache.spark.sql.types.StructField f : st.fields()) {
-                    if (!isReadableLeaf(f.dataType())) {
-                        return false;
-                    }
-                }
-                return true;
-            }
-            return isReadableLeaf(mt.keyType()) && isReadableLeaf(mt.valueType());
+            return isReadable(mt.keyType()) && isReadable(mt.valueType());
         }
         if (dt instanceof org.apache.spark.sql.types.StructType st) {
-            // #568: a struct whose fields are all readable -- leaves, structs, and lists or maps the list reader
-            // follows (it reads them at their path under the struct).
             if (st.fields().length == 0) {
                 return false;
             }
@@ -138,11 +106,6 @@ public final class NativeParquetSupport {
         // No engine lane (option A of the FLOAT / BINARY / TIMESTAMP_NTZ note, #559): decoded on a lane of the
         // same layout and emitted as Spark's Arrow vector, so operators carry the column as a foreign column.
         return decodeLane(dt) != null;
-    }
-
-    /** A readable type that is not nested: a list's element, a map's key or value. */
-    private static boolean isReadableLeaf(DataType dt) {
-        return !(dt instanceof org.apache.spark.sql.types.ArrayType || dt instanceof org.apache.spark.sql.types.MapType || dt instanceof org.apache.spark.sql.types.StructType) && isReadable(dt);
     }
 
     /**

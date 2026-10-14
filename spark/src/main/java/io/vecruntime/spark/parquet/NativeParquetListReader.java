@@ -117,6 +117,10 @@ public final class NativeParquetListReader implements NativeParquetColumn, RowLe
      */
     public static NativeParquetColumn create(MessageType clipped, String[] path, DataType type,
             String name, int batchRows, BufferAllocator allocator) {
+        if (NativeParquetTreeReader.needed(type)) {
+            // #568: nesting below the list or map this reader does not follow (a struct holding a list, ...).
+            return NativeParquetTreeReader.create(clipped, path, type, name, batchRows, allocator);
+        }
         if (NativeParquetNestedListReader.arrayDepth(type) > 1) {
             // #568: a list of lists, any depth, over one leaf.
             return NativeParquetNestedListReader.create(clipped, path, (ArrayType) type, name, batchRows,
@@ -253,6 +257,9 @@ public final class NativeParquetListReader implements NativeParquetColumn, RowLe
      */
     public static boolean forEachLeaf(MessageType clipped, String[] path, DataType type,
             BiConsumer<ColumnDescriptor, DataType> leaf) {
+        if (NativeParquetTreeReader.needed(type)) {
+            return NativeParquetTreeReader.forEachLeaf(clipped, path, type, leaf);
+        }
         if (NativeParquetNestedListReader.arrayDepth(type) > 1) {
             return NativeParquetNestedListReader.forEachLeaf(clipped, path, (ArrayType) type, leaf);
         }
