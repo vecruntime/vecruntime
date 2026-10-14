@@ -572,6 +572,17 @@ public final class NativeParquetListReader implements NativeParquetColumn, RowLe
         }
     }
 
+    @Override
+    public void setRebase(ParquetRebase rebase) {
+        first.setRebase(rebase);
+        if (second != null) {
+            second.setRebase(rebase);
+        }
+        for (NativeParquetColumnReader f : others()) {
+            f.setRebase(rebase);
+        }
+    }
+
     /**
      * Off: a list's strings are read by value through its elements, not as
      * dictionary ids.

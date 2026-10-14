@@ -764,11 +764,11 @@ class VectorParquetScanSuite extends VectorQuerySuite {
     }
   }
 
-  test("INT96 timestamps and legacy-calendar files fall over per file with the file's own rebase modes (#559)") {
-    // Spark's default output timestamp type is INT96: such a file is read by Spark's reader. A file written
-    // with the LEGACY rebase mode (a hybrid-calendar date and timestamp before 1582) carries the legacy key, so
-    // Spark rebases it on read -- the fallback reader must be built with that file's LEGACY mode, not the fixed
-    // CORRECTED of its two-argument constructor. A CORRECTED file in the same table is still read natively.
+  test("INT96 timestamps and legacy-calendar files are decoded natively with the file's own rebase modes (#568)") {
+    // Spark's default output timestamp type is INT96, decoded natively since #568 item 6. A file written with the
+    // LEGACY rebase mode (a hybrid-calendar date and timestamp before 1582) carries the legacy key, so Spark
+    // rebases it on read -- the native readers apply that file's LEGACY mode (ParquetRebase). A CORRECTED file in
+    // the same table is read as stored.
     val path = newTempPath("t_ts_mixed")
     val query =
       """SELECT CAST(id AS INT) AS i,
@@ -797,11 +797,11 @@ class VectorParquetScanSuite extends VectorQuerySuite {
       checkVectorized(s"SELECT * FROM t_ts_$dir", Seq(node))
       checkVectorized(s"SELECT min(ts), max(ts), min(d), max(d) FROM t_ts_$dir", Seq(node))
     }
-    assert(nativeRowGroups("SELECT ts, d FROM t_ts_int96") == 0, "an INT96 file was decoded natively")
-    assert(nativeRowGroups("SELECT ts, d FROM t_ts_legacy") == 0, "a LEGACY-calendar file was decoded natively")
+    assert(nativeRowGroups("SELECT ts, d FROM t_ts_int96") > 0, "an INT96 file was not decoded natively")
+    assert(nativeRowGroups("SELECT ts, d FROM t_ts_legacy") > 0, "a LEGACY-calendar file was not decoded natively")
     assert(nativeRowGroups("SELECT ts, d FROM t_ts_corrected") > 0, "a CORRECTED file was not decoded natively")
     // Under EXCEPTION (resolved per file, not per plan), a CORRECTED Spark file is still read natively, and the
-    // legacy one gets Spark's own rebase from its footer key.
+    // legacy one gets its rebase from its footer key.
     withConf("spark.sql.parquet.datetimeRebaseModeInRead" -> "EXCEPTION") {
       checkVectorized("SELECT * FROM t_ts_corrected", Seq(node))
       checkVectorized("SELECT * FROM t_ts_legacy", Seq(node))

@@ -63,6 +63,13 @@ public interface NativeParquetColumn {
     void setPoolLimit(int limit);
 
     /**
+     * This file's calendar rebase and INT96 conversion (#568 item 6), for every
+     * date and timestamp leaf below. Abstract on purpose: a reader that forgot
+     * to forward it would read a LEGACY file without its rebase.
+     */
+    void setRebase(ParquetRebase rebase);
+
+    /**
      * Emit dictionary-encoded strings as dictionary ids (#612), where the
      * column allows it.
      */

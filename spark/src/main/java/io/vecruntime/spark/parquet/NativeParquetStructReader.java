@@ -274,6 +274,13 @@ public final class NativeParquetStructReader implements NativeParquetColumn, Row
         }
     }
 
+    @Override
+    public void setRebase(ParquetRebase rebase) {
+        for (NativeParquetColumn f : fields) {
+            f.setRebase(rebase);
+        }
+    }
+
     /**
      * Off for a struct's strings: they are read by value through the struct's
      * fields, not as dictionary ids.

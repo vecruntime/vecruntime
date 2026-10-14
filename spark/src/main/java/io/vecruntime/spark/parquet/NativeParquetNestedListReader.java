@@ -269,6 +269,11 @@ public final class NativeParquetNestedListReader implements NativeParquetColumn,
     }
 
     @Override
+    public void setRebase(ParquetRebase rebase) {
+        leaf.setRebase(rebase);
+    }
+
+    @Override
     public void setDictionaryIds(boolean enabled) {
         leaf.setDictionaryIds(false);
     }

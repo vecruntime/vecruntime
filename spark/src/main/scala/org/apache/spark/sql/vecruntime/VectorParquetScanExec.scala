@@ -742,10 +742,11 @@ private[vecruntime] final class VectorParquetPartitionReader(
       val clipped = ParquetReadSupport.clipParquetSchema(fileSchema, requiredSchema, caseSensitive, useFieldId, false)
       val modes = fallbackModes(footer)
       // Encoding is only knowable at read time. If any required column chunk uses an encoding we do not
-      // decode (BYTE_STREAM_SPLIT on FIXED_LEN_BYTE_ARRAY, ...), a column's physical type is not its lane's,
-      // or a date / timestamp column's values need a calendar rebase, fall the WHOLE FILE over to Spark's
-      // vectorized reader -- with this file's rebase modes -- for correct results, no mid-decode crash.
-      if (hasUnsupportedEncodingInFooter(footer, clipped) || (hasDatetime && modes.datetimeMode != "CORRECTED")) {
+      // decode (BYTE_STREAM_SPLIT on FIXED_LEN_BYTE_ARRAY, ...) or a column's physical type is not its lane's,
+      // fall the WHOLE FILE over to Spark's vectorized reader -- with this file's rebase modes -- for correct
+      // results, no mid-decode crash. A date or timestamp file in any rebase mode is read natively (#568 item
+      // 6): its readers apply the file's LEGACY rebase, EXCEPTION check and INT96 conversion (ParquetRebase).
+      if (hasUnsupportedEncodingInFooter(footer, clipped)) {
         stream.close()
         stream = null
         return new Prepared(file, null, clipped, false, null, needsFallback = true, modes)
@@ -754,7 +755,7 @@ private[vecruntime] final class VectorParquetPartitionReader(
       val readOpts = HadoopReadOptions
         .builder(hadoopConf, path)
         .withRange(start, end)
-        .withRecordFilter(rowGroupFilter(clipped))
+        .withRecordFilter(rowGroupFilter(clipped, footer))
         // Row groups only: with the column index on, readNextFilteredRowGroup also drops PAGES outside the
         // filter's row ranges, and each column's remaining pages start at different rows. The decoder reads
         // a column's pages back to back against the row group's row count, so that would misalign the
@@ -766,7 +767,7 @@ private[vecruntime] final class VectorParquetPartitionReader(
       stream = null
       r.setRequestedSchema(clipped)
       val first = if (readFirst) r.readNextFilteredRowGroup() else null
-      val p = new Prepared(file, r, clipped, readFirst, first, needsFallback = false)
+      val p = new Prepared(file, r, clipped, readFirst, first, needsFallback = false, modes)
       r = null
       p
     } finally {
@@ -804,6 +805,12 @@ private[vecruntime] final class VectorParquetPartitionReader(
     installedFirst = p.firstStore
     installedFirstPending = p.firstRead
     val columns = p.clipped.getColumns
+    // #568 item 6: this file's calendar rebase and INT96 conversion, for every date and timestamp leaf.
+    val m = p.fallbackModes
+    val fileRebase =
+      if (m == null) io.vecruntime.spark.parquet.ParquetRebase.CORRECTED
+      else
+        new io.vecruntime.spark.parquet.ParquetRebase(m.datetimeMode, m.datetimeTz, m.int96Mode, m.int96Tz, m.convertTz)
     columnReaders = new Array[NativeParquetColumn](dataColumnCount)
     // Map each required data column to its clipped ColumnDescriptor by leaf name; a struct (#568) to its group.
     var i = 0
@@ -838,6 +845,7 @@ private[vecruntime] final class VectorParquetPartitionReader(
       }
       columnReaders(i).setPoolLimit(poolLimit)
       columnReaders(i).setDictionaryIds(dictionaryStrings)
+      columnReaders(i).setRebase(fileRebase)
       i += 1
     }
     buildPartitionColumns(p.file)
@@ -1074,16 +1082,6 @@ private[vecruntime] final class VectorParquetPartitionReader(
   }
 
   /** Whether any requested column holds dates or timestamps: the only columns a calendar rebase touches. */
-  private val hasDatetime: Boolean = {
-    def datetime(dt: org.apache.spark.sql.types.DataType): Boolean = dt match {
-      case s: StructType => s.fields.exists(f => datetime(f.dataType)) // #568: nested leaves too
-      case a: org.apache.spark.sql.types.ArrayType => datetime(a.elementType)
-      case m: org.apache.spark.sql.types.MapType => datetime(m.keyType) || datetime(m.valueType)
-      case t => t == org.apache.spark.sql.types.DateType || t == org.apache.spark.sql.types.TimestampType
-    }
-    requiredSchema.fields.exists(f => datetime(f.dataType))
-  }
-
   /**
    * This file's rebase modes and INT96 time-zone conversion, resolved as Spark's `ParquetFileFormat` resolves
    * them: from the writer's version and legacy-calendar keys in the footer, else the session configuration.
@@ -1109,15 +1107,19 @@ private[vecruntime] final class VectorParquetPartitionReader(
     )
   }
 
-  private def rowGroupFilter(clipped: MessageType): FilterCompat.Filter = {
+  private def rowGroupFilter(clipped: MessageType, footer: ParquetMetadata): FilterCompat.Filter = {
     if (pushedFilters.isEmpty) {
       return FilterCompat.NOOP
     }
-    // Only a file whose datetime columns resolved to CORRECTED is read natively (see prepare), so its
-    // filters see the values as stored.
-    val rebaseSpec = org.apache.spark.sql.catalyst.util.RebaseDateTime.RebaseSpec(
-      org.apache.spark.sql.internal.LegacyBehaviorPolicy.CORRECTED
-    )
+    // The file's own datetime rebase spec (#568 item 6), as ParquetFileFormat builds its ParquetFilters: a
+    // LEGACY file's date and timestamp statistics are in the hybrid calendar, so the filter values are rebased
+    // to match them.
+    val kv = footer.getFileMetaData.getKeyValueMetaData
+    val rebaseSpec =
+      org.apache.spark.sql.execution.datasources.DataSourceUtils.datetimeRebaseSpec(
+        k => kv.get(k),
+        rebaseConf.datetimeMode
+      )
     val parquetFilters = new ParquetFilters(
       clipped,
       pushDownDate,
@@ -1283,9 +1285,10 @@ object VectorParquetScanExec {
         // INT32 widens by sign extension, so an unsigned INT32 (Spark reads UINT_32 as a long) does not match.
         p == INT64 || (p == INT32 && !isUnsigned(physical))
       case TimestampType =>
-        // INT64 MICROS or MILLIS, as Spark's ParquetVectorUpdaterFactory matches them (either isAdjustedToUTC);
-        // INT96 and NANOS fall over per file.
-        p == INT64 && (physical.getLogicalTypeAnnotation match {
+        // INT64 MICROS or MILLIS, as Spark's ParquetVectorUpdaterFactory matches them (either isAdjustedToUTC), and
+        // INT96 (#568 item 6: converted at flush, with the file's INT96 rebase and time-zone conversion). NANOS
+        // falls over per file.
+        p == PrimitiveType.PrimitiveTypeName.INT96 || p == INT64 && (physical.getLogicalTypeAnnotation match {
           case t: org.apache.parquet.schema.LogicalTypeAnnotation.TimestampLogicalTypeAnnotation =>
             t.getUnit == org.apache.parquet.schema.LogicalTypeAnnotation.TimeUnit.MICROS ||
             t.getUnit == org.apache.parquet.schema.LogicalTypeAnnotation.TimeUnit.MILLIS
