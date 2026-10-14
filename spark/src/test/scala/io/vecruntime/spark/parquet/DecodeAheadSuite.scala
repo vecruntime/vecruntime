@@ -164,4 +164,63 @@ class DecodeAheadSuite extends VectorQuerySuite {
       assert(ahead.getClass === serial.getClass, s"${ahead.getClass} vs ${serial.getClass}")
     }
   }
+
+  /**
+   * Runs `sql` with one task over every file of `da_many` (many small files, several row groups each),
+   * returning its rows and the executor's peak read-ahead bytes; every byte reserved is given back after.
+   */
+  private def readAhead(sql: String, confs: (String, String)*): (Seq[org.apache.spark.sql.Row], Long) = {
+    VectorParquetScanExec.resetPrefetchPeak()
+    val rows = withConf(
+      Seq(
+        "spark.sql.files.maxPartitionBytes" -> (1L << 30).toString,
+        "spark.sql.files.openCostInBytes" -> "0",
+        VectorConf.ScanNativeParquetPrefetchFiles -> "6",
+        VectorConf.ScanNativeParquetPrefetchRowGroups -> "4"
+      ) ++ confs: _*
+    )(withPlugin(enabled = true)(spark.sql(sql).collect().toSeq))
+    assert(VectorParquetScanExec.prefetchInFlightBytes === 0, "read-ahead bytes were not given back")
+    (rows, VectorParquetScanExec.prefetchPeakBytes)
+  }
+
+  private lazy val manyFiles: (String, Long, Long) = {
+    val path = newTempPath("da/many")
+    withPlugin(enabled = false) {
+      spark.sql("SELECT CAST(id AS INT) AS i, CONCAT('v', CAST(id % 997 AS STRING)) AS s FROM range(0, 120000)")
+        .repartition(12).write.mode("overwrite").parquet(path)
+      spark.read.parquet(path).createOrReplaceTempView("da_many")
+    }
+    val sizes = new java.io.File(path).listFiles().filter(_.getName.endsWith(".parquet")).map(_.length)
+    (path, sizes.max, sizes.sum)
+  }
+
+  test("read-ahead is capped in bytes per task, and gives every byte back (#568)") {
+    val (_, largest, total) = manyFiles
+    val q = "SELECT i, s FROM da_many"
+    val expected = withPlugin(enabled = false)(spark.sql(q).collect().toSeq).map(_.toString).sorted
+    val (free, freePeak) = readAhead(q, VectorConf.ScanNativeParquetPrefetchMaxBytes -> "0")
+    val (capped, cappedPeak) = readAhead(q, VectorConf.ScanNativeParquetPrefetchMaxBytes -> "1")
+    assert(free.map(_.toString).sorted === expected)
+    assert(capped.map(_.toString).sorted === expected)
+    // Uncapped, six files open ahead; capped at one byte, one file and one row group (always allowed).
+    assert(freePeak > 2 * largest, s"uncapped peak $freePeak, largest file $largest")
+    assert(cappedPeak <= 2 * largest, s"capped peak $cappedPeak, largest file $largest")
+    assert(freePeak <= total, s"peak $freePeak over every file's bytes $total")
+  }
+
+  test("the executor-wide read-ahead cap bounds every task together (#568)") {
+    val (_, largest, _) = manyFiles
+    val q = "SELECT count(*), max(s) FROM da_many"
+    val (rows, peak) = readAhead(
+      q,
+      VectorConf.ScanNativeParquetPrefetchMaxBytes -> "0",
+      VectorConf.ScanNativeParquetPrefetchExecutorMaxBytes -> "1"
+    )
+    assert(rows.map(_.toString) === withPlugin(enabled = false)(spark.sql(q).collect().toSeq).map(_.toString))
+    assert(peak <= 2 * largest, s"peak $peak under a one-byte executor cap, largest file $largest")
+    withDecodeAhead(2, "virtual") {
+      val (rows2, _) = readAhead(q, VectorConf.ScanNativeParquetPrefetchMaxBytes -> "1")
+      assert(rows2.map(_.toString) === rows.map(_.toString))
+    }
+  }
 }

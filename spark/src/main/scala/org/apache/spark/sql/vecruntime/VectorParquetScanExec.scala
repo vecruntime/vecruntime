@@ -203,6 +203,8 @@ case class VectorParquetScanExec(
     )
     val prefetchFiles = io.vecruntime.spark.VectorConf.scanNativeParquetPrefetchFiles(sqlConf)
     val prefetchRowGroups = io.vecruntime.spark.VectorConf.scanNativeParquetPrefetchRowGroups(sqlConf)
+    val prefetchMaxBytes = io.vecruntime.spark.VectorConf.scanNativeParquetPrefetchMaxBytes(sqlConf)
+    val prefetchExecutorMaxBytes = io.vecruntime.spark.VectorConf.scanNativeParquetPrefetchExecutorMaxBytes(sqlConf)
     val decodeAhead = io.vecruntime.spark.VectorConf.scanNativeParquetDecodeAhead(sqlConf)
     val decodeAheadVirtual = io.vecruntime.spark.VectorConf.scanNativeParquetDecodeAheadVirtual(sqlConf)
     val dictionaryStrings = io.vecruntime.spark.VectorConf.scanNativeParquetDictionaryStrings(sqlConf)
@@ -261,7 +263,9 @@ case class VectorParquetScanExec(
       compiledFilter,
       filterColumns,
       metadataFields,
-      metadataExtractors
+      metadataExtractors,
+      prefetchMaxBytes,
+      prefetchExecutorMaxBytes
     )
     // Counted by the task of partition 0, once per execution (a driver-side count is reset when a plan
     // whose stages are already materialised runs again).
@@ -315,7 +319,9 @@ private[vecruntime] final class VectorParquetRDD(
     decodeFilter: io.vecruntime.spark.expr.VectorExpr,
     filterColumns: Array[Boolean],
     metadataFields: Array[(String, org.apache.spark.sql.types.DataType)],
-    metadataExtractors: Map[String, PartitionedFile => Any]
+    metadataExtractors: Map[String, PartitionedFile => Any],
+    prefetchMaxBytes: Long,
+    prefetchExecutorMaxBytes: Long
 ) extends RDD[ColumnarBatch](sc, Nil) {
 
   // The wrapped scan's file partitions (DPP / bucketing / splitting applied). Read lazily inside
@@ -362,7 +368,9 @@ private[vecruntime] final class VectorParquetRDD(
       decodeFilter = decodeFilter,
       filterColumns = filterColumns,
       metadataFields = metadataFields,
-      metadataExtractors = metadataExtractors
+      metadataExtractors = metadataExtractors,
+      prefetchMaxBytes = prefetchMaxBytes,
+      prefetchExecutorMaxBytes = prefetchExecutorMaxBytes
     )
     if (decodeAhead > 0) new DecodeAheadIterator(reader, decodeAhead, decodeAheadVirtual, context) else reader
   }
@@ -404,13 +412,52 @@ private[vecruntime] final class VectorParquetPartitionReader(
     filterColumns: Array[Boolean] = null,
     // #568 item 9: the file-constant metadata columns after the partition columns, and their extractors
     metadataFields: Array[(String, org.apache.spark.sql.types.DataType)] = Array.empty,
-    metadataExtractors: Map[String, PartitionedFile => Any] = Map.empty
+    metadataExtractors: Map[String, PartitionedFile => Any] = Map.empty,
+    // #568: the read-ahead's byte caps, per task and over the executor (Long.MaxValue: none)
+    prefetchMaxBytes: Long = Long.MaxValue,
+    prefetchExecutorMaxBytes: Long = Long.MaxValue
 ) extends Iterator[ColumnarBatch]
     with AutoCloseable {
 
   private val allocator = VectorAllocators.newChild("VectorParquetScanExec")
-  private val files: Iterator[PartitionedFile] = partition.files.iterator
+  private val files: BufferedIterator[PartitionedFile] = partition.files.iterator.buffered
   private val dataColumnCount = requiredSchema.length
+
+  // #568 read-ahead byte cap: the compressed bytes this task's read-ahead holds (files opened ahead, counted at
+  // their split's length, and row groups read ahead, at their requested column chunks' size), each queued
+  // item's share kept beside it so it is given back when the item is used or dropped. The executor's total
+  // is VectorParquetPartitionReader.prefetchInFlight.
+  private var aheadBytes = 0L
+  private val aheadSizes = new java.util.ArrayDeque[java.lang.Long]()
+  private val rgAheadSizes = new java.util.ArrayDeque[java.lang.Long]()
+  private var requestedPaths: Set[Seq[String]] = Set.empty // the current file's clipped leaves
+  private var currentFile: PartitionedFile = _ // the file being read (its batches carry it, #568)
+
+  /** Whether one more read-ahead of `bytes` fits; one queued item is always allowed (`queued` = 0). */
+  private def mayReadAhead(bytes: Long, queued: Int): Boolean =
+    queued == 0 || (
+      aheadBytes + bytes <= prefetchMaxBytes &&
+        VectorParquetPartitionReader.prefetchInFlight.get() + bytes <= prefetchExecutorMaxBytes
+    )
+
+  private def reserve(bytes: Long): Unit = {
+    aheadBytes += bytes
+    val now = VectorParquetPartitionReader.prefetchInFlight.addAndGet(bytes)
+    VectorParquetPartitionReader.prefetchPeak.accumulateAndGet(now, math.max)
+  }
+
+  private def unreserve(bytes: java.lang.Long): Unit = if (bytes != null) {
+    aheadBytes -= bytes
+    VectorParquetPartitionReader.prefetchInFlight.addAndGet(-bytes)
+  }
+
+  /** Row group `i` (of the current file's, after statistics pruning) at its requested column chunks' size. */
+  private def rowGroupBytes(i: Int): Long = {
+    val blocks = reader.getRowGroups
+    if (i >= blocks.size()) 0L
+    else blocks.get(i).getColumns.asScala.filter(c => requestedPaths.contains(c.getPath.toArray.toSeq))
+      .map(_.getTotalSize).sum
+  }
 
   // Per-file state.
   private var reader: ParquetFileReader = _
@@ -508,7 +555,14 @@ private[vecruntime] final class VectorParquetPartitionReader(
       val b = fallback.next()
       metrics.numOutputBatches += 1
       metrics.numOutputRows += b.numRows()
-      return new VectorParquetPartitionReader.OwnedBatch(withFallbackMetadata(b), null, null, null, recycled = true)
+      return new VectorParquetPartitionReader.OwnedBatch(
+        withFallbackMetadata(b),
+        null,
+        null,
+        null,
+        recycled = true,
+        file = currentFile
+      )
     }
     val n = math.min(batchSize, rgRows - rgOffset)
     val columns = new Array[ColumnVector](attrs.length)
@@ -577,7 +631,14 @@ private[vecruntime] final class VectorParquetPartitionReader(
     metrics.numOutputRows += n
     if (inputMetrics != null) inputMetrics.incRecordsRead(n)
     updateBytesRead()
-    new VectorParquetPartitionReader.OwnedBatch(batch, dataVectors, partitionVectors, columnReaders, recycled = false)
+    new VectorParquetPartitionReader.OwnedBatch(
+      batch,
+      dataVectors,
+      partitionVectors,
+      columnReaders,
+      recycled = false,
+      file = currentFile
+    )
   }
 
   /**
@@ -682,14 +743,20 @@ private[vecruntime] final class VectorParquetPartitionReader(
     }
     topUp(depth)
     val p = VectorParquetPartitionReader.await(ahead.poll())
+    unreserve(aheadSizes.poll())
     topUp(depth)
     install(p)
   }
 
-  /** Keeps `depth + 1` files (the one about to be used plus `depth` more) opening in the background. */
+  /**
+   * Keeps `depth + 1` files (the one about to be used plus `depth` more) opening in the background, within
+   * the read-ahead byte caps (#568).
+   */
   private def topUp(depth: Int): Unit = {
-    while (ahead.size() < depth + 1 && files.hasNext) {
+    while (ahead.size() < depth + 1 && files.hasNext && mayReadAhead(files.head.length, ahead.size())) {
       val file = files.next()
+      reserve(file.length)
+      aheadSizes.add(file.length)
       ahead.add(
         java.util.concurrent.CompletableFuture.supplyAsync(
           () => {
@@ -706,6 +773,7 @@ private[vecruntime] final class VectorParquetPartitionReader(
   private def drainAhead(): Unit = {
     while (!ahead.isEmpty) {
       val f = ahead.poll()
+      unreserve(aheadSizes.poll())
       try {
         val p = f.get()
         if (p.reader != null) p.reader.close()
@@ -817,6 +885,7 @@ private[vecruntime] final class VectorParquetPartitionReader(
       return
     }
     reader = p.reader
+    requestedPaths = p.clipped.getColumns.asScala.map(_.getPath.toSeq).toSet
     rowGroupIndex = 0
     installedFirst = p.firstStore
     installedFirstPending = p.firstRead
@@ -907,8 +976,12 @@ private[vecruntime] final class VectorParquetPartitionReader(
   /** Record this file's partition values; per-batch constant columns are built from them in next(). */
   private def buildPartitionColumns(file: PartitionedFile): Unit = {
     partitionValues = file.partitionValues
-    // input_file_name() and its siblings read the task thread's holder, as FileScanRDD sets it per file.
-    org.apache.spark.rdd.InputFileBlockHolder.set(file.urlEncodedPath, file.start, file.length)
+    // input_file_name() and its siblings read the task thread's holder, as FileScanRDD sets it per file. Under
+    // decode-ahead (handOff) this runs on the producer thread, whose holder is the task thread's own
+    // (InputFileBlockHolder is inheritable): DecodeAheadIterator sets it from each batch's file as the task
+    // thread takes the batch, so it names the file of the rows being consumed, not the one decoded ahead.
+    currentFile = file
+    if (!handOff) org.apache.spark.rdd.InputFileBlockHolder.set(file.urlEncodedPath, file.start, file.length)
     if (metadataCount > 0) {
       val row = new org.apache.spark.sql.catalyst.expressions.GenericInternalRow(metadataCount)
       org.apache.spark.sql.vecruntime.shims.SparkShims.fileConstantMetadata(
@@ -943,6 +1016,7 @@ private[vecruntime] final class VectorParquetPartitionReader(
         installedFirst = null
         s
       } else if (!rgAhead.isEmpty) {
+        unreserve(rgAheadSizes.poll())
         VectorParquetPartitionReader.await(rgAhead.poll())
       } else if (rgExhausted) {
         null
@@ -969,11 +1043,20 @@ private[vecruntime] final class VectorParquetPartitionReader(
   private var rgTail: java.util.concurrent.CompletableFuture[org.apache.parquet.column.page.PageReadStore] = _
   private var rgExhausted = false
 
-  /** Keeps `depth` row groups of the current file reading ahead, chained so the reads stay sequential. */
+  /**
+   * Keeps `depth` row groups of the current file reading ahead, chained so the reads stay sequential, within
+   * the read-ahead byte caps (#568). The next chained read is row group `rowGroupIndex + rgAhead.size()`.
+   */
   private def topUpRowGroups(depth: Int): Unit = {
     val r = reader
     val pool = VectorParquetPartitionReader.prefetchPool
-    while (rgAhead.size() < depth && !rgExhausted) {
+    while (
+      rgAhead.size() < depth && !rgExhausted &&
+      mayReadAhead(rowGroupBytes(rowGroupIndex + rgAhead.size()), rgAhead.size())
+    ) {
+      val bytes = rowGroupBytes(rowGroupIndex + rgAhead.size())
+      reserve(bytes)
+      rgAheadSizes.add(bytes)
       val next =
         if (rgTail == null) {
           java.util.concurrent.CompletableFuture.supplyAsync(() => readWithTask(r), pool)
@@ -1024,6 +1107,7 @@ private[vecruntime] final class VectorParquetPartitionReader(
       catch { case _: Throwable => () }
     }
     rgAhead.clear()
+    while (!rgAheadSizes.isEmpty) unreserve(rgAheadSizes.poll())
     rgTail = null
   }
 
@@ -1306,7 +1390,10 @@ private[vecruntime] object VectorParquetPartitionReader {
       val vectors: Array[AnyRef],
       val partitionVectors: Array[ColumnVector],
       val readers: Array[io.vecruntime.spark.parquet.NativeParquetColumn],
-      val recycled: Boolean
+      val recycled: Boolean,
+      // #568: the file the batch was read from; DecodeAheadIterator sets InputFileBlockHolder from it on the task
+      // thread, as the batches are handed out (the files are opened on the producer thread)
+      val file: PartitionedFile = null
   )
 
   /**
@@ -1329,6 +1416,13 @@ private[vecruntime] object VectorParquetPartitionReader {
     }
   }
 
+  /**
+   * #568: the compressed bytes every task's read-ahead holds in this executor (files opened ahead and row
+   * groups read ahead, not yet used), against `prefetchExecutorMaxBytes`; and its peak (read by tests).
+   */
+  val prefetchInFlight = new java.util.concurrent.atomic.AtomicLong()
+  val prefetchPeak = new java.util.concurrent.atomic.AtomicLong()
+
   /** The value of a prefetched step; its failure is rethrown as the original exception. */
   def await[T](f: java.util.concurrent.Future[T]): T =
     try f.get()
@@ -1336,6 +1430,11 @@ private[vecruntime] object VectorParquetPartitionReader {
 }
 
 object VectorParquetScanExec {
+
+  /** #568: the executor's read-ahead bytes in flight and their peak (tests read these; resetPrefetchPeak). */
+  def prefetchInFlightBytes: Long = VectorParquetPartitionReader.prefetchInFlight.get()
+  def prefetchPeakBytes: Long = VectorParquetPartitionReader.prefetchPeak.get()
+  def resetPrefetchPeak(): Unit = VectorParquetPartitionReader.prefetchPeak.set(0)
 
   /** The Parquet value/level encodings the native decoder handles; any other encoding falls the file over. */
   val SupportedEncodings: Set[String] = Set("PLAIN", "PLAIN_DICTIONARY", "RLE_DICTIONARY", "RLE", "BIT_PACKED")
