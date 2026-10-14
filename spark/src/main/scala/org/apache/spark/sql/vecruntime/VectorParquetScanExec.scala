@@ -713,6 +713,13 @@ private[vecruntime] final class VectorParquetPartitionReader(
     }
   }
 
+  // Field-id matching (#568): Spark's ParquetReadSupport fails a file with no field ids when the read schema has
+  // some, unless `fieldId.read.ignoreMissing` is set; such a file goes to Spark's reader, which raises that error.
+  private lazy val ignoreMissingFieldIds =
+    hadoopConf.getBoolean(SQLConf.IGNORE_MISSING_PARQUET_FIELD_ID.key, false)
+  private lazy val requestedHasFieldIds =
+    org.apache.spark.sql.execution.datasources.parquet.ParquetUtils.hasFieldIds(requiredSchema)
+
   /**
    * Opens one file: touches no reader state, so it may run on a prefetch thread. Returns the reader built
    * over a single stream from the footer just read (the reader owns the stream), or a fallback marker.
@@ -746,7 +753,13 @@ private[vecruntime] final class VectorParquetPartitionReader(
       // fall the WHOLE FILE over to Spark's vectorized reader -- with this file's rebase modes -- for correct
       // results, no mid-decode crash. A date or timestamp file in any rebase mode is read natively (#568 item
       // 6): its readers apply the file's LEGACY rebase, EXCEPTION check and INT96 conversion (ParquetRebase).
-      if (hasUnsupportedEncodingInFooter(footer, clipped)) {
+      if (
+        hasUnsupportedEncodingInFooter(footer, clipped) ||
+        (useFieldId && !ignoreMissingFieldIds && requestedHasFieldIds && !VectorParquetScanExec.hasFieldIds(
+          fileSchema
+        )) ||
+        (useFieldId && requestedHasFieldIds && VectorParquetScanExec.idNameClash(requiredSchema, clipped))
+      ) {
         stream.close()
         stream = null
         return new Prepared(file, null, clipped, false, null, needsFallback = true, modes)
@@ -820,23 +833,25 @@ private[vecruntime] final class VectorParquetPartitionReader(
       columnReaders(i) = field.dataType match {
         case _ if i == rowIndexOrdinal =>
           new io.vecruntime.spark.parquet.NativeParquetRowIndexColumn(field.name, allocator)
-        case dt if !NativeParquetStructReader.holds(fileSchema, Array(topLevelName(p.clipped, field.name))) =>
+        case dt if !NativeParquetStructReader.holds(fileSchema, Array(clippedName(p.clipped, i))) =>
           // #568 schema evolution: a column added since the file was written, null in every row.
           new io.vecruntime.spark.parquet.NativeParquetNullColumn(field.name, dt, allocator)
         case st: StructType =>
-          val name = topLevelName(p.clipped, field.name)
+          val name = clippedName(p.clipped, i)
           NativeParquetStructReader.create(p.clipped, fileSchema, Array(name), st, field.name, batchSize, allocator)
         case dt @ (_: org.apache.spark.sql.types.ArrayType | _: org.apache.spark.sql.types.MapType) =>
           NativeParquetListReader.create(
             p.clipped,
-            topLevelName(p.clipped, field.name),
+            fileSchema,
+            Array(clippedName(p.clipped, i)),
             dt,
             field.name,
             batchSize,
             allocator
           )
         case dt =>
-          val cd = columns.asScala.find(_.getPath()(0).equalsIgnoreCase(field.name))
+          val leafName = clippedName(p.clipped, i)
+          val cd = columns.asScala.find(_.getPath()(0).equals(leafName))
             .getOrElse(throw new IllegalStateException(s"column ${field.name} missing from clipped schema"))
           new NativeParquetColumnReader(
             cd,
@@ -874,6 +889,15 @@ private[vecruntime] final class VectorParquetPartitionReader(
     }
 
   /** The clipped schema's own name for the top-level column `name` (the file's spelling of it). */
+  /**
+   * The clipped name of requested data column `ordinal`. `clipParquetSchema` keeps the requested order, so it is
+   * the clipped schema's field at the same position -- under field-id matching (#568) the file's own name, which
+   * may differ from the requested one, or a generated name for an id the file lacks.
+   */
+  private def clippedName(clipped: MessageType, ordinal: Int): String =
+    if (clipped.getFieldCount == requiredSchema.length) clipped.getFields.get(ordinal).getName
+    else topLevelName(clipped, requiredSchema.fields(ordinal).name)
+
   private def topLevelName(clipped: MessageType, name: String): String =
     clipped.getFields.asScala.find(_.getName.equalsIgnoreCase(name)).map(_.getName).getOrElse(name)
 
@@ -1003,7 +1027,8 @@ private[vecruntime] final class VectorParquetPartitionReader(
   /**
    * Whether the native readers fill a clipped leaf the file does not hold with nulls as Spark's reader does
    * (#568 schema evolution). Its shallowest missing node must be:
-   *   - reached through plain struct groups only (no list, map or repeated ancestor: a null there has a shape);
+   *   - a top-level column, or a field of a struct at any depth (inside a list's or a map's struct too, which the
+   *     tree reader fills; the parent group is a struct when it carries no LIST or MAP annotation);
    *   - optional (Spark fails a REQUIRED missing column: "Required column is missing in data file");
    *   - when top level, a column without an existence default (Spark fills that default instead);
    *   - when a struct field, in a struct the file holds some other field of (its nulls come from that field;
@@ -1017,20 +1042,17 @@ private[vecruntime] final class VectorParquetPartitionReader(
     var j = 0
     while (j < k) {
       t = t.asGroupType().getType(path(j))
-      if (
-        t.isPrimitive || t.isRepetition(org.apache.parquet.schema.Type.Repetition.REPEATED) ||
-        t.getLogicalTypeAnnotation != null
-      ) return false
+      if (t.isPrimitive) return false
       j += 1
     }
     val parent = t.asGroupType()
+    if (k > 0 && parent.getLogicalTypeAnnotation != null) return false
     val missing = parent.getType(path(k))
     if (!missing.isRepetition(org.apache.parquet.schema.Type.Repetition.OPTIONAL)) return false
     if (k == 0) {
-      requiredSchema.fields.find(_.name.equalsIgnoreCase(path(0))).forall(f =>
-        !f.metadata.contains(
-          org.apache.spark.sql.catalyst.util.ResolveDefaultColumns.EXISTS_DEFAULT_COLUMN_METADATA_KEY
-        )
+      val ordinal = clipped.getFieldIndex(path(0))
+      ordinal >= requiredSchema.length || !requiredSchema.fields(ordinal).metadata.contains(
+        org.apache.spark.sql.catalyst.util.ResolveDefaultColumns.EXISTS_DEFAULT_COLUMN_METADATA_KEY
       )
     } else {
       parent.getFields.asScala.exists(f => NativeParquetStructReader.holds(file, path.take(k) :+ f.getName))
@@ -1059,7 +1081,7 @@ private[vecruntime] final class VectorParquetPartitionReader(
         case _
             if !NativeParquetStructReader.holds(
               footer.getFileMetaData.getSchema,
-              Array(topLevelName(clipped, field.name))
+              Array(clippedName(clipped, f))
             ) => // not in the file: a null column when missingReadable admits it (below)
         case st: StructType =>
           // #568: every leaf of the struct, in the clipped group's order, stored as its lane needs (a leaf the file
@@ -1068,7 +1090,8 @@ private[vecruntime] final class VectorParquetPartitionReader(
           val file = footer.getFileMetaData.getSchema
           val shape = NativeParquetStructReader.forEachLeaf(
             clipped,
-            Array(topLevelName(clipped, field.name)),
+            file,
+            Array(clippedName(clipped, f)),
             st,
             (cd: org.apache.parquet.column.ColumnDescriptor, dt: org.apache.spark.sql.types.DataType) =>
               if (file.containsPath(cd.getPath) && !VectorParquetScanExec.physicalMatches(dt, cd.getPrimitiveType))
@@ -1078,16 +1101,22 @@ private[vecruntime] final class VectorParquetPartitionReader(
         case dt @ (_: org.apache.spark.sql.types.ArrayType | _: org.apache.spark.sql.types.MapType) =>
           // #568: a list or map of leaves, each leaf repeated once and stored as its lane needs.
           var ok = true
+          val file = footer.getFileMetaData.getSchema
           val shape = NativeParquetListReader.forEachLeaf(
             clipped,
-            topLevelName(clipped, field.name),
+            file,
+            Array(clippedName(clipped, f)),
             dt,
             (cd: org.apache.parquet.column.ColumnDescriptor, leafType: org.apache.spark.sql.types.DataType) =>
-              if (!VectorParquetScanExec.physicalMatches(leafType, cd.getPrimitiveType)) ok = false
+              if (
+                file.containsPath(cd.getPath) && !VectorParquetScanExec.physicalMatches(leafType, cd.getPrimitiveType)
+              )
+                ok = false
           )
           if (!shape || !ok) return true
         case dt =>
-          val cd = clipped.getColumns.asScala.find(_.getPath()(0).equalsIgnoreCase(field.name))
+          val leafName = clippedName(clipped, f)
+          val cd = clipped.getColumns.asScala.find(_.getPath()(0).equals(leafName))
           if (cd.isDefined && !VectorParquetScanExec.physicalMatches(dt, cd.get.getPrimitiveType)) {
             return true
           }
@@ -1170,8 +1199,10 @@ private[vecruntime] final class VectorParquetPartitionReader(
         k => kv.get(k),
         rebaseConf.datetimeMode
       )
+    // Over the FILE's schema, as ParquetFileFormat builds its ParquetFilters: a column the file lacks (schema
+    // evolution) or holds under another name (field-id matching, #568) gets no row-group predicate, as in Spark.
     val parquetFilters = new ParquetFilters(
-      clipped,
+      footer.getFileMetaData.getSchema,
       pushDownDate,
       pushDownTimestamp,
       pushDownDecimal,
@@ -1319,6 +1350,47 @@ object VectorParquetScanExec {
     "DELTA_BYTE_ARRAY" -> Set(BINARY, FIXED_LEN_BYTE_ARRAY),
     "BYTE_STREAM_SPLIT" -> Set(INT32, INT64, DOUBLE, PrimitiveType.PrimitiveTypeName.FLOAT)
   )
+
+  /** Whether any field of a Parquet schema, at any depth, carries a field id (Spark's ParquetReadSupport check). */
+  def hasFieldIds(t: org.apache.parquet.schema.Type): Boolean =
+    (t.getId != null && !t.isInstanceOf[MessageType]) ||
+      (!t.isPrimitive && t.asGroupType().getFields.asScala.exists(hasFieldIds))
+
+  /**
+   * Under field-id matching (#568): whether some clipped field, matched by id, carries the name of a DIFFERENT
+   * requested sibling. Spark's reader pairs the clipped fields with the read schema by name after clipping by id
+   * (ParquetToSparkSchemaConverter), so it reads such a field as that sibling's type -- a type mismatch, or
+   * another column's values. The native readers pair by position, so such a file goes to Spark's reader for
+   * Spark's outcome. Walks structs, and lists' and maps' structs, as clipped (Spark's three- and two-level lists).
+   */
+  def idNameClash(dt: org.apache.spark.sql.types.DataType, t: org.apache.parquet.schema.Type): Boolean = {
+    import org.apache.spark.sql.types._
+    if (t.isPrimitive) return false
+    val g = t.asGroupType()
+    dt match {
+      case st: StructType =>
+        if (g.getFieldCount != st.length) return false
+        st.fields.indices.exists { i =>
+          val name = g.getType(i).getName
+          (!name.equalsIgnoreCase(st.fields(i).name) &&
+            st.fields.exists(_.name.equalsIgnoreCase(name))) || idNameClash(st.fields(i).dataType, g.getType(i))
+        }
+      case at: ArrayType if g.getFieldCount == 1 =>
+        val r = g.getType(0)
+        val element =
+          if (
+            !r.isPrimitive && r.asGroupType().getFieldCount == 1 && r.getName != "array" &&
+            r.getName != g.getName + "_tuple"
+          ) r.asGroupType().getType(0)
+          else r
+        idNameClash(at.elementType, element)
+      case mt: MapType
+          if g.getFieldCount == 1 && !g.getType(0).isPrimitive && g.getType(0).asGroupType().getFieldCount == 2 =>
+        val kv = g.getType(0).asGroupType()
+        idNameClash(mt.keyType, kv.getType(0)) || idNameClash(mt.valueType, kv.getType(1))
+      case _ => false
+    }
+  }
 
   /**
    * True if a file column stored as `physical` decodes into the lane of the Spark type `dt`: INT32 for int and
@@ -1477,7 +1549,14 @@ private[vecruntime] final class SparkFallbackFileReader(
       return false
     }
     if (!advanced) {
-      hasRow = reader.nextBatch()
+      // A read error carries the file, as FileScanRDD attaches it (FAILED_READ_FILE.*): the same error Spark's scan
+      // would raise for this file.
+      hasRow =
+        try reader.nextBatch()
+        catch {
+          case e: Throwable =>
+            throw org.apache.spark.sql.execution.datasources.v2.FileDataSourceV2.attachFilePath(file.urlEncodedPath, e)
+        }
       advanced = true
     }
     hasRow

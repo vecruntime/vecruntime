@@ -117,9 +117,29 @@ public final class NativeParquetListReader implements NativeParquetColumn, RowLe
      */
     public static NativeParquetColumn create(MessageType clipped, String[] path, DataType type,
             String name, int batchRows, BufferAllocator allocator) {
-        if (NativeParquetTreeReader.needed(type)) {
-            // #568: nesting below the list or map this reader does not follow (a struct holding a list, ...).
-            return NativeParquetTreeReader.create(clipped, path, type, name, batchRows, allocator);
+        return create(clipped, null, path, type, name, batchRows,
+                allocator);
+    }
+
+    /**
+     * {@link #create(MessageType, String[], DataType, String, int, BufferAllocator)}
+     * over a file whose schema is {@code file} (null: every field is in it): a
+     * list or map with a struct field the file lacks is read by the tree
+     * reader, which fills it with nulls (#568 schema evolution).
+     */
+    public static NativeParquetColumn create(
+            MessageType clipped,
+            MessageType file,
+            String[] path,
+            DataType type,
+            String name,
+            int batchRows,
+            BufferAllocator allocator) {
+        if (NativeParquetTreeReader.needed(type) || lacksSome(clipped, file, path)) {
+            // #568: nesting below the list or map this reader does not follow (a struct holding a list, ...), or
+            // a struct field the file lacks.
+            return NativeParquetTreeReader.create(clipped, file, path, type, name, batchRows,
+                    allocator);
         }
         if (NativeParquetNestedListReader.arrayDepth(type) > 1) {
             // #568: a list of lists, any depth, over one leaf.
@@ -134,15 +154,16 @@ public final class NativeParquetListReader implements NativeParquetColumn, RowLe
         if (type instanceof ArrayType at) {
             DataType et = at.elementType();
             if (et instanceof StructType st) {
-                // #568: an array of structs of leaves. Each field's leaf, matched by name in the struct's order.
+                // #568: an array of structs of leaves. Each field's leaf, by position in the struct's order (the
+                // clipped schema keeps it; under field-id matching a leaf keeps the file's name).
                 NativeParquetColumnReader[] readers = new NativeParquetColumnReader[st.fields().length];
                 for (int i = 0; i < readers.length; i++) {
                     StructField f = st.fields()[i];
-                    ColumnDescriptor cd = fieldLeaf(leaves, f.name());
+                    ColumnDescriptor cd = leaves.get(i);
                     readers[i] = new NativeParquetColumnReader(cd, NativeParquetSupport.decodeLane(f.dataType()), f.dataType(),
                             name + ".element." + f.name(), batchRows, allocator);
                 }
-                String[] leaf0 = fieldLeaf(leaves, st.fields()[0].name()).getPath();
+                String[] leaf0 = leaves.get(0).getPath();
                 int structDef = clipped.getMaxDefinitionLevel(java.util.Arrays.copyOf(leaf0, leaf0.length - 1));
                 return new NativeParquetListReader(at, readers, listDef, elementDef, structDef);
             }
@@ -163,11 +184,11 @@ public final class NativeParquetListReader implements NativeParquetColumn, RowLe
                     name + ".key", batchRows, allocator);
             for (int i = 0; i < st.fields().length; i++) {
                 StructField f = st.fields()[i];
-                ColumnDescriptor cd = fieldLeaf(values, f.name());
+                ColumnDescriptor cd = values.get(i);
                 readers[i + 1] = new NativeParquetColumnReader(cd, NativeParquetSupport.decodeLane(f.dataType()), f.dataType(),
                         name + ".value." + f.name(), batchRows, allocator);
             }
-            String[] v0 = fieldLeaf(values, st.fields()[0].name()).getPath();
+            String[] v0 = values.get(0).getPath();
             int structDef = clipped.getMaxDefinitionLevel(java.util.Arrays.copyOf(v0, v0.length - 1));
             return new NativeParquetListReader(mt, readers, listDef, elementDef, structDef);
         }
@@ -183,17 +204,19 @@ public final class NativeParquetListReader implements NativeParquetColumn, RowLe
     }
 
     /**
-     * The leaf of struct field {@code field} among an array of structs' leaves
-     * (its last path step).
+     * Whether the file ({@code null}: every field is in it) lacks some leaf of
+     * the clipped list or map at {@code path}.
      */
-    private static ColumnDescriptor fieldLeaf(List<ColumnDescriptor> leaves, String field) {
-        for (ColumnDescriptor cd : leaves) {
-            String[] p = cd.getPath();
-            if (p[p.length - 1].equalsIgnoreCase(field)) {
-                return cd;
+    static boolean lacksSome(MessageType clipped, MessageType file, String[] path) {
+        if (file == null) {
+            return false;
+        }
+        for (ColumnDescriptor cd : leavesUnder(clipped, path)) {
+            if (!file.containsPath(cd.getPath())) {
+                return true;
             }
         }
-        throw new IllegalStateException("struct field " + field + " missing from the clipped list");
+        return false;
     }
 
     /**
@@ -257,8 +280,18 @@ public final class NativeParquetListReader implements NativeParquetColumn, RowLe
      */
     public static boolean forEachLeaf(MessageType clipped, String[] path, DataType type,
             BiConsumer<ColumnDescriptor, DataType> leaf) {
-        if (NativeParquetTreeReader.needed(type)) {
-            return NativeParquetTreeReader.forEachLeaf(clipped, path, type, leaf);
+        return forEachLeaf(clipped, null, path, type, leaf);
+    }
+
+    /**
+     * {@link #forEachLeaf(MessageType, String[], DataType, BiConsumer)} over a
+     * file whose schema is {@code file} (null: every field is in it): a list or
+     * map with a struct field the file lacks is the tree reader's shape.
+     */
+    public static boolean forEachLeaf(MessageType clipped, MessageType file, String[] path,
+            DataType type, BiConsumer<ColumnDescriptor, DataType> leaf) {
+        if (NativeParquetTreeReader.needed(type) || lacksSome(clipped, file, path)) {
+            return NativeParquetTreeReader.forEachLeaf(clipped, file, path, type, leaf);
         }
         if (NativeParquetNestedListReader.arrayDepth(type) > 1) {
             return NativeParquetNestedListReader.forEachLeaf(clipped, path, (ArrayType) type, leaf);
@@ -284,9 +317,6 @@ public final class NativeParquetListReader implements NativeParquetColumn, RowLe
             String[] parent = null;
             for (int i = 0; i < leaves.size(); i++) {
                 String[] p = leaves.get(i).getPath();
-                if (!p[p.length - 1].equalsIgnoreCase(st.fields()[i].name())) {
-                    return false;
-                }
                 String[] up = java.util.Arrays.copyOf(p, p.length - 1);
                 if (parent != null && !java.util.Arrays.equals(parent, up)) {
                     return false;
@@ -323,10 +353,7 @@ public final class NativeParquetListReader implements NativeParquetColumn, RowLe
             }
             for (int i = 0; i < st.fields().length; i++) {
                 String[] p = leaves.get(i + 1).getPath();
-                if (p.length != rep.length + 2
-                        || !java.util.Arrays.equals(java.util.Arrays.copyOf(p, rep.length), rep)
-                        || !p[p.length - 1].equalsIgnoreCase(st.fields()[i].name())
-                        || !p[rep.length].equals(leaves.get(1).getPath()[rep.length])) {
+                if (p.length != rep.length + 2 || !java.util.Arrays.equals(java.util.Arrays.copyOf(p, rep.length), rep) || !p[rep.length].equals(leaves.get(1).getPath()[rep.length])) {
                     return false;
                 }
             }

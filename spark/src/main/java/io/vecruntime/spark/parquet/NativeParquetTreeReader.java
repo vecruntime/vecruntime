@@ -94,6 +94,12 @@ public final class NativeParquetTreeReader implements NativeParquetColumn, RowLe
         int entries; // this batch
     }
 
+    /**
+     * A struct field the file does not hold (#568 schema evolution): null in
+     * every instance of its struct, as Spark's reader makes it.
+     */
+    private static final class Missing extends Node {}
+
     /** One node's result in a batch. */
     private static final class Res {
         int count;
@@ -185,6 +191,7 @@ public final class NativeParquetTreeReader implements NativeParquetColumn, RowLe
      */
     private static Node build(
             MessageType clipped,
+            MessageType file,
             String[] path,
             Type t,
             DataType dt,
@@ -232,7 +239,7 @@ public final class NativeParquetTreeReader implements NativeParquetColumn, RowLe
             n.type = dt;
             n.depth = depth;
             n.existDef = existDef;
-            n.element = build(clipped, elementPath, elementType, at.elementType(),
+            n.element = build(clipped, file, elementPath, elementType, at.elementType(),
                     depth + 1, n.elemDef, elementAsElement, leaves);
             if (n.element == null) {
                 return null;
@@ -258,13 +265,29 @@ public final class NativeParquetTreeReader implements NativeParquetColumn, RowLe
             GroupType kv = r.asGroupType();
             Type k = kv.getType(0);
             Type v = kv.getType(1);
-            n.element = build(clipped, child(rp, k.getName()), k, mt.keyType(),
-                    depth + 1, n.elemDef, false, leaves);
+            n.element = build(
+                    clipped,
+                    file,
+                    child(rp, k.getName()),
+                    k,
+                    mt.keyType(),
+                    depth + 1,
+                    n.elemDef,
+                    false,
+                    leaves);
             if (n.element == null) {
                 return null;
             }
-            n.value = build(clipped, child(rp, v.getName()), v, mt.valueType(),
-                    depth + 1, n.elemDef, false, leaves);
+            n.value = build(
+                    clipped,
+                    file,
+                    child(rp, v.getName()),
+                    v,
+                    mt.valueType(),
+                    depth + 1,
+                    n.elemDef,
+                    false,
+                    leaves);
             if (n.value == null) {
                 return null;
             }
@@ -287,18 +310,29 @@ public final class NativeParquetTreeReader implements NativeParquetColumn, RowLe
             n.structDef = clipped.getMaxDefinitionLevel(path);
             n.fields = new Node[fs.length];
             for (int i = 0; i < fs.length; i++) {
+                // By position: the clipped schema keeps the requested order (under field-id matching a field keeps
+                // the file's name).
                 Type ct = g.getType(i);
-                if (!ct.getName().equalsIgnoreCase(fs[i].name())) {
-                    return null;
+                String[] cp = child(path, ct.getName());
+                if (file != null && !NativeParquetStructReader.holds(file, cp)) {
+                    Missing m = new Missing();
+                    m.type = fs[i].dataType();
+                    m.depth = depth;
+                    m.existDef = existDef;
+                    n.fields[i] = m;
+                    continue;
                 }
-                n.fields[i] = build(clipped, child(path, ct.getName()), ct, fs[i].dataType(),
+                n.fields[i] = build(clipped, file, cp, ct, fs[i].dataType(),
                         depth, existDef, false, leaves);
                 if (n.fields[i] == null) {
                     return null;
                 }
+                if (n.rep == null) {
+                    n.rep = n.fields[i].rep;
+                }
             }
-            n.rep = n.fields[0].rep;
-            return n;
+            // The struct's structure comes from a field the file holds; holding none, it is not followable.
+            return n.rep == null ? null : n;
         }
         if (!t.isPrimitive()) {
             return null;
@@ -317,25 +351,26 @@ public final class NativeParquetTreeReader implements NativeParquetColumn, RowLe
         return l;
     }
 
-    private static ListNode buildRoot(MessageType clipped, String[] path, DataType type,
-            List<Leaf> leaves) {
+    private static ListNode buildRoot(MessageType clipped, MessageType file, String[] path,
+            DataType type, List<Leaf> leaves) {
         Type t = NativeParquetListReader.nodeAt(clipped, path);
         if (t == null) {
             return null;
         }
-        Node n = build(clipped, path, t, type, 0, 0,
-                false, leaves);
+        Node n = build(clipped, file, path, t, type, 0,
+                0, false, leaves);
         return n instanceof ListNode ln ? ln : null;
     }
 
     /**
      * Checks the shape and calls {@code leaf} for each leaf; false when the
-     * reader cannot follow it.
+     * reader cannot follow it. {@code file}: the file's schema, whose missing
+     * struct fields are null (null: every field is in it).
      */
-    public static boolean forEachLeaf(MessageType clipped, String[] path, DataType type,
-            BiConsumer<ColumnDescriptor, DataType> leaf) {
+    public static boolean forEachLeaf(MessageType clipped, MessageType file, String[] path,
+            DataType type, BiConsumer<ColumnDescriptor, DataType> leaf) {
         List<Leaf> leaves = new ArrayList<>();
-        if (buildRoot(clipped, path, type, leaves) == null) {
+        if (buildRoot(clipped, file, path, type, leaves) == null) {
             return false;
         }
         for (Leaf l : leaves) {
@@ -348,10 +383,16 @@ public final class NativeParquetTreeReader implements NativeParquetColumn, RowLe
      * The reader of the list or map at {@code path}; {@link #forEachLeaf} must
      * have accepted it.
      */
-    public static NativeParquetTreeReader create(MessageType clipped, String[] path, DataType type,
-            String name, int batchRows, BufferAllocator allocator) {
+    public static NativeParquetTreeReader create(
+            MessageType clipped,
+            MessageType file,
+            String[] path,
+            DataType type,
+            String name,
+            int batchRows,
+            BufferAllocator allocator) {
         List<Leaf> leaves = new ArrayList<>();
-        ListNode root = buildRoot(clipped, path, type, leaves);
+        ListNode root = buildRoot(clipped, file, path, type, leaves);
         if (root == null) {
             throw new IllegalStateException("unfollowable nested column " + String.join(".", path));
         }
@@ -481,6 +522,12 @@ public final class NativeParquetTreeReader implements NativeParquetColumn, RowLe
         res.nulls = nulls;
         res.kids = new Res[sn.fields.length];
         for (int i = 0; i < sn.fields.length; i++) {
+            if (sn.fields[i] instanceof Missing) {
+                Res m = new Res();
+                m.count = inst;
+                res.kids[i] = m;
+                continue;
+            }
             res.kids[i] = structure(sn.fields[i], rows);
         }
         return res;
@@ -488,6 +535,9 @@ public final class NativeParquetTreeReader implements NativeParquetColumn, RowLe
 
     /** Puts each leaf's decoded vector into its result. */
     private void attach(Node node, Res res, FieldVector[] vectors) {
+        if (node instanceof Missing) {
+            return;
+        }
         if (node instanceof Leaf l) {
             res.vector = vectors[leaves.indexOf(l)];
             res.count = res.vector.getValueCount();
@@ -507,6 +557,13 @@ public final class NativeParquetTreeReader implements NativeParquetColumn, RowLe
     }
 
     private ColumnVector wrap(Node node, Res res) {
+        if (node instanceof Missing) {
+            // Spark's own all-null vector (setMissing), as its reader makes a missing column; on the heap, so
+            // nothing to release with the batch.
+            org.apache.spark.sql.execution.vectorized.OnHeapColumnVector v = new org.apache.spark.sql.execution.vectorized.OnHeapColumnVector(Math.max(1, res.count), node.type);
+            v.setMissing();
+            return v;
+        }
         if (node instanceof Leaf l) {
             return l.reader.wrap(res.vector);
         }
