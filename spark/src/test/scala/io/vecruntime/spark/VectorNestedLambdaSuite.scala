@@ -45,7 +45,10 @@ class VectorNestedLambdaSuite extends VectorQuerySuite {
         ") end as as1",
       "case when id % 8 = 0 then null else array(cast(id % 5 as int), cast(id % 3 as int), null) end as ai",
       "array(cast(id % 4 as int), cast(id % 6 as int)) as aj",
-      "cast(id % 5 as int) as t"
+      "cast(id % 5 as int) as t",
+      // map<int, array<int>>: a null map, a null value array.
+      "case when id % 10 = 0 then null else map(cast(id % 3 as int), " +
+        "case when id % 6 = 0 then null else array(cast(id as int), null) end) end as mv"
     ).repartition(3).write.mode("overwrite").parquet(path)
     spark.read.parquet(path).createOrReplaceTempView("nlam")
   }
@@ -82,5 +85,31 @@ class VectorNestedLambdaSuite extends VectorQuerySuite {
       Seq(Project)
     )
     checkVectorized("SELECT i FROM nlam WHERE exists(aa, x -> exists(x, y -> y = t))", Seq(Filter))
+  }
+
+  test("lambdas with a nested result: arrays of arrays, of structs and maps of arrays (#705)") {
+    checkVectorized(
+      "SELECT i, transform(aa, x -> x) same, transform(aa, x -> filter(x, y -> y IS NOT NULL)) nn, " +
+        "transform(aa, x -> transform(x, y -> y * t)) scaled, transform(aa, x -> slice(x, 1, 1)) head, " +
+        "transform(ai, x -> transform(aj, y -> y + x)) cross FROM nlam",
+      Seq(Project)
+    )
+    checkVectorized(
+      "SELECT i, transform(as1, s -> s.v) vs, transform(as1, s -> s) ss, " +
+        "transform(as1, s -> filter(s.v, v -> v IS NOT NULL)) fv FROM nlam",
+      Seq(Project)
+    )
+    checkVectorized(
+      "SELECT i, transform_values(mv, (k, v) -> transform(v, x -> x + k)) tv, " +
+        "zip_with(aa, aa, (x, y) -> x) zw FROM nlam",
+      Seq(Project)
+    )
+  }
+
+  test("a nested result where no element is live (null and empty outer arrays) is Spark's") {
+    checkVectorized(
+      "SELECT i, transform(aa, x -> transform(x, y -> y)) r FROM nlam WHERE i % 9 = 0 OR i % 13 = 0",
+      Seq(Filter, Project)
+    )
   }
 }

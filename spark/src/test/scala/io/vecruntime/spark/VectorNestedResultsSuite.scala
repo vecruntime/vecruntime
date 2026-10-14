@@ -74,11 +74,11 @@ class VectorNestedResultsSuite extends VectorQuerySuite {
     )
   }
 
-  test("a lambda with a nested result keeps Spark's operator, with the reason") {
+  test("a lambda building an array keeps Spark's operator: array() itself has no vectorized form") {
     checkFallback(
       "SELECT transform(ai, x -> array(x)) FROM results",
       Seq(Project),
-      "not supported"
+      "unsupported expression CreateArray"
     )
   }
 }
