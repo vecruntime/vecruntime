@@ -142,6 +142,14 @@ case class VectorExecRule(session: SparkSession) extends Rule[SparkPlan] with Lo
           new java.util.IdentityHashMap[SparkPlan, Either[String, org.apache.spark.sql.catalyst.optimizer.BuildSide]]
         )
       }
+      // input_file_name() and its siblings read a thread-local the scan sets per file on the thread that opens it;
+      // under decode-ahead (#606) files are opened on a producer thread, so such a query keeps Spark's scan.
+      lazy val readsInputFile = plan.exists(_.expressions.exists(_.exists {
+        case _: org.apache.spark.sql.catalyst.expressions.InputFileName |
+            _: org.apache.spark.sql.catalyst.expressions.InputFileBlockStart |
+            _: org.apache.spark.sql.catalyst.expressions.InputFileBlockLength => true
+        case _ => false
+      }))
       val bridge = if (VectorConf.cometMixedEnabled(conf)) CometMixedBridge.tryCreate() else null
       val prefer = if (bridge != null) PreferComet.parse(VectorConf.cometPreferComet(conf)) else PreferComet.Empty
       // The allowlist (#281): a listed operator the mixed pass will be able to offer (its inputs are ours, bottom-up)
@@ -221,7 +229,9 @@ case class VectorExecRule(session: SparkSession) extends Rule[SparkPlan] with Lo
         // decode pages straight into our Arrow vectors, so the chain above is ours from the leaf. Only a
         // supported flat Parquet scan converts; anything else keeps Spark's scan with a recorded reason.
         case s: FileSourceScanExec if VectorConf.scanNativeParquet(conf) =>
-          VectorParquetScanPlanner.reason(s, conf) match {
+          (if (VectorConf.scanNativeParquetDecodeAhead(conf) > 0 && readsInputFile)
+             Some("input_file_name() under decode-ahead (files open on the producer thread)")
+           else VectorParquetScanPlanner.reason(s, conf)) match {
             case Some(reason) => fallback(s, reason)
             case None => VectorParquetScanExec(s)
           }

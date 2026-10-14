@@ -86,10 +86,11 @@ A few rules hold the design together:
 | Calendar | Files whose datetime rebase mode resolves to `CORRECTED` | Resolved per file from the footer and the session, as Spark resolves it |
 | Data pages | v1 and v2 | v2 levels and data are read separately |
 | Schema | Flat columns and structs (#568), structs of structs included | A list or a map anywhere in a column keeps Spark's scan for the plan |
+| Metadata columns | The file-constant `_metadata` fields (`file_path`, `file_name`, `file_size`, `file_block_start`, `file_block_length`, `file_modification_time`), `_metadata.row_index`, and `input_file_name()` with its block siblings (#568) | Constants per file, from the format's extractors as `FileScanRDD` fills them; the row index is the row group's first row index plus the position. `input_file_name()` under decode-ahead keeps Spark's scan |
 | Codecs | Whatever parquet-java decompresses (snappy, zstd, gzip, lz4, …) | Decompression is done by parquet-java |
 
 What happens when a column is not supported:
-- **Spark's scan for the whole plan:** a list or a map (anywhere in a column, a struct's field included), a type with no decode path (a string with a non-default collation, say), or a bucketed scan. The planner records the reason, so VecRuntime's operators still run above Spark's scan.
+- **Spark's scan for the whole plan:** a list or a map (anywhere in a column, a struct's field included), a type with no decode path (a string with a non-default collation, say), `input_file_name()` while decode-ahead is on (the file is opened on the producer thread, and the function reads a task-thread holder), or a bucketed scan. The planner records the reason, so VecRuntime's operators still run above Spark's scan.
 - **Spark's reader for that one file**, with that file's own rebase modes and INT96 conversion: an `INT96` timestamp, a date or timestamp that needs a calendar rebase, a UTC-adjusted column read as `timestamp_ntz`, a struct field the file does not hold, a decimal stored with another scale, or an encoding on a physical type the decoder has no path for (`BYTE_STREAM_SPLIT` on `FIXED_LEN_BYTE_ARRAY`, say). The rest of the scan stays native.
 
 ## Status at 1 TB TPC-DS
@@ -250,6 +251,7 @@ The corpus approach follows Hardwood (`hardwood-hq/hardwood`), as does bounding 
     - Fallbacks with Spark's rows: a struct holding a list or a map (the plan), a struct field the file lacks, and an `INT96` timestamp in a struct (the file). Field names resolve case-insensitively.
   - **JMH:** no new decode kernel. The leaves are the flat decoders measured above, and the struct adds one pass over one leaf's levels per batch.
 - **Lists and maps.** These need repetition levels into Arrow list and map vectors (offsets plus a child), matching what `VectorGenerateExec` and `SizeExpr` consume. They keep Spark's scan until then.
+- **Metadata columns** (#568): **done**. The file-constant `_metadata` fields are constant columns after the partition columns, filled per file by `FileFormat.updateMetadataInternalRow` with the format's extractors, on native and fallback files alike (a fallback file's batch gets them appended, as `FileScanRDD` does). `_metadata.row_index` is `NativeParquetRowIndexColumn`: the scan reads whole row groups (column-index page filtering is off), so it is the footer's first row index of the group plus the position. The reader sets `InputFileBlockHolder` per file on the task thread for `input_file_name()`, `input_file_block_start()` and `input_file_block_length()`. Before this, a query reading `_metadata` failed in the native scan and `input_file_name()` did not return Spark's value. Tests: `NativeParquetMetadataSuite`, against Spark's row-based reader, on Spark- and parquet-java-written files, partitioned tables, split files, a decode filter and an INT96 file next to native ones.
 
 ### Performance
 
