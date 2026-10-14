@@ -805,6 +805,7 @@ private[vecruntime] final class VectorParquetPartitionReader(
     installedFirst = p.firstStore
     installedFirstPending = p.firstRead
     val columns = p.clipped.getColumns
+    val fileSchema = p.reader.getFileMetaData.getSchema
     // #568 item 6: this file's calendar rebase and INT96 conversion, for every date and timestamp leaf.
     val m = p.fallbackModes
     val fileRebase =
@@ -819,9 +820,12 @@ private[vecruntime] final class VectorParquetPartitionReader(
       columnReaders(i) = field.dataType match {
         case _ if i == rowIndexOrdinal =>
           new io.vecruntime.spark.parquet.NativeParquetRowIndexColumn(field.name, allocator)
+        case dt if !NativeParquetStructReader.holds(fileSchema, Array(topLevelName(p.clipped, field.name))) =>
+          // #568 schema evolution: a column added since the file was written, null in every row.
+          new io.vecruntime.spark.parquet.NativeParquetNullColumn(field.name, dt, allocator)
         case st: StructType =>
           val name = topLevelName(p.clipped, field.name)
-          NativeParquetStructReader.create(p.clipped, Array(name), st, field.name, batchSize, allocator)
+          NativeParquetStructReader.create(p.clipped, fileSchema, Array(name), st, field.name, batchSize, allocator)
         case dt @ (_: org.apache.spark.sql.types.ArrayType | _: org.apache.spark.sql.types.MapType) =>
           NativeParquetListReader.create(
             p.clipped,
@@ -997,6 +1001,43 @@ private[vecruntime] final class VectorParquetPartitionReader(
   }
 
   /**
+   * Whether the native readers fill a clipped leaf the file does not hold with nulls as Spark's reader does
+   * (#568 schema evolution). Its shallowest missing node must be:
+   *   - reached through plain struct groups only (no list, map or repeated ancestor: a null there has a shape);
+   *   - optional (Spark fails a REQUIRED missing column: "Required column is missing in data file");
+   *   - when top level, a column without an existence default (Spark fills that default instead);
+   *   - when a struct field, in a struct the file holds some other field of (its nulls come from that field;
+   *     when it holds none, Spark 4.1 reads an extra unrequested field, which our readers do not).
+   */
+  private def missingReadable(clipped: MessageType, file: MessageType, path: Array[String]): Boolean = {
+    var k = 0
+    while (k < path.length && NativeParquetStructReader.holds(file, path.take(k + 1))) k += 1
+    if (k == path.length) return true // held after all
+    var t: org.apache.parquet.schema.Type = clipped
+    var j = 0
+    while (j < k) {
+      t = t.asGroupType().getType(path(j))
+      if (
+        t.isPrimitive || t.isRepetition(org.apache.parquet.schema.Type.Repetition.REPEATED) ||
+        t.getLogicalTypeAnnotation != null
+      ) return false
+      j += 1
+    }
+    val parent = t.asGroupType()
+    val missing = parent.getType(path(k))
+    if (!missing.isRepetition(org.apache.parquet.schema.Type.Repetition.OPTIONAL)) return false
+    if (k == 0) {
+      requiredSchema.fields.find(_.name.equalsIgnoreCase(path(0))).forall(f =>
+        !f.metadata.contains(
+          org.apache.spark.sql.catalyst.util.ResolveDefaultColumns.EXISTS_DEFAULT_COLUMN_METADATA_KEY
+        )
+      )
+    } else {
+      parent.getFields.asScala.exists(f => NativeParquetStructReader.holds(file, path.take(k) :+ f.getName))
+    }
+  }
+
+  /**
    * True if any required column chunk in any row group uses a value encoding the native decoder does not
    * support (PLAIN and dictionary; the v2 encodings on the physical types in `supportsEncoding`). Read from
    * the footer's column-chunk metadata, so the decision is made once per file at open time -- a
@@ -1015,15 +1056,23 @@ private[vecruntime] final class VectorParquetPartitionReader(
       val field = requiredSchema.fields(f)
       field.dataType match {
         case _ if f == rowIndexOrdinal => // generated from the row group's offset, not stored
+        case _
+            if !NativeParquetStructReader.holds(
+              footer.getFileMetaData.getSchema,
+              Array(topLevelName(clipped, field.name))
+            ) => // not in the file: a null column when missingReadable admits it (below)
         case st: StructType =>
-          // #568: every leaf of the struct, in the clipped group's order, stored as its lane needs.
+          // #568: every leaf of the struct, in the clipped group's order, stored as its lane needs (a leaf the file
+          // lacks is a null column: missingReadable, below).
           var ok = true
+          val file = footer.getFileMetaData.getSchema
           val shape = NativeParquetStructReader.forEachLeaf(
             clipped,
             Array(topLevelName(clipped, field.name)),
             st,
             (cd: org.apache.parquet.column.ColumnDescriptor, dt: org.apache.spark.sql.types.DataType) =>
-              if (!VectorParquetScanExec.physicalMatches(dt, cd.getPrimitiveType)) ok = false
+              if (file.containsPath(cd.getPath) && !VectorParquetScanExec.physicalMatches(dt, cd.getPrimitiveType))
+                ok = false
           )
           if (!shape || !ok) return true
         case dt @ (_: org.apache.spark.sql.types.ArrayType | _: org.apache.spark.sql.types.MapType) =>
@@ -1046,16 +1095,17 @@ private[vecruntime] final class VectorParquetPartitionReader(
       f += 1
     }
     // A requested column the file does not hold (a field added since the file was written): clipping adds it to
-    // the requested schema with no column chunk behind it. Spark's reader fills it with nulls; ours has nothing
-    // to decode, so the file falls over.
+    // the requested schema with no column chunk behind it. Spark's reader fills it with nulls, and so do ours
+    // (#568 schema evolution, NativeParquetNullColumn) where the missing node is a top-level column or a field of
+    // structs only; anything else the file lacks falls over (missingReadable).
     val fileSchema = footer.getFileMetaData.getSchema
     // The row-index column is generated (NativeParquetRowIndexColumn), never stored.
     val rowIndexName = if (rowIndexOrdinal >= 0) requiredSchema.fields(rowIndexOrdinal).name else null
     if (
       clipped.getColumns.asScala.exists(cd =>
-        !fileSchema.containsPath(
-          cd.getPath
-        ) && !(cd.getPath.length == 1 && cd.getPath()(0).equalsIgnoreCase(rowIndexName))
+        !fileSchema.containsPath(cd.getPath) &&
+          !(cd.getPath.length == 1 && cd.getPath()(0).equalsIgnoreCase(rowIndexName)) &&
+          !missingReadable(clipped, fileSchema, cd.getPath)
       )
     ) return true
     val blocks = footer.getBlocks
@@ -1294,12 +1344,17 @@ object VectorParquetScanExec {
             t.getUnit == org.apache.parquet.schema.LogicalTypeAnnotation.TimeUnit.MILLIS
           case _ => false
         })
-      case DoubleType => p == DOUBLE
+      case DoubleType =>
+        // #568 schema evolution: Spark's IntegerToDoubleUpdater (any INT32) and FloatToDoubleUpdater.
+        p == DOUBLE || p == INT32 || p == PrimitiveType.PrimitiveTypeName.FLOAT
       // Columns without an engine lane (#559, option A): the scan decodes them on a lane of the same layout.
       case FloatType => p == PrimitiveType.PrimitiveTypeName.FLOAT
       case BinaryType => p == BINARY || p == FIXED_LEN_BYTE_ARRAY
       case TimestampNTZType =>
-        // INT64 MICROS or MILLIS not adjusted to UTC (Spark refuses a UTC-adjusted column as TIMESTAMP_NTZ).
+        // INT64 MICROS or MILLIS not adjusted to UTC (Spark refuses a UTC-adjusted column as TIMESTAMP_NTZ), or a
+        // DATE (#568 schema evolution: Spark's DateToTimestampNTZUpdater, midnight UTC after the date rebase).
+        (p == INT32 && physical.getLogicalTypeAnnotation
+          .isInstanceOf[org.apache.parquet.schema.LogicalTypeAnnotation.DateLogicalTypeAnnotation]) ||
         p == INT64 && (physical.getLogicalTypeAnnotation match {
           case t: org.apache.parquet.schema.LogicalTypeAnnotation.TimestampLogicalTypeAnnotation =>
             !t.isAdjustedToUTC && (t.getUnit == org.apache.parquet.schema.LogicalTypeAnnotation.TimeUnit.MICROS ||
@@ -1309,22 +1364,23 @@ object VectorParquetScanExec {
       case BooleanType => p == PrimitiveType.PrimitiveTypeName.BOOLEAN
       case _: StringType => p == BINARY
       case d: DecimalType =>
-        // The file's own decimal annotation must have the requested scale and at most the requested precision:
-        // then its unscaled values are the requested type's unscaled values. Another scale (Spark's decimal
-        // widening with a rescale), or no decimal annotation, falls over to Spark's reader.
-        val fileDecimal = physical.getLogicalTypeAnnotation match {
+        // Spark's isDecimalTypeMatched: the file's decimal (p, s) reads as (p', s') when s' >= s and the precision
+        // grows by at least as much as the scale (#568 schema evolution: the unscaled values times 10^(s' - s));
+        // an un-annotated or signed-integer INT32 / INT64 reads as a decimal with room for its integer digits
+        // (10 / 20). INT32 and INT64 feed the INT64 lane only (p' <= 18); the DECIMAL128 lane takes
+        // FIXED_LEN_BYTE_ARRAY and BINARY, converted from big-endian bytes (flushDecimal).
+        val matched = physical.getLogicalTypeAnnotation match {
           case a: org.apache.parquet.schema.LogicalTypeAnnotation.DecimalLogicalTypeAnnotation =>
-            a.getScale == d.scale && a.getPrecision <= d.precision
+            val scaleUp = d.scale - a.getScale
+            scaleUp >= 0 && d.precision - a.getPrecision >= scaleUp
+          case null | (_: org.apache.parquet.schema.LogicalTypeAnnotation.IntLogicalTypeAnnotation)
+              if !isUnsigned(physical) && (p == INT32 || p == INT64) =>
+            d.precision - d.scale >= (if (p == INT32) 10 else 20)
           case _ => false
         }
-        fileDecimal && (
-          if (d.precision <= 18) {
-            // The INT64 lane: an INT32 or INT64 widened, or big-endian bytes converted (flushDecimal).
-            p == INT32 || p == INT64 || p == FIXED_LEN_BYTE_ARRAY || p == BINARY
-          } else {
-            // The DECIMAL128 lane: big-endian bytes converted into two limbs.
-            p == FIXED_LEN_BYTE_ARRAY || p == BINARY
-          }
+        matched && (
+          if (d.precision <= 18) p == INT32 || p == INT64 || p == FIXED_LEN_BYTE_ARRAY || p == BINARY
+          else p == FIXED_LEN_BYTE_ARRAY || p == BINARY
         )
       case _ => false
     }

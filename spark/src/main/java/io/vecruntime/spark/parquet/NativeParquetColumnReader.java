@@ -98,6 +98,17 @@ public final class NativeParquetColumnReader implements NativeParquetColumn, Row
     private final boolean dateLane;
     private final boolean timestampLane;
     private ParquetRebase rebase = ParquetRebase.CORRECTED;
+    // #568 schema evolution: a column read as a wider Spark type than it is stored as, the way Spark's
+    // ParquetVectorUpdaterFactory widens it. INT32 or FLOAT values are decoded widened into INT64 slots
+    // and converted in place (WIDEN_*); a decimal read at a larger scale has its unscaled values multiplied
+    // by 10^k (rescaleFactor for the INT64 lane, rescale digits for the DECIMAL128 lane).
+    private static final int WIDEN_NONE = 0;
+    private static final int WIDEN_INT_TO_DOUBLE = 1;
+    private static final int WIDEN_FLOAT_TO_DOUBLE = 2;
+    private static final int WIDEN_DAYS_TO_MICROS = 3;
+    private final int widen;
+    private final int rescale;
+    private final long rescaleFactor;
     private static final java.lang.foreign.ValueLayout.OfLong LONG_LE = java.lang.foreign.ValueLayout.JAVA_LONG_UNALIGNED.withOrder(java.nio.ByteOrder.LITTLE_ENDIAN);
     private static final java.lang.foreign.ValueLayout.OfInt INT_LE = java.lang.foreign.ValueLayout.JAVA_INT_UNALIGNED.withOrder(java.nio.ByteOrder.LITTLE_ENDIAN);
     private final GroupUnpacker[] unpackers = new GroupUnpacker[33];
@@ -134,7 +145,16 @@ public final class NativeParquetColumnReader implements NativeParquetColumn, Row
             String name, int batchRows, BufferAllocator allocator) {
         this.column = column;
         this.type = type;
-        this.physicalType = physicalTypeOf(column, type);
+        org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName stored = column.getPrimitiveType().getPrimitiveTypeName();
+        this.widen = widenOf(stored, sparkType);
+        this.rescale = rescaleOf(column, sparkType);
+        this.rescaleFactor = rescale > 0 && rescale <= 18
+                ? LONG_TEN_POWERS[rescale]
+                : 1L;
+        // INT32 and FLOAT bits are decoded sign-extended into INT64 slots, then converted (widenLane).
+        this.physicalType = widen == WIDEN_INT_TO_DOUBLE || widen == WIDEN_FLOAT_TO_DOUBLE
+                ? VecType.INT32
+                : physicalTypeOf(column, type);
         this.sparkType = sparkType;
         this.name = name;
         this.maxDefLevel = column.getMaxDefinitionLevel();
@@ -168,11 +188,117 @@ public final class NativeParquetColumnReader implements NativeParquetColumn, Row
             this.decoder = new ColumnChunkDecoder(VecType.UTF8, VecType.UTF8, maxDefLevel, batchRows, this::unpackerFor);
             this.decoder.setFixedLength(12);
         } else {
-            this.decoder = new ColumnChunkDecoder(physicalType, type, maxDefLevel, batchRows, this::unpackerFor);
+            this.decoder = new ColumnChunkDecoder(physicalType, widen != WIDEN_NONE ? VecType.INT64 : type, maxDefLevel,
+                    batchRows, this::unpackerFor);
             if (type == VecType.UTF8 && fixedLength > 0) {
                 // A FIXED_LEN_BYTE_ARRAY column read as BINARY: fixed-length values with no length prefix.
                 this.decoder.setFixedLength(fixedLength);
             }
+        }
+    }
+
+    private static final long[] LONG_TEN_POWERS = new long[19];
+
+    static {
+        LONG_TEN_POWERS[0] = 1L;
+        for (int i = 1; i < LONG_TEN_POWERS.length; i++) {
+            LONG_TEN_POWERS[i] = LONG_TEN_POWERS[i - 1] * 10L;
+        }
+    }
+
+    /**
+     * The in-place conversion a stored type needs to become the Spark type
+     * (Spark's widening updaters).
+     */
+    private static int widenOf(org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName stored, DataType sparkType) {
+        if (sparkType instanceof org.apache.spark.sql.types.DoubleType) {
+            if (stored == org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.INT32) {
+                return WIDEN_INT_TO_DOUBLE;
+            }
+            if (stored == org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.FLOAT) {
+                return WIDEN_FLOAT_TO_DOUBLE;
+            }
+        }
+        if (sparkType instanceof org.apache.spark.sql.types.TimestampNTZType && stored == org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.INT32) {
+            return WIDEN_DAYS_TO_MICROS;
+        }
+        return WIDEN_NONE;
+    }
+
+    /**
+     * How many digits a decimal's unscaled values move left: the requested scale
+     * less the file's (an integer without a decimal annotation has scale 0).
+     */
+    private static int rescaleOf(ColumnDescriptor column, DataType sparkType) {
+        if (!(sparkType instanceof org.apache.spark.sql.types.DecimalType d)) {
+            return 0;
+        }
+        int fileScale = column.getPrimitiveType().getLogicalTypeAnnotation() instanceof org.apache.parquet.schema.LogicalTypeAnnotation.DecimalLogicalTypeAnnotation a ? a.getScale() : 0;
+        return Math.max(0, d.scale() - fileScale);
+    }
+
+    private static boolean isNull(java.lang.foreign.MemorySegment validity, int i) {
+        return validity != null && (validity.get(java.lang.foreign.ValueLayout.JAVA_BYTE, i >>> 3) & (1 << (i & 7))) == 0;
+    }
+
+    /**
+     * The widening conversion over a decoded batch of {@code n} slots (no-op
+     * when the column is read as stored). Null slots are skipped: a pooled
+     * vector's stale value must not raise.
+     */
+    private void widenLane(java.lang.foreign.MemorySegment data, java.lang.foreign.MemorySegment validity, int n) {
+        if (widen == WIDEN_DAYS_TO_MICROS) {
+            rebase.daysToMicros(data, validity, n);
+            return;
+        }
+        if (widen != WIDEN_NONE) {
+            for (int i = 0; i < n; i++) {
+                if (isNull(validity, i)) {
+                    continue;
+                }
+                long at = (long) i << 3;
+                long v = data.get(LONG_LE, at);
+                double d = widen == WIDEN_INT_TO_DOUBLE
+                        ? (double) v
+                        : (double) Float.intBitsToFloat((int) v);
+                data.set(LONG_LE, at, Double.doubleToRawLongBits(d));
+            }
+            return;
+        }
+        if (rescale > 0) {
+            if (type == VecType.DECIMAL128) {
+                rescale128(data, validity, n);
+                return;
+            }
+            // The low 64 bits of the exact product, as Spark's BigDecimal.setScale(...).unscaledValue().longValue().
+            for (int i = 0; i < n; i++) {
+                if (isNull(validity, i)) {
+                    continue;
+                }
+                long at = (long) i << 3;
+                data.set(LONG_LE, at, data.get(LONG_LE, at) * rescaleFactor);
+            }
+        }
+    }
+
+    /** DECIMAL128 slots (little-endian two's complement) times 10^rescale. */
+    private void rescale128(java.lang.foreign.MemorySegment data, java.lang.foreign.MemorySegment validity, int n) {
+        java.math.BigInteger factor = java.math.BigInteger.TEN.pow(rescale);
+        java.math.BigInteger mask = java.math.BigInteger.ONE.shiftLeft(64).subtract(java.math.BigInteger.ONE);
+        for (int i = 0; i < n; i++) {
+            if (isNull(validity, i)) {
+                continue;
+            }
+            long at = (long) i << 4;
+            long lo = data.get(LONG_LE, at);
+            long hi = data.get(LONG_LE, at + 8);
+            java.math.BigInteger v = java.math.BigInteger.valueOf(hi)
+                    .shiftLeft(64)
+                    .or(java.math.BigInteger.valueOf(lo).and(mask))
+                    .multiply(factor);
+            data.set(LONG_LE, at, v.longValue());
+            data.set(LONG_LE, at + 8,
+                    v.shiftRight(64).longValue());
         }
     }
 
@@ -663,6 +789,7 @@ public final class NativeParquetColumnReader implements NativeParquetColumn, Row
             millisToMicros(data, nulls ? validity : null, elements);
         }
         rebaseLane(data, nulls ? validity : null, elements);
+        widenLane(data, nulls ? validity : null, elements);
         ArrowOutput.finish(out, elements, !nulls);
         return fixed;
     }
@@ -768,6 +895,7 @@ public final class NativeParquetColumnReader implements NativeParquetColumn, Row
             millisToMicros(data, hasNulls ? validity : null, n);
         }
         rebaseLane(data, hasNulls ? validity : null, n);
+        widenLane(data, hasNulls ? validity : null, n);
         io.vecruntime.spark.arrow.ArrowOutput.finish(out, n, !hasNulls);
         return v;
     }
@@ -848,6 +976,8 @@ public final class NativeParquetColumnReader implements NativeParquetColumn, Row
         ArrowVectorBuffers out = ArrowVectorBuffers.forWrite(v, rows, sparkType);
         decoder.flushDecimal(rows, out.data(),
                 hasNulls ? out.validity() : null, type == VecType.DECIMAL128);
+        widenLane(out.data(), hasNulls ? out.validity() : null,
+                rows);
         ArrowOutput.finish(out, rows, !hasNulls);
         return v;
     }
@@ -933,6 +1063,7 @@ public final class NativeParquetColumnReader implements NativeParquetColumn, Row
             millisToMicros(data, hasNulls ? validity : null, n);
         }
         rebaseLane(data, hasNulls ? validity : null, n);
+        widenLane(data, hasNulls ? validity : null, n);
         io.vecruntime.spark.arrow.ArrowOutput.finish(out, n, !hasNulls);
         return v;
     }

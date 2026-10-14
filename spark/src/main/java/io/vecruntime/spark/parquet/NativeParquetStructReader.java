@@ -57,16 +57,29 @@ public final class NativeParquetStructReader implements NativeParquetColumn, Row
     // null / 0 when no group from the root down to the struct is optional (never null).
     private final RowLevels levelSource;
     private final int defLevel;
+    // The first field the file holds: a struct's levels come from it (fields the file lacks are null columns).
+    private final RowLevels levelField;
 
-    private NativeParquetStructReader(StructType type, NativeParquetColumn[] fields, RowLevels levelSource,
+    private NativeParquetStructReader(StructType type, NativeParquetColumn[] fields, int levelIndex,
             int defLevel) {
         this.type = type;
         this.fields = fields;
-        this.levelSource = defLevel > 0 ? levelSource : null;
+        this.levelField = (RowLevels) fields[levelIndex];
+        this.levelSource = defLevel > 0 ? levelField : null;
         this.defLevel = defLevel;
         if (this.levelSource != null) {
             this.levelSource.recordRowLevels();
         }
+    }
+
+    @Override
+    public int[] rowLevels() {
+        return levelField.rowLevels();
+    }
+
+    @Override
+    public void recordRowLevels() {
+        levelField.recordRowLevels();
     }
 
     /**
@@ -77,16 +90,45 @@ public final class NativeParquetStructReader implements NativeParquetColumn, Row
      */
     public static NativeParquetStructReader create(MessageType clipped, String[] path, StructType type,
             String name, int batchRows, BufferAllocator allocator) {
+        return create(clipped, null, path, type, name, batchRows,
+                allocator);
+    }
+
+    /**
+     * {@link #create(MessageType, String[], StructType, String, int, BufferAllocator)}
+     * over a file whose schema is {@code file}: a field the file does not hold
+     * (#568 schema evolution) is a {@link NativeParquetNullColumn}, and the
+     * struct's nulls come from its first field the file holds -- as Spark's
+     * {@code ParquetColumnVector} takes them from a non-missing child. {@code
+     * file} null: every field is in the file. At least one field must be.
+     */
+    public static NativeParquetStructReader create(
+            MessageType clipped,
+            MessageType file,
+            String[] path,
+            StructType type,
+            String name,
+            int batchRows,
+            BufferAllocator allocator) {
         GroupType group = clipped.getType(path).asGroupType();
         StructField[] fs = type.fields();
         NativeParquetColumn[] fields = new NativeParquetColumn[fs.length];
+        int levelField = -1;
         for (int i = 0; i < fs.length; i++) {
             String[] childPath = child(path, group.getType(i)
                     .getName());
             DataType dt = fs[i].dataType();
             String childName = name + "." + fs[i].name();
+            if (file != null && !holds(file, childPath)) {
+                fields[i] = new NativeParquetNullColumn(childName, dt, allocator);
+                continue;
+            }
+            if (levelField < 0) {
+                levelField = i;
+            }
             if (dt instanceof StructType st) {
-                fields[i] = create(clipped, childPath, st, childName, batchRows, allocator);
+                fields[i] = create(clipped, file, childPath, st, childName, batchRows,
+                        allocator);
             } else if (dt instanceof org.apache.spark.sql.types.ArrayType || dt instanceof org.apache.spark.sql.types.MapType) {
                 // #568: a list or map field, read by the list reader at its path under the struct.
                 fields[i] = NativeParquetListReader.create(clipped, childPath, dt, childName, batchRows, allocator);
@@ -96,18 +138,26 @@ public final class NativeParquetStructReader implements NativeParquetColumn, Row
                         allocator);
             }
         }
-        return new NativeParquetStructReader(type, fields, (RowLevels) fields[0],
-                clipped.getMaxDefinitionLevel(path));
+        if (levelField < 0) {
+            throw new IllegalStateException("struct " + name + ": the file holds none of its fields");
+        }
+        return new NativeParquetStructReader(type, fields, levelField, clipped.getMaxDefinitionLevel(path));
     }
 
-    @Override
-    public int[] rowLevels() {
-        return levelSource != null ? levelSource.rowLevels() : ((RowLevels) fields[0]).rowLevels();
-    }
-
-    @Override
-    public void recordRowLevels() {
-        ((RowLevels) fields[0]).recordRowLevels();
+    /**
+     * Whether the file holds the field at {@code path} (file names: the clipped
+     * schema keeps the file's own names for the fields it matched), a leaf or a
+     * group.
+     */
+    public static boolean holds(MessageType file, String[] path) {
+        Type t = file;
+        for (String p : path) {
+            if (t.isPrimitive() || !t.asGroupType().containsField(p)) {
+                return false;
+            }
+            t = t.asGroupType().getType(p);
+        }
+        return true;
     }
 
     private static String[] child(String[] path, String name) {
@@ -294,7 +344,7 @@ public final class NativeParquetStructReader implements NativeParquetColumn, Row
 
     @Override
     public int rowsRemaining() {
-        return fields[0].rowsRemaining();
+        return ((NativeParquetColumn) levelField).rowsRemaining();
     }
 
     @Override

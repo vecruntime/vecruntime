@@ -105,6 +105,35 @@ public final class ParquetRebase {
     }
 
     /**
+     * A DATE column read as {@code timestamp_ntz} (Spark's {@code
+     * DateToTimestampNTZUpdater} / {@code ...WithRebaseUpdater}): a batch of
+     * {@code n} days, each widened into an INT64 slot of {@code data}, becomes
+     * micros at midnight UTC after the file's date rebase. {@link
+     * Math#multiplyExact} fails a day out of range, as Spark's {@code
+     * daysToMicros} does.
+     */
+    public void daysToMicros(MemorySegment data, MemorySegment validity, int n) {
+        int sw = RebaseDateTime.lastSwitchJulianDay();
+        boolean rebase = dateLegacy || dateFail;
+        for (int i = 0; i < n; i++) {
+            if (!present(validity, i)) {
+                continue;
+            }
+            long at = (long) i << 3;
+            int days = (int) data.get(LE_LONG, at);
+            if (rebase && days < sw) {
+                if (dateFail) {
+                    throw DataSourceUtils.newRebaseExceptionInRead("Parquet");
+                }
+                days = RebaseDateTime.rebaseJulianToGregorianDays(days);
+            }
+            data.set(LE_LONG, at, Math.multiplyExact((long) days, MICROS_PER_DAY));
+        }
+    }
+
+    private static final long MICROS_PER_DAY = 86_400_000_000L;
+
+    /**
      * A batch of {@code n} timestamps (INT64 micros) in {@code data}; {@code
      * int96}: stored as INT96.
      */

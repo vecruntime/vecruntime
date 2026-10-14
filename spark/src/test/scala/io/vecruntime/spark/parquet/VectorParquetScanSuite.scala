@@ -433,10 +433,10 @@ class VectorParquetScanSuite extends VectorQuerySuite {
     }
   }
 
-  test("a decimal whose file scale differs from the requested one falls over per file, with Spark's rescale (#559)") {
-    // Spark reads a decimal(9,2) file as decimal(12,4) by rescaling the unscaled value; the native lanes carry the
-    // file's unscaled values as they are, so such a file must go to Spark's reader. The same precision widening at
-    // the same scale is read natively.
+  test("a decimal whose file scale differs from the requested one is rescaled natively, as Spark rescales it (#568)") {
+    // Spark reads a decimal(9,2) file as decimal(12,4) by rescaling the unscaled value; the native reader
+    // multiplies the unscaled values by 10^2 (schema evolution, #568). The same precision widening at the same
+    // scale is read as stored.
     val path = newTempPath("t_dec_scale")
     withPlugin(enabled = false) {
       spark.sql("SELECT CAST(id AS INT) AS i, CAST(id / 100.0 AS DECIMAL(9,2)) AS d, CAST(id AS DECIMAL(30,2)) AS w " +
@@ -446,7 +446,7 @@ class VectorParquetScanSuite extends VectorQuerySuite {
       withPlugin(enabled = false)(spark.read.schema(schema).parquet(path).createOrReplaceTempView("t_dec_scale"))
     read("i INT, d DECIMAL(12,4), w DECIMAL(32,4)")
     checkVectorized("SELECT * FROM t_dec_scale", Seq(node))
-    assert(nativeRowGroupsOf("SELECT d, w FROM t_dec_scale") == 0, "a rescaled decimal was decoded natively")
+    assert(nativeRowGroupsOf("SELECT d, w FROM t_dec_scale") > 0, "a rescaled decimal fell over")
     read("i INT, d DECIMAL(12,2), w DECIMAL(36,2)")
     checkVectorized("SELECT * FROM t_dec_scale", Seq(node))
     assert(nativeRowGroupsOf("SELECT d, w FROM t_dec_scale") > 0, "a widened same-scale decimal fell over")

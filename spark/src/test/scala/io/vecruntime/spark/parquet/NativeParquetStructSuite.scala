@@ -220,14 +220,15 @@ class NativeParquetStructSuite extends VectorQuerySuite {
     check("SELECT id, s.tags, s.m['k'], flat FROM t")
   }
 
-  test("a struct field the file lacks (schema evolution) falls the file over to Spark's reader, with nulls") {
+  test("a struct field the file lacks (schema evolution) is null, read natively (#568)") {
     val path = newTempPath("struct-evolve")
     spark.range(0, 800).selectExpr("cast(id as int) as id", "named_struct('a', cast(id as int)) as s")
       .write.mode("overwrite").parquet(path)
     withPlugin(enabled = false) {
       spark.read.schema("id int, s struct<a: int, b: string>").parquet(path).createOrReplaceTempView("t")
     }
-    check("SELECT * FROM t", native = false)
+    check("SELECT * FROM t")
+    // Pruned to s.b alone, the file holds no field of the struct: that stays on Spark's reader.
     check("SELECT s.b, count(*) FROM t GROUP BY s.b", native = false)
   }
 
