@@ -102,6 +102,11 @@ public final class NativeParquetRowIndexColumn implements NativeParquetColumn {
     }
 
     @Override
+    public void setRebase(ParquetRebase rebase) {
+        // Row indexes are not dates or timestamps.
+    }
+
+    @Override
     public void setDictionaryIds(boolean enabled) {
         // Not dictionary encoded.
     }

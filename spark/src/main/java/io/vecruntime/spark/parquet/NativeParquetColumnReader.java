@@ -92,6 +92,12 @@ public final class NativeParquetColumnReader implements NativeParquetColumn, Row
     private final int fixedLength;
     // TIMESTAMP stored as MILLIS: the lane holds micros, so each present value is scaled by 1000.
     private final boolean millis;
+    // #568 item 6: a TIMESTAMP stored as INT96 (12 bytes, staged like a fixed-length binary and converted at
+    // flush), and the lane's kind for the file's calendar rebase (a date's days, or a timestamp's micros).
+    private final boolean int96;
+    private final boolean dateLane;
+    private final boolean timestampLane;
+    private ParquetRebase rebase = ParquetRebase.CORRECTED;
     private static final java.lang.foreign.ValueLayout.OfLong LONG_LE = java.lang.foreign.ValueLayout.JAVA_LONG_UNALIGNED.withOrder(java.nio.ByteOrder.LITTLE_ENDIAN);
     private static final java.lang.foreign.ValueLayout.OfInt INT_LE = java.lang.foreign.ValueLayout.JAVA_INT_UNALIGNED.withOrder(java.nio.ByteOrder.LITTLE_ENDIAN);
     private final GroupUnpacker[] unpackers = new GroupUnpacker[33];
@@ -151,9 +157,16 @@ public final class NativeParquetColumnReader implements NativeParquetColumn, Row
         org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName ptn = column.getPrimitiveType().getPrimitiveTypeName();
         this.binaryDecimal = sparkType instanceof org.apache.spark.sql.types.DecimalType && (ptn == org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.FIXED_LEN_BYTE_ARRAY || ptn == org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.BINARY);
         this.fixedLength = ptn == org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.FIXED_LEN_BYTE_ARRAY ? column.getPrimitiveType().getTypeLength() : 0;
+        this.int96 = ptn == org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.INT96;
+        this.dateLane = sparkType instanceof org.apache.spark.sql.types.DateType;
+        this.timestampLane = sparkType instanceof org.apache.spark.sql.types.TimestampType;
         if (binaryDecimal) {
             this.decoder = new ColumnChunkDecoder(VecType.UTF8, VecType.UTF8, maxDefLevel, batchRows, this::unpackerFor);
             this.decoder.setFixedLength(fixedLength);
+        } else if (int96) {
+            // Staged as 12-byte values on the UTF8 path (PLAIN and dictionary), converted by flushInt96.
+            this.decoder = new ColumnChunkDecoder(VecType.UTF8, VecType.UTF8, maxDefLevel, batchRows, this::unpackerFor);
+            this.decoder.setFixedLength(12);
         } else {
             this.decoder = new ColumnChunkDecoder(physicalType, type, maxDefLevel, batchRows, this::unpackerFor);
             if (type == VecType.UTF8 && fixedLength > 0) {
@@ -396,7 +409,7 @@ public final class NativeParquetColumnReader implements NativeParquetColumn, Row
             }
             return flushUtf8(n, decoder.batchNullCount() > 0);
         }
-        if (type == VecType.BOOL || binaryDecimal) {
+        if (type == VecType.BOOL || binaryDecimal || int96) {
             int filled = 0;
             while (filled < n) {
                 if (decoder.needsPage()) {
@@ -405,7 +418,9 @@ public final class NativeParquetColumnReader implements NativeParquetColumn, Row
                 filled += decoder.readBatch(n - filled, filled);
             }
             boolean nulls = decoder.batchNullCount() > 0;
-            return binaryDecimal ? flushDecimal(n, nulls) : flushBool(n, nulls);
+            return int96
+                    ? flushInt96(n, nulls)
+                    : binaryDecimal ? flushDecimal(n, nulls) : flushBool(n, nulls);
         }
         return fillFixed(n, /* modeA= */ true);
     }
@@ -589,7 +604,7 @@ public final class NativeParquetColumnReader implements NativeParquetColumn, Row
             }
         }
         decoder.startBatch(elements);
-        boolean staged = type == VecType.UTF8 || type == VecType.BOOL || binaryDecimal;
+        boolean staged = type == VecType.UTF8 || type == VecType.BOOL || binaryDecimal || int96;
         BaseFixedWidthVector fixed = null;
         ArrowVectorBuffers out = null;
         MemorySegment data = null;
@@ -637,7 +652,9 @@ public final class NativeParquetColumnReader implements NativeParquetColumn, Row
             return flushUtf8(elements, nulls);
         }
         if (staged) {
-            return binaryDecimal ? flushDecimal(elements, nulls) : flushBool(elements, nulls);
+            return int96
+                    ? flushInt96(elements, nulls)
+                    : binaryDecimal ? flushDecimal(elements, nulls) : flushBool(elements, nulls);
         }
         if (narrowBits != 0) {
             narrow(data, elements, narrowBits);
@@ -645,6 +662,7 @@ public final class NativeParquetColumnReader implements NativeParquetColumn, Row
         if (millis) {
             millisToMicros(data, nulls ? validity : null, elements);
         }
+        rebaseLane(data, nulls ? validity : null, elements);
         ArrowOutput.finish(out, elements, !nulls);
         return fixed;
     }
@@ -710,14 +728,16 @@ public final class NativeParquetColumnReader implements NativeParquetColumn, Row
     @Override
     public FieldVector readBatchSelected(int n, java.lang.foreign.MemorySegment selection) {
         decoder.startBatch(n);
-        if (type == VecType.UTF8 || type == VecType.BOOL || binaryDecimal) {
+        if (type == VecType.UTF8 || type == VecType.BOOL || binaryDecimal || int96) {
             forRuns(n, selection,
                     (sel, len, at) -> sel ? decoder.readBatch(len, at) : decoder.skipIntoBatch(len, at));
             boolean nulls = decoder.batchNullCount() > 0;
             if (type == VecType.UTF8) {
                 return decoder.batchIsDictionaryIds() ? flushIds(n, nulls) : flushUtf8(n, nulls);
             }
-            return binaryDecimal ? flushDecimal(n, nulls) : flushBool(n, nulls);
+            return int96
+                    ? flushInt96(n, nulls)
+                    : binaryDecimal ? flushDecimal(n, nulls) : flushBool(n, nulls);
         }
         BaseFixedWidthVector v = (BaseFixedWidthVector) borrowFixed(n);
         ArrowVectorBuffers out = ArrowVectorBuffers.forWrite(v, n, sparkType);
@@ -747,6 +767,7 @@ public final class NativeParquetColumnReader implements NativeParquetColumn, Row
         if (millis) {
             millisToMicros(data, hasNulls ? validity : null, n);
         }
+        rebaseLane(data, hasNulls ? validity : null, n);
         io.vecruntime.spark.arrow.ArrowOutput.finish(out, n, !hasNulls);
         return v;
     }
@@ -831,6 +852,42 @@ public final class NativeParquetColumnReader implements NativeParquetColumn, Row
         return v;
     }
 
+    /**
+     * An INT96 timestamp batch: the staged 12-byte values into micros, then the
+     * file's INT96 rebase.
+     */
+    private FieldVector flushInt96(int rows, boolean hasNulls) {
+        BaseFixedWidthVector v = (BaseFixedWidthVector) borrowFixed(rows);
+        ArrowVectorBuffers out = ArrowVectorBuffers.forWrite(v, rows, sparkType);
+        decoder.flushInt96(rows, out.data(),
+                hasNulls ? out.validity() : null);
+        rebase.fixMicros(out.data(), hasNulls ? out.validity() : null,
+                rows, true);
+        ArrowOutput.finish(out, rows, !hasNulls);
+        return v;
+    }
+
+    /**
+     * The file's calendar rebase over a decoded date or timestamp batch (no-op
+     * for other lanes).
+     */
+    private void rebaseLane(java.lang.foreign.MemorySegment data, java.lang.foreign.MemorySegment validity, int n) {
+        if (dateLane) {
+            rebase.fixDays(data, validity, n);
+        } else if (timestampLane) {
+            rebase.fixMicros(data, validity, n, false);
+        }
+    }
+
+    /**
+     * This file's calendar rebase and INT96 conversion (#568 item 6); {@link
+     * ParquetRebase#CORRECTED} by default.
+     */
+    @Override
+    public void setRebase(ParquetRebase rebase) {
+        this.rebase = rebase;
+    }
+
     private DataPage requirePage() {
         DataPage page = pages.readPage();
         if (page == null) {
@@ -875,6 +932,7 @@ public final class NativeParquetColumnReader implements NativeParquetColumn, Row
         if (millis) {
             millisToMicros(data, hasNulls ? validity : null, n);
         }
+        rebaseLane(data, hasNulls ? validity : null, n);
         io.vecruntime.spark.arrow.ArrowOutput.finish(out, n, !hasNulls);
         return v;
     }
@@ -1129,8 +1187,14 @@ public final class NativeParquetColumnReader implements NativeParquetColumn, Row
         }
         byte[] data = bytes(dp.getBytes());
         int numValues = dp.getDictionarySize();
-        return ParquetPageDecoder.decodeDictionary(MemorySegment.ofArray(data), 0L, data.length, numValues,
-                binaryDecimal ? VecType.UTF8 : physicalType, fixedLength, scratch);
+        return ParquetPageDecoder.decodeDictionary(
+                MemorySegment.ofArray(data),
+                0L,
+                data.length,
+                numValues,
+                binaryDecimal || int96 ? VecType.UTF8 : physicalType,
+                int96 ? 12 : fixedLength,
+                scratch);
     }
 
     private static void writeInto(BytesInput in, ReusableByteOut out) {

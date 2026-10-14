@@ -78,7 +78,7 @@ class NativeParquetStructSuite extends VectorQuerySuite {
     withConf(
       "parquet.writer.version" -> (if (v2) "v2" else "v1"),
       "parquet.enable.dictionary" -> dictionary.toString,
-      // Spark writes INT96 timestamps by default, and an INT96 file goes to Spark's reader (its own test below).
+      // Micros, not Spark's default INT96, so each shape here is the INT64 layout (INT96 has its own tests).
       "spark.sql.parquet.outputTimestampType" -> "TIMESTAMP_MICROS"
     ) {
       df.repartition(2).write.mode("overwrite").parquet(path)
@@ -231,7 +231,7 @@ class NativeParquetStructSuite extends VectorQuerySuite {
     check("SELECT s.b, count(*) FROM t GROUP BY s.b", native = false)
   }
 
-  test("an INT96 timestamp inside a struct falls the file over to Spark's reader, with its rebase") {
+  test("an INT96 timestamp inside a struct is decoded natively (#568 item 6)") {
     val path = newTempPath("struct-int96")
     withConf("spark.sql.parquet.outputTimestampType" -> "INT96") {
       spark.range(0, 600).selectExpr(
@@ -240,8 +240,8 @@ class NativeParquetStructSuite extends VectorQuerySuite {
       ).write.mode("overwrite").parquet(path)
     }
     withPlugin(enabled = false)(spark.read.parquet(path).createOrReplaceTempView("t"))
-    check("SELECT * FROM t", native = false)
-    check("SELECT id, s.k FROM t") // the timestamp pruned away: no INT96 left to read
+    check("SELECT * FROM t")
+    check("SELECT id, s.k FROM t")
   }
 
   test("struct field names resolve case-insensitively, as Spark resolves them") {

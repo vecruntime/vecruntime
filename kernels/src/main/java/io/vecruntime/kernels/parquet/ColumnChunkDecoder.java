@@ -1802,6 +1802,36 @@ public final class ColumnChunkDecoder {
 
     // ------------------------------------------------------------------ flush the batch (one bulk copy each)
 
+    private static final java.lang.invoke.VarHandle BA_LONG_LE = java.lang.invoke.MethodHandles.byteArrayViewVarHandle(long[].class, java.nio.ByteOrder.LITTLE_ENDIAN);
+    private static final java.lang.invoke.VarHandle BA_INT_LE = java.lang.invoke.MethodHandles.byteArrayViewVarHandle(int[].class, java.nio.ByteOrder.LITTLE_ENDIAN);
+
+    /**
+     * Converts the finished batch of {@code rows} INT96 timestamps, staged as
+     * 12-byte values (8 little-endian bytes of nanoseconds in the day, then a
+     * 4-byte little-endian Julian day), into the INT64 lane of micros, as
+     * Spark's {@code ParquetRowConverter.binaryToSQLTimestamp} and {@code
+     * DateTimeUtils.fromJulianDay} compute them: {@code (julianDay - 2440588) *
+     * 86400000000 + nanos / 1000}. Rebase and time-zone conversion follow on
+     * the lane. A null row writes 0.
+     */
+    public void flushInt96(int rows, MemorySegment outData, MemorySegment outValidity) {
+        byte[] b = utf8Data;
+        int[] off = utf8Offsets;
+        for (int i = 0; i < rows; i++) {
+            int s = off[i];
+            long v = 0L;
+            if (off[i + 1] - s == 12) {
+                long nanos = (long) BA_LONG_LE.get(b, s);
+                int julianDay = (int) BA_INT_LE.get(b, s + 8);
+                v = (long) (julianDay - 2440588) * 86_400_000_000L + nanos / 1000L;
+            } else if (off[i + 1] != s) {
+                throw new IllegalStateException("an INT96 value of " + (off[i + 1] - s) + " bytes");
+            }
+            outData.set(LE_LONG, (long) i << 3, v);
+        }
+        flushValidity(rows, outValidity);
+    }
+
     /**
      * Copy the finished fixed-width batch of {@code rows} into the Arrow data +
      * validity buffers.
