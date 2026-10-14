@@ -507,7 +507,84 @@ class NativeParquetListSuite extends VectorQuerySuite {
     }
   }
 
-  test("a list of structs holding a list, a list of lists of structs and a map of structs keep Spark's scan") {
+  for (v2 <- Seq(false, true); dictionary <- Seq(true, false)) {
+    test(
+      s"Spark-written maps of structs: nulls at the map, the value struct and its fields (v2=$v2, dictionary=$dictionary)"
+    ) {
+      val path = newTempPath(s"ms-$v2-$dictionary")
+      withConf(
+        "parquet.writer.version" -> (if (v2) "v2" else "v1"),
+        "parquet.enable.dictionary" -> dictionary.toString,
+        "spark.sql.parquet.outputTimestampType" -> "TIMESTAMP_MICROS"
+      ) {
+        withPlugin(enabled = false) {
+          spark.range(0, 5000).selectExpr(
+            "id",
+            "case when id % 9 = 0 then null when id % 9 = 1 then map() else map_from_arrays(" +
+              "transform(sequence(0, cast(id % 4 as int)), k -> concat('k', k)), " +
+              "transform(sequence(0, cast(id % 4 as int)), k -> case when k = 2 then null else named_struct(" +
+              "'a', case when k = 3 then null else cast(id + k as int) end, 's', concat('s', (id + k) % 11), " +
+              "'d', (id + k) / 4.0, 'ts', timestamp_micros(id * 1000 + k)) end)) end as ms",
+            // A map of structs inside a struct.
+            "named_struct('m', map(cast(id % 5 as int), named_struct('x', id, 'y', concat('y', id % 3))), " +
+              "'n', cast(id as int)) as sm"
+          ).repartition(2).write.mode("overwrite").parquet(path)
+        }
+      }
+      withPlugin(enabled = false)(spark.read.parquet(path).createOrReplaceTempView("t"))
+      check("SELECT * FROM t")
+      check("SELECT id, ms['k1'] v, ms['k1'].a a, map_keys(ms) k, size(ms) n FROM t")
+      check("SELECT id, k, v.s FROM t LATERAL VIEW explode(ms) e AS k, v WHERE id % 3 = 1")
+      check("SELECT id, sm.m[cast(id % 5 as int)].y, sm.n FROM t")
+      check("SELECT id % 7 g, count(*), sum(size(ms)) FROM t GROUP BY 1")
+    }
+  }
+
+  test("parquet-java maps of structs: a MAP whose value is an optional group, v1 and v2") {
+    import org.apache.parquet.column.ParquetProperties.WriterVersion
+    val schema = org.apache.parquet.schema.MessageTypeParser.parseMessageType(
+      """message m { required int32 id;
+        |  optional group ms (MAP) { repeated group key_value { required binary key (STRING);
+        |    optional group value { optional int32 a; optional binary s (STRING); } } } }""".stripMargin
+    )
+    for (version <- Seq(WriterVersion.PARQUET_1_0, WriterVersion.PARQUET_2_0)) {
+      val path = newTempPath(s"pj-ms-$version")
+      new java.io.File(path).mkdirs()
+      val writer = org.apache.parquet.hadoop.example.ExampleParquetWriter
+        .builder(new org.apache.hadoop.fs.Path(path + "/part-0.parquet"))
+        .withConf(new org.apache.hadoop.conf.Configuration())
+        .withType(schema)
+        .withWriterVersion(version)
+        .withPageSize(1024)
+        .withRowGroupSize(16 * 1024L)
+        .build()
+      val factory = new org.apache.parquet.example.data.simple.SimpleGroupFactory(schema)
+      try {
+        for (k <- 0 until 4000) {
+          val g = factory.newGroup().append("id", k)
+          if (k % 7 != 0) {
+            val m = g.addGroup("ms")
+            for (j <- 0 until k % 4) {
+              val kv = m.addGroup("key_value").append("key", s"k$j")
+              if ((k + j) % 5 != 0) {
+                val v = kv.addGroup("value")
+                if ((k + j) % 3 != 0) v.append("a", k * 10 + j)
+                if ((k + j) % 4 != 1) v.append("s", s"s${(k + j) % 9}")
+              }
+            }
+          }
+          writer.write(g)
+        }
+      } finally writer.close()
+      withPlugin(enabled = false)(spark.read.parquet(path).createOrReplaceTempView("t"))
+      check("SELECT * FROM t")
+      check("SELECT id, ms['k1'].a, ms['k2'].s FROM t WHERE id % 5 = 2")
+    }
+  }
+
+  test(
+    "a list of structs holding a list, a list of lists of structs and a map of structs holding a list keep Spark's scan"
+  ) {
     val path = newTempPath("deep-lists")
     spark.range(0, 400).selectExpr(
       "cast(id as int) as id",
@@ -517,13 +594,14 @@ class NativeParquetListSuite extends VectorQuerySuite {
       "array(named_struct('l', array(id))) as lsl",
       "array(array(named_struct('a', id))) as lls",
       "map(cast(id as int), named_struct('a', id)) as ms",
+      "map(cast(id as int), named_struct('l', array(id))) as msl",
       "array(cast(id as int), 7) as flat"
     ).write.mode("overwrite").parquet(path)
     withPlugin(enabled = false)(spark.read.parquet(path).createOrReplaceTempView("t"))
     check("SELECT * FROM t", native = false)
     check("SELECT id, lsl FROM t", native = false)
     check("SELECT id, lls FROM t", native = false)
-    check("SELECT id, ms FROM t", native = false)
-    check("SELECT id, flat, ls, ll, sl FROM t") // each of these is read natively
+    check("SELECT id, msl FROM t", native = false)
+    check("SELECT id, flat, ls, ll, sl, ms FROM t") // each of these is read natively
   }
 }

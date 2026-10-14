@@ -1131,12 +1131,12 @@ class VectorParquetScanSuite extends VectorQuerySuite {
   // ---------------------------------------------------------------- fallbacks
 
   test(
-    "fallback: a map of structs keeps Spark's scan with a recorded reason (lists, structs and lists inside structs are native, #568)"
+    "fallback: a list of lists of structs keeps Spark's scan with a recorded reason (lists, maps, structs and their nestings of flat types are native, #568)"
   ) {
     val path = newTempPath("t_nested")
     withPlugin(enabled = false) {
       spark.sql(
-        "SELECT CAST(id AS INT) AS i, map(CAST(id AS INT), named_struct('a', CAST(id AS BIGINT) * 2)) AS st FROM range(0, 1000)"
+        "SELECT CAST(id AS INT) AS i, array(array(named_struct('a', CAST(id AS BIGINT) * 2))) AS st FROM range(0, 1000)"
       )
         .write.mode("overwrite").parquet(path)
       spark.read.parquet(path).createOrReplaceTempView("t_nested")
