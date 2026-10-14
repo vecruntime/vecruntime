@@ -236,17 +236,102 @@ class NativeParquetListSuite extends VectorQuerySuite {
     }
   }
 
-  test("a list of lists, a list of structs and a list inside a struct keep Spark's scan, with Spark's rows") {
+  for (legacy <- Seq(false, true); v2 <- Seq(false, true); dictionary <- Seq(true, false)) {
+    test(
+      s"Spark-written lists of structs: nulls at the list, the struct and the field (legacy=$legacy, v2=$v2, dictionary=$dictionary)"
+    ) {
+      val path = newTempPath(s"ls-$legacy-$v2-$dictionary")
+      withConf(
+        "spark.sql.parquet.writeLegacyFormat" -> legacy.toString,
+        "parquet.writer.version" -> (if (v2) "v2" else "v1"),
+        "parquet.enable.dictionary" -> dictionary.toString,
+        "spark.sql.parquet.outputTimestampType" -> "TIMESTAMP_MICROS"
+      ) {
+        withPlugin(enabled = false) {
+          spark.range(0, 5000).selectExpr(
+            "id",
+            "case when id % 9 = 0 then null when id % 9 = 1 then array() else " +
+              "transform(sequence(0, cast(id % 5 as int)), k -> case when k = 2 then null else named_struct(" +
+              "'a', case when k = 3 then null else cast(id + k as int) end, " +
+              "'s', concat('s', (id + k) % 11), 'd', (id + k) / 4.0, " +
+              "'ts', timestamp_micros(id * 1000 + k), 'b', k % 2 = 0) end) end as ls"
+          ).repartition(2).write.mode("overwrite").parquet(path)
+        }
+      }
+      withPlugin(enabled = false)(spark.read.parquet(path).createOrReplaceTempView("t"))
+      check("SELECT * FROM t")
+      check("SELECT id, size(ls), transform(ls, x -> x.a) a, filter(ls, x -> x.s = 's3') f FROM t")
+      check("SELECT id, e.a, e.s FROM t LATERAL VIEW explode(ls) x AS e")
+      check("SELECT id, ls FROM t WHERE exists(ls, x -> x.b) AND id % 3 = 1")
+      check("SELECT id % 7 k, count(*), sum(size(ls)) FROM t GROUP BY 1")
+    }
+  }
+
+  test("parquet-java lists of structs: the three-level LIST and the legacy two-level repeated group") {
+    import org.apache.parquet.column.ParquetProperties.WriterVersion
+    val shapes = Seq(
+      "three" -> """message m { required int32 id;
+        |  optional group ls (LIST) { repeated group list { optional group element {
+        |    optional int32 a; optional binary s (STRING); } } } }""".stripMargin,
+      "two" -> """message m { required int32 id;
+        |  optional group ls (LIST) { repeated group array { required int32 a; optional binary s (STRING); } } }""".stripMargin
+    )
+    for ((shape, text) <- shapes; version <- Seq(WriterVersion.PARQUET_1_0, WriterVersion.PARQUET_2_0)) {
+      val schema = org.apache.parquet.schema.MessageTypeParser.parseMessageType(text)
+      val path = newTempPath(s"pj-ls-$shape-$version")
+      new java.io.File(path).mkdirs()
+      val writer = org.apache.parquet.hadoop.example.ExampleParquetWriter
+        .builder(new org.apache.hadoop.fs.Path(path + "/part-0.parquet"))
+        .withConf(new org.apache.hadoop.conf.Configuration())
+        .withType(schema)
+        .withWriterVersion(version)
+        .withPageSize(1024)
+        .withRowGroupSize(16 * 1024L)
+        .build()
+      val factory = new org.apache.parquet.example.data.simple.SimpleGroupFactory(schema)
+      try {
+        for (k <- 0 until 4000) {
+          val g = factory.newGroup().append("id", k)
+          if (k % 7 != 0) {
+            val ls = g.addGroup("ls")
+            for (j <- 0 until k % 4) {
+              if (shape == "three") {
+                val e = ls.addGroup("list")
+                if ((k + j) % 5 != 0) {
+                  val el = e.addGroup("element")
+                  if ((k + j) % 3 != 0) el.append("a", k * 10 + j)
+                  if ((k + j) % 4 != 1) el.append("s", s"s${(k + j) % 9}")
+                }
+              } else {
+                val el = ls.addGroup("array").append("a", k * 10 + j)
+                if ((k + j) % 4 != 1) el.append("s", s"s${(k + j) % 9}")
+              }
+            }
+          }
+          writer.write(g)
+        }
+      } finally writer.close()
+      withPlugin(enabled = false)(spark.read.parquet(path).createOrReplaceTempView("t"))
+      check("SELECT * FROM t")
+      check("SELECT id, transform(ls, x -> x.a) a, size(ls) n FROM t WHERE id % 5 = 2")
+    }
+  }
+
+  test("a list of lists and a list inside a struct keep Spark's scan, with Spark's rows") {
     val path = newTempPath("deep-lists")
     spark.range(0, 400).selectExpr(
       "cast(id as int) as id",
       "array(array(cast(id as int)), array()) as ll",
       "array(named_struct('a', cast(id as int))) as ls",
       "named_struct('l', array(id)) as sl",
+      "array(named_struct('l', array(id))) as lsl",
       "array(cast(id as int), 7) as flat"
     ).write.mode("overwrite").parquet(path)
     withPlugin(enabled = false)(spark.read.parquet(path).createOrReplaceTempView("t"))
     check("SELECT * FROM t", native = false)
-    check("SELECT id, flat FROM t") // only the list of leaves: native
+    check("SELECT id, ll FROM t", native = false)
+    check("SELECT id, sl FROM t", native = false)
+    check("SELECT id, lsl FROM t", native = false)
+    check("SELECT id, flat, ls FROM t") // a list of leaves and a list of structs of leaves: native
   }
 }
