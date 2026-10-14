@@ -582,9 +582,117 @@ class NativeParquetListSuite extends VectorQuerySuite {
     }
   }
 
-  test(
-    "a list of structs holding a list, a list of lists of structs and a map of structs holding a list keep Spark's scan"
-  ) {
+  for (legacy <- Seq(false, true); v2 <- Seq(false, true); dictionary <- Seq(true, false)) {
+    test(
+      s"Spark-written mixed nesting: lists and maps of structs holding lists and maps, lists of lists of structs (legacy=$legacy, v2=$v2, dictionary=$dictionary)"
+    ) {
+      val path = newTempPath(s"tree-$legacy-$v2-$dictionary")
+      withConf(
+        "spark.sql.parquet.writeLegacyFormat" -> legacy.toString,
+        "parquet.writer.version" -> (if (v2) "v2" else "v1"),
+        "parquet.enable.dictionary" -> dictionary.toString
+      ) {
+        withPlugin(enabled = false) {
+          spark.range(0, 4000).selectExpr(
+            "id",
+            // array<struct<a: int, tags: array<string>, m: map<string, int>>>
+            "case when id % 9 = 0 then null when id % 9 = 1 then array() else transform(sequence(0, cast(id % 3 as int)), " +
+              "k -> case when k = 1 then null else named_struct('a', cast(id + k as int), " +
+              "'tags', case when (id + k) % 4 = 0 then null else transform(sequence(0, cast((id + k) % 3 as int)), " +
+              "j -> case when j = 1 then null else concat('t', (id + j) % 7) end) end, " +
+              "'m', case when (id + k) % 5 = 0 then null else map(concat('k', k), case when k = 2 then null " +
+              "else cast(id as int) end) end) end) end as lsl",
+            // array<array<struct<a: bigint, s: string>>>
+            "case when id % 7 = 0 then null else transform(sequence(0, cast(id % 3 as int)), " +
+              "k -> case when k = 2 then null else transform(sequence(0, cast((id + k) % 2 as int)), " +
+              "j -> case when j = 1 and k = 0 then null else named_struct('a', id * 10 + k + j, 's', concat('s', j)) end) end) end as lls",
+            // map<string, struct<l: array<int>, x: int>>, map<int, array<int>>, array<map<string, int>>
+            "case when id % 6 = 0 then null else map(concat('k', id % 3), case when id % 4 = 0 then null else " +
+              "named_struct('l', array(cast(id as int), null), 'x', cast(id % 5 as int)) end) end as msl",
+            "map(cast(id % 4 as int), case when id % 3 = 0 then null else array(cast(id as int), cast(id + 1 as int)) end) as mal",
+            "case when id % 8 = 0 then null else array(map('a', cast(id as int)), case when id % 5 = 0 then null " +
+              "else map('b', cast(id + 1 as int), 'c', cast(null as int)) end) end as lm"
+          ).repartition(2).write.mode("overwrite").parquet(path)
+        }
+      }
+      withPlugin(enabled = false)(spark.read.parquet(path).createOrReplaceTempView("t"))
+      check("SELECT * FROM t")
+      check(
+        "SELECT id, transform(lsl, x -> x.tags) tags, transform(lsl, x -> x.m) m, transform(lsl, x -> x.a) a FROM t"
+      )
+      check("SELECT id, flatten(lls) f, transform(lls, x -> transform(x, y -> y.s)) s FROM t WHERE id % 3 = 1")
+      check("SELECT id, msl['k1'].l, msl['k2'].x, mal[1], transform(lm, m -> map_keys(m)) k FROM t")
+      check("SELECT id, e.a, e.tags FROM t LATERAL VIEW explode(lsl) x AS e WHERE id % 4 = 2")
+      check("SELECT id % 7 g, count(*), sum(size(lsl)), sum(size(lls)) FROM t GROUP BY 1")
+    }
+  }
+
+  test("parquet-java mixed nesting: a three-level list of structs holding a list, and a legacy two-level form") {
+    import org.apache.parquet.column.ParquetProperties.WriterVersion
+    val shapes = Seq(
+      "three" -> """message m { required int32 id;
+        |  optional group ls (LIST) { repeated group list { optional group element {
+        |    optional int32 a;
+        |    optional group l (LIST) { repeated group list { optional binary element (STRING); } } } } } }""".stripMargin,
+      "two" -> """message m { required int32 id;
+        |  optional group ls (LIST) { repeated group array {
+        |    required int32 a; repeated binary l (STRING); } } }""".stripMargin
+    )
+    for ((shape, text) <- shapes; version <- Seq(WriterVersion.PARQUET_1_0, WriterVersion.PARQUET_2_0)) {
+      val schema = org.apache.parquet.schema.MessageTypeParser.parseMessageType(text)
+      val path = newTempPath(s"pj-tree-$shape-$version")
+      new java.io.File(path).mkdirs()
+      val writer = org.apache.parquet.hadoop.example.ExampleParquetWriter
+        .builder(new org.apache.hadoop.fs.Path(path + "/part-0.parquet"))
+        .withConf(new org.apache.hadoop.conf.Configuration())
+        .withType(schema)
+        .withWriterVersion(version)
+        .withPageSize(1024)
+        .withRowGroupSize(16 * 1024L)
+        .build()
+      val factory = new org.apache.parquet.example.data.simple.SimpleGroupFactory(schema)
+      try {
+        for (k <- 0 until 4000) {
+          val g = factory.newGroup().append("id", k)
+          if (k % 7 != 0) {
+            val ls = g.addGroup("ls")
+            for (i <- 0 until k % 4) {
+              if (shape == "three") {
+                val e = ls.addGroup("list")
+                if ((k + i) % 5 != 0) {
+                  val el = e.addGroup("element")
+                  if ((k + i) % 3 != 0) el.append("a", k * 10 + i)
+                  if ((k + i) % 4 != 1) {
+                    val l = el.addGroup("l")
+                    for (j <- 0 until (k + i) % 3) {
+                      val le = l.addGroup("list")
+                      if ((k + i + j) % 4 != 2) le.append("element", s"v${(k + j) % 9}")
+                    }
+                  }
+                }
+              } else {
+                val el = ls.addGroup("array").append("a", k * 10 + i)
+                for (j <- 0 until (k + i) % 3) el.append("l", s"v${(k + j) % 9}")
+              }
+            }
+          }
+          writer.write(g)
+        }
+      } finally writer.close()
+      withPlugin(enabled = false)(spark.read.parquet(path).createOrReplaceTempView("t"))
+      check("SELECT * FROM t")
+      check("SELECT id, transform(ls, x -> x.l) l, transform(ls, x -> x.a) a FROM t WHERE id % 5 = 2")
+    }
+  }
+
+  test("parquet-testing nested_maps (a map of maps) is read natively") {
+    withPlugin(enabled =
+      false
+    )(spark.read.parquet(resource("data/nested_maps.snappy.parquet")).createOrReplaceTempView("t"))
+    check("SELECT * FROM t")
+  }
+
+  test("every nesting of readable types is read natively: lists, structs and maps mixed") {
     val path = newTempPath("deep-lists")
     spark.range(0, 400).selectExpr(
       "cast(id as int) as id",
@@ -598,10 +706,6 @@ class NativeParquetListSuite extends VectorQuerySuite {
       "array(cast(id as int), 7) as flat"
     ).write.mode("overwrite").parquet(path)
     withPlugin(enabled = false)(spark.read.parquet(path).createOrReplaceTempView("t"))
-    check("SELECT * FROM t", native = false)
-    check("SELECT id, lsl FROM t", native = false)
-    check("SELECT id, lls FROM t", native = false)
-    check("SELECT id, msl FROM t", native = false)
-    check("SELECT id, flat, ls, ll, sl, ms FROM t") // each of these is read natively
+    check("SELECT * FROM t")
   }
 }

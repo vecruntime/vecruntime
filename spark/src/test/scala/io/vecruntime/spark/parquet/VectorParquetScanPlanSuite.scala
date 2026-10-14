@@ -148,7 +148,7 @@ class VectorParquetScanPlanSuite extends VectorQuerySuite {
   test("flag on, unsupported column: Spark's scan stays with a recorded reason") {
     write(
       "p_nested",
-      "SELECT CAST(id AS INT) AS i, array(array(named_struct('a', id + 1))) AS st FROM range(0, 1000)"
+      "SELECT CAST(id AS INT) AS i, array(collate(CAST(id AS STRING), 'UNICODE_CI')) AS st FROM range(0, 1000)"
     )
     withConf(VectorConf.ScanNativeParquet -> "true") {
       val df = withPlugin(enabled = true)(spark.sql("SELECT i, st FROM p_nested"))

@@ -115,6 +115,34 @@ class NativeParquetRebaseSuite extends VectorQuerySuite {
     }
   }
 
+  test("INT96 and LEGACY dates and timestamps deep in a list of structs are rebased by the tree reader") {
+    for (
+      (name, conf) <- Seq(
+        "int96" -> Seq(
+          "spark.sql.parquet.outputTimestampType" -> "INT96",
+          "spark.sql.parquet.int96RebaseModeInWrite" -> "LEGACY"
+        ),
+        "legacy" -> Seq(
+          "spark.sql.parquet.outputTimestampType" -> "TIMESTAMP_MICROS",
+          "spark.sql.parquet.datetimeRebaseModeInWrite" -> "LEGACY"
+        )
+      )
+    ) {
+      val path = newTempPath(s"deep-rebase-$name")
+      withConf(conf: _*) {
+        withPlugin(enabled = false) {
+          spark.range(0, 2000).selectExpr(
+            "id",
+            s"array(named_struct('d', $dates, 'ts', array($timestamps, cast(null as timestamp)))) as l"
+          ).repartition(2).write.mode("overwrite").parquet(path)
+        }
+      }
+      withPlugin(enabled = false)(spark.read.parquet(path).createOrReplaceTempView("t"))
+      check("SELECT * FROM t")
+      check("SELECT min(l[0].d), max(l[0].ts[0]) FROM t")
+    }
+  }
+
   test("INT96 written by parquet-java and by Spark in parquet-testing, read natively") {
     import org.apache.parquet.column.ParquetProperties.WriterVersion
     val schema = org.apache.parquet.schema.MessageTypeParser.parseMessageType(
