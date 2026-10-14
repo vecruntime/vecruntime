@@ -81,6 +81,18 @@ public final class NativeParquetSupport {
             return isReadableLeaf(at.elementType());
         }
         if (dt instanceof org.apache.spark.sql.types.MapType mt) {
+            if (mt.valueType() instanceof org.apache.spark.sql.types.StructType st) {
+                // #568: a map of structs of leaves.
+                if (st.fields().length == 0 || !isReadableLeaf(mt.keyType())) {
+                    return false;
+                }
+                for (org.apache.spark.sql.types.StructField f : st.fields()) {
+                    if (!isReadableLeaf(f.dataType())) {
+                        return false;
+                    }
+                }
+                return true;
+            }
             return isReadableLeaf(mt.keyType()) && isReadableLeaf(mt.valueType());
         }
         if (dt instanceof org.apache.spark.sql.types.StructType st) {

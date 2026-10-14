@@ -65,6 +65,8 @@ public final class NativeParquetListReader implements NativeParquetColumn, RowLe
     private final int elementDef; // the entry is an element at this level
     // An array of structs of leaves: one reader per field, in the struct's order (fields[0] is `first`), and the
     // level at which an element's struct is present (elementDef when the repeated group is the struct itself).
+    // A map of structs (#568): fields[0] is the key, fields[1..] the value struct's fields, and structDef the level
+    // at which an entry's value struct is present.
     private final NativeParquetColumnReader[] fields;
     private final int structDef;
     private int[] rowLevels = new int[0]; // each row's first-entry level, last batch
@@ -84,7 +86,7 @@ public final class NativeParquetListReader implements NativeParquetColumn, RowLe
         }
     }
 
-    private NativeParquetListReader(ArrayType type, NativeParquetColumnReader[] fields, int listDef,
+    private NativeParquetListReader(DataType type, NativeParquetColumnReader[] fields, int listDef,
             int elementDef, int structDef) {
         this.type = type;
         this.first = fields[0];
@@ -149,6 +151,22 @@ public final class NativeParquetListReader implements NativeParquetColumn, RowLe
                     elementDef);
         }
         MapType mt = (MapType) type;
+        if (mt.valueType() instanceof StructType st) {
+            // #568: a map of structs of leaves: the key, then each value field's leaf matched by name, in order.
+            List<ColumnDescriptor> values = leaves.subList(1, leaves.size());
+            NativeParquetColumnReader[] readers = new NativeParquetColumnReader[st.fields().length + 1];
+            readers[0] = new NativeParquetColumnReader(a, NativeParquetSupport.decodeLane(mt.keyType()), mt.keyType(),
+                    name + ".key", batchRows, allocator);
+            for (int i = 0; i < st.fields().length; i++) {
+                StructField f = st.fields()[i];
+                ColumnDescriptor cd = fieldLeaf(values, f.name());
+                readers[i + 1] = new NativeParquetColumnReader(cd, NativeParquetSupport.decodeLane(f.dataType()), f.dataType(),
+                        name + ".value." + f.name(), batchRows, allocator);
+            }
+            String[] v0 = fieldLeaf(values, st.fields()[0].name()).getPath();
+            int structDef = clipped.getMaxDefinitionLevel(java.util.Arrays.copyOf(v0, v0.length - 1));
+            return new NativeParquetListReader(mt, readers, listDef, elementDef, structDef);
+        }
         ColumnDescriptor v = leaves.get(1);
         return new NativeParquetListReader(
                 type,
@@ -285,6 +303,32 @@ public final class NativeParquetListReader implements NativeParquetColumn, RowLe
             leaf.accept(leaves.get(0), at.elementType());
             return true;
         }
+        if (type instanceof MapType mt && mt.valueType() instanceof StructType st) {
+            // A map of structs of leaves: the key under the repeated group, then one leaf per value field, in
+            // order, all under the same value group directly below it.
+            if (leaves.size() != st.fields().length + 1) {
+                return false;
+            }
+            String[] rep = repeatedPath(clipped, leaves.get(0)
+                    .getPath());
+            if (leaves.get(0).getPath().length != rep.length + 1) {
+                return false;
+            }
+            for (int i = 0; i < st.fields().length; i++) {
+                String[] p = leaves.get(i + 1).getPath();
+                if (p.length != rep.length + 2
+                        || !java.util.Arrays.equals(java.util.Arrays.copyOf(p, rep.length), rep)
+                        || !p[p.length - 1].equalsIgnoreCase(st.fields()[i].name())
+                        || !p[rep.length].equals(leaves.get(1).getPath()[rep.length])) {
+                    return false;
+                }
+            }
+            leaf.accept(leaves.get(0), mt.keyType());
+            for (int i = 0; i < st.fields().length; i++) {
+                leaf.accept(leaves.get(i + 1), st.fields()[i].dataType());
+            }
+            return true;
+        }
         if (type instanceof MapType mt) {
             if (leaves.size() != 2) {
                 return false;
@@ -381,7 +425,7 @@ public final class NativeParquetListReader implements NativeParquetColumn, RowLe
                 }
             }
             if (def >= elementDef) {
-                if (fields != null && def < structDef) {
+                if (fields != null && !(type instanceof MapType) && def < structDef) {
                     if (elementNulls == null) {
                         elementNulls = new boolean[entries];
                     }
@@ -399,7 +443,13 @@ public final class NativeParquetListReader implements NativeParquetColumn, RowLe
             try {
                 fs[0] = first.readElements(n, entries, elementDef);
                 for (int i = 1; i < fields.length; i++) {
-                    fs[i] = fields[i].readElements(n, fields[i].entriesForRows(n), elementDef);
+                    int e = fields[i].entriesForRows(n);
+                    if (i == 1 && type instanceof MapType) {
+                        // A map's value struct is null where its first field's level is below the struct's; the
+                        // key is required, so its own levels cannot tell.
+                        elementNulls = valueNulls(fields[1], e, count);
+                    }
+                    fs[i] = fields[i].readElements(n, e, elementDef);
                 }
             } catch (RuntimeException | Error e) {
                 for (int i = 0; i < fs.length; i++) {
@@ -420,6 +470,30 @@ public final class NativeParquetListReader implements NativeParquetColumn, RowLe
             }
         }
         return new Batch(n, nulls, offsets, a, b);
+    }
+
+    /**
+     * The null value structs among a map's next {@code entries} entries ({@code
+     * null}: none).
+     */
+    private boolean[] valueNulls(NativeParquetColumnReader valueField, int entries, int elements) {
+        int[] d = valueField.defLevels();
+        int off = valueField.levelOffset();
+        boolean[] out = null;
+        int at = 0;
+        for (int k = 0; k < entries; k++) {
+            int def = d[off + k];
+            if (def >= elementDef) {
+                if (def < structDef) {
+                    if (out == null) {
+                        out = new boolean[elements];
+                    }
+                    out[at] = true;
+                }
+                at++;
+            }
+        }
+        return out;
     }
 
     @Override
@@ -446,6 +520,15 @@ public final class NativeParquetListReader implements NativeParquetColumn, RowLe
     @Override
     public ColumnVector wrap(Object batch) {
         Batch b = (Batch) batch;
+        if (fields != null && type instanceof MapType mt) {
+            StructType st = (StructType) mt.valueType();
+            ColumnVector[] kids = new ColumnVector[fields.length - 1];
+            for (int i = 1; i < fields.length; i++) {
+                kids[i - 1] = fields[i].wrap(b.fs[i]);
+            }
+            return VectorNestedColumnVector.map(mt, b.rows, b.nulls, b.offsets, fields[0].wrap(b.fs[0]),
+                    VectorNestedColumnVector.struct(st, b.elements, b.elementNulls, kids));
+        }
         if (type instanceof ArrayType at) {
             if (fields != null) {
                 StructType st = (StructType) at.elementType();
