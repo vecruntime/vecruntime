@@ -29,7 +29,7 @@ import org.apache.spark.sql.vecruntime.{PlanUtils, VectorParquetScanExec}
  *   - type widening as Spark's ParquetVectorUpdaterFactory does it: INT32 and FLOAT as double, DATE as
  *     timestamp_ntz (with the file's date rebase), decimals at a larger scale and precision, signed integers
  *     as decimals; flat, in a struct and in a list; Spark's and parquet-java's files;
- *   - what stays on Spark's reader: a field missing inside a list of structs, a column with an existence default,
+ *   - what stays on Spark's reader: a column with an existence default,
  *     an integer read as a decimal wider than 18 digits. Spark's rows either way.
  */
 class NativeParquetSchemaEvolutionSuite extends VectorQuerySuite {
@@ -297,9 +297,10 @@ class NativeParquetSchemaEvolutionSuite extends VectorQuerySuite {
       v2 = false,
       dictionary = true
     )
-    // A field missing inside a list of structs: the shape of its nulls is the list's.
+    // A field missing inside a list of structs: null in each element, read natively by the tree reader since the
+    // field-id slice (NativeParquetFieldIdSuite has the full cases).
     view(path, "id bigint, l array<struct<x: int, y: string>>")
-    check("SELECT * FROM t", native = false)
+    check("SELECT * FROM t")
     // An INT32 read as a decimal of more than 18 digits (the DECIMAL128 lane takes binary decimals only).
     view(path, "id bigint, i decimal(25,3)", "w")
     check("SELECT * FROM w", native = false)

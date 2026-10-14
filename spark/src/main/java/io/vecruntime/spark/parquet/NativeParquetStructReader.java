@@ -131,7 +131,8 @@ public final class NativeParquetStructReader implements NativeParquetColumn, Row
                         allocator);
             } else if (dt instanceof org.apache.spark.sql.types.ArrayType || dt instanceof org.apache.spark.sql.types.MapType) {
                 // #568: a list or map field, read by the list reader at its path under the struct.
-                fields[i] = NativeParquetListReader.create(clipped, childPath, dt, childName, batchRows, allocator);
+                fields[i] = NativeParquetListReader.create(clipped, file, childPath, dt, childName, batchRows,
+                        allocator);
             } else {
                 ColumnDescriptor cd = clipped.getColumnDescription(childPath);
                 fields[i] = new NativeParquetColumnReader(cd, NativeParquetSupport.decodeLane(dt), dt, childName, batchRows,
@@ -175,6 +176,18 @@ public final class NativeParquetStructReader implements NativeParquetColumn, Row
      */
     public static boolean forEachLeaf(MessageType clipped, String[] path, StructType type,
             BiConsumer<ColumnDescriptor, DataType> leaf) {
+        return forEachLeaf(clipped, null, path, type, leaf);
+    }
+
+    /**
+     * {@link #forEachLeaf(MessageType, String[], StructType, BiConsumer)} over
+     * a file whose schema is {@code file} (null: every field is in it): a field
+     * the file lacks is a null column and has no leaves to check. Fields are
+     * matched by position -- {@code clipParquetSchema} keeps the requested
+     * order, and under field-id matching (#568) a field keeps the file's name.
+     */
+    public static boolean forEachLeaf(MessageType clipped, MessageType file, String[] path,
+            StructType type, BiConsumer<ColumnDescriptor, DataType> leaf) {
         // MessageType.containsPath is true for leaf paths only: walk the groups by name.
         Type t = clipped;
         for (String p : path) {
@@ -194,13 +207,13 @@ public final class NativeParquetStructReader implements NativeParquetColumn, Row
         for (int i = 0; i < fs.length; i++) {
             Type ct = group.getType(i);
             DataType dt = fs[i].dataType();
-            if (!ct.getName().equalsIgnoreCase(fs[i].name())) {
-                return false;
-            }
             String[] childPath = child(path, ct.getName());
+            if (file != null && !holds(file, childPath)) {
+                continue;
+            }
             if (dt instanceof org.apache.spark.sql.types.ArrayType || dt instanceof org.apache.spark.sql.types.MapType) {
                 // #568: a list or map field (a LIST / MAP group, or a bare repeated field) has its own shape check.
-                if (!NativeParquetListReader.forEachLeaf(clipped, childPath, dt, leaf)) {
+                if (!NativeParquetListReader.forEachLeaf(clipped, file, childPath, dt, leaf)) {
                     return false;
                 }
                 continue;
@@ -209,7 +222,7 @@ public final class NativeParquetStructReader implements NativeParquetColumn, Row
                 return false;
             }
             if (dt instanceof StructType st) {
-                if (!forEachLeaf(clipped, childPath, st, leaf)) {
+                if (!forEachLeaf(clipped, file, childPath, st, leaf)) {
                     return false;
                 }
             } else {
