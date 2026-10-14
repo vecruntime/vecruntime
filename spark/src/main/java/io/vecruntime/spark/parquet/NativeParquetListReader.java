@@ -102,8 +102,13 @@ public final class NativeParquetListReader implements NativeParquetColumn {
      * clipped schema) of Spark type {@code type}; {@link #forEachLeaf} must
      * have accepted it.
      */
-    public static NativeParquetListReader create(MessageType clipped, String top, DataType type,
+    public static NativeParquetColumn create(MessageType clipped, String top, DataType type,
             String name, int batchRows, BufferAllocator allocator) {
+        if (NativeParquetNestedListReader.arrayDepth(type) > 1) {
+            // #568: a list of lists, any depth, over one leaf.
+            return NativeParquetNestedListReader.create(clipped, top, (ArrayType) type, name, batchRows,
+                    allocator);
+        }
         List<ColumnDescriptor> leaves = leavesUnder(clipped, top);
         ColumnDescriptor a = leaves.get(0);
         String[] rep = repeatedPath(clipped, a.getPath());
@@ -191,6 +196,9 @@ public final class NativeParquetListReader implements NativeParquetColumn {
      */
     public static boolean forEachLeaf(MessageType clipped, String top, DataType type,
             BiConsumer<ColumnDescriptor, DataType> leaf) {
+        if (NativeParquetNestedListReader.arrayDepth(type) > 1) {
+            return NativeParquetNestedListReader.forEachLeaf(clipped, top, (ArrayType) type, leaf);
+        }
         if (!clipped.containsField(top)) {
             return false;
         }
