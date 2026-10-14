@@ -19,7 +19,12 @@ import scala.jdk.CollectionConverters._
 
 import io.vecruntime.spark.adapter.TypeMapping
 import io.vecruntime.spark.arrow.{ArrowOutput, SelectedColumnarBatch, VectorAllocators}
-import io.vecruntime.spark.parquet.{NativeParquetColumn, NativeParquetColumnReader, NativeParquetStructReader}
+import io.vecruntime.spark.parquet.{
+  NativeParquetColumn,
+  NativeParquetColumnReader,
+  NativeParquetListReader,
+  NativeParquetStructReader
+}
 import org.apache.hadoop.conf.Configuration
 import org.apache.parquet.HadoopReadOptions
 import org.apache.parquet.filter2.compat.FilterCompat
@@ -562,7 +567,7 @@ private[vecruntime] final class VectorParquetPartitionReader(
       while (c < dataColumnCount) {
         if (!filterColumns(c)) {
           val r = columnReaders(c)
-          if (count == 0 && !attrs(c)._2.isInstanceOf[StructType]) {
+          if (count == 0 && attrs(c)._2.isInstanceOf[AtomicType]) {
             r.skipRows(n)
             val (name, dt) = attrs(c)
             val v = ArrowOutput.nulls(name, dt, n, allocator)
@@ -764,6 +769,15 @@ private[vecruntime] final class VectorParquetPartitionReader(
         case st: StructType =>
           val name = topLevelName(p.clipped, field.name)
           NativeParquetStructReader.create(p.clipped, Array(name), st, field.name, batchSize, allocator)
+        case dt @ (_: org.apache.spark.sql.types.ArrayType | _: org.apache.spark.sql.types.MapType) =>
+          NativeParquetListReader.create(
+            p.clipped,
+            topLevelName(p.clipped, field.name),
+            dt,
+            field.name,
+            batchSize,
+            allocator
+          )
         case dt =>
           val cd = columns.asScala.find(_.getPath()(0).equalsIgnoreCase(field.name))
             .getOrElse(throw new IllegalStateException(s"column ${field.name} missing from clipped schema"))
@@ -923,6 +937,17 @@ private[vecruntime] final class VectorParquetPartitionReader(
               if (!VectorParquetScanExec.physicalMatches(dt, cd.getPrimitiveType)) ok = false
           )
           if (!shape || !ok) return true
+        case dt @ (_: org.apache.spark.sql.types.ArrayType | _: org.apache.spark.sql.types.MapType) =>
+          // #568: a list or map of leaves, each leaf repeated once and stored as its lane needs.
+          var ok = true
+          val shape = NativeParquetListReader.forEachLeaf(
+            clipped,
+            topLevelName(clipped, field.name),
+            dt,
+            (cd: org.apache.parquet.column.ColumnDescriptor, leafType: org.apache.spark.sql.types.DataType) =>
+              if (!VectorParquetScanExec.physicalMatches(leafType, cd.getPrimitiveType)) ok = false
+          )
+          if (!shape || !ok) return true
         case dt =>
           val cd = clipped.getColumns.asScala.find(_.getPath()(0).equalsIgnoreCase(field.name))
           if (cd.isDefined && !VectorParquetScanExec.physicalMatches(dt, cd.get.getPrimitiveType)) {
@@ -962,7 +987,9 @@ private[vecruntime] final class VectorParquetPartitionReader(
   /** Whether any requested column holds dates or timestamps: the only columns a calendar rebase touches. */
   private val hasDatetime: Boolean = {
     def datetime(dt: org.apache.spark.sql.types.DataType): Boolean = dt match {
-      case s: StructType => s.fields.exists(f => datetime(f.dataType)) // #568: a struct's leaves too
+      case s: StructType => s.fields.exists(f => datetime(f.dataType)) // #568: nested leaves too
+      case a: org.apache.spark.sql.types.ArrayType => datetime(a.elementType)
+      case m: org.apache.spark.sql.types.MapType => datetime(m.keyType) || datetime(m.valueType)
       case t => t == org.apache.spark.sql.types.DateType || t == org.apache.spark.sql.types.TimestampType
     }
     requiredSchema.fields.exists(f => datetime(f.dataType))
@@ -1325,12 +1352,10 @@ object VectorParquetScanPlanner {
     if (!relation.fileFormat.isInstanceOf[org.apache.spark.sql.execution.datasources.parquet.ParquetFileFormat]) {
       return Some("scan is not Parquet")
     }
-    // Arrays and maps (anywhere in a column) need repetition levels, which the reader does not decode; a struct of
-    // readable fields is read natively (#568).
+    // #568: structs of readable fields, and top-level lists and maps of leaves, are read natively; a list of lists or
+    // of structs, or a list or a map inside a struct, keeps Spark's scan.
     val nested = scan.requiredSchema.fields.find(f =>
-      !f.dataType.isInstanceOf[AtomicType] &&
-        !(f.dataType.isInstanceOf[StructType] &&
-          io.vecruntime.spark.parquet.NativeParquetSupport.isReadable(f.dataType))
+      !f.dataType.isInstanceOf[AtomicType] && !io.vecruntime.spark.parquet.NativeParquetSupport.isReadable(f.dataType)
     )
     nested.foreach(f => return Some(s"nested or complex column ${f.name}:${f.dataType.simpleString}"))
     // Every required column must be a type the native reader actually decodes -- ONE shared source of truth
