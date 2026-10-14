@@ -1080,7 +1080,8 @@ object ExpressionCompiler {
           val replaced = body.transform { case v: NamedLambdaVariable if byId.contains(v.exprId) => byId(v.exprId) }
           val outerOrdinals = outerAttrs.map(a => input.indexWhere(_.exprId == a.exprId))
           if (outerOrdinals.exists(_ < 0)) Left(s"$what over an unbound outer column")
-          else compile(replaced, lambdaAttrs ++ outerAttrs).map(c => (c, outerOrdinals))
+          // A nested body (#705: a lambda returning an array, a map or a struct) compiles as a projection.
+          else compileProjection(replaced, lambdaAttrs ++ outerAttrs).map(c => (c, outerOrdinals))
       }
     }
   }
@@ -1095,6 +1096,11 @@ object ExpressionCompiler {
 
   private def compileNested(expr: Expression, input: Seq[Attribute]): Result = expr match {
     case Alias(child, _) => compileNested(child, input)
+    // A nested column, or a nested struct field of one, as its value (#705): a lambda returning its element.
+    case a: AttributeReference if TypeMapping.nestedTypeOf(a.dataType) != null =>
+      nestedColumnPath(a, input).map { case (o, path) => NestedValueExpr(o, path, a.dataType) }
+    case g: GetStructField if TypeMapping.nestedTypeOf(g.dataType) != null =>
+      nestedColumnPath(g, input).map { case (o, path) => NestedValueExpr(o, path, g.dataType) }
     case e @ MapKeys(child) => mapPart(child, values = false, e, input)
     case e @ MapValues(child) => mapPart(child, values = true, e, input)
     case e @ ArrayTransform(child, LambdaFunction(body, vars, _)) =>
@@ -1131,7 +1137,7 @@ object ExpressionCompiler {
     if (TypeMapping.nestedTypeOf(l.dataType) == null || TypeMapping.nestedTypeOf(r.dataType) == null)
       Left(s"zip_with over ${l.dataType.simpleString} and ${r.dataType.simpleString} not supported")
     else if (vars.length != 2) Left("zip_with with a lambda of other than two arguments")
-    else if (!TypeMapping.isSupported(body.dataType)) Left(s"zip_with to ${body.dataType.simpleString} not supported")
+    else if (!laneOrNested(body.dataType)) Left(s"zip_with to ${body.dataType.simpleString} not supported")
     else
       for (
         lp <- nestedColumnPath(l, input); rp <- nestedColumnPath(r, input);
@@ -1151,7 +1157,7 @@ object ExpressionCompiler {
     if (!container.dataType.isInstanceOf[MapType] || TypeMapping.nestedTypeOf(container.dataType) == null)
       Left(s"$what over ${container.dataType.simpleString} not supported")
     else if (vars.length != 2) Left(s"$what with a lambda of other than two arguments")
-    else if (!filter && !TypeMapping.isSupported(body.dataType))
+    else if (!filter && !laneOrNested(body.dataType))
       Left(s"$what to ${body.dataType.simpleString} values not supported")
     else
       for (
@@ -1250,7 +1256,7 @@ object ExpressionCompiler {
       Left(s"$what over ${container.dataType.simpleString} not supported")
     else if (!laneOrNested(elementType))
       Left(s"$what over ${elementType.simpleString} elements not supported")
-    else if (!keep && !TypeMapping.isSupported(body.dataType))
+    else if (!keep && !laneOrNested(body.dataType))
       Left(s"$what to ${body.dataType.simpleString} elements not supported")
     else
       for (p <- nestedColumnPath(container, input); l <- lambdaOverElements(vars, body, what, input))

@@ -198,6 +198,26 @@ public final class VectorNestedColumnVector extends ColumnVector {
         return new VectorNestedColumnVector(dt, length, nulls, null, kids);
     }
 
+    /**
+     * A list column of {@code length} rows (the native Parquet scan's list,
+     * #568): row {@code i} is elements {@code [offsets[i], offsets[i + 1])} of
+     * {@code element}; {@code nulls} marks the null rows, or is absent.
+     */
+    public static ColumnVector list(ArrayType dt, int length, boolean[] nulls,
+            int[] offsets, ColumnVector element) {
+        ColumnVector e = isLeaf(dt.elementType()) ? new NullSafe(element, dt.elementType()) : element;
+        return new VectorNestedColumnVector(dt, length, nulls, offsets, new ColumnVector[] {e});
+    }
+
+    /** A map column, as {@link #list} over the keys and values. */
+    public static ColumnVector map(MapType dt, int length, boolean[] nulls,
+            int[] offsets, ColumnVector keys, ColumnVector values) {
+        ColumnVector k = isLeaf(dt.keyType()) ? new NullSafe(keys, dt.keyType()) : keys;
+        ColumnVector v = isLeaf(dt.valueType()) ? new NullSafe(values, dt.valueType()) : values;
+        return new VectorNestedColumnVector(dt, length, nulls, offsets,
+                new ColumnVector[] {k, v});
+    }
+
     public int length() {
         return length;
     }

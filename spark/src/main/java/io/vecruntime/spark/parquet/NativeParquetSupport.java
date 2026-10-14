@@ -58,14 +58,22 @@ public final class NativeParquetSupport {
 
     /** Whether the native reader can decode a column of this type. */
     public static boolean isReadable(DataType dt) {
+        if (dt instanceof org.apache.spark.sql.types.ArrayType at) {
+            // #568: a list of a leaf (repeated once); a list of lists or of structs keeps Spark's scan.
+            return isReadableLeaf(at.elementType());
+        }
+        if (dt instanceof org.apache.spark.sql.types.MapType mt) {
+            return isReadableLeaf(mt.keyType()) && isReadableLeaf(mt.valueType());
+        }
         if (dt instanceof org.apache.spark.sql.types.StructType st) {
-            // #568: a struct whose fields are all readable -- leaves or structs; an array or a map anywhere under
-            // it needs repetition levels, which the reader does not decode yet.
+            // #568: a struct whose fields are all readable -- leaves or structs; a list or a map under a struct
+            // shares the struct's levels across leaves repeated and not, which the reader does not decode yet.
             if (st.fields().length == 0) {
                 return false;
             }
             for (org.apache.spark.sql.types.StructField f : st.fields()) {
-                if (!isReadable(f.dataType())) {
+                DataType ft = f.dataType();
+                if (ft instanceof org.apache.spark.sql.types.ArrayType || ft instanceof org.apache.spark.sql.types.MapType || !isReadable(ft)) {
                     return false;
                 }
             }
@@ -101,6 +109,11 @@ public final class NativeParquetSupport {
         // No engine lane (option A of the FLOAT / BINARY / TIMESTAMP_NTZ note, #559): decoded on a lane of the
         // same layout and emitted as Spark's Arrow vector, so operators carry the column as a foreign column.
         return decodeLane(dt) != null;
+    }
+
+    /** A readable type that is not nested: a list's element, a map's key or value. */
+    private static boolean isReadableLeaf(DataType dt) {
+        return !(dt instanceof org.apache.spark.sql.types.ArrayType || dt instanceof org.apache.spark.sql.types.MapType || dt instanceof org.apache.spark.sql.types.StructType) && isReadable(dt);
     }
 
     /**

@@ -196,7 +196,7 @@ leaves out.
 | Family | Reason |
 |---|---|
 | Probabilistic sketches (`approx_count_distinct` / HyperLogLog++, `approx_percentile`, `count_min_sketch`, `hll_*` functions) | Sketch state is a Spark-defined binary buffer with its own merge semantics; the buffers are the compatibility surface, not the arithmetic, and Spark's implementation is already tight |
-| Nested results -- building a struct, array or map (`named_struct`, `struct`, `array`, `map`, `map_from_arrays`, ...), and the `array_funcs`, `map_funcs` and lambda (`transform`, `filter`, `aggregate`, `exists`, ...) families | No nested lane: the engine reads *into* nested columns (struct fields, #50) and passes whole nested columns through (#19), but never assembles one (#50) |
+| Building a struct, array or map from scalar values (`named_struct`, `struct`, `array`, `map`, `map_from_arrays`, ...) | The engine reads into nested columns (struct fields, element access, #50), runs the array, map and lambda families over them, and assembles the nested results those produce (`transform`, `filter`, `zip_with`, `transform_values`, `slice`, ... -- including a lambda whose result is itself an array, a map or a struct, #705), but has no constructor from scalars |
 | Geospatial functions | Outside the project's data model; no lane type and no plan to add one |
 | Avro / Protobuf codecs (`from_avro`, `to_avro`, `from_protobuf`, `to_protobuf`) | Schema-driven record (de)serialisation, row by row by construction |
 | JVM reflection (`java_method`, `reflect`) | Calls arbitrary JVM code per row; nothing to vectorise |
