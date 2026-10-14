@@ -59,7 +59,14 @@ public final class NativeParquetSupport {
     /** Whether the native reader can decode a column of this type. */
     public static boolean isReadable(DataType dt) {
         if (dt instanceof org.apache.spark.sql.types.ArrayType at) {
-            // #568: a list of a leaf, or of a struct of leaves (repeated once); a list of lists keeps Spark's scan.
+            // #568: a list of a leaf, of a struct of leaves, or of lists (any depth) ending in a leaf.
+            if (at.elementType() instanceof org.apache.spark.sql.types.ArrayType inner) {
+                DataType e = inner;
+                while (e instanceof org.apache.spark.sql.types.ArrayType a) {
+                    e = a.elementType();
+                }
+                return isReadableLeaf(e);
+            }
             if (at.elementType() instanceof org.apache.spark.sql.types.StructType st) {
                 if (st.fields().length == 0) {
                     return false;
