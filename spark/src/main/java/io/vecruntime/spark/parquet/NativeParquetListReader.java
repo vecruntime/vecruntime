@@ -30,6 +30,8 @@ import org.apache.parquet.schema.Type;
 import org.apache.spark.sql.types.ArrayType;
 import org.apache.spark.sql.types.DataType;
 import org.apache.spark.sql.types.MapType;
+import org.apache.spark.sql.types.StructField;
+import org.apache.spark.sql.types.StructType;
 import org.apache.spark.sql.vectorized.ColumnVector;
 
 /**
@@ -47,9 +49,12 @@ import org.apache.spark.sql.vectorized.ColumnVector;
  * <p>Every list encoding Spark reads as an array of a leaf has one repeated
  * node on the leaf's path -- the three-level {@code LIST}, the legacy
  * two-level form, a bare {@code repeated} leaf -- and the levels are taken
- * from that node and its parent. Lists of lists, lists of structs and lists
- * inside structs repeat more than once or share levels across leaves; they
- * keep Spark's scan.
+ * from that node and its parent. An array of structs of leaves has one leaf
+ * per field under the same struct group, all in one entry stream: the
+ * offsets come from the first field, an element's struct is null below the
+ * struct group's level, and each field decodes its own elements. Lists of
+ * lists and lists inside structs repeat more than once or mix repeated and
+ * unrepeated leaves; they keep Spark's scan.
  */
 public final class NativeParquetListReader implements NativeParquetColumn {
 
@@ -58,6 +63,10 @@ public final class NativeParquetListReader implements NativeParquetColumn {
     private final NativeParquetColumnReader second; // the value, or null
     private final int listDef; // the list is present at this level (0: never null)
     private final int elementDef; // the entry is an element at this level
+    // An array of structs of leaves: one reader per field, in the struct's order (fields[0] is `first`), and the
+    // level at which an element's struct is present (elementDef when the repeated group is the struct itself).
+    private final NativeParquetColumnReader[] fields;
+    private final int structDef;
 
     private NativeParquetListReader(DataType type, NativeParquetColumnReader first, NativeParquetColumnReader second,
             int listDef, int elementDef) {
@@ -66,9 +75,25 @@ public final class NativeParquetListReader implements NativeParquetColumn {
         this.second = second;
         this.listDef = listDef;
         this.elementDef = elementDef;
+        this.fields = null;
+        this.structDef = elementDef;
         first.setDictionaryIds(false);
         if (second != null) {
             second.setDictionaryIds(false);
+        }
+    }
+
+    private NativeParquetListReader(ArrayType type, NativeParquetColumnReader[] fields, int listDef,
+            int elementDef, int structDef) {
+        this.type = type;
+        this.first = fields[0];
+        this.second = null;
+        this.listDef = listDef;
+        this.elementDef = elementDef;
+        this.fields = fields;
+        this.structDef = structDef;
+        for (NativeParquetColumnReader f : fields) {
+            f.setDictionaryIds(false);
         }
     }
 
@@ -86,6 +111,19 @@ public final class NativeParquetListReader implements NativeParquetColumn {
         int listDef = rep.length == 1 ? 0 : clipped.getMaxDefinitionLevel(java.util.Arrays.copyOf(rep, rep.length - 1));
         if (type instanceof ArrayType at) {
             DataType et = at.elementType();
+            if (et instanceof StructType st) {
+                // #568: an array of structs of leaves. Each field's leaf, matched by name in the struct's order.
+                NativeParquetColumnReader[] readers = new NativeParquetColumnReader[st.fields().length];
+                for (int i = 0; i < readers.length; i++) {
+                    StructField f = st.fields()[i];
+                    ColumnDescriptor cd = fieldLeaf(leaves, f.name());
+                    readers[i] = new NativeParquetColumnReader(cd, NativeParquetSupport.decodeLane(f.dataType()), f.dataType(),
+                            name + ".element." + f.name(), batchRows, allocator);
+                }
+                String[] leaf0 = fieldLeaf(leaves, st.fields()[0].name()).getPath();
+                int structDef = clipped.getMaxDefinitionLevel(java.util.Arrays.copyOf(leaf0, leaf0.length - 1));
+                return new NativeParquetListReader(at, readers, listDef, elementDef, structDef);
+            }
             return new NativeParquetListReader(
                     type,
                     new NativeParquetColumnReader(a, NativeParquetSupport.decodeLane(et), et, name + ".element",
@@ -104,6 +142,20 @@ public final class NativeParquetListReader implements NativeParquetColumn {
                         name + ".value", batchRows, allocator),
                 listDef,
                 elementDef);
+    }
+
+    /**
+     * The leaf of struct field {@code field} among an array of structs' leaves
+     * (its last path step).
+     */
+    private static ColumnDescriptor fieldLeaf(List<ColumnDescriptor> leaves, String field) {
+        for (ColumnDescriptor cd : leaves) {
+            String[] p = cd.getPath();
+            if (p[p.length - 1].equalsIgnoreCase(field)) {
+                return cd;
+            }
+        }
+        throw new IllegalStateException("struct field " + field + " missing from the clipped list");
     }
 
     /** The leaf columns under the top-level field {@code top}, in schema order. */
@@ -152,6 +204,33 @@ public final class NativeParquetListReader implements NativeParquetColumn {
                 return false;
             }
         }
+        if (type instanceof ArrayType at && at.elementType() instanceof StructType st) {
+            // An array of structs of leaves: one leaf per field, in order, all under the same struct group.
+            if (leaves.size() != st.fields().length) {
+                return false;
+            }
+            String[] parent = null;
+            for (int i = 0; i < leaves.size(); i++) {
+                String[] p = leaves.get(i).getPath();
+                if (!p[p.length - 1].equalsIgnoreCase(st.fields()[i].name())) {
+                    return false;
+                }
+                String[] up = java.util.Arrays.copyOf(p, p.length - 1);
+                if (parent != null && !java.util.Arrays.equals(parent, up)) {
+                    return false;
+                }
+                parent = up;
+            }
+            String[] rep = repeatedPath(clipped, leaves.get(0)
+                    .getPath());
+            if (parent.length != rep.length && parent.length != rep.length + 1) {
+                return false;
+            }
+            for (int i = 0; i < leaves.size(); i++) {
+                leaf.accept(leaves.get(i), st.fields()[i].dataType());
+            }
+            return true;
+        }
         if (type instanceof ArrayType at) {
             if (leaves.size() != 1) {
                 return false;
@@ -187,6 +266,9 @@ public final class NativeParquetListReader implements NativeParquetColumn {
         final int[] offsets;
         final FieldVector a;
         final FieldVector b;
+        final FieldVector[] fs; // an array of structs: each field's elements
+        final boolean[] elementNulls; // and its null structs (null: none)
+        final int elements;
 
         Batch(int rows, boolean[] nulls, int[] offsets,
               FieldVector a, FieldVector b) {
@@ -195,6 +277,21 @@ public final class NativeParquetListReader implements NativeParquetColumn {
             this.offsets = offsets;
             this.a = a;
             this.b = b;
+            this.fs = null;
+            this.elementNulls = null;
+            this.elements = 0;
+        }
+
+        Batch(int rows, boolean[] nulls, int[] offsets,
+              FieldVector[] fs, boolean[] elementNulls, int elements) {
+            this.rows = rows;
+            this.nulls = nulls;
+            this.offsets = offsets;
+            this.a = null;
+            this.b = null;
+            this.fs = fs;
+            this.elementNulls = elementNulls;
+            this.elements = elements;
         }
     }
 
@@ -203,6 +300,9 @@ public final class NativeParquetListReader implements NativeParquetColumn {
         first.startRowGroup(store, rows);
         if (second != null) {
             second.startRowGroup(store, rows);
+        }
+        for (NativeParquetColumnReader f : others()) {
+            f.startRowGroup(store, rows);
         }
     }
 
@@ -216,6 +316,7 @@ public final class NativeParquetListReader implements NativeParquetColumn {
         boolean[] nulls = null;
         int row = -1;
         int count = 0;
+        boolean[] elementNulls = null;
         for (int k = 0; k < entries; k++) {
             int def = d[off + k];
             if (r[off + k] == 0) {
@@ -229,6 +330,12 @@ public final class NativeParquetListReader implements NativeParquetColumn {
                 }
             }
             if (def >= elementDef) {
+                if (fields != null && def < structDef) {
+                    if (elementNulls == null) {
+                        elementNulls = new boolean[entries];
+                    }
+                    elementNulls[count] = true;
+                }
                 count++;
             }
         }
@@ -236,6 +343,21 @@ public final class NativeParquetListReader implements NativeParquetColumn {
             throw new IllegalStateException("a list column ended at row " + (row + 1) + " of " + n);
         }
         offsets[n] = count;
+        if (fields != null) {
+            FieldVector[] fs = new FieldVector[fields.length];
+            try {
+                fs[0] = first.readElements(n, entries, elementDef);
+                for (int i = 1; i < fields.length; i++) {
+                    fs[i] = fields[i].readElements(n, fields[i].entriesForRows(n), elementDef);
+                }
+            } catch (RuntimeException | Error e) {
+                for (int i = 0; i < fs.length; i++) {
+                    fields[i].release(fs[i]);
+                }
+                throw e;
+            }
+            return new Batch(n, nulls, offsets, fs, elementNulls, count);
+        }
         FieldVector a = first.readElements(n, entries, elementDef);
         FieldVector b = null;
         if (second != null) {
@@ -265,12 +387,23 @@ public final class NativeParquetListReader implements NativeParquetColumn {
         if (second != null) {
             second.skipRows(n);
         }
+        for (NativeParquetColumnReader f : others()) {
+            f.skipRows(n);
+        }
     }
 
     @Override
     public ColumnVector wrap(Object batch) {
         Batch b = (Batch) batch;
         if (type instanceof ArrayType at) {
+            if (fields != null) {
+                StructType st = (StructType) at.elementType();
+                ColumnVector[] kids = new ColumnVector[fields.length];
+                for (int i = 0; i < fields.length; i++) {
+                    kids[i] = fields[i].wrap(b.fs[i]);
+                }
+                return VectorNestedColumnVector.list(at, b.rows, b.nulls, b.offsets, VectorNestedColumnVector.struct(st, b.elements, b.elementNulls, kids));
+            }
             return VectorNestedColumnVector.list(at, b.rows, b.nulls, b.offsets, first.wrap(b.a));
         }
         return VectorNestedColumnVector.map((MapType) type, b.rows, b.nulls, b.offsets,
@@ -281,6 +414,12 @@ public final class NativeParquetListReader implements NativeParquetColumn {
     public void release(Object batch) {
         if (batch != null) {
             Batch b = (Batch) batch;
+            if (fields != null) {
+                for (int i = 0; i < fields.length; i++) {
+                    fields[i].release(b.fs[i]);
+                }
+                return;
+            }
             first.release(b.a);
             if (second != null) {
                 second.release(b.b);
@@ -293,6 +432,9 @@ public final class NativeParquetListReader implements NativeParquetColumn {
         first.setPoolLimit(limit);
         if (second != null) {
             second.setPoolLimit(limit);
+        }
+        for (NativeParquetColumnReader f : others()) {
+            f.setPoolLimit(limit);
         }
     }
 
@@ -319,5 +461,13 @@ public final class NativeParquetListReader implements NativeParquetColumn {
         if (second != null) {
             second.close();
         }
+        for (NativeParquetColumnReader f : others()) {
+            f.close();
+        }
+    }
+
+    /** An array of structs' readers after the first; none otherwise. */
+    private NativeParquetColumnReader[] others() {
+        return fields == null ? new NativeParquetColumnReader[0] : java.util.Arrays.copyOfRange(fields, 1, fields.length);
     }
 }
