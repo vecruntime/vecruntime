@@ -858,9 +858,10 @@ private[vecruntime] final class VectorParquetPartitionReader(
     org.apache.spark.rdd.InputFileBlockHolder.set(file.urlEncodedPath, file.start, file.length)
     if (metadataCount > 0) {
       val row = new org.apache.spark.sql.catalyst.expressions.GenericInternalRow(metadataCount)
-      org.apache.spark.sql.execution.datasources.FileFormat.updateMetadataInternalRow(
+      org.apache.spark.sql.vecruntime.shims.SparkShims.fileConstantMetadata(
         row,
         metadataFields.map(_._1).toSeq,
+        metadataFields.map(_._2).toSeq,
         file,
         metadataExtractors
       )

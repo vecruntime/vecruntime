@@ -42,4 +42,16 @@ object SparkShims {
    * with `spark.sql.optimizer.mergeSubplans.filterPropagation.enabled` (on by default).
    */
   val sparkMergesFilteredSubqueries: Boolean = true
+
+  /**
+   * Fills `row` with one file's constant `_metadata` values (#568), as FileScanRDD fills them. 4.2 converts each value to the field's declared type.
+   */
+  def fileConstantMetadata(
+      row: org.apache.spark.sql.catalyst.InternalRow,
+      names: Seq[String],
+      types: Seq[org.apache.spark.sql.types.DataType],
+      file: org.apache.spark.sql.execution.datasources.PartitionedFile,
+      extractors: Map[String, org.apache.spark.sql.execution.datasources.PartitionedFile => Any]
+  ): Unit =
+    org.apache.spark.sql.execution.datasources.FileFormat.updateMetadataInternalRow(row, names, file, extractors, types)
 }
