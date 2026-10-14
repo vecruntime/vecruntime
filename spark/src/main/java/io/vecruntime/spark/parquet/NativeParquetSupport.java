@@ -84,14 +84,13 @@ public final class NativeParquetSupport {
             return isReadableLeaf(mt.keyType()) && isReadableLeaf(mt.valueType());
         }
         if (dt instanceof org.apache.spark.sql.types.StructType st) {
-            // #568: a struct whose fields are all readable -- leaves or structs; a list or a map under a struct
-            // shares the struct's levels across leaves repeated and not, which the reader does not decode yet.
+            // #568: a struct whose fields are all readable -- leaves, structs, and lists or maps the list reader
+            // follows (it reads them at their path under the struct).
             if (st.fields().length == 0) {
                 return false;
             }
             for (org.apache.spark.sql.types.StructField f : st.fields()) {
-                DataType ft = f.dataType();
-                if (ft instanceof org.apache.spark.sql.types.ArrayType || ft instanceof org.apache.spark.sql.types.MapType || !isReadable(ft)) {
+                if (!isReadable(f.dataType())) {
                     return false;
                 }
             }

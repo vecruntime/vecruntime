@@ -16,7 +16,6 @@
 package io.vecruntime.spark.parquet;
 
 import java.lang.foreign.MemorySegment;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.function.BiConsumer;
 
@@ -49,13 +48,14 @@ import org.apache.spark.sql.vectorized.ColumnVector;
  * its elements back to back ({@link NativeParquetColumnReader#readElements} at
  * {@code elemDef[k]}).
  */
-public final class NativeParquetNestedListReader implements NativeParquetColumn {
+public final class NativeParquetNestedListReader implements NativeParquetColumn, RowLevels {
 
     private final ArrayType type;
     private final NativeParquetColumnReader leaf;
     private final int depth;
     private final int[] listDef; // 1-based: listDef[j], elemDef[j] for j in 1..depth
     private final int[] elemDef;
+    private int[] rowLevels = new int[0]; // each row's first-entry level, last batch
 
     private NativeParquetNestedListReader(ArrayType type, NativeParquetColumnReader leaf, int[] listDef,
             int[] elemDef) {
@@ -91,9 +91,9 @@ public final class NativeParquetNestedListReader implements NativeParquetColumn 
      * The reader of the top-level list of lists {@code top}; {@link
      * #forEachLeaf} must have accepted it.
      */
-    public static NativeParquetNestedListReader create(MessageType clipped, String top, ArrayType type,
+    public static NativeParquetNestedListReader create(MessageType clipped, String[] path, ArrayType type,
             String name, int batchRows, BufferAllocator allocator) {
-        ColumnDescriptor cd = leavesUnder(clipped, top).get(0);
+        ColumnDescriptor cd = NativeParquetListReader.leavesUnder(clipped, path).get(0);
         int k = arrayDepth(type);
         int[] listDef = new int[k + 1];
         int[] elemDef = new int[k + 1];
@@ -126,16 +126,6 @@ public final class NativeParquetNestedListReader implements NativeParquetColumn 
         }
     }
 
-    private static List<ColumnDescriptor> leavesUnder(MessageType clipped, String top) {
-        List<ColumnDescriptor> out = new ArrayList<>();
-        for (ColumnDescriptor cd : clipped.getColumns()) {
-            if (cd.getPath()[0].equals(top)) {
-                out.add(cd);
-            }
-        }
-        return out;
-    }
-
     /**
      * Checks the clipped shape of the top-level list of lists {@code top}: one
      * leaf, repeated exactly as deep as {@code type} nests arrays, and no
@@ -144,12 +134,13 @@ public final class NativeParquetNestedListReader implements NativeParquetColumn 
      * leaf} with the leaf's descriptor and Spark type. False when the reader
      * cannot follow it.
      */
-    public static boolean forEachLeaf(MessageType clipped, String top, ArrayType type,
+    public static boolean forEachLeaf(MessageType clipped, String[] path, ArrayType type,
             BiConsumer<ColumnDescriptor, DataType> leaf) {
-        if (!clipped.containsField(top) || clipped.getType(top).isPrimitive()) {
+        Type node = NativeParquetListReader.nodeAt(clipped, path);
+        if (node == null || node.isPrimitive()) {
             return false;
         }
-        List<ColumnDescriptor> leaves = leavesUnder(clipped, top);
+        List<ColumnDescriptor> leaves = NativeParquetListReader.leavesUnder(clipped, path);
         int k = arrayDepth(type);
         if (leaves.size() != 1 || leaves.get(0).getMaxRepetitionLevel() != k) {
             return false;
@@ -194,6 +185,9 @@ public final class NativeParquetNestedListReader implements NativeParquetColumn 
         int[][] offsets = new int[depth + 1][];
         // Each depth's list count is bounded by the entries (and depth 1 by the rows).
         offsets[1] = new int[n + 1];
+        if (rowLevels.length < n) {
+            rowLevels = new int[n];
+        }
         for (int j = 2; j <= depth; j++) {
             offsets[j] = new int[entries + 1];
         }
@@ -204,6 +198,9 @@ public final class NativeParquetNestedListReader implements NativeParquetColumn 
                 boolean exists = j == 1 || def >= elemDef[j - 1];
                 if (rep <= j - 1 && exists) {
                     int at = lists[j];
+                    if (j == 1) {
+                        rowLevels[at] = def;
+                    }
                     offsets[j][at] = elems[j];
                     if (def < listDef[j]) {
                         if (nulls[j] == null) {
@@ -280,6 +277,15 @@ public final class NativeParquetNestedListReader implements NativeParquetColumn 
     public int rowsRemaining() {
         return leaf.rowsRemaining();
     }
+
+    @Override
+    public int[] rowLevels() {
+        return rowLevels;
+    }
+
+    /** Always kept: one store per row while the offsets are built. */
+    @Override
+    public void recordRowLevels() {}
 
     @Override
     public void close() {
