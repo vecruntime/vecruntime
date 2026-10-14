@@ -568,7 +568,10 @@ public final class NativeParquetTreeReader implements NativeParquetColumn, RowLe
         }
     }
 
-    /** The file's calendar rebase and INT96 conversion, for every leaf (#568 item 6). */
+    /**
+     * The file's calendar rebase and INT96 conversion, for every leaf (#568
+     * item 6).
+     */
     @Override
     public void setRebase(ParquetRebase rebase) {
         for (Leaf l : leaves) {
