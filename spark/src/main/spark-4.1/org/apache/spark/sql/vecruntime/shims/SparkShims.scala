@@ -39,4 +39,16 @@ object SparkShims {
    * MergeScalarSubqueries does not, so MergeFilteredAggregates does it.
    */
   val sparkMergesFilteredSubqueries: Boolean = false
+
+  /**
+   * Fills `row` with one file's constant `_metadata` values (#568), as FileScanRDD fills them. 4.1 converts each value by its extractor's Java type.
+   */
+  def fileConstantMetadata(
+      row: org.apache.spark.sql.catalyst.InternalRow,
+      names: Seq[String],
+      types: Seq[org.apache.spark.sql.types.DataType],
+      file: org.apache.spark.sql.execution.datasources.PartitionedFile,
+      extractors: Map[String, org.apache.spark.sql.execution.datasources.PartitionedFile => Any]
+  ): Unit =
+    org.apache.spark.sql.execution.datasources.FileFormat.updateMetadataInternalRow(row, names, file, extractors)
 }

@@ -206,6 +206,11 @@ case class VectorParquetScanExec(
     val decodeAhead = io.vecruntime.spark.VectorConf.scanNativeParquetDecodeAhead(sqlConf)
     val decodeAheadVirtual = io.vecruntime.spark.VectorConf.scanNativeParquetDecodeAheadVirtual(sqlConf)
     val dictionaryStrings = io.vecruntime.spark.VectorConf.scanNativeParquetDictionaryStrings(sqlConf)
+    // #568 item 9: the file-constant `_metadata` fields the scan outputs after its partition columns (file_path,
+    // file_name, file_size, file_block_start, file_block_length, file_modification_time), with the format's
+    // extractors, as FileScanRDD fills them per file.
+    val metadataFields = scan.fileConstantMetadataColumns.map(a => (a.name, a.dataType)).toArray
+    val metadataExtractors = relation.fileFormat.fileConstantMetadataExtractors
 
     val m = ScanMetrics(
       longMetric("numFiles"),
@@ -254,7 +259,9 @@ case class VectorParquetScanExec(
       dictionaryStrings,
       m,
       compiledFilter,
-      filterColumns
+      filterColumns,
+      metadataFields,
+      metadataExtractors
     )
     // Counted by the task of partition 0, once per execution (a driver-side count is reset when a plan
     // whose stages are already materialised runs again).
@@ -306,7 +313,9 @@ private[vecruntime] final class VectorParquetRDD(
     dictionaryStrings: Boolean,
     metrics: ScanMetrics,
     decodeFilter: io.vecruntime.spark.expr.VectorExpr,
-    filterColumns: Array[Boolean]
+    filterColumns: Array[Boolean],
+    metadataFields: Array[(String, org.apache.spark.sql.types.DataType)],
+    metadataExtractors: Map[String, PartitionedFile => Any]
 ) extends RDD[ColumnarBatch](sc, Nil) {
 
   // The wrapped scan's file partitions (DPP / bucketing / splitting applied). Read lazily inside
@@ -351,7 +360,9 @@ private[vecruntime] final class VectorParquetRDD(
       poolLimit = math.max(4, decodeAhead + 2),
       dictionaryStrings = dictionaryStrings,
       decodeFilter = decodeFilter,
-      filterColumns = filterColumns
+      filterColumns = filterColumns,
+      metadataFields = metadataFields,
+      metadataExtractors = metadataExtractors
     )
     if (decodeAhead > 0) new DecodeAheadIterator(reader, decodeAhead, decodeAheadVirtual, context) else reader
   }
@@ -390,7 +401,10 @@ private[vecruntime] final class VectorParquetPartitionReader(
     dictionaryStrings: Boolean = false, // #612: dictionary-encoded strings as dictionary vectors
     // #611: a predicate over the output, compiled, decoded first; and which data columns it reads
     decodeFilter: io.vecruntime.spark.expr.VectorExpr = null,
-    filterColumns: Array[Boolean] = null
+    filterColumns: Array[Boolean] = null,
+    // #568 item 9: the file-constant metadata columns after the partition columns, and their extractors
+    metadataFields: Array[(String, org.apache.spark.sql.types.DataType)] = Array.empty,
+    metadataExtractors: Map[String, PartitionedFile => Any] = Map.empty
 ) extends Iterator[ColumnarBatch]
     with AutoCloseable {
 
@@ -403,6 +417,17 @@ private[vecruntime] final class VectorParquetPartitionReader(
   private var columnReaders: Array[NativeParquetColumn] = _
   private var rowGroupIndex = 0
   private var partitionValues: InternalRow = _ // this file's partition values (for constant columns)
+  private val metadataCount = metadataFields.length
+  // `_metadata.row_index` (#568 item 9): the temporary row-index column of the requested schema, or -1.
+  private val rowIndexOrdinal =
+    org.apache.spark.sql.execution.datasources.parquet.ParquetRowIndexUtil.findRowIndexColumnIndexInSchema(
+      requiredSchema
+    )
+  // Constant columns after the data columns: the partition values, then the file-constant metadata (#568 item 9).
+  private val constantCount = partitionSchema.length + metadataCount
+  private val metadataValues = new Array[Any](metadataCount) // this file's metadata values
+  // A fallback file's metadata columns, appended to Spark's batches (on-heap constants; closed with the file).
+  private var fallbackMetadata: Array[ColumnVector] = _
 
   // Current row group state.
   private var rgRows = 0
@@ -483,14 +508,14 @@ private[vecruntime] final class VectorParquetPartitionReader(
       val b = fallback.next()
       metrics.numOutputBatches += 1
       metrics.numOutputRows += b.numRows()
-      return new VectorParquetPartitionReader.OwnedBatch(b, null, null, null, recycled = true)
+      return new VectorParquetPartitionReader.OwnedBatch(withFallbackMetadata(b), null, null, null, recycled = true)
     }
     val n = math.min(batchSize, rgRows - rgOffset)
     val columns = new Array[ColumnVector](attrs.length)
     val dataVectors = new Array[AnyRef](dataColumnCount)
     // With a decode filter, a column skipped whole is a null vector the batch owns, closed with the constants.
     val partitionVectors =
-      new Array[ColumnVector](partitionSchema.length + (if (decodeFilter == null) 0 else dataColumnCount))
+      new Array[ColumnVector](constantCount + (if (decodeFilter == null) 0 else dataColumnCount))
     var selected: SelectedColumnarBatch = null
     val late = decodeFilter != null && !lateOff
     try {
@@ -520,6 +545,16 @@ private[vecruntime] final class VectorParquetPartitionReader(
         columns(dataColumnCount + p) = col
         partitionVectors(p) = col
         p += 1
+      }
+      var k = 0
+      while (k < metadataCount) {
+        val (name, dt) = metadataFields(k)
+        val v = metadataValues(k)
+        val col =
+          if (v == null) ArrowOutput.nulls(name, dt, n, allocator) else ArrowOutput.constant(name, dt, v, n, allocator)
+        columns(dataColumnCount + partitionSchema.length + k) = col
+        partitionVectors(partitionSchema.length + k) = col
+        k += 1
       }
       if (late) selected = applyDecodeFilter(n, columns, dataVectors, partitionVectors)
     } catch {
@@ -571,7 +606,7 @@ private[vecruntime] final class VectorParquetPartitionReader(
             r.skipRows(n)
             val (name, dt) = attrs(c)
             val v = ArrowOutput.nulls(name, dt, n, allocator)
-            owned(partitionSchema.length + c) = v
+            owned(constantCount + c) = v
             columns(c) = v
           } else {
             // At the survivors only when they are few and the column is a string: a dense or scattered selection
@@ -752,6 +787,15 @@ private[vecruntime] final class VectorParquetPartitionReader(
         context,
         p.fallbackModes
       )
+      buildPartitionColumns(p.file)
+      if (metadataCount > 0) {
+        val row = new org.apache.spark.sql.catalyst.expressions.GenericInternalRow(metadataValues.map(identity))
+        fallbackMetadata = Array.tabulate[ColumnVector](metadataCount) { k =>
+          val v = new org.apache.spark.sql.execution.vectorized.ConstantColumnVector(batchSize, metadataFields(k)._2)
+          org.apache.spark.sql.execution.vectorized.ColumnVectorUtils.populate(v, row, k)
+          v
+        }
+      }
       metrics.numFiles += 1
       return
     }
@@ -766,6 +810,8 @@ private[vecruntime] final class VectorParquetPartitionReader(
     while (i < dataColumnCount) {
       val field = requiredSchema.fields(i)
       columnReaders(i) = field.dataType match {
+        case _ if i == rowIndexOrdinal =>
+          new io.vecruntime.spark.parquet.NativeParquetRowIndexColumn(field.name, allocator)
         case st: StructType =>
           val name = topLevelName(p.clipped, field.name)
           NativeParquetStructReader.create(p.clipped, Array(name), st, field.name, batchSize, allocator)
@@ -798,6 +844,23 @@ private[vecruntime] final class VectorParquetPartitionReader(
     metrics.numFiles += 1
   }
 
+  /**
+   * Spark's batch for a fallback file, with this file's metadata columns after its partition columns (Spark's
+   * reader emits data and partition columns only; FileScanRDD appends the metadata the same way).
+   */
+  private def withFallbackMetadata(b: ColumnarBatch): ColumnarBatch =
+    if (metadataCount == 0) b
+    else {
+      val cols = new Array[ColumnVector](b.numCols() + metadataCount)
+      var i = 0
+      while (i < b.numCols()) {
+        cols(i) = b.column(i)
+        i += 1
+      }
+      System.arraycopy(fallbackMetadata, 0, cols, b.numCols(), metadataCount)
+      new ColumnarBatch(cols, b.numRows())
+    }
+
   /** The clipped schema's own name for the top-level column `name` (the file's spelling of it). */
   private def topLevelName(clipped: MessageType, name: String): String =
     clipped.getFields.asScala.find(_.getName.equalsIgnoreCase(name)).map(_.getName).getOrElse(name)
@@ -805,6 +868,23 @@ private[vecruntime] final class VectorParquetPartitionReader(
   /** Record this file's partition values; per-batch constant columns are built from them in next(). */
   private def buildPartitionColumns(file: PartitionedFile): Unit = {
     partitionValues = file.partitionValues
+    // input_file_name() and its siblings read the task thread's holder, as FileScanRDD sets it per file.
+    org.apache.spark.rdd.InputFileBlockHolder.set(file.urlEncodedPath, file.start, file.length)
+    if (metadataCount > 0) {
+      val row = new org.apache.spark.sql.catalyst.expressions.GenericInternalRow(metadataCount)
+      org.apache.spark.sql.vecruntime.shims.SparkShims.fileConstantMetadata(
+        row,
+        metadataFields.map(_._1).toSeq,
+        metadataFields.map(_._2).toSeq,
+        file,
+        metadataExtractors
+      )
+      var k = 0
+      while (k < metadataCount) {
+        metadataValues(k) = row.get(k, metadataFields(k)._2)
+        k += 1
+      }
+    }
   }
 
   private def startRowGroup(store: org.apache.parquet.column.page.PageReadStore, rowCount: Int): Unit = {
@@ -926,6 +1006,7 @@ private[vecruntime] final class VectorParquetPartitionReader(
     while (f < requiredSchema.length) {
       val field = requiredSchema.fields(f)
       field.dataType match {
+        case _ if f == rowIndexOrdinal => // generated from the row group's offset, not stored
         case st: StructType =>
           // #568: every leaf of the struct, in the clipped group's order, stored as its lane needs.
           var ok = true
@@ -960,7 +1041,15 @@ private[vecruntime] final class VectorParquetPartitionReader(
     // the requested schema with no column chunk behind it. Spark's reader fills it with nulls; ours has nothing
     // to decode, so the file falls over.
     val fileSchema = footer.getFileMetaData.getSchema
-    if (clipped.getColumns.asScala.exists(cd => !fileSchema.containsPath(cd.getPath))) return true
+    // The row-index column is generated (NativeParquetRowIndexColumn), never stored.
+    val rowIndexName = if (rowIndexOrdinal >= 0) requiredSchema.fields(rowIndexOrdinal).name else null
+    if (
+      clipped.getColumns.asScala.exists(cd =>
+        !fileSchema.containsPath(
+          cd.getPath
+        ) && !(cd.getPath.length == 1 && cd.getPath()(0).equalsIgnoreCase(rowIndexName))
+      )
+    ) return true
     val blocks = footer.getBlocks
     var b = 0
     while (b < blocks.size()) {
@@ -1075,6 +1164,10 @@ private[vecruntime] final class VectorParquetPartitionReader(
   }
 
   private def closeFile(): Unit = {
+    if (fallbackMetadata != null) {
+      fallbackMetadata.foreach(_.close())
+      fallbackMetadata = null
+    }
     if (fallback != null) {
       fallback match {
         case c: AutoCloseable => c.close()
@@ -1102,6 +1195,7 @@ private[vecruntime] final class VectorParquetPartitionReader(
     releaseEmitted()
     closeFile()
     drainAhead()
+    org.apache.spark.rdd.InputFileBlockHolder.unset()
     updateBytesRead()
     allocator.close()
   }
