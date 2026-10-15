@@ -819,8 +819,10 @@ case class VectorExecRule(session: SparkSession) extends Rule[SparkPlan] with Lo
     // shuffle is row based (Comet's shuffle is columnar already), so only the types matter.
     val isFinal = VectorAggregatePlanner.readsExchange(a)
     // Any lane will do as input (a wide decimal key, input or buffer is a DECIMAL128 lane, #259): the
-    // planner below refuses a column a function or a key cannot read, with the function's own reason.
-    val inputReason = if (isFinal) laneTypeReason(a.child) else laneInputReason(a.child)
+    // planner below refuses a column a function or a key cannot read, with the function's own reason. An
+    // updating aggregate directly over an exchange (CountBelowJoin's collapse, #692) is accepted like a merging
+    // one: Spark inserts RowToColumnarExec below us when that shuffle is row based.
+    val inputReason = if (isFinal) laneTypeReason(a.child) else laneExchangeInputReason(a.child)
     inputReason match {
       case Some(reason) => fallback(original, reason)
       case None =>
