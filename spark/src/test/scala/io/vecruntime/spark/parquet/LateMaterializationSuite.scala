@@ -98,6 +98,32 @@ class LateMaterializationSuite extends VectorQuerySuite {
     }
   }
 
+  test("a struct of strings is decoded at the decode filter's survivors (#568), with Spark's rows") {
+    val path = newTempPath("lm/st")
+    withPlugin(enabled = false) {
+      spark.sql(
+        """SELECT id, CAST(id % 1000 AS INT) AS k,
+          |  CASE WHEN id % 9 = 0 THEN NULL ELSE named_struct(
+          |    'a', CASE WHEN id % 13 = 0 THEN NULL ELSE CONCAT('s', CAST(id % 37 AS STRING)) END,
+          |    'b', CONCAT('long-value-', CAST(id AS STRING), REPEAT('x', CAST(id % 40 AS INT))),
+          |    'c', CAST(id AS INT),
+          |    'n', named_struct('x', CONCAT('x', CAST(id % 11 AS STRING)), 'y', id * 2)) END AS st
+          |FROM range(0, 50000)""".stripMargin
+      ).repartition(2).write.mode("overwrite").parquet(path)
+      spark.read.parquet(path).createOrReplaceTempView("lm_st")
+    }
+    withConf(VectorConf.ScanNativeParquetLateMaterialization -> "true") {
+      for (f <- Seq("id % 4999 = 0", "k BETWEEN 100 AND 180", "id % 3 <> 0", "id < 0", "id >= 0")) {
+        val df = checkVectorized(s"SELECT id, st FROM lm_st WHERE $f", Seq(classOf[VectorParquetScanExec]))
+        assert(scanOf(df).exists(_.decodeFilter.isDefined), s"no decode filter for $f")
+        checkVectorized(s"SELECT k, max(st.a), min(st.b), sum(st.c), max(st.n.x) FROM lm_st WHERE $f GROUP BY k", Nil)
+      }
+      // A sparse selection decodes the struct's string fields at the survivors only: rows are skipped.
+      val df = checkVectorized("SELECT id, st FROM lm_st WHERE id % 4999 = 0", Seq(classOf[VectorParquetScanExec]))
+      assert(scanOf(df).map(_.metrics("numLateSkippedRows").value).sum > 0)
+    }
+  }
+
   test("rows dropped before decoding are counted, and nothing leaks") {
     val root = VectorAllocators.root()
     val before = root.getAllocatedMemory

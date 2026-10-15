@@ -260,17 +260,25 @@ public final class NativeParquetStructReader implements NativeParquetColumn, Row
 
     @Override
     public Object readBatch(int n) {
+        return read(n, null);
+    }
+
+    /**
+     * {@code n} rows of every field; {@code selection} null: all of them, else
+     * the set rows (others unread).
+     */
+    private Object read(int n, MemorySegment selection) {
         Object[] kids = new Object[fields.length];
         try {
             for (int i = 0; i < fields.length; i++) {
-                kids[i] = fields[i].readBatch(n);
+                kids[i] = selection == null ? fields[i].readBatch(n) : fields[i].readBatchSelected(n, selection);
             }
         } catch (RuntimeException | Error e) {
             releaseFields(kids);
             throw e;
         }
         // Read after every field: the level source may be under a nested field, and its levels stay valid until
-        // its next batch.
+        // its next batch. Under a selection the unselected rows' levels are stale: those rows are excluded.
         boolean[] nulls = null;
         if (levelSource != null) {
             int[] levels = levelSource.rowLevels();
@@ -287,14 +295,27 @@ public final class NativeParquetStructReader implements NativeParquetColumn, Row
         return new Batch(n, nulls, kids);
     }
 
-    /** Decoded whole: the batch's selection excludes the other rows. */
+    /**
+     * #568: each field decodes only the rows set in {@code selection} (a flat
+     * string leaf skips the others in its pages; a nested field decodes whole);
+     * the batch's selection excludes the other rows.
+     */
     @Override
     public Object readBatchSelected(int n, MemorySegment selection) {
-        return readBatch(n);
+        return read(n, selection);
     }
 
+    /**
+     * Whether some field decodes its selected rows faster than the whole batch
+     * (a string leaf).
+     */
     @Override
     public boolean decodesSelectedFaster() {
+        for (NativeParquetColumn f : fields) {
+            if (f.decodesSelectedFaster()) {
+                return true;
+            }
+        }
         return false;
     }
 
