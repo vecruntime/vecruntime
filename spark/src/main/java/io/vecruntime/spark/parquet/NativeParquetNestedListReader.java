@@ -275,7 +275,7 @@ public final class NativeParquetNestedListReader implements NativeParquetColumn,
 
     @Override
     public void setDictionaryIds(boolean enabled) {
-        leaf.setDictionaryIds(false);
+        leaf.setDictionaryIds(enabled); // #568: innermost strings as dictionary ids (#612)
     }
 
     @Override

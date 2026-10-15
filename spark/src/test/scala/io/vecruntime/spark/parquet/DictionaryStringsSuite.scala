@@ -163,6 +163,67 @@ class DictionaryStringsSuite extends VectorQuerySuite {
     checkVectorized("SELECT st.a, collect_list(st.in.b)[0] FROM dict_st WHERE i < 500 GROUP BY st.a", Seq(node))
   }
 
+  test(
+    "the strings of lists and maps come out as dictionary vectors (#568), with Spark's rows through every consumer"
+  ) {
+    val path = newTempPath("dict/lists")
+    withPlugin(enabled = false) {
+      spark.sql(
+        """SELECT CAST(id AS INT) AS i,
+          |  CASE WHEN id % 13 = 0 THEN NULL ELSE array(
+          |    CONCAT('e', CAST(id % 7 AS STRING)),
+          |    CASE WHEN id % 5 = 0 THEN NULL ELSE CONCAT('f', CAST(id % 3 AS STRING)) END) END AS l,
+          |  CASE WHEN id % 17 = 0 THEN NULL ELSE map(
+          |    CONCAT('k', CAST(id % 4 AS STRING)),
+          |    CASE WHEN id % 6 = 0 THEN NULL ELSE CONCAT('v', CAST(id % 9 AS STRING)) END) END AS m,
+          |  array(array(CONCAT('x', CAST(id % 2 AS STRING))), array()) AS ll,
+          |  array(named_struct('a', CONCAT('s', CAST(id % 8 AS STRING)), 'n', CAST(id AS INT))) AS ls
+          |FROM range(0, 50000)""".stripMargin
+      ).repartition(2).write.mode("overwrite").parquet(path)
+      spark.read.parquet(path).createOrReplaceTempView("dict_lists")
+    }
+    // The innermost string vectors, as the scan emits them.
+    val kinds = withPlugin(enabled = true) {
+      val df = spark.sql("SELECT i, l, m, ll, ls FROM dict_lists")
+      df.collect()
+      val scan = PlanUtils.allNodes(finalPlan(df)).collectFirst { case s: VectorParquetScanExec => s }
+        .getOrElse(fail("no native scan"))
+      val cols = Seq("l", "m", "ll", "ls").map(n => scan.output.indexWhere(_.name == n))
+      scan.executeColumnar().mapPartitions { it =>
+        var dict = 0L
+        var all = 0L
+        it.foreach { b =>
+          val Seq(l, m, ll, ls) = cols.map(b.column)
+          Seq(l.getChild(0), m.getChild(0), m.getChild(1), ll.getChild(0).getChild(0), ls.getChild(0).getChild(0))
+            .foreach { f =>
+              all += 1
+              if (
+                io.vecruntime.spark.arrow.VectorNestedColumnVector.unwrapLeaf(
+                  f
+                ).isInstanceOf[VectorDictionaryColumnVector]
+              ) dict += 1
+            }
+        }
+        Iterator((dict, all))
+      }.collect().foldLeft((0L, 0L)) { case ((d, a), (x, y)) => (d + x, a + y) }
+    }
+    assert(
+      kinds._1 > 0 && kinds._1 == kinds._2,
+      s"${kinds._1} of ${kinds._2} list and map string vectors were dictionary vectors"
+    )
+    checkVectorized("SELECT i, l, m, ll, ls FROM dict_lists", Seq(node))
+    checkVectorized("SELECT l[0], l[1], m['k1'], ll[0][0], ls[0].a FROM dict_lists", Seq(node))
+    checkVectorized("SELECT e, count(*) FROM dict_lists LATERAL VIEW explode(l) t AS e GROUP BY e", Seq(node))
+    checkVectorized("SELECT k, v, count(*) FROM dict_lists LATERAL VIEW explode(m) t AS k, v GROUP BY k, v", Seq(node))
+    checkVectorized(
+      "SELECT array_contains(l, 'e3'), size(l), concat_ws('|', l), map_keys(m), flatten(ll), " +
+        "transform(l, x -> upper(x)), exists(ls, s -> s.a = 's2') FROM dict_lists WHERE i % 89 = 1",
+      Seq(node)
+    )
+    checkVectorized("SELECT l, count(*) FROM dict_lists GROUP BY l", Seq(node))
+    checkVectorized("SELECT i, l, m FROM dict_lists WHERE i % 97 = 1 ORDER BY i", Seq(node))
+  }
+
   test("with the switch off the column is flat, with the same rows") {
     withConf(VectorConf.ScanNativeParquetDictionaryStrings -> "false") {
       val (dict, all) = scanColumnKinds("SELECT i, s, t FROM dict_low")

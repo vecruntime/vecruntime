@@ -639,7 +639,7 @@ public final class NativeParquetTreeReader implements NativeParquetColumn, RowLe
     @Override
     public void setDictionaryIds(boolean enabled) {
         for (Leaf l : leaves) {
-            l.reader.setDictionaryIds(false);
+            l.reader.setDictionaryIds(enabled); // #568: every string leaf as dictionary ids (#612)
         }
     }
 

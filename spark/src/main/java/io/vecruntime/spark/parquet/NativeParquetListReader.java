@@ -618,14 +618,18 @@ public final class NativeParquetListReader implements NativeParquetColumn, RowLe
     }
 
     /**
-     * Off: a list's strings are read by value through its elements, not as
-     * dictionary ids.
+     * #568: a list's or map's strings are dictionary ids too (#612), where the
+     * leaf allows it: keys, values, elements and the fields of a list of
+     * structs. Spark's getters and the adapters both read a dictionary vector.
      */
     @Override
     public void setDictionaryIds(boolean enabled) {
-        first.setDictionaryIds(false);
+        first.setDictionaryIds(enabled);
         if (second != null) {
-            second.setDictionaryIds(false);
+            second.setDictionaryIds(enabled);
+        }
+        for (NativeParquetColumnReader f : others()) {
+            f.setDictionaryIds(enabled);
         }
     }
 
