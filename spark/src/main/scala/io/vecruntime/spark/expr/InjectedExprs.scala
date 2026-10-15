@@ -15,7 +15,7 @@
  */
 package io.vecruntime.spark.expr
 
-import io.vecruntime.kernels.{ArrowLayout, Bitmap, SegmentVectorBuffers, VecType, VectorBuffers}
+import io.vecruntime.kernels.{ArrowLayout, Bitmap, SegmentVectorBuffers, SparkBloomKernels, VecType, VectorBuffers}
 import io.vecruntime.spark.adapter.TypeMapping
 import org.apache.spark.sql.catalyst.expressions.{EmptyRow, Expression, XXH64}
 import org.apache.spark.sql.execution.ExecSubqueryExpression
@@ -159,7 +159,15 @@ final case class BloomProbeExpr(filter: SubqueryLiteralExpr, hash: VectorExpr, p
   override def dataType: DataType = BooleanType
   override def children: Seq[VectorExpr] = Seq(hash)
 
-  @transient private lazy val bloom: BloomFilter = if (partitioned) null
+  /** Spark's version-2 filter, probed a batch at a time (#692); null for a partitioned or other filter. */
+  @transient private lazy val spark: SparkBloomKernels.Filter = if (partitioned) null
+  else filter.value match {
+    case null => null
+    case bytes: Array[Byte] => BloomFilterCache.getSpark(bytes)
+  }
+
+  /** Any other plain filter, probed through Spark's own class. */
+  @transient private lazy val bloom: BloomFilter = if (partitioned || spark != null) null
   else filter.value match {
     case null => null
     case bytes: Array[Byte] => BloomFilterCache.get(bytes)
@@ -174,9 +182,10 @@ final case class BloomProbeExpr(filter: SubqueryLiteralExpr, hash: VectorExpr, p
 
   override def eval(ctx: EvalContext): VectorBuffers = {
     val n = ctx.numRows
+    val sf = spark
     val b = bloom
     val ps = parts
-    if (b == null && ps == null) return SubqueryLiteralExpr.nulls(BooleanType, ctx)
+    if (sf == null && b == null && ps == null) return SubqueryLiteralExpr.nulls(BooleanType, ctx)
     val h = hash.eval(ctx)
     val bits = ArrowLayout.allocateBitmap(ctx.arena, n)
     // Only rows still undecided are probed: under AND, `ctx.active` excludes rows an earlier conjunct already
@@ -185,6 +194,10 @@ final case class BloomProbeExpr(filter: SubqueryLiteralExpr, hash: VectorExpr, p
     val active = ctx.active
     if (ps != null) {
       BloomProbeExpr.probePartitioned(ps, h, active, n, bits)
+      return SegmentVectorBuffers.fixedWidth(VecType.BOOL, n, h.validity(), bits)
+    }
+    if (sf != null) {
+      BloomProbeExpr.probeSpark(sf, h, active, n, bits)
       return SegmentVectorBuffers.fixedWidth(VecType.BOOL, n, h.validity(), bits)
     }
     var i = 0
@@ -206,16 +219,57 @@ object BloomProbeExpr {
     var xs: Array[Long] = new Array[Long](0)
     var rows: Array[Int] = new Array[Int](0)
     var out: Array[Long] = new Array[Long](0)
+    var alive: Array[Int] = new Array[Int](0)
+    var h2s: Array[Int] = new Array[Int](0)
     def ensure(n: Int): Scratch = {
       if (hashes.length < n) {
         hashes = new Array[Long](n); xs = new Array[Long](n); rows = new Array[Int](n)
-        out = new Array[Long]((n + 63) >>> 6)
+        out = new Array[Long]((n + 63) >>> 6); alive = new Array[Int](n); h2s = new Array[Int](n)
       }
       this
     }
   }
 
   private val scratch = ThreadLocal.withInitial[Scratch](() => new Scratch)
+
+  /**
+   * Spark's version-2 filter probed as one batch (#692): the probed rows' hashes copied out, then
+   * `SparkBloomKernels.probe` -- each hash function in turn over the keys still alive, so the bit reads of many
+   * keys are in flight together -- and the result bits written back, as `probePartitioned` does.
+   */
+  private[expr] def probeSpark(
+      f: SparkBloomKernels.Filter,
+      h: VectorBuffers,
+      active: java.lang.foreign.MemorySegment,
+      n: Int,
+      bits: java.lang.foreign.MemorySegment
+  ): Unit = {
+    val s = scratch.get().ensure(n)
+    val valid = h.validity()
+    if (active == null && valid == null) {
+      java.lang.foreign.MemorySegment.copy(h.data(), VectorBuffers.LE_LONG, 0L, s.hashes, 0, n)
+      SparkBloomKernels.probe(f, s.hashes, n, s.out, s.xs, s.alive, s.h2s)
+      var w = 0
+      while (w < Bitmap.wordsFor(n)) { Bitmap.setWord(bits, w, n, s.out(w)); w += 1 }
+    } else {
+      var m = 0
+      var i = 0
+      while (i < n) {
+        if ((active == null || Bitmap.isSet(active, i)) && (valid == null || Bitmap.isSet(valid, i))) {
+          s.rows(m) = i
+          s.hashes(m) = h.data().getAtIndex(VectorBuffers.LE_LONG, i)
+          m += 1
+        }
+        i += 1
+      }
+      SparkBloomKernels.probe(f, s.hashes, m, s.out, s.xs, s.alive, s.h2s)
+      var k = 0
+      while (k < m) {
+        if ((s.out(k >>> 6) & (1L << (k & 63))) != 0) Bitmap.set(bits, s.rows(k))
+        k += 1
+      }
+    }
+  }
 
   /**
    * The partitioned filter's probe as one batch (#664): the probed rows' hashes copied out, then

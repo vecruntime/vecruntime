@@ -73,6 +73,14 @@ object BloomFilterCache {
   def getPartitioned(bytes: Array[Byte]): Array[Array[Int]] =
     cached(1, bytes, org.apache.spark.sql.vecruntime.PartitionedBloomFilter.unpack).asInstanceOf[Array[Array[Int]]]
 
+  /**
+   * Spark's version-2 filter as SparkBloomKernels probes it a batch at a time (#692), parsed at most once
+   * per JVM in the same budget; null for any other version, which stays with Spark's own class (`get`).
+   */
+  def getSpark(bytes: Array[Byte]): io.vecruntime.kernels.SparkBloomKernels.Filter =
+    cached(2, bytes, b => io.vecruntime.kernels.SparkBloomKernels.parse(b))
+      .asInstanceOf[io.vecruntime.kernels.SparkBloomKernels.Filter]
+
   private def cached(kind: Int, bytes: Array[Byte], parse: Array[Byte] => AnyRef): AnyRef = {
     if (bytes.length > budget) return parse(bytes)
     val key = Key(kind, bytes.length, XXH64.hashUnsafeBytes(bytes, Platform.BYTE_ARRAY_OFFSET, bytes.length, 42L))
