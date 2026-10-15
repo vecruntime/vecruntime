@@ -32,6 +32,53 @@ public final class GroupedAccumulators {
     }
 
     /**
+     * Groups beyond which an accumulator keeps one copy of its state instead of
+     * {@link #INTERLEAVE} (#689). The copies hide the store-to-load chain of
+     * consecutive rows that share a group, which only happens with few groups;
+     * with many, each copy is one more cache line per update and the growth
+     * reallocates every copy. q78's partial aggregates at 3 TB (millions of
+     * groups per task, four copies on Graviton): one copy is -7 % on q78 and
+     * q24a, and the growth was 35 % of q78's allocated bytes. {@code
+     * -Dvecruntime.agg.collapseGroups=N} sets it (measured on Graviton 4).
+     */
+    static final int COLLAPSE_GROUPS = Integer.getInteger("vecruntime.agg.collapseGroups", 1 << 12);
+
+    /** The copies an accumulator keeps at {@code capacity} groups. */
+    private static int copiesFor(int copies, int capacity) {
+        return capacity > COLLAPSE_GROUPS ? 1 : copies;
+    }
+
+    /**
+     * {@code old} ({@code copies} copies of {@code oldCap} groups) as one copy of
+     * {@code newCap} groups: each group's copies added up.
+     */
+    private static long[] collapse(long[] old, int oldCap, int newCap,
+            int copies, boolean exact) {
+        long[] out = new long[newCap];
+        System.arraycopy(old, 0, out, 0, oldCap);
+        for (int k = 1; k < copies; k++) {
+            int base = k * oldCap;
+            for (int g = 0; g < oldCap; g++) {
+                out[g] = exact ? Math.addExact(out[g], old[base + g]) : out[g] + old[base + g];
+            }
+        }
+        return out;
+    }
+
+    private static double[] collapse(double[] old, int oldCap, int newCap,
+            int copies) {
+        double[] out = new double[newCap];
+        System.arraycopy(old, 0, out, 0, oldCap);
+        for (int k = 1; k < copies; k++) {
+            int base = k * oldCap;
+            for (int g = 0; g < oldCap; g++) {
+                out[g] += old[base + g];
+            }
+        }
+        return out;
+    }
+
+    /**
      * Number of independent accumulator sets the scatter loops rotate through.
      * A single {@code sum[g] += x} chain serialises on store-to-load forwarding
      * whenever consecutive rows share a group (about 1.5 ns per row); rotating
@@ -113,8 +160,11 @@ public final class GroupedAccumulators {
      * #sum(int)} adds the copies.
      */
     public static final class DoubleSum {
-        /** Copies of the accumulators; 1 when strict. */
-        private final int interleave;
+        /**
+         * Copies of the accumulators; 1 when strict, and once past {@link
+         * #COLLAPSE_GROUPS} groups.
+         */
+        private int interleave;
 
         /**
          * Spark's rounding: one accumulator per group, sequential reductions on
@@ -220,8 +270,15 @@ public final class GroupedAccumulators {
         private void ensure(int groups) {
             if (groups > capacity) {
                 int cap = grow(capacity, groups);
-                sum = regroup(sum, capacity, cap, interleave);
-                count = regroup(count, capacity, cap, interleave);
+                int copies = copiesFor(interleave, cap);
+                if (copies == interleave) {
+                    sum = regroup(sum, capacity, cap, interleave);
+                    count = regroup(count, capacity, cap, interleave);
+                } else {
+                    sum = collapse(sum, capacity, cap, interleave);
+                    count = collapse(count, capacity, cap, interleave, false);
+                    interleave = copies;
+                }
                 capacity = cap;
             }
         }
@@ -253,10 +310,6 @@ public final class GroupedAccumulators {
         return out;
     }
 
-    private static long[] regroup(long[] old, int oldCap, int newCap) {
-        return regroup(old, oldCap, newCap, INTERLEAVE);
-    }
-
     private static long[] regroup(long[] old, int oldCap, int newCap,
             int copies) {
         long[] out = new long[newCap * copies];
@@ -276,6 +329,7 @@ public final class GroupedAccumulators {
      */
     public static final class LongSum {
         private int capacity = 64;
+        private int copies = INTERLEAVE; // 1 once past COLLAPSE_GROUPS groups
         private long[] sum = new long[64 * INTERLEAVE];
         private long[] count = new long[64 * INTERLEAVE];
         private final Scratch scratch = new Scratch();
@@ -324,7 +378,7 @@ public final class GroupedAccumulators {
             }
             if (validity == null) {
                 int i = 0;
-                if (INTERLEAVE == 4) {
+                if (copies == 4) {
                     int c1 = cap, c2 = 2 * cap, c3 = 3 * cap;
                     for (; i + 4 <= n; i += 4) {
                         int g0 = ids[i], g1 = ids[i + 1] + c1, g2 = ids[i + 2] + c2, g3 = ids[i + 3] + c3;
@@ -337,7 +391,7 @@ public final class GroupedAccumulators {
                         count[g2]++;
                         count[g3]++;
                     }
-                } else if (INTERLEAVE == 2) {
+                } else if (copies == 2) {
                     for (; i + 2 <= n; i += 2) {
                         int g0 = ids[i], g1 = ids[i + 1] + cap;
                         sum[g0] += x[i];
@@ -353,7 +407,7 @@ public final class GroupedAccumulators {
                 }
             } else {
                 int slot = 0;
-                int total = cap * INTERLEAVE;
+                int total = cap * copies;
                 for (int w = 0, words = Bitmap.wordsFor(n);
                      w < words;
                      w++) {
@@ -376,8 +430,15 @@ public final class GroupedAccumulators {
         private void ensure(int groups) {
             if (groups > capacity) {
                 int cap = grow(capacity, groups);
-                sum = regroup(sum, capacity, cap);
-                count = regroup(count, capacity, cap);
+                int c = copiesFor(copies, cap);
+                if (c == copies) {
+                    sum = regroup(sum, capacity, cap, copies);
+                    count = regroup(count, capacity, cap, copies);
+                } else {
+                    sum = collapse(sum, capacity, cap, copies, checked);
+                    count = collapse(count, capacity, cap, copies, false);
+                    copies = c;
+                }
                 capacity = cap;
             }
         }
@@ -395,7 +456,7 @@ public final class GroupedAccumulators {
                 long[] count,
                 int cap) {
             int slot = 0;
-            int total = cap * INTERLEAVE;
+            int total = cap * copies;
             if (validity == null) {
                 for (int i = 0; i < n; i++) {
                     int g = ids[i] + slot;
@@ -428,7 +489,7 @@ public final class GroupedAccumulators {
 
         public long sum(int g) {
             long s = 0;
-            for (int k = 0; k < INTERLEAVE; k++) {
+            for (int k = 0; k < copies; k++) {
                 s = checked ? Math.addExact(s, sum[k * capacity + g]) : s + sum[k * capacity + g];
             }
             return s;
@@ -436,7 +497,7 @@ public final class GroupedAccumulators {
 
         public long count(int g) {
             long c = 0;
-            for (int k = 0; k < INTERLEAVE; k++) {
+            for (int k = 0; k < copies; k++) {
                 c += count[k * capacity + g];
             }
             return c;
@@ -678,6 +739,7 @@ public final class GroupedAccumulators {
     /** COUNT(*) or COUNT(expr). */
     public static final class Count {
         private int capacity = 64;
+        private int copies = INTERLEAVE; // 1 once past COLLAPSE_GROUPS groups
         private long[] count = new long[64 * INTERLEAVE];
 
         /** Counts every row of each group. */
@@ -695,7 +757,7 @@ public final class GroupedAccumulators {
             int cap = capacity;
             if (a.selection() != null) {
                 int slot = 0;
-                int total = cap * INTERLEAVE;
+                int total = cap * copies;
                 MemorySegment selection = a.selection();
                 for (int w = 0, words = Bitmap.wordsFor(n);
                      w < words;
@@ -713,7 +775,7 @@ public final class GroupedAccumulators {
                 return;
             }
             int i = 0;
-            if (INTERLEAVE == 4) {
+            if (copies == 4) {
                 int c1 = cap, c2 = 2 * cap, c3 = 3 * cap;
                 for (; i + 4 <= n; i += 4) {
                     count[ids[i]]++;
@@ -721,7 +783,7 @@ public final class GroupedAccumulators {
                     count[ids[i + 2] + c2]++;
                     count[ids[i + 3] + c3]++;
                 }
-            } else if (INTERLEAVE == 2) {
+            } else if (copies == 2) {
                 for (; i + 2 <= n; i += 2) {
                     count[ids[i]]++;
                     count[ids[i + 1] + cap]++;
@@ -753,7 +815,7 @@ public final class GroupedAccumulators {
             long[] count = this.count;
             int cap = capacity;
             int slot = 0;
-            int total = cap * INTERLEAVE;
+            int total = cap * copies;
             for (int w = 0, words = Bitmap.wordsFor(n);
                  w < words;
                  w++) {
@@ -772,14 +834,16 @@ public final class GroupedAccumulators {
         private void ensure(int groups) {
             if (groups > capacity) {
                 int cap = grow(capacity, groups);
-                count = regroup(count, capacity, cap);
+                int c = copiesFor(copies, cap);
+                count = c == copies ? regroup(count, capacity, cap, copies) : collapse(count, capacity, cap, copies, false);
+                copies = c;
                 capacity = cap;
             }
         }
 
         public long count(int g) {
             long c = 0;
-            for (int k = 0; k < INTERLEAVE; k++) {
+            for (int k = 0; k < copies; k++) {
                 c += count[k * capacity + g];
             }
             return c;
