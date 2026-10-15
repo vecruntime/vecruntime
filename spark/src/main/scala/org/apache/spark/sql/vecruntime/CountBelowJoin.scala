@@ -48,7 +48,7 @@ import org.apache.spark.sql.catalyst.plans.logical.{
 }
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.catalyst.trees.TreeNodeTag
-import org.apache.spark.sql.types.{DecimalType, DoubleType, LongType}
+import org.apache.spark.sql.types.{DoubleType, LongType}
 
 /**
  * Collapses a join input that only supplies grouping columns into its distinct rows and their count (#692), so a
@@ -114,9 +114,15 @@ case class CountBelowJoin(session: SparkSession) extends Rule[LogicalPlan] with 
         case _ => false
       })
 
-  /** A sum whose input can be multiplied by a count in its own result type (no interval sums, no ANSI try sums). */
+  /**
+   * A sum whose weighted form costs no more than the sum itself: a long or a double. A decimal sum of up to 8
+   * digits already reaches here as a long sum of the unscaled values (Spark's `DecimalAggregates`), so q24's
+   * `sum(ss_net_paid)` qualifies; a wider decimal times a count is a 38-digit product, which is slower and which
+   * our aggregate does not carry -- at 3 TB q23a's weighted `sum(decimal(17,2) x count)` fell back to Spark's
+   * aggregate and the query took 27 % longer. Such an aggregate is left alone.
+   */
   private def weightable(s: Sum): Boolean = s.dataType match {
-    case LongType | DoubleType | _: DecimalType => true
+    case LongType | DoubleType => true
     case _ => false
   }
 
@@ -139,13 +145,9 @@ case class CountBelowJoin(session: SparkSession) extends Rule[LogicalPlan] with 
   /** The aggregate over rows that each stand for `weight` rows of the original input. */
   private def weighted(ae: AggregateExpression, weight: Expression): Expression = ae.aggregateFunction match {
     case s: Sum =>
-      s.dataType match {
-        case d: DecimalType =>
-          // decimal(p, s) x decimal(20, 0) is wider than the sum's own type; summed there and cast back, exactly
-          // as the repeated rows would have summed (an overflow is null, or an error under ANSI, either way).
-          Cast(s.copy(child = Multiply(s.child, Cast(weight, DecimalType(20, 0)))).toAggregateExpression(), d)
-        case t => s.copy(child = Multiply(Cast(s.child, t), Cast(weight, t))).toAggregateExpression()
-      }
+      // A long or a double (see `weightable`): x * count in the sum's own type.
+      val t = s.dataType
+      s.copy(child = Multiply(Cast(s.child, t), Cast(weight, t))).toAggregateExpression()
     case c: Count =>
       // count(*) is count(1); count(x, y) counts the rows where none is null.
       val nullable = c.children.filter(_.nullable)

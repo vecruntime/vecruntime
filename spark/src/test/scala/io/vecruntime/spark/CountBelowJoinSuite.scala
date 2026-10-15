@@ -34,6 +34,9 @@ class CountBelowJoinSuite extends VectorQuerySuite {
       val amount = if (i % 53 == 0) None else Some(BigDecimal(i % 997) / 100)
       (s"name-${i % 37}", s"COUNTRY-${i % 2}", s"zip-${i % 20}", amount, (i % 11).toLong, (i % 7).toDouble)
     }.toDF("c_name", "c_country", "s_zip", "net_paid", "qty", "price")
+      // decimal(7, 2) as ss_net_paid: Spark sums it as a long of unscaled values, which the rule can weigh.
+      .withColumn("net_paid", org.apache.spark.sql.functions.col("net_paid").cast("decimal(7,2)"))
+      .withColumn("wide_paid", org.apache.spark.sql.functions.col("net_paid").cast("decimal(17,2)"))
       .write.mode("overwrite").parquet(newTempPath("cbj/sales"))
     (0 until 16000).map { i =>
       // A few null zips: dropped by the join, as each of their rows would be.
@@ -134,6 +137,8 @@ class CountBelowJoinSuite extends VectorQuerySuite {
       input.queryExecution.optimizedPlan.treeString
     )
     none("SELECT a_state, avg(qty) FROM cbj_sales JOIN cbj_address ON s_zip = a_zip GROUP BY a_state", shuffled)
+    // A decimal too wide to sum as a long: weighing it would need a 38-digit product (q23a at 3 TB, #692).
+    none("SELECT a_state, sum(wide_paid) FROM cbj_sales JOIN cbj_address ON s_zip = a_zip GROUP BY a_state", shuffled)
     none(
       "SELECT a_state, count(DISTINCT qty) FROM cbj_sales JOIN cbj_address ON s_zip = a_zip GROUP BY a_state",
       shuffled

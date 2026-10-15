@@ -526,7 +526,8 @@ Shape (logical, in the late optimizer batch):
 Aggregate(G, aggs, path)   path: deterministic Project / Filter / inner equi-Join
 ```
 
-where every aggregate function is a non-distinct, unfiltered `sum` (of a long, double or decimal), `count`, `min`
+where every aggregate function is a non-distinct, unfiltered `sum` (of a long or a double -- a decimal of up to 8
+digits counts, since Spark sums it as a long of its unscaled values), `count`, `min`
 or `max`, and an input `S` of a join on the path is a subtree with no join or aggregate, holds no aggregate
 input, and is too large to broadcast. `S` becomes
 
@@ -541,9 +542,8 @@ becomes a column of the projection, which the join then compares), and the top a
 
 The result is unchanged: an inner join pairs a row of the other side with each matching row of `S`, and rows of
 `S` equal on `K` give pairs equal in every column the plan above reads, so it sees each such pair `c` times
-either way. A null key forms one group, which the join drops as it drops each of its rows. Decimal and integer
-sums are exact (an overflow is null, or an error under ANSI, as before); a floating-point sum can differ in the
-last digits.
+either way. A null key forms one group, which the join drops as it drops each of its rows. Integer sums are exact
+(an overflow wraps, or is an error under ANSI, as before); a floating-point sum can differ in the last digits.
 
 No exchange is added. The join needs `S` partitioned by its join keys, which are columns of `K`, so the
 repartition is the exchange the join would have had and every group is whole within one task. The aggregate is a
@@ -561,8 +561,9 @@ are bounded by the product of the distinct counts of the columns `K` is computed
   `spark.sql.autoBroadcastJoinThreshold`) plans `S`'s aggregate as usual, by its own keys, and broadcasts it to
   the join, so the other, larger input is joined where it is read, with no exchange.
 
-Declined: `avg` and every other function, a `DISTINCT` or filtered aggregate, non-deterministic expressions on
-the path, outer and semi joins. Off with `spark.vecruntime.optimizer.countBelowJoin.enabled=false`.
+Declined: `avg` and every other function, a sum of a wider decimal (weighing it needs a 38-digit product: at 3 TB
+q23a's `sum(decimal(17,2))` weighted that way left the aggregate to Spark and took 27 % longer), a `DISTINCT` or
+filtered aggregate, non-deterministic expressions on the path, outer and semi joins. Off with `spark.vecruntime.optimizer.countBelowJoin.enabled=false`.
 
 
 ## `RemoveRedundantGroupKeys`: grouping keys a unique broadcast key determines (#635)
