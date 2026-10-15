@@ -22,6 +22,7 @@ import io.vecruntime.kernels.ArithOp;
 import io.vecruntime.kernels.Bitmap;
 import io.vecruntime.kernels.CompareOp;
 import io.vecruntime.kernels.DateKernels;
+import io.vecruntime.kernels.NestedVectorBuffers;
 import io.vecruntime.kernels.StringMatchKernels;
 import io.vecruntime.kernels.VecType;
 import io.vecruntime.kernels.VectorBuffers;
@@ -481,14 +482,64 @@ public final class ScalarReference {
         if (src == null || src.isNull(i)) {
             return null;
         }
-        return switch (src.type()) {
-            case INT32 -> src.getInt(i);
-            case INT64 -> src.getLong(i);
-            case FLOAT64 -> src.getDouble(i);
-            case BOOL -> src.getBoolean(i);
-            case UTF8 -> src.getString(i);
-            case DECIMAL128 -> src.getDecimal128(i);
-            case LIST, MAP, STRUCT -> throw new UnsupportedOperationException("nested lane in the scalar reference (#705)");
+        return valueAt(src, i);
+    }
+
+    /**
+     * Row {@code i} of any lane as a plain Java value, the reference's view of a
+     * value (#705): {@code Integer}, {@code Long}, {@code Double}, {@code
+     * Boolean}, {@code String}, the DECIMAL128 value, and for the nested lanes a
+     * {@code List} of elements (LIST), a {@code List} of two-element {@code
+     * List}s, keys before values in entry order (MAP -- a map's entries are
+     * ordered and its keys need not be hashable, so no {@code java.util.Map}),
+     * and a {@code List} of field values (STRUCT); a null row, element, key or
+     * field is {@code null}, recursively. Two lanes that hold the same values
+     * give equal results whatever their layout -- offsets starting anywhere, a
+     * dictionary or not -- which is what a kernel test compares.
+     */
+    public static Object valueAt(VectorBuffers v, int i) {
+        if (v.isNull(i)) {
+            return null;
+        }
+        return switch (v.type()) {
+            case INT32 -> v.getInt(i);
+            case INT64 -> v.getLong(i);
+            case FLOAT64 -> v.getDouble(i);
+            case BOOL -> v.getBoolean(i);
+            case UTF8 -> v.getString(i);
+            case DECIMAL128 -> v.getDecimal128(i);
+            case LIST -> {
+                NestedVectorBuffers n = (NestedVectorBuffers) v;
+                VectorBuffers elements = n.children().get(0);
+                java.util.List<Object> out = new java.util.ArrayList<>(n.size(i));
+                for (int j = n.start(i);
+                     j < n.end(i);
+                     j++) {
+                    out.add(valueAt(elements, j));
+                }
+                yield out;
+            }
+            case MAP -> {
+                NestedVectorBuffers n = (NestedVectorBuffers) v;
+                VectorBuffers keys = n.children().get(0);
+                VectorBuffers values = n.children().get(1);
+                java.util.List<Object> out = new java.util.ArrayList<>(n.size(i));
+                for (int j = n.start(i);
+                     j < n.end(i);
+                     j++) {
+                    out.add(java.util.Arrays.asList(valueAt(keys, j), valueAt(values, j)));
+                }
+                yield out;
+            }
+            case STRUCT -> {
+                NestedVectorBuffers n = (NestedVectorBuffers) v;
+                java.util.List<Object> out = new java.util.ArrayList<>(n.children()
+                        .size());
+                for (VectorBuffers f : n.children()) {
+                    out.add(valueAt(f, i));
+                }
+                yield out;
+            }
         };
     }
 

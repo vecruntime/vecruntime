@@ -123,4 +123,43 @@ class NestedVectorBuffersTest {
             assertEquals((128 + 5) % 3, ((NestedVectorBuffers) ss.children().get(0)).size(5));
         }
     }
+
+    /**
+     * The scalar reference reads nested lanes (#705): a list of structs and a map
+     * whose values are lists come back as plain Java values, nulls at every level,
+     * and a slice of the same rows reads as the same values, so a kernel's nested
+     * output can be compared with the reference whatever its offsets.
+     */
+    @Test
+    void scalarReferenceReadsNestedValues() {
+        try (Arena arena = Arena.ofConfined()) {
+            // list<struct<a: int, b: string>>: [{1, "x"}, null, {null, "y"}], null, []
+            VectorBuffers a = ArrowLayout.ofInts(arena, new int[] {1, 0, 0},
+                    new boolean[] {false, false, true});
+            VectorBuffers b = ArrowLayout.ofStrings(arena, new String[] {"x", null, "y"});
+            NestedVectorBuffers structs = NestedVectorBuffers.struct(3, ArrowLayout.validityFrom(arena, new boolean[] {false, true, false}, 3),
+                    List.of(a, b));
+            NestedVectorBuffers lists = NestedVectorBuffers.list(3, ArrowLayout.validityFrom(arena, new boolean[] {false, true, false}, 3),
+                    offsets(arena, 0, 3, 3, 3), structs);
+            assertEquals(java.util.Arrays.asList(java.util.Arrays.asList(1, "x"), null, java.util.Arrays.asList(null, "y")),
+                    io.vecruntime.kernels.reference.ScalarReference.valueAt(lists, 0));
+            assertEquals(null, io.vecruntime.kernels.reference.ScalarReference.valueAt(lists, 1));
+            assertEquals(List.of(), io.vecruntime.kernels.reference.ScalarReference.valueAt(lists, 2));
+
+            // map<string, list<long>>: {"k1" -> [7, null], "k2" -> null}, {"k3" -> []}
+            VectorBuffers keys = ArrowLayout.ofStrings(arena, new String[] {"k1", "k2", "k3"});
+            VectorBuffers longs = ArrowLayout.ofLongs(arena, new long[] {7, 0},
+                    new boolean[] {false, true});
+            NestedVectorBuffers valueLists = NestedVectorBuffers.list(3, ArrowLayout.validityFrom(arena, new boolean[] {false, true, false}, 3),
+                    offsets(arena, 0, 2, 2, 2), longs);
+            NestedVectorBuffers map = NestedVectorBuffers.map(2, null, offsets(arena, 0, 2, 3), keys, valueLists);
+            assertEquals(java.util.Arrays.asList(java.util.Arrays.asList("k1", java.util.Arrays.asList(7L, null)), java.util.Arrays.asList("k2", null)),
+                    io.vecruntime.kernels.reference.ScalarReference.valueAt(map, 0));
+            assertEquals(List.of(java.util.Arrays.asList("k3", List.of())), io.vecruntime.kernels.reference.ScalarReference.valueAt(map, 1));
+
+            // The same entries reached through offsets that do not start at 0 read as the same value.
+            NestedVectorBuffers shifted = NestedVectorBuffers.map(1, null, offsets(arena, 2, 3), keys, valueLists);
+            assertEquals(io.vecruntime.kernels.reference.ScalarReference.valueAt(map, 1), io.vecruntime.kernels.reference.ScalarReference.valueAt(shifted, 0));
+        }
+    }
 }
