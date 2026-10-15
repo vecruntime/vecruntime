@@ -721,7 +721,8 @@ private[vecruntime] class VectorGroupedAggregateIterator(
 
   private def keyColumn(name: String, dt: DataType, k: Int, from: Int, to: Int): ColumnVector = {
     val count = to - from
-    if (table.`type`(k) == VecType.UTF8) {
+    if (io.vecruntime.spark.expr.NestedKeyBytesExpr.supports(dt)) nestedKeyColumn(name, dt, k, from, to)
+    else if (table.`type`(k) == VecType.UTF8) {
       val dict = sharedDictionary(name, k)
       if (dict != null) {
         // The keys as ids over the table's dictionary (#377): 4 bytes a row, and the consumers --
@@ -741,6 +742,33 @@ private[vecruntime] class VectorGroupedAggregateIterator(
       table.writeKeys(k, from, to, out.validity(), out.data(), null)
       ArrowOutput.finish(out, count, false)
     }
+  }
+
+  /**
+   * Nested key `k` (#705) of groups [from, to): the stored canonical bytes read out plain, decoded back to
+   * the nested lane they encode and handed to Spark as that nested column.
+   */
+  private def nestedKeyColumn(name: String, dt: DataType, k: Int, from: Int, to: Int): ColumnVector = {
+    val count = to - from
+    val out = ArrowOutput.allocateUtf8(name, count, table.utf8Bytes(k, from, to), allocator)
+    table.writeKeys(k, from, to, out.validity(), out.data(), out.offsets())
+    val bytesColumn = ArrowOutput.finish(out, count, false)
+    val encoded = new Array[Array[Byte]](count)
+    try {
+      var i = 0
+      while (i < count) {
+        encoded(i) = if (bytesColumn.isNullAt(i)) null else bytesColumn.getUTF8String(i).getBytes; i += 1
+      }
+    } finally bytesColumn.close()
+    val arena = java.lang.foreign.Arena.ofConfined()
+    try {
+      val lane = io.vecruntime.kernels.NestedKeyCodec.decode(
+        arena,
+        io.vecruntime.spark.expr.NestedKeyBytesExpr.shape(dt),
+        encoded
+      )
+      io.vecruntime.spark.arrow.VectorNestedColumnVector.of(name, dt, lane, allocator)
+    } finally arena.close()
   }
 
   /**
@@ -833,7 +861,10 @@ object VectorAggregatePlanner {
    * merging stage, like Spark's own, groups the already normalised values.
    */
   def compileKey(e: NamedExpression, input: Seq[Attribute]): Either[String, VectorExpr] =
-    ExpressionCompiler.compileLaneColumn(e, input).flatMap {
+    if (io.vecruntime.spark.expr.NestedKeyBytesExpr.supports(e.dataType))
+      // An array or struct key (#705) groups by its canonical bytes on the UTF8 lane; the output decodes them.
+      ExpressionCompiler.compileProjection(e, input).map(io.vecruntime.spark.expr.NestedKeyBytesExpr(_, e.dataType))
+    else ExpressionCompiler.compileLaneColumn(e, input).flatMap {
       case _: LiteralExpr => Left("literal grouping key")
       case k if !keyTypes.contains(k.vecType) => Left(s"grouping key type ${e.dataType.simpleString} not supported")
       case k => Right(k)
@@ -920,7 +951,11 @@ object VectorAggregatePlanner {
                   AttributeReference(a.name, sub.dataType, sub.nullable, a.metadata)(a.exprId, a.qualifier)
               }
               val body = forwarded match { case Alias(c, _) => c; case other => other }
-              ExpressionCompiler.compileLaneColumn(body, input).flatMap {
+              // An array or struct result (#705) -- a nested grouping key, or an expression over one -- is a
+              // nested value the result projection hands Spark as it is.
+              if (io.vecruntime.spark.expr.NestedKeyBytesExpr.supports(e.dataType))
+                ExpressionCompiler.compileProjection(body, input)
+              else ExpressionCompiler.compileLaneColumn(body, input).flatMap {
                 case v if !TypeMapping.isSupported(e.dataType) && !TypeMapping.hasLane(e.dataType) =>
                   Left(s"unsupported result type ${e.dataType.simpleString} for ${e.name}")
                 case v => Right(v)
@@ -1126,7 +1161,9 @@ object VectorAggregatePlanner {
         }
         a.resultExpressions.map(_.toAttribute).find(attr =>
           !TypeMapping.isSupported(attr.dataType) && !wideOutputs.contains(attr.exprId) &&
-            !objectOutputs.contains(attr.exprId)
+            !objectOutputs.contains(attr.exprId) &&
+            // An array or struct key decoded from its bytes, or a nested result compiled above (#705).
+            !io.vecruntime.spark.expr.NestedKeyBytesExpr.supports(attr.dataType)
         ) match {
           case Some(attr) => Left(s"unsupported output type ${attr.dataType.simpleString} for ${attr.name}")
           case None =>

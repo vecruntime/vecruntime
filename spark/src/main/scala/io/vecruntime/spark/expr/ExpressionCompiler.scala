@@ -66,6 +66,7 @@ import org.apache.spark.sql.catalyst.expressions.{
   Ceil,
   Chr,
   Coalesce,
+  CreateNamedStruct,
   Concat,
   ConcatWs,
   Contains,
@@ -1109,6 +1110,9 @@ object ExpressionCompiler {
 
   private def compileNested(expr: Expression, input: Seq[Attribute]): Result = expr match {
     case Alias(child, _) => compileNested(child, input)
+    // The optimizer's marker over a nested grouping or join key whose float leaves it normalised (#705): the
+    // normalisation itself is the child (a transform, a struct of normalised fields), compiled as it is.
+    case KnownFloatingPointNormalized(child) => compileNested(child, input)
     // A nested column, or a nested struct field of one, as its value (#705): a lambda returning its element.
     case a: AttributeReference if TypeMapping.nestedTypeOf(a.dataType) != null =>
       nestedColumnPath(a, input).map { case (o, path) => NestedValueExpr(o, path, a.dataType) }
@@ -1133,10 +1137,22 @@ object ExpressionCompiler {
     case e @ MapFilter(child, LambdaFunction(body, vars, _)) => mapLambda(child, vars, body, filter = true, e, input)
     case e @ TransformValues(child, LambdaFunction(body, vars, _)) =>
       mapLambda(child, vars, body, filter = false, e, input)
+    // A struct constructor (#705), alone or under the null guard NormalizeFloatingNumbers puts around a
+    // struct key it rebuilds with normalised fields: the struct is null exactly where the guarded value is.
+    case s: CreateNamedStruct => namedStruct(s, None, input)
+    case If(IsNull(guard), Literal(null, _), s: CreateNamedStruct)
+        if TypeMapping.nestedTypeOf(guard.dataType) != null =>
+      compileNested(guard, input).flatMap(g => namedStruct(s, Some(g), input))
     // Anything else keeps the reason the ordinary compiler gives it (element access with a nested
-    // element, a struct constructor, ...).
+    // element, ...).
     case other => compile(other, input)
   }
+
+  /** `named_struct(...)`'s fields, each a lane or a nested value, as one struct lane (#705). */
+  private def namedStruct(s: CreateNamedStruct, nullWhen: Option[VectorExpr], input: Seq[Attribute]): Result =
+    s.valExprs.foldRight[Either[String, List[VectorExpr]]](Right(Nil)) { (f, acc) =>
+      for (rest <- acc; v <- compileProjection(f, input)) yield v :: rest
+    }.map(fields => NamedStructExpr(fields, nullWhen, s.dataType))
 
   /** `zip_with(a, b, (x, y) -> f)` (#705): two arrays with nested lanes, a lambda with a lane result. */
   private def zipWith(
