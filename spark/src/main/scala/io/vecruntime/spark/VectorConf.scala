@@ -71,6 +71,12 @@ object VectorConf {
   /** Logical rewrite (#657): a star join's fact side aggregated by its join keys before the joins. */
   val AggregateBelowJoinEnabled = "spark.vecruntime.optimizer.aggregateBelowJoin.enabled"
 
+  /** Logical rewrite (#692): a join input that only supplies grouping columns collapsed to distinct rows and a count. */
+  val CountBelowJoinEnabled = "spark.vecruntime.optimizer.countBelowJoin.enabled"
+
+  /** The reduction (rows / groups) statistics must allow for CountBelowJoin to collapse a side (#692; default 2). */
+  val CountBelowJoinMinReduction = "spark.vecruntime.optimizer.countBelowJoin.minReduction"
+
   /** Minimum row reduction (rows / estimated groups) statistics must show for AggregateBelowJoin; 0 = none. */
   val AggregateBelowJoinMinReduction = "spark.vecruntime.optimizer.aggregateBelowJoin.minReduction"
 
@@ -635,6 +641,14 @@ object VectorConf {
   /** Eager aggregation below star joins (#657); also off when the plugin is off. */
   def aggregateBelowJoinEnabled(conf: SQLConf): Boolean =
     isEnabled(conf) && bool(conf, AggregateBelowJoinEnabled, default = true)
+
+  /** Join inputs that only supply grouping columns collapsed to distinct rows and a count (#692); off with the plugin. */
+  def countBelowJoinEnabled(conf: SQLConf): Boolean =
+    isEnabled(conf) && bool(conf, CountBelowJoinEnabled, default = true)
+
+  /** CountBelowJoin leaves a side alone when statistics bound its groups above rows / this (default 2, #692). */
+  def countBelowJoinMinReduction(conf: SQLConf): Double =
+    math.max(1.0, conf.getConfString(CountBelowJoinMinReduction, "2").trim.toDouble)
 
   /**
    * AggregateBelowJoin's required reduction (rows / estimated groups); default 0, no estimate (#675: at 1 TB

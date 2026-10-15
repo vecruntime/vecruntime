@@ -28,6 +28,7 @@ Each rule here follows the same contract:
 | `TransitiveDpp` | `spark.vecruntime.optimizer.transitiveDpp.enabled` | q72 |
 | `FactBloomFilter` | `spark.vecruntime.optimizer.factBloomFilter.enabled` | q16, q50, q93, q94 |
 | `NarrowBelowJoin` | `spark.vecruntime.optimizer.narrowBelowJoin.enabled` | q23a, q23b |
+| `CountBelowJoin` | `spark.vecruntime.optimizer.countBelowJoin.enabled` | q24a, q24b |
 
 The plugin changes no AQE setting. `DppThroughAggregate` and `TransitiveDpp` add dynamic partition pruning
 filters where Spark's DPP does not reach; Spark's own DPP settings are unchanged.
@@ -509,6 +510,59 @@ Statistics can prove a reduction -- the groups' upper bound times that ratio at 
 disprove one, so they never decline the rewrite; a proven pre-aggregate is judged only at its budget, so a task
 whose first rows happen not to repeat a key keeps aggregating. `aggregateBelowJoin.local=false` restores Spark's
 two stages.
+
+## `CountBelowJoin`: a join input that only supplies grouping columns, as distinct rows and a count (#692)
+
+TPC-DS q24a and q24b join `customer_address` on `(upper(ca_country), ca_zip)` alone and read only `ca_state`
+above the join, so each sales row meets every address of its zip, and the aggregate above folds the pairs back.
+At 3 TB one task of that join produced 367 M rows from 0.9 M input rows (40.7 s; the stage's median task took
+0.44 s and its 125 tasks read about the same bytes each). No input-size skew handling can see it: the skew is in
+the join's output, not its input. The pairs differ only in which address they came from, which nothing above
+reads.
+
+Shape (logical, in the late optimizer batch):
+
+```
+Aggregate(G, aggs, path)   path: deterministic Project / Filter / inner equi-Join
+```
+
+where every aggregate function is a non-distinct, unfiltered `sum` (of a long, double or decimal), `count`, `min`
+or `max`, and an input `S` of a join on the path is a subtree with no join or aggregate, holds no aggregate
+input, and is too large to broadcast. `S` becomes
+
+```
+Aggregate(K, K ++ count(*) AS c, RepartitionByExpression(joinKeys, Project(K, S)))
+```
+
+with `K` the columns of `S` the plan above reads and its join keys (a key expression such as `upper(ca_country)`
+becomes a column of the projection, which the join then compares), and the top aggregate weighs each row by `c`:
+`sum(x)` becomes `sum(x * c)` cast to the original type, `count(...)` the sum of `c` over the rows it would count,
+`min` and `max` stay. Several collapsed inputs multiply their counts.
+
+The result is unchanged: an inner join pairs a row of the other side with each matching row of `S`, and rows of
+`S` equal on `K` give pairs equal in every column the plan above reads, so it sees each such pair `c` times
+either way. A null key forms one group, which the join drops as it drops each of its rows. Decimal and integer
+sums are exact (an overflow is null, or an error under ANSI, as before); a floating-point sum can differ in the
+last digits.
+
+No exchange is added. The join needs `S` partitioned by its join keys, which are columns of `K`, so the
+repartition is the exchange the join would have had and every group is whole within one task. The aggregate is a
+local one ([`LocalPreAggregate`](#aggregatebelowjoin-the-fact-aggregated-by-its-join-keys-before-a-star-join)),
+with no exchange of its own, and gives up after its first rows when its keys do not repeat -- a side joined on its
+unique key. An input whose partner would be broadcast is left alone, since it is streamed with no exchange.
+
+With statistics (`ANALYZE ... FOR COLUMNS`, or a DSv2 source's column statistics) the rule is cheaper. The groups
+are bounded by the product of the distinct counts of the columns `K` is computed from, at most the rows:
+
+- a bound above `rows / minReduction` (default 2) leaves `S` alone: no rows are spent finding out at run time;
+- a bound that proves the reduction turns off the judgement on the first rows, which a task whose first rows do
+  not repeat would otherwise fail;
+- a bound small enough to broadcast once collapsed (bound x Spark's row size estimate within
+  `spark.sql.autoBroadcastJoinThreshold`) plans `S`'s aggregate as usual, by its own keys, and broadcasts it to
+  the join, so the other, larger input is joined where it is read, with no exchange.
+
+Declined: `avg` and every other function, a `DISTINCT` or filtered aggregate, non-deterministic expressions on
+the path, outer and semi joins. Off with `spark.vecruntime.optimizer.countBelowJoin.enabled=false`.
 
 
 ## `RemoveRedundantGroupKeys`: grouping keys a unique broadcast key determines (#635)
