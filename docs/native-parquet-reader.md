@@ -287,6 +287,19 @@ The corpus approach follows Hardwood (`hardwood-hq/hardwood`), as does bounding 
 
 ### Performance
 
+- **Nested readers, JMH** (#568, `NestedParquetReadBenchmark`): one Spark-written 1M-row snappy file, one nested column at a time, read whole and folded into a checksum through Spark's `ColumnVector` getters (the way an operator above the scan reads it). Ours is compared with Spark's `VectorizedParquetRecordReader`; both agree on the checksum. x86, `-wi 2 -i 3 -f 1`, ms per read:
+
+  | column | reader | ours | Spark |
+  |---|---|---:|---:|
+  | `array<int>` | list | 79.2 ± 9.1 | 88.1 ± 4.4 |
+  | `array<string>` | list | 114.9 ± 2.4 | 117.9 ± 3.1 |
+  | `struct<int, string>` | struct | 62.1 ± 5.0 | 59.9 ± 4.1 |
+  | `map<string, int>` | list (map) | 113.7 ± 5.4 | 98.5 ± 9.5 |
+  | `array<array<int>>` | nested list | 200.8 ± 16.0 | 230.6 ± 8.8 |
+  | `array<struct<int, array<string>>>` | tree | 250.5 ± 8.6 | 250.6 ± 2.5 |
+
+  At parity or ahead everywhere but the map (15% behind). The folding through the getters is a large share of both columns. Run with `benchmarks/scripts/run-parquet-e2e.sh`'s classpath and JVM options.
+
 - **Column-index page filtering** (#568): **done**. `useColumnIndexFilter` is on (Parquet's `parquet.filter.columnindex.enabled` turns it off) for a file whose requested leaves are all flat, top level or in structs. `readNextFilteredRowGroup` then keeps only the pages overlapping the filter's row ranges, and the store carries the selected row indexes. `NativeParquetColumnReader` turns them into ranges and follows them: it moves the decoder to each range's first row, skipping rows within a page and over the pages Parquet dropped (each page's first row index gives the gap), then decodes the range. So every column emits the same selected rows although their pages start at different rows. A list or map counts entries, not rows, so a file that requests one keeps whole row groups. Before this, the column index was off: with it, the columns' pages misaligned. Tests: `NativeParquetColumnIndexSuite`, against Spark's own scan, over sorted data with small pages: every flat type and a struct, v1 and v2 pages, dictionary on and off, one and several ranges, a filter no page matches, `_metadata.row_index`, the switch off, and a file with a list. The native scan must output under a quarter of the rows it reads with the column index off.
 - **Make the sort compare robust against C2 uncommon-trap storms.** When q67 runs after q88, q28, q9 and q44 in the same app, 0–3 of 8 executors run q67's sort stage at about 2.3× CPU per task for the rest of the app.
   - The deoptimization log shows hundreds of thousands of `unstable_if` traps with action `none` in `StringCompareKernels.compareBytes` at bytecode 33, where the 8-byte loop runs out. The profile never saw that exit taken, and once HotSpot stops recompiling, the trap stays.
