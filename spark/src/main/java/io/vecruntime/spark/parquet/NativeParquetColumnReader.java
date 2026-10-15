@@ -939,7 +939,8 @@ public final class NativeParquetColumnReader implements NativeParquetColumn, Row
         rowsEmitted += rows;
         boolean nulls = decoder.batchNullCount() > 0;
         if (type == VecType.UTF8) {
-            return flushUtf8(elements, nulls);
+            // #568: a list's or map's strings are dictionary ids too, where the leaf allows it (#612).
+            return decoder.batchIsDictionaryIds() ? flushIds(elements, nulls) : flushUtf8(elements, nulls);
         }
         if (staged) {
             return int96

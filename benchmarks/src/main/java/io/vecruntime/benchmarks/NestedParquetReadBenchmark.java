@@ -149,6 +149,19 @@ public class NestedParquetReadBenchmark {
 
     @Benchmark
     public long ours() throws Exception {
+        return read(false);
+    }
+
+    /**
+     * {@link #ours} with strings emitted as dictionary ids (#612, #568), as the
+     * scan reads them when the dictionary-strings switch is on (the default).
+     */
+    @Benchmark
+    public long oursIds() throws Exception {
+        return read(true);
+    }
+
+    private long read(boolean dictionaryIds) throws Exception {
         try (ParquetFileReader r = ParquetFileReader.open(hadoopConf, new Path(filePath))) {
             MessageType file = r.getFooter()
                                 .getFileMetaData()
@@ -156,6 +169,7 @@ public class NestedParquetReadBenchmark {
             MessageType requested = new MessageType(file.getName(), file.getType(column));
             r.setRequestedSchema(requested);
             NativeParquetColumn c = reader(requested);
+            c.setDictionaryIds(dictionaryIds);
             long sum = 0;
             try {
                 PageReadStore rg;
