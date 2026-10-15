@@ -93,7 +93,7 @@ public final class GroupKeyTable {
                         Math.max(largest(p.longs), largest(p.validity))));
         IdScratch s = IdScratch.SCRATCH.get();
         largest = Math.max(largest,
-                Math.max(largest(s.ids), largest(s.entryIds)));
+                Math.max(largest(s.ids), largest(s.entries)));
         largest = Math.max(largest, Math.max(s.offs.length, Math.max(s.bytes.length, s.wordScratch.length)));
         refs += nonNull(s.keys) + nonNull(s.lastDict) + nonNull(s.lastTable);
         return new long[] {largest, refs};
@@ -799,8 +799,10 @@ public final class GroupKeyTable {
     private static final class IdScratch {
         VectorBuffers[] keys = new VectorBuffers[0];
         int[][] ids = new int[0][];
-        int[][] entryIds = new int[0][]; // per column: input dictionary entry -> id
-        int[][] entryGen = new int[0][]; // per column: the generation entryIds[c][e] was computed in
+        // Per column: input dictionary entry -> (generation << 32 | id), the id valid while the generation is
+        // the column's current one. One array, so a row reads one word per key column: over a join's build
+        // side, a dictionary of millions of rows, each read is a likely cache miss (#692).
+        long[][] entries = new long[0][];
         int[] gen = new int[0];
         VectorBuffers[] lastDict = new VectorBuffers[0];
         GroupKeyTable[] lastTable = new GroupKeyTable[0]; // per column: the table the entry map is for
@@ -840,10 +842,9 @@ public final class GroupKeyTable {
             Arrays.fill(s.lastDict, null);
             Arrays.fill(s.lastTable, null);
             trim(s.ids);
-            for (int c = 0; c < s.entryIds.length; c++) {
-                if (s.entryIds[c] != null && s.entryIds[c].length > KEEP_ELEMENTS) {
-                    s.entryIds[c] = null;
-                    s.entryGen[c] = null;
+            for (int c = 0; c < s.entries.length; c++) {
+                if (s.entries[c] != null && s.entries[c].length > KEEP_ELEMENTS) {
+                    s.entries[c] = null;
                     s.gen[c] = 0;
                 }
             }
@@ -865,8 +866,7 @@ public final class GroupKeyTable {
             }
             if (s.ids.length < k) {
                 s.ids = Arrays.copyOf(s.ids, k);
-                s.entryIds = Arrays.copyOf(s.entryIds, k);
-                s.entryGen = Arrays.copyOf(s.entryGen, k);
+                s.entries = Arrays.copyOf(s.entries, k);
                 s.gen = Arrays.copyOf(s.gen, k);
                 s.lastDict = Arrays.copyOf(s.lastDict, k);
                 s.lastTable = Arrays.copyOf(s.lastTable, k);
@@ -919,13 +919,10 @@ public final class GroupKeyTable {
             if (key.isDictionaryEncoded()) {
                 VectorBuffers d = key.dictionary();
                 int m = d.length();
-                int[] entryIds = s.entryIds[c];
-                int[] entryGen = s.entryGen[c];
-                if (entryIds == null || entryIds.length < m) {
-                    entryIds = new int[Math.max(m, entryIds == null ? 256 : entryIds.length * 2)];
-                    entryGen = new int[entryIds.length];
-                    s.entryIds[c] = entryIds;
-                    s.entryGen[c] = entryGen;
+                long[] entries = s.entries[c];
+                if (entries == null || entries.length < m) {
+                    entries = new long[Math.max(m, entries == null ? 256 : entries.length * 2)];
+                    s.entries[c] = entries;
                     s.gen[c] = 0;
                     s.lastDict[c] = null;
                     s.lastTable[c] = null;
@@ -944,7 +941,7 @@ public final class GroupKeyTable {
                     s.lastTable[c] = this;
                     s.lastInsert[c] = insert;
                     if (++s.gen[c] == 0) {
-                        Arrays.fill(entryGen, 0);
+                        Arrays.fill(entries, 0L);
                         s.gen[c] = 1;
                     }
                 }
@@ -969,7 +966,8 @@ public final class GroupKeyTable {
                         continue;
                     }
                     int e = ids[i];
-                    if (entryGen[e] != gen) {
+                    long entry = entries[e];
+                    if ((int) (entry >>> 32) != gen) {
                         int id;
                         if (dValidity != null && !Bitmap.isSet(dValidity, e)) {
                             id = 0; // a null entry: the row is null through the dictionary; not a key value
@@ -978,10 +976,10 @@ public final class GroupKeyTable {
                             int len = dOff.get(VectorBuffers.LE_INT, (long) (e + 1) << 2) - start;
                             id = dict.indexOf(dData, start, len, insert, s.entryBytes);
                         }
-                        entryIds[e] = id;
-                        entryGen[e] = gen;
+                        entry = ((long) gen << 32) | (id & 0xFFFFFFFFL);
+                        entries[e] = entry;
                     }
-                    ids[i] = entryIds[e];
+                    ids[i] = (int) entry;
                 }
             } else {
                 int[] offs = s.offs;
