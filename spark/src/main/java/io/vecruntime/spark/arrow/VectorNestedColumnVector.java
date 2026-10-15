@@ -323,6 +323,15 @@ public final class VectorNestedColumnVector extends ColumnVector {
     }
 
     /**
+     * The column under a leaf field's null-safe wrapper (#568), or {@code cv}
+     * itself: the adapters read a leaf's buffers directly (an Arrow vector, a
+     * dictionary vector), with no per-value getter and so no null-slot hazard.
+     */
+    public static ColumnVector unwrapLeaf(ColumnVector cv) {
+        return cv instanceof NullSafe n ? n.inner : cv;
+    }
+
+    /**
      * A leaf column under a nested value whose primitive getters answer a null
      * slot with zero instead of raising (Arrow's {@code get} checks nulls;
      * Spark's bulk array copy reads every slot and then sets the null bits
