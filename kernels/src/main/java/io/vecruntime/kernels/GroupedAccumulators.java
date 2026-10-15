@@ -38,10 +38,12 @@ public final class GroupedAccumulators {
      * with many, each copy is one more cache line per update and the growth
      * reallocates every copy. q78's partial aggregates at 3 TB (millions of
      * groups per task, four copies on Graviton): one copy is -7 % on q78 and
-     * q24a, and the growth was 35 % of q78's allocated bytes. {@code
-     * -Dvecruntime.agg.collapseGroups=N} sets it (measured on Graviton 4).
+     * q24a, and the growth was 35 % of q78's allocated bytes. Tuned on Graviton
+     * 4 (3 TB, thresholds 1,024 / 4,096 / 16,384 against main, two legs each):
+     * 16,384 was best on q78 (-7.7 %) with q4, q67 and few-group queries level.
+     * {@code -Dvecruntime.agg.collapseGroups=N} sets it.
      */
-    static final int COLLAPSE_GROUPS = Integer.getInteger("vecruntime.agg.collapseGroups", 1 << 12);
+    static final int COLLAPSE_GROUPS = Integer.getInteger("vecruntime.agg.collapseGroups", 1 << 14);
 
     /** The copies an accumulator keeps at {@code capacity} groups. */
     private static int copiesFor(int copies, int capacity) {
