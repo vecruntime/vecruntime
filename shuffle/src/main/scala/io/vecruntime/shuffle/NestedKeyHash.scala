@@ -15,7 +15,7 @@
  */
 package io.vecruntime.shuffle
 
-import io.vecruntime.kernels.{Decimal128, NestedVectorBuffers, PartitionKernels, VectorBuffers}
+import io.vecruntime.kernels.{Decimal128, NestedVectorBuffers, PartitionKernels, VecType, VectorBuffers}
 import io.vecruntime.spark.adapter.TypeMapping
 import org.apache.spark.sql.types._
 
@@ -67,11 +67,7 @@ object NestedKeyHash {
       h
     case IntegerType | DateType | ByteType | ShortType => PartitionKernels.hashInt(v.getInt(i), seed)
     case LongType | TimestampType | TimestampNTZType => PartitionKernels.hashLong(v.getLong(i), seed)
-    case d: DecimalType if d.precision <= TypeMapping.MAX_DECIMAL_PRECISION =>
-      PartitionKernels.hashLong(v.getLong(i), seed)
-    case _: DecimalType =>
-      val bytes = Decimal128.toBigInteger(Decimal128.hi(v.data(), i), Decimal128.lo(v.data(), i)).toByteArray
-      PartitionKernels.hashUnsafeBytes(bytes, seed)
+    case d: DecimalType => decimal(v, d, i, seed)
     case DoubleType => PartitionKernels.hashLong(PartitionKernels.doubleBits(v.getDouble(i)), seed)
     case BooleanType => PartitionKernels.hashInt(if (v.getBoolean(i)) 1 else 0, seed)
     case StringType | BinaryType =>
@@ -82,10 +78,33 @@ object NestedKeyHash {
     case other => throw new IllegalArgumentException(s"no nested key hash for ${other.simpleString}")
   }
 
-  /** `pmod(hash, n)` of each row's hash, Spark's partition id. */
+  /**
+   * A decimal as Spark hashes it: precision <= 18 by its unscaled long, wider by the bytes of its unscaled
+   * BigInteger (#732). The read follows the leaf's physical lane, not the Spark type, so a narrow decimal
+   * held in a DECIMAL128 lane still hashes by its unscaled value; any other lane fails instead of hashing
+   * the wrong bytes.
+   */
+  private def decimal(v: VectorBuffers, d: DecimalType, i: Int, seed: Int): Int = v.`type`() match {
+    case VecType.INT64 =>
+      require(
+        d.precision <= TypeMapping.MAX_DECIMAL_PRECISION,
+        s"${d.simpleString} key held in an INT64 lane"
+      )
+      PartitionKernels.hashLong(v.getLong(i), seed)
+    case VecType.DECIMAL128 =>
+      val lo = Decimal128.lo(v.data(), i)
+      if (d.precision <= TypeMapping.MAX_DECIMAL_PRECISION) PartitionKernels.hashLong(lo, seed)
+      else {
+        val bytes = Decimal128.toBigInteger(Decimal128.hi(v.data(), i), lo).toByteArray
+        PartitionKernels.hashUnsafeBytes(bytes, seed)
+      }
+    case other => throw new IllegalArgumentException(s"no nested key hash for ${d.simpleString} in a $other lane")
+  }
+
+  /** `pmod(hash, n)` of each row's hash, Spark's partition id ([[PartitionKernels.pmod]]). */
   def ids(hashes: Array[Int], n: Int, numPartitions: Int, ids: Array[Int]): Unit = {
     var r = 0
-    while (r < n) { val m = hashes(r) % numPartitions; ids(r) = if (m < 0) m + numPartitions else m; r += 1 }
+    while (r < n) { ids(r) = PartitionKernels.pmod(hashes(r), numPartitions); r += 1 }
   }
 
 }
