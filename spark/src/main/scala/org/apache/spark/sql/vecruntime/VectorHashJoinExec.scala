@@ -1779,7 +1779,9 @@ object VectorJoinPlanner {
         val keyFailures = j.leftKeys.flatMap(k => compileKey(k, j.left.output).left.toOption) ++ j.rightKeys.flatMap(
           k => compileKey(k, j.right.output).left.toOption
         )
-        val laneless = (j.left.output ++ j.right.output).filterNot(a => TypeMapping.hasLane(a.dataType))
+        // Keys are compiled above (lanes only); a payload column may also be an array, map or struct (#705),
+        // copied by the column builders' nested lanes and gathered as a nested lane.
+        val laneless = (j.left.output ++ j.right.output).filterNot(a => TypeMapping.carriesNested(a.dataType))
         if (keyFailures.nonEmpty) Left(keyFailures.mkString("; "))
         else if (laneless.nonEmpty)
           Left(s"unsupported column type ${laneless.head.dataType.simpleString} for ${laneless.head.name}")

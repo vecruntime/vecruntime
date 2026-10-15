@@ -50,6 +50,7 @@ public final class ColumnBuilder implements AutoCloseable {
     private MemorySegment validity; // allocated lazily on the first null
     private MemorySegment offsets; // UTF8 only
     private long bytesUsed; // UTF8 data bytes
+    private final NestedColumnBuilder nested; // LIST, MAP, STRUCT (#705); null for a lane
 
     public ColumnBuilder(Arena arena, VecType type, int expectedRows) {
         this(arena, false, type, expectedRows);
@@ -70,6 +71,11 @@ public final class ColumnBuilder implements AutoCloseable {
         this.owned = owning ? new Arena[4] : null;
         this.type = type;
         int cap = Math.max(expectedRows, 1024);
+        if (type.isNested()) {
+            nested = new NestedColumnBuilder(arena, type, expectedRows);
+            return;
+        }
+        nested = null;
         if (type == VecType.UTF8) {
             Arena o = freshArena();
             offsets = ArrowLayout.allocateOffsets(o, cap);
@@ -117,6 +123,10 @@ public final class ColumnBuilder implements AutoCloseable {
      */
     @Override
     public void close() {
+        if (nested != null) {
+            nested.close();
+            return;
+        }
         if (owned == null) {
             return;
         }
@@ -137,6 +147,9 @@ public final class ColumnBuilder implements AutoCloseable {
      * in them.
      */
     public long allocatedBytes() {
+        if (nested != null) {
+            return nested.allocatedBytes();
+        }
         long bytes = data.byteSize();
         if (offsets != null) {
             bytes += offsets.byteSize();
@@ -156,6 +169,10 @@ public final class ColumnBuilder implements AutoCloseable {
      * the capacity past the budget is never appended.
      */
     public long bytesAfterAppend(VectorBuffers in, MemorySegment selection, int count) {
+        if (nested != null) {
+            // A nested column is never budgeted by its bytes (its build side stays in memory): an estimate.
+            return nested.allocatedBytes() + 16L * count;
+        }
         if (count == 0) {
             return allocatedBytes();
         }
@@ -206,6 +223,9 @@ public final class ColumnBuilder implements AutoCloseable {
     }
 
     public int length() {
+        if (nested != null) {
+            return nested.length();
+        }
         return length;
     }
 
@@ -221,6 +241,10 @@ public final class ColumnBuilder implements AutoCloseable {
     public void append(VectorBuffers in, MemorySegment selection, int count) {
         if (in.type() != type) {
             throw new IllegalArgumentException("appending " + in.type() + " to a " + type + " column");
+        }
+        if (nested != null) {
+            nested.append(in, selection, count);
+            return;
         }
         if (count == 0) {
             return;
@@ -425,6 +449,9 @@ public final class ColumnBuilder implements AutoCloseable {
 
     /** The accumulated column; valid until the arena is closed or the next append. */
     public VectorBuffers view() {
+        if (nested != null) {
+            return nested.view();
+        }
         if (type == VecType.UTF8) {
             return SegmentVectorBuffers.utf8(length, validity, offsets, data);
         }
