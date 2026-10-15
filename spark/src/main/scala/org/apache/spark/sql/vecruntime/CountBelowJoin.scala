@@ -48,7 +48,7 @@ import org.apache.spark.sql.catalyst.plans.logical.{
 }
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.catalyst.trees.TreeNodeTag
-import org.apache.spark.sql.types.{DoubleType, LongType}
+import org.apache.spark.sql.types.{DecimalType, DoubleType, LongType}
 
 /**
  * Collapses a join input that only supplies grouping columns into its distinct rows and their count (#692), so a
@@ -115,16 +115,26 @@ case class CountBelowJoin(session: SparkSession) extends Rule[LogicalPlan] with 
       })
 
   /**
-   * A sum whose weighted form costs no more than the sum itself: a long or a double. A decimal sum of up to 8
-   * digits already reaches here as a long sum of the unscaled values (Spark's `DecimalAggregates`), so q24's
-   * `sum(ss_net_paid)` qualifies; a wider decimal times a count is a 38-digit product, which is slower and which
-   * our aggregate does not carry -- at 3 TB q23a's weighted `sum(decimal(17,2) x count)` fell back to Spark's
-   * aggregate and the query took 27 % longer. Such an aggregate is left alone.
+   * A sum that can be weighted in its own result type. A long or a double: x * count in that type. A decimal
+   * of up to 8 digits already reaches here as a long sum of the unscaled values (Spark's `DecimalAggregates`), so
+   * q24's `sum(ss_net_paid)` is a long. A wider decimal (#762) is weighted as `x * cast(count as decimal(20,0))`,
+   * a product our aggregate multiplies on the 128-bit lane, summed and cast back to the sum's own type -- but only
+   * when that product cannot overflow: `x`'s precision plus the count's 20 digits and the product's carry digit
+   * must fit 38. Past that, Spark would lower the product's scale (rounding every weighted row) or, without ANSI,
+   * null an overflowing product the sum would then skip, where the unweighted sum overflows to null. q23's
+   * `decimal(17,2)` fits exactly. A wider decimal sum is left alone.
    */
   private def weightable(s: Sum): Boolean = s.dataType match {
     case LongType | DoubleType => true
+    case _: DecimalType => s.child.dataType match {
+        case d: DecimalType => d.precision + CountDecimal.precision + 1 <= DecimalType.MAX_PRECISION
+        case _ => false
+      }
     case _ => false
   }
+
+  /** The count as a decimal: a long's 19 digits and its sign fit decimal(20,0). */
+  private val CountDecimal = DecimalType(20, 0)
 
   private def rewrite(a: Aggregate): Option[LogicalPlan] = {
     val aggExprs = a.aggregateExpressions.flatMap(_.collect { case ae: AggregateExpression => ae })
@@ -144,6 +154,11 @@ case class CountBelowJoin(session: SparkSession) extends Rule[LogicalPlan] with 
 
   /** The aggregate over rows that each stand for `weight` rows of the original input. */
   private def weighted(ae: AggregateExpression, weight: Expression): Expression = ae.aggregateFunction match {
+    case s: Sum if s.dataType.isInstanceOf[DecimalType] =>
+      // A wide decimal (see `weightable`): x * cast(count as decimal(20,0)) at x's scale, summed in 38 digits and
+      // cast back to the sum's own type, which raises (ANSI) or nulls past its precision as the sum itself would.
+      val product = Multiply(s.child, Cast(weight, CountDecimal))
+      Cast(s.copy(child = product).toAggregateExpression(), s.dataType)
     case s: Sum =>
       // A long or a double (see `weightable`): x * count in the sum's own type.
       val t = s.dataType

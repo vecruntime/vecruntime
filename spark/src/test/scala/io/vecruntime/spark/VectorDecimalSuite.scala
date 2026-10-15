@@ -237,13 +237,10 @@ class VectorDecimalSuite extends VectorQuerySuite {
     // The projected form of the wide product compiles onto the DECIMAL128 lane since #258 (the sum keeps the speculative path).
     checkVectorized("SELECT dec12 * dec12 AS x FROM t WHERE i > 5", Seq(Project))
     // (the Final stage may still be ours: it merges the buffer Spark's Partial produced)
-    // (a wide sum as an operand became speculative in slice 4; a wide operand that is neither is still refused)
+    // (a wide sum as an operand became speculative in slice 4; a wide operand that is neither -- a cast to a wide
+    // decimal -- leaves the product to the DECIMAL128 kernels since #762, both stages ours)
     bothOurs("SELECT sum((dec12 * dec12 + 1) * dec7) AS s FROM t")
-    assert(nodesOf[HashAggregateExec](checkFallback(
-      "SELECT sum(cast(dec12 * dec12 AS decimal(30,4)) * dec7) AS s FROM t",
-      Seq.empty,
-      "neither a lane nor a speculative product or sum"
-    )).nonEmpty)
+    bothOurs("SELECT sum(cast(dec12 * dec12 AS decimal(30,4)) * dec7) AS s FROM t")
     // A min/max over a wide product reads the DECIMAL128 lane since #259 (slice 1).
     checkVectorized("SELECT max(dec12 * dec12) AS m FROM t", Seq(Agg))
   }
