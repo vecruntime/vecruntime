@@ -565,9 +565,12 @@ Declined: `avg` and every other function, a sum of a wider decimal (weighing it 
 q23a's `sum(decimal(17,2))` weighted that way left the aggregate to Spark and took 27 % longer), a `DISTINCT` or
 filtered aggregate, non-deterministic expressions on the path, outer and semi joins.
 
-Measured at 3 TB without statistics (TPC-DS, 103 queries, Graviton 4 r8gd.12xlarge x 10, two runs each, alternating):
-1,407 s on main against 1,296 s with the rule (−7.9 %), identical row counts on every query. The rule changes 26
-queries, which took 340 s on main and 251 s with it (−26 %): q24a 95.1 -> 54.9 s, q24b 100.7 -> 53.1 s, q11 −14 %,
+Measured at 3 TB without statistics (TPC-DS, Graviton 4 r8gd.12xlarge x 10, two runs each, alternating): over the
+102 queries every run completed, 1,407 s on main against 1,296 s with the rule (−7.9 %), with checksums identical
+to each other and to the published 12-node run. q93, which the rule does not change, failed in one run with the rule
+after executors were killed for memory (exit 137) and its shuffle fetches failed; main's 10-node runs lost
+executors the same way in q78, q79 and q94. The rule changes 26 queries, which took 340 s on main and 251 s with it
+(−26 %): q24a 95.1 -> 54.9 s, q24b 100.7 -> 53.1 s, q11 −14 %,
 q74 −10 %, q12 and q20 about −1 s. The other rewritten queries move by a few tenths of a second either way, and q64 is
 about 2.7 s (6 %) slower in both runs. Off with `spark.vecruntime.optimizer.countBelowJoin.enabled=false`.
 
