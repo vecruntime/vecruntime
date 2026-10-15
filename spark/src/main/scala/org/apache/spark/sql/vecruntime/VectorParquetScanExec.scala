@@ -742,8 +742,11 @@ private[vecruntime] final class VectorParquetPartitionReader(
       return
     }
     topUp(depth)
-    val p = VectorParquetPartitionReader.await(ahead.poll())
+    // Take the open and its size together, before waiting: a failed open (or a kill while waiting) must not
+    // leave its size queued, unpaired with any open, where close() would never give it back.
+    val f = ahead.poll()
     unreserve(aheadSizes.poll())
+    val p = VectorParquetPartitionReader.await(f)
     topUp(depth)
     install(p)
   }
@@ -1362,9 +1365,21 @@ private[vecruntime] final class VectorParquetPartitionReader(
   }
 
   override def close(): Unit = {
-    releaseEmitted()
-    closeFile()
-    drainAhead()
+    try {
+      releaseEmitted()
+      closeFile()
+    } finally {
+      try drainAhead()
+      finally {
+        // A closed reader holds no read-ahead bytes, whatever path the task took (#568).
+        while (!aheadSizes.isEmpty) unreserve(aheadSizes.poll())
+        while (!rgAheadSizes.isEmpty) unreserve(rgAheadSizes.poll())
+        if (aheadBytes != 0) {
+          VectorParquetPartitionReader.prefetchInFlight.addAndGet(-aheadBytes)
+          aheadBytes = 0
+        }
+      }
+    }
     org.apache.spark.rdd.InputFileBlockHolder.unset()
     updateBytesRead()
     allocator.close()

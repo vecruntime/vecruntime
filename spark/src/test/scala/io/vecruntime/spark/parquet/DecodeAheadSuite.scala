@@ -223,4 +223,31 @@ class DecodeAheadSuite extends VectorQuerySuite {
       assert(rows2.map(_.toString) === rows.map(_.toString))
     }
   }
+
+  test("a file whose open ahead fails gives its read-ahead bytes back (#568)") {
+    val path = newTempPath("da/badopen")
+    withPlugin(enabled = false) {
+      spark.range(0, 60000).selectExpr("CAST(id AS INT) AS i").repartition(6).write.mode("overwrite").parquet(path)
+      spark.read.parquet(path).createOrReplaceTempView("da_badopen")
+    }
+    // Break the trailing magic of one file after the listing (same length), so opening it ahead fails.
+    val files = new java.io.File(path).listFiles().filter(_.getName.endsWith(".parquet")).sortBy(_.getName)
+    val raf = new java.io.RandomAccessFile(files(2), "rw")
+    try {
+      raf.seek(raf.length() - 4)
+      raf.write(Array.fill[Byte](4)(0))
+    } finally raf.close()
+    for (decodeAhead <- Seq(0, 2)) {
+      val run = () =>
+        withConf(
+          "spark.sql.files.maxPartitionBytes" -> (1L << 30).toString,
+          "spark.sql.files.openCostInBytes" -> "0",
+          "spark.sql.files.minPartitionNum" -> "1", // one task over every file
+          VectorConf.ScanNativeParquetPrefetchFiles -> "6"
+        )(withPlugin(enabled = true)(spark.sql("SELECT sum(i) FROM da_badopen").collect()))
+      if (decodeAhead > 0) withDecodeAhead(decodeAhead, "virtual")(intercept[Throwable](run()))
+      else intercept[Throwable](run())
+      assert(VectorParquetScanExec.prefetchInFlightBytes === 0, s"decodeAhead=$decodeAhead: bytes not given back")
+    }
+  }
 }
