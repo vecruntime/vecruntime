@@ -153,12 +153,9 @@ class VectorProjectSuite extends VectorQuerySuite {
     checkVectorized("SELECT i, st.c IS NULL AS nc, size(arr) AS n, arr IS NOT NULL AS na FROM nested", Seq(Project))
     // Under a sparse selection the filter compacts; the project then reads the remapped struct's children.
     checkVectorized("SELECT st.a AS a, st.c.d AS d FROM nested WHERE i % 250 = 3", Seq(Filter, Project))
-    // A struct-typed field as a value is a struct result: refused with the reason; a field of a non-struct is an analysis error in Spark itself.
-    checkFallback(
-      "SELECT i, st.c.d + 1 AS d1, named_struct('x', st.a) AS sx FROM nested",
-      Seq(Project),
-      "unsupported expression CreateNamedStruct"
-    )
+    // A struct built from fields is a struct result our projection hands Spark since #705 (the constructor that
+    // NormalizeFloatingNumbers also uses on struct grouping keys).
+    checkVectorized("SELECT i, st.c.d + 1 AS d1, named_struct('x', st.a) AS sx FROM nested", Seq(Project))
   }
 
   test("date fields, truncation and arithmetic over date columns") {
