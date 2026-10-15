@@ -1317,7 +1317,12 @@ object VectorAggregates {
       c.children match {
         case Seq(Literal(v, _)) if v != null => Right(CountAgg(None))
         case Seq(child) =>
-          ExpressionCompiler.compileLaneColumn(child, input).flatMap {
+          // A nested argument (#705, count(DISTINCT array_column) after the distinct rewrite): count reads only
+          // the lane's validity, so the nested value compiles as it is.
+          val compiled =
+            if (TypeMapping.nestedTypeOf(child.dataType) != null) ExpressionCompiler.compileProjection(child, input)
+            else ExpressionCompiler.compileLaneColumn(child, input)
+          compiled.flatMap {
             case _: LiteralExpr => Right(CountAgg(None))
             case e => Right(CountAgg(Some(e)))
           }

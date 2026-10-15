@@ -174,7 +174,12 @@ Compiled by `VectorAggregates` for `HashAggregateExec` in every mode (see
 
 `aggregate over a literal`, `aggregate over <type> not supported` (non-numeric input) and
 `literal grouping key` / `grouping key type <type> not supported` (unsupported types; doubles group by bits after their normalisation pass) are
-the remaining reasons on the aggregate's inputs.
+the remaining reasons on the aggregate's inputs. An array or struct grouping key (#705) groups by a canonical byte
+encoding of its value on the string key lane -- equal exactly when the values are equal element by element and
+field by field, nulls included -- and is decoded back to the array or struct for the output; `count` reads a
+nested argument too (`count(DISTINCT array_column)`). A key holding a map is refused, as in Spark. Past the spill threshold a partial aggregate with
+such a key emits and starts over as usual; a merging one keeps its table in memory, since nested keys are not
+bucketed.
 
 ## Planned
 

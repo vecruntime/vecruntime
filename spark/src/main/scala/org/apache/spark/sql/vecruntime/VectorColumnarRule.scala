@@ -818,9 +818,11 @@ case class VectorExecRule(session: SparkSession) extends Rule[SparkPlan] with Lo
     // A merging aggregate (Final, PartialMerge) reads an exchange; Spark inserts RowToColumnarExec below us when the
     // shuffle is row based (Comet's shuffle is columnar already), so only the types matter.
     val isFinal = VectorAggregatePlanner.readsExchange(a)
-    // Any lane will do as input (a wide decimal key, input or buffer is a DECIMAL128 lane, #259): the
-    // planner below refuses a column a function or a key cannot read, with the function's own reason.
-    val inputReason = if (isFinal) laneTypeReason(a.child) else laneInputReason(a.child)
+    // Any lane will do as input (a wide decimal key, input or buffer is a DECIMAL128 lane, #259; an array or
+    // struct key is a nested lane, #705): the planner below refuses a column a function or a key cannot read,
+    // with the function's own reason.
+    val inputReason =
+      if (isFinal) laneTypeReason(a.child, nested = true) else laneInputReason(a.child, nested = true)
     inputReason match {
       case Some(reason) => fallback(original, reason)
       case None =>
@@ -1156,18 +1158,22 @@ case class VectorExecRule(session: SparkSession) extends Rule[SparkPlan] with Lo
     if ((left eq v.left) && (right eq v.right)) v else v.copy(left = left, right = right)
   }
 
-  /** Like [[columnarInputReason]] for an operator that only moves columns: any lane type will do. */
-  private def laneInputReason(plan: SparkPlan): Option[String] =
+  /**
+   * Like [[columnarInputReason]] for an operator that only moves columns: any lane type will do, and with
+   * `nested` a nested lane too (#705).
+   */
+  private def laneInputReason(plan: SparkPlan, nested: Boolean = false): Option[String] =
     if (!columnarChild(plan)) Some(s"child ${plan.nodeName} is not columnar")
-    else plan.output.find(a => !TypeMapping.hasLane(a.dataType)).map(a =>
-      s"unsupported column type ${a.dataType.simpleString} for ${a.name}"
-    )
+    else laneTypeReason(plan, nested)
 
-  /** Like [[typeReason]] for an operator that reads any lane type (the aggregate over the DECIMAL128 lane, #259). */
-  private def laneTypeReason(plan: SparkPlan): Option[String] =
-    plan.output.find(a => !TypeMapping.hasLane(a.dataType)).map(a =>
-      s"unsupported column type ${a.dataType.simpleString} for ${a.name}"
-    )
+  /**
+   * Like [[typeReason]] for an operator that reads any lane type (the aggregate over the DECIMAL128 lane, #259),
+   * and with `nested` a nested lane too (the aggregate's array and struct keys, #705).
+   */
+  private def laneTypeReason(plan: SparkPlan, nested: Boolean = false): Option[String] =
+    plan.output.find(a =>
+      if (nested) !TypeMapping.carriesNested(a.dataType) else !TypeMapping.hasLane(a.dataType)
+    ).map(a => s"unsupported column type ${a.dataType.simpleString} for ${a.name}")
 
   /**
    * The build side of a broadcast hash join (#547): a column without a lane is carried in a row store

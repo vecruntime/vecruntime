@@ -119,13 +119,10 @@ class VectorProjectSuite extends VectorQuerySuite {
         ).toSeq
     }
     assert(fields.sortBy(_._1) == expected.sortBy(_._1))
-    // Reading into an array or a map compiles since #705 (VectorElementAccessSuite); grouping by the struct is refused.
+    // Reading into an array or a map compiles since #705 (VectorElementAccessSuite), and so does grouping by the
+    // struct (VectorNestedGroupingSuite).
     checkVectorized("SELECT i, arr[0] AS a0, mp['k'] AS k FROM nested", Seq(Project))
-    checkFallback(
-      "SELECT st, count(*) AS n FROM nested GROUP BY st",
-      Seq(classOf[VectorHashAggregateExec]),
-      "unsupported column type struct"
-    )
+    checkVectorized("SELECT st, count(*) AS n FROM nested GROUP BY st", Seq(classOf[VectorHashAggregateExec]))
     // Arithmetic, casts and abs over the wide lane compile since #258; a rounding function over it still falls back.
     checkFallback("SELECT bround(wide, 1) AS w FROM nested", Seq(Project), "decimal(38,4)")
   }
