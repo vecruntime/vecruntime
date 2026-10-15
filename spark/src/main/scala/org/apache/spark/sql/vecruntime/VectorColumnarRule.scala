@@ -799,9 +799,9 @@ case class VectorExecRule(session: SparkSession) extends Rule[SparkPlan] with Lo
    * Final aggregate's input: Spark inserts RowToColumnarExec below us when the shuffle is row based.
    */
   /** Like [[exchangeInputReason]] for the joins, whose keys and payloads may be any lane type (a wide decimal included, #259). */
-  private def laneExchangeInputReason(plan: SparkPlan): Option[String] = plan match {
-    case _: ShuffleExchangeLike | _: QueryStageExec | _: AQEShuffleReadExec => laneTypeReason(plan)
-    case other => laneInputReason(other)
+  private def laneExchangeInputReason(plan: SparkPlan, nested: Boolean = false): Option[String] = plan match {
+    case _: ShuffleExchangeLike | _: QueryStageExec | _: AQEShuffleReadExec => laneTypeReason(plan, nested)
+    case other => laneInputReason(other, nested)
   }
 
   private def exchangeInputReason(plan: SparkPlan): Option[String] = plan match {
@@ -820,9 +820,11 @@ case class VectorExecRule(session: SparkSession) extends Rule[SparkPlan] with Lo
     val isFinal = VectorAggregatePlanner.readsExchange(a)
     // Any lane will do as input (a wide decimal key, input or buffer is a DECIMAL128 lane, #259; an array or
     // struct key is a nested lane, #705): the planner below refuses a column a function or a key cannot read,
-    // with the function's own reason.
+    // with the function's own reason. An updating aggregate directly over an exchange (CountBelowJoin's
+    // collapse, #692) is accepted like a merging one: Spark inserts RowToColumnarExec below us when that
+    // shuffle is row based.
     val inputReason =
-      if (isFinal) laneTypeReason(a.child, nested = true) else laneInputReason(a.child, nested = true)
+      if (isFinal) laneTypeReason(a.child, nested = true) else laneExchangeInputReason(a.child, nested = true)
     inputReason match {
       case Some(reason) => fallback(original, reason)
       case None =>
