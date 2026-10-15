@@ -936,8 +936,10 @@ object ExpressionCompiler {
     val what = e.prettyName
     if (TypeMapping.nestedTypeOf(container.dataType) == null)
       Left(s"$what over ${container.dataType.simpleString} not supported (a leaf without a lane)")
-    else if (!TypeMapping.isSupported(e.dataType) && !(nestedResult && TypeMapping.nestedTypeOf(e.dataType) != null))
-      Left(s"$what with a ${e.dataType.simpleString} result not supported (#705: nested and wide results come later)")
+    else if (!TypeMapping.hasLane(e.dataType) && !(nestedResult && TypeMapping.nestedTypeOf(e.dataType) != null))
+      // A wide decimal element is gathered onto a DECIMAL128 lane like any other (#705): the consumers that read
+      // it (comparisons, wide arithmetic, the projection's output) take that lane; the others refuse it by type.
+      Left(s"$what with a ${e.dataType.simpleString} result not supported (a leaf without a lane)")
     else {
       val argOk = mode match {
         case ElementAccessExpr.MapKey =>
@@ -984,9 +986,8 @@ object ExpressionCompiler {
       Left(s"$what over collated ${elementType.simpleString} elements not supported")
     else if (lane == null || !ElementAccessExpr.keyLane(lane) || !TypeMapping.hasLane(elementType))
       Left(s"$what over ${elementType.simpleString} elements not supported")
-    // array_min / array_max return an element: a wide decimal one has no output lane here.
-    else if (arg == null && !TypeMapping.isSupported(elementType))
-      Left(s"$what over ${elementType.simpleString} elements not supported")
+    // array_min / array_max return an element, gathered at the winning position: a wide decimal one onto a
+    // DECIMAL128 lane, compared on its two limbs (#705).
     else if (arg != null && arg.dataType != elementType)
       Left(s"$what of a ${arg.dataType.simpleString} in ${elementType.simpleString} elements not supported")
     else
@@ -1031,9 +1032,13 @@ object ExpressionCompiler {
           else ArrayPredicateExpr(p._1, p._2, container.dataType, forAll, l._1, l._2, followThreeValuedLogic)
   }
 
-  /** A value a lambda can read: a leaf with a lane, or an array / map / struct with a nested lane (#705). */
+  /**
+   * A value a lambda can read: a leaf with a lane, or an array / map / struct with a nested lane (#705). A wide
+   * decimal (DECIMAL128) counts: the lambda moves it, and what reads it -- a comparison, wide arithmetic -- takes
+   * the wide operand path or refuses it with its own reason.
+   */
   private def laneOrNested(dt: DataType): Boolean =
-    TypeMapping.isSupported(dt) || TypeMapping.nestedTypeOf(dt) != null
+    TypeMapping.hasLane(dt) || TypeMapping.nestedTypeOf(dt) != null
 
   /**
    * Every lambda variable `body` reads is one of `ids` or bound by a lambda inside `body` (#705, nested
@@ -1091,8 +1096,16 @@ object ExpressionCompiler {
    * `transform` and `filter` build an array lane; everything else is [[compile]].
    */
   def compileProjection(expr: Expression, input: Seq[Attribute]): Result =
-    if (TypeMapping.nestedTypeOf(expr.dataType) == null) compile(expr, input)
-    else compileNested(expr, input)
+    if (TypeMapping.nestedTypeOf(expr.dataType) != null) compileNested(expr, input)
+    else if (isWideDecimal(expr.dataType)) compileWideResult(expr, input)
+    else compile(expr, input)
+
+  /** A wide decimal result: a column (a lambda variable included) moved as its DECIMAL128 lane, else [[compile]]. */
+  private def compileWideResult(expr: Expression, input: Seq[Attribute]): Result = expr match {
+    case Alias(child, _) => compileWideResult(child, input)
+    case a: AttributeReference => compileLaneColumn(a, input)
+    case other => compile(other, input)
+  }
 
   private def compileNested(expr: Expression, input: Seq[Attribute]): Result = expr match {
     case Alias(child, _) => compileNested(child, input)

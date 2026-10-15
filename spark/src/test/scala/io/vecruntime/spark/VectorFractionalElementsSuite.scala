@@ -42,7 +42,9 @@ class VectorFractionalElementsSuite extends VectorQuerySuite {
         "cast(-7.5 as decimal(30,4)), cast(null as decimal(30,4))) end as dw",
       "map(case when id % 2 = 0 then -0.0d else cast('NaN' as double) end, concat('v', id), 2.5d, 'two') as m",
       "cast(id % 9 as double) / 4 as x",
-      "cast(cast(id as decimal(30,4)) * 1000000000000 as decimal(30,4)) as w"
+      "cast(cast(id as decimal(30,4)) * 1000000000000 as decimal(30,4)) as w",
+      "map(cast(id % 3 as int), cast(cast(id as decimal(30,4)) * 1000000000000 as decimal(30,4)), " +
+        "cast(id % 3 + 1 as int), cast(null as decimal(30,4))) as mw"
     ).repartition(3).write.mode("overwrite").parquet(path)
     spark.read.parquet(path).createOrReplaceTempView("fe")
   }
@@ -74,7 +76,19 @@ class VectorFractionalElementsSuite extends VectorQuerySuite {
     checkVectorized("SELECT i FROM fe WHERE array_contains(ad, cast('NaN' as double)) AND i % 3 = 0", Seq(Filter))
   }
 
-  test("array_max over wide decimals keeps Spark's operator, with the reason") {
-    checkFallback("SELECT array_max(dw) FROM fe", Seq(Project), "decimal(30,4) elements not supported")
+  test("wide decimal elements as results: array_min / array_max, element access, a map value; read by a filter") {
+    checkVectorized(
+      "SELECT i, array_min(dw) mn, array_max(dw) mx, dw[0] first, element_at(dw, -2) second, dw[2] third, " +
+        "mw[i % 3] mv, mw[7] mnone FROM fe",
+      Seq(Project)
+    )
+    // The gathered DECIMAL128 element compared and filtered on, as a wide column would be.
+    checkVectorized("SELECT i FROM fe WHERE array_max(dw) > cast(5 as decimal(30,4)) AND dw[0] = w", Seq(Filter))
+    // Lambdas over wide elements: kept by a comparison, returned as they are.
+    checkVectorized(
+      "SELECT i, filter(dw, x -> x > cast(0 as decimal(30,4))) pos, transform(dw, x -> x) same, " +
+        "exists(dw, x -> x = w) hit FROM fe",
+      Seq(Project)
+    )
   }
 }
