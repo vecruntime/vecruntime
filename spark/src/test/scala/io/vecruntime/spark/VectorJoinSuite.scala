@@ -766,12 +766,11 @@ class VectorJoinSuite extends VectorQuerySuite {
       "SELECT /*+ SHUFFLE_HASH(dim) */ dim.name, nk.i, nk.st FROM dim FULL OUTER JOIN nk ON dim.di = nk.i50 AND nk.i < 3000",
       Seq(SHJ)
     )
-    // A broadcast build side carries such a payload in a row store (#547, its own test below); the
-    // shuffled join's build side is still laid out in lanes only, and refuses it with its reason.
-    checkFallback(
+    // A broadcast build side carries such a payload in a row store (#547, its own test below), and since #705 so
+    // does the shuffled join's build side, held in memory then (VectorNestedJoinSuite).
+    checkVectorized(
       "SELECT /*+ SHUFFLE_HASH(nk) */ nk.i, nk.st, dim.name FROM dim JOIN nk ON dim.di = nk.i50 WHERE dim.di < 10",
-      Seq(SHJ),
-      "unsupported column type struct"
+      Seq(SHJ)
     )
   }
 
