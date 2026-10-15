@@ -105,6 +105,64 @@ class DictionaryStringsSuite extends VectorQuerySuite {
     checkVectorized("SELECT i, s FROM dict_fallback WHERE i % 97 = 1", Seq(node))
   }
 
+  test("a struct's string fields come out as dictionary vectors (#568), with Spark's rows through every consumer") {
+    val path = newTempPath("dict/struct")
+    withPlugin(enabled = false) {
+      spark.sql(
+        """SELECT CAST(id AS INT) AS i,
+          |  CASE WHEN id % 9 = 0 THEN NULL ELSE named_struct(
+          |    'a', CASE WHEN id % 11 = 0 THEN NULL ELSE CONCAT('cat-', CAST(id % 37 AS STRING)) END,
+          |    'n', CAST(id AS INT),
+          |    'in', named_struct('b', CONCAT('b', CAST(id % 5 AS STRING)), 'm', id)) END AS st,
+          |  array(CONCAT('e', CAST(id % 3 AS STRING))) AS l
+          |FROM range(0, 50000)""".stripMargin
+      ).repartition(2).write.mode("overwrite").parquet(path)
+      spark.read.parquet(path).createOrReplaceTempView("dict_st")
+    }
+    // The struct's fields, as the scan emits them: dictionary vectors for its strings (the inner struct's too).
+    val kinds = withPlugin(enabled = true) {
+      val df = spark.sql("SELECT i, st FROM dict_st")
+      df.collect()
+      val scan = PlanUtils.allNodes(finalPlan(df)).collectFirst { case s: VectorParquetScanExec => s }
+        .getOrElse(fail("no native scan"))
+      val o = scan.output.indexWhere(_.name == "st")
+      scan.executeColumnar().mapPartitions { it =>
+        var dict = 0L
+        var all = 0L
+        it.foreach { b =>
+          val st = b.column(o)
+          Seq(st.getChild(0), st.getChild(2).getChild(0)).foreach { f =>
+            all += 1
+            if (
+              io.vecruntime.spark.arrow.VectorNestedColumnVector.unwrapLeaf(
+                f
+              ).isInstanceOf[VectorDictionaryColumnVector]
+            ) dict += 1
+          }
+        }
+        Iterator((dict, all))
+      }.collect().foldLeft((0L, 0L)) { case ((d, a), (x, y)) => (d + x, a + y) }
+    }
+    assert(
+      kinds._1 > 0 && kinds._1 == kinds._2,
+      s"${kinds._1} of ${kinds._2} struct string fields were dictionary vectors"
+    )
+    checkVectorized("SELECT i, st FROM dict_st", Seq(node))
+    checkVectorized("SELECT st.a, count(*), sum(st.n) FROM dict_st GROUP BY st.a", Seq(node))
+    checkVectorized(
+      "SELECT st.in.b, st.a, count(*) FROM dict_st WHERE st.a = 'cat-3' OR st.a IS NULL GROUP BY 1, 2",
+      Seq(node)
+    )
+    checkVectorized("SELECT upper(st.a), length(st.in.b), st.a LIKE 'cat-1%' FROM dict_st", Seq(node))
+    checkVectorized("SELECT count(DISTINCT st.a), max(st.in.b) FROM dict_st", Seq(node))
+    checkVectorized("SELECT i, st, l FROM dict_st WHERE i % 97 = 1 ORDER BY i", Seq(node))
+    checkVectorized(
+      "SELECT x.st.a, y.st.in.b FROM dict_st x JOIN dict_st y ON x.st.a = y.st.a AND x.i = y.i + 1 WHERE x.i < 2000",
+      Seq(node)
+    )
+    checkVectorized("SELECT st.a, collect_list(st.in.b)[0] FROM dict_st WHERE i < 500 GROUP BY st.a", Seq(node))
+  }
+
   test("with the switch off the column is flat, with the same rows") {
     withConf(VectorConf.ScanNativeParquetDictionaryStrings -> "false") {
       val (dict, all) = scanColumnKinds("SELECT i, s, t FROM dict_low")

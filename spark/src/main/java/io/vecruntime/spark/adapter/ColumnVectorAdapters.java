@@ -84,6 +84,9 @@ public final class ColumnVectorAdapters {
     }
 
     public static VectorBuffers adapt(ColumnVector cv, int numRows, Arena scratch) {
+        // A leaf field of the native scan's struct, list or map (#568) is wrapped null-safe for Spark's getters;
+        // its own vector (Arrow, dictionary ids) is read directly here, zero-copy.
+        cv = io.vecruntime.spark.arrow.VectorNestedColumnVector.unwrapLeaf(cv);
         if (cv instanceof io.vecruntime.spark.arrow.SlicedColumnVector s) {
             // A batch-sized offset view over a reader-owned row-group vector (the native Parquet scan): adapt
             // the underlying vector and slice it on the 64-aligned batch offset -- zero-copy, and it never
@@ -130,6 +133,7 @@ public final class ColumnVectorAdapters {
 
     /** True if {@link #adapt} would not need to copy. */
     public static boolean isZeroCopy(ColumnVector cv, int numRows) {
+        cv = io.vecruntime.spark.arrow.VectorNestedColumnVector.unwrapLeaf(cv);
         if (cv instanceof BorrowedColumnVector b) {
             return isZeroCopy(b.inner(), numRows);
         }

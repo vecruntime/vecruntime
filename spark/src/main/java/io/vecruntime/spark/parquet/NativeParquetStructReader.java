@@ -366,13 +366,16 @@ public final class NativeParquetStructReader implements NativeParquetColumn, Row
     }
 
     /**
-     * Off for a struct's strings: they are read by value through the struct's
-     * fields, not as dictionary ids.
+     * #568: a struct's flat string fields are emitted as dictionary ids too
+     * (#612), the way a top-level string column is, where the leaf allows it.
+     * The consumers read a field through Spark's getters (nested lanes, Spark's
+     * operators) or adapt it as a column ({@code StructFieldExpr}), and both
+     * take a dictionary vector. A list or map field keeps its own choice (off).
      */
     @Override
     public void setDictionaryIds(boolean enabled) {
         for (NativeParquetColumn f : fields) {
-            f.setDictionaryIds(false);
+            f.setDictionaryIds(enabled);
         }
     }
 
