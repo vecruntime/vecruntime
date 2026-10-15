@@ -191,6 +191,19 @@ public final class GroupKeyTable {
     private byte[] emitScratch = new byte[0]; // a column's values gathered from the dictionary before one bulk copy out
     private int[] memo = new int[0];
 
+    // Packed multi-key lookup (#692); see assignPacked.
+    private boolean packedOff;
+    private int[] packedWidth; // per column: bits of its code in the packed key
+    private int[] packedShift; // per column: where its code sits
+    private LongCodes[] packedValues; // INT32 / INT64 columns: value -> code (1-based; 0 is null)
+    private long[] packedIndex; // pairs: packed key, group id (-1 = empty slot)
+    private int packedMask;
+    private int packedSize;
+    private int[][] packedCodes = new int[0][]; // per column: the batch's codes
+    private long[] packedKeysScratch = new long[0];
+    private long packedRows;
+    private long packedMisses;
+
     /**
      * When every key is dictionary encoded and the dictionaries are small,
      * group ids are memoised per combination of dictionary indices for the
@@ -286,6 +299,20 @@ public final class GroupKeyTable {
             }
         }
         strCols = s;
+        packedOff = !PACKED_ENABLED
+                    || !packedKeys(this.types)
+                    || fast != null
+                    || dictionaryLimit == 0;
+        if (!packedOff) {
+            packedWidth = new int[k];
+            packedShift = new int[k];
+            packedValues = new LongCodes[k];
+            for (int c = 0; c < k; c++) {
+                if (types[c] == VecType.INT32 || types[c] == VecType.INT64) {
+                    packedValues[c] = new LongCodes();
+                }
+            }
+        }
     }
 
     private void startRecord(int c) {
@@ -340,6 +367,12 @@ public final class GroupKeyTable {
         if (combinations > 0 && combinations <= MEMO_MAX_COMBINATIONS && combinations <= memoLimit(n)) {
             return assignMemoised(keys, ids, n, outIds, (int) combinations,
                     selection);
+        }
+        if (!packedOff) {
+            int r = assignPacked(keys, ids, n, outIds, selection);
+            if (r >= 0) {
+                return r;
+            }
         }
         if (hashScratch.length < n) {
             hashScratch = new int[Math.max(n, hashScratch.length * 2)];
@@ -1087,6 +1120,379 @@ public final class GroupKeyTable {
         return HashKernels.finish(h);
     }
 
+    // ------------------------------------------------------------------ packed multi-key lookup (#692)
+
+    /**
+     * Distinct values of a packed path's INT32 / INT64 key column, beyond
+     * which it gives up: a column's code must fit its share of 64 bits.
+     */
+    static final int PACKED_MAX_VALUES = 1 << 16;
+
+    /**
+     * Rows after which a packed path that keeps missing gives up: past
+     * {@code PACKED_MIN_ROWS} rows, more than one miss in
+     * {@code PACKED_MAX_MISS_RATIO} rows means most rows are new groups, which
+     * pay the packed probe on top of the general one.
+     */
+    static final long PACKED_MIN_ROWS = 1 << 16;
+
+    static final int PACKED_MAX_MISS_RATIO = 4;
+
+    /**
+     * {@code -Dvecruntime.kernels.packedGroupKeys=false} keeps every table on
+     * the general probe (benchmarks compare the two; an escape hatch).
+     */
+    static final boolean PACKED_ENABLED = !"false".equals(System.getProperty("vecruntime.kernels.packedGroupKeys"));
+
+    /**
+     * Whether a table of {@code types} may take the packed path: two or more
+     * keys, each a UTF8 (by dictionary id), INT32, INT64 or BOOL.
+     */
+    private static boolean packedKeys(VecType[] types) {
+        if (types.length < 2) {
+            return false;
+        }
+        for (VecType t : types) {
+            if (t != VecType.UTF8
+                    && t != VecType.INT32
+                    && t != VecType.INT64
+                    && t != VecType.BOOL) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Package-private, for the tests: whether the table still takes the packed
+     * path.
+     */
+    boolean packedLookup() {
+        return !packedOff;
+    }
+
+    /** Package-private, for the tests: the general probe only from now on. */
+    void disablePacked() {
+        dropPacked();
+    }
+
+    private void dropPacked() {
+        packedOff = true;
+        packedIndex = null;
+        packedValues = null;
+        packedCodes = new int[0][];
+        packedKeysScratch = new long[0];
+    }
+
+    /**
+     * {@link #assign} by one packed key per row (#692): each key column is
+     * mapped to a small code (a UTF8 column's dictionary id + 1, an integer
+     * column's value through a per-column map, a boolean's 1 or 2; 0 is
+     * null), the codes are packed into one 128-bit key (two {@code long}s; a
+     * code never straddles them), and a table from packed key to group id
+     * answers the row in one probe of one cache line.
+     * The general probe compares every key column of the group (q24a's partial
+     * aggregate: ten keys, its {@code lookupOrInsert} and {@code equals} 10 %
+     * of the executor samples at 3 TB). A miss takes the general probe, which
+     * finds or inserts the group, and remembers the answer, so the packed
+     * table never decides a group on its own and is a cache of the general
+     * one.
+     *
+     * <p>A column's code width grows as its values do; a grown width moves
+     * every code, so the packed table is emptied and refills from the general
+     * probe. Returns {@code -1}, and the caller takes the general path, when
+     * the codes no longer fit 128 bits, an integer column has too many distinct
+     * values, a UTF8 column has turned to records, or most rows miss; the
+     * table then stays general.
+     */
+    private int assignPacked(VectorBuffers[] keys, IdScratch ids, int n,
+            int[] outIds, MemorySegment selection) {
+        int k = types.length;
+        if (n == 0) {
+            return size;
+        }
+        for (int c = 0; c < k; c++) {
+            if (types[c] == VecType.UTF8
+                    && (record[c] || ids == null || ids.ids[c] == null)) {
+                dropPacked();
+                return -1;
+            }
+        }
+        Bound b = Bound.of(keys, ids);
+        if (packedCodes.length < k) {
+            packedCodes = new int[k][];
+        }
+        boolean widened = false;
+        for (int c = 0; c < k; c++) {
+            int[] codes = packedCodes[c];
+            if (codes == null || codes.length < n) {
+                codes = new int[Math.max(n, codes == null ? 4096 : codes.length * 2)];
+                packedCodes[c] = codes;
+            }
+            int max = 0;
+            switch (types[c]) {
+                case UTF8 -> {
+                    int[] id = b.ids[c];
+                    for (int i = 0; i < n; i++) {
+                        int code = b.isNull(c, i) ? 0 : id[i] + 1;
+                        codes[i] = code;
+                        max = Math.max(max, code);
+                    }
+                }
+                case BOOL -> {
+                    for (int i = 0; i < n; i++) {
+                        codes[i] = b.isNull(c, i)
+                                ? 0
+                                : (b.getBoolean(c, i) ? 2 : 1);
+                    }
+                    max = 2;
+                }
+                case INT32 -> {
+                    LongCodes m = packedValues[c];
+                    for (int i = 0; i < n; i++) {
+                        int code = b.isNull(c, i) ? 0 : m.codeOf(b.getInt(c, i));
+                        codes[i] = code;
+                        max = Math.max(max, code);
+                    }
+                    if (m.size() > PACKED_MAX_VALUES) {
+                        dropPacked();
+                        return -1;
+                    }
+                }
+                case INT64 -> {
+                    LongCodes m = packedValues[c];
+                    for (int i = 0; i < n; i++) {
+                        int code = b.isNull(c, i) ? 0 : m.codeOf(b.getLong(c, i));
+                        codes[i] = code;
+                        max = Math.max(max, code);
+                    }
+                    if (m.size() > PACKED_MAX_VALUES) {
+                        dropPacked();
+                        return -1;
+                    }
+                }
+                default -> throw new IllegalStateException("no packed key for " + types[c]);
+            }
+            int need = 64 - Long.numberOfLeadingZeros(max);
+            if (need > packedWidth[c]) {
+                // One bit of headroom: the width doubles the codes it holds, so it grows log-many times.
+                packedWidth[c] = need + 1;
+                widened = true;
+            }
+        }
+        if (widened || packedIndex == null) {
+            // Columns fill the low word, then the high one; a code never straddles the two.
+            int lo = 0;
+            int hi = 0;
+            for (int c = 0; c < k; c++) {
+                int w = packedWidth[c];
+                if (lo + w <= 64) {
+                    packedShift[c] = lo;
+                    lo += w;
+                } else if (hi + w <= 64) {
+                    packedShift[c] = 64 + hi;
+                    hi += w;
+                } else {
+                    dropPacked();
+                    return -1;
+                }
+            }
+            packedIndex = emptyPacked(Math.max(1024, Integer.highestOneBit(Math.max(1, size)) * 4));
+            packedMask = packedIndex.length / 3 - 1;
+            packedSize = 0;
+        }
+        if (packedKeysScratch.length < 2 * n) {
+            packedKeysScratch = new long[Math.max(2 * n, packedKeysScratch.length * 2)];
+        }
+        long[] pk = packedKeysScratch; // row i: low word at 2 i, high word at 2 i + 1
+        Arrays.fill(pk, 0, 2 * n, 0L);
+        for (int c = 0; c < k; c++) {
+            int[] codes = packedCodes[c];
+            int sh = packedShift[c];
+            int word = sh >>> 6;
+            int bit = sh & 63;
+            for (int i = 0; i < n; i++) {
+                pk[2 * i + word] |= (long) codes[i] << bit;
+            }
+        }
+        long misses = 0;
+        long rows = 0;
+        if (selection == null) {
+            for (int i = 0; i < n; i++) {
+                long kl = pk[2 * i];
+                long kh = pk[2 * i + 1];
+                int gid = packedGet(kl, kh);
+                if (gid < 0) {
+                    gid = lookupOrInsert(b, i, rowHash(b, i));
+                    packedPut(kl, kh, gid);
+                    misses++;
+                }
+                outIds[i] = gid;
+            }
+            rows = n;
+        } else {
+            Arrays.fill(outIds, 0, n, -1);
+            for (int w = 0, words = Bitmap.wordsFor(n);
+                 w < words;
+                 w++) {
+                long bits = Bitmap.wordAt(selection, w, n);
+                while (bits != 0L) {
+                    int i = (w << 6) + Long.numberOfTrailingZeros(bits);
+                    bits &= bits - 1;
+                    long kl = pk[2 * i];
+                    long kh = pk[2 * i + 1];
+                    int gid = packedGet(kl, kh);
+                    if (gid < 0) {
+                        gid = lookupOrInsert(b, i, rowHash(b, i));
+                        packedPut(kl, kh, gid);
+                        misses++;
+                    }
+                    outIds[i] = gid;
+                    rows++;
+                }
+            }
+        }
+        packedRows += rows;
+        packedMisses += misses;
+        if (packedRows >= PACKED_MIN_ROWS && packedMisses * PACKED_MAX_MISS_RATIO > packedRows) {
+            dropPacked();
+        }
+        return size;
+    }
+
+    /**
+     * The hash {@link HashKernels#mixColumn} gives row {@code row} of the
+     * packed path's columns (UTF8 by dictionary id): what {@link #groupHash}
+     * gives the group the row belongs to.
+     */
+    private int rowHash(Bound keys, int row) {
+        int h = HashKernels.SEED;
+        for (int c = 0; c < types.length; c++) {
+            int v;
+            if (keys.isNull(c, row)) {
+                v = HashKernels.NULL_MARK;
+            } else {
+                v = switch (types[c]) {
+                            case INT32 -> keys.getInt(c, row);
+                            case INT64 -> HashKernels.fold(keys.getLong(c, row));
+                            case BOOL -> keys.getBoolean(c, row) ? 1 : 0;
+                            case UTF8 -> keys.getId(c, row);
+                            default -> throw new IllegalStateException("no packed key for " + types[c]);
+                        };
+            }
+            h = HashKernels.mix32(h, v);
+        }
+        return HashKernels.finish(h);
+    }
+
+    private static long[] emptyPacked(int slotCount) {
+        long[] t = new long[3 * slotCount];
+        for (int p = 2; p < t.length; p += 3) {
+            t[p] = -1L;
+        }
+        return t;
+    }
+
+    private static int packedSlot(long lo, long hi, int mask) {
+        long x = (lo ^ (hi * 0xC2B2AE3D27D4EB4FL)) * 0x9E3779B97F4A7C15L;
+        return (int) (x >>> 32) & mask;
+    }
+
+    private int packedGet(long lo, long hi) {
+        long[] t = packedIndex;
+        int pos = packedSlot(lo, hi, packedMask);
+        while (true) {
+            int p = 3 * pos;
+            long gid = t[p + 2];
+            if (gid < 0) {
+                return -1;
+            }
+            if (t[p] == lo && t[p + 1] == hi) {
+                return (int) gid;
+            }
+            pos = (pos + 1) & packedMask;
+        }
+    }
+
+    private void packedPut(long lo, long hi, int gid) {
+        if ((packedSize + 1) * 2L > packedMask + 1L) {
+            long[] old = packedIndex;
+            packedIndex = emptyPacked((packedMask + 1) * 2);
+            packedMask = packedIndex.length / 3 - 1;
+            packedSize = 0;
+            for (int p = 0; p < old.length; p += 3) {
+                if (old[p + 2] >= 0) {
+                    packedPut(old[p], old[p + 1], (int) old[p + 2]);
+                }
+            }
+        }
+        long[] t = packedIndex;
+        int pos = packedSlot(lo, hi, packedMask);
+        while (t[3 * pos + 2] >= 0) {
+            if (t[3 * pos] == lo && t[3 * pos + 1] == hi) {
+                return;
+            }
+            pos = (pos + 1) & packedMask;
+        }
+        t[3 * pos] = lo;
+        t[3 * pos + 1] = hi;
+        t[3 * pos + 2] = gid;
+        packedSize++;
+    }
+
+    /**
+     * An integer key column's distinct values, each a code from 1 in order of
+     * first sight: open addressing over the values, the codes beside them.
+     */
+    static final class LongCodes {
+        private long[] values = new long[64];
+        private int[] codes = new int[64]; // 0 = empty slot
+        private int size;
+
+        int size() {
+            return size;
+        }
+
+        int codeOf(long v) {
+            int mask = values.length - 1;
+            int pos = (int) ((v * 0x9E3779B97F4A7C15L) >>> 32) & mask;
+            while (codes[pos] != 0) {
+                if (values[pos] == v) {
+                    return codes[pos];
+                }
+                pos = (pos + 1) & mask;
+            }
+            values[pos] = v;
+            codes[pos] = ++size;
+            if (size * 2 > values.length) {
+                grow();
+            }
+            return size;
+        }
+
+        private void grow() {
+            long[] ov = values;
+            int[] oc = codes;
+            values = new long[ov.length * 2];
+            codes = new int[ov.length * 2];
+            int mask = values.length - 1;
+            for (int p = 0; p < ov.length; p++) {
+                if (oc[p] != 0) {
+                    int pos = (int) ((ov[p] * 0x9E3779B97F4A7C15L) >>> 32) & mask;
+                    while (codes[pos] != 0) {
+                        pos = (pos + 1) & mask;
+                    }
+                    values[pos] = ov[p];
+                    codes[pos] = oc[p];
+                }
+            }
+        }
+
+        long memoryBytes() {
+            return 12L * values.length;
+        }
+    }
+
     // ------------------------------------------------------------------ inline integer keys (#677)
 
     /**
@@ -1611,6 +2017,15 @@ public final class GroupKeyTable {
         }
         if (strCols > 0) {
             bytes += emitScratch.length;
+        }
+        if (packedIndex != null) {
+            bytes += 8L * packedIndex.length + 8L * packedKeysScratch.length;
+            for (int[] codes : packedCodes) {
+                bytes += codes == null ? 0L : 4L * codes.length;
+            }
+            for (LongCodes m : packedValues) {
+                bytes += m == null ? 0L : m.memoryBytes();
+            }
         }
         return bytes;
     }
