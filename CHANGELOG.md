@@ -4,6 +4,106 @@ All notable changes to vecruntime. The format follows [Keep a Changelog](https:/
 the project uses [semantic versioning](https://semver.org/) once it reaches 1.0 -- until then a minor
 version may change configuration keys or defaults, always noted here.
 
+## 0.0.8 -- 2026-10-16
+
+The native Parquet reader handles nested types; array, map and struct columns ride a nested lane through
+sorts, top-N, joins, coalesce, limits, broadcast and our shuffle; collated strings are carried and compared.
+A new `CountBelowJoin` rewrite collapses a join input that only feeds grouping columns, and AQE starts from
+more shuffle partitions so large aggregates stop spilling. TPC-DS 3 TB on 12 x r8gd.12xlarge (data-on-eks
+layout, 200 shuffle partitions), 2026-10-16, main `fac37478`: 1,118.6 s, 2.00x Gluten + Velox 1.6.0
+(2,239.9 s) and 2.21x DataFusion Comet 0.16.0 (2,467.5 s). q24a 109.0 -> 45.6 s; starting AQE from 8
+partitions per core (#790), q78 64.6 -> 46.7 s and q67 56.8 -> 33.3 s at 200 partitions.
+
+### Added
+
+- The native Parquet reader (`spark.vecruntime.scan.nativeParquet.enabled`, on) reads nested types: any
+  nesting of lists, maps and structs, lists of structs, maps of structs, lists of lists at any depth, and
+  struct columns of flat types (#736, #739, #740, #741, #742, #744). It also gains `_metadata` columns, the
+  row index and `input_file_name()` (#738, #751), schema evolution (missing columns as nulls, type widening,
+  #745), Parquet field-id matching with struct fields missing inside lists and maps (#746), INT96 timestamps
+  and calendar rebase (#743), collated strings and bucketed scans (#747), and column-index page filtering
+  (#748). A struct's string fields read as dictionary ids and its fields read zero-copy, decoding only the
+  decode filter's survivors field by field (#753, #754); the strings of lists and maps read as dictionary ids
+  (#756).
+- Array, map and struct columns ride a nested lane (`VecType.LIST`, `MAP`, `STRUCT`) through the engine
+  (#705): our shuffle's hash and range keys and payload (#719, #730), sort payload columns and
+  order-preserving array and struct sort keys (#773, #774), the top-N (#777), the shuffled hash join and merge
+  join as keys and payload (#768, #769, #770, #775, #778), coalesce (#776), limits (#779), the columnar
+  broadcast (#780) and aggregate grouping keys (#766). Nested lanes were added in the kernels first (#718).
+- Nested-element expressions over the element lane (#705): element access and `slice` (#720, #725),
+  `array_contains`, `array_position`, `array_min`/`array_max` (#721), `exists`/`forall` (#722),
+  `transform`, `filter`, `map_keys`/`map_values` and other array results (#723), `aggregate`, `zip_with`,
+  `map_filter` and `transform_values` (#728), nested and over-nested-element lambdas and lambdas with nested
+  results (#733, #737), double and decimal elements in array comparisons (#731), and wide-decimal elements as
+  results and lambda variables (#763).
+- Collated strings (`STRING COLLATE UTF8_LCASE`, `UNICODE_CI`, ...) are carried as their bytes on the UTF8
+  lane through filters, sorts, joins, unions, limits and our shuffle, and are keyed, compared and aggregated
+  on their collation keys (#781, #782): equality, `IN`/`InSet` and range comparisons compile over collation
+  keys, and `min`/`max` keep the value with the least/greatest key; collation-aware hashing and operations
+  that read characters stay Spark's.
+- `BINARY` columns and keys cross our exchange on the UTF8 lane, hashed as Spark hashes binary (#717).
+- `FLOAT` rides the `FLOAT64` lane, widened on input and narrowed on output, including as a hash and range
+  key across our exchange (#726, #727).
+- `TIMESTAMP_NTZ` rides the `INT64` lane, kept columnar through filters, projections, aggregates, joins,
+  windows, top-N and our shuffle; zone-dependent expressions over it stay Spark's (#711).
+- `CountBelowJoin`, a logical rewrite that collapses a join input that only feeds grouping columns
+  (`spark.vecruntime.optimizer.countBelowJoin.enabled`, on by default): a join whose output explodes on a few
+  keys (TPC-DS q24a/q24b, `customer_address` joined on `(upper(ca_country), ca_zip)` with only `ca_state`
+  read above -- one task produced 367 M rows from 0.9 M at 3 TB) becomes a local pre-aggregate on the join
+  keys weighted by `count(*)`, reusing the exchange the join needs. It weights long, double and decimal
+  sums up to 17 digits (the product fits 38 digits); wider decimal sums are left alone (#762, #764, #767).
+- Arrow Flight shuffle transport tunables (`spark.vecruntime.shuffle.flight.chunkBytes`, `channelsPerPeer`,
+  `clientWindow`, `backpressureBytes`); each keeps today's behaviour when unset (#706).
+
+### Changed
+
+- AQE starts from more shuffle partitions (`spark.vecruntime.shuffle.initialPartitionsPerCore`, default 8):
+  the driver plugin sets `spark.sql.adaptive.coalescePartitions.initialPartitionNum` to this factor times the
+  executor cores when it exceeds `spark.sql.shuffle.partitions`, so large aggregates split into more, smaller
+  tasks and stop spilling, while AQE coalesces small stages back down. At 3 TB with 200 partitions q78 spilled
+  201 GB and q67 235 GB; starting from 920 partitions both spill nothing (q78 64.6 -> 46.7 s, q67 56.8 ->
+  33.3 s). Left alone when the user set the key, when AQE or its coalescing is off, when the core count is
+  unknown up front, or when the factor is 0 (#790).
+- The join emits repeated probe strings as a dictionary of the probe rows: when a batch's rows repeat a probe
+  row at least 4 times on average, the column leaves as a dictionary over the distinct probe rows instead of
+  gathering bytes into every output row (q24a joined 0.7 M probe rows into 367 M at 3 TB) (#691).
+- The merge join stops at the first matching right run for `LeftSemi`/`LeftAnti`/`ExistenceJoin` with no join
+  condition, instead of walking the whole right run per left row (q14a `INTERSECT` spent 182 s in one task at
+  3 TB) (#690).
+- The runtime bloom-filter probe over Spark's own filter is vectorised and batched (`SparkBloomKernels`):
+  it parses the serialised filter once per executor and probes a batch breadth first, no result change (it was
+  13-18 % of q24a/q24b executor CPU at 3 TB) (#758).
+- Hash aggregation gets a packed multi-key group lookup -- two or more UTF8/INT32/INT64/BOOL keys packed into
+  a 128-bit key probed in one cache line, backing off to the general probe above its code width (#760) -- and
+  one word per row in the group table's dictionary-entry map (#759). Accumulators collapse their interleaved
+  copies into one past 16,384 groups, so a high-cardinality partial aggregate stops reallocating four copies
+  (#761).
+- `AggregateBelowJoin`'s pre-aggregate is a per-task local aggregate that adds no exchange and gives up when
+  the keys do not reduce, judged after 2 batches (`...aggregateBelowJoin.probeRows` default 262144 -> 16384):
+  where the keys barely repeat (q47/q57) the former partial-exchange-final plan cost 23.7 s against 6.5-7.2 s
+  with the rule off (#707, #710).
+- File partitions are planned without building Spark's unused Parquet reader, which broadcast the whole Hadoop
+  conf (~2,000 short-lived allocations per planned scan on the driver) for a reader we never run (#699).
+
+### Fixed
+
+- An aggregate with a `FILTER` clause reads a struct input again: its narrowed evaluation context had dropped
+  the batch's columns, so `count(DISTINCT 1), ..., count(DISTINCT (a, b))`, which Spark's distinct rewrite turns
+  into `FILTER` clauses over a struct, failed with "unsupported Spark type StructType" (golden files `count.sql`
+  and `udf/udf-count.sql`) (#793).
+- The driver cancels the jobs of a SQL execution that has ended
+  (`spark.vecruntime.cancelEndedExecutionJobs`, default on): AQE could submit a scan stage just before a query
+  with an empty relation returned, and the orphaned stage held every slot into the next query (q17 idle for
+  its first 11 s at 3 TB) (#791). This complements #715's refusal to submit a shuffle stage after its query
+  ended (`spark.vecruntime.shuffle.skipEndedExecutionStages`, default on).
+- The shuffled hash join spills the overflowing build batch before asking for another: the hold loop called
+  `hasNext` once more after the batch that overflowed the budget, and the shuffle reader had already released
+  that batch's buffers, so its lanes read as 0-byte segments (q14b failed at 3 TB under a coalesce/`CASE WHEN`
+  build key) (#772).
+- The native reader's read-ahead gives back the bytes of a failed open: an open that failed, or a task killed
+  while waiting, left its reserved size queued, so the executor's in-flight count never returned to zero and
+  narrowed every later task's read-ahead (#755).
+
 ## 0.0.7 -- 2026-10-09
 
 Spark 4.2 builds, and every artifact now names its Spark line (`vecruntime-spark_4.1_2.13`,
