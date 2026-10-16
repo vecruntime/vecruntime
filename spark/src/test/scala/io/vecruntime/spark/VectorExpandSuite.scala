@@ -121,6 +121,17 @@ class VectorExpandSuite extends VectorQuerySuite {
     assert(nodesOf[org.apache.spark.sql.execution.aggregate.HashAggregateExec](df).isEmpty, finalPlan(df).treeString)
   }
 
+  test("a distinct over a struct value next to other distincts: its FILTER reads the struct column") {
+    // count.sql's query #2: the distinct groups become FILTER clauses over the expand's columns (an expand of a
+    // struct stays Spark's), one of them the struct (i, l). The filtered count read it as a lane through a context
+    // that had lost the batch's columns: "unsupported Spark type StructType".
+    checkVectorized(
+      "SELECT count(DISTINCT 1), count(DISTINCT i), count(DISTINCT (i, l)), count(DISTINCT (i + l)) FROM t",
+      Seq(Agg)
+    )
+    checkVectorized("SELECT s, count(DISTINCT (i, l)) AS dil, count(DISTINCT l) AS dl FROM t GROUP BY s", Seq(Agg))
+  }
+
   test("expand can be disabled") {
     withConf(VectorConf.ExpandEnabled -> "false") {
       val df =
