@@ -83,10 +83,13 @@ trait VectorHashJoinLike extends VectorBinaryExec {
   /** The joined row a condition sees: both sides, whatever the join type outputs. */
   private def joinedOutput: Seq[Attribute] = left.output ++ right.output
 
+  /** Whether array and struct keys ride the byte encoding (#705): the shuffled hash join, built from batches. */
+  protected def nestedKeys: Boolean = false
+
   @transient protected lazy val compiledBuildKeys: Array[VectorExpr] =
-    VectorJoinPlanner.compileKeys(buildKeys, buildPlan.output)
+    VectorJoinPlanner.compileKeys(buildKeys, buildPlan.output, nestedKeys)
   @transient protected lazy val compiledStreamedKeys: Array[VectorExpr] =
-    VectorJoinPlanner.compileKeys(streamedKeys, streamedPlan.output)
+    VectorJoinPlanner.compileKeys(streamedKeys, streamedPlan.output, nestedKeys)
   @transient protected lazy val compiledCondition: Option[VectorExpr] =
     condition.map(c =>
       VectorJoinPlanner.compileCondition(
@@ -327,6 +330,8 @@ case class VectorShuffledHashJoinExec(
     right: SparkPlan
 ) extends VectorHashJoinLike {
 
+  override protected def nestedKeys: Boolean = true
+
   override def requiredChildDistribution: Seq[Distribution] =
     ClusteredDistribution(leftKeys) :: ClusteredDistribution(rightKeys) :: Nil
 
@@ -456,7 +461,11 @@ final class BuildTable(
 
   def build(): BuildTable = {
     if (numRows > 0 && spec.buildKeys.nonEmpty) {
-      val ctx = new EvalContext(arena, numRows, c => columns(c))
+      // A key over an array or struct column (#705) reads it from its row store, Spark's own column vector.
+      val raw: Int => org.apache.spark.sql.vectorized.ColumnVector =
+        if (payload == null) null
+        else c => if (payload(c) == null) null else payload(c).plain()
+      val ctx = new EvalContext(arena, numRows, c => columns(c), null, numRows, raw)
       val keys = spec.buildKeys.map(_.eval(ctx))
       val ids = new Array[Int](numRows)
       val valid = BuildTable.nonNullKeys(ctx, keys)
@@ -1606,16 +1615,26 @@ object VectorJoinPlanner {
   private val keyTypes: Set[VecType] =
     Set(VecType.INT32, VecType.INT64, VecType.BOOL, VecType.UTF8, VecType.FLOAT64, VecType.DECIMAL128)
 
-  def compileKeys(keys: Seq[Expression], input: Seq[Attribute]): Array[VectorExpr] =
+  def compileKeys(keys: Seq[Expression], input: Seq[Attribute], nested: Boolean = false): Array[VectorExpr] =
     keys.map(k =>
       compileKey(
         k,
-        input
+        input,
+        nested
       ).fold(r => throw new IllegalStateException(s"cannot vectorize join key ${k.sql}: $r"), identity)
     ).toArray
 
-  def compileKey(key: Expression, input: Seq[Attribute]): Either[String, VectorExpr] =
-    ExpressionCompiler.compileLaneColumn(key, input).flatMap {
+  /**
+   * With `nested` (the shuffled hash join, #705), an array or struct key is its canonical bytes on the UTF8 lane
+   * ([[io.vecruntime.spark.expr.NestedKeyBytesExpr]]): the table hashes and compares them as a string key, byte
+   * equality being Spark's key equality (an UnsafeRow comparison, null fields equal), and a null key is a null
+   * lane, skipped as Spark's `anyNull` skips it. Not for the merge join, which orders runs by the key: the bytes
+   * do not sort as Spark sorts arrays and structs.
+   */
+  def compileKey(key: Expression, input: Seq[Attribute], nested: Boolean = false): Either[String, VectorExpr] =
+    if (nested && io.vecruntime.spark.expr.NestedKeyBytesExpr.supports(key.dataType))
+      ExpressionCompiler.compileProjection(key, input).map(io.vecruntime.spark.expr.NestedKeyBytesExpr(_, key.dataType))
+    else ExpressionCompiler.compileLaneColumn(key, input).flatMap {
       case _: LiteralExpr => Left("literal join key")
       case k if !keyTypes.contains(k.vecType) => Left(s"join key type ${key.dataType.simpleString} not supported")
       case k => Right(k)
@@ -1692,13 +1711,13 @@ object VectorJoinPlanner {
       condition: Option[Expression],
       left: SparkPlan,
       right: SparkPlan,
-      preservedBuild: Boolean
+      preservedBuild: Boolean,
+      nestedKeys: Boolean = false
   ): Either[String, Unit] = {
     if (leftKeys.isEmpty) Left("join without equi-join keys")
     else supportedType(joinType, buildSide, preservedBuild).flatMap { _ =>
-      val keyFailures = leftKeys.flatMap(k => compileKey(k, left.output).left.toOption) ++ rightKeys.flatMap(k =>
-        compileKey(k, right.output).left.toOption
-      )
+      val keyFailures = leftKeys.flatMap(k => compileKey(k, left.output, nestedKeys).left.toOption) ++
+        rightKeys.flatMap(k => compileKey(k, right.output, nestedKeys).left.toOption)
       if (keyFailures.nonEmpty) Left(keyFailures.mkString("; "))
       // The condition sees both sides, whatever the join type outputs.
       else condition.map(c => compileCondition(c, left.output ++ right.output).map(_ => ())).getOrElse(Right(()))
@@ -1756,9 +1775,17 @@ object VectorJoinPlanner {
     if (j.isSkewJoin) Left("skew join not supported")
     else {
       val v = VectorShuffledHashJoinExec(j.leftKeys, j.rightKeys, j.joinType, j.buildSide, j.condition, j.left, j.right)
-      check(j.leftKeys, j.rightKeys, j.joinType, j.buildSide, j.condition, j.left, j.right, preservedBuild = true).map(
-        _ => v
-      )
+      check(
+        j.leftKeys,
+        j.rightKeys,
+        j.joinType,
+        j.buildSide,
+        j.condition,
+        j.left,
+        j.right,
+        preservedBuild = true,
+        nestedKeys = true
+      ).map(_ => v)
     }
   }
 

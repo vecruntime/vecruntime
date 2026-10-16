@@ -370,10 +370,20 @@ case class VectorExecRule(session: SparkSession) extends Rule[SparkPlan] with Lo
             if (!payloadOk) laneExchangeInputReason(shjBuild)
             else shjBuild match {
               case _: ShuffleExchangeLike | _: QueryStageExec | _: AQEShuffleReadExec =>
-                payloadTypeReason(shjBuild, if (shjBuild eq j.left) j.leftKeys else j.rightKeys, j.condition)
+                payloadTypeReason(
+                  shjBuild,
+                  if (shjBuild eq j.left) j.leftKeys else j.rightKeys,
+                  j.condition,
+                  nestedKeys = true
+                )
               case other =>
                 forwardingInputReason(other).orElse(
-                  payloadTypeReason(other, if (shjBuild eq j.left) j.leftKeys else j.rightKeys, j.condition)
+                  payloadTypeReason(
+                    other,
+                    if (shjBuild eq j.left) j.leftKeys else j.rightKeys,
+                    j.condition,
+                    nestedKeys = true
+                  )
                 )
             }
           streamedInputReason(shjStreamed).orElse(shjBuildReason) match {
@@ -1212,13 +1222,18 @@ case class VectorExecRule(session: SparkSession) extends Rule[SparkPlan] with Lo
   private def payloadTypeReason(
       buildPlan: SparkPlan,
       keys: Seq[org.apache.spark.sql.catalyst.expressions.Expression],
-      condition: Option[org.apache.spark.sql.catalyst.expressions.Expression]
+      condition: Option[org.apache.spark.sql.catalyst.expressions.Expression],
+      nestedKeys: Boolean = false
   ): Option[String] = {
-    val read = AttributeSet(keys.flatMap(_.references)) ++ condition.map(_.references).getOrElse(AttributeSet.empty)
-    buildPlan.output.find(a =>
+    val keyRefs = AttributeSet(keys.flatMap(_.references))
+    val condRefs = condition.map(_.references).getOrElse(AttributeSet.empty)
+    buildPlan.output.find { a =>
+      // With `nestedKeys` (the shuffled hash join, #705) a key may read an array or struct column: the key is
+      // compiled to its bytes over the batch (VectorJoinPlanner.compileKey), the column itself held as payload.
+      val keyOk = !keyRefs.contains(a) || (nestedKeys && TypeMapping.carriesNested(a.dataType))
       !TypeMapping.hasLane(a.dataType) &&
-        (read.contains(a) || !io.vecruntime.spark.arrow.BuildPayloadColumn.carries(a.dataType))
-    ).map(a => s"unsupported column type ${a.dataType.simpleString} for ${a.name}")
+      (!keyOk || condRefs.contains(a) || !io.vecruntime.spark.arrow.BuildPayloadColumn.carries(a.dataType))
+    }.map(a => s"unsupported column type ${a.dataType.simpleString} for ${a.name}")
   }
 
   private def typeReason(
