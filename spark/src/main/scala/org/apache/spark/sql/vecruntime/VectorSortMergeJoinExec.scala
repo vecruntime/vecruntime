@@ -102,9 +102,11 @@ case class VectorSortMergeJoinExec(
     case _ => left.outputPartitioning
   }
 
-  @transient private lazy val compiledLeftKeys: Array[VectorExpr] = VectorJoinPlanner.compileKeys(leftKeys, left.output)
+  // An array or struct key (#705) by its order-preserving bytes: the runs are walked in Spark's order of the value.
+  @transient private lazy val compiledLeftKeys: Array[VectorExpr] =
+    VectorJoinPlanner.compileKeys(leftKeys, left.output, ordered = true)
   @transient private lazy val compiledRightKeys: Array[VectorExpr] =
-    VectorJoinPlanner.compileKeys(rightKeys, right.output)
+    VectorJoinPlanner.compileKeys(rightKeys, right.output, ordered = true)
   @transient private lazy val compiledCondition: Option[VectorExpr] =
     condition.map(c =>
       VectorJoinPlanner.compileCondition(
@@ -932,7 +934,7 @@ private[vecruntime] class VectorSortMergeJoinIterator(
       var c = 0
       while (c < spec.leftWidth) {
         val (name, dt) = spec.outputAttrs(c)
-        columns(c) = ArrowOutput.gather(name, dt, left.columns(c), chunkIdx, 0, count, allocator)
+        columns(c) = gatherColumn(name, dt, left.columns(c), chunkIdx, count)
         c += 1
       }
       if (joinType.isInstanceOf[ExistenceJoin]) {
