@@ -168,7 +168,7 @@ case class VectorWindowExec(
   override def outputOrdering: Seq[SortOrder] = child.outputOrdering
   override def outputPartitioning: Partitioning = child.outputPartitioning
 
-  private def compileKey(e: Expression): VectorExpr = ExpressionCompiler.compileLaneColumn(e, child.output) match {
+  private def compileKey(e: Expression): VectorExpr = ExpressionCompiler.compileOrderKey(e, child.output) match {
     case Right(v) => v
     case Left(reason) => throw new IllegalStateException(s"cannot vectorize window key ${e.sql}: $reason")
   }
@@ -937,7 +937,7 @@ object VectorWindowPlanner {
       if (k.dataType == DoubleType || k.dataType == FloatType)
         Some(s"window key ${k.sql}: double keys not supported (Spark compares them after NaN and zero normalisation)")
       else if (!TypeMapping.hasLane(k.dataType)) Some(s"window key type ${k.dataType.simpleString} not supported")
-      else ExpressionCompiler.compileLaneColumn(k, w.child.output).left.toOption.map(r => s"window key ${k.sql}: $r")
+      else ExpressionCompiler.compileOrderKey(k, w.child.output).left.toOption.map(r => s"window key ${k.sql}: $r")
     }
     aggregateWindows(w.windowExpression) match {
       case Some((aggs, _)) =>
@@ -1362,7 +1362,7 @@ case class VectorWindowGroupLimitExec(
   override def outputOrdering: Seq[SortOrder] = child.outputOrdering
   override def outputPartitioning: Partitioning = child.outputPartitioning
 
-  private def compileKey(e: Expression): VectorExpr = ExpressionCompiler.compileLaneColumn(e, child.output) match {
+  private def compileKey(e: Expression): VectorExpr = ExpressionCompiler.compileOrderKey(e, child.output) match {
     case Right(v) => v
     case Left(reason) => throw new IllegalStateException(s"cannot vectorize window group limit key ${e.sql}: $reason")
   }
@@ -1410,7 +1410,7 @@ object VectorWindowGroupLimitPlanner {
           )
           else if (!TypeMapping.hasLane(k.dataType)) Some(s"window key type ${k.dataType.simpleString} not supported")
           else
-            ExpressionCompiler.compileLaneColumn(k, g.child.output).left.toOption.map(r => s"window key ${k.sql}: $r")
+            ExpressionCompiler.compileOrderKey(k, g.child.output).left.toOption.map(r => s"window key ${k.sql}: $r")
         }
         keyFailures.headOption.toLeft(VectorWindowGroupLimitExec(
           g.partitionSpec,

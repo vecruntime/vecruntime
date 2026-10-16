@@ -66,6 +66,7 @@ import org.apache.spark.sql.catalyst.expressions.{
   Ceil,
   Chr,
   Coalesce,
+  CollationKey,
   CreateNamedStruct,
   Concat,
   ConcatWs,
@@ -277,6 +278,8 @@ object ExpressionCompiler {
     // filter as a subquery result, never as a lane.
     case _: Cast | _: Md5 | _: Sha1 | _: Sha2 | _: Crc32 => true
     case _: BloomFilterMightContain | _: org.apache.spark.sql.vecruntime.PartitionedBloomMightContain => true
+    // A collated string's collation key (#705): binary output, compiled by its own rule below.
+    case _: CollationKey => true
     case _ => false
   }
 
@@ -334,6 +337,17 @@ object ExpressionCompiler {
   }
 
   /**
+   * A sort or window key: a collated string column orders and compares as its collation key (#705) --
+   * equal keys exactly where the collation says equal, unsigned key order its order -- and anything else as
+   * [[compileLaneColumn]]. Not for grouping keys, whose output is the column's own value.
+   */
+  def compileOrderKey(expr: Expression, input: Seq[Attribute]): Result = expr match {
+    case a: AttributeReference if CollationKeyExpr.collationOf(a.dataType) >= 0 =>
+      compileMovedColumn(a, input).map(CollationKeyExpr(_, CollationKeyExpr.collationOf(a.dataType)))
+    case e => compileLaneColumn(e, input)
+  }
+
+  /**
    * [[compileLaneColumn]] for operators that only copy a column into their output (an expand's or a
    * rollup's projections, a merge's row values): a collated string column is carried as its bytes (#705).
    */
@@ -354,6 +368,10 @@ object ExpressionCompiler {
     // A collated string (#705) rides the UTF8 lane only to be carried: whatever compares, hashes, orders,
     // matches or maps its characters follows the collation, not the bytes, and stays Spark's. A null test
     // reads only validity.
+    // Spark's collation key (the join keys RewriteCollationJoin puts on a collated equality, and their exchanges'
+    // hash keys): the bytes CollationFactory gives the value, a binary key the kernels compare as any (#705).
+    case k @ CollationKey(a: AttributeReference) if CollationKeyExpr.collationOf(a.dataType) >= 0 =>
+      compileMovedColumn(a, input).map(CollationKeyExpr(_, k.collationId))
     case e if collatedOperand(e) && !(e.isInstanceOf[IsNull] || e.isInstanceOf[IsNotNull]) =>
       Left(s"unsupported ${e.prettyName} over a collated string")
 

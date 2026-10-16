@@ -111,11 +111,33 @@ class VectorCollatedStringSuite extends VectorQuerySuite {
     assert(df2.collect().toSeq == withPlugin(enabled = false)(spark.sql(sortedWithin).collect().toSeq))
   }
 
-  test("a key over a collated string is refused with its reason") {
-    checkFallback(
-      "SELECT s, count(*) FROM ct GROUP BY s",
-      Seq(classOf[org.apache.spark.sql.vecruntime.VectorHashAggregateExec]),
-      "collated"
+  test("collation keys (step 2): grouping, sorts, top-N and broadcast joins on collated keys are ours") {
+    val Agg = classOf[org.apache.spark.sql.vecruntime.VectorHashAggregateExec]
+    // Grouping by the collation key, each group output as one of its values: compared through lower().
+    checkVectorized("SELECT lower(s), c FROM (SELECT s, count(*) c FROM ct GROUP BY s)", Seq(Agg))
+    checkVectorized("SELECT lower(u), c, sk FROM (SELECT u, count(*) c, sum(k) sk FROM ct GROUP BY u)", Seq(Agg))
+    checkVectorized("SELECT count(*) FROM (SELECT DISTINCT s, u FROM ct)", Seq(Agg))
+    // A join on a collated equality: Spark keys it on collationkey(), a binary key ours compares.
+    checkVectorized(
+      "SELECT /*+ BROADCAST(cd) */ k, s, d FROM ct JOIN cd ON s = s2",
+      Seq(classOf[VectorBroadcastHashJoinExec])
     )
+    checkVectorized(
+      "SELECT /*+ BROADCAST(cd) */ k FROM ct LEFT ANTI JOIN cd ON s = s2",
+      Seq(classOf[VectorBroadcastHashJoinExec])
+    )
+    // Sorts in the collation's order, ties broken by k: compared in order.
+    for (
+      q <- Seq(
+        "SELECT s, k FROM ct1 SORT BY s, k",
+        "SELECT u, s, k FROM ct1 SORT BY u DESC NULLS LAST, s, k"
+      )
+    ) {
+      val df = checkVectorized(q, Seq(classOf[VectorSortExec]))
+      assert(df.collect().toSeq == withPlugin(enabled = false)(spark.sql(q).collect().toSeq), q)
+    }
+    val topN = "SELECT s, u, k FROM ct ORDER BY u, s DESC, k LIMIT 40"
+    val df = checkVectorized(topN, Seq(classOf[org.apache.spark.sql.vecruntime.VectorTakeOrderedAndProjectExec]))
+    assert(df.collect().toSeq == withPlugin(enabled = false)(spark.sql(topN).collect().toSeq))
   }
 }

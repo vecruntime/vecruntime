@@ -364,6 +364,11 @@ object VectorShuffleExchangeExec {
    * The partitionings this exchange takes: hash over lane keys (a struct of lanes hashes its leaves),
    * round robin, single, range over lane keys. Columns are lanes or structs of lanes (flattened).
    */
+  /** A collated string hash key (#705): partitioned by its collation key, which the rule materialises. */
+  def collatedKey(e: org.apache.spark.sql.catalyst.expressions.Expression): Boolean =
+    e.isInstanceOf[Attribute] && e.dataType.isInstanceOf[org.apache.spark.sql.types.StringType] &&
+      io.vecruntime.spark.adapter.TypeMapping.isCollated(e.dataType)
+
   def supports(partitioning: Partitioning, output: Seq[Attribute]): Boolean = {
     def laneKey(dt: org.apache.spark.sql.types.DataType) = io.vecruntime.spark.adapter.TypeMapping.hasLane(dt)
     // A float key hashes the float's own bits, narrowed from its FLOAT64 lane (KeyKind.FLOAT, #712).
@@ -397,7 +402,7 @@ object VectorShuffleExchangeExec {
    * the rule only takes the exchange when every key has one.
    */
   def keysAsColumns(partitioning: Partitioning, child: SparkPlan): Partitioning = partitioning match {
-    case h: HashPartitioning if h.expressions.exists(!_.isInstanceOf[Attribute]) =>
+    case h: HashPartitioning if h.expressions.exists(e => !e.isInstanceOf[Attribute] || collatedKey(e)) =>
       val aliases = child match {
         case p: VectorProjectExec => p.projectList.collect { case a: org.apache.spark.sql.catalyst.expressions.Alias =>
             a
@@ -405,6 +410,12 @@ object VectorShuffleExchangeExec {
         case _ => Nil
       }
       h.copy(expressions = h.expressions.map {
+        // A collated key (#705) partitions by its materialised collation key: Spark's CollationAwareMurmur3Hash
+        // hashes those bytes.
+        case a: Attribute if collatedKey(a) =>
+          aliases.find(_.child.semanticEquals(org.apache.spark.sql.catalyst.expressions.CollationKey(a)))
+            .map(_.toAttribute)
+            .getOrElse(throw new IllegalStateException(s"collated hash key $a has no collation key column"))
         case a: Attribute => a
         case e => aliases.find(_.child.semanticEquals(e)).map(_.toAttribute)
             .getOrElse(throw new IllegalStateException(s"hash key $e is not a column of the exchange's input"))
