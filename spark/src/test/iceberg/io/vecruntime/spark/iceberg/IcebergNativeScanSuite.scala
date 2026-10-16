@@ -110,6 +110,21 @@ class IcebergNativeScanSuite extends IcebergMorSuiteBase {
     checkVectorized("SELECT s, count(*) FROM t GROUP BY s", Seq(Agg))
   }
 
+  icebergTest("metadata columns _file, _pos and _spec_id are read natively, with and without deletes") {
+    spark.sql(s"CREATE OR REPLACE TABLE $Db.t_meta USING iceberg AS SELECT * FROM $Db.t_pos")
+    Seq("t_meta", "t_pos", "t_eq").foreach { table =>
+      // The table itself, not the view `t`: Iceberg's hidden metadata columns resolve on the relation.
+      val t = s"$Db.$table"
+      val df = checkVectorized(s"SELECT _file, _pos, _spec_id, i, s FROM $t WHERE i % 97 = 3", Seq(Filter))
+      val (native, iceberg) = groups(df)
+      assert(native > 0 && iceberg == 0, s"$table: native $native, Iceberg $iceberg")
+      // Each one alone and out of order: _pos without the other constants, _file only, before the data columns.
+      checkVectorized(s"SELECT l, _pos FROM $t WHERE i % 89 = 1", Seq(Filter))
+      checkVectorized(s"SELECT _file, count(*), max(i) FROM $t GROUP BY _file", Seq(Agg))
+      checkVectorized(s"SELECT _spec_id, count(*) FROM $t GROUP BY _spec_id", Seq(Agg))
+    }
+  }
+
   icebergTest("a renamed column is matched by its field id") {
     spark.sql(s"CREATE OR REPLACE TABLE $Db.t_renamed USING iceberg AS SELECT i, l, s, d2 FROM $Db.t_pos")
     spark.sql(s"ALTER TABLE $Db.t_renamed RENAME COLUMN l TO l2")
