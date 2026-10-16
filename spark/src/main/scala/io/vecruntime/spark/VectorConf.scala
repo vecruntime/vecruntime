@@ -196,6 +196,13 @@ object VectorConf {
   /** Our own Java Parquet page decoder behind a VectorParquetScanExec (#559), on by default (see scanNativeParquet). */
   val ScanNativeParquet = "spark.vecruntime.scan.nativeParquet.enabled"
 
+  /**
+   * #735: Iceberg tables read with our native Parquet reader (VectorIcebergScanExec) over Iceberg's own planning:
+   * each task group of data files without deletes is decoded by VectorParquetPartitionReader, any other group by
+   * Iceberg's reader. Off by default until the TPC-DS Iceberg A/B.
+   */
+  val ScanNativeIceberg = "spark.vecruntime.scan.nativeIceberg.enabled"
+
   /** VectorParquetScanExec read-ahead (#559/#566): files of a split opened ahead, `0` off. */
   val ScanNativeParquetPrefetchFiles = "spark.vecruntime.scan.nativeParquet.prefetchFiles"
 
@@ -513,6 +520,10 @@ object VectorConf {
    * this key is set explicitly.
    */
   def scanNativeParquet(conf: SQLConf): Boolean = bool(conf, ScanNativeParquet, default = !cometScanActive(conf))
+
+  /** #735: VectorIcebergScanExec, behind the native Parquet scan's own switch too. */
+  def scanNativeIceberg(conf: SQLConf): Boolean =
+    bool(conf, ScanNativeIceberg, default = false) && scanNativeParquet(conf)
 
   /** Whether Comet's scan is active in this session: its plugin or extension registered and its scan not off. */
   def cometScanActive(conf: SQLConf): Boolean = {
