@@ -254,14 +254,14 @@ case class VectorExecRule(session: SparkSession) extends Rule[SparkPlan] with Lo
           VectorBroadcastExchangeExec(b.mode, b.child)
 
         case l: LocalLimitExec if VectorConf.limitEnabled(conf) =>
-          laneInputReason(l.child) match {
+          laneInputReason(l.child, nested = true) match {
             case Some(reason) => fallback(l, reason)
             case None => VectorLimitPlanner.planLocal(l).fold(reason => fallback(l, reason), v => v)
           }
 
         case g: GlobalLimitExec if VectorConf.limitEnabled(conf) =>
           // Only over a columnar child: above Spark's row shuffle the limit stays Spark's.
-          laneInputReason(g.child) match {
+          laneInputReason(g.child, nested = true) match {
             case Some(reason) => fallback(g, reason)
             case None => VectorLimitPlanner.planGlobal(g).fold(reason => fallback(g, reason), v => v)
           }
@@ -269,7 +269,7 @@ case class VectorExecRule(session: SparkSession) extends Rule[SparkPlan] with Lo
         case c: CollectLimitExec if VectorConf.limitEnabled(conf) =>
           // Per-partition cut stays columnar; the final take goes through Spark's single-partition
           // shuffle like the top-N operator.
-          laneInputReason(c.child) match {
+          laneInputReason(c.child, nested = true) match {
             case Some(reason) => fallback(c, reason)
             case None => VectorLimitPlanner.planCollect(c).fold(reason => fallback(c, reason), v => v)
           }
