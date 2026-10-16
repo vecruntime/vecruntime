@@ -84,8 +84,11 @@ case class VectorIcebergScanExec(scan: BatchScanExec, fieldIds: Seq[Int]) extend
 
   override protected def doExecuteColumnar(): RDD[ColumnarBatch] = {
     val sqlConf = session.sessionState.conf
-    // The data columns, each carrying its Iceberg field id, so the reader matches the file's columns by id.
-    val requiredSchema = StructType(output.zip(fieldIds).map { case (a, id) =>
+    // The output's data columns (metadata columns aside), each carrying its Iceberg field id, so the reader
+    // matches the file's columns by id.
+    val kinds = output.zip(fieldIds).map { case (a, id) => IcebergTasks.columnKind(a.name, id) }
+    val dataColumns = output.zip(fieldIds).zip(kinds).collect { case ((a, id), IcebergTasks.DataColumn) => (a, id) }
+    val requiredSchema = StructType(dataColumns.map { case (a, id) =>
       StructField(
         a.name,
         a.dataType,
@@ -117,7 +120,7 @@ case class VectorIcebergScanExec(scan: BatchScanExec, fieldIds: Seq[Int]) extend
     // None: an equality column our reader cannot decode, so those files keep Iceberg's reader.
     val tableSchema = IcebergTasks.tableSchema(scan)
     val equalitySchema = IcebergTasks
-      .equalityColumns(scan.inputRDD.partitions, tableSchema, fieldIds.toSet)
+      .equalityColumns(scan.inputRDD.partitions, tableSchema, dataColumns.map(_._2).toSet)
       .map(extra => VectorIcebergRDD.withPositions(StructType(requiredSchema.fields ++ extra)))
     val equalityConfBroadcast = equalitySchema.map(confFor)
 
@@ -140,7 +143,8 @@ case class VectorIcebergScanExec(scan: BatchScanExec, fieldIds: Seq[Int]) extend
       equalitySchema,
       tableSchema,
       requiredSchema,
-      output.map(a => (a.name, a.dataType)).toArray,
+      dataColumns.map { case (a, _) => (a.name, a.dataType) }.toArray,
+      kinds.toArray,
       math.max(64, sqlConf.parquetVectorizedReaderBatchSize / 64 * 64),
       NativeScanRebaseConf(
         sqlConf.getConf(SQLConf.PARQUET_REBASE_MODE_IN_READ).toString,
@@ -178,7 +182,8 @@ private[vecruntime] final class VectorIcebergRDD(
     equalitySchema: Option[StructType],
     tableSchema: AnyRef, // org.apache.iceberg.Schema (java.io.Serializable)
     requiredSchema: StructType,
-    attrs: Array[(String, org.apache.spark.sql.types.DataType)],
+    attrs: Array[(String, org.apache.spark.sql.types.DataType)], // the data columns, in output order
+    kinds: Array[IcebergTasks.ColumnKind], // per output column
     batchSize: Int,
     rebaseConf: NativeScanRebaseConf,
     prefetchFiles: Int,
@@ -198,6 +203,15 @@ private[vecruntime] final class VectorIcebergRDD(
   override protected def getPreferredLocations(split: Partition): Seq[String] =
     shims.SparkShims.dataSourceInputPartitions(split).flatMap(_.preferredLocations()).distinct
 
+  // Iceberg metadata columns. `_pos` is the reader's row-index column; `_file` and `_spec_id` are per-file
+  // constants, passed to the reader as the split's partition values (it appends them after the data columns).
+  private val needsPositions = kinds.contains(IcebergTasks.PosColumn)
+  private val constants = kinds.exists(k => k == IcebergTasks.FileColumn || k == IcebergTasks.SpecIdColumn)
+  private val constantSchema =
+    if (constants) IcebergTasks.ConstantSchema else new StructType()
+  // Whether a reader batch can be handed on as it is: only data columns, in output order.
+  private val plain = kinds.forall(_ == IcebergTasks.DataColumn)
+
   override def compute(split: Partition, context: TaskContext): Iterator[ColumnarBatch] = {
     val inputs = shims.SparkShims.dataSourceInputPartitions(split)
     // In order: a run of native groups is read as one file partition (so read-ahead crosses groups), each other
@@ -214,7 +228,7 @@ private[vecruntime] final class VectorIcebergRDD(
     // Equality delete sets loaded once per Spark task: many data files share the same delete files.
     val equalitySets = scala.collection.mutable.HashMap.empty[(Seq[String], Seq[Int]), AnyRef]
     inputs.foreach { p =>
-      IcebergTasks.nativeTasks(p, equality = equalitySchema.isDefined) match {
+      IcebergTasks.nativeTasks(p, equality = equalitySchema.isDefined, constants = constants) match {
         case Some(tasks) =>
           nativeGroups += 1
           tasks.foreach { t =>
@@ -238,6 +252,23 @@ private[vecruntime] final class VectorIcebergRDD(
     segments.result().iterator.flatMap(make => make())
   }
 
+  /**
+   * The output columns of a reader batch laid out as [data columns][`extra` equality columns][row positions,
+   * when `positions`][constants]: per output column, its ordinal in the batch.
+   */
+  private def layout(extra: Int, positions: Boolean): Array[Int] = {
+    val d = attrs.length
+    val posOrdinal = d + extra
+    val constBase = posOrdinal + (if (positions) 1 else 0)
+    var data = 0
+    kinds.map {
+      case IcebergTasks.DataColumn => data += 1; data - 1
+      case IcebergTasks.PosColumn => posOrdinal
+      case IcebergTasks.FileColumn => constBase
+      case IcebergTasks.SpecIdColumn => constBase + 1
+    }
+  }
+
   private def deletedIterator(
       index: Int,
       p: InputPartition,
@@ -248,13 +279,15 @@ private[vecruntime] final class VectorIcebergRDD(
     lazy val deleted =
       if (t.deletes.isEmpty) Array.emptyLongArray else IcebergTasks.deletedPositions(p, t.location, t.deletes)
     if (t.equalityDeletes.isEmpty) {
+      val out = layout(0, positions = true)
       readerOf(index, Array(t.file), positionsConfBroadcast, VectorIcebergRDD.withPositions(requiredSchema), context)
-        .map(b => IcebergTasks.withoutDeleted(b, deleted, attrs.length, null))
+        .map(b => IcebergTasks.withoutDeleted(b, out, attrs.length, deleted, null))
     } else {
       val schema = equalitySchema.get
+      val out = layout(schema.length - attrs.length - 1, positions = true)
       lazy val equality = IcebergTasks.equalityFilter(p, t.equalityDeletes, tableSchema, schema, equalitySets)
       readerOf(index, Array(t.file), equalityConfBroadcast.get, schema, context)
-        .map(b => IcebergTasks.withoutDeleted(b, deleted, attrs.length, equality(b)))
+        .map(b => IcebergTasks.withoutDeleted(b, out, schema.length - 1, deleted, equality(b)))
     }
   }
 
@@ -262,7 +295,16 @@ private[vecruntime] final class VectorIcebergRDD(
       index: Int,
       files: Array[PartitionedFile],
       context: TaskContext
-  ): Iterator[ColumnarBatch] = readerOf(index, files, confBroadcast, requiredSchema, context)
+  ): Iterator[ColumnarBatch] =
+    if (plain) readerOf(index, files, confBroadcast, requiredSchema, context)
+    else if (needsPositions) {
+      val out = layout(0, positions = true)
+      readerOf(index, files, positionsConfBroadcast, VectorIcebergRDD.withPositions(requiredSchema), context)
+        .map(b => IcebergTasks.withoutDeleted(b, out, attrs.length, Array.emptyLongArray, null))
+    } else {
+      val out = layout(0, positions = false)
+      readerOf(index, files, confBroadcast, requiredSchema, context).map(b => IcebergTasks.reordered(b, out))
+    }
 
   private def readerOf(
       index: Int,
@@ -271,12 +313,12 @@ private[vecruntime] final class VectorIcebergRDD(
       schema: StructType,
       context: TaskContext
   ): Iterator[ColumnarBatch] = {
-    val columns = attrs ++ schema.fields.drop(attrs.length).map(f => (f.name, f.dataType))
+    val columns = attrs ++ (schema.fields.drop(attrs.length) ++ constantSchema.fields).map(f => (f.name, f.dataType))
     val reader = new VectorParquetPartitionReader(
       FilePartition(index, files),
       conf.value.value,
       schema,
-      new StructType(),
+      constantSchema,
       columns,
       batchSize,
       caseSensitive = false,
@@ -385,7 +427,34 @@ private[vecruntime] object IcebergTasks {
     m.invoke(target)
   }
 
-  /** The Iceberg field ids of `b`'s output, in order, or why the scan cannot be read natively. */
+  /** What an output column of the scan is: a data column read from the file, or an Iceberg metadata column. */
+  sealed trait ColumnKind extends Serializable
+  case object DataColumn extends ColumnKind
+  case object FileColumn extends ColumnKind // _file: the data file's location
+  case object PosColumn extends ColumnKind // _pos: the row's position in its file
+  case object SpecIdColumn extends ColumnKind // _spec_id: the data file's partition spec id
+
+  // Iceberg's reserved metadata column ids (MetadataColumns): every metadata column sits near Int.MaxValue.
+  private val FileId = Int.MaxValue - 1
+  private val PosId = Int.MaxValue - 2
+  private val SpecIdId = Int.MaxValue - 4
+  private val MetadataIdFloor = Int.MaxValue - 10000
+
+  def columnKind(name: String, id: Int): ColumnKind =
+    if (id == FileId && name == "_file") FileColumn
+    else if (id == PosId && name == "_pos") PosColumn
+    else if (id == SpecIdId && name == "_spec_id") SpecIdColumn
+    else DataColumn
+
+  /** The per-file constants a split carries as its partition values, in this order: `_file`, `_spec_id`. */
+  val ConstantSchema: StructType = new StructType()
+    .add("_file", org.apache.spark.sql.types.StringType, nullable = false)
+    .add("_spec_id", org.apache.spark.sql.types.IntegerType, nullable = false)
+
+  /**
+   * The Iceberg field ids of `b`'s output, in order (Iceberg's reserved ids for the metadata columns `_file`,
+   * `_pos` and `_spec_id`), or why the scan cannot be read natively.
+   */
   def outputFieldIds(b: BatchScanExec): Either[String, Seq[Int]] =
     try {
       val table = call(b.scan, "table")
@@ -397,15 +466,22 @@ private[vecruntime] object IcebergTasks {
       val columns = call(schema, "columns").asInstanceOf[java.util.List[AnyRef]].asScala
       val byName = columns.map(f => call(f, "name").asInstanceOf[String].toLowerCase -> f).toMap
       Right(b.output.map { a =>
-        val field = byName.getOrElse(a.name.toLowerCase, return Left(s"column ${a.name} not in the Iceberg projection"))
-        val id = call(field, "fieldId").asInstanceOf[Integer].intValue()
-        // Metadata columns (_file, _pos, _deleted, _spec_id, _partition, row lineage) have reserved ids at the top.
-        if (id >= Int.MaxValue - 10000) return Left(s"Iceberg metadata column ${a.name}")
-        // A v3 initial default fills the column for files written before it was added; our reader reads nulls.
-        if (call(field, "initialDefault") != null) return Left(s"Iceberg column ${a.name} has an initial default")
-        val typeId = call(call(field, "type"), "typeId").toString
-        if (!NativeTypes.contains(typeId)) return Left(s"Iceberg type $typeId of ${a.name}")
-        id
+        a.name match {
+          case "_file" => FileId
+          case "_pos" => PosId
+          case "_spec_id" => SpecIdId
+          case _ =>
+            val field =
+              byName.getOrElse(a.name.toLowerCase, return Left(s"column ${a.name} not in the Iceberg projection"))
+            val id = call(field, "fieldId").asInstanceOf[Integer].intValue()
+            // Other metadata columns (_deleted, _partition, row lineage) keep Iceberg's reader.
+            if (id >= MetadataIdFloor) return Left(s"Iceberg metadata column ${a.name}")
+            // A v3 initial default fills the column for files written before it was added; our reader reads nulls.
+            if (call(field, "initialDefault") != null) return Left(s"Iceberg column ${a.name} has an initial default")
+            val typeId = call(call(field, "type"), "typeId").toString
+            if (!NativeTypes.contains(typeId)) return Left(s"Iceberg type $typeId of ${a.name}")
+            id
+        }
       })
     } catch {
       case e: ReflectiveOperationException => Left(s"Iceberg scan not recognised: $e")
@@ -430,7 +506,7 @@ private[vecruntime] object IcebergTasks {
    * is found at open: the reader reads an optional missing column as nulls, as Iceberg does without an initial
    * default.)
    */
-  def nativeTasks(p: InputPartition, equality: Boolean): Option[Array[NativeTask]] = {
+  def nativeTasks(p: InputPartition, equality: Boolean, constants: Boolean): Option[Array[NativeTask]] = {
     if (p.getClass.getName != "org.apache.iceberg.spark.source.SparkInputPartition") return None
     val tasks = call(call(p, "taskGroup"), "tasks").asInstanceOf[java.util.Collection[AnyRef]].asScala
     val out = tasks.map { task =>
@@ -457,7 +533,11 @@ private[vecruntime] object IcebergTasks {
       val size = call(file, "fileSizeInBytes").asInstanceOf[java.lang.Long].longValue()
       NativeTask(
         PartitionedFile(
-          InternalRow.empty,
+          if (!constants) InternalRow.empty
+          else InternalRow(
+            org.apache.spark.unsafe.types.UTF8String.fromString(location),
+            call(file, "specId").asInstanceOf[Integer].intValue()
+          ),
           SparkPath.fromPath(new Path(location)),
           call(task, "start").asInstanceOf[java.lang.Long].longValue(),
           call(task, "length").asInstanceOf[java.lang.Long].longValue(),
@@ -627,27 +707,44 @@ private[vecruntime] object IcebergTasks {
     sorted
   }
 
+  /** A reader batch's columns taken in output order (`out`: per output column, its ordinal in `batch`). */
+  def reordered(batch: ColumnarBatch, out: Array[Int]): ColumnarBatch = {
+    val columns = out.map(batch.column)
+    batch match {
+      case s: io.vecruntime.spark.arrow.SelectedColumnarBatch =>
+        io.vecruntime.spark.arrow.SelectedColumnarBatch.ofHeap(
+          columns,
+          s.numRows(),
+          s.selection(),
+          s.selectedCount(),
+          false
+        )
+      case _ => new ColumnarBatch(columns, batch.numRows())
+    }
+  }
+
   /**
-   * `batch` cut to its first `keep` columns -- dropping the equality columns the query does not project and the
-   * file's row positions (the last column: Spark's temporary row-index column, made by our reader and by Spark's
-   * fallback reader alike) -- with the rows at `deleted` positions deselected, and, when `equalityDeleted` is set,
-   * the rows it reports deleted (by row of the batch). Rows of a batch come in file order, so the walk through
-   * `deleted` is one pass. The columns stay the reader's (borrowed).
+   * `batch` with its columns taken in output order (`out`: per output column, its ordinal in `batch`) -- dropping
+   * the equality columns the query does not project and, unless `_pos` is an output, the file's row positions at
+   * `posOrdinal` (Spark's temporary row-index column, made by our reader and by Spark's fallback reader alike) --
+   * with the rows at `deleted` positions deselected and, when `equalityDeleted` is set, the rows it reports
+   * deleted (by row of the batch). Rows of a batch come in file order, so the walk through `deleted` is one pass.
+   * The columns stay the reader's (borrowed).
    */
   def withoutDeleted(
       batch: ColumnarBatch,
+      out: Array[Int],
+      posOrdinal: Int,
       deleted: Array[Long],
-      keep: Int,
       equalityDeleted: Int => Boolean
   ): ColumnarBatch = {
     val n = batch.numRows()
-    val ord = batch.numCols() - 1
-    val columns = Array.tabulate[org.apache.spark.sql.vectorized.ColumnVector](keep)(batch.column)
+    val columns = out.map(batch.column)
     val base = batch match {
       case s: io.vecruntime.spark.arrow.SelectedColumnarBatch => s
       case _ => null
     }
-    val pos = batch.column(ord)
+    val pos = batch.column(posOrdinal)
     var j = if (n == 0) deleted.length else lowerBound(deleted, pos.getLong(0))
     val noPositions = n == 0 || j == deleted.length || deleted(j) > pos.getLong(n - 1)
     if (noPositions && (equalityDeleted == null || n == 0)) {
