@@ -271,7 +271,7 @@ case class VectorExecRule(session: SparkSession) extends Rule[SparkPlan] with Lo
         case t: TakeOrderedAndProjectExec if VectorConf.takeOrderedEnabled(conf) =>
           // ORDER BY ... LIMIT over a columnar child: the per-partition top-N is ours, the final
           // merge of at most limit rows per partition goes through Spark's single-partition shuffle.
-          laneInputReason(t.child) match {
+          laneInputReason(t.child, nested = true) match {
             case Some(reason) => fallback(t, reason)
             case None =>
               VectorTakeOrderedPlanner.plan(t) match {

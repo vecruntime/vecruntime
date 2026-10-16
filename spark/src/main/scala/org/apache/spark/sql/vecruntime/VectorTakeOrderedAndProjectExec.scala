@@ -150,8 +150,9 @@ object VectorTakeOrderedPlanner {
   def plan(t: TakeOrderedAndProjectExec): Either[String, VectorTakeOrderedAndProjectExec] = {
     val keyFailures =
       t.sortOrder.flatMap(o => VectorSortPlanner.compileKey(o, t.child.output).left.toOption.map(r => s"${o.sql}: $r"))
-    // Spark's own row projection applies `projectList`; the batch built from the rows carries any lane type (a wide decimal included, #259).
-    val outputFailures = t.projectList.filterNot(e => TypeMapping.hasLane(e.dataType)).map(e =>
+    // Spark's own row projection applies `projectList`; the batch built from the rows carries any lane type (a wide
+    // decimal included, #259) and an array, map or struct (#705).
+    val outputFailures = t.projectList.filterNot(e => TypeMapping.carriesNested(e.dataType)).map(e =>
       s"unsupported output type ${e.dataType.simpleString} for ${e.name}"
     )
     if (t.offset != 0) Left(s"offset ${t.offset} not supported")
