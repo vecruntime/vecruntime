@@ -242,9 +242,15 @@ case class VectorExecRule(session: SparkSession) extends Rule[SparkPlan] with Lo
             if VectorConf.broadcastExchangeEnabled(conf) && !VectorConf.cometMixedEnabled(conf) &&
               (b.mode.isInstanceOf[org.apache.spark.sql.execution.joins.HashedRelationBroadcastMode] ||
                 b.mode == org.apache.spark.sql.catalyst.plans.physical.IdentityBroadcastMode) &&
-              (ours(b.child) || b.child.supportsColumnar) && laneTypeReason(b.child).isEmpty =>
+              (ours(b.child) || b.child.supportsColumnar) &&
+              laneTypeReason(
+                b.child,
+                // An array, map or struct column (#705) crosses in Arrow's nested layout; the hash joins hold it
+                // in their build row stores. The nested-loop join's broadcast still needs lanes everywhere.
+                nested = b.mode.isInstanceOf[org.apache.spark.sql.execution.joins.HashedRelationBroadcastMode]
+              ).isEmpty =>
           // Over our plan, or a columnar source (Spark's vectorized scan): its batches are read through the
-          // adapter seam as any input of ours is; every column needs a lane, as the join's build side does.
+          // adapter seam as any input of ours is; every column needs a lane, or is nested payload as above.
           VectorBroadcastExchangeExec(b.mode, b.child)
 
         case l: LocalLimitExec if VectorConf.limitEnabled(conf) =>
