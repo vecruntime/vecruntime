@@ -166,22 +166,50 @@ object VectorBroadcastBatches {
     val out = new Array[ColumnVector](types.length)
     var c = 0
     while (c < types.length) {
-      val v = ArrowOutput.newVector(names(c), types(c), allocator)
-      root.getVector(c).makeTransferPair(v).transfer()
-      out(c) = ArrowOutput.wrap(v, types(c))
+      val src = root.getVector(c)
+      if (isNested(types(c))) {
+        // An array, map or struct (#705): Arrow's own list / map / struct vector, read through Spark's adapter.
+        val v = src.getField.createVector(allocator)
+        src.makeTransferPair(v).transfer()
+        out(c) = new org.apache.spark.sql.vectorized.ArrowColumnVector(v)
+      } else {
+        val v = ArrowOutput.newVector(names(c), types(c), allocator)
+        src.makeTransferPair(v).transfer()
+        out(c) = ArrowOutput.wrap(v, types(c))
+      }
       c += 1
     }
     new ColumnarBatch(out, root.getRowCount)
   }
 
+  /** A column the stream carries in Arrow's nested layout rather than as one of our lanes (#705). */
+  private[vecruntime] def isNested(dt: DataType): Boolean = !io.vecruntime.spark.adapter.TypeMapping.hasLane(dt)
+
+  /** The stream's vector for column `c`: one of our lanes, or Spark's Arrow mapping of a nested type. */
+  private def newRootVector(
+      name: String,
+      dt: DataType,
+      allocator: org.apache.arrow.memory.BufferAllocator
+  ): org.apache.arrow.vector.FieldVector =
+    if (isNested(dt))
+      org.apache.spark.sql.util.ArrowUtils.toArrowField(name, dt, nullable = true, "UTC", largeVarTypes = false)
+        .createVector(allocator)
+    else ArrowOutput.newVector(name, dt, allocator)
+
   /**
    * One partition's batches as one Arrow IPC stream: each batch's rows (its selection applied, if it
-   * carries one) copied into Arrow vectors and written as a record batch. Returns (rows, bytes).
+   * carries one) copied into Arrow vectors and written as a record batch. Returns (rows, bytes). An
+   * array, map or struct column (#705) is written row by row through Spark's own Arrow field writer: a
+   * broadcast side is small, and the writer is the mapping Spark's Arrow readers expect.
    */
   def write(iter: Iterator[ColumnarBatch], names: Array[String], types: Array[DataType]): (Long, Array[Byte]) = {
     val allocator = VectorAllocators.newChild("VectorBroadcastExchangeExec.write")
     val bytes = new ByteArrayOutputStream()
-    val root = VectorSchemaRoot.of(names.indices.map(c => ArrowOutput.newVector(names(c), types(c), allocator)): _*)
+    val root = VectorSchemaRoot.of(names.indices.map(c => newRootVector(names(c), types(c), allocator)): _*)
+    val nestedWriters = types.indices.map(c =>
+      if (isNested(types(c))) org.apache.spark.sql.execution.arrow.ArrowWriter.createFieldWriter(root.getVector(c))
+      else null
+    ).toArray
     val writer = new ArrowStreamWriter(root, null, Channels.newChannel(bytes))
     var rows = 0L
     try {
@@ -194,17 +222,30 @@ object VectorBroadcastBatches {
             if (n > 0) {
               var c = 0
               while (c < types.length) {
-                // A dictionary-encoded string column is decoded first: the stream carries plain vectors.
-                val raw = ctx.input(c)
-                val arena = if (raw.isDictionaryEncoded) java.lang.foreign.Arena.ofConfined() else null
-                try {
-                  val in = if (arena == null) raw else ArrowOutput.decodeDictionary(raw, arena)
-                  val col =
-                    if (ctx.selection == null) ArrowOutput.copy(names(c), types(c), in, allocator)
-                    else ArrowOutput.compact(names(c), types(c), in, ctx.selection, n, allocator)
-                  try AggregateSpill.vectorOf(col).makeTransferPair(root.getVector(c)).transfer()
-                  finally col.close()
-                } finally if (arena != null) arena.close()
+                val fw = nestedWriters(c)
+                if (fw != null) {
+                  fw.reset()
+                  val col = ctx.column(c)
+                  val one = new org.apache.spark.sql.vectorized.ColumnarArray(col, 0, ctx.numRows)
+                  var i = 0
+                  while (i < ctx.numRows) {
+                    if (ctx.selection == null || io.vecruntime.kernels.Bitmap.isSet(ctx.selection, i)) fw.write(one, i)
+                    i += 1
+                  }
+                  fw.finish()
+                } else {
+                  // A dictionary-encoded string column is decoded first: the stream carries plain vectors.
+                  val raw = ctx.input(c)
+                  val arena = if (raw.isDictionaryEncoded) java.lang.foreign.Arena.ofConfined() else null
+                  try {
+                    val in = if (arena == null) raw else ArrowOutput.decodeDictionary(raw, arena)
+                    val col =
+                      if (ctx.selection == null) ArrowOutput.copy(names(c), types(c), in, allocator)
+                      else ArrowOutput.compact(names(c), types(c), in, ctx.selection, n, allocator)
+                    try AggregateSpill.vectorOf(col).makeTransferPair(root.getVector(c)).transfer()
+                    finally col.close()
+                  } finally if (arena != null) arena.close()
+                }
                 c += 1
               }
               root.setRowCount(n)
