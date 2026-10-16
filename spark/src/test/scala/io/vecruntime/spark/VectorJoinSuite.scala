@@ -774,6 +774,37 @@ class VectorJoinSuite extends VectorQuerySuite {
     )
   }
 
+  test("#771: CASE WHEN build keys while the build side spills, over columns null on whole batches") {
+    // q14b's shape at 3 TB: a shuffled hash join spilling its build side while it evaluates a CASE WHEN key.
+    // The key's branches read columns that are entirely null in some batches (an all-null int, a filtered-out
+    // value), so their lanes can arrive with no data at all.
+    val dimNulls = newTempPath("j771/dim")
+    spark.range(0, 2000).selectExpr(
+      "cast(id % 50 as int) as di",
+      "case when id < 1000 then cast(null as int) else cast(id % 50 as int) end as dn",
+      "concat('name', id) as name"
+    ).repartition(4, org.apache.spark.sql.functions.col("di")).write.mode("overwrite").parquet(dimNulls)
+    spark.read.parquet(dimNulls).createOrReplaceTempView("dim771")
+    withConf(VectorConf.JoinSpillBytes -> "1", VectorConf.JoinSpillBuckets -> "4") {
+      // q14b's exact keys: INTERSECT is a null-safe left semi join, keyed coalesce(x, 0) and isnull(x) per column.
+      checkVectorized(
+        "SELECT /*+ SHUFFLE_HASH(d) */ tk.i50 FROM tk LEFT SEMI JOIN dim771 d " +
+          "ON coalesce(tk.i50, 0) = coalesce(d.dn, 0) AND isnull(tk.i50) = isnull(d.dn) WHERE tk.i < 800",
+        Seq(SHJ)
+      )
+      checkVectorized(
+        "SELECT /*+ SHUFFLE_HASH(d) */ tk.i, d.name FROM tk JOIN dim771 d " +
+          "ON tk.i50 = CASE WHEN d.dn IS NULL THEN d.di ELSE d.dn END",
+        Seq(SHJ)
+      )
+      checkVectorized(
+        "SELECT /*+ SHUFFLE_HASH(d) */ tk.i, d.name FROM tk JOIN dim771 d " +
+          "ON tk.i50 = CASE WHEN d.di > 25 THEN d.dn WHEN d.di > 10 THEN d.di END",
+        Seq(SHJ)
+      )
+    }
+  }
+
   test(
     "#416: a build side past spark.vecruntime.join.spillBytes splits both sides into buckets on disk -- every join type"
   ) {

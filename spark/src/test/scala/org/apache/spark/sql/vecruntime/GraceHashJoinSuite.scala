@@ -189,8 +189,8 @@ class GraceHashJoinSuite extends AnyFunSuite {
     var asked = 0
     val build =
       intSide("bk", heldRows + 4 * 8192, perKey = 4)(emitted => if (emitted > heldRows && window == 0) window = 1)
-    // The hold loop's condition asks hasNext once more right after the overflowing batch; the drain loop's
-    // call is the second one, and the held spill lies between the two.
+    // Since #771 the hold loop stops at the overflowing batch without asking hasNext again: the held spill lies
+    // before the drain loop's first call, and the window closes at its second.
     val wrapped = new Iterator[ColumnarBatch] {
       override def hasNext: Boolean = {
         if (window == 1) { asked += 1; if (asked == 2) window = 2 }
@@ -232,6 +232,52 @@ class GraceHashJoinSuite extends AnyFunSuite {
     val growth = (peakUsed - startUsed) / 1048576.0
     // 2 x 1 MB of hash and id scratch, reused across slices, plus per-slice Arrow objects; 128 MB before.
     assert(growth < 32, f"heap grew by $growth%.1f MB while bucketing the held rows")
+  }
+
+  test("#771: the batch that overflows the budget is spilled before the build side is asked for another") {
+    // Our shuffle reader closes the last batch it handed out when hasNext finds the stream ended
+    // (VectorShuffleManager closes the reader, PartitionedIpcFile.close() closes `last`). The hold loop asked
+    // hasNext once more after the overflowing batch, so when that batch ended its stream it was released
+    // before it was spilled: q14b at 3 TB read past a 0-byte buffer. Every build batch here is the last of
+    // its stream and closes on the next hasNext; the result must be the in-memory join's.
+    val allocator = new org.apache.arrow.memory.RootAllocator()
+    try {
+      def streamOfOne(base: Int, n: Int): Iterator[ColumnarBatch] = new Iterator[ColumnarBatch] {
+        private var handed: ColumnarBatch = null
+        private var done = false
+        override def hasNext: Boolean = {
+          if (handed != null && !done) { handed.close(); done = true } // the reader closes `last` at the end
+          handed == null
+        }
+        override def next(): ColumnarBatch = {
+          val v = new org.apache.arrow.vector.IntVector("bk", allocator)
+          v.allocateNew(n)
+          var i = 0
+          while (i < n) { v.set(i, ((((base + i) / 4) * 2654435761L) & 0x3fffffffL).toInt); i += 1 }
+          v.setValueCount(n)
+          handed = new ColumnarBatch(Array(new io.vecruntime.spark.arrow.VectorArrowColumnVector(v)), n)
+          handed
+        }
+      }
+      // Four streams of 8192 rows, as AQE's coalesced read chains the shuffle blocks of several map tasks.
+      def build(): Iterator[ColumnarBatch] = (0 until 4).iterator.flatMap(s => streamOfOne(s * 8192, 8192))
+      def run(budget: Long): (Long, Long) = {
+        val ctx = new RecordingTaskContext
+        TaskContext.setTaskContext(ctx)
+        try {
+          val out = rowsOf(
+            GraceHashJoin.iterator(build(), intSide("k", 16384, perKey = 4)(), intSpec, metrics, budget, 8),
+            _.getInt(_)
+          )
+          ctx.complete()
+          out
+        } finally TaskContext.unset()
+      }
+      val expected = run(Long.MaxValue)
+      assert(expected._1 === 16384L * 4)
+      // The first batch overflows (1 byte), or a later one does (the second, then the fourth, the last of all).
+      for (budget <- Seq(1L, 40L * 1024, 120L * 1024)) assert(run(budget) === expected, s"budget $budget")
+    } finally allocator.close()
   }
 
   /** A task context that records the completion listeners and runs them on `complete()`; nothing else. */
