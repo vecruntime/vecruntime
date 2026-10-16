@@ -354,7 +354,7 @@ object ExpressionCompiler {
     // A collated string (#705) rides the UTF8 lane only to be carried: whatever compares, hashes, orders,
     // matches or maps its characters follows the collation, not the bytes, and stays Spark's. A null test
     // reads only validity.
-    case e if collatedOperand(e) && !(e.isInstanceOf[IsNull] || e.isInstanceOf[IsNotNull]) =>
+    case e if collatedOperand(e) && !(e.isInstanceOf[IsNull] || e.isInstanceOf[IsNotNull] || e.isInstanceOf[Alias]) =>
       Left(s"unsupported ${e.prettyName} over a collated string")
 
     // A scalar subquery result in any reference-free shape (the ScalarSubquery, a struct field of a

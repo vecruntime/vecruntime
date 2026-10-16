@@ -978,7 +978,7 @@ class VectorProjectSuite extends VectorQuerySuite {
     checkFallback(
       "SELECT upper(collate(s, 'UTF8_LCASE')) AS a FROM t",
       Seq(Project),
-      "collated string follows ICU rules"
+      "over a collated string"
     )
     checkFallback("SELECT trim(s FROM concat('s', s)) AS a FROM t", Seq(Project), "non-literal trim string")
   }
