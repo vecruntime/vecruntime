@@ -83,6 +83,38 @@ class VectorNestedJoinSuite extends VectorQuerySuite {
     }
   }
 
+  test("shuffled hash join: array and struct keys by their bytes, every join type, null keys never matching") {
+    // Struct (k % 50, 's' || k % 7) and array (k % 40, null) keys on both sides, nulls on both; Spark's key equality
+    // is field by field and element by element, a null field equal to a null field.
+    spark.range(0, 3000).selectExpr(
+      "cast(id as int) as k",
+      "case when id % 11 = 0 then null else named_struct('a', cast(id % 50 as int), 'b', concat('s', id % 7)) end as sk",
+      "case when id % 13 = 0 then null else array(cast(id % 40 as int), cast(null as int)) end as ak"
+    ).repartition(3).write.mode("overwrite").parquet(newTempPath("nj/keys_left"))
+    spark.range(0, 400).selectExpr(
+      "cast(id as int) as d",
+      "case when id % 9 = 0 then null else named_struct('a', cast(id % 50 as int), 'b', concat('s', id % 7)) end as sk2",
+      "case when id % 5 = 0 then null else array(cast(id % 40 as int), cast(null as int)) end as ak2"
+    ).repartition(2).write.mode("overwrite").parquet(newTempPath("nj/keys_right"))
+    spark.read.parquet(newTempPath("nj/keys_left")).createOrReplaceTempView("nkl")
+    spark.read.parquet(newTempPath("nj/keys_right")).createOrReplaceTempView("nkr")
+    for (jt <- Seq("", "LEFT", "RIGHT", "FULL")) {
+      checkVectorized(
+        s"SELECT /*+ SHUFFLE_HASH(nkr) */ k, sk, d FROM nkl $jt JOIN nkr ON sk = sk2",
+        Seq(classOf[VectorShuffledHashJoinExec])
+      )
+    }
+    // An array key beside a narrow one; an anti join on a struct key.
+    checkVectorized(
+      "SELECT /*+ SHUFFLE_HASH(nkr) */ k, ak, d FROM nkl JOIN nkr ON ak = ak2 AND k % 50 = d % 50",
+      Seq(classOf[VectorShuffledHashJoinExec])
+    )
+    checkVectorized(
+      "SELECT /*+ SHUFFLE_HASH(nkr) */ k FROM nkl LEFT ANTI JOIN nkr ON sk = sk2",
+      Seq(classOf[VectorShuffledHashJoinExec])
+    )
+  }
+
   test("sort-merge join: nested payload on both sides, inner, outer and semi, runs spanning batches") {
     for (jt <- Seq("", "LEFT", "RIGHT", "FULL")) {
       checkVectorized(
