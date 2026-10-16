@@ -300,8 +300,9 @@ case class VectorExecRule(session: SparkSession) extends Rule[SparkPlan] with Lo
         case s: SortExec if VectorConf.sortEnabled(conf) =>
           // Only over a columnar child: a sort above Spark's row shuffle would need a
           // RowToColumnarExec first and gain nothing over Spark's own sort. The sort only moves
-          // its columns (append, order, gather), so a DECIMAL128 lane is as good as any (#257).
-          laneInputReason(s.child) match {
+          // its columns (append, order, gather), so a DECIMAL128 lane is as good as any (#257), and so is an
+          // array, map or struct payload column (#705, sorted in one in-memory run).
+          laneInputReason(s.child, nested = true) match {
             case Some(reason) => fallback(s, reason)
             case None =>
               VectorSortPlanner.plan(s) match {
