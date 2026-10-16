@@ -719,4 +719,40 @@ object VectorConf {
 
   def uiRetainedExecutions(get: String => Option[String]): Int =
     get(UiRetainedExecutions).flatMap(v => scala.util.Try(v.trim.toInt).toOption).filter(_ > 0).getOrElse(100)
+
+  val ShuffleInitialPartitionsPerCore = "spark.vecruntime.shuffle.initialPartitionsPerCore"
+  private val InitialPartitionNum = "spark.sql.adaptive.coalescePartitions.initialPartitionNum"
+
+  /**
+   * The shuffle partition count AQE starts from (#689), set by the driver plugin before any session exists:
+   * `perCore` (`spark.vecruntime.shuffle.initialPartitionsPerCore`, default 8) times the executor cores, when
+   * that is more than `spark.sql.shuffle.partitions`. AQE coalesces the partitions back to its advisory size
+   * (`spark.sql.adaptive.advisoryPartitionSizeInBytes`), so a small stage ends up with as few tasks as before,
+   * while a large aggregate or join stage keeps enough partitions to fit its tasks in memory: at 3 TB with 23
+   * executors x 5 cores, q78 and q67 spill 201 GB and 235 GB at 200 partitions and nothing when AQE starts from
+   * 900.
+   *
+   * `None` -- nothing is set -- when the user set `initialPartitionNum`, AQE or its coalescing is off, the core
+   * count is not known up front (dynamic allocation without `maxExecutors`, or no `spark.executor.instances`),
+   * the factor is 0, or the result would not raise `spark.sql.shuffle.partitions`.
+   */
+  def initialShufflePartitions(get: String => Option[String]): Option[Int] = {
+    def flag(key: String, default: Boolean) = get(key).map(_.trim.equalsIgnoreCase("true")).getOrElse(default)
+    def int(key: String) = get(key).flatMap(v => scala.util.Try(v.trim.toInt).toOption)
+    val perCore = int(ShuffleInitialPartitionsPerCore).getOrElse(8)
+    val dynamic = flag("spark.dynamicAllocation.enabled", default = false)
+    val executors =
+      if (dynamic) int("spark.dynamicAllocation.maxExecutors").filter(_ < Int.MaxValue)
+      else int("spark.executor.instances")
+    val cores = int("spark.executor.cores").getOrElse(1)
+    val partitions = int("spark.sql.shuffle.partitions").getOrElse(200)
+    if (get(InitialPartitionNum).isDefined) None
+    else if (!flag("spark.sql.adaptive.enabled", default = true)) None
+    else if (!flag("spark.sql.adaptive.coalescePartitions.enabled", default = true)) None
+    else if (perCore <= 0) None
+    else
+      executors.filter(_ > 0).map(e => e.toLong * cores * perCore).filter(_ > partitions).map(n =>
+        math.min(n, 100000L).toInt
+      )
+  }
 }
