@@ -26,7 +26,7 @@ any unsupported operator, expression or data type, always with a recorded reason
 
 ## Status
 
-Version 0.0.7, a preview release under the Apache License 2.0 (see `LICENSE` and `NOTICE`). VecRuntime runs
+Version 0.0.8, a preview release under the Apache License 2.0 (see `LICENSE` and `NOTICE`). VecRuntime runs
 the whole of TPC-DS (103 queries) and TPC-H (22) and returns Spark's results. Benchmark results, with the
 hardware and settings behind them, are on the [project site](https://vecruntime.github.io/vecruntime/):
 [TPC-DS 1 TB on x86](https://vecruntime.github.io/vecruntime/benchmarks/tpcds-1tb.html),
@@ -49,8 +49,8 @@ Maven repository served from this repository's `maven-repo` branch, with no acco
 
 | Spark | plugin | columnar shuffle |
 |---|---|---|
-| 4.1 | `io.github.vecruntime:vecruntime-spark_4.1_2.13:0.0.7` | `io.github.vecruntime:vecruntime-shuffle_4.1_2.13:0.0.7` |
-| 4.2 | `io.github.vecruntime:vecruntime-spark_4.2_2.13:0.0.7` | `io.github.vecruntime:vecruntime-shuffle_4.2_2.13:0.0.7` |
+| 4.1 | `io.github.vecruntime:vecruntime-spark_4.1_2.13:0.0.8` | `io.github.vecruntime:vecruntime-shuffle_4.1_2.13:0.0.8` |
+| 4.2 | `io.github.vecruntime:vecruntime-spark_4.2_2.13:0.0.8` | `io.github.vecruntime:vecruntime-shuffle_4.2_2.13:0.0.8` |
 
 ```xml
 <repositories>
@@ -64,7 +64,7 @@ Maven repository served from this repository's `maven-repo` branch, with no acco
   <dependency>
     <groupId>io.github.vecruntime</groupId>
     <artifactId>vecruntime-spark_4.1_2.13</artifactId>   <!-- or vecruntime-spark_4.2_2.13 -->
-    <version>0.0.7</version>
+    <version>0.0.8</version>
   </dependency>
 </dependencies>
 ```
@@ -74,7 +74,7 @@ Maven repository served from this repository's `maven-repo` branch, with no acco
 ```bash
 spark-submit \
   --repositories https://raw.githubusercontent.com/vecruntime/vecruntime/maven-repo/ \
-  --packages io.github.vecruntime:vecruntime-spark_4.1_2.13:0.0.7 \
+  --packages io.github.vecruntime:vecruntime-spark_4.1_2.13:0.0.8 \
   --conf spark.plugins=io.vecruntime.spark.VectorPlugin \
   --conf spark.driver.extraJavaOptions="--add-modules=jdk.incubator.vector --enable-native-access=ALL-UNNAMED --sun-misc-unsafe-memory-access=allow" \
   --conf spark.executor.extraJavaOptions="--add-modules=jdk.incubator.vector --enable-native-access=ALL-UNNAMED --sun-misc-unsafe-memory-access=allow" \
