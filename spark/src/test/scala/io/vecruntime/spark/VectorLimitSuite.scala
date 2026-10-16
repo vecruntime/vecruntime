@@ -141,7 +141,8 @@ class VectorLimitSuite extends VectorQuerySuite {
     assert(nodesOf[VectorCollectLimitExec](df).nonEmpty, finalPlan(df).treeString)
     val got = df.collect()
     assert(got.length === 37)
-    val all = withPlugin(enabled = false)(spark.sql("SELECT k, a, st, m FROM ln").collect()).map(r => r.getInt(0) -> r).toMap
+    val all =
+      withPlugin(enabled = false)(spark.sql("SELECT k, a, st, m FROM ln").collect()).map(r => r.getInt(0) -> r).toMap
     got.foreach(r => assert(all(r.getInt(0)) == r, r.toString))
     // Under a filter's selection: the limit compacts the lanes and remaps the nested columns by the same rows.
     val filtered = withPlugin(enabled = true) {
