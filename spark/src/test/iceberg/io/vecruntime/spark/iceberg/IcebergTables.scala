@@ -153,11 +153,15 @@ object IcebergTables {
    * it as a row delta, the way a streaming CDC writer would. The delete gets a sequence number
    * above every existing data file, so it applies to all of them.
    */
-  def addEqualityDeletes(spark: SparkSession, name: String, keys: Seq[Int]): Unit = {
+  def addEqualityDeletes(spark: SparkSession, name: String, keys: Seq[Int]): Unit =
+    addEqualityDeletesOn(spark, name, "i", keys.map(Int.box))
+
+  /** As [[addEqualityDeletes]], on column `column` with the given values (Iceberg's Java values; null allowed). */
+  def addEqualityDeletesOn(spark: SparkSession, name: String, column: String, values: Seq[Any]): Unit = {
     val table: Table = Spark3Util.loadIcebergTable(spark, name)
     val schema = table.schema()
-    val keyField = schema.findField("i")
-    val deleteSchema = schema.select("i")
+    val keyField = schema.findField(column)
+    val deleteSchema = schema.select(column)
     // Iceberg 1.12 dropped GenericAppenderFactory; its writer factory goes through the format-model registry.
     val factory = new GenericFileWriterFactory.Builder(table)
       .deleteFileFormat(FileFormat.PARQUET)
@@ -167,9 +171,9 @@ object IcebergTables {
     val outputFile = OutputFileFactory.builderFor(table, 1, 1).format(FileFormat.PARQUET).build().newOutputFile()
     val writer = factory.newEqualityDeleteWriter(outputFile, table.spec(), null)
     try {
-      keys.foreach { k =>
+      values.foreach { v =>
         val record = GenericRecord.create(deleteSchema)
-        record.setField("i", Int.box(k))
+        record.setField(column, v)
         writer.write(record)
       }
     } finally {
