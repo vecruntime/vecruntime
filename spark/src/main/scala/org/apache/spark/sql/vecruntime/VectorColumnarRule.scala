@@ -196,7 +196,7 @@ case class VectorExecRule(session: SparkSession) extends Rule[SparkPlan] with Lo
           VectorStructuralPlanner.planUnion(u).fold(reason => fallback(u, reason), v => v)
 
         case c: CoalesceExec if VectorConf.coalesceEnabled(conf) =>
-          laneInputReason(c.child) match {
+          laneInputReason(c.child, nested = true) match { // batches pass through whole: nested columns too (#705)
             case Some(reason) => fallback(c, reason)
             case None => VectorStructuralPlanner.planCoalesce(c).fold(reason => fallback(c, reason), v => v)
           }

@@ -183,4 +183,19 @@ class VectorUnionSuite extends VectorQuerySuite {
       assert(nodesOf[CoalesceExec](df).nonEmpty)
     }
   }
+
+  test("coalesce passes array, map and struct columns through, a sort above it ours (#705)") {
+    spark.range(0, 3000).selectExpr(
+      "cast(id as int) as k",
+      "case when id % 7 = 0 then null else array(cast(id as int), cast(null as int)) end as a",
+      "case when id % 5 = 0 then null else named_struct('s', concat('v', id), 'l', array(id % 4)) end as st",
+      "case when id % 6 = 0 then null else map(concat('k', id % 9), cast(id as double)) end as m"
+    ).repartition(4).write.mode("overwrite").parquet(newTempPath("union/nested"))
+    spark.read.parquet(newTempPath("union/nested")).createOrReplaceTempView("cn")
+    val sql = "SELECT /*+ COALESCE(1) */ k, a, st, m FROM cn SORT BY k"
+    val df = checkVectorized(sql, Seq(Coalesce, classOf[org.apache.spark.sql.vecruntime.VectorSortExec]))
+    // One partition sorted: the order is total, compared in order.
+    assert(df.collect().toSeq == withPlugin(enabled = false)(spark.sql(sql).collect().toSeq))
+    checkVectorized("SELECT /*+ COALESCE(2) */ k, a, m FROM cn WHERE k % 3 = 0", Seq(Coalesce))
+  }
 }
