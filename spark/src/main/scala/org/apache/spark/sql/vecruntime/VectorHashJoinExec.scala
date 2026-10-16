@@ -1615,12 +1615,18 @@ object VectorJoinPlanner {
   private val keyTypes: Set[VecType] =
     Set(VecType.INT32, VecType.INT64, VecType.BOOL, VecType.UTF8, VecType.FLOAT64, VecType.DECIMAL128)
 
-  def compileKeys(keys: Seq[Expression], input: Seq[Attribute], nested: Boolean = false): Array[VectorExpr] =
+  def compileKeys(
+      keys: Seq[Expression],
+      input: Seq[Attribute],
+      nested: Boolean = false,
+      ordered: Boolean = false
+  ): Array[VectorExpr] =
     keys.map(k =>
       compileKey(
         k,
         input,
-        nested
+        nested,
+        ordered
       ).fold(r => throw new IllegalStateException(s"cannot vectorize join key ${k.sql}: $r"), identity)
     ).toArray
 
@@ -1628,11 +1634,20 @@ object VectorJoinPlanner {
    * With `nested` (the shuffled hash join, #705), an array or struct key is its canonical bytes on the UTF8 lane
    * ([[io.vecruntime.spark.expr.NestedKeyBytesExpr]]): the table hashes and compares them as a string key, byte
    * equality being Spark's key equality (an UnsafeRow comparison, null fields equal), and a null key is a null
-   * lane, skipped as Spark's `anyNull` skips it. Not for the merge join, which orders runs by the key: the bytes
-   * do not sort as Spark sorts arrays and structs.
+   * lane, skipped as Spark's `anyNull` skips it. Those bytes do not sort as Spark sorts arrays and structs, so the
+   * merge join, which walks both sides in key order, asks for `ordered` keys instead: the order-preserving bytes
+   * ([[io.vecruntime.spark.expr.NestedSortKeyExpr]]), compared unsigned as a string key, which is Spark's ordering
+   * of the value -- and equal exactly when that ordering says equal, -0.0 and 0.0, NaN and NaN included.
    */
-  def compileKey(key: Expression, input: Seq[Attribute], nested: Boolean = false): Either[String, VectorExpr] =
-    if (nested && io.vecruntime.spark.expr.NestedKeyBytesExpr.supports(key.dataType))
+  def compileKey(
+      key: Expression,
+      input: Seq[Attribute],
+      nested: Boolean = false,
+      ordered: Boolean = false
+  ): Either[String, VectorExpr] =
+    if (ordered && io.vecruntime.spark.expr.NestedSortKeyExpr.supports(key.dataType))
+      ExpressionCompiler.compileProjection(key, input).map(io.vecruntime.spark.expr.NestedSortKeyExpr(_, key.dataType))
+    else if (nested && io.vecruntime.spark.expr.NestedKeyBytesExpr.supports(key.dataType))
       ExpressionCompiler.compileProjection(key, input).map(io.vecruntime.spark.expr.NestedKeyBytesExpr(_, key.dataType))
     else ExpressionCompiler.compileLaneColumn(key, input).flatMap {
       case _: LiteralExpr => Left("literal join key")
@@ -1803,11 +1818,13 @@ object VectorJoinPlanner {
         case other => Left(s"join type $other not supported")
       }
       typeOk.flatMap { _ =>
-        val keyFailures = j.leftKeys.flatMap(k => compileKey(k, j.left.output).left.toOption) ++ j.rightKeys.flatMap(
-          k => compileKey(k, j.right.output).left.toOption
-        )
-        // Keys are compiled above (lanes only); a payload column may also be an array, map or struct (#705),
-        // copied by the column builders' nested lanes and gathered as a nested lane.
+        val keyFailures =
+          j.leftKeys.flatMap(k => compileKey(k, j.left.output, ordered = true).left.toOption) ++ j.rightKeys.flatMap(
+            k => compileKey(k, j.right.output, ordered = true).left.toOption
+          )
+        // Keys are compiled above (lanes, or an array or struct by its order-preserving bytes, #705); a payload
+        // column may also be an array, map or struct, copied by the column builders' nested lanes and gathered as
+        // a nested lane.
         val laneless = (j.left.output ++ j.right.output).filterNot(a => TypeMapping.carriesNested(a.dataType))
         if (keyFailures.nonEmpty) Left(keyFailures.mkString("; "))
         else if (laneless.nonEmpty)

@@ -113,6 +113,28 @@ class VectorNestedJoinSuite extends VectorQuerySuite {
       "SELECT /*+ SHUFFLE_HASH(nkr) */ k FROM nkl LEFT ANTI JOIN nkr ON sk = sk2",
       Seq(classOf[VectorShuffledHashJoinExec])
     )
+    // The merge join (#705): the same keys by their order-preserving bytes, both sides sorted on them by our sort.
+    withConf(io.vecruntime.spark.VectorConf.SortMergeJoinMode -> "merge") {
+      for (jt <- Seq("", "LEFT", "RIGHT", "FULL")) {
+        checkVectorized(
+          s"SELECT /*+ MERGE(nkr) */ k, sk, d FROM nkl $jt JOIN nkr ON sk = sk2",
+          Seq(classOf[VectorSortMergeJoinExec])
+        )
+      }
+      checkVectorized(
+        "SELECT /*+ MERGE(nkr) */ k, ak, d FROM nkl JOIN nkr ON ak = ak2 AND k % 50 = d % 50",
+        Seq(classOf[VectorSortMergeJoinExec])
+      )
+      checkVectorized(
+        "SELECT /*+ MERGE(nkr) */ k FROM nkl LEFT ANTI JOIN nkr ON sk = sk2",
+        Seq(classOf[VectorSortMergeJoinExec])
+      )
+      // The left side's unmatched rows carry its nested payload (the left-only emit gathers nested lanes).
+      checkVectorized(
+        "SELECT /*+ MERGE(nkr) */ k, sk, ak FROM nkl LEFT ANTI JOIN nkr ON ak = ak2",
+        Seq(classOf[VectorSortMergeJoinExec])
+      )
+    }
   }
 
   test("sort-merge join: nested payload on both sides, inner, outer and semi, runs spanning batches") {
