@@ -51,6 +51,12 @@ class VectorPlugin extends SparkPlugin {
           s"spark-vector: AQE starts from $n shuffle partitions (spark.vecruntime.shuffle.initialPartitionsPerCore)"
         )
       }
+      // #788: a stage AQE submitted just before its query returned is cancelled, not left to run under the next.
+      if (VectorConf.cancelEndedExecutionJobs(get)) {
+        sc.addSparkListener(new org.apache.spark.sql.vecruntime.EndedExecutionJobCanceller((job, reason) =>
+          sc.cancelJob(job, reason)
+        ))
+      }
       org.apache.spark.sql.vecruntime.ui.VectorUi.attach(
         sc,
         enabled = VectorConf.uiEnabled(get),
