@@ -1739,7 +1739,16 @@ object ExpressionCompiler {
         _ <- if (le.isInstanceOf[LiteralExpr] && re.isInstanceOf[LiteralExpr]) Left("arithmetic on two literals")
         else Right(())
       } yield (le, re)
+    // A wide operand that is not itself speculative arithmetic (a wide column, a cast to a wide decimal --
+    // CountBelowJoin's `cast(count as decimal(20,0))`, #762) leaves the expression to the 128-bit kernels
+    // (#258): None, not a refusal.
+    def speculable(o: Expression): Boolean =
+      TypeMapping.isSupported(o.dataType) || speculativeDecimalArithmetic(o, input).isDefined
     e match {
+      case m @ Multiply(l, r, _) if !speculable(l) || !speculable(r) => None
+      case a: BinaryArithmetic
+          if (a.isInstanceOf[Add] || a.isInstanceOf[Subtract]) &&
+            (!speculable(a.left) || !speculable(a.right)) => None
       case m @ Multiply(l, r, _) =>
         // Spark 4.1's Multiply carries a NumericEvalContext; the mode lives inside it.
         val mode = m.evalContext.evalMode

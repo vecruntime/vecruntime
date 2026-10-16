@@ -557,6 +557,42 @@ class VectorWideDecimalSuite extends VectorQuerySuite {
       }
     }
   }
+
+  /**
+   * #762: a wide sum weighted by a count, as CountBelowJoin (#692) writes it -- `sum(x * cast(c as
+   * decimal(20,0)))` with `x` a wide column, a 38-digit product and sum -- and cast back to the sum's own
+   * type. Both stages are ours: the partial multiplies on the DECIMAL128 lane, the final casts the
+   * decimal(38, s) total down with Spark's overflow semantics.
+   */
+  test("a wide decimal sum weighted by a count, cast back to its type, both stages ours (#762)") {
+    val Agg = classOf[org.apache.spark.sql.vecruntime.VectorHashAggregateExec]
+    def bothStagesOurs(sql: String): Unit = {
+      val df = checkVectorized(sql, Seq(Agg))
+      val spark = nodesOf[org.apache.spark.sql.execution.aggregate.BaseAggregateExec](df)
+      assert(spark.isEmpty, s"a Spark aggregate is left: ${finalPlan(df).treeString}")
+      assert(nodesOf[org.apache.spark.sql.vecruntime.VectorHashAggregateExec](df).size >= 2, finalPlan(df).treeString)
+    }
+    for (ansi <- Seq("false", "true")) {
+      withConf("spark.sql.ansi.enabled" -> ansi) {
+        bothStagesOurs(
+          "SELECT i % 7 AS k, sum(w27 * cast(cast(i % 5 AS bigint) AS decimal(20,0))) AS s FROM tw_plain GROUP BY i % 7"
+        )
+        bothStagesOurs(
+          "SELECT i % 7 AS k, cast(sum(w27 * cast(cast(i % 5 AS bigint) AS decimal(20,0))) AS decimal(37,2)) AS s " +
+            "FROM tw_plain GROUP BY i % 7"
+        )
+        // q23's shape: the weighted value is itself a sum below (AggregateBelowJoin's partial, decimal(28,2) here
+        // from a decimal(18,2) product), weighted by a count and cast back to the outer sum's type.
+        bothStagesOurs(
+          "SELECT k, cast(sum(ps * cast(c AS decimal(20,0))) AS decimal(38,2)) AS s FROM (" +
+            "SELECT i % 7 AS k, cast(i % 5 AS bigint) AS c, " +
+            "sum(cast(i % 100 AS decimal(9,2)) * cast(i % 37 AS decimal(9,0))) AS ps " +
+            "FROM tw_plain GROUP BY i % 7, cast(i % 5 AS bigint)) GROUP BY k"
+        )
+      }
+    }
+  }
+
 }
 
 /** Sorting over the lane: the four-pass two-limb key order equals Spark's in every partition. */
@@ -609,4 +645,5 @@ class VectorWideDecimalSortSuite extends VectorQuerySuite {
   test("a computed expression over a wide decimal is a sort key since #258") {
     checkVectorized("SELECT w38, i FROM tws SORT BY w38 * 2", Seq(Sort))
   }
+
 }

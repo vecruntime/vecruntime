@@ -37,6 +37,7 @@ class CountBelowJoinSuite extends VectorQuerySuite {
       // decimal(7, 2) as ss_net_paid: Spark sums it as a long of unscaled values, which the rule can weigh.
       .withColumn("net_paid", org.apache.spark.sql.functions.col("net_paid").cast("decimal(7,2)"))
       .withColumn("wide_paid", org.apache.spark.sql.functions.col("net_paid").cast("decimal(17,2)"))
+      .withColumn("wider_paid", org.apache.spark.sql.functions.col("net_paid").cast("decimal(18,2)"))
       .write.mode("overwrite").parquet(newTempPath("cbj/sales"))
     (0 until 16000).map { i =>
       // A few null zips: dropped by the join, as each of their rows would be.
@@ -137,8 +138,8 @@ class CountBelowJoinSuite extends VectorQuerySuite {
       input.queryExecution.optimizedPlan.treeString
     )
     none("SELECT a_state, avg(qty) FROM cbj_sales JOIN cbj_address ON s_zip = a_zip GROUP BY a_state", shuffled)
-    // A decimal too wide to sum as a long: weighing it would need a 38-digit product (q23a at 3 TB, #692).
-    none("SELECT a_state, sum(wide_paid) FROM cbj_sales JOIN cbj_address ON s_zip = a_zip GROUP BY a_state", shuffled)
+    // A decimal whose product with the count could overflow 38 digits is left alone (#762).
+    none("SELECT a_state, sum(wider_paid) FROM cbj_sales JOIN cbj_address ON s_zip = a_zip GROUP BY a_state", shuffled)
     none(
       "SELECT a_state, count(DISTINCT qty) FROM cbj_sales JOIN cbj_address ON s_zip = a_zip GROUP BY a_state",
       shuffled
@@ -152,6 +153,29 @@ class CountBelowJoinSuite extends VectorQuerySuite {
       "SELECT a_state, sum(qty) FROM cbj_sales JOIN cbj_address ON s_zip = a_zip GROUP BY a_state",
       "spark.sql.autoBroadcastJoinThreshold" -> (64L << 20).toString
     )
+  }
+
+  test("a decimal(17,2) sum is weighted in 38 digits and cast back, every aggregate stage ours (#762)") {
+    // q23a's shape at 3 TB: a sum too wide for Spark's long rewrite, alone and beside a long sum and a count.
+    for (ansi <- Seq("false", "true")) {
+      val sql = "SELECT a_state, sum(wide_paid) w, sum(qty) q, count(*) n FROM cbj_sales JOIN cbj_address " +
+        "ON s_zip = a_zip GROUP BY a_state"
+      // AggregateBelowJoin pre-aggregates the sales side of this join first; off, the address side is collapsed
+      // and the sums are weighted. On, both rules apply as at 3 TB: the plan must stay ours either way.
+      val weighted =
+        run(sql, shuffled, "spark.sql.ansi.enabled" -> ansi, VectorConf.AggregateBelowJoinEnabled -> "false")
+      assert(
+        collapsed(weighted.queryExecution.optimizedPlan).size == 1,
+        weighted.queryExecution.optimizedPlan.treeString
+      )
+      for (df <- Seq(weighted, run(sql, shuffled, "spark.sql.ansi.enabled" -> ansi))) {
+        assert(df.schema("w").dataType == org.apache.spark.sql.types.DecimalType(27, 2), df.schema.treeString)
+        assert(
+          nodesOf[org.apache.spark.sql.execution.aggregate.BaseAggregateExec](df).isEmpty,
+          s"a Spark aggregate is left: ${finalPlan(df).treeString}"
+        )
+      }
+    }
   }
 
   private val withStats = q24Shape.replace("cbj_address", "cbj_address_stats")
