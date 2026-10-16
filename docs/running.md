@@ -134,7 +134,7 @@ their footprint by the same factor -- strict mode is the cheapest in memory as w
 | `spark.vecruntime.agg.passThroughRatio` | a partial aggregate whose full table reduced its input by less than this factor stops aggregating and passes each batch on (default `1.5`, `0` = never; #376). The exchange receives the same rows either way |
 | `spark.vecruntime.join.maxBuildSize` | the largest build side the hash joins take (per task, on the heap) |
 | `spark.vecruntime.shuffle.bufferBytes`, `spark.vecruntime.shuffle.flushBytes`, `spark.vecruntime.shuffle.batchBytes` | what a map task holds before writing (direct memory): across all partitions, per partition before its temporary file, per record batch |
-| `spark.sql.shuffle.partitions` | the size of a reduce task's input, hence of every table built from it: at 1 TB with 200 partitions a wide exchange hands a reducer several hundred MB of compressed input, and the final aggregate over it is the one that spills (#368 measures 1000 partitions with a 128 MB advisory size) |
+| `spark.sql.shuffle.partitions` | the size of a reduce task's input, hence of every table built from it: at 1 TB with 200 partitions a wide exchange hands a reducer several hundred MB of compressed input, and the final aggregate over it is the one that spills (#368 measures 1000 partitions with a 128 MB advisory size) With AQE on, the plugin starts it from 8 partitions per executor core and lets AQE coalesce (`spark.vecruntime.shuffle.initialPartitionsPerCore`, #689). |
 
 The sort holds runs of `spark.vecruntime.sort.runRows` rows and spills them as Arrow IPC once their bytes
 pass `spark.vecruntime.sort.spillBytes` (default 1 GiB, measured in #416; the runs are merged on the way

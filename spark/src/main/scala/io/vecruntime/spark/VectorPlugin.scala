@@ -44,6 +44,13 @@ class VectorPlugin extends SparkPlugin {
       }
       // The UI tab needs the SparkContext, which only exists here.
       val get: String => Option[String] = k => ctx.conf().getOption(k)
+      // #689: AQE starts from enough partitions for the executors' cores and coalesces down, unless set.
+      VectorConf.initialShufflePartitions(get).foreach { n =>
+        ctx.conf().set("spark.sql.adaptive.coalescePartitions.initialPartitionNum", n.toString)
+        logInfo(
+          s"spark-vector: AQE starts from $n shuffle partitions (spark.vecruntime.shuffle.initialPartitionsPerCore)"
+        )
+      }
       org.apache.spark.sql.vecruntime.ui.VectorUi.attach(
         sc,
         enabled = VectorConf.uiEnabled(get),

@@ -33,4 +33,31 @@ class VectorPluginSuite extends SparkVectorFunSuite {
     assert(df.count() === 1899)
     assert(PlanUtils.allNodes(df.queryExecution.executedPlan).exists(_.isInstanceOf[VectorFilterExec]))
   }
+
+  test("AQE starts from executor cores x initialPartitionsPerCore partitions (#689)") {
+    def init(conf: (String, String)*): Option[Int] = VectorConf.initialShufflePartitions(conf.toMap.get)
+    val cluster = Seq("spark.executor.instances" -> "23", "spark.executor.cores" -> "5")
+    // 23 x 5 x 8 = 920 > 200
+    assert(init(cluster: _*) === Some(920))
+    assert(init(cluster :+ ("spark.vecruntime.shuffle.initialPartitionsPerCore" -> "4"): _*) === Some(460))
+    // never below what the user asked for, and never over the user's own initialPartitionNum
+    assert(init(cluster :+ ("spark.sql.shuffle.partitions" -> "2000"): _*) === None)
+    assert(init(cluster :+ ("spark.sql.adaptive.coalescePartitions.initialPartitionNum" -> "300"): _*) === None)
+    // AQE or its coalescing off: the partition count is final, leave it
+    assert(init(cluster :+ ("spark.sql.adaptive.enabled" -> "false"): _*) === None)
+    assert(init(cluster :+ ("spark.sql.adaptive.coalescePartitions.enabled" -> "false"): _*) === None)
+    assert(init(cluster :+ ("spark.vecruntime.shuffle.initialPartitionsPerCore" -> "0"): _*) === None)
+    // cores unknown up front: local mode, dynamic allocation without a maximum
+    assert(init() === None)
+    assert(init("spark.dynamicAllocation.enabled" -> "true", "spark.executor.cores" -> "4") === None)
+    assert(
+      init(
+        "spark.dynamicAllocation.enabled" -> "true",
+        "spark.dynamicAllocation.maxExecutors" -> "10",
+        "spark.executor.cores" -> "4"
+      ) === Some(320)
+    )
+    // this session (local mode) is left as it was
+    assert(!spark.sparkContext.getConf.contains("spark.sql.adaptive.coalescePartitions.initialPartitionNum"))
+  }
 }
