@@ -20,7 +20,7 @@ ARG AWS_SDK_V2_VERSION=2.35.4
 # built against, and the one the Iceberg AWS bundle carries -- pinned here so S3A does not depend on that bundle.
 ARG AAL_VERSION=1.3.1
 ARG COMET_VERSION=1.0.0
-ARG ICEBERG_VERSION=1.11.0
+ARG ICEBERG_VERSION=1.12.0
 # Amazon Corretto Crypto Provider (#566): native AES-GCM / SHA-2 / HMAC for the S3 TLS + SigV4 path. On the
 # class path only; a run opts in with -Djava.security.properties=/opt/spark/accp/accp.security.
 ARG ACCP_VERSION=2.5.0
