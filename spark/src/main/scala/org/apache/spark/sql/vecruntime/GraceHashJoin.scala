@@ -80,7 +80,10 @@ object GraceHashJoin extends Logging {
     var total = 0
     // The batch that would have grown the builders past the budget: not appended, bucketed first below.
     var overflowBatch: ColumnarBatch = null
-    while (buildIter.hasNext && overflowBatch == null) {
+    // `overflowBatch == null` first (#771): once a batch overflows, the build side must not be asked for another
+    // before that batch is spilled. Our shuffle reader closes the last batch it handed out when hasNext finds
+    // its stream ended, which released the held batch's buffers (q14b at 3 TB read past a 0-byte segment).
+    while (overflowBatch == null && buildIter.hasNext) {
       val batch = buildIter.next()
       if (batch.numRows() > 0) {
         EvalContexts.withBatch(batch) { ctx =>
