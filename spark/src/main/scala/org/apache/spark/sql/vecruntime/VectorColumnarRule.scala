@@ -196,7 +196,7 @@ case class VectorExecRule(session: SparkSession) extends Rule[SparkPlan] with Lo
           VectorStructuralPlanner.planUnion(u).fold(reason => fallback(u, reason), v => v)
 
         case c: CoalesceExec if VectorConf.coalesceEnabled(conf) =>
-          laneInputReason(c.child) match {
+          laneInputReason(c.child, nested = true) match { // batches pass through whole: nested columns too (#705)
             case Some(reason) => fallback(c, reason)
             case None => VectorStructuralPlanner.planCoalesce(c).fold(reason => fallback(c, reason), v => v)
           }
@@ -271,7 +271,7 @@ case class VectorExecRule(session: SparkSession) extends Rule[SparkPlan] with Lo
         case t: TakeOrderedAndProjectExec if VectorConf.takeOrderedEnabled(conf) =>
           // ORDER BY ... LIMIT over a columnar child: the per-partition top-N is ours, the final
           // merge of at most limit rows per partition goes through Spark's single-partition shuffle.
-          laneInputReason(t.child) match {
+          laneInputReason(t.child, nested = true) match {
             case Some(reason) => fallback(t, reason)
             case None =>
               VectorTakeOrderedPlanner.plan(t) match {
@@ -1213,7 +1213,7 @@ case class VectorExecRule(session: SparkSession) extends Rule[SparkPlan] with Lo
         case org.apache.spark.sql.catalyst.optimizer.BuildLeft => j.leftKeys
         case org.apache.spark.sql.catalyst.optimizer.BuildRight => j.rightKeys
       }
-      payloadTypeReason(buildPlan, keys, j.condition)
+      payloadTypeReason(buildPlan, keys, j.condition, nestedKeys = !j.isNullAwareAntiJoin)
     }
 
   /**

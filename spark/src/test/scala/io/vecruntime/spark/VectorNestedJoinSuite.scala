@@ -113,6 +113,21 @@ class VectorNestedJoinSuite extends VectorQuerySuite {
       "SELECT /*+ SHUFFLE_HASH(nkr) */ k FROM nkl LEFT ANTI JOIN nkr ON sk = sk2",
       Seq(classOf[VectorShuffledHashJoinExec])
     )
+    // The broadcast join: the same keys, the build side's key column read from its row store.
+    for (jt <- Seq("", "LEFT", "LEFT SEMI", "LEFT ANTI")) {
+      checkVectorized(
+        s"SELECT /*+ BROADCAST(nkr) */ k, sk FROM nkl $jt JOIN nkr ON sk = sk2",
+        Seq(classOf[VectorBroadcastHashJoinExec])
+      )
+    }
+    checkVectorized(
+      "SELECT /*+ BROADCAST(nkl) */ k, d, ak2 FROM nkl RIGHT JOIN nkr ON ak = ak2",
+      Seq(classOf[VectorBroadcastHashJoinExec])
+    )
+    checkVectorized(
+      "SELECT /*+ BROADCAST(nkr) */ k, ak, d FROM nkl JOIN nkr ON ak = ak2 AND k % 50 = d % 50",
+      Seq(classOf[VectorBroadcastHashJoinExec])
+    )
     // The merge join (#705): the same keys by their order-preserving bytes, both sides sorted on them by our sort.
     withConf(io.vecruntime.spark.VectorConf.SortMergeJoinMode -> "merge") {
       for (jt <- Seq("", "LEFT", "RIGHT", "FULL")) {

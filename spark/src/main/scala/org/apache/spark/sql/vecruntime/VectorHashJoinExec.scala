@@ -176,6 +176,11 @@ case class VectorBroadcastHashJoinExec(
     override val isNullAwareAntiJoin: Boolean = false
 ) extends VectorHashJoinLike {
 
+  // Array and struct keys (#705) by their bytes, as the shuffled hash join: the build side's key column is read
+  // from the row store its broadcast rows are copied into (#547). Not under the null-aware anti join, whose
+  // singleton relations are decided by Spark on the key's own nulls.
+  override protected def nestedKeys: Boolean = !isNullAwareAntiJoin
+
   override def requiredChildDistribution: Seq[Distribution] = {
     val boundKeys = BindReferences.bindReferences(HashJoin.rewriteKeyExpr(buildKeys), buildPlan.output)
     // The same mode as Spark's operator, so the exchange already in the plan is the one required: a
@@ -1763,9 +1768,17 @@ object VectorJoinPlanner {
         j.right,
         j.isNullAwareAntiJoin
       )
-      check(j.leftKeys, j.rightKeys, j.joinType, j.buildSide, j.condition, j.left, j.right, preservedBuild = false).map(
-        _ => v
-      )
+      check(
+        j.leftKeys,
+        j.rightKeys,
+        j.joinType,
+        j.buildSide,
+        j.condition,
+        j.left,
+        j.right,
+        preservedBuild = false,
+        nestedKeys = !j.isNullAwareAntiJoin
+      ).map(_ => v)
     }
   }
 

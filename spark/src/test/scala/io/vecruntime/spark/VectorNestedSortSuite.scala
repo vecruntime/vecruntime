@@ -89,4 +89,18 @@ class VectorNestedSortSuite extends VectorQuerySuite {
     // Floats compared as strings: the harness's row equality cannot see NaN equal to NaN inside an array.
     checkSortedNested("SELECT cast(kd AS string) d, i FROM (SELECT kd, i FROM nk SORT BY kd, i)")
   }
+
+  test("a top-N: nested keys, nested payload and nested outputs (Spark's projection over the surviving rows)") {
+    val topN = Seq(classOf[org.apache.spark.sql.vecruntime.VectorTakeOrderedAndProjectExec])
+    def check(sql: String): Unit = {
+      val df = checkVectorized(sql, topN)
+      val expected = withPlugin(enabled = false)(spark.sql(sql).collect().toSeq)
+      assert(df.collect().toSeq == expected, sql)
+    }
+    check("SELECT ka, ks, i FROM nk ORDER BY ka DESC NULLS LAST, i LIMIT 40")
+    check("SELECT i, ks FROM nk ORDER BY ks, i DESC LIMIT 40")
+    // Payload of every nested kind, a map included, over a lane key; a projection building a nested output.
+    check("SELECT k, a, st, m FROM ns ORDER BY k DESC LIMIT 30")
+    check("SELECT k, named_struct('x', a, 'y', m) AS p FROM ns ORDER BY k LIMIT 30")
+  }
 }
