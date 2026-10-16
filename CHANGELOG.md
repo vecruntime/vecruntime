@@ -87,6 +87,10 @@ partitions per core (#790), q78 64.6 -> 46.7 s and q67 56.8 -> 33.3 s at 200 par
 
 ### Fixed
 
+- An aggregate with a `FILTER` clause reads a struct input again: its narrowed evaluation context had dropped
+  the batch's columns, so `count(DISTINCT 1), ..., count(DISTINCT (a, b))`, which Spark's distinct rewrite turns
+  into `FILTER` clauses over a struct, failed with "unsupported Spark type StructType" (golden files `count.sql`
+  and `udf/udf-count.sql`) (#793).
 - The driver cancels the jobs of a SQL execution that has ended
   (`spark.vecruntime.cancelEndedExecutionJobs`, default on): AQE could submit a scan stage just before a query
   with an empty relation returned, and the orphaned stage held every slot into the next query (q17 idle for
