@@ -110,7 +110,11 @@ object VectorSortPlanner {
    * wide decimal column (a DECIMAL128 lane the sort kernel orders limb by limb, #257).
    */
   def compileKey(order: SortOrder, input: Seq[Attribute]): Either[String, VectorExpr] =
-    ExpressionCompiler.compileLaneColumn(order.child, input).flatMap {
+    if (io.vecruntime.spark.expr.NestedSortKeyExpr.supports(order.child.dataType))
+      // An array or struct key (#705): its order-preserving bytes, sorted as a string key.
+      ExpressionCompiler.compileProjection(order.child, input)
+        .map(io.vecruntime.spark.expr.NestedSortKeyExpr(_, order.child.dataType))
+    else ExpressionCompiler.compileLaneColumn(order.child, input).flatMap {
       case _: LiteralExpr => Left("literal sort key")
       case k if !TypeMapping.hasLane(order.child.dataType) =>
         Left(s"sort key type ${order.child.dataType.simpleString} not supported")

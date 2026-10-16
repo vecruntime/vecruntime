@@ -66,4 +66,27 @@ class VectorNestedSortSuite extends VectorQuerySuite {
       checkSortedNested("SELECT k, a, st FROM ns1 SORT BY k")
     }
   }
+
+  test("array and struct sort keys order as Spark orders them, both directions and null orders") {
+    // Keys with prefixes (shorter first), null elements and fields (first), empty arrays, NaN / -0.0 / 0.0,
+    // strings with prefixes, empty strings and NUL bytes, negative decimals; `i` breaks ties for a total order.
+    spark.range(0, 3000).selectExpr(
+      "cast(id as int) as i",
+      "case when id % 13 = 0 then null when id % 11 = 0 then array() " +
+        "else slice(array(cast(id % 5 as int) - 2, case when id % 7 = 0 then null else cast(id % 3 as int) end, " +
+        "cast(id % 2 as int)), 1, cast(1 + id % 3 as int)) end as ka",
+      "array(case id % 5 when 0 then cast('NaN' as double) when 1 then -0.0D when 2 then 0.0D " +
+        "when 3 then -1.5D else 2.5D end) as kd",
+      "case when id % 17 = 0 then null else named_struct('s', case id % 4 when 0 then '' when 1 then 'a' " +
+        "when 2 then 'ab' else concat('a', char(0), 'b') end, 'n', case when id % 9 = 0 then null " +
+        "else cast((id % 7) - 3 as decimal(20,2)) end) end as ks"
+    ).repartition(1).write.mode("overwrite").parquet(newTempPath("nested-sort-keys"))
+    spark.read.parquet(newTempPath("nested-sort-keys")).createOrReplaceTempView("nk")
+    checkSortedNested("SELECT ka, i FROM nk SORT BY ka, i")
+    checkSortedNested("SELECT ka, i FROM nk SORT BY ka DESC NULLS LAST, i")
+    checkSortedNested("SELECT ks, i FROM nk SORT BY ks ASC NULLS LAST, i DESC")
+    checkSortedNested("SELECT ks, ka, i FROM nk SORT BY ks DESC, ka, i")
+    // Floats compared as strings: the harness's row equality cannot see NaN equal to NaN inside an array.
+    checkSortedNested("SELECT cast(kd AS string) d, i FROM (SELECT kd, i FROM nk SORT BY kd, i)")
+  }
 }
