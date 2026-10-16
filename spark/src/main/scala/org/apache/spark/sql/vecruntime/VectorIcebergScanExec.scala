@@ -90,17 +90,25 @@ case class VectorIcebergScanExec(scan: BatchScanExec, fieldIds: Seq[Int]) extend
         new MetadataBuilder().putLong(ParquetUtils.FIELD_ID_METADATA_KEY, id.toLong).build()
       )
     })
-    val hadoopConf = session.sessionState.newHadoopConf()
-    hadoopConf.set(ParquetReadSupport.SPARK_ROW_REQUESTED_SCHEMA, requiredSchema.json)
-    hadoopConf.set(
-      org.apache.spark.sql.execution.datasources.parquet.ParquetWriteSupport.SPARK_ROW_SCHEMA,
-      requiredSchema.json
-    )
-    hadoopConf.set(org.apache.parquet.hadoop.ParquetInputFormat.READ_SUPPORT_CLASS, classOf[ParquetReadSupport].getName)
-    hadoopConf.set(SQLConf.SESSION_LOCAL_TIMEZONE.key, sqlConf.sessionLocalTimeZone)
-    hadoopConf.setBoolean(SQLConf.CASE_SENSITIVE.key, sqlConf.caseSensitiveAnalysis)
-    hadoopConf.setBoolean(SQLConf.PARQUET_FIELD_ID_READ_ENABLED.key, true)
-    val confBroadcast = session.sparkContext.broadcast(new SerializableConfiguration(hadoopConf))
+    def confFor(schema: StructType) = {
+      val hadoopConf = session.sessionState.newHadoopConf()
+      // Spark's fallback reader takes the requested schema from the conf.
+      hadoopConf.set(ParquetReadSupport.SPARK_ROW_REQUESTED_SCHEMA, schema.json)
+      hadoopConf.set(
+        org.apache.spark.sql.execution.datasources.parquet.ParquetWriteSupport.SPARK_ROW_SCHEMA,
+        schema.json
+      )
+      hadoopConf.set(
+        org.apache.parquet.hadoop.ParquetInputFormat.READ_SUPPORT_CLASS,
+        classOf[ParquetReadSupport].getName
+      )
+      hadoopConf.set(SQLConf.SESSION_LOCAL_TIMEZONE.key, sqlConf.sessionLocalTimeZone)
+      hadoopConf.setBoolean(SQLConf.CASE_SENSITIVE.key, sqlConf.caseSensitiveAnalysis)
+      hadoopConf.setBoolean(SQLConf.PARQUET_FIELD_ID_READ_ENABLED.key, true)
+      session.sparkContext.broadcast(new SerializableConfiguration(hadoopConf))
+    }
+    val confBroadcast = confFor(requiredSchema)
+    val positionsConfBroadcast = confFor(VectorIcebergRDD.withPositions(requiredSchema))
 
     val m = ScanMetrics(
       longMetric("numFiles"),
@@ -116,6 +124,7 @@ case class VectorIcebergScanExec(scan: BatchScanExec, fieldIds: Seq[Int]) extend
       scan.readerFactory,
       fieldIds.toArray,
       confBroadcast,
+      positionsConfBroadcast,
       requiredSchema,
       output.map(a => (a.name, a.dataType)).toArray,
       math.max(64, sqlConf.parquetVectorizedReaderBatchSize / 64 * 64),
@@ -150,6 +159,7 @@ private[vecruntime] final class VectorIcebergRDD(
     readerFactory: PartitionReaderFactory,
     fieldIds: Array[Int],
     confBroadcast: org.apache.spark.broadcast.Broadcast[SerializableConfiguration],
+    positionsConfBroadcast: org.apache.spark.broadcast.Broadcast[SerializableConfiguration],
     requiredSchema: StructType,
     attrs: Array[(String, org.apache.spark.sql.types.DataType)],
     batchSize: Int,
@@ -185,11 +195,20 @@ private[vecruntime] final class VectorIcebergRDD(
       segments += (() => nativeIterator(split.index, files, context))
     }
     inputs.foreach { p =>
-      IcebergTasks.nativeFiles(p, fieldIds) match {
-        case Some(files) =>
+      IcebergTasks.nativeTasks(p) match {
+        case Some(tasks) =>
           nativeGroups += 1
-          pending ++= files
-          pendingCount += files.length
+          tasks.foreach { t =>
+            if (t.deletes.isEmpty) {
+              pending += t.file
+              pendingCount += 1
+            } else {
+              // A file with position deletes or a deletion vector: read with its row positions, the deleted ones
+              // deselected (its delete files are loaded when its first batch is read).
+              flush()
+              segments += (() => deletedIterator(split.index, p, t, context))
+            }
+          }
         case None =>
           icebergGroups += 1
           flush()
@@ -200,17 +219,39 @@ private[vecruntime] final class VectorIcebergRDD(
     segments.result().iterator.flatMap(make => make())
   }
 
+  private def deletedIterator(
+      index: Int,
+      p: InputPartition,
+      t: IcebergTasks.NativeTask,
+      context: TaskContext
+  ): Iterator[ColumnarBatch] = {
+    lazy val deleted = IcebergTasks.deletedPositions(p, t.location, t.deletes)
+    readerOf(index, Array(t.file), positionsConfBroadcast, VectorIcebergRDD.withPositions(requiredSchema), context)
+      .map(b => IcebergTasks.withoutDeleted(b, deleted))
+  }
+
   private def nativeIterator(
       index: Int,
       files: Array[PartitionedFile],
       context: TaskContext
+  ): Iterator[ColumnarBatch] = readerOf(index, files, confBroadcast, requiredSchema, context)
+
+  private def readerOf(
+      index: Int,
+      files: Array[PartitionedFile],
+      conf: org.apache.spark.broadcast.Broadcast[SerializableConfiguration],
+      schema: StructType,
+      context: TaskContext
   ): Iterator[ColumnarBatch] = {
+    val columns =
+      if (schema.length == attrs.length) attrs
+      else attrs :+ ((schema.last.name, schema.last.dataType))
     val reader = new VectorParquetPartitionReader(
       FilePartition(index, files),
-      confBroadcast.value.value,
-      requiredSchema,
+      conf.value.value,
+      schema,
       new StructType(),
-      attrs,
+      columns,
       batchSize,
       caseSensitive = false,
       useFieldId = true,
@@ -251,6 +292,21 @@ private[vecruntime] final class VectorIcebergRDD(
       }
     }
   }
+}
+
+/** Helpers of [[VectorIcebergRDD]]. */
+private[vecruntime] object VectorIcebergRDD {
+
+  /**
+   * `schema` with Spark's temporary row-index column last: the file's row positions, generated by our reader
+   * (NativeParquetRowIndexColumn) and by Spark's fallback reader alike, for applying position deletes.
+   */
+  def withPositions(schema: StructType): StructType =
+    schema.add(
+      org.apache.spark.sql.execution.datasources.parquet.ParquetFileFormat.ROW_INDEX_TEMPORARY_COLUMN_NAME,
+      org.apache.spark.sql.types.LongType,
+      nullable = false
+    )
 }
 
 /** Plan-time checks for [[VectorIcebergScanExec]]. */
@@ -329,34 +385,135 @@ private[vecruntime] object IcebergTasks {
       case e: ReflectiveOperationException => Left(s"Iceberg scan not recognised: $e")
     }
 
+  /** One file scan task read natively: its split, the data file's location, and its position delete files. */
+  final case class NativeTask(file: PartitionedFile, location: String, deletes: java.util.List[AnyRef])
+
   /**
-   * The group's data files as file splits when every task is a Parquet data file with no deletes; None when
-   * Iceberg must read it. (Scan tasks carry no column statistics, so a projected column a file lacks is found at
+   * The group's tasks as file splits when every task is an unencrypted Parquet data file whose delete files (if
+   * any) are all position deletes or deletion vectors; None when Iceberg must read it (equality deletes, another
+   * format, encryption). (Scan tasks carry no column statistics, so a projected column a file lacks is found at
    * open: the reader reads an optional missing column as nulls, as Iceberg does without an initial default.)
    */
-  def nativeFiles(p: InputPartition, fieldIds: Array[Int]): Option[Array[PartitionedFile]] = {
+  def nativeTasks(p: InputPartition): Option[Array[NativeTask]] = {
     if (p.getClass.getName != "org.apache.iceberg.spark.source.SparkInputPartition") return None
     val tasks = call(call(p, "taskGroup"), "tasks").asInstanceOf[java.util.Collection[AnyRef]].asScala
-    val files = tasks.map { task =>
+    val out = tasks.map { task =>
       if (!task.getClass.getName.contains("FileScanTask")) return None
-      val deletes = call(task, "deletes").asInstanceOf[java.util.List[_]]
-      if (deletes != null && !deletes.isEmpty) return None
+      val deletes = call(task, "deletes").asInstanceOf[java.util.List[AnyRef]]
+      val positionDeletes =
+        if (deletes == null) java.util.Collections.emptyList[AnyRef]()
+        else {
+          deletes.asScala.foreach { d =>
+            // Equality deletes need the rows' values (Iceberg's DeleteFilter); an encrypted delete file needs
+            // Iceberg's decryption.
+            if (call(d, "content").toString != "POSITION_DELETES" || call(d, "keyMetadata") != null) return None
+          }
+          deletes
+        }
       val file = call(task, "file")
       if (call(file, "format").toString != "PARQUET") return None
       // An encrypted file is decrypted by Iceberg's FileIO (bulkDecrypt); our reader would read its bytes raw.
       if (call(file, "keyMetadata") != null) return None
       val location = call(file, "location").toString
       val size = call(file, "fileSizeInBytes").asInstanceOf[java.lang.Long].longValue()
-      PartitionedFile(
-        InternalRow.empty,
-        SparkPath.fromPath(new Path(location)),
-        call(task, "start").asInstanceOf[java.lang.Long].longValue(),
-        call(task, "length").asInstanceOf[java.lang.Long].longValue(),
-        Array.empty[String],
-        0L,
-        size
+      NativeTask(
+        PartitionedFile(
+          InternalRow.empty,
+          SparkPath.fromPath(new Path(location)),
+          call(task, "start").asInstanceOf[java.lang.Long].longValue(),
+          call(task, "length").asInstanceOf[java.lang.Long].longValue(),
+          Array.empty[String],
+          0L,
+          size
+        ),
+        location,
+        positionDeletes
       )
     }
-    Some(files.toArray)
+    Some(out.toArray)
+  }
+
+  /**
+   * The deleted row positions of one data file, ascending, from its position delete files or deletion vector,
+   * loaded by Iceberg's own `BaseDeleteLoader` through the partition's `FileIO` (as Iceberg's reader loads
+   * them, so position deletes and deletion vectors keep Iceberg's semantics, including the DV's referenced-file
+   * check).
+   */
+  def deletedPositions(p: InputPartition, location: String, deletes: java.util.List[AnyRef]): Array[Long] = {
+    val cl = p.getClass.getClassLoader
+    val deleteFileClass = Class.forName("org.apache.iceberg.DeleteFile", false, cl)
+    val newInputFile =
+      Class.forName("org.apache.iceberg.io.FileIO", false, cl).getMethod("newInputFile", deleteFileClass)
+    val io = call(p, "io")
+    val open: java.util.function.Function[AnyRef, AnyRef] = d => newInputFile.invoke(io, d)
+    val loaderClass = Class.forName("org.apache.iceberg.data.BaseDeleteLoader", false, cl)
+    val loader = loaderClass.getConstructor(classOf[java.util.function.Function[_, _]]).newInstance(open)
+    val index = loaderClass
+      .getMethod("loadPositionDeletes", classOf[java.lang.Iterable[_]], classOf[CharSequence])
+      .invoke(loader, deletes, location)
+    val positions = new scala.collection.mutable.ArrayBuilder.ofLong
+    val collect: java.util.function.LongConsumer = pos => positions += pos
+    Class
+      .forName("org.apache.iceberg.deletes.PositionDeleteIndex", false, cl)
+      .getMethod("forEach", classOf[java.util.function.LongConsumer])
+      .invoke(index, collect)
+    val sorted = positions.result()
+    java.util.Arrays.sort(sorted)
+    sorted
+  }
+
+  /**
+   * `batch` without its last column -- the file's row positions (Spark's temporary row-index column, made by our
+   * reader and by Spark's fallback reader alike) -- and with the rows at `deleted` positions deselected. Rows of a
+   * batch come in file order, so the walk through `deleted` is one pass. The columns stay the reader's (borrowed).
+   */
+  def withoutDeleted(batch: ColumnarBatch, deleted: Array[Long]): ColumnarBatch = {
+    val n = batch.numRows()
+    val ord = batch.numCols() - 1
+    val columns = Array.tabulate[org.apache.spark.sql.vectorized.ColumnVector](ord)(batch.column)
+    val base = batch match {
+      case s: io.vecruntime.spark.arrow.SelectedColumnarBatch => s
+      case _ => null
+    }
+    val pos = batch.column(ord)
+    var j = if (n == 0) deleted.length else lowerBound(deleted, pos.getLong(0))
+    if (n == 0 || j == deleted.length || deleted(j) > pos.getLong(n - 1)) {
+      return if (base == null) new ColumnarBatch(columns, n)
+      else io.vecruntime.spark.arrow.SelectedColumnarBatch.ofHeap(
+        columns,
+        n,
+        base.selection(),
+        base.selectedCount(),
+        false
+      )
+    }
+    val words = new Array[Long]((n + 63) >>> 6)
+    val bits = java.lang.foreign.MemorySegment.ofArray(words)
+    if (base != null) io.vecruntime.kernels.BitmapKernels.copy(base.selection(), bits, n)
+    else {
+      java.util.Arrays.fill(words, -1L)
+      if ((n & 63) != 0) words(words.length - 1) = (1L << (n & 63)) - 1
+    }
+    var i = 0
+    while (i < n && j < deleted.length) {
+      val p = pos.getLong(i)
+      while (j < deleted.length && deleted(j) < p) j += 1
+      if (j < deleted.length && deleted(j) == p) words(i >>> 6) &= ~(1L << (i & 63))
+      i += 1
+    }
+    var count = 0
+    var w = 0
+    while (w < words.length) { count += java.lang.Long.bitCount(words(w)); w += 1 }
+    io.vecruntime.spark.arrow.SelectedColumnarBatch.ofHeap(columns, n, bits, count, false)
+  }
+
+  private def lowerBound(a: Array[Long], v: Long): Int = {
+    var lo = 0
+    var hi = a.length
+    while (lo < hi) {
+      val mid = (lo + hi) >>> 1
+      if (a(mid) < v) lo = mid + 1 else hi = mid
+    }
+    lo
   }
 }

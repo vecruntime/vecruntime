@@ -66,12 +66,28 @@ class IcebergNativeScanSuite extends IcebergMorSuiteBase {
     checkMixedQueries()
   }
 
-  icebergTest("task groups with delete files are read by Iceberg's reader, the rest natively") {
+  icebergTest("position deletes are applied natively as a selection") {
     useTable("t_pos")
     val df = checkVectorized("SELECT count(*), sum(d2), min(i), max(i) FROM t", Seq(Agg))
     val (native, iceberg) = groups(df)
-    assert(iceberg > 0, s"native $native, Iceberg $iceberg")
+    assert(native > 0 && iceberg == 0, s"native $native, Iceberg $iceberg")
     assert(count("SELECT count(*) FROM t") === IcebergTables.MixedLiveRows)
+    checkVectorized("SELECT s, count(*), sum(l) FROM t WHERE i % 3 = 1 GROUP BY s", Seq(Filter, Agg))
+  }
+
+  icebergTest("deletion vectors are applied natively as a selection") {
+    useTable("t_dv")
+    val df = checkVectorized("SELECT count(*), sum(d2), min(i), max(i) FROM t", Seq(Agg))
+    val (native, iceberg) = groups(df)
+    assert(native > 0 && iceberg == 0, s"native $native, Iceberg $iceberg")
+    checkVectorized("SELECT s, count(*), sum(l) FROM t WHERE i > 7 GROUP BY s", Seq(Filter, Agg))
+  }
+
+  icebergTest("task groups with equality deletes are read by Iceberg's reader") {
+    useTable("t_eq")
+    val df = checkVectorized("SELECT count(*), sum(d2), min(i), max(i) FROM t", Seq(Agg))
+    val (native, iceberg) = groups(df)
+    assert(iceberg > 0, s"native $native, Iceberg $iceberg")
   }
 
   icebergTest("a renamed column is matched by its field id") {
