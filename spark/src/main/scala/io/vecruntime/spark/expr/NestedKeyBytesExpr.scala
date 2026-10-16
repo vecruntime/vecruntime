@@ -37,7 +37,8 @@ object NestedKeyBytesExpr {
 
   /** Whether a grouping key of type `dt` rides the codec: an array or struct with lanes and no map inside. */
   def supports(dt: DataType): Boolean = (dt.isInstanceOf[ArrayType] || dt.isInstanceOf[StructType]) &&
-    !hasMap(dt) && TypeMapping.nestedTypeOf(dt) != null
+    !hasMap(dt) && TypeMapping.nestedTypeOf(dt) != null &&
+    !TypeMapping.isCollated(dt) // a collated leaf's bytes are not its equality (#705)
 
   private def hasMap(dt: DataType): Boolean = dt match {
     case _: MapType => true

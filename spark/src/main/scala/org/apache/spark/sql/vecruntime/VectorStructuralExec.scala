@@ -113,6 +113,11 @@ object VectorStructuralPlanner {
   def planUnion(u: UnionExec): Either[String, VectorUnionExec] = {
     if (u.children.size < 2) Left("union with fewer than two children")
     else if (!u.children.exists(_.supportsColumnar)) Left("no columnar child")
+    else if (
+      // A row child is converted by Spark's RowToColumnarExec, which has no converter for a collated string (#705);
+      // with such a child the union is Spark's row union (a row child keeps Spark's UnionExec off its columnar path).
+      u.children.exists(c => !c.supportsColumnar && c.output.exists(a => TypeMapping.isCollated(a.dataType)))
+    ) Left("a row child with a collated string column (no row-to-columnar conversion)")
     else Right(VectorUnionExec(u.children))
   }
 

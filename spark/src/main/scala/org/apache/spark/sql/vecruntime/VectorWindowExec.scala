@@ -709,6 +709,8 @@ object VectorWindowPlanner {
       if (i < 0) Left(s"input ${a.sql} is not a column of the child")
       else if (!TypeMapping.hasLane(a.dataType))
         Left(s"unsupported column type ${a.dataType.simpleString} for ${a.name}")
+      else if (TypeMapping.isCollated(a.dataType)) // min / max would order its bytes (#705)
+        Left(s"window function over ${a.dataType.simpleString} not supported (a collated string)")
       else Right(i)
     case other => Left(s"input ${other.sql} is not a column (Spark projects complex inputs below the window)")
   }
@@ -1674,7 +1676,7 @@ private[vecruntime] class VectorWindowOffsetIterator(
       case DoubleType => java.lang.Double.valueOf(col.getDouble(r))
       case FloatType => java.lang.Float.valueOf(col.getFloat(r)) // #712
       case BooleanType => java.lang.Boolean.valueOf(col.getBoolean(r))
-      case StringType => col.getUTF8String(r).clone()
+      case _: StringType => col.getUTF8String(r).clone() // a collated string too: its bytes (#705)
       case BinaryType => col.getBinary(r) // #705: Spark's internal value for binary
       case d: SparkDecimalType if d.precision > TypeMapping.MAX_DECIMAL_PRECISION =>
         col.getDecimal(

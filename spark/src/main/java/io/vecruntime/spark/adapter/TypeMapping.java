@@ -64,11 +64,12 @@ public final class TypeMapping {
         if (dt instanceof BooleanType) {
             return VecType.BOOL;
         }
-        if (dt instanceof StringType st) {
-            // Kernels compare, group and sort bytes: only UTF8_BINARY strings are lanes. A collated
-            // string (STRING COLLATE UTF8_LCASE, ...) has no lane and the operator falls back -- Spark's
-            // own RowToColumnarExec cannot convert one either.
-            return st.isUTF8BinaryCollation() ? VecType.UTF8 : null;
+        if (dt instanceof StringType) {
+            // Kernels compare, group and sort bytes, which is a UTF8_BINARY string's order and equality. A
+            // collated string (STRING COLLATE UTF8_LCASE, ...) is the same bytes, so it rides the UTF8 lane to be
+            // carried -- adapted, copied, gathered, shuffled, broadcast -- but no kernel computes on it (#705):
+            // isSupported refuses it, and every key and comparison site asks isCollated.
+            return VecType.UTF8;
         }
         if (dt instanceof BinaryType) {
             // BINARY (#705): offsets and bytes, the UTF8 lane's layout. Equality, ordering (unsigned bytes) and
@@ -109,7 +110,61 @@ public final class TypeMapping {
      */
     public static boolean isSupported(DataType dt) {
         VecType t = vecTypeOf(dt);
-        return t != null && t != VecType.DECIMAL128;
+        return t != null && t != VecType.DECIMAL128 && !isCollated(dt);
+    }
+
+    /**
+     * {@code dt} with every collated string replaced by a plain one (#705): the
+     * layout that carries its bytes, for code that moves columns and picks its
+     * encoding by the type (the shuffle's IPC streams). The operators'
+     * attributes keep the collation; only the carrier forgets it.
+     */
+    public static DataType withoutCollation(DataType dt) {
+        if (dt instanceof StringType) {
+            return org.apache.spark.sql.types.DataTypes.StringType;
+        }
+        if (dt instanceof org.apache.spark.sql.types.ArrayType a) {
+            return new org.apache.spark.sql.types.ArrayType(withoutCollation(a.elementType()), a.containsNull());
+        }
+        if (dt instanceof org.apache.spark.sql.types.MapType m) {
+            return new org.apache.spark.sql.types.MapType(withoutCollation(m.keyType()), withoutCollation(m.valueType()), m.valueContainsNull());
+        }
+        if (dt instanceof org.apache.spark.sql.types.StructType s) {
+            org.apache.spark.sql.types.StructField[] fields = s.fields().clone();
+            for (int i = 0; i < fields.length; i++) {
+                org.apache.spark.sql.types.StructField f = fields[i];
+                fields[i] = new org.apache.spark.sql.types.StructField(f.name(), withoutCollation(f.dataType()), f.nullable(),
+                        f.metadata());
+            }
+            return new org.apache.spark.sql.types.StructType(fields);
+        }
+        return dt;
+    }
+
+    /**
+     * Whether {@code dt} is, or holds anywhere inside an array, map or struct,
+     * a string whose collation is not UTF8_BINARY (#705): bytes then do not
+     * decide its equality, order or hash, so it may be carried on the UTF8 lane
+     * but never keyed, compared, hashed or ordered by the kernels.
+     */
+    public static boolean isCollated(DataType dt) {
+        if (dt instanceof StringType st) {
+            return !st.isUTF8BinaryCollation();
+        }
+        if (dt instanceof org.apache.spark.sql.types.ArrayType a) {
+            return isCollated(a.elementType());
+        }
+        if (dt instanceof org.apache.spark.sql.types.MapType m) {
+            return isCollated(m.keyType()) || isCollated(m.valueType());
+        }
+        if (dt instanceof org.apache.spark.sql.types.StructType s) {
+            for (org.apache.spark.sql.types.StructField f : s.fields()) {
+                if (isCollated(f.dataType())) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     public static boolean isWideDecimal(DataType dt) {
