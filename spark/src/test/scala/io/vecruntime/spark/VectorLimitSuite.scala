@@ -125,4 +125,33 @@ class VectorLimitSuite extends VectorQuerySuite {
       assert(nodesOf[CollectLimitExec](df).nonEmpty)
     }
   }
+
+  test("array, map and struct columns through the limits (#705)") {
+    spark.range(0, 4000).selectExpr(
+      "cast(id as int) as k",
+      "case when id % 7 = 0 then null else array(cast(id as int), cast(null as int)) end as a",
+      "case when id % 5 = 0 then null else named_struct('s', concat('v', id), 'l', array(id % 4)) end as st",
+      "case when id % 6 = 0 then null else map(concat('k', id % 9), cast(id as double)) end as m"
+    ).repartition(3).write.mode("overwrite").parquet(newTempPath("limit/nested"))
+    spark.read.parquet(newTempPath("limit/nested")).createOrReplaceTempView("ln")
+    // A collect limit cuts each partition (a boundary batch compacted, nested columns remapped) and builds the
+    // final batch from rows; which rows survive an unordered LIMIT is not fixed, so the rows are checked whole.
+    val sql = "SELECT k, a, st, m FROM ln LIMIT 37"
+    val df = withPlugin(enabled = true) { val d = spark.sql(sql); d.collect(); d }
+    assert(nodesOf[VectorCollectLimitExec](df).nonEmpty, finalPlan(df).treeString)
+    val got = df.collect()
+    assert(got.length === 37)
+    val all = withPlugin(enabled = false)(spark.sql("SELECT k, a, st, m FROM ln").collect()).map(r => r.getInt(0) -> r).toMap
+    got.foreach(r => assert(all(r.getInt(0)) == r, r.toString))
+    // Under a filter's selection: the limit compacts the lanes and remaps the nested columns by the same rows.
+    val filtered = withPlugin(enabled = true) {
+      val d = spark.sql("SELECT k, a, m FROM ln WHERE k % 3 = 1 LIMIT 11"); d.collect(); d
+    }
+    assert(nodesOf[VectorCollectLimitExec](filtered).nonEmpty, finalPlan(filtered).treeString)
+    filtered.collect().foreach { r =>
+      val k = r.getInt(0)
+      assert(k % 3 == 1)
+      assert(all(k).get(1) == r.get(1) && all(k).get(3) == r.get(2), r.toString)
+    }
+  }
 }

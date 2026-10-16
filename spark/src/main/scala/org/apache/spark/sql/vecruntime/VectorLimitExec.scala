@@ -75,10 +75,19 @@ private[vecruntime] class VectorLimitIterator(
         val keep = math.min(live, remaining)
         val selection = VectorLimitIterator.head(ctx.selection, ctx.numRows, keep, ctx)
         val columns = new Array[ColumnVector](outputAttrs.length)
+        var foreignRows: Array[Int] = null // the kept rows as row ids, for a column with no lane (#705)
         var c = 0
         while (c < columns.length) {
           val (name, dt) = outputAttrs(c)
-          columns(c) = ArrowOutput.compact(name, dt, ctx.input(c), selection, keep, allocator)
+          columns(c) =
+            if (io.vecruntime.spark.adapter.TypeMapping.hasLane(dt))
+              ArrowOutput.compact(name, dt, ctx.input(c), selection, keep, allocator)
+            else {
+              // An array, map or struct: a remapped view of the batch's own vector, as the filter passes it on.
+              if (foreignRows == null)
+                foreignRows = io.vecruntime.spark.arrow.RemappedColumnVector.rowsOf(selection, ctx.numRows, keep)
+              io.vecruntime.spark.arrow.RemappedColumnVector.of(ctx.column(c), foreignRows)
+            }
           c += 1
         }
         remaining -= keep
@@ -207,7 +216,7 @@ object VectorLimitPlanner {
     else Right(VectorGlobalLimitExec(g.limit, g.child))
 
   def planCollect(c: CollectLimitExec): Either[String, VectorCollectLimitExec] = {
-    val outputFailures = c.child.output.filterNot(a => TypeMapping.hasLane(a.dataType)).map(a =>
+    val outputFailures = c.child.output.filterNot(a => TypeMapping.carriesNested(a.dataType)).map(a =>
       s"unsupported output type ${a.dataType.simpleString} for ${a.name}"
     )
     if (c.offset != 0) Left(s"offset ${c.offset} not supported")
