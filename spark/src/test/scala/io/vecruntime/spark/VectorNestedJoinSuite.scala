@@ -25,7 +25,7 @@ import org.apache.spark.sql.vecruntime.{
 /**
  * Array and struct columns through our joins (#705): as payload on either side of the broadcast and shuffled hash
  * joins under every join type Spark plans for them -- the build side's in a row store (#547), which keeps a shuffled
- * build side in memory. The merge join does not carry them yet.
+ * build side in memory -- and of the merge join, whose column builders copy nested lanes.
  */
 class VectorNestedJoinSuite extends VectorQuerySuite {
 
@@ -83,12 +83,25 @@ class VectorNestedJoinSuite extends VectorQuerySuite {
     }
   }
 
-  test("sort-merge join: a nested payload still keeps Spark's merge join, with the reason") {
-    // The merge join copies its right side's runs into column builders, which hold lanes only (#705, next slice).
-    checkFallback(
-      payload.format("").replace("SELECT", "SELECT /*+ MERGE(nd) */"),
-      Seq(classOf[VectorSortMergeJoinExec]),
-      "unsupported column type array"
+  test("sort-merge join: nested payload on both sides, inner, outer and semi, runs spanning batches") {
+    for (jt <- Seq("", "LEFT", "RIGHT", "FULL")) {
+      checkVectorized(
+        payload.format(jt).replace("SELECT", "SELECT /*+ MERGE(nd) */"),
+        Seq(classOf[VectorSortMergeJoinExec])
+      )
+    }
+    // A semi join under the hint is re-planned as our shuffled hash join (the sort-merge pre-pass's choice): ours either way.
+    checkVectorized(
+      "SELECT /*+ MERGE(nd) */ k, fa FROM nf LEFT SEMI JOIN nd ON k = dk",
+      Seq(classOf[VectorShuffledHashJoinExec])
     )
+    // Many rows per key (g, dg take 9 values): runs longer than a batch are copied by the nested column builders.
+    withConf("spark.sql.parquet.columnarReaderBatchSize" -> "64", VectorConf.ScanNativeParquet -> "false") {
+      checkVectorized(
+        "SELECT /*+ MERGE(nd) */ g, fa, ds FROM nf JOIN nd ON g = dg WHERE k < 300",
+        Seq(classOf[VectorSortMergeJoinExec])
+      )
+    }
   }
+
 }

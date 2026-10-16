@@ -322,7 +322,7 @@ class VectorSortMergeJoinSuite extends VectorQuerySuite {
     }
   }
 
-  test("the mode switch: off leaves Spark's join, hash takes the rewrite, a struct column falls back") {
+  test("the mode switch: off leaves Spark's join, hash takes the rewrite, a struct column is carried") {
     withConf("spark.sql.autoBroadcastJoinThreshold" -> "-1", VectorConf.SortMergeJoinMode -> "off") {
       val df = checkVectorized("SELECT a.v, b.w FROM a JOIN b ON a.ki = b.ki", Seq())
       assert(nodesOf[SortMergeJoinExec](df).nonEmpty)
@@ -330,11 +330,11 @@ class VectorSortMergeJoinSuite extends VectorQuerySuite {
     withConf("spark.sql.autoBroadcastJoinThreshold" -> "-1", VectorConf.SortMergeJoinMode -> "hash") {
       checkVectorized("SELECT a.v, b.w FROM a JOIN b ON a.ki = b.ki", Seq(classOf[VectorShuffledHashJoinExec]))
     }
+    // A struct payload runs our merge join since #705: the column builders copy nested lanes.
     withConf(merge: _*) {
-      checkFallback(
+      checkVectorized(
         "SELECT a.v, s.st FROM a JOIN (SELECT ki, struct(w, tag) AS st FROM b) s ON a.ki = s.ki",
-        Seq(SMJ),
-        "unsupported column type struct"
+        Seq(SMJ)
       )
     }
   }

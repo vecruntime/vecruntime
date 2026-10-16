@@ -19,6 +19,7 @@ import java.lang.foreign.{Arena, MemorySegment}
 import java.util.ArrayDeque
 
 import io.vecruntime.kernels.{Bitmap, ColumnBuilder, RunKernels, RunMerge, SegmentVectorBuffers, VecType, VectorBuffers}
+import io.vecruntime.spark.adapter.TypeMapping
 import io.vecruntime.spark.arrow.{ArrowOutput, VectorAllocators}
 import io.vecruntime.spark.expr.VectorExpr
 import org.apache.arrow.memory.BufferAllocator
@@ -409,8 +410,13 @@ private[vecruntime] class VectorSortMergeJoinIterator(
       val columns = new Array[ColumnBuilder](width)
       var c = 0
       while (c < width) {
-        val b = new ColumnBuilder(arena, ctx.input(c).`type`(), math.max(count, 1))
-        b.append(ctx.input(c), ctx.selection, count)
+        // An array, map or struct column (#705) is read into a nested lane from the batch's own vector.
+        val dt = batch.column(c).dataType()
+        val in =
+          if (TypeMapping.nestedTypeOf(dt) == null) ctx.input(c)
+          else io.vecruntime.spark.adapter.NestedColumns.adapt(batch.column(c), dt, ctx.numRows, arena)
+        val b = new ColumnBuilder(arena, in.`type`(), math.max(count, 1))
+        b.append(in, ctx.selection, count)
         columns(c) = b
         c += 1
       }
@@ -851,17 +857,45 @@ private[vecruntime] class VectorSortMergeJoinIterator(
         else if ((c < spec.leftWidth) != spec.swapped) {
           // Spark's left side: the streamed rows, or the buffered run when the sides are swapped.
           val ordinal = if (spec.swapped) c - spec.leftWidth else c
-          if (left == null) ArrowOutput.nulls(name, dt, count, allocator)
-          else ArrowOutput.gather(name, dt, left.columns(ordinal), leftIdx, 0, count, allocator)
+          if (left == null) nullColumn(name, dt, count)
+          else gatherColumn(name, dt, left.columns(ordinal), leftIdx, count)
         } else {
           val ordinal = if (spec.swapped) c else c - spec.leftWidth
-          if (rightCols == null) ArrowOutput.nulls(name, dt, count, allocator)
-          else ArrowOutput.gather(name, dt, rightCols(ordinal), rightIdx, 0, count, allocator)
+          if (rightCols == null) nullColumn(name, dt, count)
+          else gatherColumn(name, dt, rightCols(ordinal), rightIdx, count)
         }
       c += 1
     }
     new ColumnarBatch(columns, count)
   }
+
+  /**
+   * Rows `idx[0, count)` of `src` (-1 = null): a lane through the gather kernels, an array, map or struct (#705)
+   * as the nested lane gathered row by row and handed to Spark as its nested column.
+   */
+  private def gatherColumn(name: String, dt: DataType, src: VectorBuffers, idx: Array[Int], count: Int): ColumnVector =
+    if (TypeMapping.nestedTypeOf(dt) == null) ArrowOutput.gather(name, dt, src, idx, 0, count, allocator)
+    else {
+      val arena = Arena.ofConfined()
+      try {
+        val rows = if (idx.length == count) idx else java.util.Arrays.copyOf(idx, count)
+        io.vecruntime.spark.arrow.VectorNestedColumnVector.of(
+          name,
+          dt,
+          io.vecruntime.spark.expr.ElementAccessExpr.gather(src, rows, count, arena),
+          allocator
+        )
+      } finally arena.close()
+    }
+
+  /** `count` nulls of `dt`: an outer join's missing side. */
+  private def nullColumn(name: String, dt: DataType, count: Int): ColumnVector =
+    if (TypeMapping.nestedTypeOf(dt) == null) ArrowOutput.nulls(name, dt, count, allocator)
+    else {
+      val v = new org.apache.spark.sql.execution.vectorized.OnHeapColumnVector(math.max(count, 1), dt)
+      v.putNulls(0, count)
+      v
+    }
 
   /** The joined ordinals the condition reads. */
   private val conditionRefs: Array[Boolean] = spec.condition.map { cond =>
