@@ -102,6 +102,13 @@ class VectorAggregateSuite extends VectorQuerySuite {
     checkVectorized("SELECT count(*) FROM t", Seq(Agg))
   }
 
+  test("#785: a partial count past its budget that does not reduce forwards its batches, filtered or not") {
+    withConf(AggSpillPolicy.ThresholdKey -> "8k") {
+      checkVectorized("SELECT i, count(*) AS n FROM t GROUP BY i", Seq(Agg))
+      checkVectorized("SELECT i, l, count(1) AS n FROM t WHERE i % 3 <> 0 GROUP BY i, l", Seq(Agg))
+    }
+  }
+
   test(
     "#363: past its budget the aggregate spills -- the partial emits and restarts, the final merges bucket by bucket"
   ) {
