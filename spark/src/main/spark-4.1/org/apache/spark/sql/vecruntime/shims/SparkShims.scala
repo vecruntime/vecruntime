@@ -51,4 +51,10 @@ object SparkShims {
       extractors: Map[String, org.apache.spark.sql.execution.datasources.PartitionedFile => Any]
   ): Unit =
     org.apache.spark.sql.execution.datasources.FileFormat.updateMetadataInternalRow(row, names, file, extractors)
+
+  /** The input partitions of one `DataSourceRDD` partition (several in Spark 4.1). */
+  def dataSourceInputPartitions(
+      p: org.apache.spark.Partition
+  ): Seq[org.apache.spark.sql.connector.read.InputPartition] =
+    p.asInstanceOf[org.apache.spark.sql.execution.datasources.v2.DataSourceRDDPartition].inputPartitions
 }

@@ -28,7 +28,7 @@ import org.apache.spark.sql.connector.read.{InputPartition, PartitionReaderFacto
 import org.apache.spark.sql.execution.{LeafExecNode, SparkPlan}
 import org.apache.spark.sql.execution.datasources.{FilePartition, PartitionedFile}
 import org.apache.spark.sql.execution.datasources.parquet.{ParquetReadSupport, ParquetUtils}
-import org.apache.spark.sql.execution.datasources.v2.{BatchScanExec, DataSourceRDDPartition}
+import org.apache.spark.sql.execution.datasources.v2.BatchScanExec
 import org.apache.spark.sql.execution.metric.{SQLMetric, SQLMetrics}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types.{AtomicType, MetadataBuilder, StructField, StructType}
@@ -169,10 +169,10 @@ private[vecruntime] final class VectorIcebergRDD(
   override protected def getPartitions: Array[Partition] = parts
 
   override protected def getPreferredLocations(split: Partition): Seq[String] =
-    split.asInstanceOf[DataSourceRDDPartition].inputPartitions.flatMap(_.preferredLocations()).distinct
+    shims.SparkShims.dataSourceInputPartitions(split).flatMap(_.preferredLocations()).distinct
 
   override def compute(split: Partition, context: TaskContext): Iterator[ColumnarBatch] = {
-    val inputs = split.asInstanceOf[DataSourceRDDPartition].inputPartitions
+    val inputs = shims.SparkShims.dataSourceInputPartitions(split)
     // In order: a run of native groups is read as one file partition (so read-ahead crosses groups), each other
     // group by Iceberg's reader, the order of the groups kept.
     val segments = Seq.newBuilder[() => Iterator[ColumnarBatch]]
@@ -343,6 +343,8 @@ private[vecruntime] object IcebergTasks {
       if (deletes != null && !deletes.isEmpty) return None
       val file = call(task, "file")
       if (call(file, "format").toString != "PARQUET") return None
+      // An encrypted file is decrypted by Iceberg's FileIO (bulkDecrypt); our reader would read its bytes raw.
+      if (call(file, "keyMetadata") != null) return None
       val location = call(file, "location").toString
       val size = call(file, "fileSizeInBytes").asInstanceOf[java.lang.Long].longValue()
       PartitionedFile(
