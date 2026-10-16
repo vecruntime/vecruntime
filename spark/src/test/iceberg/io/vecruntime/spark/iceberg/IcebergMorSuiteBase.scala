@@ -46,6 +46,9 @@ abstract class IcebergMorSuiteBase extends VectorQuerySuite {
   /** Simple class name of the columnar scan expected under our operators. */
   protected def expectedScanClass: String
 
+  /** The scan Spark plans with the plugin off; defaults to the scan expected under our operators. */
+  protected def pluginOffScanClass: String = expectedScanClassFor("t_pos")
+
   /** Per table, for readers that only handle some of them; defaults to [[expectedScanClass]]. */
   protected def expectedScanClassFor(table: String): String = expectedScanClass
 
@@ -318,7 +321,7 @@ abstract class IcebergMorSuiteBase extends VectorQuerySuite {
       val df = spark.sql("SELECT count(*) FROM t WHERE i > 10")
       df.collect()
       val leaves = PlanUtils.allNodes(finalPlan(df)).filter(_.children.isEmpty)
-      assert(leaves.map(_.getClass.getSimpleName).contains(expectedScanClassFor("t_pos")), finalPlan(df).treeString)
+      assert(leaves.map(_.getClass.getSimpleName).contains(pluginOffScanClass), finalPlan(df).treeString)
       assert(nodesOf[VectorFilterExec](df).isEmpty)
     }
   }
