@@ -374,7 +374,13 @@ object VectorShuffleExchangeExec {
         io.vecruntime.spark.adapter.TypeMapping.nestedTypeOf(dt) != null
     output.forall(a => column(a.dataType)) && (partitioning match {
       // A nested key (an array, or a struct holding one) hashes as Spark's Murmur3Hash does (NestedKeyHash, #705).
-      case h: HashPartitioning => h.expressions.forall(e => e.isInstanceOf[Attribute] && column(e.dataType))
+      // A collated key (#705) hashes its collation key in Spark (CollationAwareMurmur3Hash), not its bytes: Spark's.
+      case h: HashPartitioning =>
+        h.expressions.forall(e =>
+          e.isInstanceOf[Attribute] && column(
+            e.dataType
+          ) && !io.vecruntime.spark.adapter.TypeMapping.isCollated(e.dataType)
+        )
       case _: RoundRobinPartitioning => true
       case SinglePartition => true
       // Range ids come from Spark's partitioner over the rows, so a nested sort key reads as Spark's (#705).
@@ -418,7 +424,11 @@ object VectorShuffleExchangeExec {
   ): VectorShuffleDependency = {
     // `output` is the child's (keys are resolved against it); `written` is what the shuffle carries --
     // the same, less the trailing materialised key columns.
-    val schema = org.apache.spark.sql.catalyst.types.DataTypeUtils.fromAttributes(written)
+    // A collated string (#705) crosses as the plain string its bytes are: the streams pick their encodings
+    // by the type, and the exchange's attributes keep the collation.
+    val schema = io.vecruntime.spark.adapter.TypeMapping.withoutCollation(
+      org.apache.spark.sql.catalyst.types.DataTypeUtils.fromAttributes(written)
+    ).asInstanceOf[StructType]
     // Structs cross as lanes (StructFlattening): the streams carry the flat schema, and a hash key on
     // a struct hashes its leaves. Ordinals past the written columns are materialised keys, which the
     // writer appends after the flat lanes.

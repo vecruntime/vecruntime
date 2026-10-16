@@ -129,7 +129,8 @@ object VectorRowStages {
       case DoubleType => v.putDouble(i, row.getDouble(c))
       case FloatType => v.putFloat(i, row.getFloat(c)) // #712
       case d: DecimalType => v.putDecimal(i, row.getDecimal(c, d.precision, d.scale), d.precision)
-      case StringType => val b = row.getUTF8String(c).getBytes; v.putByteArray(i, b, 0, b.length)
+      case _: StringType =>
+        val b = row.getUTF8String(c).getBytes; v.putByteArray(i, b, 0, b.length) // collated too (#705)
       case BinaryType => val b = row.getBinary(c); v.putByteArray(i, b, 0, b.length) // #705
       case other => throw new IllegalStateException(s"unsupported output type ${other.simpleString}")
     }

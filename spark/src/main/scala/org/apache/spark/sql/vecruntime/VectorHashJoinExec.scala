@@ -1839,7 +1839,16 @@ object VectorJoinPlanner {
         // column may also be an array, map or struct, copied by the column builders' nested lanes and gathered as
         // a nested lane.
         val laneless = (j.left.output ++ j.right.output).filterNot(a => TypeMapping.carriesNested(a.dataType))
+        // A row input (Spark's sort over a row shuffle) is converted by RowToColumnarExec, which has no converter for a
+        // collated string (#705).
+        val rowCollated = Seq(j.left, j.right).find(c =>
+          !c.supportsColumnar && c.output.exists(a => TypeMapping.isCollated(a.dataType))
+        )
         if (keyFailures.nonEmpty) Left(keyFailures.mkString("; "))
+        else if (rowCollated.nonEmpty)
+          Left(
+            s"child ${rowCollated.get.nodeName} is a row plan with a collated column (no row-to-columnar conversion)"
+          )
         else if (laneless.nonEmpty)
           Left(s"unsupported column type ${laneless.head.dataType.simpleString} for ${laneless.head.name}")
         else

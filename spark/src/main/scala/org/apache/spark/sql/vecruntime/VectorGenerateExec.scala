@@ -161,7 +161,7 @@ private[vecruntime] class VectorGenerateIterator(
       case DoubleType => java.lang.Double.valueOf(arr.getDouble(k))
       case FloatType => java.lang.Float.valueOf(arr.getFloat(k)) // #712
       case BooleanType => java.lang.Boolean.valueOf(arr.getBoolean(k))
-      case StringType => arr.getUTF8String(k)
+      case _: StringType => arr.getUTF8String(k) // a collated string too: its bytes (#705)
       case BinaryType => arr.getBinary(k) // #705: Spark's internal value for binary
       case d: DecimalType => java.lang.Long.valueOf(arr.getDecimal(k, d.precision, d.scale).toUnscaledLong)
       case other => throw new IllegalStateException(s"unexpected element type $other")

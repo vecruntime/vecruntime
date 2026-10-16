@@ -58,7 +58,7 @@ case class VectorRollupExec(
     p.map {
       case Literal(v, dt) => LiteralExpr(v, dt)
       case e =>
-        ExpressionCompiler.compileLaneColumn(e, level.output) match {
+        ExpressionCompiler.compileMovedColumn(e, level.output) match {
           case Right(c) => c
           case Left(reason) => throw new IllegalStateException(s"cannot vectorize rollup slot ${e.sql}: $reason")
         }

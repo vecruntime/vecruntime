@@ -445,6 +445,34 @@ class VectorShuffleSuite extends AnyFunSuite with BeforeAndAfterAll {
     assert(exchanges(plan).exists(_.isInstanceOf[VectorShuffleExchangeExec]), s"$plan")
   }
 
+  test("collated string columns cross our exchange as their bytes; a collated hash key stays Spark's (#705)") {
+    val path = tempDir.resolve("collated").toString
+    spark.range(0, 20000).selectExpr(
+      "cast(id % 97 as int) as k",
+      "cast(id as int) as i",
+      "collate(case when id % 13 = 0 then null else element_at(array('a', 'A', 'b', 'B', 'é', 'É'), " +
+        "cast(id % 6 as int) + 1) end, 'UTF8_LCASE') as s",
+      "array(collate(element_at(array('q', 'Q'), cast(id % 2 as int) + 1), 'UNICODE_CI')) as arr"
+    ).write.mode("overwrite").parquet(path)
+    spark.read.parquet(path).createOrReplaceTempView("coll")
+    // Payload: hash on k, the collated columns carried.
+    val carried = spark.table("coll").repartition(8, org.apache.spark.sql.functions.col("k"))
+    assertOurExchange(carried)
+    checkAgainstSpark("select * from (select /*+ REPARTITION(8, k) */ * from coll)")
+    // Keys: a collated hash key hashes its collation key in Spark; equal values meet in one partition.
+    val byS = "select spark_partition_id() p, lower(s) ls from (select /*+ REPARTITION(8, s) */ s from coll)"
+    checkAgainstSpark(byS)
+    val keyed = collectPlan(spark.sql("select /*+ REPARTITION(8, s) */ s from coll"))
+    assert(exchanges(keyed).forall(_.isInstanceOf[ShuffleExchangeExec]), s"$keyed")
+    checkAgainstSpark("select lower(s) ls, count(*) c from coll group by s")
+    // Range keys: Spark's partitioner over the rows, the collation's order.
+    val ordered = "select s, k, i from coll order by s, k, i limit 3000" // i: a total order
+    val ours = spark.sql(ordered).collect().toSeq
+    spark.sessionState.conf.setConfString("spark.vecruntime.enabled", "false")
+    try assert(ours === spark.sql(ordered).collect().toSeq)
+    finally spark.sessionState.conf.setConfString("spark.vecruntime.enabled", "true")
+  }
+
   test("range partitioning: a global order by is Spark's rows in Spark's order") {
     val sql = "select s, x, k from t order by s desc, x, k limit 5000"
     val ours = spark.sql(sql).collect().toSeq

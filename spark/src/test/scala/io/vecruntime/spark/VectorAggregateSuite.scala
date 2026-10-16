@@ -718,11 +718,12 @@ class VectorAggregateSuite extends VectorQuerySuite {
       Seq(Agg)
     )
     checkVectorized("SELECT count(i, 7, l) AS a, count(1, 2) AS b FROM t", Seq(Agg))
-    // Kernels compare bytes: a collated string has no lane, and Spark's RowToColumnarExec cannot convert one either.
+    // Kernels compare bytes: a collated string is carried on the UTF8 lane but never grouped by its bytes (#705); here
+    // the grouping key is also a `collate(...)` projection, which stays Spark's.
     checkFallback(
       "SELECT count(*) AS n FROM t GROUP BY s COLLATE UTF8_LCASE",
       Seq(Agg),
-      "unsupported column type string collate"
+      "collated"
     )
     checkFallback(
       "SELECT s COLLATE UTF8_LCASE AS c, i FROM t WHERE i < 10",

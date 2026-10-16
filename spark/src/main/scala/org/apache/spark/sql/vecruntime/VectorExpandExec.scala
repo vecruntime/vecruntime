@@ -55,7 +55,7 @@ case class VectorExpandExec(projections: Seq[Seq[Expression]], output: Seq[Attri
       // operands, but here they are whole constant columns.
       case Literal(v, dt) => LiteralExpr(v, dt)
       case e =>
-        ExpressionCompiler.compileLaneColumn(e, child.output) match {
+        ExpressionCompiler.compileMovedColumn(e, child.output) match {
           case Right(c) => c
           case Left(reason) => throw new IllegalStateException(s"cannot vectorize expand slot ${e.sql}: $reason")
         }
@@ -218,7 +218,7 @@ object VectorExpandPlanner {
           Some(s"projection $i: literal of unsupported type ${dt.simpleString}")
         case _: Literal => None
         case expr =>
-          ExpressionCompiler.compileLaneColumn(expr, e.child.output) match {
+          ExpressionCompiler.compileMovedColumn(expr, e.child.output) match {
             case Right(_) => None
             case Left(reason) => Some(s"projection $i: ${expr.sql}: $reason")
           }

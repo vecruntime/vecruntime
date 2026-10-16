@@ -235,7 +235,7 @@ object VectorMergeRowsPlanner {
     else all(exprs.zip(output).map { case (e, out) =>
       if (TypeMapping.hasLane(out.dataType)) {
         val compiled = if (TypeMapping.isSupported(out.dataType)) ExpressionCompiler.compile(e, input)
-        else ExpressionCompiler.compileLaneColumn(e, input)
+        else ExpressionCompiler.compileMovedColumn(e, input)
         compiled.left.map(r => s"${e.sql}: $r").map(c => CompiledOutput(out.name, out.dataType, c, -1))
       } else e match {
         case a: AttributeReference =>

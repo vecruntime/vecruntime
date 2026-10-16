@@ -256,6 +256,10 @@ object ExpressionCompiler {
   private def binaryOperand(e: Expression): Boolean =
     e.dataType == BinaryType || e.children.exists(_.dataType == BinaryType)
 
+  /** An expression producing or reading a collated string, anywhere inside its type (#705). */
+  private def collatedOperand(e: Expression): Boolean =
+    TypeMapping.isCollated(e.dataType) || e.children.exists(c => TypeMapping.isCollated(c.dataType))
+
   /**
    * Expressions whose result over BINARY is the same as over a binary-collation string of the same
    * bytes: references, comparisons (unsigned byte order in both), null tests and the conditionals that
@@ -319,10 +323,25 @@ object ExpressionCompiler {
    * payloads); everything that reads the column goes through [[compile]], which refuses it.
    */
   def compileLaneColumn(expr: Expression, input: Seq[Attribute]): Result = expr match {
+    // A collated string (#705) has the UTF8 lane but bytes are not its order or equality: never a key,
+    // never an operand of the aggregate functions that read their input through here.
+    case e if TypeMapping.isCollated(e.dataType) =>
+      Left(s"${e.dataType.simpleString} not supported as a key or operand (a collated string)")
     case a: AttributeReference if TypeMapping.hasLane(a.dataType) && !TypeMapping.isSupported(a.dataType) =>
       val ordinal = input.indexWhere(_.exprId == a.exprId)
       if (ordinal < 0) Left(s"unbound attribute ${a.name}") else Right(ColumnRef(ordinal, a.dataType))
     case e => compile(e, input)
+  }
+
+  /**
+   * [[compileLaneColumn]] for operators that only copy a column into their output (an expand's or a
+   * rollup's projections, a merge's row values): a collated string column is carried as its bytes (#705).
+   */
+  def compileMovedColumn(expr: Expression, input: Seq[Attribute]): Result = expr match {
+    case a: AttributeReference if TypeMapping.isCollated(a.dataType) && TypeMapping.hasLane(a.dataType) =>
+      val ordinal = input.indexWhere(_.exprId == a.exprId)
+      if (ordinal < 0) Left(s"unbound attribute ${a.name}") else Right(ColumnRef(ordinal, a.dataType))
+    case e => compileLaneColumn(e, input)
   }
 
   def compile(expr: Expression, input: Seq[Attribute]): Result = expr match {
@@ -331,6 +350,12 @@ object ExpressionCompiler {
     // substring, lpad, casts, hashes, ...) would count UTF-8 characters where Spark counts bytes.
     case e if binaryOperand(e) && !binaryNeutral(e) =>
       Left(s"unsupported ${e.prettyName} over binary")
+
+    // A collated string (#705) rides the UTF8 lane only to be carried: whatever compares, hashes, orders,
+    // matches or maps its characters follows the collation, not the bytes, and stays Spark's. A null test
+    // reads only validity.
+    case e if collatedOperand(e) && !(e.isInstanceOf[IsNull] || e.isInstanceOf[IsNotNull] || e.isInstanceOf[Alias]) =>
+      Left(s"unsupported ${e.prettyName} over a collated string")
 
     // A scalar subquery result in any reference-free shape (the ScalarSubquery, a struct field of a
     // merged one, a CASE over such fields): a literal by the time the operator runs, read then.
@@ -2164,7 +2189,9 @@ object ExpressionCompiler {
     }
 
   private def nullTestChild(e: Expression, input: Seq[Attribute]): Result =
-    if (!TypeMapping.isSupported(e.dataType) && nestedColumnPath(e, input).isRight)
+    if (e.isInstanceOf[AttributeReference] && TypeMapping.isCollated(e.dataType) && TypeMapping.hasLane(e.dataType))
+      compileMovedColumn(e, input) // a collated string column (#705): its validity is its lane's
+    else if (!TypeMapping.isSupported(e.dataType) && nestedColumnPath(e, input).isRight)
       nestedColumnPath(e, input).map { case (ordinal, path) => NestedValidityExpr(ordinal, path) }
     else compile(e, input).flatMap {
       case _: LiteralExpr => Left("null test on literal")

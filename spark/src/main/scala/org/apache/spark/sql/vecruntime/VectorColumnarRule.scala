@@ -817,9 +817,19 @@ case class VectorExecRule(session: SparkSession) extends Rule[SparkPlan] with Lo
    * the planner. The build side keeps [[laneTypeReason]]: its rows are laid out in lanes.
    */
   private def streamedInputReason(plan: SparkPlan): Option[String] = plan match {
-    case _: ShuffleExchangeLike | _: QueryStageExec | _: AQEShuffleReadExec => None
+    case _: ShuffleExchangeLike | _: QueryStageExec | _: AQEShuffleReadExec => rowConversionReason(plan)
     case other => forwardingInputReason(other)
   }
+
+  /**
+   * A row input Spark converts below us with `RowToColumnarExec`, which has no converter for a collated
+   * string (#705): such an input is refused, whatever the operator would do with the column.
+   */
+  private def rowConversionReason(plan: SparkPlan): Option[String] =
+    if (plan.supportsColumnar) None
+    else plan.output.find(a => TypeMapping.isCollated(a.dataType)).map(a =>
+      s"child ${plan.nodeName} is a row plan with the collated column ${a.name} (no row-to-columnar conversion)"
+    )
 
   private def forwardingInputReason(plan: SparkPlan): Option[String] =
     if (!columnarChild(plan)) Some(s"child ${plan.nodeName} is not columnar") else None
@@ -1205,7 +1215,7 @@ case class VectorExecRule(session: SparkSession) extends Rule[SparkPlan] with Lo
   private def laneTypeReason(plan: SparkPlan, nested: Boolean = false): Option[String] =
     plan.output.find(a =>
       if (nested) !TypeMapping.carriesNested(a.dataType) else !TypeMapping.hasLane(a.dataType)
-    ).map(a => s"unsupported column type ${a.dataType.simpleString} for ${a.name}")
+    ).map(a => s"unsupported column type ${a.dataType.simpleString} for ${a.name}").orElse(rowConversionReason(plan))
 
   /**
    * The build side of a broadcast hash join (#547): a column without a lane is carried in a row store
