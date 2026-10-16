@@ -1136,6 +1136,15 @@ object VectorAggregates {
       if (ordinal < 0) Left(s"unbound attribute ${buffers(i).name}")
       else ExpressionCompiler.compileLaneColumn(input(ordinal), input)
     }
+    // A value buffer (first / last): a collated string (#705) is read as its bytes.
+    def valueRef(i: Int): Either[String, VectorExpr] =
+      if (TypeMapping.isCollated(buffers(i).dataType)) movedRef(i) else ref(i)
+    // A buffer holding a collated string (#705), read as its bytes.
+    def movedRef(i: Int): Either[String, VectorExpr] = {
+      val ordinal = bufferOrdinal(i)
+      if (ordinal < 0) Left(s"unbound attribute ${buffers(i).name}")
+      else ExpressionCompiler.compileMovedColumn(input(ordinal), input)
+    }
     f match {
       case s: Sum if s.evalContext.evalMode == EvalMode.TRY && s.dataType == LongType && buffers.length == 2 =>
         for (sum <- ref(0); empty <- ref(1)) yield TrySumLongMergeAgg(sum, empty)
@@ -1167,6 +1176,11 @@ object VectorAggregates {
           }
         }
       case _: Count => ref(0).map(CountMergeAgg.apply)
+      // A collated string's min / max buffer (#705): the value, ordered by its collation key.
+      case m: Min if collationOf(m.dataType) >= 0 =>
+        movedRef(0).map(b => CollatedMinMaxAgg(b, collationOf(m.dataType), isMin = true, m.dataType))
+      case m: Max if collationOf(m.dataType) >= 0 =>
+        movedRef(0).map(b => CollatedMinMaxAgg(b, collationOf(m.dataType), isMin = false, m.dataType))
       case m: Min if orderedLane(m.dataType) => ref(0).map(b => OrderedMinMaxAgg(b, isMin = true, m.dataType))
       case m: Max if orderedLane(m.dataType) => ref(0).map(b => OrderedMinMaxAgg(b, isMin = false, m.dataType))
       case m: Min => ref(0).flatMap(numericBuffer(m.dataType)).map(b => MinMaxAgg(b, isMin = true, m.dataType))
@@ -1174,7 +1188,7 @@ object VectorAggregates {
       case b: BitAggregate if buffers.length == 1 && integralLane(b.dataType) =>
         ref(0).map(v => BitAgg(v, bitOp(b), b.dataType))
       case l: Last if buffers.length == 2 && FirstAgg.supportsWide(l.dataType) =>
-        for (last <- ref(0); valueSet <- ref(1)) yield LastAgg(last, l.dataType, l.ignoreNulls, Some(valueSet))
+        for (last <- valueRef(0); valueSet <- ref(1)) yield LastAgg(last, l.dataType, l.ignoreNulls, Some(valueSet))
       case l: Last => Left(s"last over ${l.dataType.simpleString} not supported")
       case m: MaxMinBy
           if buffers.length == 2 && FirstAgg.supports(m.valueExpr.dataType) && Rows.supportsOrdering(
@@ -1208,7 +1222,7 @@ object VectorAggregates {
           Left(s"avg producing ${a.dataType.simpleString} not supported")
         else for (sum <- ref(0); count <- ref(1)) yield AverageMergeAgg(sum, count, strict)
       case f: First if buffers.length == 2 && FirstAgg.supportsWide(f.dataType) =>
-        for (first <- ref(0); valueSet <- ref(1)) yield FirstMergeAgg(first, valueSet, f.dataType)
+        for (first <- valueRef(0); valueSet <- ref(1)) yield FirstMergeAgg(first, valueSet, f.dataType)
       case f: First => Left(s"first over ${f.dataType.simpleString} not supported")
       case m: CentralMomentAgg if buffers.length == m.aggBufferAttributes.length =>
         momentBuffers(buffers.indices.map(ref)).map(MomentsAgg(_, MomentsAgg.Central(buffers.length - 1), merge = true))
@@ -1233,6 +1247,13 @@ object VectorAggregates {
 
   /** min/max lanes handled by a comparison per row rather than the numeric kernels. */
   private def orderedLane(dt: DataType): Boolean = dt == BooleanType || dt == StringType
+
+  private def collationOf(dt: DataType): Int = io.vecruntime.spark.expr.CollationKeyExpr.collationOf(dt)
+
+  /** A first / last input: a collated string column (#705) is carried as its bytes, nothing compares it. */
+  private def valueColumn(e: Expression, input: Seq[Attribute]): Either[String, VectorExpr] =
+    if (TypeMapping.isCollated(e.dataType)) ExpressionCompiler.compileMovedColumn(e, input)
+    else ExpressionCompiler.compileLaneColumn(e, input)
   private def integralLane(dt: DataType): Boolean = dt == org.apache.spark.sql.types.IntegerType || dt == LongType
   private def bitOp(b: BitAggregate): BitAgg.Op = b match {
     case _: BitAndAgg => BitAgg.And
@@ -1321,6 +1342,8 @@ object VectorAggregates {
           // the lane's validity, so the nested value compiles as it is.
           val compiled =
             if (TypeMapping.nestedTypeOf(child.dataType) != null) ExpressionCompiler.compileProjection(child, input)
+            // A collated string (#705): count reads only its validity.
+            else if (TypeMapping.isCollated(child.dataType)) ExpressionCompiler.compileMovedColumn(child, input)
             else ExpressionCompiler.compileLaneColumn(child, input)
           compiled.flatMap {
             case _: LiteralExpr => Right(CountAgg(None))
@@ -1338,6 +1361,13 @@ object VectorAggregates {
           }
       }
 
+    // MIN / MAX over a collated string column (#705): ordered by its collation key, the value kept.
+    case m: Min if collationOf(m.dataType) >= 0 && m.child.isInstanceOf[Attribute] =>
+      ExpressionCompiler.compileMovedColumn(m.child, input)
+        .map(child => CollatedMinMaxAgg(child, collationOf(m.dataType), isMin = true, m.dataType))
+    case m: Max if collationOf(m.dataType) >= 0 && m.child.isInstanceOf[Attribute] =>
+      ExpressionCompiler.compileMovedColumn(m.child, input)
+        .map(child => CollatedMinMaxAgg(child, collationOf(m.dataType), isMin = false, m.dataType))
     case m: Min if orderedLane(m.dataType) =>
       orderedChild(m.child, input).map(child => OrderedMinMaxAgg(child, isMin = true, m.dataType))
     case m: Max if orderedLane(m.dataType) =>
@@ -1351,7 +1381,7 @@ object VectorAggregates {
       }
     case b: BitAggregate => Left(s"${b.prettyName} over ${b.dataType.simpleString} not supported")
     case l: Last if FirstAgg.supportsWide(l.dataType) =>
-      ExpressionCompiler.compileLaneColumn(l.child, input).flatMap {
+      valueColumn(l.child, input).flatMap {
         case _: LiteralExpr => Left("last of a literal")
         case e => Right(LastAgg(e, l.dataType, l.ignoreNulls, None))
       }
@@ -1413,7 +1443,7 @@ object VectorAggregates {
       momentArgs(Seq(r.right, r.left), input).map(MomentsAgg(_, MomentsAgg.Regression, merge = false))
 
     case f: First if FirstAgg.supportsWide(f.dataType) =>
-      ExpressionCompiler.compileLaneColumn(f.child, input).flatMap {
+      valueColumn(f.child, input).flatMap {
         case _: LiteralExpr => Left("first of a literal")
         case e => Right(FirstAgg(e, f.dataType, f.ignoreNulls))
       }

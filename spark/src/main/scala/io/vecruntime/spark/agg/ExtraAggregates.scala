@@ -134,6 +134,61 @@ final case class OrderedMinMaxAgg(input: VectorExpr, isMin: Boolean, dataType: D
 }
 
 /**
+ * MIN / MAX over a collated string (#705): the order is the collation's -- each value's collation key
+ * (`CollationFactory.getCollationKeyBytes`) compared unsigned -- and the buffer keeps the value itself, the first
+ * one seen among those whose keys tie, as Spark's `least` / `greatest` keep the buffer on a tie. The merge is the
+ * same operation over the buffer column.
+ */
+final case class CollatedMinMaxAgg(input: VectorExpr, collationId: Int, isMin: Boolean, dataType: DataType)
+    extends VectorAggFunction {
+  override def bufferTypes: Seq[DataType] = Seq(dataType)
+  private def better(c: Int): Boolean = if (isMin) c < 0 else c > 0
+  private def keyOf(bytes: Array[Byte]): Array[Byte] =
+    org.apache.spark.sql.catalyst.util.CollationFactory.getCollationKeyBytes(
+      org.apache.spark.unsafe.types.UTF8String.fromBytes(bytes),
+      collationId
+    )
+
+  override def newState(): AggState = new AggState {
+    private var best: Array[Byte] = null
+    private var bestKey: Array[Byte] = null
+    override def update(ctx: EvalContext): Unit = {
+      val v = input.eval(ctx)
+      Rows.ungrouped(ctx) { i =>
+        if (Rows.valid(v, i)) {
+          val bytes = v.getUtf8Bytes(i)
+          val key = keyOf(bytes)
+          if (best == null || better(java.util.Arrays.compareUnsigned(key, bestKey))) { best = bytes; bestKey = key }
+        }
+      }
+    }
+    override def bufferValues: Array[Any] =
+      Array(if (best == null) null else org.apache.spark.unsafe.types.UTF8String.fromBytes(best))
+  }
+  override def newGroupedState(): GroupedAggState = new GroupedAggState {
+    private val state = new GroupValues
+    private var keys = new Array[Array[Byte]](0)
+    override def update(ctx: EvalContext, groups: GroupAssignment): Unit = {
+      state.ensure(groups.numGroups())
+      if (keys.length < groups.numGroups())
+        keys = java.util.Arrays.copyOf(keys, math.max(groups.numGroups(), keys.length * 2))
+      val v = input.eval(ctx)
+      Rows.grouped(ctx, groups) { (g, i) =>
+        if (Rows.valid(v, i)) {
+          val bytes = v.getUtf8Bytes(i)
+          val key = keyOf(bytes)
+          if (!state.set(g) || better(java.util.Arrays.compareUnsigned(key, keys(g)))) {
+            state.values(g) = org.apache.spark.unsafe.types.UTF8String.fromBytes(bytes); state.set(g) = true
+            keys(g) = key
+          }
+        }
+      }
+    }
+    override def bufferValue(g: Int, slot: Int): Any = state.value(g)
+  }
+}
+
+/**
  * LAST with or without `ignoreNulls`: the value of the last row (the last non-null row when nulls are
  * ignored) in partition order, Spark's `(last, valueSet)` buffer. In a merge mode the buffers arrive in
  * partition order too, so the same class serves with `valueSet` as the guard.

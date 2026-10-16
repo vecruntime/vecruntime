@@ -445,32 +445,64 @@ class VectorShuffleSuite extends AnyFunSuite with BeforeAndAfterAll {
     assert(exchanges(plan).exists(_.isInstanceOf[VectorShuffleExchangeExec]), s"$plan")
   }
 
-  test("collated string columns cross our exchange as their bytes; a collated hash key stays Spark's (#705)") {
+  test("collated strings cross our exchange as their bytes and hash by their collation keys (#705)") {
     val path = tempDir.resolve("collated").toString
     spark.range(0, 20000).selectExpr(
       "cast(id % 97 as int) as k",
       "cast(id as int) as i",
-      "collate(case when id % 13 = 0 then null else element_at(array('a', 'A', 'b', 'B', 'é', 'É'), " +
-        "cast(id % 6 as int) + 1) end, 'UTF8_LCASE') as s",
+      "collate(case when id % 13 = 0 then null else element_at(array('a', 'A', 'b', 'B ', 'é', 'É', 'Σ', 'ς', 'σ'), " +
+        "cast(id % 9 as int) + 1) end, 'UTF8_LCASE') as s",
+      "collate(element_at(array('Straße', 'STRASSE', 'café', 'CAFÉ', 'z', 'Z'), cast(id % 6 as int) + 1), " +
+        "'UNICODE_CI') as u",
+      "collate(element_at(array('x', 'x  ', 'X ', 'y'), cast(id % 4 as int) + 1), 'UTF8_LCASE_RTRIM') as r",
       "array(collate(element_at(array('q', 'Q'), cast(id % 2 as int) + 1), 'UNICODE_CI')) as arr"
     ).write.mode("overwrite").parquet(path)
     spark.read.parquet(path).createOrReplaceTempView("coll")
+    val dim = tempDir.resolve("collated-dim").toString
+    spark.range(0, 500).selectExpr(
+      "cast(id as int) as d",
+      "collate(element_at(array('A', 'b ', 'É', 'σ'), cast(id % 4 as int) + 1), 'UTF8_LCASE') as s2",
+      "collate(element_at(array('strasse', 'Café', 'Z'), cast(id % 3 as int) + 1), 'UNICODE_CI') as u2"
+    ).write.mode("overwrite").parquet(dim)
+    spark.read.parquet(dim).createOrReplaceTempView("colld")
     // Payload: hash on k, the collated columns carried.
-    val carried = spark.table("coll").repartition(8, org.apache.spark.sql.functions.col("k"))
-    assertOurExchange(carried)
+    assertOurExchange(spark.table("coll").repartition(8, org.apache.spark.sql.functions.col("k")))
     checkAgainstSpark("select * from (select /*+ REPARTITION(8, k) */ * from coll)")
-    // Keys: a collated hash key hashes its collation key in Spark; equal values meet in one partition.
-    val byS = "select spark_partition_id() p, lower(s) ls from (select /*+ REPARTITION(8, s) */ s from coll)"
-    checkAgainstSpark(byS)
-    val keyed = collectPlan(spark.sql("select /*+ REPARTITION(8, s) */ s from coll"))
-    assert(exchanges(keyed).forall(_.isInstanceOf[ShuffleExchangeExec]), s"$keyed")
+    // A collated hash key: every row lands in the partition Spark's exchange puts it in.
+    for (c <- Seq("s", "u", "r")) {
+      val q = s"select spark_partition_id() p, i from (select /*+ REPARTITION(8, $c) */ i, $c from coll)"
+      assertOurExchange(spark.sql(q))
+      checkAgainstSpark(q)
+    }
+    checkAgainstSpark(
+      "select spark_partition_id() p, i from (select /*+ REPARTITION(5, s, k, u) */ i, s, k, u from coll)"
+    )
+    // Joins on a collated equality: Spark keys them on collationkey(), hashed and compared as binary by ours.
+    val shj = "select /*+ SHUFFLE_HASH(colld) */ i, d from coll join colld on s = s2"
+    val shjPlan = assertOurExchange(spark.sql(shj), expectedCount = 2)
+    assert(nodes(shjPlan).exists(_.nodeName.contains("VectorShuffledHashJoin")), s"$shjPlan")
+    checkAgainstSpark(shj)
+    checkAgainstSpark("select /*+ SHUFFLE_HASH(colld) */ i, d from coll left join colld on u = u2")
+    checkAgainstSpark("select /*+ MERGE(colld) */ i, d from coll join colld on s = s2 and u = u2")
+    checkAgainstSpark("select i from coll left anti join colld on u = u2")
+    // A group by and a window over a collated key: their exchanges hash the collation key; values compare by it.
     checkAgainstSpark("select lower(s) ls, count(*) c from coll group by s")
-    // Range keys: Spark's partitioner over the rows, the collation's order.
-    val ordered = "select s, k, i from coll order by s, k, i limit 3000" // i: a total order
-    val ours = spark.sql(ordered).collect().toSeq
-    spark.sessionState.conf.setConfString("spark.vecruntime.enabled", "false")
-    try assert(ours === spark.sql(ordered).collect().toSeq)
-    finally spark.sessionState.conf.setConfString("spark.vecruntime.enabled", "true")
+    checkAgainstSpark("select k, lower(min(s)) mn, lower(max(u)) mx, count(r) c from coll group by k")
+    checkAgainstSpark("select lower(min(u)) mn, lower(max(s)) mx from coll where s in ('A', 'σ') or u = 'cafe'")
+    checkAgainstSpark("select i, rank() over (partition by s order by k, i) rk from coll")
+    checkAgainstSpark("select i, row_number() over (partition by u, r order by i) rn from coll")
+    // Range keys: Spark's partitioner over the rows, the collation's order; our sort orders by the key.
+    for (
+      ordered <- Seq(
+        "select s, k, i from coll order by s, k, i limit 3000", // i: a total order
+        "select u, r, i from coll order by u desc nulls last, r, i"
+      )
+    ) {
+      val ours = spark.sql(ordered).collect().toSeq
+      spark.sessionState.conf.setConfString("spark.vecruntime.enabled", "false")
+      try assert(ours === spark.sql(ordered).collect().toSeq, ordered)
+      finally spark.sessionState.conf.setConfString("spark.vecruntime.enabled", "true")
+    }
   }
 
   test("range partitioning: a global order by is Spark's rows in Spark's order") {

@@ -144,7 +144,8 @@ final case class FirstAgg(input: VectorExpr, dataType: DataType, ignoreNulls: Bo
 
 object FirstAgg {
   def supports(dt: DataType): Boolean = dt match {
-    case IntegerType | LongType | DoubleType | DateType | BooleanType | org.apache.spark.sql.types.StringType => true
+    case IntegerType | LongType | DoubleType | DateType | BooleanType => true
+    case _: org.apache.spark.sql.types.StringType => true // a collated string too (#705): first / last only move it
     case _: org.apache.spark.sql.types.DecimalType => io.vecruntime.spark.adapter.TypeMapping.isSupported(dt)
     case _ => false
   }

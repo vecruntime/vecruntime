@@ -211,6 +211,12 @@ case class VectorHashAggregateExec(
       val probe = if (localProbe) VectorConf.aggregateBelowJoinProbeRows(conf) else 0L
       return AggSpillPolicy.EmitAndReset(if (threshold > 0) threshold else Long.MaxValue, passThrough, probe)
     }
+    // A collated key (#705) is bucketed by nothing a spill knows (its representatives differ in bytes): a merging
+    // stage keeps its groups in memory, never emitting one twice.
+    if (
+      groupingExpressions.exists(g => TypeMapping.isCollated(g.dataType)) &&
+      (requiredChildDistributionExpressions.isDefined || VectorAggregatePlanner.mergesBuffers(modes))
+    ) return AggSpillPolicy.InMemory
     if (threshold <= 0 || groupingExpressions.isEmpty) AggSpillPolicy.InMemory
     else if (aggregateExpressions.isEmpty) {
       // Keys only (a distinct): before the exchange it emits keys, after it it merges them -- either way re-readable.
@@ -426,6 +432,16 @@ private[vecruntime] class VectorGroupedAggregateIterator(
   private val keyDicts = new Array[SharedDictionary](keyExprs.length)
   private var states: Array[GroupedAggState] = aggs.map(_.newGroupedState())
   private var idScratch = new Array[Int](0)
+  // A collated string key (#705) groups by its collation key: the value each group outputs is the first one
+  // the table saw for it, kept here by group id (null entries for the other keys).
+  private val representativeOf: Array[VectorExpr] = keyExprs.map {
+    case c: io.vecruntime.spark.expr.CollationKeyExpr => c.child
+    case _ => null
+  }
+  private val hasRepresentatives = representativeOf.exists(_ != null)
+  private var representatives: Array[java.util.ArrayList[Array[Byte]]] = newRepresentatives()
+  private def newRepresentatives(): Array[java.util.ArrayList[Array[Byte]]] =
+    representativeOf.map(r => if (r == null) null else new java.util.ArrayList[Array[Byte]]())
   private var inputDone = false
   private var emittedGroups = 0
   private var current: ColumnarBatch = _
@@ -513,11 +529,40 @@ private[vecruntime] class VectorGroupedAggregateIterator(
         val keys = new Array[VectorBuffers](keyExprs.length)
         var k = 0
         while (k < keys.length) { keys(k) = keyExprs(k).eval(ctx); k += 1 }
+        val before = table.size()
         val numGroups = table.assign(keys, n, idScratch, ctx.selection)
+        if (hasRepresentatives && table.size() > before) recordRepresentatives(ctx, n, before)
         val assignment = GroupAssignment.of(idScratch, n, numGroups, ctx.arena, ctx.selection)
         var i = 0
         while (i < states.length) { states(i).update(ctx, assignment); i += 1 }
       }
+    }
+  }
+
+  /** The first value of every group created by this batch (ids from `before`), for each collated key. */
+  private def recordRepresentatives(ctx: io.vecruntime.spark.expr.EvalContext, n: Int, before: Int): Unit = {
+    val size = table.size()
+    var k = 0
+    while (k < representativeOf.length) {
+      if (representativeOf(k) != null) {
+        val reps = representatives(k)
+        while (reps.size() < size) reps.add(null)
+        val seen = new Array[Boolean](size - before)
+        val values = representativeOf(k).eval(ctx)
+        val selection = ctx.selection
+        var i = 0
+        while (i < n) {
+          if (selection == null || io.vecruntime.kernels.Bitmap.isSet(selection, i)) {
+            val g = idScratch(i)
+            if (g >= before && !seen(g - before)) {
+              seen(g - before) = true
+              reps.set(g, if (values.isNull(i)) null else values.getUtf8Bytes(i))
+            }
+          }
+          i += 1
+        }
+      }
+      k += 1
     }
   }
 
@@ -554,6 +599,7 @@ private[vecruntime] class VectorGroupedAggregateIterator(
     releaseDictionaries()
     table = new GroupKeyTable(keyExprs.map(_.vecType), dictionaryStrings)
     states = aggs.map(_.newGroupedState())
+    representatives = newRepresentatives()
     emittedGroups = 0
     fillRows = 0L
   }
@@ -721,7 +767,13 @@ private[vecruntime] class VectorGroupedAggregateIterator(
 
   private def keyColumn(name: String, dt: DataType, k: Int, from: Int, to: Int): ColumnVector = {
     val count = to - from
-    if (io.vecruntime.spark.expr.NestedKeyBytesExpr.supports(dt)) nestedKeyColumn(name, dt, k, from, to)
+    if (representativeOf(k) != null) {
+      // A collated key (#705): each group's first value, not its collation key.
+      val values = new Array[Array[Byte]](count)
+      var o = 0
+      while (o < count) { values(o) = representatives(k).get(from + o); o += 1 }
+      ArrowOutput.utf8Column(name, values, allocator)
+    } else if (io.vecruntime.spark.expr.NestedKeyBytesExpr.supports(dt)) nestedKeyColumn(name, dt, k, from, to)
     else if (table.`type`(k) == VecType.UTF8) {
       val dict = sharedDictionary(name, k)
       if (dict != null) {
@@ -861,7 +913,11 @@ object VectorAggregatePlanner {
    * merging stage, like Spark's own, groups the already normalised values.
    */
   def compileKey(e: NamedExpression, input: Seq[Attribute]): Either[String, VectorExpr] =
-    if (io.vecruntime.spark.expr.NestedKeyBytesExpr.supports(e.dataType))
+    if (e.isInstanceOf[Attribute] && io.vecruntime.spark.expr.CollationKeyExpr.collationOf(e.dataType) >= 0)
+      // A collated string key (#705) groups by its collation key; the output is a value of the group (the
+      // first the table saw), as Spark's sort aggregate outputs one of the group's values.
+      ExpressionCompiler.compileOrderKey(e, input)
+    else if (io.vecruntime.spark.expr.NestedKeyBytesExpr.supports(e.dataType))
       // An array or struct key (#705) groups by its canonical bytes on the UTF8 lane; the output decodes them.
       ExpressionCompiler.compileProjection(e, input).map(io.vecruntime.spark.expr.NestedKeyBytesExpr(_, e.dataType))
     else ExpressionCompiler.compileLaneColumn(e, input).flatMap {
@@ -1163,7 +1219,10 @@ object VectorAggregatePlanner {
           !TypeMapping.isSupported(attr.dataType) && !wideOutputs.contains(attr.exprId) &&
             !objectOutputs.contains(attr.exprId) &&
             // An array or struct key decoded from its bytes, or a nested result compiled above (#705).
-            !io.vecruntime.spark.expr.NestedKeyBytesExpr.supports(attr.dataType)
+            !io.vecruntime.spark.expr.NestedKeyBytesExpr.supports(attr.dataType) &&
+            // A collated string (#705): a grouping key output as one of its group's values, or a min / max /
+            // first / last buffer or result -- values the functions carried; nothing computed one from its bytes.
+            !(io.vecruntime.spark.expr.CollationKeyExpr.collationOf(attr.dataType) >= 0)
         ) match {
           case Some(attr) => Left(s"unsupported output type ${attr.dataType.simpleString} for ${attr.name}")
           case None =>
@@ -1197,7 +1256,9 @@ object AggBufferColumns {
     // and array outputs (the object aggregates, #57) have no lane and no direct writer -- straight to
     // the boxed path, which routes them to Spark's on-heap column store.
     if (
-      dt != org.apache.spark.sql.types.StringType && !dt.isInstanceOf[org.apache.spark.sql.types.BinaryType] &&
+      !dt.isInstanceOf[org.apache.spark.sql.types.StringType] && !dt.isInstanceOf[
+        org.apache.spark.sql.types.BinaryType
+      ] &&
       !dt.isInstanceOf[org.apache.spark.sql.types.ArrayType]
     ) {
       val out = ArrowOutput.allocateFixed(name, dt, to - from, allocator)
@@ -1237,7 +1298,7 @@ object AggBufferColumns {
           o += 1
         }
         return ArrowOutput.finish(out, count, !anyNull)
-      case org.apache.spark.sql.types.StringType =>
+      case _: org.apache.spark.sql.types.StringType => // a collated string too (#705)
         // min/max, first/last, min_by/max_by over strings: boxed UTF8Strings into a varchar vector.
         val values = new Array[Array[Byte]](count)
         var o = 0

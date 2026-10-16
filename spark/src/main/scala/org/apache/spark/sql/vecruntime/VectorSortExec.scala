@@ -114,7 +114,7 @@ object VectorSortPlanner {
       // An array or struct key (#705): its order-preserving bytes, sorted as a string key.
       ExpressionCompiler.compileProjection(order.child, input)
         .map(io.vecruntime.spark.expr.NestedSortKeyExpr(_, order.child.dataType))
-    else ExpressionCompiler.compileLaneColumn(order.child, input).flatMap {
+    else ExpressionCompiler.compileOrderKey(order.child, input).flatMap {
       case _: LiteralExpr => Left("literal sort key")
       case k if !TypeMapping.hasLane(order.child.dataType) =>
         Left(s"sort key type ${order.child.dataType.simpleString} not supported")

@@ -231,8 +231,8 @@ measurements behind each item are in the linked docs and issues.
 - Decimal window aggregates over sliding frames (#28), `IGNORE NULLS` (#58), `RANGE` window offsets over decimal or timestamp (interval) order keys.
 - The window operator holds its whole partition in memory (the sort and the joins spill; the window
   does not yet).
-- Regular expressions, collated strings, binary and Float columns as computed values or keys (they
-  pass through untouched); the full lists are the "Falls back" column of
+- Regular expressions, binary and Float columns as computed values or keys, and collated strings as
+  computed values (they pass through untouched); the full lists are the "Falls back" column of
   [Supported today](how-it-works.html#supported-today) and `docs/expressions.md`.
 
 **Known behaviour to be aware of**

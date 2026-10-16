@@ -952,27 +952,39 @@ case class VectorExecRule(session: SparkSession) extends Rule[SparkPlan] with Lo
    */
   private def computedHashKeys(s: ShuffleExchangeExec, conf: SQLConf): Option[SparkPlan] = s.outputPartitioning match {
     case h: org.apache.spark.sql.catalyst.plans.physical.HashPartitioning
-        if h.expressions.exists(!_.isInstanceOf[Attribute]) =>
+        if h.expressions.exists(e => !e.isInstanceOf[Attribute] || collatedHashKey(e, conf)) =>
       val input = s.child.output
+      // A collated string key (#705) is partitioned by its collation key: Spark's CollationAwareMurmur3Hash is
+      // Murmur3 over exactly those bytes.
+      def keyOf(e: org.apache.spark.sql.catalyst.expressions.Expression) =
+        if (collatedHashKey(e, conf)) org.apache.spark.sql.catalyst.expressions.CollationKey(e) else e
       val compiles = h.expressions.forall {
-        case _: Attribute => true
-        case e => TypeMapping.isSupported(e.dataType) && ExpressionCompiler.compile(e, input).isRight
+        case a: Attribute if !collatedHashKey(a, conf) => true
+        case e => TypeMapping.isSupported(keyOf(e).dataType) && ExpressionCompiler.compile(keyOf(e), input).isRight
       }
       if (!compiles) None
       else {
         val keys = h.expressions.zipWithIndex.collect {
-          case (e, i) if !e.isInstanceOf[Attribute] => Alias(e, s"_shuffle_key_$i")()
+          case (e, i) if !e.isInstanceOf[Attribute] || collatedHashKey(e, conf) => Alias(keyOf(e), s"_shuffle_key_$i")()
         }
         val projected = VectorProjectExec(input ++ keys, s.child)
         val asColumns = h.copy(expressions = h.expressions.map {
-          case a: Attribute => a
-          case e => keys.find(_.child.semanticEquals(e)).get.toAttribute
+          case a: Attribute if !collatedHashKey(a, conf) => a
+          case e => keys.find(_.child.semanticEquals(keyOf(e))).get.toAttribute
         })
         if (!VectorShuffle.supports(asColumns, projected.output)) None
         else Some(VectorShuffle.exchange(s.copy(child = projected), keys.size))
       }
     case _ => None
   }
+
+  /**
+   * A collated string hash key our exchange partitions by its collation key (#705). HashPartitioning hashes
+   * with CollationAwareMurmur3Hash, whose collation-aware path does not depend on the legacy hashing flag.
+   */
+  private def collatedHashKey(e: org.apache.spark.sql.catalyst.expressions.Expression, conf: SQLConf): Boolean =
+    e.isInstanceOf[Attribute] && e.dataType.isInstanceOf[org.apache.spark.sql.types.StringType] &&
+      TypeMapping.isCollated(e.dataType)
 
   /** Why a projection would not compile over its child's output (an expression, an output type), input aside. */
   private def projectReason(p: ProjectExec): Option[String] = {
