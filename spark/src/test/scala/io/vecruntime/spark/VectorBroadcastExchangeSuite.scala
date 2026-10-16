@@ -211,4 +211,40 @@ class VectorBroadcastExchangeSuite extends VectorQuerySuite {
       }
     }
   }
+
+  test("array, map and struct build columns cross our broadcast in Arrow's nested layout (#705)") {
+    spark.range(0, 300).selectExpr(
+      "cast(id as int) as nk",
+      "case when id % 7 = 0 then null else array(cast(id as int), cast(null as int), cast(id % 3 as int)) end as na",
+      "case when id % 5 = 0 then null else named_struct('s', concat('v', id), 'l', array(id % 4), " +
+        "'t', named_struct('d', cast(id as decimal(20,2)), 'b', id % 2 = 0)) end as ns",
+      "case when id % 6 = 0 then null else map(concat('k', id % 9), cast(id as double)) end as nm",
+      "case when id % 11 = 0 then null else named_struct('a', cast(id % 40 as int), 'b', concat('x', id % 7)) end as skey"
+    ).write.mode("overwrite").parquet(newTempPath("bx/nested"))
+    spark.read.parquet(newTempPath("bx/nested")).createOrReplaceTempView("bn")
+    spark.sql("SELECT *, named_struct('a', cast(i % 40 as int), 'b', concat('x', i % 7)) AS tkey FROM tk")
+      .createOrReplaceTempView("tkn")
+    Seq(true, false).foreach { aqe =>
+      withConf("spark.sql.adaptive.enabled" -> aqe.toString) {
+        Seq(
+          // Nested payload on the build side, every join type the broadcast plans.
+          "SELECT /*+ BROADCAST(bn) */ i, na, ns, nm FROM tk JOIN bn ON i50 = nk",
+          "SELECT /*+ BROADCAST(bn) */ i, na, nm FROM tk LEFT JOIN bn ON i50 = nk",
+          "SELECT /*+ BROADCAST(bn) */ i FROM tk LEFT SEMI JOIN bn ON i50 = nk AND na IS NOT NULL",
+          // A struct key, its build column read from the row store the broadcast batches fill.
+          "SELECT /*+ BROADCAST(bn) */ i, nk, ns FROM tkn JOIN bn ON tkey = skey"
+        ).foreach { q =>
+          val df = checkVectorized(q, Seq(BHJ, VBX))
+          assert(
+            exchanges(df).forall(_.isInstanceOf[VectorBroadcastExchangeExec]),
+            s"a Spark broadcast exchange left (aqe=$aqe): $q\n${finalPlan(df).treeString}"
+          )
+        }
+      }
+    }
+    // A Spark join over the same exchange reads Spark's relation, built from the nested batches.
+    withConf(VectorConf.BroadcastHashJoinEnabled -> "false") {
+      checkVectorized("SELECT /*+ BROADCAST(bn) */ i, na, ns, nm FROM tk JOIN bn ON i50 = nk", Seq(VBX))
+    }
+  }
 }
