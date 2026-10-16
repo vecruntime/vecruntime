@@ -447,6 +447,28 @@ private[vecruntime] class VectorGroupedAggregateIterator(
   private var current: ColumnarBatch = _
   private var closed = false
 
+  // Pass-through without a table (#785): when every key is an input column with a lane and every aggregate counts
+  // rows, a batch that does not reduce is its own groups -- its key columns as they are, a count of 1 each. A
+  // collapse on a unique key (CountBelowJoin) otherwise hashed every row into a fresh table only to copy it out.
+  private val forwardable: Boolean =
+    !hasRepresentatives && layout.indices.forall { c =>
+      layout(c) match {
+        case KeySlot(k) =>
+          keyExprs(k) match {
+            case ColumnRef(_, dt) => dt == outputAttrs(c)._2 && TypeMapping.hasLane(dt)
+            case _ => false
+          }
+        case BufferSlot(aggIdx, _) =>
+          outputAttrs(c)._2 == org.apache.spark.sql.types.LongType && (aggs(aggIdx) match {
+            case io.vecruntime.spark.agg.CountAgg(None) => true
+            case io.vecruntime.spark.agg.CountAgg(Some(l: LiteralExpr)) => l.value != null
+            case _ => false
+          })
+      }
+    }
+  // A forwarded batch waiting for `next()`.
+  private var pending: ColumnarBatch = _
+
   // Grace hash (Final past the budget): the spill, the bucket being merged and its batches.
   private var spill: AggregateSpill = _
   private var bucket = -1
@@ -623,6 +645,7 @@ private[vecruntime] class VectorGroupedAggregateIterator(
 
   /** Makes groups available to emit; false when the iterator is exhausted. */
   private def advance(): Boolean = {
+    if (pending != null) return true
     if (fed) return inputDone && emittedGroups < table.size()
     while (emittedGroups >= table.size()) {
       policy match {
@@ -632,6 +655,15 @@ private[vecruntime] class VectorGroupedAggregateIterator(
           inputDone = true
         case AggSpillPolicy.EmitAndReset(budget, ratio, _) =>
           if (inputDone) return false
+          if (passThrough && forwardable) {
+            reset() // the last table is out: free it
+            while (input.hasNext) {
+              pending = forward(input.next())
+              if (pending != null) return true
+            }
+            inputDone = true
+            return false
+          }
           reset()
           inputDone = fill(input, budget)
           // Past the budget: this table goes out now and the next stage merges it with the rest. A table
@@ -703,6 +735,13 @@ private[vecruntime] class VectorGroupedAggregateIterator(
   override def next(): ColumnarBatch = {
     if (!hasNext) throw new NoSuchElementException("no more groups")
     releaseCurrent()
+    if (pending != null) {
+      current = pending
+      pending = null
+      metrics.numOutputBatches += 1
+      metrics.numOutputRows += current.numRows()
+      return current
+    }
     val from = emittedGroups
     val to = math.min(table.size(), from + OutputBatchSize)
     current = buildBatch(from, to)
@@ -710,6 +749,41 @@ private[vecruntime] class VectorGroupedAggregateIterator(
     metrics.numOutputBatches += 1
     metrics.numOutputRows += (to - from)
     current
+  }
+
+  /**
+   * One input batch as its own groups (#785, see `forwardable`): key columns borrowed from the input (it stays
+   * alive until the next batch is pulled) or compacted through its selection, and a count of 1 per row.
+   */
+  private def forward(batch: ColumnarBatch): ColumnarBatch = metrics.timed {
+    metrics.numInputBatches += 1
+    EvalContexts.withBatch(batch) { ctx =>
+      val rows = ctx.selectedCount
+      if (rows == 0) null
+      else {
+        val columns = new Array[ColumnVector](layout.length)
+        var c = 0
+        try {
+          while (c < columns.length) {
+            val (name, dt) = outputAttrs(c)
+            columns(c) = layout(c) match {
+              case KeySlot(k) =>
+                val ordinal = keyExprs(k).asInstanceOf[ColumnRef].ordinal
+                if (ctx.hasSelection) ArrowOutput.compact(name, dt, ctx.input(ordinal), ctx.selection, rows, allocator)
+                else io.vecruntime.spark.arrow.BorrowedColumnVector.of(ctx.column(ordinal))
+              case BufferSlot(_, _) => ArrowOutput.constant(name, dt, java.lang.Long.valueOf(1L), rows, allocator)
+            }
+            c += 1
+          }
+        } catch {
+          case t: Throwable =>
+            var i = 0
+            while (i < c) { if (columns(i) != null) columns(i).close(); i += 1 }
+            throw t
+        }
+        new ColumnarBatch(columns, rows)
+      }
+    }
   }
 
   private def buildBatch(from: Int, to: Int): ColumnarBatch = {
@@ -884,6 +958,7 @@ private[vecruntime] class VectorGroupedAggregateIterator(
     if (!closed) {
       closed = true
       releaseCurrent()
+      if (pending != null) { pending.close(); pending = null }
       if (bucketInput != null) {
         try bucketInput.close()
         catch { case _: Exception => }; bucketInput = null

@@ -195,6 +195,21 @@ class CountBelowJoinSuite extends VectorQuerySuite {
     assert(collapsed(df.queryExecution.optimizedPlan).isEmpty, df.queryExecution.optimizedPlan.treeString)
   }
 
+  test(
+    "#785: a side joined on its unique key, no statistics: past the probe its batches pass through, results unchanged"
+  ) {
+    // Every address row is its own group: the first 256 rows show no reduction and the rest goes out batch by
+    // batch as it came, with a count of 1 -- with and without a filter on the side (a selection over the batch).
+    Seq(
+      "SELECT a_state, sum(qty) q, count(*) n FROM cbj_sales JOIN cbj_address ON qty = a_sk GROUP BY a_state",
+      """SELECT a_state, a_zip, count(*) n, max(price) hi FROM cbj_sales JOIN cbj_address ON qty = a_sk
+        |WHERE a_state <> 'state-3' GROUP BY a_state, a_zip""".stripMargin
+    ).foreach { sql =>
+      val df = run(sql, shuffled, VectorConf.AggregateBelowJoinProbeRows -> "256")
+      assert(collapsed(df.queryExecution.optimizedPlan).size == 1, df.queryExecution.optimizedPlan.treeString)
+    }
+  }
+
   test("statistics: a side small once collapsed is aggregated and broadcast, the large side keeps no exchange") {
     // The raw side does not fit the threshold; 2 x 21 x 5 groups of four columns do.
     val sizeOfSide = spark.table("cbj_address_stats").queryExecution.optimizedPlan.stats.sizeInBytes
