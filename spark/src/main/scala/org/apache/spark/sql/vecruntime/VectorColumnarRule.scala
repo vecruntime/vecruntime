@@ -1213,7 +1213,7 @@ case class VectorExecRule(session: SparkSession) extends Rule[SparkPlan] with Lo
         case org.apache.spark.sql.catalyst.optimizer.BuildLeft => j.leftKeys
         case org.apache.spark.sql.catalyst.optimizer.BuildRight => j.rightKeys
       }
-      payloadTypeReason(buildPlan, keys, j.condition)
+      payloadTypeReason(buildPlan, keys, j.condition, nestedKeys = !j.isNullAwareAntiJoin)
     }
 
   /**
