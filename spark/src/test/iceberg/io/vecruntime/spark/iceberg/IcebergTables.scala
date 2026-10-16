@@ -17,7 +17,7 @@ package io.vecruntime.spark.iceberg
 
 import io.vecruntime.spark.test.TestTables
 import org.apache.iceberg.{FileFormat, Table}
-import org.apache.iceberg.data.{GenericAppenderFactory, GenericRecord}
+import org.apache.iceberg.data.{GenericFileWriterFactory, GenericRecord}
 import org.apache.iceberg.io.OutputFileFactory
 import org.apache.iceberg.spark.Spark3Util
 import org.apache.spark.sql.SparkSession
@@ -158,15 +158,14 @@ object IcebergTables {
     val schema = table.schema()
     val keyField = schema.findField("i")
     val deleteSchema = schema.select("i")
-    val factory = new GenericAppenderFactory(
-      schema,
-      table.spec(),
-      Array(keyField.fieldId()),
-      deleteSchema,
-      null
-    )
+    // Iceberg 1.12 dropped GenericAppenderFactory; its writer factory goes through the format-model registry.
+    val factory = new GenericFileWriterFactory.Builder(table)
+      .deleteFileFormat(FileFormat.PARQUET)
+      .equalityFieldIds(Array(keyField.fieldId()))
+      .equalityDeleteRowSchema(deleteSchema)
+      .build()
     val outputFile = OutputFileFactory.builderFor(table, 1, 1).format(FileFormat.PARQUET).build().newOutputFile()
-    val writer = factory.newEqDeleteWriter(outputFile, FileFormat.PARQUET, null)
+    val writer = factory.newEqualityDeleteWriter(outputFile, table.spec(), null)
     try {
       keys.foreach { k =>
         val record = GenericRecord.create(deleteSchema)
