@@ -23,7 +23,7 @@ import scala.collection.mutable.ArrayBuffer
 import scala.jdk.CollectionConverters._
 
 import org.apache.iceberg.{FileFormat, Table}
-import org.apache.iceberg.data.{GenericAppenderFactory, GenericRecord}
+import org.apache.iceberg.data.{GenericFileWriterFactory, GenericRecord}
 import org.apache.iceberg.io.OutputFileFactory
 import org.apache.iceberg.spark.Spark3Util
 import org.apache.spark.sql.{DataFrame, SparkSession}
@@ -422,13 +422,18 @@ object IcebergMorGenerator {
     val keyField = schema.findField(eqKey)
     val deleteSchema = schema.select(eqKey)
     val isLong = keyField.`type`().typeId() == org.apache.iceberg.types.Type.TypeID.LONG
-    val factory = new GenericAppenderFactory(schema, table.spec(), Array(keyField.fieldId()), deleteSchema, null)
+    // Iceberg 1.12 dropped GenericAppenderFactory; its writer factory goes through the format-model registry.
+    val factory = new GenericFileWriterFactory.Builder(table)
+      .deleteFileFormat(FileFormat.PARQUET)
+      .equalityFieldIds(Array(keyField.fieldId()))
+      .equalityDeleteRowSchema(deleteSchema)
+      .build()
     val delta = table.newRowDelta()
     var written = 0L
     keys.grouped(perFile).zipWithIndex.foreach { case (chunk, i) =>
       written += chunk.size
       val outputFile = OutputFileFactory.builderFor(table, 1, i + 1).format(FileFormat.PARQUET).build().newOutputFile()
-      val writer = factory.newEqDeleteWriter(outputFile, FileFormat.PARQUET, null)
+      val writer = factory.newEqualityDeleteWriter(outputFile, table.spec(), null)
       try {
         chunk.foreach { k =>
           val record = GenericRecord.create(deleteSchema)
