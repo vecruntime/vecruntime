@@ -140,4 +140,28 @@ class VectorCollatedStringSuite extends VectorQuerySuite {
     val df = checkVectorized(topN, Seq(classOf[org.apache.spark.sql.vecruntime.VectorTakeOrderedAndProjectExec]))
     assert(df.collect().toSeq == withPlugin(enabled = false)(spark.sql(topN).collect().toSeq))
   }
+
+  test("collation keys: comparisons, IN and min / max / count / first over collated values are ours") {
+    val Agg = classOf[org.apache.spark.sql.vecruntime.VectorHashAggregateExec]
+    val Filter = classOf[VectorFilterExec]
+    Seq(
+      "SELECT k, s FROM ct WHERE s = 'A'",
+      "SELECT k, s FROM ct WHERE s <> 'ab'",
+      "SELECT k, s FROM ct WHERE s IN ('AB', 'É')",
+      "SELECT k, s FROM ct WHERE s IN ('a', 'B', 'aB', 'é', 'x', 'q')", // past the short-list path
+      "SELECT k, u FROM ct WHERE u = 'strasse'",
+      "SELECT k, u FROM ct WHERE u > 'cafe' AND u <= 'STRASSE'",
+      "SELECT k, s FROM ct WHERE s < 'b' OR s >= 'é'",
+      "SELECT k, s FROM ct WHERE s <=> 'AB'"
+    ).foreach(q => checkVectorized(q, Seq(Filter)))
+    withConf("spark.sql.optimizer.inSetConversionThreshold" -> "2") {
+      checkVectorized("SELECT k, s FROM ct WHERE s IN ('A', 'b', 'É')", Seq(Filter))
+    }
+    Seq(
+      "SELECT lower(min(s)), lower(max(s)), lower(min(u)), lower(max(u)), count(s), count(u) FROM ct",
+      "SELECT k % 7, lower(min(s)), lower(max(u)), count(s) FROM ct GROUP BY k % 7",
+      "SELECT lower(u), lower(min(s)), lower(max(s)) FROM ct GROUP BY u",
+      "SELECT k % 5, lower(first(s)), lower(last(u)) FROM (SELECT * FROM ct1 SORT BY k) GROUP BY k % 5"
+    ).foreach(q => checkVectorized(q, Seq(Agg))) // the partial stages here; the finals read Spark's row exchange
+  }
 }

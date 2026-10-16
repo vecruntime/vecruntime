@@ -44,7 +44,8 @@ final case class CollationKeyExpr(child: VectorExpr, collationId: Int) extends V
       if (in.isNull(i)) nulls(i) = true
       else {
         val key = CollationFactory.getCollationKeyBytes(UTF8String.fromBytes(in.getUtf8Bytes(i)), collationId)
-        if (size + key.length > out.length) out = java.util.Arrays.copyOf(out, math.max(out.length * 2, size + key.length))
+        if (size + key.length > out.length)
+          out = java.util.Arrays.copyOf(out, math.max(out.length * 2, size + key.length))
         System.arraycopy(key, 0, out, size, key.length)
         size += key.length
       }

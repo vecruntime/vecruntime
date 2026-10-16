@@ -1220,9 +1220,9 @@ object VectorAggregatePlanner {
             !objectOutputs.contains(attr.exprId) &&
             // An array or struct key decoded from its bytes, or a nested result compiled above (#705).
             !io.vecruntime.spark.expr.NestedKeyBytesExpr.supports(attr.dataType) &&
-            // A collated string grouping key, output as one of its group's values (#705).
-            !(io.vecruntime.spark.expr.CollationKeyExpr.collationOf(attr.dataType) >= 0 &&
-              a.groupingExpressions.exists(_.toAttribute.exprId == attr.exprId))
+            // A collated string (#705): a grouping key output as one of its group's values, or a min / max /
+            // first / last buffer or result -- values the functions carried; nothing computed one from its bytes.
+            !(io.vecruntime.spark.expr.CollationKeyExpr.collationOf(attr.dataType) >= 0)
         ) match {
           case Some(attr) => Left(s"unsupported output type ${attr.dataType.simpleString} for ${attr.name}")
           case None =>
@@ -1256,7 +1256,9 @@ object AggBufferColumns {
     // and array outputs (the object aggregates, #57) have no lane and no direct writer -- straight to
     // the boxed path, which routes them to Spark's on-heap column store.
     if (
-      dt != org.apache.spark.sql.types.StringType && !dt.isInstanceOf[org.apache.spark.sql.types.BinaryType] &&
+      !dt.isInstanceOf[org.apache.spark.sql.types.StringType] && !dt.isInstanceOf[
+        org.apache.spark.sql.types.BinaryType
+      ] &&
       !dt.isInstanceOf[org.apache.spark.sql.types.ArrayType]
     ) {
       val out = ArrowOutput.allocateFixed(name, dt, to - from, allocator)
@@ -1296,7 +1298,7 @@ object AggBufferColumns {
           o += 1
         }
         return ArrowOutput.finish(out, count, !anyNull)
-      case org.apache.spark.sql.types.StringType =>
+      case _: org.apache.spark.sql.types.StringType => // a collated string too (#705)
         // min/max, first/last, min_by/max_by over strings: boxed UTF8Strings into a varchar vector.
         val values = new Array[Array[Byte]](count)
         var o = 0

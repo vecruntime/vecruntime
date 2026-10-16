@@ -474,7 +474,9 @@ class VectorShuffleSuite extends AnyFunSuite with BeforeAndAfterAll {
       assertOurExchange(spark.sql(q))
       checkAgainstSpark(q)
     }
-    checkAgainstSpark("select spark_partition_id() p, i from (select /*+ REPARTITION(5, s, k, u) */ i, s, k, u from coll)")
+    checkAgainstSpark(
+      "select spark_partition_id() p, i from (select /*+ REPARTITION(5, s, k, u) */ i, s, k, u from coll)"
+    )
     // Joins on a collated equality: Spark keys them on collationkey(), hashed and compared as binary by ours.
     val shj = "select /*+ SHUFFLE_HASH(colld) */ i, d from coll join colld on s = s2"
     val shjPlan = assertOurExchange(spark.sql(shj), expectedCount = 2)
@@ -485,13 +487,17 @@ class VectorShuffleSuite extends AnyFunSuite with BeforeAndAfterAll {
     checkAgainstSpark("select i from coll left anti join colld on u = u2")
     // A group by and a window over a collated key: their exchanges hash the collation key; values compare by it.
     checkAgainstSpark("select lower(s) ls, count(*) c from coll group by s")
+    checkAgainstSpark("select k, lower(min(s)) mn, lower(max(u)) mx, count(r) c from coll group by k")
+    checkAgainstSpark("select lower(min(u)) mn, lower(max(s)) mx from coll where s in ('A', 'σ') or u = 'cafe'")
     checkAgainstSpark("select i, rank() over (partition by s order by k, i) rk from coll")
     checkAgainstSpark("select i, row_number() over (partition by u, r order by i) rn from coll")
     // Range keys: Spark's partitioner over the rows, the collation's order; our sort orders by the key.
-    for (ordered <- Seq(
+    for (
+      ordered <- Seq(
         "select s, k, i from coll order by s, k, i limit 3000", // i: a total order
         "select u, r, i from coll order by u desc nulls last, r, i"
-      )) {
+      )
+    ) {
       val ours = spark.sql(ordered).collect().toSeq
       spark.sessionState.conf.setConfString("spark.vecruntime.enabled", "false")
       try assert(ours === spark.sql(ordered).collect().toSeq, ordered)

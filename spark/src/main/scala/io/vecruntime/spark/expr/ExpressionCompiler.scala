@@ -318,7 +318,41 @@ object ExpressionCompiler {
 
   /** Compiles a comparison / IN operand: the wide-decimal path for wide types, [[compile]] otherwise. */
   private def operand(e: Expression, input: Seq[Attribute]): Result =
-    if (isWideDecimal(e.dataType)) wideOperand(e, input) else compile(e, input)
+    if (CollationKeyExpr.collationOf(e.dataType) >= 0) collatedOperandKey(e, input)
+    else if (isWideDecimal(e.dataType)) wideOperand(e, input)
+    else compile(e, input)
+
+  /**
+   * A comparison / IN operand of a collated string type (#705): its collation key -- the column's
+   * [[CollationKeyExpr]], a literal's key bytes folded now. Keys are equal exactly when the collation says equal
+   * and compare, unsigned, in its order, so the comparison kernels decide as Spark's collation-aware comparator.
+   */
+  private def collatedOperandKey(e: Expression, input: Seq[Attribute]): Result = {
+    val id = CollationKeyExpr.collationOf(e.dataType)
+    e match {
+      case a: AttributeReference => compileMovedColumn(a, input).map(CollationKeyExpr(_, id))
+      case Literal(null, _) => Left("comparison against NULL")
+      case Literal(v: UTF8String, _) =>
+        Right(LiteralExpr(
+          UTF8String.fromBytes(org.apache.spark.sql.catalyst.util.CollationFactory.getCollationKeyBytes(v, id)),
+          BinaryType
+        ))
+      case other => Left(s"unsupported ${other.prettyName} over a collated string")
+    }
+  }
+
+  /** A comparison, IN or <=> whose operands are collated columns or literals: compiled on their collation keys. */
+  private def collatedComparison(e: Expression): Boolean = {
+    def plain(x: Expression) = x.isInstanceOf[AttributeReference] || x.isInstanceOf[Literal]
+    e match {
+      case _: EqualTo | _: LessThan | _: LessThanOrEqual | _: GreaterThan | _: GreaterThanOrEqual | _: EqualNullSafe =>
+        e.children.forall(plain)
+      case Not(EqualTo(l, r)) => plain(l) && plain(r)
+      case In(v, list) => plain(v) && list.forall(_.isInstanceOf[Literal])
+      case InSet(v, _) => plain(v)
+      case _ => false
+    }
+  }
 
   /**
    * A bare column of any lane type -- including a DECIMAL128 column no kernel computes on yet (#257)
@@ -372,7 +406,9 @@ object ExpressionCompiler {
     // hash keys): the bytes CollationFactory gives the value, a binary key the kernels compare as any (#705).
     case k @ CollationKey(a: AttributeReference) if CollationKeyExpr.collationOf(a.dataType) >= 0 =>
       compileMovedColumn(a, input).map(CollationKeyExpr(_, k.collationId))
-    case e if collatedOperand(e) && !(e.isInstanceOf[IsNull] || e.isInstanceOf[IsNotNull] || e.isInstanceOf[Alias]) =>
+    case e
+        if collatedOperand(e) && !(e.isInstanceOf[IsNull] || e.isInstanceOf[IsNotNull] || e.isInstanceOf[Alias]) &&
+          !collatedComparison(e) =>
       Left(s"unsupported ${e.prettyName} over a collated string")
 
     // A scalar subquery result in any reference-free shape (the ScalarSubquery, a struct field of a
@@ -2000,8 +2036,8 @@ object ExpressionCompiler {
         else binaryBoolean(l, r, input)(NullSafeEqExpr(_, _))
       case _ =>
         for {
-          le <- compile(l, input)
-          re <- compile(r, input)
+          le <- if (TypeMapping.isCollated(l.dataType)) operand(l, input) else compile(l, input)
+          re <- if (TypeMapping.isCollated(r.dataType)) operand(r, input) else compile(r, input)
           _ <- check(le, re, l, r)
         } yield NullSafeEqExpr(le, re)
     }
@@ -2014,7 +2050,17 @@ object ExpressionCompiler {
   private def inSet(value: Expression, hset: Set[Any], input: Seq[Attribute]): Result = {
     if (hset.isEmpty) Left("empty IN set")
     else if (hset.contains(null)) Left("NULL in IN set")
-    else compile(value, input).flatMap {
+    else if (CollationKeyExpr.collationOf(value.dataType) >= 0) {
+      // A collated value (#705): the set's elements as their collation keys.
+      if (!hset.forall(_.isInstanceOf[UTF8String])) Left("IN set elements are not strings")
+      else for {
+        c <- collatedOperandKey(value, input)
+        lits <- hset.toSeq.foldRight[Either[String, List[LiteralExpr]]](Right(Nil)) { (v, acc) =>
+          for (rest <- acc; k <- collatedOperandKey(Literal(v, value.dataType), input))
+            yield k.asInstanceOf[LiteralExpr] :: rest
+        }
+      } yield stringIn(c, lits)
+    } else compile(value, input).flatMap {
       case _: LiteralExpr => Left("IN over a literal")
       case c if c.vecType == VecType.UTF8 =>
         if (!hset.forall(_.isInstanceOf[UTF8String])) Left("IN set elements are not strings")
