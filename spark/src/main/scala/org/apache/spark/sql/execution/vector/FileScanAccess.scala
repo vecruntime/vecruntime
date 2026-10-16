@@ -110,7 +110,7 @@ object FileScanAccess {
    * reading the scan's selected partitions throws "... has not finished" for a subquery that was started but
    * never awaited. Idempotent.
    */
-  def prepareAndWaitForSubqueries(scan: FileSourceScanExec): Unit = {
+  def prepareAndWaitForSubqueries(scan: org.apache.spark.sql.execution.SparkPlan): Unit = {
     val cls = classOf[org.apache.spark.sql.execution.SparkPlan]
     val prepare = cls.getDeclaredMethod("prepareSubqueries")
     prepare.setAccessible(true)

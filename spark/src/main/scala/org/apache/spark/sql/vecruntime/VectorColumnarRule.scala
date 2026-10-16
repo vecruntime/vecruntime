@@ -233,6 +233,11 @@ case class VectorExecRule(session: SparkSession) extends Rule[SparkPlan] with Lo
         case r: RangeExec if VectorConf.rangeEnabled(conf) =>
           VectorRangePlanner.plan(r).fold(reason => fallback(r, reason), v => v)
 
+        // #735: an Iceberg scan read by our native Parquet reader over Iceberg's planning (task groups with
+        // deletes still go through Iceberg's reader inside the node). Anything else keeps Spark's BatchScanExec.
+        case b: org.apache.spark.sql.execution.datasources.v2.BatchScanExec if VectorConf.scanNativeIceberg(conf) =>
+          VectorIcebergScanPlanner.plan(b, conf).fold(reason => fallback(b, reason), v => v)
+
         // A broadcast over one of our plans (#325): its batches are broadcast as they are, for the hash
         // joins' relation and the nested-loop join's identity broadcast alike; a Spark consumer gets
         // `mode.transform` over the batches' rows (the bridge). Under the
