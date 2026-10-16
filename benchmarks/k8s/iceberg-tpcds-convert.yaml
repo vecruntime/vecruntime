@@ -1,0 +1,63 @@
+# #735: convert the TPC-DS Parquet tables on S3 into an Iceberg Hadoop catalog on S3, ON THE CLUSTER
+# (IcebergTpcdsConvert: one CTAS per table, partitioned as the Parquet is). Render by replacing IMAGE, S3_BUCKET,
+# DATA_PREFIX (e.g. tpcds/sf3000-doeks), WAREHOUSE_PREFIX (e.g. iceberg/tpcds), NAMESPACE, NODE_SELECTOR and
+# EXECUTORS; then `kubectl apply -f`. The tables are read back with
+# `TpcdsRunner --data catalog:ice.NAMESPACE` and the same catalog configuration (IcebergMorGenerator.catalogConf).
+apiVersion: sparkoperator.k8s.io/v1beta2
+kind: SparkApplication
+metadata:
+  name: vecruntime-iceberg-convert-NAMESPACE
+  namespace: bench
+spec:
+  type: Scala
+  mode: cluster
+  image: IMAGE
+  imagePullPolicy: IfNotPresent
+  mainClass: io.vecruntime.benchmarks.IcebergTpcdsConvert
+  mainApplicationFile: local:///opt/spark/jars/benchmarks.jar
+  arguments:
+    - "--data"
+    - "s3a://S3_BUCKET/DATA_PREFIX"
+    - "--warehouse"
+    - "s3a://S3_BUCKET/WAREHOUSE_PREFIX"
+    - "--namespace"
+    - "NAMESPACE"
+  sparkVersion: "4.1.3"
+  sparkConf:
+    spark.sql.adaptive.enabled: "true"
+    spark.sql.shuffle.partitions: "900"
+    spark.hadoop.fs.s3a.connection.maximum: "200"
+    spark.hadoop.fs.s3a.aws.credentials.provider: "software.amazon.awssdk.auth.credentials.WebIdentityTokenFileCredentialsProvider"
+    spark.driver.extraJavaOptions: >-
+      --add-modules=jdk.incubator.vector --enable-native-access=ALL-UNNAMED --sun-misc-unsafe-memory-access=allow
+      --add-opens=java.base/java.lang=ALL-UNNAMED --add-opens=java.base/java.nio=ALL-UNNAMED
+      --add-opens=java.base/sun.nio.ch=ALL-UNNAMED -Dio.netty.tryReflectionSetAccessible=true
+    spark.executor.extraJavaOptions: >-
+      --add-modules=jdk.incubator.vector --enable-native-access=ALL-UNNAMED --sun-misc-unsafe-memory-access=allow
+      --add-opens=java.base/java.lang=ALL-UNNAMED --add-opens=java.base/java.nio=ALL-UNNAMED
+      --add-opens=java.base/sun.nio.ch=ALL-UNNAMED -Dio.netty.tryReflectionSetAccessible=true
+  restartPolicy:
+    type: Never
+  driver:
+    cores: 4
+    memory: "16g"
+    serviceAccount: sfi-engine
+    nodeSelector:
+      workload: "NODE_SELECTOR"
+    volumeMounts:
+      - name: tmp
+        mountPath: /tmp
+  executor:
+    instances: EXECUTORS
+    cores: 5
+    memory: "44g"
+    memoryOverhead: "14g"
+    serviceAccount: sfi-engine
+    nodeSelector:
+      workload: "NODE_SELECTOR"
+    volumeMounts:
+      - name: tmp
+        mountPath: /tmp
+  volumes:
+    - name: tmp
+      emptyDir: {}
