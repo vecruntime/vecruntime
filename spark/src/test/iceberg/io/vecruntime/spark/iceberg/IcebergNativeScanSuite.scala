@@ -83,11 +83,31 @@ class IcebergNativeScanSuite extends IcebergMorSuiteBase {
     checkVectorized("SELECT s, count(*), sum(l) FROM t WHERE i > 7 GROUP BY s", Seq(Filter, Agg))
   }
 
-  icebergTest("task groups with equality deletes are read by Iceberg's reader") {
+  icebergTest("equality deletes are applied natively, the equality column read even when not projected") {
     useTable("t_eq")
     val df = checkVectorized("SELECT count(*), sum(d2), min(i), max(i) FROM t", Seq(Agg))
     val (native, iceberg) = groups(df)
-    assert(iceberg > 0, s"native $native, Iceberg $iceberg")
+    assert(native > 0 && iceberg == 0, s"native $native, Iceberg $iceberg")
+    // `i`, the equality column, not projected: read for the deletes, then dropped.
+    val noKey = checkVectorized("SELECT s, count(*), sum(l), max(d2) FROM t GROUP BY s", Seq(Agg))
+    val (native2, iceberg2) = groups(noKey)
+    assert(native2 > 0 && iceberg2 == 0, s"native $native2, Iceberg $iceberg2")
+    assert(count("SELECT count(*) FROM t") === IcebergTables.EqLiveRows)
+    assert(count("SELECT count(d2) FROM t") === IcebergTables.EqLiveRows)
+    checkVectorized("SELECT s, count(*), sum(l) FROM t WHERE l % 5 = 2 GROUP BY s", Seq(Filter, Agg))
+  }
+
+  icebergTest("equality deletes on a string column are applied natively") {
+    spark.sql(
+      s"CREATE OR REPLACE TABLE $Db.t_eqs USING iceberg TBLPROPERTIES ('format-version'='2') AS SELECT * FROM $Db.t_pos"
+    )
+    // A null in an equality delete matches the null rows, as in Iceberg.
+    IcebergTables.addEqualityDeletesOn(spark, s"$Db.t_eqs", "s", Seq("s3", "s17", null))
+    useTable("t_eqs")
+    val df = checkVectorized("SELECT count(*), sum(l), min(i) FROM t", Seq(Agg))
+    val (native, iceberg) = groups(df)
+    assert(native > 0 && iceberg == 0, s"native $native, Iceberg $iceberg")
+    checkVectorized("SELECT s, count(*) FROM t GROUP BY s", Seq(Agg))
   }
 
   icebergTest("a renamed column is matched by its field id") {
