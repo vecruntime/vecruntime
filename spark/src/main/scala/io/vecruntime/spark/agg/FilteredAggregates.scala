@@ -37,7 +37,13 @@ final case class FilteredAgg(inner: VectorAggFunction, predicate: VectorExpr) ex
     override def update(ctx: EvalContext): Unit = {
       val bits = FilteredAgg.passing(ctx, predicate)
       val count = Bitmap.popcount(bits, ctx.numRows)
-      if (count > 0) s.update(new EvalContext(ctx.arena, ctx.numRows, ctx.input, bits, count))
+      if (count > 0) {
+        // The batch's own columns ride along: a nested input (a struct the distinct rewrite filters, count.sql)
+        // is read from its column vector, and an object aggregate drives Spark's rows through the batch.
+        val filtered = new EvalContext(ctx.arena, ctx.numRows, ctx.input, bits, count, ctx.column)
+        filtered.batch = ctx.batch
+        s.update(filtered)
+      }
     }
     override def bufferValues: Array[Any] = s.bufferValues
   }
