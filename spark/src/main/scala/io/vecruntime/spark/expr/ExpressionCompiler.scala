@@ -372,7 +372,7 @@ object ExpressionCompiler {
     // hash keys): the bytes CollationFactory gives the value, a binary key the kernels compare as any (#705).
     case k @ CollationKey(a: AttributeReference) if CollationKeyExpr.collationOf(a.dataType) >= 0 =>
       compileMovedColumn(a, input).map(CollationKeyExpr(_, k.collationId))
-    case e if collatedOperand(e) && !(e.isInstanceOf[IsNull] || e.isInstanceOf[IsNotNull]) =>
+    case e if collatedOperand(e) && !(e.isInstanceOf[IsNull] || e.isInstanceOf[IsNotNull] || e.isInstanceOf[Alias]) =>
       Left(s"unsupported ${e.prettyName} over a collated string")
 
     // A scalar subquery result in any reference-free shape (the ScalarSubquery, a struct field of a
