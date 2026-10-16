@@ -21,7 +21,8 @@ import scala.collection.mutable.ArrayBuffer
 
 import io.vecruntime.kernels.{ColumnBuilder, RunMerge, SortKernels, VecType, VectorBuffers}
 import io.vecruntime.spark.arrow.{ArrowOutput, ArrowVectorBuffers, VectorAllocators}
-import io.vecruntime.spark.expr.{ColumnRef, VectorExpr}
+import io.vecruntime.spark.adapter.TypeMapping
+import io.vecruntime.spark.expr.{ColumnRef, EvalContext, VectorExpr}
 import org.apache.arrow.memory.BufferAllocator
 import org.apache.spark.TaskContext
 import org.apache.spark.sql.types.DataType
@@ -51,6 +52,15 @@ private[vecruntime] class VectorSortIterator(
     spillBytes: Long = Long.MaxValue
 ) extends Iterator[ColumnarBatch]
     with AutoCloseable {
+
+  /**
+   * Whether an output column is an array, map or struct (#705). Such a column is copied by the column builders'
+   * nested lanes and gathered as a nested lane, which only the single in-memory run does: the partition is then
+   * one run, never spilled -- the runs' merge gather and the spill files hold lanes only.
+   */
+  private val hasNested: Boolean = outputAttrs.exists { case (_, dt) => TypeMapping.nestedTypeOf(dt) != null }
+  private val runRowLimit: Int = if (hasNested) Int.MaxValue else runRows
+  private val spillLimit: Long = if (hasNested) Long.MaxValue else spillBytes
 
   /** A run the merge reads: its key columns and output columns as they currently stand. */
   private sealed trait Run {
@@ -161,6 +171,34 @@ private[vecruntime] class VectorSortIterator(
   Option(TaskContext.get()).foreach(_.addTaskCompletionListener[Unit](_ => close()))
 
   /** Rough size of `count` rows of `in`: the fixed width, or a string column's mean bytes per row plus its offset. */
+  /** Column `c` of the batch as a lane: an array, map or struct read into a nested lane (#705). */
+  private def inputLane(ctx: EvalContext, batch: ColumnarBatch, c: Int): VectorBuffers = {
+    val dt = outputAttrs(c)._2
+    if (TypeMapping.nestedTypeOf(dt) == null) ctx.input(c)
+    else io.vecruntime.spark.adapter.NestedColumns.adapt(batch.column(c), dt, ctx.numRows, ctx.arena)
+  }
+
+  /** Rows `permutation[from, to)` of a nested lane, handed to Spark as its nested column. */
+  private def nestedGather(
+      name: String,
+      dt: DataType,
+      in: VectorBuffers,
+      permutation: Array[Int],
+      from: Int,
+      to: Int
+  ): ColumnVector = {
+    val arena = Arena.ofConfined()
+    try {
+      val rows = java.util.Arrays.copyOfRange(permutation, from, to)
+      io.vecruntime.spark.arrow.VectorNestedColumnVector.of(
+        name,
+        dt,
+        io.vecruntime.spark.expr.ElementAccessExpr.gather(in, rows, to - from, arena),
+        allocator
+      )
+    } finally arena.close()
+  }
+
   private def estimateBytes(in: VectorBuffers, count: Int): Long = {
     val n = math.max(in.length(), 1)
     val perRow: Long = in.`type`() match {
@@ -257,7 +295,7 @@ private[vecruntime] class VectorSortIterator(
         total += runTotal
         // Past the budget the newest run goes to disk in sorted order and its memory is returned;
         // what stays resident is at most the budget plus one run.
-        if (residentBytes > spillBytes) {
+        if (residentBytes > spillLimit) {
           runs += spill(run)
           residentBytes -= runBytes
         } else {
@@ -282,17 +320,19 @@ private[vecruntime] class VectorSortIterator(
             val count = ctx.selectedCount
             if (count > 0) {
               if (columnBuilders == null) {
-                val expected = math.max(math.min(runRows, count), 1)
+                val expected = math.max(math.min(runRowLimit, count), 1)
                 runArena = Arena.ofShared()
                 columnBuilders =
-                  Array.tabulate(numColumns)(c => new ColumnBuilder(runArena, ctx.input(c).`type`(), expected))
+                  Array.tabulate(numColumns)(c =>
+                    new ColumnBuilder(runArena, inputLane(ctx, batch, c).`type`(), expected)
+                  )
                 keyBuilders = Array.tabulate(computedKeys.length)(k =>
                   new ColumnBuilder(runArena, keyExprs(computedKeys(k)).vecType, expected)
                 )
               }
               var c = 0
               while (c < numColumns) {
-                val in = ctx.input(c)
+                val in = inputLane(ctx, batch, c)
                 columnBuilders(c).append(in, ctx.selection, count)
                 val b = estimateBytes(in, count)
                 runBytes += b; residentBytes += b
@@ -307,7 +347,7 @@ private[vecruntime] class VectorSortIterator(
                 k += 1
               }
               runTotal += count
-              if (runTotal >= runRows) seal()
+              if (runTotal >= runRowLimit) seal()
             }
           }
         }
@@ -362,7 +402,10 @@ private[vecruntime] class VectorSortIterator(
         var c = 0
         while (c < numColumns) {
           val (name, dt) = outputAttrs(c)
-          out(c) = ArrowOutput.gather(name, dt, columns(c), permutation, from, to, allocator)
+          out(c) =
+            if (TypeMapping.nestedTypeOf(dt) == null)
+              ArrowOutput.gather(name, dt, columns(c), permutation, from, to, allocator)
+            else nestedGather(name, dt, columns(c), permutation, from, to)
           c += 1
         }
       } else {
