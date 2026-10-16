@@ -13,13 +13,16 @@
 """Render the TPC-DS 3 TB page (docs/benchmarks/tpcds-3tb-graviton.html): VecRuntime against the Gluten + Velox
 and DataFusion Comet results awslabs data-on-eks published for the same dataset and hardware.
 
-    R=benchmarks/results/tpcds-sf3000-doeks-2026-10-10
-    render-doeks-page.py --vector $R/vecruntime-p900.jsonl --vector-alt $R/vecruntime-p200.jsonl \\
+    R=benchmarks/results/tpcds-sf3000-doeks-2026-10-16
+    render-doeks-page.py --vector $R/vecruntime-p200.jsonl --vector-label "VecRuntime (200 partitions)" \\
         --gluten $R/doeks-gluten-velox-1.6.0-arm64.csv --comet $R/doeks-comet-0.16.0.csv \\
-        --out docs/benchmarks/tpcds-3tb-graviton.html [--meta meta.json]
+        --out docs/benchmarks/tpcds-3tb-graviton.html --meta $R/meta.json
+
+    (2026-10-10's page: --vector $R/vecruntime-p900.jsonl --vector-alt $R/vecruntime-p200.jsonl over that day's dir.)
 
 `--vector` / `--vector-alt` are the cluster runner's JSON-lines result files (the main run and the run at
-data-on-eks's 200 shuffle partitions); `--gluten` / `--comet` are data-on-eks's per-query CSVs
+data-on-eks's 200 shuffle partitions). `--vector-alt` is optional: without it the page shows the one VecRuntime run,
+labelled `--vector-label` (default "VecRuntime (900 partitions)"). `--gluten` / `--comet` are data-on-eks's per-query CSVs
 (`Name,Mean,Min,Max`, seconds, names like `q1-v4.0`). `meta.json` overrides the text below (DEFAULT_META).
 The helpers and the look are render-benchmark-page.py's; the page is self-contained (data inlined, Chart.js
 from a CDN).
@@ -98,7 +101,8 @@ def bucket(ratio):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--vector", required=True); ap.add_argument("--vector-alt", required=True)
+    ap.add_argument("--vector", required=True); ap.add_argument("--vector-alt")
+    ap.add_argument("--vector-label", help='label of --vector, e.g. "VecRuntime (200 partitions)"')
     ap.add_argument("--gluten", required=True); ap.add_argument("--comet", required=True)
     ap.add_argument("--out", required=True); ap.add_argument("--meta")
     ap.add_argument("--web-out", help="also write a standalone web/ page (no Jekyll) to this path")
@@ -107,18 +111,27 @@ def main():
     meta = dict(DEFAULT_META)
     if a.meta:
         meta.update(json.loads(Path(a.meta).read_text()))
-    V, A = load(a.vector), load(a.vector_alt)
+    two = a.vector_alt is not None  # two VecRuntime runs (900 and 200 partitions), or one
+    if a.vector_label:
+        LABELS["vector"] = a.vector_label
+    vlabel = LABELS["vector"]
+    vshort = vlabel.replace("VecRuntime (", "").replace(" partitions)", "")  # "900" / "200" for column headers
+    engines = ENGINES if two else ("vector", "gluten", "comet")
+    vrun = ("vector", "alt") if two else ("vector",)
+    V = load(a.vector)
+    A = load(a.vector_alt) if two else V
     sec = {"vector": {q: r["medianMs"] / 1000 for q, r in V.items()}, "alt": {q: r["medianMs"] / 1000 for q, r in A.items()},
            "gluten": load_csv(a.gluten), "comet": load_csv(a.comet)}
-    queries = sorted(set.intersection(*(set(sec[e]) for e in ENGINES)), key=qkey)
+    queries = sorted(set.intersection(*(set(sec[e]) for e in engines)), key=qkey)
     if len(queries) < 100:
-        sys.exit(f"only {len(queries)} queries common to the four result sets")
+        sys.exit(f"only {len(queries)} queries common to the {len(engines)} result sets")
     n = len(queries)
     s = {e: {q: sec[e][q] for q in queries} for e in ENGINES}
     tot = {e: sum(s[e].values()) for e in ENGINES}
+    vcols = ["VecRuntime 900", "VecRuntime 200"] if two else [f"VecRuntime {vshort}"]
     vs = lambda e, other, q: s[other][q] / s[e][q]  # how many times faster e is than other on q
-    geo = {(e, o): geomean([vs(e, o, q) for q in queries]) for e in ("vector", "alt") for o in ("gluten", "comet")}
-    wins = {(e, o): sum(1 for q in queries if s[e][q] < s[o][q]) for e in ("vector", "alt") for o in ("gluten", "comet")}
+    geo = {(e, o): geomean([vs(e, o, q) for q in queries]) for e in vrun for o in ("gluten", "comet")}
+    wins = {(e, o): sum(1 for q in queries if s[e][q] < s[o][q]) for e in vrun for o in ("gluten", "comet")}
     rows_diff = [q for q in queries if V[q].get("rows") != A[q].get("rows")]
     cks_diff = [q for q in queries if V[q].get("checksum") != A[q].get("checksum")]
     exe = {e: sum(R[q].get("executorRunTimeMs", 0) for q in queries) / 3.6e6 for e, R in (("vector", V), ("alt", A))}
@@ -128,7 +141,7 @@ def main():
     f1 = lambda x: f"{x:,.1f}"
 
     def summary_row(e):
-        if e in ("vector", "alt"):
+        if e in vrun:
             return (LABELS[e], f"<b>{f1(tot[e])}</b>" if e == "vector" else f1(tot[e]),
                     f"{tot['gluten'] / tot[e]:.2f}x", f"{tot['comet'] / tot[e]:.2f}x",
                     f"{geo[(e, 'gluten')]:.2f}x / {geo[(e, 'comet')]:.2f}x",
@@ -147,7 +160,7 @@ def main():
                     key=lambda q: -(s["vector"][q] - min(s["gluten"][q], s["comet"][q])))
 
     def behind_rows():
-        return [(q, f1(s["vector"][q]), f1(s["alt"][q]), f1(s["gluten"][q]), f1(s["comet"][q]),
+        return [(q, f1(s["vector"][q])) + ((f1(s["alt"][q]),) if two else ()) + (f1(s["gluten"][q]), f1(s["comet"][q]),
                  f"{s['vector'][q] - min(s['gluten'][q], s['comet'][q]):+.1f}") for q in behind]
 
     top = sorted(queries, key=lambda q: -vs("vector", "gluten", q))[:10]
@@ -158,17 +171,44 @@ def main():
 
     per_query_rows = []
     for q in queries:
-        best = min(s[e][q] for e in ENGINES)
+        best = min(s[e][q] for e in engines)
         cell = lambda x: f"<b>{f1(x)}</b>" if x == best else f1(x)
-        per_query_rows.append((q, cell(s["vector"][q]), cell(s["alt"][q]), cell(s["gluten"][q]), cell(s["comet"][q]),
+        per_query_rows.append((q, cell(s["vector"][q])) + ((cell(s["alt"][q]),) if two else ()) +
+                              (cell(s["gluten"][q]), cell(s["comet"][q]),
                                f"{vs('vector', 'gluten', q):.2f}x", f"{vs('vector', 'comet', q):.2f}x"))
 
-    chart_data = {"queries": queries, "series": {e: [round(s[e][q], 2) for q in queries] for e in ENGINES},
-                  "labels": LABELS, "colors": COLORS, "totals": {e: round(tot[e], 1) for e in ENGINES}}
+    chart_data = {"queries": queries, "series": {e: [round(s[e][q], 2) for q in queries] for e in engines},
+                  "labels": LABELS, "colors": COLORS, "totals": {e: round(tot[e], 1) for e in engines},
+                  "engines": list(engines)}
     versions = table(["Component", "Version"], [(k, html.escape(v)) for k, v in meta["versions"].items()], "kv")
     env = table(["Component", "Configuration"], [(k, html.escape(meta[k.lower()])) for k in ("Dataset", "Cluster", "Executors", "Storage")], "kv")
     conf_v = "\n".join(meta["vector_conf"])
     notes = "".join(f"<li>{html.escape(x)}</li>" for x in meta["notes"])
+
+    alt_card = (f'<div class="card"><div class="l">VecRuntime, 200 partitions</div><div class="n">{tot["alt"]:,.0f} s</div>'
+                f'<div class="l">data-on-eks\'s setting · {tot["gluten"] / tot["alt"]:.2f}x Gluten · {tot["comet"] / tot["alt"]:.2f}x Comet</div></div>'
+                if two else "")
+    partitions_section = (f"""<h2 id="partitions">900 against 200 shuffle partitions</h2>
+<p>data-on-eks runs at Spark's default of 200 shuffle partitions. At 3 TB VecRuntime is {100 * tot["alt"] / tot["vector"] - 100:.1f}% slower in total at 200
+than at 900 ({f1(tot["alt"])} s against {f1(tot["vector"])} s); the per-query differences go both ways.
+{"Both runs returned the same rows and checksums on every query." if not rows_diff and not cks_diff else
+ "The two runs returned the same rows and checksums on every query except " + ", ".join(sorted(set(rows_diff) | set(cks_diff), key=qkey)) + ": " + html.escape(meta.get("partition_diff_note") or "see the notes below.")}</p>
+<div class="two">
+<div><p>Slower at 200:</p>{table(["Query", "900 (s)", "200 (s)", "Difference"], parts_rows(list(reversed(by_parts[-8:]))))}</div>
+<div><p>Faster at 200:</p>{table(["Query", "900 (s)", "200 (s)", "Difference"], parts_rows(by_parts[:8]))}</div>
+</div>
+{table(["VecRuntime run", "Executor time (h)", "GC (h)", "Shuffle read (TB)"], [
+    (LABELS["vector"], f"{exe['vector']:.1f}", f"{gc['vector']:.2f}", f"{shuf['vector']:.2f}"),
+    (LABELS["alt"], f"{exe['alt']:.1f}", f"{gc['alt']:.2f}", f"{shuf['alt']:.2f}"),
+])}
+
+""" if two else "")
+    methodology = meta.get("methodology") or (
+        "The dataset was generated with data-on-eks's own generator image and arguments, and VecRuntime ran on the node type,\n"
+        "node count and executor layout of their benchmark (23 executors x 5 cores, 58 GB each). The two VecRuntime runs ran one after another on the\n"
+        "same nodes, each alone on the cluster; each query ran once after the plan was compiled, and its time is the wall-clock of its execution as the\n"
+        "runner measures it. Before the full runs, a tuning round on ten heavy queries chose the heap/overhead split; it found two problems that the\n"
+        "fixes in #690 and #691 address (q14a: 224 s to 56 s; q24a: 141 s to 105 s).")
 
     page = f"""---
 layout: default
@@ -199,49 +239,31 @@ on twelve Graviton4 nodes. This page runs VecRuntime on the same generated data,
 and sets its times against theirs.</p>
 
 <div class="cards">
-<div class="card"><div class="l">VecRuntime, 900 partitions</div><div class="n">{tot["vector"]:,.0f} s</div><div class="l">{n} queries · {tot["gluten"] / tot["vector"]:.2f}x Gluten · {tot["comet"] / tot["vector"]:.2f}x Comet</div></div>
-<div class="card"><div class="l">VecRuntime, 200 partitions</div><div class="n">{tot["alt"]:,.0f} s</div><div class="l">data-on-eks's setting · {tot["gluten"] / tot["alt"]:.2f}x Gluten · {tot["comet"] / tot["alt"]:.2f}x Comet</div></div>
+<div class="card"><div class="l">{html.escape(vlabel.replace(" (", ", ").rstrip(")"))}</div><div class="n">{tot["vector"]:,.0f} s</div><div class="l">{n} queries · {tot["gluten"] / tot["vector"]:.2f}x Gluten · {tot["comet"] / tot["vector"]:.2f}x Comet</div></div>
+{alt_card}
 <div class="card"><div class="l">Gluten + Velox 1.6.0 / Comet 0.16.0</div><div class="n">{tot["gluten"]:,.0f} / {tot["comet"]:,.0f} s</div><div class="l">data-on-eks's published runs</div></div>
 </div>
 
 <h2 id="summary">Summary</h2>
 {table(["Engine", "Completion time (s)", "vs Gluten", "vs Comet", "Per-query geomean vs Gluten / Comet", "Faster than Gluten / Comet on"],
-       [summary_row(e) for e in ENGINES])}
+       [summary_row(e) for e in engines])}
 <div class="chart"><canvas id="totals"></canvas></div>
 
 <h3>Where each engine is ahead</h3>
 <div class="two">
-<div>{table(["VecRuntime (900) vs Gluten", "Queries"], list(dg.items()))}</div>
-<div>{table(["VecRuntime (900) vs Comet", "Queries"], list(dc.items()))}</div>
+<div>{table([f"VecRuntime ({vshort}) vs Gluten", "Queries"], list(dg.items()))}</div>
+<div>{table([f"VecRuntime ({vshort}) vs Comet", "Queries"], list(dc.items()))}</div>
 </div>
 <div class="chart tall"><canvas id="speed"></canvas></div>
 
 <h3>Largest leads</h3>
 {table(["Query", "VecRuntime (s)", "Gluten (s)", "Comet (s)", "vs Gluten", "vs Comet"], top_rows)}
 <h3>Where VecRuntime is behind</h3>
-<p>Queries where Gluten or Comet is faster than VecRuntime at 900 partitions, by the gap to the faster of the two (seconds).</p>
-{table(["Query", "VecRuntime 900", "VecRuntime 200", "Gluten", "Comet", "Gap"], behind_rows()) if behind else "<p>None.</p>"}
+<p>Queries where Gluten or Comet is faster than VecRuntime at {vshort} partitions, by the gap to the faster of the two (seconds).</p>
+{table(["Query"] + vcols + ["Gluten", "Comet", "Gap"], behind_rows()) if behind else "<p>None.</p>"}
 
-<h2 id="partitions">900 against 200 shuffle partitions</h2>
-<p>data-on-eks runs at Spark's default of 200 shuffle partitions. At 3 TB VecRuntime is {100 * tot["alt"] / tot["vector"] - 100:.1f}% slower in total at 200
-than at 900 ({f1(tot["alt"])} s against {f1(tot["vector"])} s); the per-query differences go both ways.
-{"Both runs returned the same rows and checksums on every query." if not rows_diff and not cks_diff else
- "The two runs returned the same rows and checksums on every query except " + ", ".join(sorted(set(rows_diff) | set(cks_diff), key=qkey)) + ": " + html.escape(meta.get("partition_diff_note") or "see the notes below.")}</p>
-<div class="two">
-<div><p>Slower at 200:</p>{table(["Query", "900 (s)", "200 (s)", "Difference"], parts_rows(list(reversed(by_parts[-8:]))))}</div>
-<div><p>Faster at 200:</p>{table(["Query", "900 (s)", "200 (s)", "Difference"], parts_rows(by_parts[:8]))}</div>
-</div>
-{table(["VecRuntime run", "Executor time (h)", "GC (h)", "Shuffle read (TB)"], [
-    (LABELS["vector"], f"{exe['vector']:.1f}", f"{gc['vector']:.2f}", f"{shuf['vector']:.2f}"),
-    (LABELS["alt"], f"{exe['alt']:.1f}", f"{gc['alt']:.2f}", f"{shuf['alt']:.2f}"),
-])}
-
-<h2 id="infrastructure">Benchmark infrastructure</h2>
-<p><b>Methodology.</b> The dataset was generated with data-on-eks's own generator image and arguments, and VecRuntime ran on the node type,
-node count and executor layout of their benchmark (23 executors x 5 cores, 58 GB each). The two VecRuntime runs ran one after another on the
-same nodes, each alone on the cluster; each query ran once after the plan was compiled, and its time is the wall-clock of its execution as the
-runner measures it. Before the full runs, a tuning round on ten heavy queries chose the heap/overhead split; it found two problems that the
-fixes in #690 and #691 address (q14a: 224 s to 56 s; q24a: 141 s to 105 s).</p>
+{partitions_section}<h2 id="infrastructure">Benchmark infrastructure</h2>
+<p><b>Methodology.</b> {methodology}</p>
 <h3>Test environment</h3>
 {env}
 <h3>Versions</h3>
@@ -259,12 +281,12 @@ fixes in #690 and #691 address (q14a: 224 s to 56 s; q24a: 141 s to 105 s).</p>
 
 <h2 id="table">All queries</h2>
 <details open><summary>Seconds per query, the fastest engine in bold</summary>
-{table(["Query", "VecRuntime 900", "VecRuntime 200", "Gluten", "Comet", "vs Gluten", "vs Comet"], per_query_rows, "all")}
+{table(["Query"] + vcols + ["Gluten", "Comet", "vs Gluten", "vs Comet"], per_query_rows, "all")}
 </details>
 
 <h2 id="running">Running the benchmark</h2>
 <p>The cluster runner, the Spark-on-Kubernetes manifests and the image are in <a href="{meta["run_doc"]}">the benchmark runner's README</a>;
-the image builds for arm64 on an arm64 node. <code>run-matrix.sh</code> writes one JSON-lines result file per run; this page is rendered from two
+the image builds for arm64 on an arm64 node. <code>run-matrix.sh</code> writes one JSON-lines result file per run; this page is rendered from {"two" if two else "one"}
 of them and data-on-eks's two result CSVs by <code>benchmarks/scripts/render-doeks-page.py</code>. The 1 TB runs against Apache Spark are on the
 <a href="{meta["graviton_page"]}">Graviton4 1 TB page</a>.</p>
 
@@ -278,7 +300,7 @@ const opts = (title, yTitle, extra={{}}) => Object.assign({{
   plugins: {{ title: {{ display: !!title, text: title }}, legend: {{ position: 'top' }} }},
   scales: {{ y: {{ title: {{ display: true, text: yTitle }} }} }}
 }}, extra);
-const all = ['vector', 'alt', 'gluten', 'comet'];
+const all = D.engines;
 new Chart(document.getElementById('totals'), {{ type: 'bar', data: {{ labels: all.map(e => D.labels[e]),
   datasets: [{{ label: 'Completion time', data: all.map(e => D.totals[e]), backgroundColor: all.map(e => D.colors[e]) }}] }},
   options: opts('Completion time, {n} queries', 'seconds', {{ plugins: {{ legend: {{ display: false }}, title: {{ display: true, text: 'Completion time, {n} queries' }} }} }}) }});
@@ -291,13 +313,13 @@ chunks.forEach((keys, i) => new Chart(document.getElementById('perquery' + (i + 
 new Chart(document.getElementById('speed'), {{ type: 'line',
   data: {{ labels: D.queries, datasets: ['gluten', 'comet'].map(o => ({{ label: 'vs ' + D.labels[o], borderColor: D.colors[o], backgroundColor: D.colors[o],
     pointRadius: 3, showLine: false, data: D.queries.map((q, i) => +(D.series[o][i] / D.series.vector[i]).toFixed(3)) }})) }},
-  options: opts('VecRuntime (900 partitions) speedup per query (log scale; 1 = parity)', 'x faster',
+  options: opts('{vlabel} speedup per query (log scale; 1 = parity)', 'x faster',
     {{ scales: {{ y: {{ type: 'logarithmic', min: 0.25, max: 20, title: {{ display: true, text: 'x faster' }} }} }} }}) }});
 </script>
 """
     Path(a.out).parent.mkdir(parents=True, exist_ok=True)
     Path(a.out).write_text(page)
-    print(f"wrote {a.out}: {n} queries; vector={tot['vector']:.1f}s alt={tot['alt']:.1f}s gluten={tot['gluten']:.1f}s comet={tot['comet']:.1f}s; "
+    print(f"wrote {a.out}: {n} queries; vector={tot['vector']:.1f}s alt={tot['alt'] if two else '-'}s gluten={tot['gluten']:.1f}s comet={tot['comet']:.1f}s; "
           f"geomean vs gluten {geo[('vector', 'gluten')]:.3f} vs comet {geo[('vector', 'comet')]:.3f}; rows differ {rows_diff}; checksums differ {cks_diff}")
     if a.web_out:
         from webwrap import to_web_page
