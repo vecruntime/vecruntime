@@ -721,6 +721,11 @@ object VectorConf {
     get(UiRetainedExecutions).flatMap(v => scala.util.Try(v.trim.toInt).toOption).filter(_ > 0).getOrElse(100)
 
   val ShuffleInitialPartitionsPerCore = "spark.vecruntime.shuffle.initialPartitionsPerCore"
+  val CancelEndedExecutionJobs = "spark.vecruntime.cancelEndedExecutionJobs"
+
+  /** #788: cancel the jobs still running under a SQL execution that has ended (driver plugin; default on). */
+  def cancelEndedExecutionJobs(get: String => Option[String]): Boolean =
+    get(CancelEndedExecutionJobs).forall(_.trim.equalsIgnoreCase("true"))
   private val InitialPartitionNum = "spark.sql.adaptive.coalescePartitions.initialPartitionNum"
 
   /**
