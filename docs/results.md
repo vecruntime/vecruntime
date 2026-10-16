@@ -2710,6 +2710,40 @@ frequency and double-pumping questions, `vpcompress` latency, whether decision 5
 Every switch above reads `Platform`, so those pools are a measurement away, not a code change.
 
 
+## TPC-DS 3 TB against Gluten + Velox and DataFusion Comet, the data-on-eks benchmark (2026-10-16)
+
+The page `docs/benchmarks/tpcds-3tb-graviton.html` now shows VecRuntime at data-on-eks's own 200 shuffle partitions
+only. The result files are in `benchmarks/results/tpcds-sf3000-doeks-2026-10-16/`. The setup is as on 2026-10-10
+below: the same data, 12 x r8gd.12xlarge, 23 x 5 cores x 58 GB, and at 200 partitions the 35/23 heap / overhead
+split q93 needs.
+
+**Code:** main at fac37478, arm64 image `d565-main-fac37478-arm64`. Since 2026-10-10 it adds `CountBelowJoin`
+(#764, #767), and the native Parquet reader is on by default.
+
+**Totals** (103 queries):
+
+| engine | total (s) | vs Gluten | vs Comet | geomean vs Gluten / Comet | faster than Gluten / Comet on |
+|---|---:|---:|---:|---:|---:|
+| VecRuntime, 200 partitions, 35/23 | 1,118.6 | 2.00x | 2.21x | 1.80x / 1.76x | 94 / 95 |
+| VecRuntime 2026-10-10, 200 partitions | 1,258.0 | 1.78x | 1.96x | 1.77x / 1.74x | 92 / 92 |
+| Gluten + Velox 1.6.0 | 2,239.9 | | | | |
+| Comet 0.16.0 | 2,467.5 | | | | |
+
+- **Moved most:**
+  - q24a 109.0 -> 45.6 s and q24b 106.4 -> 43.9 (`CountBelowJoin`, #692), against Gluten's 83.1 / 81.7;
+  - q47 46.2 -> 10.3;
+  - q17 13.8 -> 5.1.
+- **Behind the faster of Gluten and Comet:**
+  - q78 69.3 / 46.4 s (#689);
+  - q67 59.7 / 50.7;
+  - q97, q38, q87, q65, q1 and q58, by 0.9–2.6 s each.
+- **Correctness:** checksums equal the 2026-10-10 200-partition run on every query except q39a. That is its known ±1 row from a coefficient of variation of exactly 1 (#695, below).
+- **At 900 partitions** the same image ran twice on the same day for #692: 1,150.8 s and 1,104.4 s. Every checksum was equal to the 2026-10-10 900-partition run.
+  - q24a was 47.0 / 43.7 s and q24b 44.4 / 42.1 s.
+  - q64 was 39.7 / 37.9 s against 33.2 (#785).
+  - q17 and q29 were idle for 10–20 s in the second run only (#788).
+
+
 ## TPC-DS 3 TB against Gluten + Velox and DataFusion Comet, the data-on-eks benchmark (2026-10-10)
 
 The page is `docs/benchmarks/tpcds-3tb-graviton.html`; the result files are in

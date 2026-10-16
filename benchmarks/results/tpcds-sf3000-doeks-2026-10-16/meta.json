@@ -1,0 +1,29 @@
+{
+  "versions": {
+    "VecRuntime": "main at fac37478 (2026-10-16): CountBelowJoin (#764, #767) and the native Parquet reader on by default; arm64 image",
+    "Spark (VecRuntime)": "4.1.3, Scala 2.13, Amazon Corretto 25.0.4.1",
+    "Gluten + Velox (data-on-eks)": "1.6.0 on Spark 3.5.8, Scala 2.12, JDK 17",
+    "DataFusion Comet (data-on-eks)": "0.16.0 on Spark 3.5.8, Scala 2.12, JDK 17"
+  },
+  "executors": "23 executors x 5 cores x 58 GB each, as data-on-eks (Gluten / Comet: 20 GB heap + 6 GB overhead + 32 GB off-heap); VecRuntime: 35 GB heap + 23 GB overhead; driver 5 cores x 24 GB",
+  "vector_conf": [
+    "spark.plugins=io.vecruntime.spark.VectorPlugin",
+    "spark.shuffle.manager=org.apache.spark.sql.vecruntime.shuffle.VectorShuffleManager",
+    "spark.sql.shuffle.partitions=200   (data-on-eks's setting, Spark's default)",
+    "spark.sql.adaptive.enabled=true",
+    "spark.sql.adaptive.maxShuffledHashJoinLocalMapThreshold=64MB",
+    "spark.vecruntime.exec.strictFloatingPoint=false",
+    "spark.hadoop.fs.s3a.connection.maximum=1000, threads.max=256, max.total.tasks=128",
+    "Executors: -XX:+UseParallelGC -XX:ParallelGCThreads=5 (data-on-eks runs ParallelGC too); ACCP as the JCA provider",
+    "--add-modules=jdk.incubator.vector --enable-native-access=ALL-UNNAMED (driver and executors)"
+  ],
+  "methodology": "The dataset was generated with data-on-eks's own generator image and arguments, and VecRuntime ran on the node type, node count and executor layout of their benchmark (23 executors x 5 cores, 58 GB each), at their 200 shuffle partitions. The run had the cluster to itself; each query ran once after the plan was compiled, and its time is the wall-clock of its execution as the runner measures it.",
+  "notes": [
+    "The Gluten and Comet numbers are data-on-eks's published results (the mean of their iterations); they were not re-run here. VecRuntime's are one measured iteration per query.",
+    "VecRuntime runs at data-on-eks's own setting, 200 shuffle partitions with AQE coalescing, so all three engines share the configuration.",
+    "At 200 partitions VecRuntime needs the larger overhead (35 GB + 23 GB): with 44 GB + 14 GB an executor exceeded its container in q93.",
+    "The engines run on different Spark lines: VecRuntime needs Spark 4.1+ and JDK 25, the data-on-eks Gluten and Comet runs are on Spark 3.5.8 and JDK 17.",
+    "There is no Apache Spark baseline at 3 TB, so result checksums are not compared against Spark here; VecRuntime's results match Spark's on the 1 TB runs and in the test suites.",
+    "The previous version of this page (2026-10-10, VecRuntime 0.0.7 + #690 + #691, at 900 and 200 partitions) is kept in benchmarks/results/tpcds-sf3000-doeks-2026-10-10/."
+  ]
+}
