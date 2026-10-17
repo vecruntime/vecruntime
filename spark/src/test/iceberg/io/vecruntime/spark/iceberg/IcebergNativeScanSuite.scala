@@ -158,6 +158,79 @@ class IcebergNativeScanSuite extends IcebergMorSuiteBase {
     checkVectorized("SELECT count(*), sum(l) FROM t WHERE b AND i > 1", Seq(Filter, Agg))
   }
 
+  private def rowGroups(df: DataFrame): Long = scans(df).map(_.metrics("numRowGroups").value).sum
+
+  /** One file, ascending `a` and `b`, in many small row groups: row-group skipping is all a filter can do. */
+  private def sortedTable(name: String): Unit = {
+    spark.sql(
+      s"CREATE OR REPLACE TABLE $Db.$name (a INT, b BIGINT, s STRING) USING iceberg " +
+        "TBLPROPERTIES ('write.parquet.row-group-size-bytes'='2048')"
+    )
+    spark.sql(
+      s"INSERT INTO $Db.$name SELECT CAST(id AS INT), id * 3, concat('s', CAST(id % 40 AS STRING)) " +
+        "FROM range(0, 20000, 1, 1)"
+    )
+  }
+
+  icebergTest("the filter above the scan skips row groups, by field id") {
+    sortedTable("t_push")
+    useTable("t_push")
+    val all = checkVectorized("SELECT count(*), sum(b) FROM t WHERE s IS NOT NULL", Seq(Filter, Agg))
+    val df = checkVectorized("SELECT count(*), sum(b) FROM t WHERE a BETWEEN 1000 AND 1100", Seq(Filter, Agg))
+    assert(scans(df).exists(_.pushedFilters.nonEmpty), finalPlan(df).treeString)
+    val (read, total) = (rowGroups(df), rowGroups(all))
+    assert(total > 10 && read > 0 && read * 5 < total, s"read $read of $total row groups")
+    assert(count("SELECT count(*) FROM t WHERE a BETWEEN 1000 AND 1100") === 101)
+    // Strings, IN lists, an OR and a NOT: the same rows as Spark's.
+    checkVectorized("SELECT count(*), sum(b) FROM t WHERE a IN (3, 9000, 19999) OR b < 30", Seq(Filter, Agg))
+    checkVectorized("SELECT count(*) FROM t WHERE s = 's7' AND NOT (a > 500)", Seq(Filter, Agg))
+    // Spark's switch turns the push off.
+    withConf("spark.sql.parquet.filterPushdown" -> "false") {
+      val off = checkVectorized("SELECT count(*), sum(b) FROM t WHERE a BETWEEN 1000 AND 1100", Seq(Filter, Agg))
+      assert(rowGroups(off) === total, s"read ${rowGroups(off)} of $total row groups")
+    }
+  }
+
+  icebergTest("a pushed filter on a renamed column skips row groups of the files written before the rename") {
+    sortedTable("t_push_ren")
+    spark.sql(s"ALTER TABLE $Db.t_push_ren RENAME COLUMN a TO a2")
+    useTable("t_push_ren")
+    val all = checkVectorized("SELECT count(*), sum(b) FROM t WHERE s IS NOT NULL", Seq(Filter, Agg))
+    val df = checkVectorized("SELECT count(*), sum(b) FROM t WHERE a2 BETWEEN 1000 AND 1100", Seq(Filter, Agg))
+    val (read, total) = (rowGroups(df), rowGroups(all))
+    assert(read > 0 && read * 5 < total, s"read $read of $total row groups")
+  }
+
+  icebergTest("after a rename and a new column taking the old name, a filter on the new column reads the old files") {
+    sortedTable("t_push_reuse")
+    // The old files' `a` is now `a_old`; the new `a` (another field id) is null in them.
+    spark.sql(s"ALTER TABLE $Db.t_push_reuse RENAME COLUMN a TO a_old")
+    spark.sql(s"ALTER TABLE $Db.t_push_reuse ADD COLUMN a INT")
+    spark.sql(s"INSERT INTO $Db.t_push_reuse VALUES (-1, -3, 'new', 5), (-2, -6, 'new', 6)")
+    useTable("t_push_reuse")
+    // By name, `a IS NULL` would be tested against the old files' a_old (no nulls) and skip them all.
+    checkVectorized("SELECT count(*), sum(b) FROM t WHERE a IS NULL", Seq(Filter, Agg))
+    assert(count("SELECT count(*) FROM t WHERE a IS NULL") === 20000)
+    // The new column alone, beside the renamed one, and under OR / NOT: every one tested by field id.
+    checkVectorized("SELECT count(*), sum(b) FROM t WHERE a = 5", Seq(Filter, Agg))
+    checkVectorized("SELECT count(*), sum(b) FROM t WHERE a IS NULL AND a_old BETWEEN 10 AND 20", Seq(Filter, Agg))
+    checkVectorized("SELECT count(*), sum(b) FROM t WHERE a = 6 OR a_old = 3", Seq(Filter, Agg))
+    checkVectorized("SELECT count(*), sum(b) FROM t WHERE NOT (a = 6)", Seq(Filter, Agg))
+    assert(count("SELECT count(*) FROM t WHERE a IS NULL AND a_old BETWEEN 10 AND 20") === 11)
+  }
+
+  icebergTest("pushed filters on a partitioned table with deletes return Spark's rows") {
+    spark.sql(
+      s"CREATE OR REPLACE TABLE $Db.t_push_part USING iceberg PARTITIONED BY (b) TBLPROPERTIES " +
+        s"('format-version'='2', 'write.parquet.row-group-size-bytes'='2048') AS SELECT i, l, s, b, d2 FROM $Db.t_pos"
+    )
+    spark.sql(s"DELETE FROM $Db.t_push_part WHERE i % 11 = 4")
+    useTable("t_push_part")
+    checkVectorized("SELECT b, count(*), sum(l) FROM t WHERE i BETWEEN 100 AND 400 GROUP BY b", Seq(Filter, Agg))
+    checkVectorized("SELECT count(*), sum(l) FROM t WHERE b AND s >= 's3' AND d2 > 0.5", Seq(Filter, Agg))
+    checkVectorized(s"SELECT _pos, i FROM $Db.t_push_part WHERE i < 50 AND _pos > 3", Seq(Filter))
+  }
+
   icebergTest("switched off, Spark's BatchScanExec stays") {
     withConf(VectorConf.ScanNativeIceberg -> "false") {
       useTable("t_pos")
