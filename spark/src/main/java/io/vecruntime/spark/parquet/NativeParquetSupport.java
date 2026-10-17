@@ -46,11 +46,13 @@ import org.apache.spark.sql.types.TimestampType;
  * and UTF8. Each file's physical types are checked against these lanes at open
  * ({@code VectorParquetScanExec.physicalMatches}), and so is each file's
  * calendar-rebase mode. TIMESTAMP is the INT64 lane of micros (INT64 {@code
- * MICROS}, or {@code MILLIS} scaled); an INT96 file falls over per file.
- * FLOAT, BINARY and TIMESTAMP_NTZ have no engine lane: they are decoded on a
- * lane of the same layout ({@link #decodeLane}) and emitted as Spark's Arrow
- * vectors, carried by operators as foreign columns. Deliberately excluded:
- * every nested/complex type.
+ * MICROS}, or {@code MILLIS} scaled), and INT96 is converted at flush.
+ * TIMESTAMP_NTZ, BINARY and FLOAT have engine lanes (INT64, UTF8, FLOAT64;
+ * #705, #712); a collated string rides the UTF8 lane. TIME (#787) has no
+ * engine lane: it is decoded on the INT64 lane of the same layout ({@link
+ * #decodeLane}) and emitted as Spark's Arrow {@code TimeNanoVector}, which
+ * operators carry as a column without a lane. Lists, maps and structs are
+ * readable when every leaf below them is (#568).
  */
 public final class NativeParquetSupport {
 
@@ -67,6 +69,11 @@ public final class NativeParquetSupport {
         }
         if (dt instanceof org.apache.spark.sql.types.StructType st) {
             if (st.fields().length == 0) {
+                return false;
+            }
+            // Spark's PushVariantIntoScan (#787): a struct of the paths a query extracts from a variant column,
+            // which Spark's reader computes from the variant group. Not a struct of the file's fields: Spark's scan.
+            if (org.apache.spark.sql.execution.datasources.VariantMetadata$.MODULE$.isVariantStruct(st)) {
                 return false;
             }
             for (org.apache.spark.sql.types.StructField f : st.fields()) {
@@ -91,6 +98,11 @@ public final class NativeParquetSupport {
         if (dt instanceof BooleanType) {
             return true; // BOOLEAN physical, BOOL lane (bitmap)
         }
+        if (dt instanceof org.apache.spark.sql.types.VariantType) {
+            // #787: an unshredded variant group, read as the struct of its two binaries (variantAsStruct); a file
+            // with a shredded variant falls over to Spark's reader (hasShreddedVariant).
+            return true;
+        }
         if (dt instanceof DoubleType) {
             return true; // DOUBLE physical, FLOAT64 lane
         }
@@ -105,20 +117,21 @@ public final class NativeParquetSupport {
             // type and decimal annotation are checked at open (VectorParquetScanExec.physicalMatches).
             return d.precision() <= 38;
         }
-        // No engine lane (option A of the FLOAT / BINARY / TIMESTAMP_NTZ note, #559): decoded on a lane of the
-        // same layout and emitted as Spark's Arrow vector, so operators carry the column as a foreign column.
+        // No engine lane (option A of the #559 note; today TIME, #787): decoded on a lane of the same layout and
+        // emitted as Spark's Arrow vector, so operators carry the column as a foreign column.
         return decodeLane(dt) != null;
     }
 
     /**
      * The decoder lane for a Spark type: {@link TypeMapping#vecTypeOf} for a
      * type with an engine lane, else the lane whose bytes a column without one
-     * shares -- FLOAT on INT32 (the 4-byte IEEE bits, as stored), BINARY on UTF8
-     * (offsets and bytes), TIMESTAMP_NTZ on INT64 (micros). The scan emits those
-     * as Arrow {@code Float4Vector} / {@code VarBinaryVector} / {@code
-     * TimeStampMicroVector}, which Spark's {@code ArrowColumnVector} reads;
-     * operators pass them through as columns without a lane, as they do over
-     * Spark's own scan. {@code null}: not decodable.
+     * shares -- TIME on INT64 (nanoseconds of the day, #787). FLOAT decodes its
+     * 4-byte IEEE bits on INT32 into a {@code Float4Vector}, which operators
+     * widen onto the FLOAT64 lane (#712); BINARY and collated strings share the
+     * UTF8 lane. The scan emits TIME as an Arrow {@code TimeNanoVector}, which
+     * Spark's {@code
+     * ArrowColumnVector} reads; operators pass it through as a column without a
+     * lane, as they do over Spark's own scan. {@code null}: not decodable.
      */
     public static VecType decodeLane(DataType dt) {
         if (dt instanceof FloatType) {
@@ -133,6 +146,11 @@ public final class NativeParquetSupport {
         if (dt instanceof TimestampNTZType) {
             return VecType.INT64;
         }
+        if (dt instanceof org.apache.spark.sql.types.TimeType) {
+            // #787: Spark's nanoseconds of the day; INT64 TIME(MICROS) scaled by 1000 at decode, as Spark's
+            // LongAsNanosUpdater does. No engine lane: emitted as a TimeNanoVector (ArrowOutput.newVector).
+            return VecType.INT64;
+        }
         return TypeMapping.vecTypeOf(dt);
     }
 
@@ -142,5 +160,79 @@ public final class NativeParquetSupport {
      */
     public static boolean isForeign(DataType dt) {
         return dt instanceof FloatType;
+    }
+
+    /**
+     * The struct an unshredded variant group is read as (#787): its {@code
+     * value} and {@code metadata} binaries, in that order -- Spark's {@code
+     * ColumnVector.getVariant} reads child 0 as the value and child 1 as the
+     * metadata, so the struct column the scan emits is the variant column.
+     * Clipping by name puts the file's group in this order whatever order the
+     * file stores it in.
+     */
+    public static final org.apache.spark.sql.types.StructType VARIANT_READ_TYPE = new org.apache.spark.sql.types.StructType().add("value", org.apache.spark.sql.types.DataTypes.BinaryType, false).add("metadata", org.apache.spark.sql.types.DataTypes.BinaryType, false);
+
+    /**
+     * {@code dt} with every variant, at any depth, replaced by {@link
+     * #VARIANT_READ_TYPE}.
+     */
+    public static DataType variantAsStruct(DataType dt) {
+        if (dt instanceof org.apache.spark.sql.types.VariantType) {
+            return VARIANT_READ_TYPE;
+        }
+        if (dt instanceof org.apache.spark.sql.types.ArrayType at) {
+            DataType e = variantAsStruct(at.elementType());
+            return e.equals(at.elementType()) ? dt : new org.apache.spark.sql.types.ArrayType(e, at.containsNull());
+        }
+        if (dt instanceof org.apache.spark.sql.types.MapType mt) {
+            DataType k = variantAsStruct(mt.keyType());
+            DataType v = variantAsStruct(mt.valueType());
+            return k.equals(mt.keyType()) && v.equals(mt.valueType())
+                    ? dt
+                    : new org.apache.spark.sql.types.MapType(k, v, mt.valueContainsNull());
+        }
+        if (dt instanceof org.apache.spark.sql.types.StructType st) {
+            return variantAsStruct(st);
+        }
+        return dt;
+    }
+
+    /**
+     * {@link #variantAsStruct(DataType)} over a schema; the same instance when
+     * it holds no variant.
+     */
+    public static org.apache.spark.sql.types.StructType variantAsStruct(org.apache.spark.sql.types.StructType st) {
+        org.apache.spark.sql.types.StructField[] fs = st.fields();
+        org.apache.spark.sql.types.StructField[] out = null;
+        for (int i = 0; i < fs.length; i++) {
+            DataType t = variantAsStruct(fs[i].dataType());
+            if (!t.equals(fs[i].dataType())) {
+                if (out == null) {
+                    out = fs.clone();
+                }
+                out[i] = new org.apache.spark.sql.types.StructField(fs[i].name(), t, fs[i].nullable(),
+                        fs[i].metadata());
+            }
+        }
+        return out == null ? st : new org.apache.spark.sql.types.StructType(out);
+    }
+
+    /**
+     * Whether a file schema holds a shredded variant: a group with a {@code
+     * typed_value} field beside its {@code metadata} (the shredding spec's
+     * layout). Reading such a variant means rebuilding values from the typed
+     * columns, so the file goes to Spark's reader. Matching any such group,
+     * not only the requested ones, can only send a file to Spark's reader.
+     */
+    public static boolean hasShreddedVariant(org.apache.parquet.schema.GroupType g) {
+        if (g.containsField("typed_value") && g.containsField("metadata")) {
+            return true;
+        }
+        for (org.apache.parquet.schema.Type t : g.getFields()) {
+            if (!t.isPrimitive() && hasShreddedVariant(t.asGroupType())) {
+                return true;
+            }
+        }
+        return false;
     }
 }
