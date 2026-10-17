@@ -423,6 +423,10 @@ private[vecruntime] final class VectorParquetPartitionReader(
     with AutoCloseable {
 
   private val allocator = VectorAllocators.newChild("VectorParquetScanExec")
+  // #787: the schema the native readers decode -- the requested one with each variant as the struct of its value and
+  // metadata binaries, whose struct column is Spark's variant column. Spark's fallback reader takes requiredSchema.
+  private val readSchema = io.vecruntime.spark.parquet.NativeParquetSupport.variantAsStruct(requiredSchema)
+  private val readsVariant = readSchema != requiredSchema
   private val files: BufferedIterator[PartitionedFile] = partition.files.iterator.buffered
   private val dataColumnCount = requiredSchema.length
 
@@ -820,7 +824,7 @@ private[vecruntime] final class VectorParquetPartitionReader(
       stream = inputFile.newStream()
       val footer: ParquetMetadata = ParquetFileReader.readFooter(inputFile, rangeOpts, stream)
       val fileSchema = footer.getFileMetaData.getSchema
-      val clipped = ParquetReadSupport.clipParquetSchema(fileSchema, requiredSchema, caseSensitive, useFieldId, false)
+      val clipped = ParquetReadSupport.clipParquetSchema(fileSchema, readSchema, caseSensitive, useFieldId, false)
       val modes = fallbackModes(footer)
       // Encoding is only knowable at read time. If any required column chunk uses an encoding we do not
       // decode (BYTE_STREAM_SPLIT on FIXED_LEN_BYTE_ARRAY, ...) or a column's physical type is not its lane's,
@@ -829,10 +833,11 @@ private[vecruntime] final class VectorParquetPartitionReader(
       // 6): its readers apply the file's LEGACY rebase, EXCEPTION check and INT96 conversion (ParquetRebase).
       if (
         hasUnsupportedEncodingInFooter(footer, clipped) ||
+        (readsVariant && io.vecruntime.spark.parquet.NativeParquetSupport.hasShreddedVariant(fileSchema)) ||
         (useFieldId && !ignoreMissingFieldIds && requestedHasFieldIds && !VectorParquetScanExec.hasFieldIds(
           fileSchema
         )) ||
-        (useFieldId && requestedHasFieldIds && VectorParquetScanExec.idNameClash(requiredSchema, clipped))
+        (useFieldId && requestedHasFieldIds && VectorParquetScanExec.idNameClash(readSchema, clipped))
       ) {
         stream.close()
         stream = null
@@ -907,7 +912,7 @@ private[vecruntime] final class VectorParquetPartitionReader(
     // Map each required data column to its clipped ColumnDescriptor by leaf name; a struct (#568) to its group.
     var i = 0
     while (i < dataColumnCount) {
-      val field = requiredSchema.fields(i)
+      val field = readSchema.fields(i)
       columnReaders(i) = field.dataType match {
         case _ if i == rowIndexOrdinal =>
           new io.vecruntime.spark.parquet.NativeParquetRowIndexColumn(field.name, allocator)
@@ -1167,8 +1172,8 @@ private[vecruntime] final class VectorParquetPartitionReader(
     // decode path today -- the bytes of the others are not an INT64 lane. Check every requested column's
     // physical type against its lane, per file, before any decode.
     var f = 0
-    while (f < requiredSchema.length) {
-      val field = requiredSchema.fields(f)
+    while (f < readSchema.length) {
+      val field = readSchema.fields(f)
       field.dataType match {
         case _ if f == rowIndexOrdinal => // generated from the row group's offset, not stored
         case _
