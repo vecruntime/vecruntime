@@ -931,8 +931,9 @@ private[vecruntime] final class VectorParquetPartitionReader(
         case _ if i == rowIndexOrdinal =>
           new io.vecruntime.spark.parquet.NativeParquetRowIndexColumn(field.name, allocator)
         case dt if !NativeParquetStructReader.holds(fileSchema, Array(clippedName(p.clipped, i))) =>
-          // #568 schema evolution: a column added since the file was written, null in every row.
-          new io.vecruntime.spark.parquet.NativeParquetNullColumn(field.name, dt, allocator)
+          // #568 schema evolution: a column added since the file was written, null in every row, or its
+          // existence default when it was added with one (#812).
+          new io.vecruntime.spark.parquet.NativeParquetNullColumn(field.name, dt, allocator, existenceDefault(i))
         case st: StructType =>
           val name = clippedName(p.clipped, i)
           NativeParquetStructReader.create(p.clipped, fileSchema, Array(name), st, field.name, batchSize, allocator)
@@ -1148,6 +1149,18 @@ private[vecruntime] final class VectorParquetPartitionReader(
    *   - when a struct field, in a struct the file holds some other field of (its nulls come from that field;
    *     when it holds none, Spark 4.1 reads an extra unrequested field, which our readers do not).
    */
+  /** #812: requested column `ordinal`'s existence default (Spark's internal value), or null. */
+  private def existenceDefault(ordinal: Int): Any =
+    if (
+      ordinal < requiredSchema.length && requiredSchema.fields(ordinal).metadata.contains(
+        org.apache.spark.sql.catalyst.util.ResolveDefaultColumns.EXISTS_DEFAULT_COLUMN_METADATA_KEY
+      )
+    ) existenceDefaults(ordinal)
+    else null
+
+  private lazy val existenceDefaults: Array[Any] =
+    org.apache.spark.sql.catalyst.util.ResolveDefaultColumns.existenceDefaultValues(requiredSchema)
+
   private def missingReadable(clipped: MessageType, file: MessageType, path: Array[String]): Boolean = {
     var k = 0
     while (k < path.length && NativeParquetStructReader.holds(file, path.take(k + 1))) k += 1
@@ -1164,10 +1177,16 @@ private[vecruntime] final class VectorParquetPartitionReader(
     val missing = parent.getType(path(k))
     if (!missing.isRepetition(org.apache.parquet.schema.Type.Repetition.OPTIONAL)) return false
     if (k == 0) {
+      // #812: a column with an existence default is that default in every row: a constant of a type with an
+      // engine lane, a string or a binary; another type stays on Spark's reader.
       val ordinal = clipped.getFieldIndex(path(0))
       ordinal >= requiredSchema.length || !requiredSchema.fields(ordinal).metadata.contains(
         org.apache.spark.sql.catalyst.util.ResolveDefaultColumns.EXISTS_DEFAULT_COLUMN_METADATA_KEY
-      )
+      ) || existenceDefault(ordinal) == null || (requiredSchema.fields(ordinal).dataType match {
+        case _: org.apache.spark.sql.types.StringType | org.apache.spark.sql.types.BinaryType => true
+        case dt: AtomicType => io.vecruntime.spark.adapter.TypeMapping.vecTypeOf(dt) != null
+        case _ => false
+      })
     } else {
       parent.getFields.asScala.exists(f => NativeParquetStructReader.holds(file, path.take(k) :+ f.getName))
     }

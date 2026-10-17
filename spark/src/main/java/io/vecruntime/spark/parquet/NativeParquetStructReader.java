@@ -112,7 +112,10 @@ public final class NativeParquetStructReader implements NativeParquetColumn, Row
             BufferAllocator allocator) {
         GroupType group = clipped.getType(path).asGroupType();
         StructField[] fs = type.fields();
-        NativeParquetColumn[] fields = new NativeParquetColumn[fs.length];
+        // #812: when the file holds none of the requested fields, Spark's clipping appends the file's cheapest
+        // field after them, only for the struct's nulls; it is read here as the level source and not emitted.
+        boolean extra = group.getFieldCount() == fs.length + 1;
+        NativeParquetColumn[] fields = new NativeParquetColumn[fs.length + (extra ? 1 : 0)];
         int levelField = -1;
         for (int i = 0; i < fs.length; i++) {
             String[] childPath = child(path, group.getType(i)
@@ -139,10 +142,42 @@ public final class NativeParquetStructReader implements NativeParquetColumn, Row
                         allocator);
             }
         }
+        if (extra) {
+            String[] extraPath = child(path, group.getType(fs.length).getName());
+            ColumnDescriptor cd = clipped.getColumnDescription(extraPath);
+            DataType dt = levelOnlyType(cd);
+            fields[fs.length] = new NativeParquetColumnReader(cd, NativeParquetSupport.decodeLane(dt), dt,
+                    name + "." + group.getType(fs.length).getName(), batchRows, allocator);
+            levelField = fs.length;
+        }
         if (levelField < 0) {
             throw new IllegalStateException("struct " + name + ": the file holds none of its fields");
         }
         return new NativeParquetStructReader(type, fields, levelField, clipped.getMaxDefinitionLevel(path));
+    }
+
+    /**
+     * #812: the Spark type a field read only for its levels is decoded as: its physical type's own, whatever
+     * its annotation (its values are dropped). {@code null} for a physical type with no such path.
+     */
+    static DataType levelOnlyType(ColumnDescriptor cd) {
+        switch (cd.getPrimitiveType().getPrimitiveTypeName()) {
+            case INT32:
+                return org.apache.spark.sql.types.DataTypes.IntegerType;
+            case INT64:
+                return org.apache.spark.sql.types.DataTypes.LongType;
+            case BOOLEAN:
+                return org.apache.spark.sql.types.DataTypes.BooleanType;
+            case FLOAT:
+                return org.apache.spark.sql.types.DataTypes.FloatType;
+            case DOUBLE:
+                return org.apache.spark.sql.types.DataTypes.DoubleType;
+            case BINARY:
+            case FIXED_LEN_BYTE_ARRAY:
+                return org.apache.spark.sql.types.DataTypes.BinaryType;
+            default:
+                return null;
+        }
     }
 
     /**
@@ -201,7 +236,31 @@ public final class NativeParquetStructReader implements NativeParquetColumn, Row
         }
         GroupType group = t.asGroupType();
         StructField[] fs = type.fields();
-        if (fs.length == 0 || group.getFieldCount() != fs.length) {
+        if (fs.length == 0) {
+            return false;
+        }
+        if (group.getFieldCount() == fs.length + 1) {
+            // #812: the file holds none of the requested fields and Spark's clipping appended one of its own for
+            // the struct's nulls. Followed when that field is a single optional or required leaf.
+            if (file == null) {
+                return false;
+            }
+            for (int i = 0; i < fs.length; i++) {
+                if (holds(file, child(path, group.getType(i).getName()))) {
+                    return false;
+                }
+            }
+            Type ex = group.getType(fs.length);
+            if (!ex.isPrimitive() || ex.isRepetition(Type.Repetition.REPEATED)) {
+                return false;
+            }
+            ColumnDescriptor cd = clipped.getColumnDescription(child(path, ex.getName()));
+            DataType dt = levelOnlyType(cd);
+            if (dt == null) {
+                return false;
+            }
+            leaf.accept(cd, dt);
+        } else if (group.getFieldCount() != fs.length) {
             return false;
         }
         for (int i = 0; i < fs.length; i++) {
@@ -329,8 +388,8 @@ public final class NativeParquetStructReader implements NativeParquetColumn, Row
     @Override
     public ColumnVector wrap(Object batch) {
         Batch b = (Batch) batch;
-        ColumnVector[] cols = new ColumnVector[fields.length];
-        for (int i = 0; i < fields.length; i++) {
+        ColumnVector[] cols = new ColumnVector[type.fields().length];
+        for (int i = 0; i < cols.length; i++) {
             cols[i] = fields[i].wrap(b.fields[i]);
         }
         return VectorNestedColumnVector.struct(type, b.rows, b.nulls, cols);
