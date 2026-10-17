@@ -141,6 +141,19 @@ class IcebergRuntimeFilterBySizeSuite extends VectorQuerySuite {
     assert(onKey.isEmpty, df.queryExecution.optimizedPlan.treeString)
   }
 
+  test("a dimension broadcast by its files, over a fact with no shuffle below, gets no filter (q89)", IcebergTest) {
+    // As on Parquet, where the dimension's files make the join a broadcast and Spark's rule skips a broadcast join
+    // with no shuffle under the fact: the broadcast hint V2BroadcastBySize gives it must be seen first.
+    val df = run(q, "spark.sql.autoBroadcastJoinThreshold" -> threshold.toString)
+    assert(
+      df.queryExecution.optimizedPlan.collect { case j: Join => j.hint }.exists(h =>
+        (h.leftHint ++ h.rightHint).exists(_.strategy.contains(org.apache.spark.sql.catalyst.plans.logical.BROADCAST))
+      ),
+      df.queryExecution.optimizedPlan.treeString
+    )
+    assert(blooms(df).isEmpty, df.queryExecution.optimizedPlan.treeString)
+  }
+
   test("nothing is added when Spark's runtime bloom filter is off", IcebergTest) {
     val df = run(q, "spark.sql.optimizer.runtime.bloomFilter.enabled" -> "false")
     assert(blooms(df).isEmpty)

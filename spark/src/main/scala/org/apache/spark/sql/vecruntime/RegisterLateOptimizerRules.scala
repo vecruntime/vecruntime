@@ -46,14 +46,16 @@ case class RegisterLateOptimizerRules(session: SparkSession) extends Rule[Logica
         if (!exp.extraOptimizations.exists(_.isInstanceOf[CountBelowJoin])) {
           exp.extraOptimizations = exp.extraOptimizations :+ CountBelowJoin(session)
         }
-        // Spark's runtime filters from small DSv2 dimensions, before the broadcast hints change which joins look
-        // like shuffle joins to Spark's rule (as on a file table, where Spark's rule ran on an unhinted plan).
-        if (!exp.extraOptimizations.exists(_.isInstanceOf[V2RuntimeFilterBySize])) {
-          exp.extraOptimizations = exp.extraOptimizations :+ V2RuntimeFilterBySize(session)
-        }
         // Before FactBloomFilter, which leaves a join with a broadcast side alone.
         if (!exp.extraOptimizations.exists(_.isInstanceOf[V2BroadcastBySize])) {
           exp.extraOptimizations = exp.extraOptimizations :+ V2BroadcastBySize(session)
+        }
+        // Spark's runtime filters from small DSv2 dimensions, after the broadcast hints: Spark's rule skips a join it
+        // takes for a broadcast with no shuffle below, which on a file table it decides by the files' sizes. Before
+        // the hints, a small Iceberg dimension's inflated estimate makes its join look like a shuffle join, and the
+        // rule would add a filter its Parquet copy does not get (q89's `item` on `store_sales`).
+        if (!exp.extraOptimizations.exists(_.isInstanceOf[V2RuntimeFilterBySize])) {
+          exp.extraOptimizations = exp.extraOptimizations :+ V2RuntimeFilterBySize(session)
         }
         if (!exp.extraOptimizations.exists(_.isInstanceOf[FactBloomFilter])) {
           exp.extraOptimizations = exp.extraOptimizations :+ FactBloomFilter(session)
