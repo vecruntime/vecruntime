@@ -50,10 +50,18 @@ import org.apache.spark.util.SerializableConfiguration
  *  - anything else (encryption, another format, an equality column we cannot decode): Iceberg's own columnar
  *    reader for that group, whose batches
  *    our operators adapt as they do today.
- * No filter is pushed into the native reader yet: Iceberg's reader only skips row groups by the residual, and
- * Spark keeps the filter above the scan, so reading every row group returns the same rows.
+ * The filter Spark keeps above the scan is pushed into the native reader (`pushedFilters`) to skip row groups and
+ * pages by their statistics, each column matched to the file's by field id, never by name; the filter above still
+ * decides which rows pass.
  */
-case class VectorIcebergScanExec(scan: BatchScanExec, fieldIds: Seq[Int]) extends LeafExecNode with VectorPlan {
+case class VectorIcebergScanExec(
+    scan: BatchScanExec,
+    fieldIds: Seq[Int],
+    // The filter above the scan, translated (see VectorColumnarRule): row groups are skipped by it, matched to each
+    // file's columns by field id; the filter above still decides which rows pass.
+    pushedFilters: Seq[org.apache.spark.sql.sources.Filter] = Nil
+) extends LeafExecNode
+    with VectorPlan {
 
   override val output: Seq[Attribute] = scan.output
   override def outputPartitioning: Partitioning = scan.outputPartitioning
@@ -80,7 +88,10 @@ case class VectorIcebergScanExec(scan: BatchScanExec, fieldIds: Seq[Int]) extend
     org.apache.spark.sql.execution.vector.FileScanAccess.prepareAndWaitForSubqueries(scan)
   }
 
-  override def simpleString(maxFields: Int): String = s"VectorIcebergScan ${scan.simpleString(maxFields)}"
+  override def simpleString(maxFields: Int): String = {
+    val pushed = if (pushedFilters.isEmpty) "" else pushedFilters.mkString("PushedFilters: [", ", ", "] ")
+    s"VectorIcebergScan $pushed${scan.simpleString(maxFields)}"
+  }
 
   override protected def doExecuteColumnar(): RDD[ColumnarBatch] = {
     val sqlConf = session.sessionState.conf
@@ -111,6 +122,12 @@ case class VectorIcebergScanExec(scan: BatchScanExec, fieldIds: Seq[Int]) extend
       hadoopConf.set(SQLConf.SESSION_LOCAL_TIMEZONE.key, sqlConf.sessionLocalTimeZone)
       hadoopConf.setBoolean(SQLConf.CASE_SENSITIVE.key, sqlConf.caseSensitiveAnalysis)
       hadoopConf.setBoolean(SQLConf.PARQUET_FIELD_ID_READ_ENABLED.key, true)
+      // Read by Spark's schema converter when a file falls back to Spark's reader (as the Parquet scan sets them):
+      // e.g. a renamed column whose old name a new column took (idNameClash).
+      hadoopConf.setBoolean(SQLConf.PARQUET_BINARY_AS_STRING.key, sqlConf.isParquetBinaryAsString)
+      hadoopConf.setBoolean(SQLConf.PARQUET_INT96_AS_TIMESTAMP.key, sqlConf.isParquetINT96AsTimestamp)
+      hadoopConf.setBoolean(SQLConf.PARQUET_INFER_TIMESTAMP_NTZ_ENABLED.key, sqlConf.parquetInferTimestampNTZEnabled)
+      hadoopConf.setBoolean(SQLConf.LEGACY_PARQUET_NANOS_AS_LONG.key, sqlConf.legacyParquetNanosAsLong)
       session.sparkContext.broadcast(new SerializableConfiguration(hadoopConf))
     }
     val confBroadcast = confFor(requiredSchema)
@@ -124,6 +141,10 @@ case class VectorIcebergScanExec(scan: BatchScanExec, fieldIds: Seq[Int]) extend
       .map(extra => VectorIcebergRDD.withPositions(StructType(requiredSchema.fields ++ extra)))
     val equalityConfBroadcast = equalitySchema.map(confFor)
 
+    // Pushed filters by field id: the data columns' quoted names, as the translated filters name them.
+    val filterFieldIds =
+      if (pushedFilters.isEmpty || !sqlConf.parquetFilterPushDown) null
+      else dataColumns.map { case (a, id) => org.apache.spark.sql.catalyst.util.quoteIfNeeded(a.name) -> id }.toMap
     val m = ScanMetrics(
       longMetric("numFiles"),
       longMetric("numOutputRows"),
@@ -161,7 +182,16 @@ case class VectorIcebergScanExec(scan: BatchScanExec, fieldIds: Seq[Int]) extend
       io.vecruntime.spark.VectorConf.scanNativeParquetPrefetchExecutorMaxBytes(sqlConf),
       m,
       longMetric("numNativeGroups"),
-      longMetric("numIcebergGroups")
+      longMetric("numIcebergGroups"),
+      if (filterFieldIds == null) Nil else pushedFilters,
+      filterFieldIds,
+      PushDownConf(
+        sqlConf.parquetFilterPushDownDate,
+        sqlConf.parquetFilterPushDownTimestamp,
+        sqlConf.parquetFilterPushDownDecimal,
+        sqlConf.parquetFilterPushDownStringPredicate,
+        sqlConf.parquetFilterPushDownInFilterThreshold
+      )
     )
   }
 
@@ -195,7 +225,10 @@ private[vecruntime] final class VectorIcebergRDD(
     prefetchExecutorMaxBytes: Long,
     metrics: ScanMetrics,
     nativeGroups: SQLMetric,
-    icebergGroups: SQLMetric
+    icebergGroups: SQLMetric,
+    pushedFilters: Seq[org.apache.spark.sql.sources.Filter],
+    filterFieldIds: Map[String, Int], // null: nothing pushed
+    pushDown: PushDownConf
 ) extends RDD[ColumnarBatch](sc, Nil) {
 
   override protected def getPartitions: Array[Partition] = parts
@@ -323,12 +356,12 @@ private[vecruntime] final class VectorIcebergRDD(
       batchSize,
       caseSensitive = false,
       useFieldId = true,
-      pushedFilters = Nil,
-      pushDownDate = false,
-      pushDownTimestamp = false,
-      pushDownDecimal = false,
-      pushDownStringPredicate = false,
-      pushDownInFilterThreshold = 0,
+      pushedFilters = pushedFilters,
+      pushDownDate = pushDown.date,
+      pushDownTimestamp = pushDown.timestamp,
+      pushDownDecimal = pushDown.decimal,
+      pushDownStringPredicate = pushDown.stringPredicate,
+      pushDownInFilterThreshold = pushDown.inFilterThreshold,
       rebaseConf = rebaseConf,
       prefetchFiles = prefetchFiles,
       prefetchRowGroups = prefetchRowGroups,
@@ -338,7 +371,8 @@ private[vecruntime] final class VectorIcebergRDD(
       poolLimit = math.max(4, decodeAhead + 2),
       dictionaryStrings = dictionaryStrings,
       prefetchMaxBytes = prefetchMaxBytes,
-      prefetchExecutorMaxBytes = prefetchExecutorMaxBytes
+      prefetchExecutorMaxBytes = prefetchExecutorMaxBytes,
+      filterFieldIds = filterFieldIds
     )
     if (decodeAhead > 0) new DecodeAheadIterator(reader, decodeAhead, decodeAheadVirtual, context) else reader
   }
@@ -361,6 +395,15 @@ private[vecruntime] final class VectorIcebergRDD(
     }
   }
 }
+
+/** Spark's Parquet filter push-down switches, for the filters pushed into [[VectorIcebergRDD]]'s reader. */
+private[vecruntime] final case class PushDownConf(
+    date: Boolean,
+    timestamp: Boolean,
+    decimal: Boolean,
+    stringPredicate: Boolean,
+    inFilterThreshold: Int
+)
 
 /** Helpers of [[VectorIcebergRDD]]. */
 private[vecruntime] object VectorIcebergRDD {

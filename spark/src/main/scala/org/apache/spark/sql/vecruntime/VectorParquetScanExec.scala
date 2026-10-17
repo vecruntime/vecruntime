@@ -415,7 +415,10 @@ private[vecruntime] final class VectorParquetPartitionReader(
     metadataExtractors: Map[String, PartitionedFile => Any] = Map.empty,
     // #568: the read-ahead's byte caps, per task and over the executor (Long.MaxValue: none)
     prefetchMaxBytes: Long = Long.MaxValue,
-    prefetchExecutorMaxBytes: Long = Long.MaxValue
+    prefetchExecutorMaxBytes: Long = Long.MaxValue,
+    // #735: pushed filters name the requested columns, matched to each file's columns by field id (quoted
+    // column name -> field id); null: by name, as Spark does. Iceberg files are never rebased.
+    filterFieldIds: Map[String, Int] = null
 ) extends Iterator[ColumnarBatch]
     with AutoCloseable {
 
@@ -1286,9 +1289,18 @@ private[vecruntime] final class VectorParquetPartitionReader(
     val kv = footer.getFileMetaData.getKeyValueMetaData
     val rebaseSpec =
       org.apache.spark.sql.execution.datasources.DataSourceUtils.datetimeRebaseSpec(
-        k => kv.get(k),
-        rebaseConf.datetimeMode
+        // #735: Iceberg writes proleptic dates and timestamps and its readers never rebase.
+        if (filterFieldIds != null) (_: String) => null else (k: String) => kv.get(k),
+        if (filterFieldIds != null) "CORRECTED" else rebaseConf.datetimeMode
       )
+    // #735: by field id, each filter renamed to the file's own column with that id; a filter on a column the
+    // file lacks is dropped (see renameByFieldId).
+    val filters =
+      if (filterFieldIds == null) pushedFilters
+      else VectorParquetScanExec.renameByFieldId(pushedFilters, filterFieldIds, footer.getFileMetaData.getSchema)
+    if (filters.isEmpty) {
+      return FilterCompat.NOOP
+    }
     // Over the FILE's schema, as ParquetFileFormat builds its ParquetFilters: a column the file lacks (schema
     // evolution) or holds under another name (field-id matching, #568) gets no row-group predicate, as in Spark.
     val parquetFilters = new ParquetFilters(
@@ -1301,7 +1313,7 @@ private[vecruntime] final class VectorParquetPartitionReader(
       caseSensitive,
       rebaseSpec
     )
-    val predicates = pushedFilters.flatMap(f => parquetFilters.createFilter(f))
+    val predicates = filters.flatMap(f => parquetFilters.createFilter(f))
     if (predicates.isEmpty) {
       FilterCompat.NOOP
     } else {
@@ -1467,6 +1479,54 @@ object VectorParquetScanExec {
     "DELTA_BYTE_ARRAY" -> Set(BINARY, FIXED_LEN_BYTE_ARRAY),
     "BYTE_STREAM_SPLIT" -> Set(INT32, INT64, DOUBLE, PrimitiveType.PrimitiveTypeName.FLOAT)
   )
+
+  /**
+   * #735: `filters`, written over the requested columns (`ids`: quoted name -> field id), renamed to the columns
+   * of `fileSchema` (top level) carrying those ids -- so after a rename, or a dropped column whose name a new
+   * column took, a filter is tested against the column the reader reads, never one that merely shares its name.
+   * A top-level conjunct naming a column the file lacks (or holds under a repeated id) is dropped: the column
+   * reads as nulls there and the filter above the scan decides. Inside `Or` / `Not` nothing is dropped: such a
+   * filter is renamed whole or not pushed. The result only skips row groups, so dropping is always safe.
+   */
+  def renameByFieldId(
+      filters: Seq[org.apache.spark.sql.sources.Filter],
+      ids: Map[String, Int],
+      fileSchema: MessageType
+  ): Seq[org.apache.spark.sql.sources.Filter] = {
+    import org.apache.spark.sql.sources._
+    val fields: Seq[org.apache.parquet.schema.Type] = fileSchema.getFields.asScala.toSeq.filter(_.getId != null)
+    val byId: Map[Int, String] = fields.groupBy(_.getId.intValue).collect {
+      case (id, ts) if ts.size == 1 => id -> org.apache.spark.sql.catalyst.util.quoteIfNeeded(ts.head.getName)
+    }
+    val names: Map[String, String] = ids.flatMap { case (n, id) => byId.get(id).map(n -> _) }
+    def rename(f: Filter): Option[Filter] = {
+      def col(n: String)(make: String => Filter): Option[Filter] = names.get(n).map(make)
+      f match {
+        case EqualTo(a, v) => col(a)(EqualTo(_, v))
+        case EqualNullSafe(a, v) => col(a)(EqualNullSafe(_, v))
+        case GreaterThan(a, v) => col(a)(GreaterThan(_, v))
+        case GreaterThanOrEqual(a, v) => col(a)(GreaterThanOrEqual(_, v))
+        case LessThan(a, v) => col(a)(LessThan(_, v))
+        case LessThanOrEqual(a, v) => col(a)(LessThanOrEqual(_, v))
+        case In(a, vs) => col(a)(In(_, vs))
+        case IsNull(a) => col(a)(IsNull(_))
+        case IsNotNull(a) => col(a)(IsNotNull(_))
+        case StringStartsWith(a, v) => col(a)(StringStartsWith(_, v))
+        case StringEndsWith(a, v) => col(a)(StringEndsWith(_, v))
+        case StringContains(a, v) => col(a)(StringContains(_, v))
+        case And(l, r) => for (x <- rename(l); y <- rename(r)) yield And(x, y)
+        case Or(l, r) => for (x <- rename(l); y <- rename(r)) yield Or(x, y)
+        case Not(c) => rename(c).map(Not(_))
+        case AlwaysTrue() | AlwaysFalse() => Some(f)
+        case _ => None
+      }
+    }
+    def conjuncts(f: Filter): Seq[Filter] = f match {
+      case And(l, r) => conjuncts(l) ++ conjuncts(r)
+      case other => Seq(other)
+    }
+    filters.flatMap(conjuncts).flatMap(rename)
+  }
 
   /** Whether any field of a Parquet schema, at any depth, carries a field id (Spark's ParquetReadSupport check). */
   def hasFieldIds(t: org.apache.parquet.schema.Type): Boolean =

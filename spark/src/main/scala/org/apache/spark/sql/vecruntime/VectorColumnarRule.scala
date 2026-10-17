@@ -515,7 +515,7 @@ case class VectorExecRule(session: SparkSession) extends Rule[SparkPlan] with Lo
             case other => other
           }
       }
-      val converted = plan.transformUp(delegation.orElse(conversions))
+      val converted = pushIcebergFilters(plan.transformUp(delegation.orElse(conversions)))
       val prefetchDepth = VectorConf.scanPrefetchDepth(conf)
       val withPrefetch = if (prefetchDepth > 0) prefetchScans(converted, prefetchDepth) else converted
       val withDecodeFilters =
@@ -732,6 +732,28 @@ case class VectorExecRule(session: SparkSession) extends Rule[SparkPlan] with Lo
       )
         f.copy(child = s.copy(decodeFilter = Some(cond)))
       else f
+  }
+
+  /**
+   * #735: a filter directly over the native Iceberg scan hands it its deterministic conjuncts, translated as Spark
+   * translates a file scan's data filters (top-level columns only). The scan skips row groups and pages by them,
+   * each column matched to the file's by field id; the filter stays and decides which rows pass.
+   */
+  private def pushIcebergFilters(plan: SparkPlan): SparkPlan = plan.transformUp {
+    case f @ VectorFilterExec(cond, s: VectorIcebergScanExec, _) if s.pushedFilters.isEmpty =>
+      def conjuncts(e: org.apache.spark.sql.catalyst.expressions.Expression)
+          : Seq[org.apache.spark.sql.catalyst.expressions.Expression] =
+        e match {
+          case org.apache.spark.sql.catalyst.expressions.And(l, r) => conjuncts(l) ++ conjuncts(r)
+          case other => Seq(other)
+        }
+      val pushed = conjuncts(cond)
+        .filter(_.deterministic)
+        .flatMap(c =>
+          org.apache.spark.sql.execution.datasources.DataSourceStrategy
+            .translateFilter(c, supportNestedPredicatePushdown = false)
+        )
+      if (pushed.isEmpty) f else f.copy(child = s.copy(pushedFilters = pushed))
   }
 
   private def markSelectionProducers(plan: SparkPlan): SparkPlan = plan.transformDown {
