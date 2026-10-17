@@ -104,6 +104,9 @@ object VectorConf {
   /** #735: broadcast a small DSv2 (Iceberg) join input by its planned file bytes (V2BroadcastBySize). */
   val V2BroadcastBySizeEnabled = "spark.vecruntime.optimizer.v2BroadcastBySize.enabled"
 
+  /** #735: Spark's runtime bloom filter from a small DSv2 (Iceberg) dimension by its planned file bytes. */
+  val V2RuntimeFilterBySizeEnabled = "spark.vecruntime.optimizer.v2RuntimeFilterBySize.enabled"
+
   /** #735: V2BroadcastBySize leaves an input whose own size estimate exceeds this many bytes (default 1 GiB). */
   val V2BroadcastBySizeMaxEstimatedBytes = "spark.vecruntime.optimizer.v2BroadcastBySize.maxEstimatedBytes"
 
@@ -697,6 +700,10 @@ object VectorConf {
   /** V2BroadcastBySize (#735), default true. */
   def v2BroadcastBySizeEnabled(conf: SQLConf): Boolean =
     isEnabled(conf) && bool(conf, V2BroadcastBySizeEnabled, default = true)
+
+  /** V2RuntimeFilterBySize (#735), default true. */
+  def v2RuntimeFilterBySizeEnabled(conf: SQLConf): Boolean =
+    isEnabled(conf) && bool(conf, V2RuntimeFilterBySizeEnabled, default = true)
 
   /** V2BroadcastBySize's cap on an input's own size estimate (#735), default 1 GiB; `1g` style sizes accepted. */
   def v2BroadcastBySizeMaxEstimatedBytes(conf: SQLConf): Long =

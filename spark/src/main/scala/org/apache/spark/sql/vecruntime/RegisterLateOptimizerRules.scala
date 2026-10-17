@@ -46,6 +46,11 @@ case class RegisterLateOptimizerRules(session: SparkSession) extends Rule[Logica
         if (!exp.extraOptimizations.exists(_.isInstanceOf[CountBelowJoin])) {
           exp.extraOptimizations = exp.extraOptimizations :+ CountBelowJoin(session)
         }
+        // Spark's runtime filters from small DSv2 dimensions, before the broadcast hints change which joins look
+        // like shuffle joins to Spark's rule (as on a file table, where Spark's rule ran on an unhinted plan).
+        if (!exp.extraOptimizations.exists(_.isInstanceOf[V2RuntimeFilterBySize])) {
+          exp.extraOptimizations = exp.extraOptimizations :+ V2RuntimeFilterBySize(session)
+        }
         // Before FactBloomFilter, which leaves a join with a broadcast side alone.
         if (!exp.extraOptimizations.exists(_.isInstanceOf[V2BroadcastBySize])) {
           exp.extraOptimizations = exp.extraOptimizations :+ V2BroadcastBySize(session)

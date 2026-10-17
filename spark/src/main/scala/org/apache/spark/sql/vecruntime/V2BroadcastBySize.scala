@@ -19,6 +19,7 @@ import io.vecruntime.spark.VectorConf
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.optimizer.JoinSelectionHelper
 import org.apache.spark.sql.catalyst.plans.logical.{BROADCAST, Filter, HintInfo, Join, LogicalPlan, Project}
+import org.apache.spark.sql.catalyst.plans.logical.statsEstimation.EstimationUtils
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.execution.datasources.v2.DataSourceV2ScanRelation
 
@@ -32,8 +33,8 @@ import org.apache.spark.sql.execution.datasources.v2.DataSourceV2ScanRelation
  * both sides have been shuffled -- two extra shuffles of the fact, q7 23 s against 12 s with a broadcast.
  *
  * A join input that is one DSv2 scan under projections and filters, too large to broadcast by its estimate, is
- * estimated again by the bytes of the files its scan planned (Iceberg's task groups) scaled as Spark scaled the
- * scan's own estimate up to that input (the columns the projections keep); at most the threshold, it gets a
+ * estimated again by the bytes of the files its scan planned (Iceberg's task groups), scaled by the share of a row
+ * the scan reads and by what the input keeps of the scan's estimate (`byFiles`); at most the threshold, it gets a
  * broadcast hint, which Spark's join selection takes when the join type allows that side to be broadcast. The
  * uncompressed estimate must stay within `spark.vecruntime.optimizer.v2BroadcastBySize.maxEstimatedBytes`, so a
  * table that compresses unusually well is not broadcast whole. A join that already carries a hint is left alone.
@@ -48,14 +49,8 @@ case class V2BroadcastBySize(session: SparkSession) extends Rule[LogicalPlan] wi
     val maxEstimated = VectorConf.v2BroadcastBySizeMaxEstimatedBytes(conf)
     def small(side: LogicalPlan): Boolean = {
       val estimate = side.stats.sizeInBytes
-      estimate > threshold && estimate <= maxEstimated && (scanOf(side) match {
-        case Some(scan) =>
-          V2BroadcastBySize.plannedBytes(scan).exists { files =>
-            val whole = scan.stats.sizeInBytes
-            whole > 0 && BigInt(files) * estimate / whole <= threshold
-          }
-        case None => false
-      })
+      estimate > threshold && estimate <= maxEstimated &&
+      scanOf(side).flatMap(V2BroadcastBySize.byFiles(side, _)).exists(_ <= threshold)
     }
     plan.transformUp {
       case j @ Join(left, right, jt, _, hint) if hint.leftHint.isEmpty && hint.rightHint.isEmpty =>
@@ -80,6 +75,25 @@ case class V2BroadcastBySize(session: SparkSession) extends Rule[LogicalPlan] wi
 }
 
 object V2BroadcastBySize {
+
+  /**
+   * `side`'s size by the files its scan planned, as a file table's input is estimated: the files' bytes times the
+   * share of a row the scan reads (Spark's row-size estimate of the scan's columns against the table's, as Spark
+   * scales a projection of a file scan), times what `side` keeps of the scan's own estimate. The scan's estimate
+   * already counts only the columns it reads, the files every column, so without the column share a narrow read of
+   * a wide table (q82's `item`, 5 of 22 columns) would look several times larger than its Parquet copy.
+   */
+  def byFiles(side: LogicalPlan, scan: DataSourceV2ScanRelation): Option[BigInt] = {
+    val whole = scan.stats.sizeInBytes
+    if (whole <= 0) None
+    else
+      plannedBytes(scan).map { files =>
+        val read = EstimationUtils.getSizePerRow(scan.output)
+        val table = EstimationUtils.getSizePerRow(scan.relation.output)
+        val columns = if (table > 0) BigInt(files) * read / table else BigInt(files)
+        columns.min(BigInt(files)) * side.stats.sizeInBytes / whole
+      }
+  }
 
   /**
    * The bytes of the files an Iceberg scan planned (its task groups' `sizeBytes`), or None for a scan of another

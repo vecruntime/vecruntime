@@ -67,7 +67,7 @@ class IcebergBroadcastBySizeSuite extends VectorQuerySuite {
     }.get
     val scan = side.collectFirst { case s: DataSourceV2ScanRelation => s }.get
     val estimate = side.stats.sizeInBytes
-    val scaled = BigInt(V2BroadcastBySize.plannedBytes(scan).get) * estimate / scan.stats.sizeInBytes
+    val scaled = V2BroadcastBySize.byFiles(side, scan).get
     assert(scaled * 4 < estimate, s"the test needs the files ($scaled B) well under the estimate ($estimate B)")
     threshold = ((scaled + estimate) / 2).toLong
   }
@@ -114,6 +114,45 @@ class IcebergBroadcastBySizeSuite extends VectorQuerySuite {
   test("an input whose estimate is above maxEstimatedBytes is left alone", IcebergTest) {
     val df = run(q7, VectorConf.V2BroadcastBySizeMaxEstimatedBytes -> "1k")
     assert(broadcastHints(df) === 0)
+  }
+
+  test("a narrow read of a wide dimension is sized by the columns it reads (q82's item)", IcebergTest) {
+    // Ten text columns the query never reads, 12 characters each against Spark's 20-byte default width: the files
+    // are mostly those columns, yet smaller than the rows-times-widths estimate.
+    val unread = (0 until 10).map(i => s"substr(md5(CAST(id + $i AS STRING)), 1, 12) AS w_u$i").mkString(", ")
+    spark.sql(
+      s"""CREATE OR REPLACE TABLE $Db.wdim USING iceberg AS
+         |SELECT id AS w_key, IF(id % 2 = 0, 'M', 'F') AS w_gender, $unread
+         |FROM range(0, 20000)""".stripMargin
+    )
+    spark.table(s"$Db.wdim").createOrReplaceTempView("wdim")
+    // q7's shape (avg and max): a bare count would be rewritten below the join (CountBelowJoin) first.
+    val sql = "SELECT f_qty, avg(f_key) a, max(w_gender) m FROM fact JOIN wdim ON f_dim = w_key " +
+      "WHERE w_gender = 'M' GROUP BY f_qty"
+    val plan = withConf(VectorConf.V2BroadcastBySizeEnabled -> "false")(spark.sql(sql).queryExecution.optimizedPlan)
+    val side = plan.collectFirst {
+      case j: Join if j.right.exists(isWide) => j.right
+      case j: Join if j.left.exists(isWide) => j.left
+    }.get
+    val scan = side.collectFirst { case s: DataSourceV2ScanRelation => s }.get
+    val byColumns = V2BroadcastBySize.byFiles(side, scan).get
+    val wholeRows = BigInt(V2BroadcastBySize.plannedBytes(scan).get) * side.stats.sizeInBytes / scan.stats.sizeInBytes
+    // Below both Spark's own estimate (so Spark alone does not broadcast) and the whole rows' share (so only the
+    // column share brings it under), above the column share.
+    val ceiling = side.stats.sizeInBytes.min(wholeRows)
+    assert(byColumns * 3 / 2 < ceiling, s"the read columns ($byColumns B) should be well under $ceiling B")
+    val t = ((byColumns + ceiling) / 2).toLong
+    withConf("spark.sql.autoBroadcastJoinThreshold" -> t.toString) {
+      val expected = withPlugin(enabled = false)(spark.sql(sql).collect())
+      val df = withPlugin(enabled = true) { val d = spark.sql(sql); d.collect(); d }
+      assertRowsEqual(expected, df.collect(), 1e-9, sql)
+      assert(broadcastHints(df) === 1, df.queryExecution.optimizedPlan.treeString)
+    }
+  }
+
+  private def isWide(p: org.apache.spark.sql.catalyst.plans.logical.LogicalPlan): Boolean = p match {
+    case s: DataSourceV2ScanRelation => s.relation.name.endsWith("wdim")
+    case _ => false
   }
 
   test("an outer join broadcasts only a side its type allows", IcebergTest) {
