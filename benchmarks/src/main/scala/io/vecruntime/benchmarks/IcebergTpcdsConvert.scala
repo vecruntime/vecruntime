@@ -36,7 +36,9 @@ import org.apache.spark.sql.SparkSession
  *
  * `--stats` converts nothing: it runs Iceberg's `compute_table_stats` on each table instead, which writes the
  * per-column distinct-count sketches (Puffin `apache-datasketches-theta-v1`) of the current snapshot. Iceberg's scan
- * reports them to Spark as column statistics when `spark.sql.cbo.enabled` is on.
+ * reports them to Spark as column statistics when `spark.sql.cbo.enabled` is on. `--stats-fact-keys` does the same
+ * but sketches only the `_sk` columns of the fact tables (a full read of each sketched column; the dimensions are
+ * small and get every column).
  */
 object IcebergTpcdsConvert {
 
@@ -46,8 +48,13 @@ object IcebergTpcdsConvert {
       namespace: String = "tpcds",
       tables: Seq[String] = TpcdsRunner.Tables,
       replace: Boolean = false,
-      stats: Boolean = false
+      stats: Boolean = false,
+      factKeysOnly: Boolean = false
   )
+
+  /** TPC-DS fact tables: `--stats-fact-keys` sketches only their `_sk` columns. */
+  val Facts: Set[String] =
+    Set("store_sales", "catalog_sales", "web_sales", "store_returns", "catalog_returns", "web_returns", "inventory")
 
   def parse(args: List[String], a: Args = Args()): Args = args match {
     case Nil => a
@@ -57,6 +64,7 @@ object IcebergTpcdsConvert {
     case "--tables" :: v :: t => parse(t, a.copy(tables = v.split(",").map(_.trim).filter(_.nonEmpty).toSeq))
     case "--replace" :: t => parse(t, a.copy(replace = true))
     case "--stats" :: t => parse(t, a.copy(stats = true))
+    case "--stats-fact-keys" :: t => parse(t, a.copy(stats = true, factKeysOnly = true))
     case other => throw new IllegalArgumentException(s"unknown arguments: ${other.mkString(" ")}")
   }
 
@@ -78,8 +86,21 @@ object IcebergTpcdsConvert {
     if (a.stats) {
       a.tables.foreach { t =>
         val t0 = System.nanoTime()
-        val out = spark.sql(s"CALL $cat.system.compute_table_stats(table => '${a.namespace}.$t')").collect()
-        println(f"[stats] $t: ${out.map(_.mkString(" ")).mkString("; ")}, ${(System.nanoTime() - t0) / 1e9}%.0f s")
+        // A fact's sketches cost a full read of each of its columns: with --stats-fact-keys only its `_sk` keys
+        // (the join and partition columns the rules estimate by); a dimension always gets every column.
+        val keysOnly = a.factKeysOnly && IcebergTpcdsConvert.Facts.contains(t)
+        val columns =
+          if (!keysOnly) ""
+          else {
+            val keys = spark.table(s"$cat.${a.namespace}.$t").columns.filter(_.endsWith("_sk"))
+            keys.map(c => s"'$c'").mkString(", columns => array(", ", ", ")")
+          }
+        val out =
+          spark.sql(s"CALL $cat.system.compute_table_stats(table => '${a.namespace}.$t'$columns)").collect()
+        println(
+          f"[stats] $t${if (keysOnly) " (keys)" else ""}: ${out.map(_.mkString(" ")).mkString("; ")}, " +
+            f"${(System.nanoTime() - t0) / 1e9}%.0f s"
+        )
       }
       spark.stop()
       return
