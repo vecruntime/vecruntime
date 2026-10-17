@@ -24,21 +24,10 @@ import org.apache.spark.sql.catalyst.expressions.{
   ExprId,
   PredicateHelper,
   ScalarSubquery,
-  SubqueryExpression,
   XxHash64
 }
 import org.apache.spark.sql.catalyst.optimizer.{InjectRuntimeFilter, PushDownPredicates}
-import org.apache.spark.sql.catalyst.plans.logical.{
-  Aggregate,
-  BROADCAST,
-  Filter,
-  HintInfo,
-  Join,
-  JoinHint,
-  LogicalPlan,
-  Project
-}
-import org.apache.spark.sql.catalyst.trees.TreeNodeTag
+import org.apache.spark.sql.catalyst.plans.logical.{Aggregate, Filter, LogicalPlan, Project}
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.execution.datasources.{HadoopFsRelation, LogicalRelation}
 import org.apache.spark.sql.execution.datasources.v2.DataSourceV2ScanRelation
@@ -69,70 +58,6 @@ case class V2RuntimeFilterBySize(session: SparkSession) extends Rule[LogicalPlan
     val conf = session.sessionState.conf
     if (!VectorConf.v2RuntimeFilterBySizeEnabled(conf) || !conf.runtimeFilterBloomFilterEnabled) return plan
     if (!plan.exists(_.isInstanceOf[DataSourceV2ScanRelation])) return plan
-    addSmall(dropCostly(plan, conf), conf)
-  }
-
-  /**
-   * Drops the runtime bloom filters Spark's rule added whose creation side joins a DSv2 scan that is large by its
-   * planned files (#735, q14a).
-   *
-   * Spark's rule judges the creation side by its estimate only. On Iceberg, 3 TB q14a's `item LEFT SEMI
-   * cross_items` -- `item` known to hold 360,000 rows -- is within the threshold, and three filters on the sales
-   * tables' item keys are built from it: each computes `cross_items` (three more scans of the sales tables) again,
-   * 75 s against 60 s with Spark's bloom filter off. Its Parquet copy gets none. A creation side that is one scan
-   * under projections and filters, or joins only small scans, is kept.
-   */
-  private def dropCostly(plan: LogicalPlan, conf: SQLConf): LogicalPlan = {
-    if (
-      !plan.exists(_.expressions.exists(_.exists {
-        case b: BloomFilterMightContain => costly(b, conf)
-        case _ => false
-      }))
-    ) return plan
-    plan.transformUp {
-      case f @ Filter(cond, child) =>
-        val parts = splitConjunctivePredicates(cond)
-        val left = parts.filterNot {
-          case b: BloomFilterMightContain => costly(b, conf)
-          case _ => false
-        }
-        if (left.size == parts.size) f
-        else if (left.isEmpty) child
-        else Filter(left.reduce(And), child)
-    }
-  }
-
-  /**
-   * Whether building `b` reads a large DSv2 scan beyond its creation side's own: the creation side joins another
-   * relation, or filters by an IN / EXISTS subquery that Spark's rule counted as a selective filter and that a later
-   * batch turns into a semi join. Either way building the filter reads what that join or subquery reads.
-   */
-  private def costly(b: BloomFilterMightContain, conf: SQLConf): Boolean = {
-    val limit = VectorConf.v2BroadcastBySizeMaxEstimatedBytes(conf)
-    def large(s: DataSourceV2ScanRelation): Boolean =
-      V2BroadcastBySize.plannedBytes(s).forall(_ > limit)
-    def readsLarge(p: LogicalPlan): Boolean = p.exists {
-      case scan: DataSourceV2ScanRelation => large(scan)
-      case _ => false
-    } || p.exists(_.expressions.exists(_.exists {
-      case s: SubqueryExpression => readsLarge(s.plan)
-      case _ => false
-    }))
-    b.bloomFilterExpression match {
-      case s: ScalarSubquery =>
-        creationOf(s.plan).exists {
-          case j: Join => readsLarge(j)
-          case f: Filter => f.condition.exists {
-              case q: SubqueryExpression => readsLarge(q.plan)
-              case _ => false
-            }
-          case _ => false
-        }
-      case _ => false
-    }
-  }
-
-  private def addSmall(plan: LogicalPlan, conf: SQLConf): LogicalPlan = {
     val threshold = conf.runtimeFilterCreationSideThreshold
     val raised = VectorConf.v2BroadcastBySizeMaxEstimatedBytes(conf)
     if (raised <= threshold) return plan
@@ -142,25 +67,8 @@ case class V2RuntimeFilterBySize(session: SparkSession) extends Rule[LogicalPlan
     val local = conf.clone()
     local.setConf(SQLConf.RUNTIME_BLOOM_FILTER_CREATION_SIDE_THRESHOLD, raised)
     local.setConf(SQLConf.RUNTIME_FILTER_NUMBER_THRESHOLD, room)
-    // Spark's rule skips a join it takes for a broadcast with no shuffle below, judged by size estimates. A join
-    // input small by its files that V2BroadcastBySize left unhinted -- one a rollup above groups by (q27's store and
-    // item) -- would look like a shuffle join here and draw a filter its Parquet copy does not get, so such joins
-    // carry a broadcast hint while Spark's rule runs, and lose it again after.
-    val broadcastAt = conf.autoBroadcastJoinThreshold
-    val hinted =
-      if (broadcastAt <= 0) plan
-      else
-        plan.transformUp {
-          case j @ Join(l, r, _, _, h)
-              if h.leftHint.isEmpty && h.rightHint.isEmpty &&
-                (V2BroadcastBySize.smallByFiles(l, broadcastAt, raised) ||
-                  V2BroadcastBySize.smallByFiles(r, broadcastAt, raised)) =>
-            val marked = j.copy(hint = JoinHint(Some(HintInfo(strategy = Some(BROADCAST))), None))
-            marked.setTagValue(V2RuntimeFilterBySize.TemporaryHint, ())
-            marked
-        }
-    val injected = SQLConf.withExistingConf(local)(InjectRuntimeFilter(hinted))
-    if (injected.fastEquals(hinted)) return plan
+    val injected = SQLConf.withExistingConf(local)(InjectRuntimeFilter(plan))
+    if (injected.fastEquals(plan)) return plan
     // A table's partition columns are pruned by dynamic partition pruning, which runs before Spark's rule; there
     // Spark's rule sees the pruning filter and declines a bloom filter on the same key (q14a's `ss_sold_date_sk`
     // from one month of `date_dim`). In this batch the pruning filter is no longer in that form, so a new filter on
@@ -178,10 +86,7 @@ case class V2RuntimeFilterBySize(session: SparkSession) extends Rule[LogicalPlan
     }
     def keep(b: BloomFilterMightContain): Boolean = b.bloomFilterExpression match {
       case s: ScalarSubquery if before.contains(s.exprId) => true
-      case s: ScalarSubquery =>
-        // Not one dropCostly removed: Spark's rule, run again here, would build it from the same creation side,
-        // whose own scan is small by its files although building it reads a large table (q14a).
-        !onPartition(b) && smallByFiles(creationOf(s.plan), threshold) && !costly(b, conf)
+      case s: ScalarSubquery => !onPartition(b) && smallByFiles(creationOf(s.plan), threshold)
       case _ => true
     }
     val kept = injected.transformUp {
@@ -196,9 +101,7 @@ case class V2RuntimeFilterBySize(session: SparkSession) extends Rule[LogicalPlan
         else Filter(left.reduce(And), child)
     }
     if (bloomIds(kept) == before) return plan
-    pushDown(kept.transformUp {
-      case j: Join if j.getTagValue(V2RuntimeFilterBySize.TemporaryHint).isDefined => j.copy(hint = JoinHint.NONE)
-    })
+    pushDown(kept)
   }
 
   private def bloomIds(plan: LogicalPlan): Set[ExprId] =
@@ -237,10 +140,4 @@ case class V2RuntimeFilterBySize(session: SparkSession) extends Rule[LogicalPlan
     }
     current
   }
-}
-
-object V2RuntimeFilterBySize {
-
-  /** Marks a broadcast hint this rule adds only while Spark's rule runs. */
-  val TemporaryHint: TreeNodeTag[Unit] = TreeNodeTag[Unit]("vecruntime.v2RuntimeFilterBySize.temporaryHint")
 }

@@ -154,23 +154,6 @@ class IcebergRuntimeFilterBySizeSuite extends VectorQuerySuite {
     assert(blooms(df).isEmpty, df.queryExecution.optimizedPlan.treeString)
   }
 
-  test("a dimension small by its files that a rollup groups by gets no filter either (q27)", IcebergTest) {
-    // V2BroadcastBySize leaves it unhinted (a rollup above groups by its column), but it is no shuffle join by
-    // its files, so Spark's rule must not see one: no bloom filter, as on Parquet.
-    val sql =
-      """SELECT d_status, f_qty, avg(f_key) a FROM fact JOIN dim ON f_dim = d_key
-        |WHERE d_gender = 'M' AND d_status = 'status-2' GROUP BY ROLLUP(d_status, f_qty)""".stripMargin
-    val df = run(sql, "spark.sql.autoBroadcastJoinThreshold" -> threshold.toString)
-    assert(blooms(df).isEmpty, df.queryExecution.optimizedPlan.treeString)
-    // And the temporary hint is gone again: the join keeps no hint.
-    assert(
-      df.queryExecution.optimizedPlan.collect { case j: Join => j.hint }.forall(h =>
-        h.leftHint.isEmpty && h.rightHint.isEmpty
-      ),
-      df.queryExecution.optimizedPlan.treeString
-    )
-  }
-
   test("nothing is added when Spark's runtime bloom filter is off", IcebergTest) {
     val df = run(q, "spark.sql.optimizer.runtime.bloomFilter.enabled" -> "false")
     assert(blooms(df).isEmpty)
