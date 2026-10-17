@@ -1632,6 +1632,14 @@ object VectorParquetScanExec {
           case _ => false
         })
       case BooleanType => p == PrimitiveType.PrimitiveTypeName.BOOLEAN
+      case _: TimeType =>
+        // #787: INT64 TIME(MICROS), scaled to nanoseconds as Spark's LongAsNanosUpdater does. A TIME(NANOS) or
+        // INT32 TIME(MILLIS) file falls over to Spark's reader per file, so its outcome is Spark's own.
+        p == INT64 && (physical.getLogicalTypeAnnotation match {
+          case t: org.apache.parquet.schema.LogicalTypeAnnotation.TimeLogicalTypeAnnotation =>
+            t.getUnit == org.apache.parquet.schema.LogicalTypeAnnotation.TimeUnit.MICROS
+          case _ => false
+        })
       case _: StringType => p == BINARY
       case d: DecimalType =>
         // Spark's isDecimalTypeMatched: the file's decimal (p, s) reads as (p', s') when s' >= s and the precision
@@ -1770,10 +1778,10 @@ private[vecruntime] final class SparkFallbackFileReader(
 }
 
 /**
- * The planner's decision for a `FileSourceScanExec`: convert it to [[VectorParquetScanExec]] when the flag
- * is on and the scan is a supported flat Parquet scan, else the recorded reason. Encoding is only knowable
- * at read time, so slice 1 supports PLAIN / RLE_DICTIONARY and the reader fails over on any other page --
- * documented in docs/operators.md.
+ * The planner's decision for a `FileSourceScanExec`: convert it to [[VectorParquetScanExec]] (on by default) when
+ * the scan is a Parquet scan whose required and partition columns are all types the native reader decodes, else the
+ * recorded reason. Encodings and each file's physical types are only knowable at read time: a file the reader cannot
+ * decode is read by Spark's reader instead (per file), documented in docs/operators.md.
  */
 object VectorParquetScanPlanner {
 
@@ -1782,16 +1790,15 @@ object VectorParquetScanPlanner {
     if (!relation.fileFormat.isInstanceOf[org.apache.spark.sql.execution.datasources.parquet.ParquetFileFormat]) {
       return Some("scan is not Parquet")
     }
-    // #568: structs of readable fields, and top-level lists and maps of leaves, are read natively; a list of lists or
-    // of structs, or a list or a map inside a struct, keeps Spark's scan.
+    // #568: lists, maps and structs are read natively at any depth (#740, #744, #747) when every leaf below them is
+    // readable.
     val nested = scan.requiredSchema.fields.find(f =>
       !f.dataType.isInstanceOf[AtomicType] && !io.vecruntime.spark.parquet.NativeParquetSupport.isReadable(f.dataType)
     )
     nested.foreach(f => return Some(s"nested or complex column ${f.name}:${f.dataType.simpleString}"))
     // Every required column must be a type the native reader actually decodes -- ONE shared source of truth
-    // (NativeParquetSupport) so the plan-time check and the runtime decoder cannot drift. Excludes FLOAT,
-    // TIMESTAMP_NTZ, BINARY, wide decimals and collated strings; each file's physical types are checked again
-    // at open (physicalMatches).
+    // (NativeParquetSupport) so the plan-time check and the runtime decoder cannot drift. Each file's physical types
+    // are checked again at open (physicalMatches).
     scan.requiredSchema.fields.foreach { f =>
       if (!io.vecruntime.spark.parquet.NativeParquetSupport.isReadable(f.dataType)) {
         return Some(s"unsupported column type ${f.name}:${f.dataType.simpleString}")

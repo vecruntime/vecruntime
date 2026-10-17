@@ -98,6 +98,10 @@ public final class ArrowOutput {
         if (dt instanceof org.apache.spark.sql.types.TimestampNTZType) {
             return new org.apache.arrow.vector.TimeStampMicroVector(name, allocator);
         }
+        if (dt instanceof org.apache.spark.sql.types.TimeType) {
+            // #787: nanoseconds of the day, Spark's TimeType value; ArrowColumnVector's TimeNanoAccessor reads it.
+            return new org.apache.arrow.vector.TimeNanoVector(name, allocator);
+        }
         throw new UnsupportedOperationException("unsupported output type " + dt);
     }
 

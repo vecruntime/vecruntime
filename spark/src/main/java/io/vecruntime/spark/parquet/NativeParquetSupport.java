@@ -46,11 +46,13 @@ import org.apache.spark.sql.types.TimestampType;
  * and UTF8. Each file's physical types are checked against these lanes at open
  * ({@code VectorParquetScanExec.physicalMatches}), and so is each file's
  * calendar-rebase mode. TIMESTAMP is the INT64 lane of micros (INT64 {@code
- * MICROS}, or {@code MILLIS} scaled); an INT96 file falls over per file.
- * FLOAT, BINARY and TIMESTAMP_NTZ have no engine lane: they are decoded on a
- * lane of the same layout ({@link #decodeLane}) and emitted as Spark's Arrow
- * vectors, carried by operators as foreign columns. Deliberately excluded:
- * every nested/complex type.
+ * MICROS}, or {@code MILLIS} scaled), and INT96 is converted at flush.
+ * TIMESTAMP_NTZ, BINARY and FLOAT have engine lanes (INT64, UTF8, FLOAT64;
+ * #705, #712); a collated string rides the UTF8 lane. TIME (#787) has no
+ * engine lane: it is decoded on the INT64 lane of the same layout ({@link
+ * #decodeLane}) and emitted as Spark's Arrow {@code TimeNanoVector}, which
+ * operators carry as a column without a lane. Lists, maps and structs are
+ * readable when every leaf below them is (#568).
  */
 public final class NativeParquetSupport {
 
@@ -105,20 +107,21 @@ public final class NativeParquetSupport {
             // type and decimal annotation are checked at open (VectorParquetScanExec.physicalMatches).
             return d.precision() <= 38;
         }
-        // No engine lane (option A of the FLOAT / BINARY / TIMESTAMP_NTZ note, #559): decoded on a lane of the
-        // same layout and emitted as Spark's Arrow vector, so operators carry the column as a foreign column.
+        // No engine lane (option A of the #559 note; today TIME, #787): decoded on a lane of the same layout and
+        // emitted as Spark's Arrow vector, so operators carry the column as a foreign column.
         return decodeLane(dt) != null;
     }
 
     /**
      * The decoder lane for a Spark type: {@link TypeMapping#vecTypeOf} for a
      * type with an engine lane, else the lane whose bytes a column without one
-     * shares -- FLOAT on INT32 (the 4-byte IEEE bits, as stored), BINARY on UTF8
-     * (offsets and bytes), TIMESTAMP_NTZ on INT64 (micros). The scan emits those
-     * as Arrow {@code Float4Vector} / {@code VarBinaryVector} / {@code
-     * TimeStampMicroVector}, which Spark's {@code ArrowColumnVector} reads;
-     * operators pass them through as columns without a lane, as they do over
-     * Spark's own scan. {@code null}: not decodable.
+     * shares -- TIME on INT64 (nanoseconds of the day, #787). FLOAT decodes its
+     * 4-byte IEEE bits on INT32 into a {@code Float4Vector}, which operators
+     * widen onto the FLOAT64 lane (#712); BINARY and collated strings share the
+     * UTF8 lane. The scan emits TIME as an Arrow {@code TimeNanoVector}, which
+     * Spark's {@code
+     * ArrowColumnVector} reads; operators pass it through as a column without a
+     * lane, as they do over Spark's own scan. {@code null}: not decodable.
      */
     public static VecType decodeLane(DataType dt) {
         if (dt instanceof FloatType) {
@@ -131,6 +134,11 @@ public final class NativeParquetSupport {
             return VecType.UTF8; // a collated string too: the same bytes, no engine lane (#568)
         }
         if (dt instanceof TimestampNTZType) {
+            return VecType.INT64;
+        }
+        if (dt instanceof org.apache.spark.sql.types.TimeType) {
+            // #787: Spark's nanoseconds of the day; INT64 TIME(MICROS) scaled by 1000 at decode, as Spark's
+            // LongAsNanosUpdater does. No engine lane: emitted as a TimeNanoVector (ArrowOutput.newVector).
             return VecType.INT64;
         }
         return TypeMapping.vecTypeOf(dt);
