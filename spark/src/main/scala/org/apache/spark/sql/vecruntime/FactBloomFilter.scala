@@ -41,6 +41,7 @@ import org.apache.spark.sql.catalyst.plans.{Inner, JoinType, LeftOuter, LeftSemi
 import org.apache.spark.sql.catalyst.plans.logical.{Aggregate, Filter, Join, LogicalPlan, Project}
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.execution.datasources.LogicalRelation
+import org.apache.spark.sql.execution.datasources.v2.DataSourceV2ScanRelation
 import org.apache.spark.sql.internal.SQLConf
 
 /**
@@ -54,7 +55,7 @@ import org.apache.spark.sql.internal.SQLConf
  *
  * Shape: a shuffle equi-join (neither side broadcastable) that can prune the application side (inner, left
  * semi, or the null-supplying side of an outer join), where:
- * - the application key traces, through projections, filters and inner or semi joins, to a file scan of at
+ * - the application key traces, through projections, filters and inner or semi joins, to a file or DSv2 scan of at
  *   least `spark.sql.optimizer.runtime.bloomFilter.applicationSideScanSizeThreshold`;
  * - the application side is at least `spark.vecruntime.optimizer.factBloomFilter.sizeRatio` times larger in
  *   estimated bytes than the creation side;
@@ -88,7 +89,7 @@ case class FactBloomFilter(session: SparkSession) extends Rule[LogicalPlan] with
     // shuffle grew from 75 to 101 GB. Such a relation gets no probe.
     // Copies are told apart by their attribute ids: the same relation inside a subquery of the plan (Spark's
     // own runtime filter built from it) keeps its ids and is not a second read.
-    shared = plan.collect { case r: LogicalRelation => (r.canonicalized, r.output.map(_.exprId)) }
+    shared = plan.collect { case r if isScan(r) => (r.canonicalized, r.output.map(_.exprId)) }
       .groupBy(_._1).collect { case (c, copies) if copies.map(_._2).distinct.size > 1 => c }.toSet
     val reduced = if (VectorConf.factBloomFilterTransitive(conf)) transitive(plan, conf) else plan
     budget -= countBlooms(reduced) - countBlooms(plan)
@@ -289,7 +290,12 @@ case class FactBloomFilter(session: SparkSession) extends Rule[LogicalPlan] with
 
   /** Estimated rows of the base relation the creation key traces to, through projections, filters and joins. */
   private def keyTableRows(plan: LogicalPlan, key: Expression): Option[BigInt] = {
-    def rows(rel: LogicalRelation): BigInt = rel.catalogTable.flatMap(_.stats).flatMap(_.rowCount).getOrElse {
+    // A DSv2 scan reports its rows itself (an Iceberg scan: the snapshot's or the planned files' record count).
+    def rows(rel: LogicalPlan): BigInt = (rel match {
+      case l: LogicalRelation => l.catalogTable.flatMap(_.stats).flatMap(_.rowCount)
+      case v: DataSourceV2ScanRelation => v.stats.rowCount
+      case _ => None
+    }).getOrElse {
       val width = math.max(8L, rel.output.map(_.dataType.defaultSize.toLong).sum + 8L)
       rel.stats.sizeInBytes / width
     }
@@ -305,7 +311,7 @@ case class FactBloomFilter(session: SparkSession) extends Rule[LogicalPlan] with
         if (j.left.outputSet.contains(a)) trace(j.left, a)
         else if (j.right.outputSet.contains(a)) trace(j.right, a)
         else None
-      case rel: LogicalRelation if rel.outputSet.contains(a) => Some(rows(rel))
+      case rel if isScan(rel) && rel.outputSet.contains(a) => Some(rows(rel))
       case _ => None
     }
     key match {
@@ -424,7 +430,7 @@ case class FactBloomFilter(session: SparkSession) extends Rule[LogicalPlan] with
         // filters (a dynamic pruning expression among them) only from the filter directly over the relation, so
         // a second filter in between would lose the scan's partition pruning and leave the pruning expression in
         // a filter evaluated row by row (q48, q13 and q61 at 1 TB).
-        case Filter(probe, rel: LogicalRelation) if child.isInstanceOf[LogicalRelation] => Filter(And(cond, probe), rel)
+        case Filter(probe, rel) if isScan(rel) && isScan(child) => Filter(And(cond, probe), rel)
         case c => Filter(cond, c)
       }
     case jn @ Join(l, r, jt, _, _) if jt == Inner || jt == LeftSemi =>
@@ -432,12 +438,19 @@ case class FactBloomFilter(session: SparkSession) extends Rule[LogicalPlan] with
       else if (jt == Inner && key.references.subsetOf(r.outputSet))
         onScan(r, key, threshold, mk).map(c => jn.copy(right = c))
       else None
-    case rel: LogicalRelation
-        if key.references.subsetOf(rel.outputSet) && rel.stats.sizeInBytes >= BigInt(threshold) &&
+    case rel
+        if isScan(rel) && key.references.subsetOf(rel.outputSet) && rel.stats.sizeInBytes >= BigInt(threshold) &&
           !shared.contains(rel.canonicalized) =>
       Some(Filter(mk(key), rel))
     case _ => None
   }
+
+  /**
+   * A table scan the probe can go on: a file scan, or (#735) a DSv2 scan -- an Iceberg table, already pushed down
+   * when this rule runs. Its filter above it is where Spark takes runtime filters from, as for a file scan.
+   */
+  private def isScan(p: LogicalPlan): Boolean =
+    p.isInstanceOf[LogicalRelation] || p.isInstanceOf[DataSourceV2ScanRelation]
 
   private def hasFilterOn(cond: Expression, key: Expression): Boolean =
     splitConjunctivePredicates(cond).exists {
