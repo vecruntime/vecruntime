@@ -17,10 +17,19 @@ package org.apache.spark.sql.vecruntime
 
 import io.vecruntime.spark.VectorConf
 import org.apache.spark.sql.SparkSession
-import org.apache.spark.sql.catalyst.expressions.{And, BloomFilterMightContain, ExprId, PredicateHelper, ScalarSubquery}
+import org.apache.spark.sql.catalyst.expressions.{
+  And,
+  AttributeSet,
+  BloomFilterMightContain,
+  ExprId,
+  PredicateHelper,
+  ScalarSubquery,
+  XxHash64
+}
 import org.apache.spark.sql.catalyst.optimizer.{InjectRuntimeFilter, PushDownPredicates}
 import org.apache.spark.sql.catalyst.plans.logical.{Aggregate, Filter, LogicalPlan, Project}
 import org.apache.spark.sql.catalyst.rules.Rule
+import org.apache.spark.sql.execution.datasources.{HadoopFsRelation, LogicalRelation}
 import org.apache.spark.sql.execution.datasources.v2.DataSourceV2ScanRelation
 import org.apache.spark.sql.internal.SQLConf
 
@@ -60,9 +69,24 @@ case class V2RuntimeFilterBySize(session: SparkSession) extends Rule[LogicalPlan
     local.setConf(SQLConf.RUNTIME_FILTER_NUMBER_THRESHOLD, room)
     val injected = SQLConf.withExistingConf(local)(InjectRuntimeFilter(plan))
     if (injected.fastEquals(plan)) return plan
+    // A table's partition columns are pruned by dynamic partition pruning, which runs before Spark's rule; there
+    // Spark's rule sees the pruning filter and declines a bloom filter on the same key (q14a's `ss_sold_date_sk`
+    // from one month of `date_dim`). In this batch the pruning filter is no longer in that form, so a new filter on
+    // a partition column is dropped here: it would only cost its build (two exchanges in q14a) and its probe.
+    val partitionKeys = AttributeSet(plan.collect {
+      case s: DataSourceV2ScanRelation => V2PruningColumns.of(s.relation).toSeq
+      case l: LogicalRelation if l.relation.isInstanceOf[HadoopFsRelation] =>
+        val names = l.relation.asInstanceOf[HadoopFsRelation].partitionSchema.fieldNames
+        val resolver = conf.resolver
+        l.output.filter(a => names.exists(n => resolver(n, a.name)))
+    }.flatten)
+    def onPartition(b: BloomFilterMightContain): Boolean = b.valueExpression match {
+      case XxHash64(Seq(v), _) => v.references.nonEmpty && v.references.subsetOf(partitionKeys)
+      case _ => false
+    }
     def keep(b: BloomFilterMightContain): Boolean = b.bloomFilterExpression match {
       case s: ScalarSubquery if before.contains(s.exprId) => true
-      case s: ScalarSubquery => smallByFiles(creationOf(s.plan), threshold)
+      case s: ScalarSubquery => !onPartition(b) && smallByFiles(creationOf(s.plan), threshold)
       case _ => true
     }
     val kept = injected.transformUp {

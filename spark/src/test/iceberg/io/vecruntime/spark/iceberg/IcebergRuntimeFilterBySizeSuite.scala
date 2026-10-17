@@ -125,6 +125,22 @@ class IcebergRuntimeFilterBySizeSuite extends VectorQuerySuite {
     assert(blooms(df).isEmpty)
   }
 
+  test("no filter on a fact's partition column, which partition pruning already prunes (q14a)", IcebergTest) {
+    spark.sql(
+      s"""CREATE OR REPLACE TABLE $Db.pfact USING iceberg PARTITIONED BY (p_key) AS
+         |SELECT id % 40 AS p_key, id % 9 AS p_qty, id AS p_val FROM range(0, 400000)""".stripMargin
+    )
+    spark.table(s"$Db.pfact").createOrReplaceTempView("pfact")
+    val sql =
+      """SELECT p_qty, avg(p_val) a, max(d_status) m FROM pfact JOIN dim ON p_key = d_key
+        |WHERE d_gender = 'M' AND d_status = 'status-2' GROUP BY p_qty""".stripMargin
+    val df = run(sql)
+    val onKey = df.queryExecution.optimizedPlan.collect { case f: Filter => f }.flatMap(_.condition.collect {
+      case b: BloomFilterMightContain if b.valueExpression.references.exists(_.name == "p_key") => b
+    })
+    assert(onKey.isEmpty, df.queryExecution.optimizedPlan.treeString)
+  }
+
   test("nothing is added when Spark's runtime bloom filter is off", IcebergTest) {
     val df = run(q, "spark.sql.optimizer.runtime.bloomFilter.enabled" -> "false")
     assert(blooms(df).isEmpty)
