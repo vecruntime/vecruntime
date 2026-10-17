@@ -147,6 +147,15 @@ public final class NativeParquetColumnReader implements NativeParquetColumn, Row
     private int levelEnd; // entries whose levels have been read
     private boolean chunkHead; // the chunk's first entry is not checked yet
     private int rowsEmitted; // rows of the row group emitted
+    // #626: a repeated leaf of a row group filtered by the column index. Each pulled page's first entry in the
+    // kept levels and its first row index, oldest first ([pageHead, pageTail)), and the absolute row of the
+    // entry at levelStart, which is always a row's first entry between calls. A page begins on a row boundary
+    // wherever an offset index exists (the format requires it), so a page's first entry is its first row's.
+    private int[] pageLevelAt = new int[8];
+    private long[] pageFirstRow = new long[8];
+    private int pageHead;
+    private int pageTail;
+    private long levelRow;
 
     // A small pool of released batch vectors to reuse (bounded; extras are closed). Guarded by its own
     // monitor: with decode-ahead (#606) the producer thread borrows while the task thread releases. On JDK 25 a
@@ -352,7 +361,7 @@ public final class NativeParquetColumnReader implements NativeParquetColumn, Row
 
     @Override
     public void startRowGroup(org.apache.parquet.column.page.PageReadStore store, int rows) {
-        setRanges(repeated ? java.util.Optional.empty() : store.getRowIndexes(), rows);
+        setRanges(store.getRowIndexes(), rows);
         startPages(store.getPageReader(column), rows);
     }
 
@@ -727,6 +736,9 @@ public final class NativeParquetColumnReader implements NativeParquetColumn, Row
         levelEnd = 0;
         rowsEmitted = 0;
         chunkHead = true;
+        pageHead = 0;
+        pageTail = 0;
+        levelRow = 0;
     }
 
     /**
@@ -760,6 +772,7 @@ public final class NativeParquetColumnReader implements NativeParquetColumn, Row
         }
         int n = page.getValueCount();
         makeRoom(n);
+        int firstEntry = levelEnd;
         ColumnChunkDecoder.Page kernel;
         if (page instanceof DataPageV1 v1) {
             byte[] buf = bytes(v1.getBytes());
@@ -793,7 +806,110 @@ public final class NativeParquetColumnReader implements NativeParquetColumn, Row
         }
         levelEnd += n;
         pendingPages.add(kernel);
+        if (rangeStart != null) {
+            keepPageStart(page, firstEntry, n);
+        }
         return true;
+    }
+
+    /**
+     * #626: records where a pulled page of a column-index-filtered row group
+     * starts, in the kept levels and in rows, so {@link #alignRepeated} can
+     * cross the pages the column index dropped.
+     */
+    private void keepPageStart(DataPage page, int firstEntry, int n) {
+        if (page.getFirstRowIndex().isEmpty()) {
+            throw new IllegalStateException("a page of " + java.util.Arrays.toString(column.getPath()) + " filtered by the column index has no first row index");
+        }
+        if (n > 0 && reps[firstEntry] != 0 && pageTail > 0) {
+            throw new IllegalStateException("a page of " + java.util.Arrays.toString(column.getPath()) + " does not begin on a row boundary, which a file with an offset index must");
+        }
+        if (pageHead > 0) {
+            int live = pageTail - pageHead;
+            System.arraycopy(pageLevelAt, pageHead, pageLevelAt, 0, live);
+            System.arraycopy(pageFirstRow, pageHead, pageFirstRow, 0, live);
+            pageHead = 0;
+            pageTail = live;
+        }
+        if (pageTail == pageLevelAt.length) {
+            pageLevelAt = java.util.Arrays.copyOf(pageLevelAt, 2 * pageTail);
+            pageFirstRow = java.util.Arrays.copyOf(pageFirstRow, 2 * pageTail);
+        }
+        pageLevelAt[pageTail] = firstEntry;
+        pageFirstRow[pageTail] = page.getFirstRowIndex().get();
+        pageTail++;
+    }
+
+    /**
+     * #626: moves a repeated leaf of a column-index-filtered row group to its
+     * next selected row, skipping the entries of the rows before it in the
+     * pages it holds and jumping over the pages the column index dropped. A
+     * batch never crosses a selected range (the scan bounds it), so the rows
+     * of one call are consecutive in the row group.
+     */
+    private void alignRepeated() {
+        if (rangeStart == null || range >= rangeStart.length) {
+            return;
+        }
+        startChunkHead();
+        long target = rangeStart[range] + inRange;
+        while (true) {
+            if (levelStart == levelEnd && !pullPage()) {
+                throw new IllegalStateException("ran out of pages for " + java.util.Arrays.toString(column.getPath()) + " before row " + target);
+            }
+            while (pageHead + 1 < pageTail && pageLevelAt[pageHead + 1] <= levelStart) {
+                pageHead++;
+            }
+            if (pageLevelAt[pageHead] == levelStart) {
+                levelRow = pageFirstRow[pageHead];
+            }
+            if (levelRow >= target) {
+                if (levelRow > target) {
+                    throw new IllegalStateException("row " + target + " of " + java.util.Arrays.toString(column.getPath()) + " is in no page the column index kept");
+                }
+                return;
+            }
+            int pageEnd = pageHead + 1 < pageTail ? pageLevelAt[pageHead + 1] : levelEnd;
+            long want = target - levelRow;
+            long starts = 0;
+            int j = levelStart + 1;
+            while (j < pageEnd) {
+                if (reps[j] == 0 && ++starts == want) {
+                    break;
+                }
+                j++;
+            }
+            int entries = j - levelStart;
+            int done = 0;
+            while (done < entries) {
+                if (decoder.needsPage()) {
+                    decoder.feedPage(nextKernelPage());
+                }
+                done += decoder.skip(entries - done);
+            }
+            levelStart = j;
+            levelRow += j < pageEnd ? want : starts + 1;
+        }
+    }
+
+    /** #626: the cursor and row of a filtered repeated leaf move {@code rows} on. */
+    private void advanceRepeated(int rows) {
+        if (rangeStart != null) {
+            levelRow += rows;
+            advance(rows);
+        }
+    }
+
+    /**
+     * #626: a filtered repeated leaf's {@code n} rows must lie in its current
+     * range.
+     */
+    private void requireInRange(int n) {
+        if (rangeStart != null
+                && n > 0
+                && (range >= rangeStart.length || n > rangeEnd[range] - rangeStart[range] - inRange)) {
+            throw new IllegalStateException(n + " rows of " + java.util.Arrays.toString(column.getPath()) + " cross a range the column index selected");
+        }
     }
 
     /**
@@ -820,6 +936,9 @@ public final class NativeParquetColumnReader implements NativeParquetColumn, Row
             int live = levelEnd - levelStart;
             System.arraycopy(reps, levelStart, reps, 0, live);
             System.arraycopy(defs, levelStart, defs, 0, live);
+            for (int q = pageHead; q < pageTail; q++) {
+                pageLevelAt[q] -= levelStart;
+            }
             levelStart = 0;
             levelEnd = live;
         }
@@ -873,6 +992,8 @@ public final class NativeParquetColumnReader implements NativeParquetColumn, Row
      */
     int entriesForRows(int n) {
         startChunkHead();
+        alignRepeated();
+        requireInRange(n);
         int rows = 0;
         int seen = 0; // entries scanned, from levelStart (pullPage may move levelStart to 0)
         while (true) {
@@ -916,6 +1037,7 @@ public final class NativeParquetColumnReader implements NativeParquetColumn, Row
      */
     FieldVector readElements(int rows, int entries, int elementDef) {
         startChunkHead();
+        alignRepeated();
         int from = levelStart;
         int[] d = defs;
         int elements = 0;
@@ -968,6 +1090,7 @@ public final class NativeParquetColumnReader implements NativeParquetColumn, Row
         }
         levelStart += entries;
         rowsEmitted += rows;
+        advanceRepeated(rows);
         boolean nulls = decoder.batchNullCount() > 0;
         if (type == VecType.UTF8) {
             // #568: a list's or map's strings are dictionary ids too, where the leaf allows it (#612).
@@ -996,6 +1119,7 @@ public final class NativeParquetColumnReader implements NativeParquetColumn, Row
      */
     void skipEntries(int rows, int entries) {
         startChunkHead();
+        alignRepeated();
         int done = 0;
         while (done < entries) {
             if (decoder.needsPage()) {
@@ -1005,6 +1129,7 @@ public final class NativeParquetColumnReader implements NativeParquetColumn, Row
         }
         levelStart += entries;
         rowsEmitted += rows;
+        advanceRepeated(rows);
     }
 
     // ----- late materialization (#611) -----
@@ -1028,12 +1153,12 @@ public final class NativeParquetColumnReader implements NativeParquetColumn, Row
      */
     @Override
     public void skipRows(int n) {
-        if (rangeStart != null) {
-            advance(n);
-            return;
-        }
         if (repeated) {
             skipEntries(n, entriesForRows(n));
+            return;
+        }
+        if (rangeStart != null) {
+            advance(n);
             return;
         }
         int done = 0;
