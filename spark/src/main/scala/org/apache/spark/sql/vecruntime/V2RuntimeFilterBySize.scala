@@ -27,7 +27,7 @@ import org.apache.spark.sql.catalyst.expressions.{
   XxHash64
 }
 import org.apache.spark.sql.catalyst.optimizer.{InjectRuntimeFilter, PushDownPredicates}
-import org.apache.spark.sql.catalyst.plans.logical.{Aggregate, Filter, LogicalPlan, Project}
+import org.apache.spark.sql.catalyst.plans.logical.{Aggregate, Filter, Join, LogicalPlan, Project}
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.execution.datasources.{HadoopFsRelation, LogicalRelation}
 import org.apache.spark.sql.execution.datasources.v2.DataSourceV2ScanRelation
@@ -58,6 +58,54 @@ case class V2RuntimeFilterBySize(session: SparkSession) extends Rule[LogicalPlan
     val conf = session.sessionState.conf
     if (!VectorConf.v2RuntimeFilterBySizeEnabled(conf) || !conf.runtimeFilterBloomFilterEnabled) return plan
     if (!plan.exists(_.isInstanceOf[DataSourceV2ScanRelation])) return plan
+    addSmall(dropCostly(plan, conf), conf)
+  }
+
+  /**
+   * Drops the runtime bloom filters Spark's rule added whose creation side joins a DSv2 scan that is large by its
+   * planned files (#735, q14a).
+   *
+   * Spark's rule judges the creation side by its estimate only. On Iceberg, 3 TB q14a's `item LEFT SEMI
+   * cross_items` -- `item` known to hold 360,000 rows -- is within the threshold, and three filters on the sales
+   * tables' item keys are built from it: each computes `cross_items` (three more scans of the sales tables) again,
+   * 75 s against 60 s with Spark's bloom filter off. Its Parquet copy gets none. A creation side that is one scan
+   * under projections and filters, or joins only small scans, is kept.
+   */
+  private def dropCostly(plan: LogicalPlan, conf: SQLConf): LogicalPlan = {
+    val limit = VectorConf.v2BroadcastBySizeMaxEstimatedBytes(conf)
+    def large(s: DataSourceV2ScanRelation): Boolean =
+      V2BroadcastBySize.plannedBytes(s).forall(_ > limit)
+    def costly(b: BloomFilterMightContain): Boolean = b.bloomFilterExpression match {
+      case s: ScalarSubquery =>
+        creationOf(s.plan).exists {
+          case j: Join => j.exists {
+              case scan: DataSourceV2ScanRelation => large(scan)
+              case _ => false
+            }
+          case _ => false
+        }
+      case _ => false
+    }
+    if (
+      !plan.exists(_.expressions.exists(_.exists {
+        case b: BloomFilterMightContain => costly(b)
+        case _ => false
+      }))
+    ) return plan
+    plan.transformUp {
+      case f @ Filter(cond, child) =>
+        val parts = splitConjunctivePredicates(cond)
+        val left = parts.filterNot {
+          case b: BloomFilterMightContain => costly(b)
+          case _ => false
+        }
+        if (left.size == parts.size) f
+        else if (left.isEmpty) child
+        else Filter(left.reduce(And), child)
+    }
+  }
+
+  private def addSmall(plan: LogicalPlan, conf: SQLConf): LogicalPlan = {
     val threshold = conf.runtimeFilterCreationSideThreshold
     val raised = VectorConf.v2BroadcastBySizeMaxEstimatedBytes(conf)
     if (raised <= threshold) return plan
