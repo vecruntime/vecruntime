@@ -98,6 +98,14 @@ public final class ArrowOutput {
         if (dt instanceof org.apache.spark.sql.types.TimestampNTZType) {
             return new org.apache.arrow.vector.TimeStampMicroVector(name, allocator);
         }
+        if (dt instanceof org.apache.spark.sql.types.YearMonthIntervalType) {
+            return new org.apache.arrow.vector.IntervalYearVector(name, allocator); // #812
+        }
+        if (dt instanceof org.apache.spark.sql.types.DayTimeIntervalType) {
+            return new org.apache.arrow.vector.DurationVector(name, // #812
+             org.apache.arrow.vector.types.pojo.FieldType.nullable(new org.apache.arrow.vector.types.pojo.ArrowType.Duration(org.apache.arrow.vector.types.TimeUnit.MICROSECOND)),
+                    allocator);
+        }
         throw new UnsupportedOperationException("unsupported output type " + dt);
     }
 

@@ -131,7 +131,10 @@ class ParquetTestingCorpusSuite extends VectorQuerySuite {
       "int32_plain",
       "int32_byte_stream_split",
       "int64_plain",
-      "int64_byte_stream_split"
+      "int64_byte_stream_split",
+      // #812: BYTE_STREAM_SPLIT on FIXED_LEN_BYTE_ARRAY, which Spark's vectorized reader refuses
+      "flba5_byte_stream_split",
+      "decimal_byte_stream_split"
     ),
     "rle_boolean_encoding.parquet" -> Set("datatype_boolean"),
     // decimals carried in INT32 / INT64, BYTE_ARRAY and FIXED_LEN_BYTE_ARRAY (big-endian bytes converted)
