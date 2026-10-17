@@ -35,6 +35,7 @@ import org.apache.spark.sql.catalyst.expressions.aggregate.{AggregateExpression,
 import org.apache.spark.sql.catalyst.plans.Inner
 import org.apache.spark.sql.catalyst.plans.logical.{Aggregate, Filter, Join, LogicalPlan, Project}
 import org.apache.spark.sql.catalyst.rules.Rule
+import org.apache.spark.sql.execution.datasources.v2.{DataSourceV2ScanRelation, V2ScanRelationPushDown}
 
 /**
  * Global aggregates over the same data with different filters, computed in one pass.
@@ -58,7 +59,9 @@ import org.apache.spark.sql.catalyst.rules.Rule
  * one row, so the join is the concatenation and becomes one aggregate), folded over q88's chain,
  * and (b) the uncorrelated scalar subqueries of one operator whose plans are global aggregates:
  * each mergeable group is replaced by one merged aggregate under a projection of its own column,
- * which Spark's `MergeScalarSubqueries` then computes once. Off with
+ * which Spark's `MergeScalarSubqueries` then computes once. A DSv2 table's subqueries (an Iceberg q9) reach
+ * this rule already optimized, their scans pushed down -- each with its own filters and columns -- so their scans
+ * are first taken back to the table's relation, the merged aggregate pushed down again (see [[unpush]]). Off with
  * `spark.vecruntime.optimizer.mergeFilteredAggregates.enabled=false`, and with the plugin.
  */
 case class MergeFilteredAggregates(session: SparkSession) extends Rule[LogicalPlan] with PredicateHelper {
@@ -207,15 +210,40 @@ case class MergeFilteredAggregates(session: SparkSession) extends Rule[LogicalPl
     case _ => a.orElse(b)
   }
 
+  /**
+   * #735: `a` with each DSv2 scan (`DataSourceV2ScanRelation`, built by Spark's `V2ScanRelationPushDown` when it
+   * optimized the subquery) replaced by the relation it scans, whose output holds the scan's columns: the leaves
+   * of two subqueries over one table are then the same plan, as a file table's are. Only when nothing is lost: no
+   * scan with a pushed aggregate (its output is not the relation's columns), and pushing the result down again
+   * builds the same scans -- a scan that absorbed a predicate the plan above no longer shows (an Iceberg identity
+   * partition filter) would come back without it. Otherwise `a` as it is.
+   */
+  private def unpush(a: Aggregate): Aggregate = {
+    var ok = true
+    val out = a.transformUp {
+      case s: DataSourceV2ScanRelation =>
+        val columns = s.relation.output.map(_.exprId).toSet
+        if (s.output.forall(o => columns.contains(o.exprId))) s.relation
+        else { ok = false; s }
+    }
+    if (!ok || (out eq a)) return a
+    val before = a.collect { case s: DataSourceV2ScanRelation => s.scan }
+    val after = V2ScanRelationPushDown(out).collect { case s: DataSourceV2ScanRelation => s.scan }
+    if (before.size == after.size && before.zip(after).forall { case (x, y) => x == y }) out.asInstanceOf[Aggregate]
+    else a
+  }
+
   /** The operator's uncorrelated global-aggregate scalar subqueries, mergeable ones computed as one. */
   private def mergeScalarSubqueries(p: LogicalPlan): LogicalPlan = {
     val subqueries = p.expressions.flatMap(_.collect { case s: ScalarSubquery if scalar(s) => s }).distinct
     if (subqueries.size < 2) return p
+    // #735: each subquery's plan with its DSv2 scans taken back to their relations (the others as they are).
+    val plans: Map[ScalarSubquery, Aggregate] = subqueries.map(s => s -> unpush(s.plan.asInstanceOf[Aggregate])).toMap
     // Greedy groups: each subquery joins the first group whose merged aggregate it merges with.
     val groups =
       scala.collection.mutable.ArrayBuffer.empty[(Aggregate, scala.collection.mutable.ArrayBuffer[ScalarSubquery])]
     subqueries.foreach { s =>
-      val a = s.plan.asInstanceOf[Aggregate]
+      val a = plans(s)
       val i = groups.indexWhere { case (g, _) => merge(g, a).isDefined }
       if (i < 0) groups += (a -> scala.collection.mutable.ArrayBuffer(s))
       else {
@@ -224,9 +252,11 @@ case class MergeFilteredAggregates(session: SparkSession) extends Rule[LogicalPl
     }
     val replacement: Map[ScalarSubquery, ScalarSubquery] = groups.iterator.filter(_._2.size > 1).flatMap {
       case (merged, members) =>
+        // The merged scans of a DSv2 table pushed down again: the ORed filters and the union of the columns.
+        val pushed = V2ScanRelationPushDown(merged)
         members.map { s =>
           val col = s.plan.output.head
-          s -> s.withNewPlan(Project(Seq(col), merged))
+          s -> s.withNewPlan(Project(Seq(col), pushed))
         }
     }.toMap
     if (replacement.isEmpty) p
