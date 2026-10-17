@@ -115,6 +115,8 @@ public final class NativeParquetColumnReader implements NativeParquetColumn, Row
     private final Arena scratch;
     private final ColumnChunkDecoder decoder;
     private final ReusableByteOut pageOut = new ReusableByteOut(1 << 16);
+    // #786: a v2 page's definition levels when they are not one heap buffer (copied, as the values are into pageOut).
+    private final ReusableByteOut levelsOut = new ReusableByteOut(1 << 12);
 
     // Per-chunk (row-group) state.
     private PageReader pages;
@@ -766,21 +768,37 @@ public final class NativeParquetColumnReader implements NativeParquetColumn, Row
                     encoding(v1.getValueEncoding()));
         } else {
             DataPageV2 v2 = (DataPageV2) page;
-            byte[] rep = bytes(v2.getRepetitionLevels());
-            byte[] def = bytes(v2.getDefinitionLevels());
-            byte[] data = bytes(v2.getData());
-            readLevels(rep, 0, rep.length, repBitWidth, reps, n);
-            readLevels(def, 0, def.length, ParquetPageDecoder.bitWidth(maxDefLevel), defs,
-                    n);
-            byte[] buf = new byte[def.length + data.length];
-            System.arraycopy(def, 0, buf, 0, def.length);
-            System.arraycopy(data, 0, buf, def.length, data.length);
-            kernel = ColumnChunkDecoder.Page.v2At(buf, 0, def.length, def.length, data.length, n,
+            // The page is queued past this call, so each section is its own array: parquet-java's own buffer when
+            // it is one on the heap (#786), else a copy. Level and value sections are never joined into one.
+            java.nio.ByteBuffer rep = ownedView(v2.getRepetitionLevels());
+            java.nio.ByteBuffer def = ownedView(v2.getDefinitionLevels());
+            java.nio.ByteBuffer data = ownedView(v2.getData());
+            readLevels(rep.array(), rep.arrayOffset() + rep.position(), rep.remaining(),
+                    repBitWidth, reps, n);
+            readLevels(def.array(), def.arrayOffset() + def.position(), def.remaining(),
+                    ParquetPageDecoder.bitWidth(maxDefLevel), defs, n);
+            kernel = ColumnChunkDecoder.Page.v2Split(
+                    def.array(),
+                    def.arrayOffset() + def.position(),
+                    def.remaining(),
+                    data.array(),
+                    data.arrayOffset() + data.position(),
+                    data.remaining(),
+                    n,
                     encoding(v2.getDataEncoding()));
         }
         levelEnd += n;
         pendingPages.add(kernel);
         return true;
+    }
+
+    /**
+     * {@code in} as a heap buffer the caller may keep: parquet-java's own
+     * (#786), else a copy of its own.
+     */
+    private static java.nio.ByteBuffer ownedView(BytesInput in) {
+        java.nio.ByteBuffer view = heapView(in);
+        return view != null ? view : java.nio.ByteBuffer.wrap(bytes(in));
     }
 
     /** Room for {@code n} more kept levels: drops the decoded ones, then grows. */
@@ -1440,21 +1458,107 @@ public final class NativeParquetColumnReader implements NativeParquetColumn, Row
         }
     }
 
+    /**
+     * The page for the decoder. #786: decoded where parquet-java left it -- a
+     * heap buffer (a decompressed page, an uncompressed one in the chunk's
+     * buffer) is read in place; anything else (a stream from the decompressor,
+     * a direct buffer, a list of buffers) is copied into a reused buffer, as
+     * every page was before. A v2 page's level and value sections are read
+     * where each is, never copied into one buffer.
+     */
     private ColumnChunkDecoder.Page toKernelPage(DataPage page) {
         if (page instanceof DataPageV1 v1) {
+            java.nio.ByteBuffer view = heapView(v1.getBytes());
+            if (view != null) {
+                return ColumnChunkDecoder.Page.v1At(view.array(), view.arrayOffset() + view.position(), view.remaining(),
+                        v1.getValueCount(), encoding(v1.getValueEncoding()));
+            }
             pageOut.reset();
             writeInto(v1.getBytes(), pageOut);
             return ColumnChunkDecoder.Page.v1(pageOut.array(), pageOut.size(), v1.getValueCount(),
                     encoding(v1.getValueEncoding()));
         }
         DataPageV2 v2 = (DataPageV2) page;
-        pageOut.reset();
-        writeInto(v2.getDefinitionLevels(), pageOut);
-        int levelsLength = pageOut.size();
-        writeInto(v2.getData(), pageOut);
-        // The reused buffer is larger than the page: pass the page's real extent.
-        return ColumnChunkDecoder.Page.v2At(pageOut.array(), 0, levelsLength, levelsLength,
-                pageOut.size() - levelsLength, v2.getValueCount(), encoding(v2.getDataEncoding()));
+        byte[] levels;
+        int levelsAt;
+        int levelsLength;
+        java.nio.ByteBuffer lv = heapView(v2.getDefinitionLevels());
+        if (lv != null) {
+            levels = lv.array();
+            levelsAt = lv.arrayOffset() + lv.position();
+            levelsLength = lv.remaining();
+        } else {
+            levelsOut.reset();
+            writeInto(v2.getDefinitionLevels(), levelsOut);
+            levels = levelsOut.array();
+            levelsAt = 0;
+            levelsLength = levelsOut.size();
+        }
+        byte[] values;
+        int valuesAt;
+        int valuesLength;
+        java.nio.ByteBuffer vv = heapView(v2.getData());
+        if (vv != null) {
+            values = vv.array();
+            valuesAt = vv.arrayOffset() + vv.position();
+            valuesLength = vv.remaining();
+        } else {
+            pageOut.reset();
+            writeInto(v2.getData(), pageOut);
+            values = pageOut.array();
+            valuesAt = 0;
+            valuesLength = pageOut.size();
+        }
+        // Each section's real extent: a reused or shared buffer is larger than the section.
+        return ColumnChunkDecoder.Page.v2Split(levels, levelsAt, levelsLength, values, valuesAt, valuesLength,
+                v2.getValueCount(), encoding(v2.getDataEncoding()));
+    }
+
+    /**
+     * #786: {@code in}'s bytes as the heap buffer that already holds them, or
+     * null when they are not one heap buffer. parquet-java hands its own buffer
+     * back when it is of the allocator's kind; for anything else it would
+     * allocate and copy, which this allocator refuses, so the caller copies
+     * into its reused buffer instead.
+     */
+    private static java.nio.ByteBuffer heapView(BytesInput in) {
+        try {
+            java.nio.ByteBuffer b = in.toByteBuffer(NO_COPY, buf -> {});
+            return b.hasArray() ? b : null;
+        } catch (NotOneHeapBuffer e) {
+            return null;
+        }
+    }
+
+    /**
+     * Refuses to allocate: {@link #heapView} only takes a buffer parquet-java
+     * already has.
+     */
+    private static final org.apache.parquet.bytes.ByteBufferAllocator NO_COPY = new org.apache.parquet.bytes.ByteBufferAllocator() {
+        @Override
+        public java.nio.ByteBuffer allocate(int size) {
+            throw new NotOneHeapBuffer();
+        }
+
+        @Override
+        public void release(java.nio.ByteBuffer b) {}
+
+        @Override
+        public boolean isDirect() {
+            return false;
+        }
+    };
+
+    /**
+     * {@link #NO_COPY}'s refusal: no stack trace, one instance (it is control
+     * flow, once per such page).
+     */
+    private static final class NotOneHeapBuffer extends RuntimeException {
+        private static final long serialVersionUID = 1L;
+
+        NotOneHeapBuffer() {
+            super("not one heap buffer", null, false, false);
+        }
     }
 
     @SuppressWarnings("deprecation") // PLAIN_DICTIONARY is the legacy data-page dictionary encoding

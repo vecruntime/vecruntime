@@ -459,7 +459,7 @@ public final class ColumnChunkDecoder {
                 levelLen = len;
                 valuesStart = levelStart + len;
             }
-            reader(page.data, (int) levelStart, levelLen, defBitWidth).readInts(pageLevels, 0, n);
+            reader(page.levelsData(), (int) levelStart, levelLen, defBitWidth).readInts(pageLevels, 0, n);
         }
         this.deltaReader = null;
         this.boolReader = null;
@@ -1975,6 +1975,13 @@ public final class ColumnChunkDecoder {
      */
     public static final class Page {
         public final byte[] data;
+
+        /**
+         * #786: a v2 page's definition levels when they are not in {@link
+         * #data} (null: they are).
+         */
+        public final byte[] levels;
+
         public final long dataOffset;
         public final long dataLength;
         public final long levelsOffset;
@@ -1994,7 +2001,23 @@ public final class ColumnChunkDecoder {
                 int valueCount,
                 boolean v2,
                 ParquetPageDecoder.Encoding encoding) {
+            this(data, null, dataOffset, dataLength, levelsOffset, levelsLength,
+                    valuesOffset, valueCount, v2, encoding);
+        }
+
+        private Page(
+                byte[] data,
+                byte[] levels,
+                long dataOffset,
+                long dataLength,
+                long levelsOffset,
+                int levelsLength,
+                long valuesOffset,
+                int valueCount,
+                boolean v2,
+                ParquetPageDecoder.Encoding encoding) {
             this.data = data;
+            this.levels = levels;
             this.dataOffset = dataOffset;
             this.dataLength = dataLength;
             this.levelsOffset = levelsOffset;
@@ -2048,6 +2071,30 @@ public final class ColumnChunkDecoder {
                 ParquetPageDecoder.Encoding encoding) {
             return new Page(data, levelsOffset, levelsLength + valuesLength, levelsOffset, levelsLength,
                     valuesOffset, valueCount, true, encoding);
+        }
+
+        /**
+         * #786: a v2 page decoded where its sections already are: the
+         * definition levels in {@code levels} at {@code levelsOffset}, the
+         * values in {@code values} at {@code valuesOffset}, each with its own
+         * length -- no copy into one buffer.
+         */
+        public static Page v2Split(
+                byte[] levels,
+                int levelsOffset,
+                int levelsLength,
+                byte[] values,
+                int valuesOffset,
+                int valuesLength,
+                int valueCount,
+                ParquetPageDecoder.Encoding encoding) {
+            return new Page(values, levels, valuesOffset, (long) levelsLength + valuesLength, levelsOffset,
+                    levelsLength, valuesOffset, valueCount, true, encoding);
+        }
+
+        /** The array holding the definition levels. */
+        byte[] levelsData() {
+            return levels != null ? levels : data;
         }
 
         long valuesStart() {
