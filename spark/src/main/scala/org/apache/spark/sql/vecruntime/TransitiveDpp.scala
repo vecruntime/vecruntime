@@ -160,10 +160,35 @@ case class TransitiveDpp(session: SparkSession) extends Rule[LogicalPlan] with P
           case fs: HadoopFsRelation if fs.partitionSchema.nonEmpty =>
             val partCols = AttributeSet(l.resolve(fs.partitionSchema, session.sessionState.analyzer.resolver))
             if (value.references.nonEmpty && value.references.subsetOf(partCols) && value.deterministic) {
-              Some(Filter(DynamicPruningSubquery(value, build, Seq(buildKey), Seq(0), onlyInBroadcast = false), l))
+              Some(Filter(
+                DynamicPruningSubquery(
+                  value,
+                  V2PruningColumns.scanned(build),
+                  Seq(buildKey),
+                  Seq(0),
+                  onlyInBroadcast = false
+                ),
+                l
+              ))
             } else None
           case _ => None
         }
+      // #735: a DSv2 table (Iceberg) by its identity partition columns: not scanned yet when this rule runs, so
+      // the pruning subquery's dimension plan is pushed down here (V2PruningColumns.scanned).
+      case r: org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation =>
+        val partCols = V2PruningColumns.of(r)
+        if (value.references.nonEmpty && value.references.subsetOf(partCols) && value.deterministic) {
+          Some(Filter(
+            DynamicPruningSubquery(
+              value,
+              V2PruningColumns.scanned(build),
+              Seq(buildKey),
+              Seq(0),
+              onlyInBroadcast = false
+            ),
+            r
+          ))
+        } else None
       case _ => None
     }
 
