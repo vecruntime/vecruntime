@@ -146,10 +146,25 @@ class VectorParquetScanPlanSuite extends VectorQuerySuite {
   }
 
   test("flag on, unsupported column: Spark's scan stays with a recorded reason") {
-    write(
-      "p_nested",
-      "SELECT CAST(id AS INT) AS i, array(make_dt_interval(0, 0, 0, id)) AS st FROM range(0, 1000)"
-    )
+    // #812: a list of a user-defined type (every Parquet-storable built-in type has a decode path now).
+    withPlugin(enabled = false) {
+      val path = newTempPath("p_nested")
+      val schema = org.apache.spark.sql.types.StructType(
+        Seq(
+          org.apache.spark.sql.types.StructField("i", org.apache.spark.sql.types.IntegerType),
+          org.apache.spark.sql.types.StructField(
+            "st",
+            org.apache.spark.sql.types.ArrayType(new org.apache.spark.sql.vecruntime.TestPointUDT)
+          )
+        )
+      )
+      val rows = (0 until 1000).map(i =>
+        org.apache.spark.sql.Row(i, Seq(org.apache.spark.sql.vecruntime.TestPoint(i)))
+      )
+      spark.createDataFrame(spark.sparkContext.parallelize(rows), schema)
+        .write.mode("overwrite").parquet(path)
+      spark.read.parquet(path).createOrReplaceTempView("p_nested")
+    }
     withConf(VectorConf.ScanNativeParquet -> "true") {
       val df = withPlugin(enabled = true)(spark.sql("SELECT i, st FROM p_nested"))
       df.collect()
