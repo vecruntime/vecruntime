@@ -24,6 +24,7 @@ import org.apache.spark.sql.catalyst.expressions.{
   ExprId,
   PredicateHelper,
   ScalarSubquery,
+  SubqueryExpression,
   XxHash64
 }
 import org.apache.spark.sql.catalyst.optimizer.{InjectRuntimeFilter, PushDownPredicates}
@@ -75,11 +76,22 @@ case class V2RuntimeFilterBySize(session: SparkSession) extends Rule[LogicalPlan
     val limit = VectorConf.v2BroadcastBySizeMaxEstimatedBytes(conf)
     def large(s: DataSourceV2ScanRelation): Boolean =
       V2BroadcastBySize.plannedBytes(s).forall(_ > limit)
+    def readsLarge(p: LogicalPlan): Boolean = p.exists {
+      case scan: DataSourceV2ScanRelation => large(scan)
+      case _ => false
+    } || p.exists(_.expressions.exists(_.exists {
+      case s: SubqueryExpression => readsLarge(s.plan)
+      case _ => false
+    }))
+    // The creation side joins another relation, or filters by an IN / EXISTS subquery that Spark's rule counted
+    // as a selective filter and that a later batch turns into a semi join: either way building the filter reads
+    // what that join or subquery reads.
     def costly(b: BloomFilterMightContain): Boolean = b.bloomFilterExpression match {
       case s: ScalarSubquery =>
         creationOf(s.plan).exists {
-          case j: Join => j.exists {
-              case scan: DataSourceV2ScanRelation => large(scan)
+          case j: Join => readsLarge(j)
+          case f: Filter => f.condition.exists {
+              case q: SubqueryExpression => readsLarge(q.plan)
               case _ => false
             }
           case _ => false
