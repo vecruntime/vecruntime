@@ -160,4 +160,31 @@ class IcebergBroadcastBySizeSuite extends VectorQuerySuite {
     val df = run("SELECT count(*) FROM dim LEFT JOIN fact ON d_key = f_dim")
     assert(broadcastHints(df) === 0, df.queryExecution.optimizedPlan.treeString)
   }
+
+  // #735, q89: a grouping-only dimension (its columns only grouped/filtered, never summed) joined to the fact.
+  // Sized by Iceberg's rows-times-widths estimate it is above the threshold, so neither Spark nor CountBelowJoin
+  // broadcasts it and the join is a shuffle (sort-merge) join -- an extra shuffle its Parquet copy, sized by its
+  // file bytes, avoids by staying a broadcast. broadcastable()/V2BroadcastBySize must size it by its files so the
+  // dimension is broadcast on Iceberg too, and CountBelowJoin does not collapse-and-shuffle a side it keeps.
+  private lazy val q89 =
+    """SELECT d_status, f_qty, avg(f_key) a FROM fact JOIN dim ON f_dim = d_key
+      |GROUP BY d_status, f_qty""".stripMargin
+
+  private def repartitions(df: DataFrame): Int =
+    df.queryExecution.optimizedPlan.collect {
+      case r: org.apache.spark.sql.catalyst.plans.logical.RepartitionByExpression => r
+    }.size
+
+  test("a grouping-only Iceberg dimension stays broadcast, not collapsed and shuffled (q89)", IcebergTest) {
+    val df = run(q89)
+    // The dimension is broadcast below the join: a hint, a broadcast join, and no CountBelowJoin repartition.
+    assert(broadcastHints(df) === 1, df.queryExecution.optimizedPlan.treeString)
+    assert(broadcastJoins(df) === 1, df.queryExecution.executedPlan.treeString)
+    assert(repartitions(df) === 0, df.queryExecution.optimizedPlan.treeString)
+    // With the file sizing off, Iceberg's rows-times-widths estimate is above the threshold, so the dimension is
+    // not broadcast and the join is a shuffle join: the extra shuffle the fix removes.
+    val off = run(q89, VectorConf.V2BroadcastBySizeEnabled -> "false")
+    assert(broadcastHints(off) === 0, off.queryExecution.optimizedPlan.treeString)
+    assert(broadcastJoins(off) === 0, off.queryExecution.executedPlan.treeString)
+  }
 }

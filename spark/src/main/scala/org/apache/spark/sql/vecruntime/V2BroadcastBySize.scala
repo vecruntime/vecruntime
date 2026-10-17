@@ -49,8 +49,7 @@ case class V2BroadcastBySize(session: SparkSession) extends Rule[LogicalPlan] wi
     val maxEstimated = VectorConf.v2BroadcastBySizeMaxEstimatedBytes(conf)
     def small(side: LogicalPlan): Boolean = {
       val estimate = side.stats.sizeInBytes
-      estimate > threshold && estimate <= maxEstimated &&
-      scanOf(side).flatMap(V2BroadcastBySize.byFiles(side, _)).exists(_ <= threshold)
+      estimate > threshold && V2BroadcastBySize.smallByFiles(side, threshold, maxEstimated)
     }
     plan.transformUp {
       case j @ Join(left, right, jt, _, hint) if hint.leftHint.isEmpty && hint.rightHint.isEmpty =>
@@ -64,17 +63,28 @@ case class V2BroadcastBySize(session: SparkSession) extends Rule[LogicalPlan] wi
         else j
     }
   }
+}
+
+object V2BroadcastBySize {
 
   /** The DSv2 scan `p` reads when `p` is that scan under projections and filters only. */
-  private def scanOf(p: LogicalPlan): Option[DataSourceV2ScanRelation] = p match {
+  def scanOf(p: LogicalPlan): Option[DataSourceV2ScanRelation] = p match {
     case Project(_, child) => scanOf(child)
     case Filter(_, child) => scanOf(child)
     case s: DataSourceV2ScanRelation => Some(s)
     case _ => None
   }
-}
 
-object V2BroadcastBySize {
+  /**
+   * Whether `side` -- one DSv2 scan under projections and filters -- is small enough to broadcast by the bytes of
+   * the files its scan planned, as its Parquet copy would be judged: its own (uncompressed) estimate within
+   * `maxEstimated` so a table that compresses unusually well is not broadcast whole, and the file-byte estimate
+   * (`byFiles`) at most `threshold`. Shared by the broadcast-hint rule and [[CountBelowJoin]], which must not
+   * collapse-and-shuffle a dimension its Parquet copy keeps a broadcast (#735, q89).
+   */
+  def smallByFiles(side: LogicalPlan, threshold: Long, maxEstimated: Long): Boolean =
+    side.stats.sizeInBytes <= maxEstimated &&
+      scanOf(side).flatMap(byFiles(side, _)).exists(_ <= threshold)
 
   /**
    * `side`'s size by the files its scan planned, as a file table's input is estimated: the files' bytes times the

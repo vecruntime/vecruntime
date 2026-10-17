@@ -243,8 +243,17 @@ case class CountBelowJoin(session: SparkSession) extends Rule[LogicalPlan] with 
 
   /** Small enough that Spark would broadcast it: replicated whole, so a repartition would only add a shuffle. */
   private def broadcastable(s: LogicalPlan): Boolean = {
-    val threshold = session.sessionState.conf.autoBroadcastJoinThreshold
-    threshold >= 0 && s.stats.sizeInBytes <= BigInt(threshold)
+    val conf = session.sessionState.conf
+    val threshold = conf.autoBroadcastJoinThreshold
+    if (threshold < 0) return false
+    // Spark's own estimate, or -- as V2BroadcastBySize judges the broadcast later -- a DSv2 (Iceberg) scan whose
+    // files are within the threshold though its rows-times-column-widths estimate is not (#735, q89). Without this,
+    // a dimension whose Parquet copy stays a broadcast is collapsed and shuffled below the join on Iceberg (an
+    // extra sort-merge join and two exchanges), the slowdown V2BroadcastBySize exists to remove -- but it cannot,
+    // once the dimension is an Aggregate rather than a scan under projections and filters.
+    s.stats.sizeInBytes <= BigInt(threshold) ||
+    (VectorConf.v2BroadcastBySizeEnabled(conf) &&
+      V2BroadcastBySize.smallByFiles(s, threshold, VectorConf.v2BroadcastBySizeMaxEstimatedBytes(conf)))
   }
 
   private def collapse(
