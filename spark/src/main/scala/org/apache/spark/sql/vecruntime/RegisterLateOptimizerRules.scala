@@ -46,6 +46,10 @@ case class RegisterLateOptimizerRules(session: SparkSession) extends Rule[Logica
         if (!exp.extraOptimizations.exists(_.isInstanceOf[CountBelowJoin])) {
           exp.extraOptimizations = exp.extraOptimizations :+ CountBelowJoin(session)
         }
+        // Before FactBloomFilter, which leaves a join with a broadcast side alone.
+        if (!exp.extraOptimizations.exists(_.isInstanceOf[V2BroadcastBySize])) {
+          exp.extraOptimizations = exp.extraOptimizations :+ V2BroadcastBySize(session)
+        }
         if (!exp.extraOptimizations.exists(_.isInstanceOf[FactBloomFilter])) {
           exp.extraOptimizations = exp.extraOptimizations :+ FactBloomFilter(session)
         }
