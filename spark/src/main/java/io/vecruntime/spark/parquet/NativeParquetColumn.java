@@ -63,6 +63,16 @@ public interface NativeParquetColumn {
     void setPoolLimit(int limit);
 
     /**
+     * #735: whether the scan installed a {@link ReusingCodecFactory}, so a page
+     * the decompressor returns lives in a buffer reused by the next page. A
+     * repeated leaf (which pulls pages ahead and queues several) must then copy
+     * each page out; a flat leaf consumes one page at a time and reads it in
+     * place either way. Default off: with the default codec factory each page is
+     * its own fresh array and nothing copies (#786).
+     */
+    void setReuseDecompress(boolean reuse);
+
+    /**
      * This file's calendar rebase and INT96 conversion (#568 item 6), for every
      * date and timestamp leaf below. Abstract on purpose: a reader that forgot
      * to forward it would read a LEGACY file without its rebase.

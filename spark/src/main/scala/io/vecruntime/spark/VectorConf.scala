@@ -231,6 +231,15 @@ object VectorConf {
   val ScanNativeParquetLateMaterializationMinBytes =
     "spark.vecruntime.scan.nativeParquet.lateMaterialization.minScanBytes"
 
+  /**
+   * #735: a column chunk's data pages decompress through one reused `byte[]` per decompressor (zstd, snappy)
+   * instead of a fresh array per page, read in place by #786. Default on.
+   */
+  val ScanNativeParquetReuseDecompressBuffers = "spark.vecruntime.scan.parquet.reuseDecompressBuffers.enabled"
+
+  /** #735: parquet-java's per-row-group column-chunk buffers come from a small bounded heap pool. Default on. */
+  val ScanNativeParquetPoolChunkBuffers = "spark.vecruntime.scan.parquet.poolChunkBuffers.enabled"
+
   /** Mixed chains (#280): Comet's native operators above ours through the sink leaf. Off until #281 decides an allowlist. */
   val CometMixedEnabled = "spark.vecruntime.comet.mixed.enabled"
 
@@ -620,6 +629,22 @@ object VectorConf {
       .toOption
       .filter(_ >= 0)
       .getOrElse(1L << 30)
+
+  /**
+   * #735: the native scan opens files with a {@code ReusingCodecFactory}, so each column chunk's data pages
+   * decompress through one reused growable {@code byte[]} per decompressor (zstd and snappy) instead of a fresh
+   * array per page; #786's in-place path then reads that array with no further copy. Default on.
+   */
+  def scanNativeParquetReuseDecompressBuffers(conf: SQLConf): Boolean =
+    bool(conf, ScanNativeParquetReuseDecompressBuffers, default = true)
+
+  /**
+   * #735: the native scan opens files with a bounded heap {@code PooledHeapAllocator}, so parquet-java's
+   * per-row-group column-chunk buffers come from a small pool instead of a fresh allocation each row group.
+   * Default on.
+   */
+  def scanNativeParquetPoolChunkBuffers(conf: SQLConf): Boolean =
+    bool(conf, ScanNativeParquetPoolChunkBuffers, default = true)
 
   private def intIn(conf: SQLConf, key: String, default: Int, max: Int): Int =
     scala.util.Try(conf.getConfString(key, default.toString).trim.toInt).toOption.map(n =>

@@ -359,6 +359,13 @@ public final class NativeParquetStructReader implements NativeParquetColumn, Row
     }
 
     @Override
+    public void setReuseDecompress(boolean reuse) {
+        for (NativeParquetColumn f : fields) {
+            f.setReuseDecompress(reuse);
+        }
+    }
+
+    @Override
     public void setRebase(ParquetRebase rebase) {
         for (NativeParquetColumn f : fields) {
             f.setRebase(rebase);

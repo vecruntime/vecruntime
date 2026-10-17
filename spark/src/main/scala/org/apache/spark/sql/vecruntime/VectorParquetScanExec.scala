@@ -208,6 +208,8 @@ case class VectorParquetScanExec(
     val decodeAhead = io.vecruntime.spark.VectorConf.scanNativeParquetDecodeAhead(sqlConf)
     val decodeAheadVirtual = io.vecruntime.spark.VectorConf.scanNativeParquetDecodeAheadVirtual(sqlConf)
     val dictionaryStrings = io.vecruntime.spark.VectorConf.scanNativeParquetDictionaryStrings(sqlConf)
+    val reuseDecompressBuffers = io.vecruntime.spark.VectorConf.scanNativeParquetReuseDecompressBuffers(sqlConf)
+    val poolChunkBuffers = io.vecruntime.spark.VectorConf.scanNativeParquetPoolChunkBuffers(sqlConf)
     // #568 item 9: the file-constant `_metadata` fields the scan outputs after its partition columns (file_path,
     // file_name, file_size, file_block_start, file_block_length, file_modification_time), with the format's
     // extractors, as FileScanRDD fills them per file.
@@ -259,6 +261,8 @@ case class VectorParquetScanExec(
       decodeAhead,
       decodeAheadVirtual,
       dictionaryStrings,
+      reuseDecompressBuffers,
+      poolChunkBuffers,
       m,
       compiledFilter,
       filterColumns,
@@ -315,6 +319,8 @@ private[vecruntime] final class VectorParquetRDD(
     decodeAhead: Int,
     decodeAheadVirtual: Boolean,
     dictionaryStrings: Boolean,
+    reuseDecompressBuffers: Boolean,
+    poolChunkBuffers: Boolean,
     metrics: ScanMetrics,
     decodeFilter: io.vecruntime.spark.expr.VectorExpr,
     filterColumns: Array[Boolean],
@@ -370,7 +376,9 @@ private[vecruntime] final class VectorParquetRDD(
       metadataFields = metadataFields,
       metadataExtractors = metadataExtractors,
       prefetchMaxBytes = prefetchMaxBytes,
-      prefetchExecutorMaxBytes = prefetchExecutorMaxBytes
+      prefetchExecutorMaxBytes = prefetchExecutorMaxBytes,
+      reuseDecompressBuffers = reuseDecompressBuffers,
+      poolChunkBuffers = poolChunkBuffers
     )
     if (decodeAhead > 0) new DecodeAheadIterator(reader, decodeAhead, decodeAheadVirtual, context) else reader
   }
@@ -416,6 +424,9 @@ private[vecruntime] final class VectorParquetPartitionReader(
     // #568: the read-ahead's byte caps, per task and over the executor (Long.MaxValue: none)
     prefetchMaxBytes: Long = Long.MaxValue,
     prefetchExecutorMaxBytes: Long = Long.MaxValue,
+    // #735: open files with a reused-buffer codec factory (zstd/snappy) and/or a pooled heap chunk allocator.
+    reuseDecompressBuffers: Boolean = false,
+    poolChunkBuffers: Boolean = false,
     // #735: pushed filters name the requested columns, matched to each file's columns by field id (quoted
     // column name -> field id); null: by name, as Spark does. Iceberg files are never rebased.
     filterFieldIds: Map[String, Int] = null
@@ -839,7 +850,7 @@ private[vecruntime] final class VectorParquetPartitionReader(
         return new Prepared(file, null, clipped, false, null, needsFallback = true, modes)
       }
       // The reader owns the stream from here (closed by reader.close()); clear our handle.
-      val readOpts = HadoopReadOptions
+      val readOptsBuilder = HadoopReadOptions
         .builder(hadoopConf, path)
         .withRange(start, end)
         .withRecordFilter(rowGroupFilter(clipped, footer))
@@ -852,7 +863,15 @@ private[vecruntime] final class VectorParquetPartitionReader(
           hadoopConf.getBoolean(org.apache.parquet.hadoop.ParquetInputFormat.COLUMN_INDEX_FILTERING_ENABLED, true) &&
             clipped.getColumns.asScala.forall(_.getMaxRepetitionLevel == 0)
         )
-        .build()
+      // #735: a reused-buffer codec factory (zstd/snappy decompress through one growable byte[] per chunk,
+      // read in place by #786) and/or a bounded heap pool for parquet-java's per-row-group chunk buffers.
+      io.vecruntime.spark.parquet.NativeParquetReaderOptions.apply(
+        readOptsBuilder,
+        hadoopConf,
+        reuseDecompressBuffers,
+        poolChunkBuffers
+      )
+      val readOpts = readOptsBuilder.build()
       r = ParquetFileReader.open(inputFile, footer, readOpts, stream)
       stream = null
       r.setRequestedSchema(clipped)
@@ -943,6 +962,8 @@ private[vecruntime] final class VectorParquetPartitionReader(
       columnReaders(i).setPoolLimit(poolLimit)
       columnReaders(i).setDictionaryIds(dictionaryStrings)
       columnReaders(i).setRebase(fileRebase)
+      // #735: a repeated leaf must copy a page out of the decompressor's reused buffer (it queues several).
+      columnReaders(i).setReuseDecompress(reuseDecompressBuffers)
       i += 1
     }
     buildPartitionColumns(p.file)
