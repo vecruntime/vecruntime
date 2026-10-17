@@ -33,6 +33,10 @@ import org.apache.spark.sql.SparkSession
  *   --namespace sf3000 [--tables store_sales,item] [--replace]
  * }}}
  * Run it with the catalog through `TpcdsRunner --data catalog:ice.sf3000` afterwards.
+ *
+ * `--stats` converts nothing: it runs Iceberg's `compute_table_stats` on each table instead, which writes the
+ * per-column distinct-count sketches (Puffin `apache-datasketches-theta-v1`) of the current snapshot. Iceberg's scan
+ * reports them to Spark as column statistics when `spark.sql.cbo.enabled` is on.
  */
 object IcebergTpcdsConvert {
 
@@ -41,7 +45,8 @@ object IcebergTpcdsConvert {
       warehouse: String = "",
       namespace: String = "tpcds",
       tables: Seq[String] = TpcdsRunner.Tables,
-      replace: Boolean = false
+      replace: Boolean = false,
+      stats: Boolean = false
   )
 
   def parse(args: List[String], a: Args = Args()): Args = args match {
@@ -51,6 +56,7 @@ object IcebergTpcdsConvert {
     case "--namespace" :: v :: t => parse(t, a.copy(namespace = v))
     case "--tables" :: v :: t => parse(t, a.copy(tables = v.split(",").map(_.trim).filter(_.nonEmpty).toSeq))
     case "--replace" :: t => parse(t, a.copy(replace = true))
+    case "--stats" :: t => parse(t, a.copy(stats = true))
     case other => throw new IllegalArgumentException(s"unknown arguments: ${other.mkString(" ")}")
   }
 
@@ -69,6 +75,15 @@ object IcebergTpcdsConvert {
     val cat = IcebergMorGenerator.Catalog
     val base = a.data.stripSuffix("/")
     val fs = FileSystem.get(new URI(base), spark.sparkContext.hadoopConfiguration)
+    if (a.stats) {
+      a.tables.foreach { t =>
+        val t0 = System.nanoTime()
+        val out = spark.sql(s"CALL $cat.system.compute_table_stats(table => '${a.namespace}.$t')").collect()
+        println(f"[stats] $t: ${out.map(_.mkString(" ")).mkString("; ")}, ${(System.nanoTime() - t0) / 1e9}%.0f s")
+      }
+      spark.stop()
+      return
+    }
     spark.sql(s"CREATE NAMESPACE IF NOT EXISTS $cat.${a.namespace}")
     a.tables.foreach { t =>
       val dir = new HPath(s"$base/$t")
