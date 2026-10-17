@@ -71,6 +71,11 @@ public final class NativeParquetSupport {
             if (st.fields().length == 0) {
                 return false;
             }
+            // Spark's PushVariantIntoScan (#787): a struct of the paths a query extracts from a variant column,
+            // which Spark's reader computes from the variant group. Not a struct of the file's fields: Spark's scan.
+            if (org.apache.spark.sql.execution.datasources.VariantMetadata$.MODULE$.isVariantStruct(st)) {
+                return false;
+            }
             for (org.apache.spark.sql.types.StructField f : st.fields()) {
                 if (!isReadable(f.dataType())) {
                     return false;
@@ -92,6 +97,11 @@ public final class NativeParquetSupport {
         }
         if (dt instanceof BooleanType) {
             return true; // BOOLEAN physical, BOOL lane (bitmap)
+        }
+        if (dt instanceof org.apache.spark.sql.types.VariantType) {
+            // #787: an unshredded variant group, read as the struct of its two binaries (variantAsStruct); a file
+            // with a shredded variant falls over to Spark's reader (hasShreddedVariant).
+            return true;
         }
         if (dt instanceof DoubleType) {
             return true; // DOUBLE physical, FLOAT64 lane
@@ -150,5 +160,79 @@ public final class NativeParquetSupport {
      */
     public static boolean isForeign(DataType dt) {
         return dt instanceof FloatType;
+    }
+
+    /**
+     * The struct an unshredded variant group is read as (#787): its {@code
+     * value} and {@code metadata} binaries, in that order -- Spark's {@code
+     * ColumnVector.getVariant} reads child 0 as the value and child 1 as the
+     * metadata, so the struct column the scan emits is the variant column.
+     * Clipping by name puts the file's group in this order whatever order the
+     * file stores it in.
+     */
+    public static final org.apache.spark.sql.types.StructType VARIANT_READ_TYPE = new org.apache.spark.sql.types.StructType().add("value", org.apache.spark.sql.types.DataTypes.BinaryType, false).add("metadata", org.apache.spark.sql.types.DataTypes.BinaryType, false);
+
+    /**
+     * {@code dt} with every variant, at any depth, replaced by {@link
+     * #VARIANT_READ_TYPE}.
+     */
+    public static DataType variantAsStruct(DataType dt) {
+        if (dt instanceof org.apache.spark.sql.types.VariantType) {
+            return VARIANT_READ_TYPE;
+        }
+        if (dt instanceof org.apache.spark.sql.types.ArrayType at) {
+            DataType e = variantAsStruct(at.elementType());
+            return e.equals(at.elementType()) ? dt : new org.apache.spark.sql.types.ArrayType(e, at.containsNull());
+        }
+        if (dt instanceof org.apache.spark.sql.types.MapType mt) {
+            DataType k = variantAsStruct(mt.keyType());
+            DataType v = variantAsStruct(mt.valueType());
+            return k.equals(mt.keyType()) && v.equals(mt.valueType())
+                    ? dt
+                    : new org.apache.spark.sql.types.MapType(k, v, mt.valueContainsNull());
+        }
+        if (dt instanceof org.apache.spark.sql.types.StructType st) {
+            return variantAsStruct(st);
+        }
+        return dt;
+    }
+
+    /**
+     * {@link #variantAsStruct(DataType)} over a schema; the same instance when
+     * it holds no variant.
+     */
+    public static org.apache.spark.sql.types.StructType variantAsStruct(org.apache.spark.sql.types.StructType st) {
+        org.apache.spark.sql.types.StructField[] fs = st.fields();
+        org.apache.spark.sql.types.StructField[] out = null;
+        for (int i = 0; i < fs.length; i++) {
+            DataType t = variantAsStruct(fs[i].dataType());
+            if (!t.equals(fs[i].dataType())) {
+                if (out == null) {
+                    out = fs.clone();
+                }
+                out[i] = new org.apache.spark.sql.types.StructField(fs[i].name(), t, fs[i].nullable(),
+                        fs[i].metadata());
+            }
+        }
+        return out == null ? st : new org.apache.spark.sql.types.StructType(out);
+    }
+
+    /**
+     * Whether a file schema holds a shredded variant: a group with a {@code
+     * typed_value} field beside its {@code metadata} (the shredding spec's
+     * layout). Reading such a variant means rebuilding values from the typed
+     * columns, so the file goes to Spark's reader. Matching any such group,
+     * not only the requested ones, can only send a file to Spark's reader.
+     */
+    public static boolean hasShreddedVariant(org.apache.parquet.schema.GroupType g) {
+        if (g.containsField("typed_value") && g.containsField("metadata")) {
+            return true;
+        }
+        for (org.apache.parquet.schema.Type t : g.getFields()) {
+            if (!t.isPrimitive() && hasShreddedVariant(t.asGroupType())) {
+                return true;
+            }
+        }
+        return false;
     }
 }
