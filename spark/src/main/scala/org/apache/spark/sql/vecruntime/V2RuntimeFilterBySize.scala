@@ -83,6 +83,31 @@ case class V2RuntimeFilterBySize(session: SparkSession) extends Rule[LogicalPlan
    * under projections and filters, or joins only small scans, is kept.
    */
   private def dropCostly(plan: LogicalPlan, conf: SQLConf): LogicalPlan = {
+    if (
+      !plan.exists(_.expressions.exists(_.exists {
+        case b: BloomFilterMightContain => costly(b, conf)
+        case _ => false
+      }))
+    ) return plan
+    plan.transformUp {
+      case f @ Filter(cond, child) =>
+        val parts = splitConjunctivePredicates(cond)
+        val left = parts.filterNot {
+          case b: BloomFilterMightContain => costly(b, conf)
+          case _ => false
+        }
+        if (left.size == parts.size) f
+        else if (left.isEmpty) child
+        else Filter(left.reduce(And), child)
+    }
+  }
+
+  /**
+   * Whether building `b` reads a large DSv2 scan beyond its creation side's own: the creation side joins another
+   * relation, or filters by an IN / EXISTS subquery that Spark's rule counted as a selective filter and that a later
+   * batch turns into a semi join. Either way building the filter reads what that join or subquery reads.
+   */
+  private def costly(b: BloomFilterMightContain, conf: SQLConf): Boolean = {
     val limit = VectorConf.v2BroadcastBySizeMaxEstimatedBytes(conf)
     def large(s: DataSourceV2ScanRelation): Boolean =
       V2BroadcastBySize.plannedBytes(s).forall(_ > limit)
@@ -93,10 +118,7 @@ case class V2RuntimeFilterBySize(session: SparkSession) extends Rule[LogicalPlan
       case s: SubqueryExpression => readsLarge(s.plan)
       case _ => false
     }))
-    // The creation side joins another relation, or filters by an IN / EXISTS subquery that Spark's rule counted
-    // as a selective filter and that a later batch turns into a semi join: either way building the filter reads
-    // what that join or subquery reads.
-    def costly(b: BloomFilterMightContain): Boolean = b.bloomFilterExpression match {
+    b.bloomFilterExpression match {
       case s: ScalarSubquery =>
         creationOf(s.plan).exists {
           case j: Join => readsLarge(j)
@@ -107,23 +129,6 @@ case class V2RuntimeFilterBySize(session: SparkSession) extends Rule[LogicalPlan
           case _ => false
         }
       case _ => false
-    }
-    if (
-      !plan.exists(_.expressions.exists(_.exists {
-        case b: BloomFilterMightContain => costly(b)
-        case _ => false
-      }))
-    ) return plan
-    plan.transformUp {
-      case f @ Filter(cond, child) =>
-        val parts = splitConjunctivePredicates(cond)
-        val left = parts.filterNot {
-          case b: BloomFilterMightContain => costly(b)
-          case _ => false
-        }
-        if (left.size == parts.size) f
-        else if (left.isEmpty) child
-        else Filter(left.reduce(And), child)
     }
   }
 
@@ -173,7 +178,10 @@ case class V2RuntimeFilterBySize(session: SparkSession) extends Rule[LogicalPlan
     }
     def keep(b: BloomFilterMightContain): Boolean = b.bloomFilterExpression match {
       case s: ScalarSubquery if before.contains(s.exprId) => true
-      case s: ScalarSubquery => !onPartition(b) && smallByFiles(creationOf(s.plan), threshold)
+      case s: ScalarSubquery =>
+        // Not one dropCostly removed: Spark's rule, run again here, would build it from the same creation side,
+        // whose own scan is small by its files although building it reads a large table (q14a).
+        !onPartition(b) && smallByFiles(creationOf(s.plan), threshold) && !costly(b, conf)
       case _ => true
     }
     val kept = injected.transformUp {
