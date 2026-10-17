@@ -28,7 +28,17 @@ import org.apache.spark.sql.catalyst.expressions.{
   XxHash64
 }
 import org.apache.spark.sql.catalyst.optimizer.{InjectRuntimeFilter, PushDownPredicates}
-import org.apache.spark.sql.catalyst.plans.logical.{Aggregate, Filter, Join, LogicalPlan, Project}
+import org.apache.spark.sql.catalyst.plans.logical.{
+  Aggregate,
+  BROADCAST,
+  Filter,
+  HintInfo,
+  Join,
+  JoinHint,
+  LogicalPlan,
+  Project
+}
+import org.apache.spark.sql.catalyst.trees.TreeNodeTag
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.execution.datasources.{HadoopFsRelation, LogicalRelation}
 import org.apache.spark.sql.execution.datasources.v2.DataSourceV2ScanRelation
@@ -127,8 +137,25 @@ case class V2RuntimeFilterBySize(session: SparkSession) extends Rule[LogicalPlan
     val local = conf.clone()
     local.setConf(SQLConf.RUNTIME_BLOOM_FILTER_CREATION_SIDE_THRESHOLD, raised)
     local.setConf(SQLConf.RUNTIME_FILTER_NUMBER_THRESHOLD, room)
-    val injected = SQLConf.withExistingConf(local)(InjectRuntimeFilter(plan))
-    if (injected.fastEquals(plan)) return plan
+    // Spark's rule skips a join it takes for a broadcast with no shuffle below, judged by size estimates. A join
+    // input small by its files that V2BroadcastBySize left unhinted -- one a rollup above groups by (q27's store and
+    // item) -- would look like a shuffle join here and draw a filter its Parquet copy does not get, so such joins
+    // carry a broadcast hint while Spark's rule runs, and lose it again after.
+    val broadcastAt = conf.autoBroadcastJoinThreshold
+    val hinted =
+      if (broadcastAt <= 0) plan
+      else
+        plan.transformUp {
+          case j @ Join(l, r, _, _, h)
+              if h.leftHint.isEmpty && h.rightHint.isEmpty &&
+                (V2BroadcastBySize.smallByFiles(l, broadcastAt, raised) ||
+                  V2BroadcastBySize.smallByFiles(r, broadcastAt, raised)) =>
+            val marked = j.copy(hint = JoinHint(Some(HintInfo(strategy = Some(BROADCAST))), None))
+            marked.setTagValue(V2RuntimeFilterBySize.TemporaryHint, ())
+            marked
+        }
+    val injected = SQLConf.withExistingConf(local)(InjectRuntimeFilter(hinted))
+    if (injected.fastEquals(hinted)) return plan
     // A table's partition columns are pruned by dynamic partition pruning, which runs before Spark's rule; there
     // Spark's rule sees the pruning filter and declines a bloom filter on the same key (q14a's `ss_sold_date_sk`
     // from one month of `date_dim`). In this batch the pruning filter is no longer in that form, so a new filter on
@@ -161,7 +188,9 @@ case class V2RuntimeFilterBySize(session: SparkSession) extends Rule[LogicalPlan
         else Filter(left.reduce(And), child)
     }
     if (bloomIds(kept) == before) return plan
-    pushDown(kept)
+    pushDown(kept.transformUp {
+      case j: Join if j.getTagValue(V2RuntimeFilterBySize.TemporaryHint).isDefined => j.copy(hint = JoinHint.NONE)
+    })
   }
 
   private def bloomIds(plan: LogicalPlan): Set[ExprId] =
@@ -200,4 +229,10 @@ case class V2RuntimeFilterBySize(session: SparkSession) extends Rule[LogicalPlan
     }
     current
   }
+}
+
+object V2RuntimeFilterBySize {
+
+  /** Marks a broadcast hint this rule adds only while Spark's rule runs. */
+  val TemporaryHint: TreeNodeTag[Unit] = TreeNodeTag[Unit]("vecruntime.v2RuntimeFilterBySize.temporaryHint")
 }
