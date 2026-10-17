@@ -187,4 +187,28 @@ class IcebergBroadcastBySizeSuite extends VectorQuerySuite {
     assert(broadcastHints(off) === 0, off.queryExecution.optimizedPlan.treeString)
     assert(broadcastJoins(off) === 0, off.queryExecution.executedPlan.treeString)
   }
+
+  private lazy val q67 =
+    """SELECT d_status, d_gender, f_qty, sum(f_key) s FROM fact JOIN dim ON f_dim = d_key
+      |GROUP BY ROLLUP(d_status, d_gender, f_qty)""".stripMargin
+
+  test("a dimension grouped by a rollup above the join keeps Spark's size decision (q67)", IcebergTest) {
+    // Broadcast, the fact reaches the rollup unclustered by the join key and its partial aggregate cannot combine
+    // a key's rows within a task; shuffled, it can. The rule gives no file-byte hint to such a side.
+    val df = run(q67)
+    assert(broadcastHints(df) === 0, df.queryExecution.optimizedPlan.treeString)
+    assert(broadcastJoins(df) === 0, df.queryExecution.executedPlan.treeString)
+    // The same join under a plain GROUP BY is still broadcast by its files.
+    val plain = run(q67.replace("GROUP BY ROLLUP(d_status, d_gender, f_qty)", "GROUP BY d_status, d_gender, f_qty"))
+    assert(broadcastHints(plain) === 1, plain.queryExecution.optimizedPlan.treeString)
+  }
+
+  test("a rollup over the fact's own columns does not hold back the dimension", IcebergTest) {
+    // The dimension read as in q7 (above the threshold by its estimate, within it by its files); its d_status only
+    // feeds an aggregate, so the rollup over the fact's f_qty does not hold it back.
+    val sql = """SELECT f_qty, avg(f_key) a, max(d_status) m FROM fact JOIN dim ON f_dim = d_key
+                |WHERE d_gender = 'M' AND d_status = 'status-2' GROUP BY ROLLUP(f_qty)""".stripMargin
+    val df = run(sql)
+    assert(broadcastHints(df) === 1, df.queryExecution.optimizedPlan.treeString)
+  }
 }

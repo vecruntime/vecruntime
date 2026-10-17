@@ -18,7 +18,8 @@ package org.apache.spark.sql.vecruntime
 import io.vecruntime.spark.VectorConf
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.optimizer.JoinSelectionHelper
-import org.apache.spark.sql.catalyst.plans.logical.{BROADCAST, Filter, HintInfo, Join, LogicalPlan, Project}
+import org.apache.spark.sql.catalyst.expressions.{Alias, ExprId, Literal, NamedExpression}
+import org.apache.spark.sql.catalyst.plans.logical.{BROADCAST, Expand, Filter, HintInfo, Join, LogicalPlan, Project}
 import org.apache.spark.sql.catalyst.plans.logical.statsEstimation.EstimationUtils
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.execution.datasources.v2.DataSourceV2ScanRelation
@@ -47,9 +48,11 @@ case class V2BroadcastBySize(session: SparkSession) extends Rule[LogicalPlan] wi
     val threshold = conf.autoBroadcastJoinThreshold
     if (!VectorConf.v2BroadcastBySizeEnabled(conf) || threshold <= 0) return plan
     val maxEstimated = VectorConf.v2BroadcastBySizeMaxEstimatedBytes(conf)
+    val rolledUp = V2BroadcastBySize.rollupGroupedColumns(plan)
     def small(side: LogicalPlan): Boolean = {
       val estimate = side.stats.sizeInBytes
-      estimate > threshold && V2BroadcastBySize.smallByFiles(side, threshold, maxEstimated)
+      estimate > threshold && !side.output.exists(a => rolledUp.contains(a.exprId)) &&
+      V2BroadcastBySize.smallByFiles(side, threshold, maxEstimated)
     }
     plan.transformUp {
       case j @ Join(left, right, jt, _, hint) if hint.leftHint.isEmpty && hint.rightHint.isEmpty =>
@@ -66,6 +69,50 @@ case class V2BroadcastBySize(session: SparkSession) extends Rule[LogicalPlan] wi
 }
 
 object V2BroadcastBySize {
+
+  /**
+   * The columns a rollup, cube or grouping sets above a join groups by, traced through the projections, filters
+   * and joins below its `Expand` to the join inputs they come from (#735, q67 and q22).
+   *
+   * Such a join input is left to Spark's own estimate. When it is shuffled, the fact arrives at the `Expand`
+   * clustered by the join key, and the partial aggregate above it combines the rows of one key's groups within a
+   * task; broadcast, the fact keeps its scan's order and every level of the rollup multiplies rows the partial
+   * aggregate can no longer combine. At 3 TB, q67 broadcast `item` by its files and shuffled 2.0 billion rows
+   * (164 GB) to its final aggregate against 0.9 billion (52 GB) with `item` shuffled, 72 s against 41 s; its Parquet
+   * copy is shuffled there too (above the threshold by its files).
+   */
+  def rollupGroupedColumns(plan: LogicalPlan): Set[ExprId] = {
+    val out = scala.collection.mutable.Set.empty[ExprId]
+    def trace(p: LogicalPlan, cols: Set[ExprId]): Unit = if (cols.nonEmpty) p match {
+      case Project(list, child) =>
+        val next = list.flatMap {
+          case a: Alias if cols.contains(a.exprId) => a.child.references.map(_.exprId)
+          case n: NamedExpression if cols.contains(n.exprId) => Seq(n.exprId)
+          case _ => Nil
+        }.toSet
+        trace(child, next)
+      case Filter(_, child) => trace(child, cols)
+      case j: Join =>
+        out ++= cols
+        trace(j.left, cols.intersect(j.left.output.map(_.exprId).toSet))
+        trace(j.right, cols.intersect(j.right.output.map(_.exprId).toSet))
+      case _ =>
+    }
+    plan.foreach {
+      case e: Expand =>
+        // A column the Expand nulls in some projection is a grouping column of that projection's grouping set.
+        val grouped = e.output.indices.filter(i =>
+          e.projections.exists(_(i) match {
+            case Literal(null, _) => true
+            case _ => false
+          })
+        )
+        val cols = grouped.flatMap(i => e.projections.flatMap(_(i).references.map(_.exprId))).toSet
+        trace(e.child, cols)
+      case _ =>
+    }
+    out.toSet
+  }
 
   /** The DSv2 scan `p` reads when `p` is that scan under projections and filters only. */
   def scanOf(p: LogicalPlan): Option[DataSourceV2ScanRelation] = p match {
