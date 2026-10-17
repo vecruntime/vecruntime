@@ -101,6 +101,12 @@ object VectorConf {
    */
   val FactBloomFilterEnabled = "spark.vecruntime.optimizer.factBloomFilter.enabled"
 
+  /** #735: broadcast a small DSv2 (Iceberg) join input by its planned file bytes (V2BroadcastBySize). */
+  val V2BroadcastBySizeEnabled = "spark.vecruntime.optimizer.v2BroadcastBySize.enabled"
+
+  /** #735: V2BroadcastBySize leaves an input whose own size estimate exceeds this many bytes (default 1 GiB). */
+  val V2BroadcastBySizeMaxEstimatedBytes = "spark.vecruntime.optimizer.v2BroadcastBySize.maxEstimatedBytes"
+
   /** Run-time evidence (#659): the build counts the creation side's actual rows and declines when not much smaller. */
   val FactBloomFilterRuntimeEvidence = "spark.vecruntime.optimizer.factBloomFilter.runtimeEvidence"
 
@@ -688,6 +694,19 @@ object VectorConf {
     isEnabled(conf) && bool(conf, RemoveRedundantGroupKeysEnabled, default = true)
 
   /** The fact-to-fact bloom filter (#641); also off when the plugin is off. */
+  /** V2BroadcastBySize (#735), default true. */
+  def v2BroadcastBySizeEnabled(conf: SQLConf): Boolean =
+    isEnabled(conf) && bool(conf, V2BroadcastBySizeEnabled, default = true)
+
+  /** V2BroadcastBySize's cap on an input's own size estimate (#735), default 1 GiB; `1g` style sizes accepted. */
+  def v2BroadcastBySizeMaxEstimatedBytes(conf: SQLConf): Long =
+    scala.util.Try(
+      org.apache.spark.network.util.JavaUtils.byteStringAsBytes(conf.getConfString(
+        V2BroadcastBySizeMaxEstimatedBytes,
+        "1g"
+      ).trim)
+    ).toOption.filter(_ >= 0).getOrElse(1L << 30)
+
   def factBloomFilterEnabled(conf: SQLConf): Boolean =
     isEnabled(conf) && bool(conf, FactBloomFilterEnabled, default = true)
 
