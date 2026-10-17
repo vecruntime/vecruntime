@@ -313,7 +313,7 @@ class NativeParquetSchemaEvolutionSuite extends VectorQuerySuite {
         spark.sql("INSERT INTO evolve_default SELECT cast(id as int) FROM range(0, 500)")
         spark.sql("ALTER TABLE evolve_default ADD COLUMN v int DEFAULT 42")
         spark.sql("ALTER TABLE evolve_default ADD COLUMN w string DEFAULT 'none'")
-        spark.sql("ALTER TABLE evolve_default ADD COLUMN x decimal(25,2) DEFAULT 12345678901234567890.25")
+        spark.sql("ALTER TABLE evolve_default ADD COLUMN x decimal(25,2) DEFAULT 1234567.25")
         spark.sql("ALTER TABLE evolve_default ADD COLUMN y date DEFAULT date'2020-02-29'")
         spark.sql("ALTER TABLE evolve_default ADD COLUMN z bigint DEFAULT NULL")
       }

@@ -53,8 +53,12 @@ public final class NativeParquetNullColumn implements NativeParquetColumn {
         this(name, type, allocator, null);
     }
 
-    /** A missing column whose every row is {@code value} (Spark's internal value; null: null rows). */
-    public NativeParquetNullColumn(String name, DataType type, BufferAllocator allocator, Object value) {
+    /**
+     * A missing column whose every row is {@code value} (Spark's internal
+     * value; null: null rows).
+     */
+    public NativeParquetNullColumn(String name, DataType type, BufferAllocator allocator,
+            Object value) {
         this.value = value;
         this.name = name;
         this.type = type;

@@ -143,11 +143,12 @@ public final class NativeParquetStructReader implements NativeParquetColumn, Row
             }
         }
         if (extra) {
-            String[] extraPath = child(path, group.getType(fs.length).getName());
+            String[] extraPath = child(path, group.getType(fs.length)
+                    .getName());
             ColumnDescriptor cd = clipped.getColumnDescription(extraPath);
             DataType dt = levelOnlyType(cd);
-            fields[fs.length] = new NativeParquetColumnReader(cd, NativeParquetSupport.decodeLane(dt), dt,
-                    name + "." + group.getType(fs.length).getName(), batchRows, allocator);
+            fields[fs.length] = new NativeParquetColumnReader(cd, NativeParquetSupport.decodeLane(dt), dt, name + "." + group.getType(fs.length).getName(),
+                    batchRows, allocator);
             levelField = fs.length;
         }
         if (levelField < 0) {
@@ -157,8 +158,9 @@ public final class NativeParquetStructReader implements NativeParquetColumn, Row
     }
 
     /**
-     * #812: the Spark type a field read only for its levels is decoded as: its physical type's own, whatever
-     * its annotation (its values are dropped). {@code null} for a physical type with no such path.
+     * #812: the Spark type a field read only for its levels is decoded as: its
+     * physical type's own, whatever its annotation (its values are dropped).
+     * {@code null} for a physical type with no such path.
      */
     static DataType levelOnlyType(ColumnDescriptor cd) {
         switch (cd.getPrimitiveType().getPrimitiveTypeName()) {
@@ -246,7 +248,8 @@ public final class NativeParquetStructReader implements NativeParquetColumn, Row
                 return false;
             }
             for (int i = 0; i < fs.length; i++) {
-                if (holds(file, child(path, group.getType(i).getName()))) {
+                if (holds(file, child(path, group.getType(i)
+                        .getName()))) {
                     return false;
                 }
             }
