@@ -625,6 +625,13 @@ public final class NativeParquetTreeReader implements NativeParquetColumn, RowLe
         }
     }
 
+    @Override
+    public void setReuseDecompress(boolean reuse) {
+        for (Leaf l : leaves) {
+            l.reader.setReuseDecompress(reuse);
+        }
+    }
+
     /**
      * The file's calendar rebase and INT96 conversion, for every leaf (#568
      * item 6).

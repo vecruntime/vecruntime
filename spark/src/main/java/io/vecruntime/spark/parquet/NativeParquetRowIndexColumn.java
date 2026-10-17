@@ -118,6 +118,11 @@ public final class NativeParquetRowIndexColumn implements NativeParquetColumn {
     }
 
     @Override
+    public void setReuseDecompress(boolean reuse) {
+        // Row indexes are not read from pages.
+    }
+
+    @Override
     public void setRebase(ParquetRebase rebase) {
         // Row indexes are not dates or timestamps.
     }

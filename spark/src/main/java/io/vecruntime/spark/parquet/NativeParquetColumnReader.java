@@ -154,6 +154,10 @@ public final class NativeParquetColumnReader implements NativeParquetColumn, Row
     private final Deque<FieldVector> pool = new ArrayDeque<>();
     private int maxPool = 4;
     private boolean closed;
+    // #735: the scan installed a ReusingCodecFactory, so a decompressed page lives in a buffer the next page
+    // reuses. A repeated leaf queues several pages at once (pullPage), so it must copy each out of that buffer;
+    // a flat leaf reads one page at a time in place. Off by default (default codec factory: a fresh array a page).
+    private boolean reuseDecompress;
 
     public NativeParquetColumnReader(ColumnDescriptor column, VecType type, DataType sparkType,
             String name, int batchRows, BufferAllocator allocator) {
@@ -793,12 +797,21 @@ public final class NativeParquetColumnReader implements NativeParquetColumn, Row
     }
 
     /**
-     * {@code in} as a heap buffer the caller may keep: parquet-java's own
-     * (#786), else a copy of its own.
+     * {@code in} as a heap buffer the caller may keep PAST the next page: #786's
+     * own buffer when it is one on the heap AND nothing reuses it, else a copy.
+     * A repeated leaf queues several pages, so when the scan reuses the
+     * decompressor's buffer (#735) every page here must be copied out -- the
+     * reused buffer would otherwise be overwritten by the next page while this
+     * one is still queued.
      */
-    private static java.nio.ByteBuffer ownedView(BytesInput in) {
-        java.nio.ByteBuffer view = heapView(in);
-        return view != null ? view : java.nio.ByteBuffer.wrap(bytes(in));
+    private java.nio.ByteBuffer ownedView(BytesInput in) {
+        if (!reuseDecompress) {
+            java.nio.ByteBuffer view = heapView(in);
+            if (view != null) {
+                return view;
+            }
+        }
+        return java.nio.ByteBuffer.wrap(bytes(in));
     }
 
     /** Room for {@code n} more kept levels: drops the decoded ones, then grows. */
@@ -1450,6 +1463,12 @@ public final class NativeParquetColumnReader implements NativeParquetColumn, Row
         synchronized (pool) {
             maxPool = Math.max(1, limit);
         }
+    }
+
+    /** #735: see {@link #reuseDecompress} and {@link #ownedView}. */
+    @Override
+    public void setReuseDecompress(boolean reuse) {
+        this.reuseDecompress = reuse;
     }
 
     private FieldVector pooled() {

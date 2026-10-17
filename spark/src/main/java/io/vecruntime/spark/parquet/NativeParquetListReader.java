@@ -607,6 +607,17 @@ public final class NativeParquetListReader implements NativeParquetColumn, RowLe
     }
 
     @Override
+    public void setReuseDecompress(boolean reuse) {
+        first.setReuseDecompress(reuse);
+        if (second != null) {
+            second.setReuseDecompress(reuse);
+        }
+        for (NativeParquetColumnReader f : others()) {
+            f.setReuseDecompress(reuse);
+        }
+    }
+
+    @Override
     public void setRebase(ParquetRebase rebase) {
         first.setRebase(rebase);
         if (second != null) {

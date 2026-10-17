@@ -269,6 +269,11 @@ public final class NativeParquetNestedListReader implements NativeParquetColumn,
     }
 
     @Override
+    public void setReuseDecompress(boolean reuse) {
+        leaf.setReuseDecompress(reuse);
+    }
+
+    @Override
     public void setRebase(ParquetRebase rebase) {
         leaf.setRebase(rebase);
     }

@@ -101,6 +101,11 @@ public final class NativeParquetNullColumn implements NativeParquetColumn {
     }
 
     @Override
+    public void setReuseDecompress(boolean reuse) {
+        // No pages to decompress.
+    }
+
+    @Override
     public void setDictionaryIds(boolean enabled) {
         // No values.
     }

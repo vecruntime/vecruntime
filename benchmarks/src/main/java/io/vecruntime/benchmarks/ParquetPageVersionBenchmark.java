@@ -72,6 +72,11 @@ public class ParquetPageVersionBenchmark {
     @Param({"zstd", "uncompressed", "snappy"})
     public String codec;
 
+    // #735: off = parquet-java's default codec factory + allocator (a fresh array per page, per row group);
+    // on = our ReusingCodecFactory + PooledHeapAllocator through the shared scan helper. The before/after.
+    @Param({"off", "on"})
+    public String tuning;
+
     private SparkSession spark;
     private File dir;
     private String filePath;
@@ -135,7 +140,12 @@ public class ParquetPageVersionBenchmark {
      */
     @Benchmark
     public long decode(Blackhole bh) throws Exception {
-        try (ParquetFileReader reader = ParquetFileReader.open(hadoopConf, new Path(filePath))) {
+        boolean on = "on".equals(tuning);
+        org.apache.parquet.hadoop.util.HadoopInputFile inputFile = org.apache.parquet.hadoop.util.HadoopInputFile.fromPath(new Path(filePath), hadoopConf);
+        org.apache.parquet.ParquetReadOptions options = io.vecruntime.spark.parquet.NativeParquetReaderOptions.apply(org.apache.parquet.HadoopReadOptions.builder(hadoopConf, new Path(filePath)),
+                hadoopConf, on, on)
+                .build();
+        try (ParquetFileReader reader = ParquetFileReader.open(inputFile, options)) {
             List<ColumnDescriptor> columns = reader.getFooter()
                     .getFileMetaData()
                     .getSchema()
@@ -145,6 +155,7 @@ public class ParquetPageVersionBenchmark {
                 ColumnDescriptor cd = columns.get(c);
                 readers[c] = new NativeParquetColumnReader(cd, TypeMapping.vecTypeOf(schema.fields()[c].dataType()), schema.fields()[c].dataType(), cd.getPath()[0],
                         BATCH_ROWS, allocator);
+                readers[c].setReuseDecompress(on);
             }
             long rows = 0;
             PageReadStore rg;

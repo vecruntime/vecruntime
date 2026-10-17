@@ -180,6 +180,8 @@ case class VectorIcebergScanExec(
       io.vecruntime.spark.VectorConf.scanNativeParquetDictionaryStrings(sqlConf),
       io.vecruntime.spark.VectorConf.scanNativeParquetPrefetchMaxBytes(sqlConf),
       io.vecruntime.spark.VectorConf.scanNativeParquetPrefetchExecutorMaxBytes(sqlConf),
+      io.vecruntime.spark.VectorConf.scanNativeParquetReuseDecompressBuffers(sqlConf),
+      io.vecruntime.spark.VectorConf.scanNativeParquetPoolChunkBuffers(sqlConf),
       m,
       longMetric("numNativeGroups"),
       longMetric("numIcebergGroups"),
@@ -223,6 +225,8 @@ private[vecruntime] final class VectorIcebergRDD(
     dictionaryStrings: Boolean,
     prefetchMaxBytes: Long,
     prefetchExecutorMaxBytes: Long,
+    reuseDecompressBuffers: Boolean,
+    poolChunkBuffers: Boolean,
     metrics: ScanMetrics,
     nativeGroups: SQLMetric,
     icebergGroups: SQLMetric,
@@ -372,6 +376,8 @@ private[vecruntime] final class VectorIcebergRDD(
       dictionaryStrings = dictionaryStrings,
       prefetchMaxBytes = prefetchMaxBytes,
       prefetchExecutorMaxBytes = prefetchExecutorMaxBytes,
+      reuseDecompressBuffers = reuseDecompressBuffers,
+      poolChunkBuffers = poolChunkBuffers,
       filterFieldIds = filterFieldIds
     )
     if (decodeAhead > 0) new DecodeAheadIterator(reader, decodeAhead, decodeAheadVirtual, context) else reader
