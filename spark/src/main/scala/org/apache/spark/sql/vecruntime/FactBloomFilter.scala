@@ -115,6 +115,23 @@ case class FactBloomFilter(session: SparkSession) extends Rule[LogicalPlan] with
   }
 
   private def prunesLeft(jt: JoinType): Boolean = jt == Inner || jt == LeftSemi || jt == RightOuter
+
+  /**
+   * Whether `creation` is more than a filter over one scan and reads a relation the plan reads again (#735, q14a).
+   * Such a creation side -- q14a's `item` semi-joined to `cross_items`, an intersection of three years of all three
+   * sales tables that the query uses in each channel -- is computed again by the filter's own subquery: that
+   * subquery's adaptive plan starts the same exchanges as the main plan's at the same moment, before either is
+   * there to reuse, and at 3 TB q14a ran `cross_items` twice (72 s; 56 s without the filters, its Parquet copy 51 s).
+   * A filter over one scan builds from the join's own exchange (`shareExchange`) and is kept.
+   */
+  private def rebuildsShared(creation: LogicalPlan): Boolean = {
+    def oneScan(p: LogicalPlan): Boolean = p match {
+      case Project(_, c) => oneScan(c)
+      case Filter(_, c) => oneScan(c)
+      case r => isScan(r)
+    }
+    !oneScan(creation) && creation.exists(r => isScan(r) && shared.contains(r.canonicalized))
+  }
   private def prunesRight(jt: JoinType): Boolean = jt == Inner || jt == LeftOuter
 
   private def countBlooms(plan: LogicalPlan): Int =
@@ -128,6 +145,7 @@ case class FactBloomFilter(session: SparkSession) extends Rule[LogicalPlan] with
     val conf = session.sessionState.conf
     val ratio = VectorConf.factBloomFilterSizeRatio(conf)
     if (!appKey.deterministic || !creationKey.deterministic || creationKey.references.isEmpty) return None
+    if (rebuildsShared(creation)) return None
     // With run-time evidence the build checks the creation side's actual rows against `ratio`; the plan-time
     // estimate of a creation side reduced by a filter or a join (its base table's size) would understate that
     // reduction and decline q50's returns, so the plan only requires the application side to be the larger.
