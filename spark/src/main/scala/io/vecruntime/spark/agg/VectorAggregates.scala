@@ -1146,6 +1146,8 @@ object VectorAggregates {
       else ExpressionCompiler.compileMovedColumn(input(ordinal), input)
     }
     f match {
+      case g if restrictedAggregate(g) =>
+        Left(s"${g.prettyName} over ${g.children.map(_.dataType.simpleString).mkString(", ")} not supported")
       case s: Sum if s.evalContext.evalMode == EvalMode.TRY && s.dataType == LongType && buffers.length == 2 =>
         for (sum <- ref(0); empty <- ref(1)) yield TrySumLongMergeAgg(sum, empty)
       case s: Sum if s.evalContext.evalMode == EvalMode.TRY && s.dataType.isInstanceOf[DecimalType] =>
@@ -1270,6 +1272,17 @@ object VectorAggregates {
     if (numeric.contains(b.vecType) || b.vecType == VecType.DECIMAL128) Right(b)
     else Left(s"min/max over ${dt.simpleString} not supported")
 
+  /**
+   * #812: an aggregate over a time or an ANSI interval other than count, min, max, first or last: those read the
+   * lane's value as is; every other one (sum, avg, moments, ...) reads it as a time or an interval.
+   */
+  private def restrictedAggregate(f: AggregateFunction): Boolean = {
+    val touches = TypeMapping.isComputeRestricted(f.dataType) ||
+      f.children.exists(c => TypeMapping.isComputeRestricted(c.dataType))
+    touches && !(f.isInstanceOf[Count] || f.isInstanceOf[Min] || f.isInstanceOf[Max] || f.isInstanceOf[First] ||
+      f.isInstanceOf[Last])
+  }
+
   /** The arguments of a moment statistic as double lanes. */
   private def momentArgs(args: Seq[Expression], input: Seq[Attribute]): Either[String, Seq[VectorExpr]] =
     args.foldRight[Either[String, List[VectorExpr]]](Right(Nil)) { (a, acc) =>
@@ -1292,6 +1305,10 @@ object VectorAggregates {
       complete: Boolean,
       strict: Boolean
   ): Either[String, VectorAggFunction] = f match {
+    // #812: a time or an ANSI interval is carried on its lane, not summed or averaged (Spark's interval sum
+    // fails on overflow; time takes none): only count, min, max, first and last run over one natively.
+    case g if restrictedAggregate(g) =>
+      Left(s"${g.prettyName} over ${g.children.map(_.dataType.simpleString).mkString(", ")} not supported")
     // try_sum over an integral input: Spark's (sum, isEmpty) buffer with the whole group nulled on overflow.
     case s: Sum if s.evalContext.evalMode == EvalMode.TRY && s.dataType == LongType =>
       numericChild(s.child, input).flatMap { child =>

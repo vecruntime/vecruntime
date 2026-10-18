@@ -239,8 +239,9 @@ object AggregateSpill {
 
   /** The same key kinds as the shuffle's hash partitioning, so the buckets are Spark's hashes over the same lanes. */
   def keyKind(dt: DataType): KeyKind = dt match {
-    case IntegerType | DateType => KeyKind.INT
-    case LongType | TimestampType | TimestampNTZType => KeyKind.LONG
+    case IntegerType | DateType | _: org.apache.spark.sql.types.YearMonthIntervalType => KeyKind.INT
+    case LongType | TimestampType | TimestampNTZType | _: org.apache.spark.sql.types.TimeType | _: org.apache.spark.sql.types.DayTimeIntervalType =>
+      KeyKind.LONG
     case d: DecimalType if d.precision <= TypeMapping.MAX_DECIMAL_PRECISION => KeyKind.LONG
     case _: DecimalType => KeyKind.DECIMAL128
     case DoubleType | FloatType => KeyKind.DOUBLE // a float key is its widened double (#712): buckets stay internal
@@ -251,7 +252,7 @@ object AggregateSpill {
 
   /** Whether every grouping key type can be bucketed. */
   def supportsKeys(types: Seq[DataType]): Boolean = types.forall {
-    case IntegerType | DateType | LongType | TimestampType | TimestampNTZType | DoubleType | FloatType | BooleanType |
+    case IntegerType | DateType | LongType | TimestampType | TimestampNTZType | _: org.apache.spark.sql.types.TimeType | _: org.apache.spark.sql.types.DayTimeIntervalType | _: org.apache.spark.sql.types.YearMonthIntervalType | DoubleType | FloatType | BooleanType |
         StringType |
         _: DecimalType =>
       true

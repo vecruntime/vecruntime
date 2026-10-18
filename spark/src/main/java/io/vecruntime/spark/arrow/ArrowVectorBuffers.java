@@ -71,6 +71,15 @@ public final class ArrowVectorBuffers implements VectorBuffers {
         if (v instanceof BigIntVector || v instanceof TimeStampVector) {
             return VecType.INT64;
         }
+        // #812: time (nanoseconds of the day) and interval day to second (micros) are longs, interval year to
+        // month (months) an int, lanes like any (TypeMapping.isCarriedLong); Spark's ArrowColumnVector reads
+        // these classes back as its time and interval types.
+        if (v instanceof org.apache.arrow.vector.TimeNanoVector || v instanceof org.apache.arrow.vector.DurationVector) {
+            return VecType.INT64;
+        }
+        if (v instanceof org.apache.arrow.vector.IntervalYearVector) {
+            return VecType.INT32;
+        }
         if (v instanceof Float8Vector) {
             return VecType.FLOAT64;
         }
@@ -121,15 +130,20 @@ public final class ArrowVectorBuffers implements VectorBuffers {
     public static ArrowVectorBuffers forWrite(ValueVector v, int length, org.apache.spark.sql.types.DataType sparkType) {
         ArrowVectorBuffers b;
         if (vecTypeOf(v) == null
-                && (v instanceof org.apache.arrow.vector.Float4Vector || v instanceof org.apache.arrow.vector.IntervalYearVector || v instanceof org.apache.arrow.vector.DurationVector)) {
+                && (v instanceof org.apache.arrow.vector.Float4Vector
+                        || v instanceof org.apache.arrow.vector.IntervalYearVector
+                        || v instanceof org.apache.arrow.vector.DurationVector
+                        || v instanceof org.apache.arrow.vector.TimeNanoVector)) {
             // A column with no engine lane, written by the native Parquet scan on the lane of the same layout
-            // (#559): FLOAT's 4-byte bits on INT32. Deliberately not in vecTypeOf, so no reader of an incoming
-            // vector ever takes it for an INT32 lane. (BINARY has had the UTF8 lane since #705.)
+            // (#559): FLOAT's 4-byte bits on INT32, TIME's nanoseconds on INT64 (#787). Deliberately not in
+            // vecTypeOf, so no reader of an incoming vector ever takes it for an engine lane.
             if (v.getValidityBuffer().capacity() < Bitmap.bytesFor(length)) {
                 throw new IllegalStateException("vector not allocated for " + length + " elements");
             }
             // #812: ANSI intervals likewise, months on INT32 and micros on INT64, outside vecTypeOf too.
-            VecType lane = v instanceof org.apache.arrow.vector.DurationVector ? VecType.INT64 : VecType.INT32;
+            VecType lane = v instanceof org.apache.arrow.vector.DurationVector || v instanceof org.apache.arrow.vector.TimeNanoVector
+                    ? VecType.INT64
+                    : VecType.INT32;
             b = wrap(v, lane, length, ArrowSegments.of(v.getValidityBuffer()));
         } else {
             b = forWrite(v, length);
