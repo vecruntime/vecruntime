@@ -61,13 +61,39 @@ case class VectorIcebergScanExec(
     // file's columns by field id; the filter above still decides which rows pass.
     pushedFilters: Seq[org.apache.spark.sql.sources.Filter] = Nil
 ) extends LeafExecNode
-    with VectorPlan {
+    with VectorPlan
+    with RuntimeFilterTarget {
 
   override val output: Seq[Attribute] = scan.output
   override def outputPartitioning: Partitioning = scan.outputPartitioning
   override def outputOrdering: Seq[SortOrder] = scan.outputOrdering
 
+  /**
+   * Filters a broadcast hash join above derived from its build keys (#610), set on the driver before this node's
+   * RDD is made, as [[VectorParquetScanExec]] takes them. ANDed with `pushedFilters`, they skip row groups by their
+   * statistics, each column matched by field id; the join above still decides which rows pass.
+   */
+  @transient @volatile private[vecruntime] var runtimeFilters: Seq[org.apache.spark.sql.sources.Filter] = Nil
+
+  /** The runtime filters attached so far (tests). */
+  def runtimeFilterCount: Int = runtimeFilters.size
+
+  private[vecruntime] def addRuntimeFilter(f: org.apache.spark.sql.sources.Filter): Unit = synchronized {
+    if (!runtimeFilters.contains(f)) runtimeFilters = runtimeFilters :+ f
+  }
+
+  /**
+   * A data column of the files (not an Iceberg metadata column) whose name needs no quoting: the pushed filters
+   * are matched to field ids by quoted name, and a runtime filter names the column as it is.
+   */
+  private[vecruntime] def isDataColumn(name: String): Boolean =
+    output.zip(fieldIds).exists { case (a, id) =>
+      a.name == name && IcebergTasks.columnKind(a.name, id) == IcebergTasks.DataColumn &&
+      org.apache.spark.sql.catalyst.util.quoteIfNeeded(name) == name
+    }
+
   override lazy val metrics: Map[String, SQLMetric] = Map(
+    "numRuntimeFilters" -> SQLMetrics.createMetric(sparkContext, "number of runtime filters from joins"),
     "numFiles" -> SQLMetrics.createMetric(sparkContext, "number of files read"),
     "numOutputRows" -> SQLMetrics.createMetric(sparkContext, "number of output rows"),
     "numOutputBatches" -> SQLMetrics.createMetric(sparkContext, "number of output batches"),
@@ -96,6 +122,13 @@ case class VectorIcebergScanExec(
 
   override protected def doExecuteColumnar(): RDD[ColumnarBatch] = {
     val sqlConf = session.sessionState.conf
+    // The static pushed filters and the joins' runtime filters (#610), read now: the joins attached them on the
+    // driver before executing this side.
+    val runtime = if (sqlConf.parquetFilterPushDown) runtimeFilters else Nil
+    val filters = pushedFilters ++ runtime
+    // As the Parquet scan: runtime filters prune row groups by statistics only; with no static filter but null
+    // checks, Parquet's dictionary and bloom checks (an object-store request per row group) are off.
+    val statsOnly = runtime.nonEmpty && pushedFilters.forall(_.isInstanceOf[org.apache.spark.sql.sources.IsNotNull])
     // The output's data columns (metadata columns aside), each carrying its Iceberg field id, so the reader
     // matches the file's columns by id.
     val kinds = output.zip(fieldIds).map { case (a, id) => IcebergTasks.columnKind(a.name, id) }
@@ -129,6 +162,10 @@ case class VectorIcebergScanExec(
       hadoopConf.setBoolean(SQLConf.PARQUET_INT96_AS_TIMESTAMP.key, sqlConf.isParquetINT96AsTimestamp)
       hadoopConf.setBoolean(SQLConf.PARQUET_INFER_TIMESTAMP_NTZ_ENABLED.key, sqlConf.parquetInferTimestampNTZEnabled)
       hadoopConf.setBoolean(SQLConf.LEGACY_PARQUET_NANOS_AS_LONG.key, sqlConf.legacyParquetNanosAsLong)
+      if (statsOnly) {
+        hadoopConf.setBoolean(org.apache.parquet.hadoop.ParquetInputFormat.DICTIONARY_FILTERING_ENABLED, false)
+        hadoopConf.setBoolean(org.apache.parquet.hadoop.ParquetInputFormat.BLOOM_FILTERING_ENABLED, false)
+      }
       session.sparkContext.broadcast(new SerializableConfiguration(hadoopConf))
     }
     val confBroadcast = confFor(requiredSchema)
@@ -144,7 +181,7 @@ case class VectorIcebergScanExec(
 
     // Pushed filters by field id: the data columns' quoted names, as the translated filters name them.
     val filterFieldIds =
-      if (pushedFilters.isEmpty || !sqlConf.parquetFilterPushDown) null
+      if (filters.isEmpty || !sqlConf.parquetFilterPushDown) null
       else dataColumns.map { case (a, id) => org.apache.spark.sql.catalyst.util.quoteIfNeeded(a.name) -> id }.toMap
     val m = ScanMetrics(
       longMetric("numFiles"),
@@ -155,9 +192,9 @@ case class VectorIcebergScanExec(
       longMetric("numLateSkippedRows"),
       longMetric("numPagesSkipped")
     )
-    new VectorIcebergRDD(
+    val rdd = new VectorIcebergRDD(
       session.sparkContext,
-      scan.inputRDD.partitions,
+      VectorIcebergRDD.packed(scan, sqlConf, session.leafNodeDefaultParallelism),
       scan.readerFactory,
       fieldIds.toArray,
       confBroadcast,
@@ -187,7 +224,7 @@ case class VectorIcebergScanExec(
       m,
       longMetric("numNativeGroups"),
       longMetric("numIcebergGroups"),
-      if (filterFieldIds == null) Nil else pushedFilters,
+      if (filterFieldIds == null) Nil else filters,
       filterFieldIds,
       PushDownConf(
         sqlConf.parquetFilterPushDownDate,
@@ -197,6 +234,13 @@ case class VectorIcebergScanExec(
         sqlConf.parquetFilterPushDownInFilterThreshold
       )
     )
+    // Counted by the task of partition 0, once per execution, as the Parquet scan counts them.
+    if (runtime.isEmpty) rdd
+    else {
+      val counter = longMetric("numRuntimeFilters")
+      val n = runtime.size.toLong
+      rdd.mapPartitionsWithIndexInternal { (i, it) => if (i == 0) counter += n; it }
+    }
   }
 
 }
@@ -240,7 +284,7 @@ private[vecruntime] final class VectorIcebergRDD(
   override protected def getPartitions: Array[Partition] = parts
 
   override protected def getPreferredLocations(split: Partition): Seq[String] =
-    shims.SparkShims.dataSourceInputPartitions(split).flatMap(_.preferredLocations()).distinct
+    VectorIcebergRDD.inputsOf(split).flatMap(_.preferredLocations()).distinct
 
   // Iceberg metadata columns. `_pos` is the reader's row-index column; `_file` and `_spec_id` are per-file
   // constants, passed to the reader as the split's partition values (it appends them after the data columns).
@@ -252,7 +296,7 @@ private[vecruntime] final class VectorIcebergRDD(
   private val plain = kinds.forall(_ == IcebergTasks.DataColumn)
 
   override def compute(split: Partition, context: TaskContext): Iterator[ColumnarBatch] = {
-    val inputs = shims.SparkShims.dataSourceInputPartitions(split)
+    val inputs = VectorIcebergRDD.inputsOf(split)
     // In order: a run of native groups is read as one file partition (so read-ahead crosses groups), each other
     // group by Iceberg's reader, the order of the groups kept.
     val segments = Seq.newBuilder[() => Iterator[ColumnarBatch]]
@@ -414,7 +458,57 @@ private[vecruntime] final case class PushDownConf(
 )
 
 /** Helpers of [[VectorIcebergRDD]]. */
+/** Several of Iceberg's input partitions read as one Spark task (see [[VectorIcebergRDD.packed]]). */
+private[vecruntime] final class VectorIcebergPartition(override val index: Int, val inputs: Seq[InputPartition])
+    extends Partition
+
 private[vecruntime] object VectorIcebergRDD {
+
+  /** The Iceberg input partitions of one of the RDD's partitions, packed or the wrapped scan's own. */
+  def inputsOf(split: Partition): Seq[InputPartition] = split match {
+    case v: VectorIcebergPartition => v.inputs
+    case p => shims.SparkShims.dataSourceInputPartitions(p)
+  }
+
+  /**
+   * The wrapped scan's partitions packed as Spark packs a file scan's splits (`FilePartition.maxSplitBytes` and
+   * `getFilePartitions`), see [[io.vecruntime.spark.VectorConf.ScanNativeIcebergPackSplits]]: each input partition
+   * weighs its task group's bytes plus `spark.sql.files.openCostInBytes` per file, the largest first, next-fit into
+   * tasks of at most `min(maxPartitionBytes, max(openCost, total / minPartitionNum))`. The scan's own partitions
+   * when it reports a partitioning, when packing is off or merges nothing, or when a group's size is unknown.
+   */
+  def packed(scan: BatchScanExec, conf: SQLConf, leafParallelism: Int): Array[Partition] = {
+    val parts = scan.inputRDD.partitions
+    if (
+      parts.length < 2 || !io.vecruntime.spark.VectorConf.scanNativeIcebergPackSplits(conf) ||
+      !scan.outputPartitioning.isInstanceOf[org.apache.spark.sql.catalyst.plans.physical.UnknownPartitioning]
+    ) return parts
+    val openCost = conf.filesOpenCostInBytes
+    val inputs = parts.map(p => shims.SparkShims.dataSourceInputPartitions(p))
+    val sizes = inputs.map(_.map(IcebergTasks.groupBytes(_, openCost)))
+    if (sizes.exists(_.exists(_ < 0))) return parts
+    val weights = sizes.map(_.sum)
+    val minPartitions = conf.filesMinPartitionNum.getOrElse(leafParallelism).max(1)
+    val maxSplit = math.min(conf.filesMaxPartitionBytes, math.max(openCost, weights.sum / minPartitions))
+    val out = Array.newBuilder[Partition]
+    var current = Seq.newBuilder[InputPartition]
+    var currentSize = 0L
+    var n = 0
+    def close(): Unit = if (currentSize > 0) {
+      out += new VectorIcebergPartition(n, current.result())
+      n += 1
+      current = Seq.newBuilder[InputPartition]
+      currentSize = 0L
+    }
+    weights.indices.sortBy(i => -weights(i)).foreach { i =>
+      if (currentSize > 0 && currentSize + weights(i) > maxSplit) close()
+      current ++= inputs(i)
+      currentSize += weights(i)
+    }
+    close()
+    val packedParts = out.result()
+    if (packedParts.length == parts.length) parts else packedParts
+  }
 
   /**
    * `schema` with Spark's temporary row-index column last: the file's row positions, generated by our reader
@@ -603,6 +697,19 @@ private[vecruntime] object IcebergTasks {
     }
     Some(out.toArray)
   }
+
+  /**
+   * The bytes Spark would weigh a task group by: its files' bytes (Iceberg's `sizeBytes`) plus `openCost` per file,
+   * or -1 when `p` is not an Iceberg input partition.
+   */
+  def groupBytes(p: InputPartition, openCost: Long): Long =
+    if (p.getClass.getName != "org.apache.iceberg.spark.source.SparkInputPartition") -1L
+    else {
+      val group = call(p, "taskGroup")
+      val bytes = call(group, "sizeBytes").asInstanceOf[java.lang.Long].longValue()
+      val files = call(group, "filesCount").asInstanceOf[java.lang.Integer].intValue()
+      bytes + files.toLong * openCost
+    }
 
   /** Iceberg's own `BaseDeleteLoader`, opening delete files through the partition's `FileIO`, and its class. */
   private def deleteLoader(p: InputPartition): (Class[_], AnyRef) = {

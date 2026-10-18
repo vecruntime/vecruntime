@@ -106,6 +106,14 @@ public final class NativeParquetColumnReader implements NativeParquetColumn, Row
     private static final int WIDEN_INT_TO_DOUBLE = 1;
     private static final int WIDEN_FLOAT_TO_DOUBLE = 2;
     private static final int WIDEN_DAYS_TO_MICROS = 3;
+    // #812: an unsigned INT32 (UINT_32) read as a long, zero-extended (Spark's UnsignedIntegerUpdater).
+    private static final int WIDEN_UINT32_TO_LONG = 4;
+    // #812: an INT32 / INT64 read as a decimal wider than 18 digits: each 8-byte slot sign-extended to a
+    // 16-byte DECIMAL128 slot in place (Spark's IntegerToBinaryUpdater / LongToBinaryUpdater, or their
+    // ToDecimal forms when rescaled).
+    private static final int WIDEN_LONG_TO_DEC128 = 5;
+    // #812: an unsigned INT64 (UINT_64) read as decimal(20, 0), zero-extended (Spark's UnsignedLongUpdater).
+    private static final int WIDEN_ULONG_TO_DEC128 = 6;
     private final int widen;
     private final int rescale;
     private final long rescaleFactor;
@@ -172,8 +180,7 @@ public final class NativeParquetColumnReader implements NativeParquetColumn, Row
             String name, int batchRows, BufferAllocator allocator) {
         this.column = column;
         this.type = type;
-        org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName stored = column.getPrimitiveType().getPrimitiveTypeName();
-        this.widen = widenOf(stored, sparkType);
+        this.widen = widenOf(column, sparkType);
         this.rescale = rescaleOf(column, sparkType);
         this.rescaleFactor = rescale > 0 && rescale <= 18
                 ? LONG_TEN_POWERS[rescale]
@@ -237,7 +244,21 @@ public final class NativeParquetColumnReader implements NativeParquetColumn, Row
      * The in-place conversion a stored type needs to become the Spark type
      * (Spark's widening updaters).
      */
-    private static int widenOf(org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName stored, DataType sparkType) {
+    private static int widenOf(ColumnDescriptor column, DataType sparkType) {
+        org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName stored = column.getPrimitiveType().getPrimitiveTypeName();
+        org.apache.parquet.schema.LogicalTypeAnnotation a = column.getPrimitiveType().getLogicalTypeAnnotation();
+        boolean unsigned = a instanceof org.apache.parquet.schema.LogicalTypeAnnotation.IntLogicalTypeAnnotation i && !i.isSigned();
+        if (sparkType instanceof org.apache.spark.sql.types.LongType
+                && stored == org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.INT32
+                && unsigned
+                && ((org.apache.parquet.schema.LogicalTypeAnnotation.IntLogicalTypeAnnotation) a).getBitWidth() == 32) {
+            return WIDEN_UINT32_TO_LONG;
+        }
+        if (sparkType instanceof org.apache.spark.sql.types.DecimalType d
+                && d.precision() > 18
+                && (stored == org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.INT32 || stored == org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.INT64)) {
+            return unsigned ? WIDEN_ULONG_TO_DEC128 : WIDEN_LONG_TO_DEC128;
+        }
         if (sparkType instanceof org.apache.spark.sql.types.DoubleType) {
             if (stored == org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.INT32) {
                 return WIDEN_INT_TO_DOUBLE;
@@ -276,6 +297,28 @@ public final class NativeParquetColumnReader implements NativeParquetColumn, Row
     private void widenLane(java.lang.foreign.MemorySegment data, java.lang.foreign.MemorySegment validity, int n) {
         if (widen == WIDEN_DAYS_TO_MICROS) {
             rebase.daysToMicros(data, validity, n);
+            return;
+        }
+        if (widen == WIDEN_UINT32_TO_LONG) {
+            for (int i = 0; i < n; i++) {
+                long at = (long) i << 3;
+                data.set(LONG_LE, at, data.get(LONG_LE, at) & 0xFFFFFFFFL);
+            }
+            return;
+        }
+        if (widen == WIDEN_LONG_TO_DEC128 || widen == WIDEN_ULONG_TO_DEC128) {
+            // From the last slot down, so no 8-byte value is overwritten before it is moved.
+            boolean signed = widen == WIDEN_LONG_TO_DEC128;
+            for (int i = n - 1; i >= 0; i--) {
+                long v = data.get(LONG_LE, (long) i << 3);
+                long at = (long) i << 4;
+                data.set(LONG_LE, at, v);
+                data.set(LONG_LE, at + 8,
+                        signed ? v >> 63 : 0L);
+            }
+            if (rescale > 0) {
+                rescale128(data, validity, n);
+            }
             return;
         }
         if (widen != WIDEN_NONE) {

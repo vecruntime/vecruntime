@@ -34,6 +34,16 @@ import org.apache.spark.sql.types.{DataType, IntegerType, LongType, StringType}
  * Only for joins that drop a streamed row without a match: inner joins and left semi joins with the build
  * on the right. A null key never matches, and neither filter keeps one.
  */
+/** A native scan that takes the runtime filters of the joins above it (#610), set on the driver. */
+trait RuntimeFilterTarget {
+
+  /** Adds `f`, ANDed with the scan's static pushed filters, before the scan's RDD is made. */
+  private[vecruntime] def addRuntimeFilter(f: sources.Filter): Unit
+
+  /** Whether `name` is a column of the files the scan reads, which their statistics can rule out. */
+  private[vecruntime] def isDataColumn(name: String): Boolean
+}
+
 object VectorRuntimeFilters {
 
   /** The supported key types: integer and string columns. */
@@ -52,10 +62,13 @@ object VectorRuntimeFilters {
   /**
    * The native scan under `plan` producing `a` unchanged, and its attribute there: through filters,
    * projections (a column, or an alias of one) and the streamed side of an eligible join, which passes its
-   * streamed rows' columns through.
+   * streamed rows' columns through. A native Parquet scan, or a native Iceberg scan (#735: its Parquet copy
+   * gets these filters, so an Iceberg table read without them reads row groups the copy skips -- q99 at 3 TB
+   * read 2909 of catalog_sales' row groups against the copy's 825).
    */
-  def scanFor(plan: SparkPlan, a: Attribute): Option[(VectorParquetScanExec, Attribute)] = plan match {
+  def scanFor(plan: SparkPlan, a: Attribute): Option[(RuntimeFilterTarget, Attribute)] = plan match {
     case s: VectorParquetScanExec => s.output.find(_.exprId == a.exprId).map(x => (s, x))
+    case s: VectorIcebergScanExec => s.output.find(_.exprId == a.exprId).map(x => (s, x))
     case f: VectorFilterExec => scanFor(f.child, a)
     case p: VectorProjectExec =>
       p.projectList.find(_.exprId == a.exprId).collect {
