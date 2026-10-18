@@ -191,6 +191,67 @@ class IcebergNativeScanSuite extends IcebergMorSuiteBase {
     }
   }
 
+  icebergTest("Iceberg's task groups are packed into tasks as Spark packs a file scan's splits") {
+    // Small files, each its own task group (a 1 KB split target).
+    spark.sql(
+      s"CREATE OR REPLACE TABLE $Db.t_pack (a INT, b BIGINT, s STRING) USING iceberg " +
+        "TBLPROPERTIES ('read.split.target-size'='1024')"
+    )
+    spark.sql(
+      s"INSERT INTO $Db.t_pack SELECT CAST(id AS INT), id * 3, concat('s', CAST(id % 40 AS STRING)) " +
+        "FROM range(0, 20000, 1, 16)"
+    )
+    useTable("t_pack")
+    def tasks(df: DataFrame): Int = scans(df).map(_.executeColumnar().getNumPartitions).sum
+    val sql = "SELECT s, count(*), sum(b) FROM t WHERE a % 7 <> 3 GROUP BY s"
+    val off = withConf(VectorConf.ScanNativeIcebergPackSplits -> "false") { checkVectorized(sql, Seq(Filter, Agg)) }
+    val on = checkVectorized(sql, Seq(Filter, Agg))
+    assert(tasks(off) >= 16, s"${tasks(off)} tasks unpacked")
+    assert(tasks(on) < tasks(off), s"${tasks(on)} tasks packed, ${tasks(off)} unpacked")
+    // Packed to fill the cores: never fewer tasks than Spark's own packing of the same bytes would make.
+    withConf("spark.sql.files.minPartitionNum" -> "4") {
+      val four = checkVectorized(sql, Seq(Filter, Agg))
+      assert(tasks(four) >= 4 && tasks(four) <= tasks(off), s"${tasks(four)} tasks with minPartitionNum 4")
+    }
+    // A table with deletes keeps its rows when its groups are packed.
+    spark.sql(s"DELETE FROM $Db.t_pack WHERE a % 11 = 4")
+    checkVectorized(sql, Seq(Filter, Agg))
+    assert(count("SELECT count(*) FROM t") === 20000 - (0 until 20000).count(_ % 11 == 4))
+  }
+
+  icebergTest("a broadcast join's build keys skip the fact's row groups, by field id (#610 on Iceberg)") {
+    sortedTable("t_rf")
+    spark.sql(
+      s"CREATE OR REPLACE TABLE $Db.t_rf_dim USING iceberg AS " +
+        "SELECT CAST(id AS INT) AS k, id * 3 AS lk, concat('d', CAST(id AS STRING)) AS name FROM range(0, 20000)"
+    )
+    // The dimension is filtered on its name, not its key: Spark infers nothing for the fact side.
+    for (
+      (sql, inMax) <- Seq(
+        s"SELECT count(*), sum(f.b) FROM $Db.t_rf f JOIN $Db.t_rf_dim d ON f.a = d.k WHERE d.name LIKE 'd12__'" -> "1024",
+        s"SELECT count(*), sum(f.b) FROM $Db.t_rf f JOIN $Db.t_rf_dim d ON f.a = d.k WHERE d.name LIKE 'd12__'" -> "10",
+        s"SELECT count(*), sum(f.a) FROM $Db.t_rf f JOIN $Db.t_rf_dim d ON f.b = d.lk " +
+          "WHERE d.name LIKE 'd31__' AND f.s <> 's1'" -> "1024"
+      )
+    ) withConf(VectorConf.JoinRuntimeFiltersInMax -> inMax) {
+      val off = withConf(VectorConf.JoinRuntimeFilters -> "false") { checkVectorized(sql, Seq(Agg)) }
+      val on = withConf(VectorConf.JoinRuntimeFilters -> "true") { checkVectorized(sql, Seq(Agg)) }
+      def rf(df: DataFrame) = scans(df).map(_.metrics("numRuntimeFilters").value).sum
+      assert(rf(off) === 0)
+      assert(rf(on) > 0, s"$sql\n${finalPlan(on).treeString}")
+      assert(rowGroups(on) * 5 < rowGroups(off), s"read ${rowGroups(on)} of ${rowGroups(off)} row groups: $sql")
+    }
+    // A left join keeps every fact row: no filter.
+    val left = withConf(VectorConf.JoinRuntimeFilters -> "true") {
+      checkVectorized(
+        s"SELECT count(*), count(d.name) FROM $Db.t_rf f LEFT JOIN " +
+          s"(SELECT * FROM $Db.t_rf_dim WHERE name LIKE 'd12__') d ON f.a = d.k",
+        Seq(Agg)
+      )
+    }
+    assert(scans(left).map(_.metrics("numRuntimeFilters").value).sum === 0)
+  }
+
   icebergTest("a pushed filter on a renamed column skips row groups of the files written before the rename") {
     sortedTable("t_push_ren")
     spark.sql(s"ALTER TABLE $Db.t_push_ren RENAME COLUMN a TO a2")

@@ -80,7 +80,7 @@ case class VectorParquetScanExec(
     scan: FileSourceScanExec,
     /** #611: the condition of the filter above, decoded first (see `markDecodeFilters`); None by default. */
     decodeFilter: Option[org.apache.spark.sql.catalyst.expressions.Expression] = None
-) extends LeafExecNode with VectorPlan {
+) extends LeafExecNode with VectorPlan with RuntimeFilterTarget {
 
   override val output: Seq[Attribute] = scan.output
   override def outputPartitioning: Partitioning = scan.outputPartitioning
