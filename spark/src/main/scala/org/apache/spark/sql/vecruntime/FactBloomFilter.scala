@@ -107,7 +107,7 @@ case class FactBloomFilter(session: SparkSession) extends Rule[LogicalPlan] with
     budget -= countBlooms(reduced) - countBlooms(plan)
     reduced.transformUp {
       case j @ ExtractEquiJoinKeys(jt, leftKeys, rightKeys, _, _, left, right, hint)
-          if budget > 0 && !canBroadcastBySize(left, conf) && !canBroadcastBySize(right, conf) &&
+          if budget > 0 && !smallBySize(left, conf) && !smallBySize(right, conf) &&
             !hintToBroadcastLeft(hint) && !hintToBroadcastRight(hint) =>
         var newLeft = left
         var newRight = right
@@ -407,7 +407,7 @@ case class FactBloomFilter(session: SparkSession) extends Rule[LogicalPlan] with
   private def transitive(plan: LogicalPlan, conf: SQLConf): LogicalPlan = plan.transformDown {
     case j @ ExtractEquiJoinKeys(Inner, leftKeys, rightKeys, _, _, left, right, _) =>
       def reduceWith(x: LogicalPlan, d: LogicalPlan, xKeys: Seq[Expression], dKeys: Seq[Expression]): LogicalPlan =
-        if (!canBroadcastBySize(d, conf) || !KeyStats.reduced(d) || canBroadcastBySize(x, conf)) x
+        if (!smallBySize(d, conf) || !KeyStats.reduced(d) || smallBySize(x, conf)) x
         else xKeys.zip(dKeys).foldLeft(x) {
           case (acc, (xk: org.apache.spark.sql.catalyst.expressions.Attribute, dk)) if dk.references.nonEmpty =>
             belowShuffleJoin(acc, xk, dimensionFilter(d, dk), conf).getOrElse(acc)
@@ -426,6 +426,21 @@ case class FactBloomFilter(session: SparkSession) extends Rule[LogicalPlan] with
   }
 
   /**
+   * Whether `p` is small enough to be broadcast: Spark's size estimate, or -- as [[V2BroadcastBySize]] judges the
+   * broadcast later -- a DSv2 (Iceberg) scan under projections and filters whose planned files are within the
+   * threshold though its rows-times-column-widths estimate is not (#735). With Spark's estimate alone, a join with
+   * such a dimension looked like a shuffle join on Iceberg and was given filters its Parquet copy, a broadcast join,
+   * is not: once [[V2RuntimeFilterBySize]] drops Spark's filters on 3 TB q7's `store_sales` (`promotion`'s key, 1,792
+   * of its 1,800 rows, 74 s of probe CPU to remove 0.4 % of 1.66 G rows), this rule would plant them again.
+   */
+  private def smallBySize(p: LogicalPlan, conf: SQLConf): Boolean =
+    canBroadcastBySize(p, conf) || {
+      val threshold = conf.autoBroadcastJoinThreshold
+      threshold >= 0 && VectorConf.v2BroadcastBySizeEnabled(conf) &&
+      V2BroadcastBySize.smallByFiles(p, threshold, VectorConf.v2BroadcastBySizeMaxEstimatedBytes(conf))
+    }
+
+  /**
    * `p` with the dimension filter on the scan of the input holding `key` of the first shuffle join (both inputs
    * too large to broadcast) found under it; `None` if there is none, or the key's input is not a plain scan.
    */
@@ -442,7 +457,7 @@ case class FactBloomFilter(session: SparkSession) extends Rule[LogicalPlan] with
       val inLeft = l.outputSet.contains(key)
       val side = if (inLeft) l else r
       if (!inLeft && !r.outputSet.contains(key)) None
-      else if (!canBroadcastBySize(l, conf) && !canBroadcastBySize(r, conf))
+      else if (!smallBySize(l, conf) && !smallBySize(r, conf))
         onScan(side, key, 0L, mk).map(c => if (inLeft) jn.copy(left = c) else jn.copy(right = c))
       else belowShuffleJoin(side, key, mk, conf).map(c => if (inLeft) jn.copy(left = c) else jn.copy(right = c))
     case _ => None

@@ -117,4 +117,56 @@ class IcebergFactBloomFilterSuite extends VectorQuerySuite {
         |  ON a.ss_ticket_number = sr_ticket_number GROUP BY a.ss_item_sk""".stripMargin
     run(sql)
   }
+
+  test("a dimension small by its files is a broadcast, so the fact gets no filter through it (q7, #735)", IcebergTest) {
+    // q7's shape: the fact joined to a dimension whose Iceberg estimate (rows times default column widths) is above
+    // the broadcast threshold while its files are far below it, then to a small, weakly filtered dimension. Its
+    // Parquet copy broadcasts both, so the fact gets no bloom filter. On Iceberg, Spark's own runtime filter rule ran
+    // before the file-size broadcast hints, took the first join for a shuffle join and probed the fact with both
+    // dimensions' keys; the fact bloom filter judged the join by the same estimate.
+    spark.sql(
+      s"""CREATE OR REPLACE TABLE $Db.q7_cdemo USING iceberg AS
+         |SELECT id AS cd_demo_sk, IF(id % 2 = 0, 'M', 'F') AS cd_gender, IF(id % 3 = 0, 'S', 'M') AS cd_marital,
+         |  'College' AS cd_education, 'Good' AS cd_credit
+         |FROM range(0, 20000)""".stripMargin
+    )
+    spark.sql(
+      s"""CREATE OR REPLACE TABLE $Db.q7_promo USING iceberg AS
+         |SELECT id AS p_promo_sk, IF(id % 200 = 0, 'Y', 'N') AS p_channel FROM range(0, 1800)""".stripMargin
+    )
+    spark.sql(
+      s"""CREATE OR REPLACE TABLE $Db.q7_sales USING iceberg AS
+         |SELECT id % 20000 AS ss_cdemo_sk, id % 1800 AS ss_promo_sk, id % 13 AS ss_quantity,
+         |  lpad(CAST(id * 2654435761 AS STRING), 40, '0') AS ss_pad
+         |FROM range(0, 60000)""".stripMargin
+    )
+    def scanOf(t: String) = spark.table(s"$Db.$t").queryExecution.optimizedPlan.collectFirst {
+      case s: DataSourceV2ScanRelation => s
+    }.get
+    val cdemo = scanOf("q7_cdemo")
+    val cdemoFiles = org.apache.spark.sql.vecruntime.V2BroadcastBySize.plannedBytes(cdemo).get
+    val salesFiles = org.apache.spark.sql.vecruntime.V2BroadcastBySize.plannedBytes(scanOf("q7_sales")).get
+    // A threshold above the dimension's files, below its estimate and the fact's files.
+    val threshold = cdemoFiles * 4
+    assert(
+      cdemo.stats.sizeInBytes > threshold && salesFiles > threshold,
+      s"cdemo files $cdemoFiles, estimate ${cdemo.stats.sizeInBytes}; sales files $salesFiles"
+    )
+    val sql =
+      s"""SELECT ss_quantity, count(*) c, max(ss_pad) p
+         |FROM $Db.q7_sales JOIN $Db.q7_cdemo ON ss_cdemo_sk = cd_demo_sk
+         |JOIN $Db.q7_promo ON ss_promo_sk = p_promo_sk
+         |WHERE cd_gender = 'M' AND cd_marital = 'S' AND p_channel = 'N'
+         |GROUP BY ss_quantity""".stripMargin
+    withConf(
+      "spark.sql.autoBroadcastJoinThreshold" -> threshold.toString,
+      "spark.sql.optimizer.runtime.bloomFilter.applicationSideScanSizeThreshold" -> "0"
+    ) {
+      val expected = withPlugin(enabled = false)(spark.sql(sql).collect())
+      val df = withPlugin(enabled = true) { val d = spark.sql(sql); d.collect(); d }
+      assertRowsEqual(expected, df.collect(), 1e-9, sql)
+      assert(expected.nonEmpty, sql)
+      assert(salesBlooms(df) === 0, df.queryExecution.optimizedPlan.treeString)
+    }
+  }
 }
