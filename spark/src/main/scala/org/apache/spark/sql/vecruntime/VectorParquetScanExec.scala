@@ -450,6 +450,10 @@ private[vecruntime] final class VectorParquetPartitionReader(
    */
   private def fileReadSchema(fileSchema: MessageType): Option[StructType] = {
     if (!readsVariant) return Some(readSchema)
+    // #808: a bare repeated group annotated VARIANT (a list of variants in the legacy one-level form, Hardwood's
+    // repeated_variant_group_test) clips only against Spark's own array<variant>, not the read schema's struct of
+    // binaries: that one file goes to Spark's reader.
+    if (VectorParquetScanExec.hasRepeatedVariantGroup(fileSchema)) return None
     val clipped0 = ParquetReadSupport.clipParquetSchema(fileSchema, readSchema, caseSensitive, useFieldId, false)
     val out = readSchema.fields.clone()
     var changed = false
@@ -897,7 +901,15 @@ private[vecruntime] final class VectorParquetPartitionReader(
       val fileSchema = footer.getFileMetaData.getSchema
       val read = fileReadSchema(fileSchema)
       val clipped =
-        ParquetReadSupport.clipParquetSchema(fileSchema, read.getOrElse(readSchema), caseSensitive, useFieldId, false)
+        // #808: a file going to Spark's reader (read = None) is clipped against Spark's own schema, which is the
+        // only one some files clip against (a bare repeated VARIANT group).
+        ParquetReadSupport.clipParquetSchema(
+          fileSchema,
+          read.getOrElse(requiredSchema),
+          caseSensitive,
+          useFieldId,
+          false
+        )
       val modes = fallbackModes(footer)
       // Encoding is only knowable at read time. If any required column chunk uses an encoding we do not
       // decode (BYTE_STREAM_SPLIT on FIXED_LEN_BYTE_ARRAY, ...) or a column's physical type is not its lane's,
@@ -1660,6 +1672,12 @@ object VectorParquetScanExec {
   def hasFieldIds(t: org.apache.parquet.schema.Type): Boolean =
     (t.getId != null && !t.isInstanceOf[MessageType]) ||
       (!t.isPrimitive && t.asGroupType().getFields.asScala.exists(hasFieldIds))
+
+  /** #808: whether a Parquet schema holds, at any depth, a repeated group annotated VARIANT (a bare list of them). */
+  def hasRepeatedVariantGroup(t: org.apache.parquet.schema.Type): Boolean =
+    !t.isPrimitive && ((t.isRepetition(org.apache.parquet.schema.Type.Repetition.REPEATED) &&
+      t.getLogicalTypeAnnotation != null && t.getLogicalTypeAnnotation.toString.startsWith("VARIANT")) ||
+      t.asGroupType().getFields.asScala.exists(hasRepeatedVariantGroup))
 
   /**
    * Under field-id matching (#568): whether some clipped field, matched by id, carries the name of a DIFFERENT

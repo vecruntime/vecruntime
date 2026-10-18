@@ -121,7 +121,9 @@ public final class ArrowVectorBuffers implements VectorBuffers {
     public static ArrowVectorBuffers forWrite(ValueVector v, int length, org.apache.spark.sql.types.DataType sparkType) {
         ArrowVectorBuffers b;
         if (vecTypeOf(v) == null
-                && (v instanceof org.apache.arrow.vector.Float4Vector || v instanceof org.apache.arrow.vector.IntervalYearVector || v instanceof org.apache.arrow.vector.DurationVector
+                && (v instanceof org.apache.arrow.vector.Float4Vector
+                        || v instanceof org.apache.arrow.vector.IntervalYearVector
+                        || v instanceof org.apache.arrow.vector.DurationVector
                         || v instanceof org.apache.arrow.vector.TimeNanoVector)) {
             // A column with no engine lane, written by the native Parquet scan on the lane of the same layout
             // (#559): FLOAT's 4-byte bits on INT32, TIME's nanoseconds on INT64 (#787). Deliberately not in

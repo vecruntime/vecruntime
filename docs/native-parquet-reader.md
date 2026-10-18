@@ -97,7 +97,7 @@ What happens when a column is not supported:
 - **Encrypted Parquet** (Parquet modular encryption) is not a feature of the native scan. Decryption is parquet-java's: the scan opens files through `ParquetFileReader` with the Hadoop configuration, so with Spark's crypto factory and KMS settings (`parquet.crypto.factory.class`, ...) parquet-java decrypts the footer and pages and the scan decodes them; without the keys it fails as Spark's reader does. That one path is tested (`NativeParquetPerFileSuite`: footer and two columns encrypted, read with and without the keys); KMS integrations, plaintext footers and per-column key mixes are not, and are Spark's and parquet-java's to support.
 - **`CalendarInterval`** never reaches the scan: Spark cannot write it to Parquet, so no Parquet column holds one. The ANSI interval types it can write are read natively (#812).
 
-**Conformance corpus (#808).** `ParquetCorpusConformanceSuite` reads every file of `apache/parquet-testing` and of Hardwood's test corpus and pins how each one is read; see below.
+**Conformance corpus (#808).** `ParquetCorpusConformanceSuite` reads every file of `apache/parquet-testing` and of Hardwood's test corpus and pins how each one is read; see "Whole-corpus conformance" below.
 
 ## Status at 1 TB TPC-DS
 
@@ -196,6 +196,13 @@ For each encoding:
 - a corrupt file Spark refuses must be refused too.
 
 The corpus approach follows Hardwood (`hardwood-hq/hardwood`), as does bounding every file-declared size before allocating: the `DELTA_BINARY_PACKED` block size, a `BYTE_STREAM_SPLIT` region that is not a whole number of values, and bit-packed runs past the stream end.
+
+**Whole-corpus conformance (#808).** `ParquetCorpusConformanceSuite` reads every Parquet file of `apache/parquet-testing` (`data/` and `bad_data/`, 80 files) and of Hardwood's core test corpus (`spark/src/test/resources/hardwood/`, 223 files, Apache-2.0, commit in its `SOURCE_SHA`): every physical and logical type, encodings, codecs, page and bloom-filter indexes, nested shapes, variants and malformed files. Each file is read with the plugin on and checked against Spark's outcome with it off (its vectorized reader, else its row-based reader, else the refusal): the same rows by value, or both refuse. How the plugin read it is pinned per file, and per column when the file is not native as a whole, in `parquet-corpus-expected.tsv`; a read that changes fails the suite until `CORPUS_UPDATE_BASELINE=true` regenerates the file, so a fallback is always a recorded choice.
+
+Today: 240 files are read natively, 2 are empty, 59 are refused by Spark and by the plugin alike (malformed files; types Spark 4.1 does not read, such as `FLOAT16`, `UUID`, the legacy `INTERVAL` converted type, 12-byte timestamps and geospatial types; encrypted files read without keys; a few legacy list and map shapes Spark rejects), and 2 go to Spark's reader for the file:
+- `list_of_lists_legacy_two_level_test`: a legacy two-level list whose element is a repeated group holding a bare repeated leaf (`list<struct<num: array<int>>>`).
+- `repeated_variant_group_test`: a bare repeated group annotated `VARIANT`, which Spark clips only against its own `array<variant>`.
+The parquet-java reader tests themselves build their files in code; the cases they cover (encodings, page versions, dictionary fallbacks, nulls, nesting, schema evolution, field ids) are exercised by the suites listed under each feature below.
 
 - **BOOLEAN.** **Done**: v1 `PLAIN` (bit-packed, LSB first) and v2 `RLE`, into a `BOOL` lane (Arrow's bit-packed vector). `PLAIN` with every row present copies up to 64 bits a step from any source bit offset to any destination bit offset. With nulls, the bits are scattered one per present row. `flushBool` masks stray bits past the batch's last row. A page that claims more values than it holds fails.
   - Checked against a scalar reference, at every batch size, with nulls and across pages (`ColumnChunkDecoderTest`).

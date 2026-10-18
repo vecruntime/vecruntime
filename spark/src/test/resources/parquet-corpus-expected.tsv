@@ -11,8 +11,7 @@ parquet-testing/data/byte_array_decimal.parquet	*	native
 parquet-testing/data/byte_stream_split.zstd.parquet	*	native
 parquet-testing/data/byte_stream_split_extended.gzip.parquet	*	refused
 parquet-testing/data/column_chunk_key_value_metadata.parquet	*	native-empty
-parquet-testing/data/concatenated_gzip_members.parquet	*	file-fallback
-parquet-testing/data/concatenated_gzip_members.parquet	long_col	file-fallback
+parquet-testing/data/concatenated_gzip_members.parquet	*	native
 parquet-testing/data/data_index_bloom_encoding_stats.parquet	*	native
 parquet-testing/data/data_index_bloom_encoding_with_length.parquet	*	native
 parquet-testing/data/datapage_v1-corrupt-checksum.parquet	*	native
@@ -52,43 +51,7 @@ parquet-testing/data/nan_in_stats.parquet	*	native
 parquet-testing/data/nation.dict-malformed.parquet	*	refused
 parquet-testing/data/nested_lists.snappy.parquet	*	native
 parquet-testing/data/nested_maps.snappy.parquet	*	native
-parquet-testing/data/nested_structs.rust.parquet	*	file-fallback
-parquet-testing/data/nested_structs.rust.parquet	roll_num	file-fallback
-parquet-testing/data/nested_structs.rust.parquet	PC_CUR	file-fallback
-parquet-testing/data/nested_structs.rust.parquet	CVA_2012	file-fallback
-parquet-testing/data/nested_structs.rust.parquet	CVA_2016	file-fallback
-parquet-testing/data/nested_structs.rust.parquet	BIA_3	file-fallback
-parquet-testing/data/nested_structs.rust.parquet	BIA_4	file-fallback
-parquet-testing/data/nested_structs.rust.parquet	ACTUAL_FRONTAGE	file-fallback
-parquet-testing/data/nested_structs.rust.parquet	ACTUAL_DEPTH	file-fallback
-parquet-testing/data/nested_structs.rust.parquet	ACTUAL_LOT_SIZE	file-fallback
-parquet-testing/data/nested_structs.rust.parquet	GLA	file-fallback
-parquet-testing/data/nested_structs.rust.parquet	SOURCE_GLA	file-fallback
-parquet-testing/data/nested_structs.rust.parquet	IPS_GLA	file-fallback
-parquet-testing/data/nested_structs.rust.parquet	GLA_ALL	file-fallback
-parquet-testing/data/nested_structs.rust.parquet	bia	file-fallback
-parquet-testing/data/nested_structs.rust.parquet	EFFECTIVE_LOT_SIZE	file-fallback
-parquet-testing/data/nested_structs.rust.parquet	effective_lot_area	file-fallback
-parquet-testing/data/nested_structs.rust.parquet	EFFECTIVE_FRONTAGE	file-fallback
-parquet-testing/data/nested_structs.rust.parquet	EFFECTIVE_DEPTH	file-fallback
-parquet-testing/data/nested_structs.rust.parquet	rw_area_tot	file-fallback
-parquet-testing/data/nested_structs.rust.parquet	effective_lot_sqft	file-fallback
-parquet-testing/data/nested_structs.rust.parquet	dup	file-fallback
-parquet-testing/data/nested_structs.rust.parquet	nonCTXT	file-fallback
-parquet-testing/data/nested_structs.rust.parquet	vacantland	file-fallback
-parquet-testing/data/nested_structs.rust.parquet	parkingbillboard	file-fallback
-parquet-testing/data/nested_structs.rust.parquet	cvalte10	file-fallback
-parquet-testing/data/nested_structs.rust.parquet	condootherhotel	file-fallback
-parquet-testing/data/nested_structs.rust.parquet	calculated_lot_size	file-fallback
-parquet-testing/data/nested_structs.rust.parquet	calculated_efflot_size	file-fallback
-parquet-testing/data/nested_structs.rust.parquet	missingsite	file-fallback
-parquet-testing/data/nested_structs.rust.parquet	missinggla	file-fallback
-parquet-testing/data/nested_structs.rust.parquet	missingsitegla	file-fallback
-parquet-testing/data/nested_structs.rust.parquet	actual_lot_size_sqft	file-fallback
-parquet-testing/data/nested_structs.rust.parquet	lotsize_sqft	file-fallback
-parquet-testing/data/nested_structs.rust.parquet	count	file-fallback
-parquet-testing/data/nested_structs.rust.parquet	ul_observation_date	file-fallback
-parquet-testing/data/nested_structs.rust.parquet	ul_tz_offset_minutes_ul_observation_date	file-fallback
+parquet-testing/data/nested_structs.rust.parquet	*	native
 parquet-testing/data/non_hadoop_lz4_compressed.parquet	*	refused
 parquet-testing/data/nonnullable.impala.parquet	*	native
 parquet-testing/data/null_list.parquet	*	native
@@ -119,13 +82,7 @@ hardwood/address_book_test.parquet	*	native
 hardwood/annotated_list_element_group_test.parquet	*	refused
 hardwood/annotated_repeated_group_test.parquet	*	refused
 hardwood/avro_name_resolution.parquet	*	native
-hardwood/avro_variant_identity_test.parquet	*	plan-fallback: nested or complex column real_variant:struct<0:variant>
-hardwood/avro_variant_identity_test.parquet	plain_top	native
-hardwood/avro_variant_identity_test.parquet	plain_container	native
-hardwood/avro_variant_identity_test.parquet	plain_list	native
-hardwood/avro_variant_identity_test.parquet	plain_map	native
-hardwood/avro_variant_identity_test.parquet	real_variant	plan-fallback: nested or complex column real_variant:struct<0:variant>
-hardwood/avro_variant_identity_test.parquet	variant_container	plan-fallback: nested or complex column variant_container:struct<real_nested_variant:variant>
+hardwood/avro_variant_identity_test.parquet	*	native
 hardwood/batch_array_identity_test.parquet	*	native
 hardwood/bloom_filter_multi_rg_dict_index_test.parquet	*	native
 hardwood/bloom_filter_multi_rg_test.parquet	*	native
@@ -163,9 +120,7 @@ hardwood/compat_required.parquet	*	native
 hardwood/compat_ts_micros.parquet	*	native
 hardwood/compat_ts_millis.parquet	*	native
 hardwood/convert_fidelity_test.parquet	*	native
-hardwood/convert_variant_null_test.parquet	*	plan-fallback: nested or complex column var:struct<0:variant>
-hardwood/convert_variant_null_test.parquet	id	native
-hardwood/convert_variant_null_test.parquet	var	plan-fallback: nested or complex column var:struct<0:variant>
+hardwood/convert_variant_null_test.parquet	*	native
 hardwood/deep_nested_struct_test.parquet	*	native
 hardwood/delta_binary_packed_optional_test.parquet	*	native
 hardwood/delta_binary_packed_test.parquet	*	native
@@ -273,17 +228,7 @@ hardwood/multi_file_part0.parquet	*	native
 hardwood/multi_file_part1.parquet	*	native
 hardwood/multi_row_group_page_index.parquet	*	native
 hardwood/negative_data_page_offset.parquet	*	refused
-hardwood/nested_binary_test.parquet	*	plan-fallback: nested or complex column var:struct<0:variant>
-hardwood/nested_binary_test.parquet	id	native
-hardwood/nested_binary_test.parquet	blob	native
-hardwood/nested_binary_test.parquet	blobs	native
-hardwood/nested_binary_test.parquet	holder	native
-hardwood/nested_binary_test.parquet	by_name	native
-hardwood/nested_binary_test.parquet	fixed	native
-hardwood/nested_binary_test.parquet	fixeds	native
-hardwood/nested_binary_test.parquet	fixed_holder	native
-hardwood/nested_binary_test.parquet	fixed_by_name	native
-hardwood/nested_binary_test.parquet	var	plan-fallback: nested or complex column var:struct<0:variant>
+hardwood/nested_binary_test.parquet	*	native
 hardwood/nested_dict_batch_boundary.parquet	*	native
 hardwood/nested_dict_no_dict_offset_v2.parquet	*	native
 hardwood/nested_dict_understated_offset_v1.parquet	*	native
@@ -331,9 +276,9 @@ hardwood/primitive_lists_test.parquet	*	native
 hardwood/primitive_types_test.parquet	*	native
 hardwood/repeated_legacy_map_test.parquet	*	refused
 hardwood/repeated_variant_group_plain_test.parquet	*	native
-hardwood/repeated_variant_group_test.parquet	*	plan-fallback: nested or complex column foo:array<variant>
+hardwood/repeated_variant_group_test.parquet	*	file-fallback
 hardwood/repeated_variant_group_test.parquet	id	native
-hardwood/repeated_variant_group_test.parquet	foo	plan-fallback: nested or complex column foo:array<variant>
+hardwood/repeated_variant_group_test.parquet	foo	file-fallback
 hardwood/shared_leaf_name_test.parquet	*	native
 hardwood/simple_map_test.parquet	*	native
 hardwood/size_statistics_test.parquet	*	native
@@ -347,35 +292,15 @@ hardwood/unannotated_repeated_group_empty_test.parquet	*	native
 hardwood/unannotated_repeated_group_test.parquet	*	native
 hardwood/unannotated_repeated_nested_test.parquet	*	native
 hardwood/unannotated_repeated_primitive_test.parquet	*	native
-hardwood/unsigned_int_nested_test.parquet	*	file-fallback
-hardwood/unsigned_int_nested_test.parquet	id	native
-hardwood/unsigned_int_nested_test.parquet	point	file-fallback
-hardwood/unsigned_int_nested_test.parquet	flags	file-fallback
-hardwood/unsigned_int_nested_test.parquet	counters	file-fallback
-hardwood/unsigned_int_test.parquet	*	file-fallback
-hardwood/unsigned_int_test.parquet	id	file-fallback
-hardwood/unsigned_int_test.parquet	uint32_val	file-fallback
-hardwood/unsigned_int_test.parquet	uint64_val	file-fallback
+hardwood/unsigned_int_nested_test.parquet	*	native
+hardwood/unsigned_int_test.parquet	*	native
 hardwood/uuid_list_test.parquet	*	refused
-hardwood/variant_attributes_example.parquet	*	plan-fallback: nested or complex column value:struct<0:variant>
-hardwood/variant_attributes_example.parquet	id	native
-hardwood/variant_attributes_example.parquet	name	native
-hardwood/variant_attributes_example.parquet	value	plan-fallback: nested or complex column value:struct<0:variant>
-hardwood/variant_in_repeated_test.parquet	*	plan-fallback: nested or complex column top_var:struct<0:variant>
-hardwood/variant_in_repeated_test.parquet	id	native
-hardwood/variant_in_repeated_test.parquet	top_var	plan-fallback: nested or complex column top_var:struct<0:variant>
-hardwood/variant_in_repeated_test.parquet	var_map	plan-fallback: nested or complex column var_map:map<string,variant>
-hardwood/variant_in_repeated_test.parquet	var_list	plan-fallback: nested or complex column var_list:array<variant>
-hardwood/variant_metadata_offset_size2.parquet	*	plan-fallback: nested or complex column var:struct<0:variant>
-hardwood/variant_metadata_offset_size2.parquet	id	native
-hardwood/variant_metadata_offset_size2.parquet	var	plan-fallback: nested or complex column var:struct<0:variant>
-hardwood/variant_negative_dict_size.parquet	*	plan-fallback: nested or complex column var:struct<0:variant>
-hardwood/variant_negative_dict_size.parquet	id	native
-hardwood/variant_negative_dict_size.parquet	var	plan-fallback: nested or complex column var:struct<0:variant>
+hardwood/variant_attributes_example.parquet	*	native
+hardwood/variant_in_repeated_test.parquet	*	native
+hardwood/variant_metadata_offset_size2.parquet	*	native
+hardwood/variant_negative_dict_size.parquet	*	native
 hardwood/variant_shredded_in_struct_test.parquet	*	refused
 hardwood/variant_shredded_test.parquet	*	refused
-hardwood/variant_test.parquet	*	plan-fallback: nested or complex column var:struct<0:variant>
-hardwood/variant_test.parquet	id	native
-hardwood/variant_test.parquet	var	plan-fallback: nested or complex column var:struct<0:variant>
+hardwood/variant_test.parquet	*	native
 hardwood/wide_struct_test.parquet	*	refused
 hardwood/yellow_tripdata_sample.parquet	*	native
