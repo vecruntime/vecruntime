@@ -157,6 +157,7 @@ public final class ColumnChunkDecoder {
     private RleBitPackingReader boolReader; // BOOL RLE: the page's 1-bit hybrid value stream
     private long pageEndExclusive; // PLAIN: one past the last byte of the page's value region
     private int fixedLength; // UTF8 staging of a FIXED_LEN_BYTE_ARRAY column: the value width (0: length-prefixed)
+    private byte[] bssPlain = new byte[0]; // #812: a BYTE_STREAM_SPLIT FIXED_LEN_BYTE_ARRAY page in PLAIN order
 
     // ---- reused per-batch scratch ----
     private int[] idScratch = new int[0]; // dictionary ids for a page-slice
@@ -521,6 +522,31 @@ public final class ColumnChunkDecoder {
             this.binarySrc = page.data;
             this.dbaPrevStart = -1;
             this.dbaPrevLen = 0;
+        } else if (page.encoding == ParquetPageDecoder.Encoding.BYTE_STREAM_SPLIT && physicalType == VecType.UTF8 && fixedLength > 0) {
+            // #812: FIXED_LEN_BYTE_ARRAY (a decimal, a binary): its fixedLength streams are put back into
+            // PLAIN order once per page, into a buffer the decoder reuses, and the page is read as PLAIN.
+            this.idReader = null;
+            int len = (int) (page.dataEnd() - valuesStart);
+            if (len < 0 || len % fixedLength != 0) {
+                throw new IllegalStateException("BYTE_STREAM_SPLIT: a " + len + "-byte value region is not a whole number of " + fixedLength + "-byte values");
+            }
+            int count = len / fixedLength;
+            if (bssPlain.length < len) {
+                bssPlain = new byte[Math.max(len, 2 * bssPlain.length)];
+            }
+            byte[] src = page.data;
+            int from = (int) valuesStart;
+            for (int j = 0; j < fixedLength; j++) {
+                int stream = from + j * count;
+                for (int i = 0; i < count; i++) {
+                    bssPlain[i * fixedLength + j] = src[stream + i];
+                }
+            }
+            this.pageData = bssPlain;
+            this.pageEncoding = ParquetPageDecoder.Encoding.PLAIN;
+            this.plainCursor = 0;
+            this.utf8PlainCursor = 0;
+            this.pageEndExclusive = len;
         } else if (page.encoding == ParquetPageDecoder.Encoding.BYTE_STREAM_SPLIT) {
             if (physicalType == VecType.UTF8) {
                 throw new IllegalArgumentException("BYTE_STREAM_SPLIT on a UTF8 lane");
