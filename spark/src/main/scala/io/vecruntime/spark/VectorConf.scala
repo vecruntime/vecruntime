@@ -212,6 +212,16 @@ object VectorConf {
    */
   val ScanNativeIceberg = "spark.vecruntime.scan.nativeIceberg.enabled"
 
+  /**
+   * #735: VectorIcebergScanExec packs Iceberg's task groups into Spark tasks as Spark packs the files of a Parquet
+   * scan: up to `spark.sql.files.maxPartitionBytes`, lowered to fill `spark.sql.files.minPartitionNum` (default the
+   * leaf parallelism) cores, each file costing `spark.sql.files.openCostInBytes` more. Iceberg's adaptive split size
+   * aims at one split per core with a 16 MB floor and never combines files of 19 MB: at 3 TB q40 read
+   * `catalog_sales` in 1014 tasks against its Parquet copy's 338, each paying a file open and footer read.
+   * Only when the scan reports no partitioning (a storage-partitioned join keeps Iceberg's groups).
+   */
+  val ScanNativeIcebergPackSplits = "spark.vecruntime.scan.nativeIceberg.packSplits"
+
   /** VectorParquetScanExec read-ahead (#559/#566): files of a split opened ahead, `0` off. */
   val ScanNativeParquetPrefetchFiles = "spark.vecruntime.scan.nativeParquet.prefetchFiles"
 
@@ -560,6 +570,8 @@ object VectorConf {
   /** #735: VectorIcebergScanExec, behind the native Parquet scan's own switch too. */
   def scanNativeIceberg(conf: SQLConf): Boolean =
     bool(conf, ScanNativeIceberg, default = false) && scanNativeParquet(conf)
+
+  def scanNativeIcebergPackSplits(conf: SQLConf): Boolean = bool(conf, ScanNativeIcebergPackSplits, default = true)
 
   /** Whether Comet's scan is active in this session: its plugin or extension registered and its scan not off. */
   def cometScanActive(conf: SQLConf): Boolean = {
