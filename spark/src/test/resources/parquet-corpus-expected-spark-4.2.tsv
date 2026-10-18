@@ -1,0 +1,3 @@
+hardwood/geospatial_e2e_test.parquet	*	plan-fallback: unsupported column type location:geometry(4326)
+hardwood/geospatial_e2e_test.parquet	city_name	native
+hardwood/geospatial_e2e_test.parquet	location	plan-fallback: unsupported column type location:geometry(4326)

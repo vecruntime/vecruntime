@@ -143,8 +143,19 @@ class ParquetCorpusConformanceSuite extends VectorQuerySuite {
 
   private val baselineName = "parquet-corpus-expected.tsv"
 
-  private def baselinePath: java.nio.file.Path =
-    Paths.get(sys.props.getOrElse("user.dir", "."), "src", "test", "resources", baselineName)
+  /** The Spark line the base baseline is recorded on. */
+  private val baseLine = "4.1"
+
+  /** This run's Spark line, major.minor. */
+  private val sparkLine = org.apache.spark.SPARK_VERSION.split('.').take(2).mkString(".")
+
+  private def resourcePath(name: String): java.nio.file.Path =
+    Paths.get(sys.props.getOrElse("user.dir", "."), "src", "test", "resources", name)
+
+  private def readBaseline(name: String): Option[Seq[String]] =
+    Option(getClass.getClassLoader.getResource(name)).map(url =>
+      new String(Files.readAllBytes(Paths.get(url.toURI)), StandardCharsets.UTF_8).linesIterator.toSeq
+    )
 
   test("every corpus file reads as Spark reads it, and each read is the recorded native read or fallback (#808)") {
     assert(corpus.size > 300, s"corpus has only ${corpus.size} files")
@@ -162,18 +173,32 @@ class ParquetCorpusConformanceSuite extends VectorQuerySuite {
     }
     val text = actual.mkString("", "\n", "\n")
     val update = sys.env.get("CORPUS_UPDATE_BASELINE").contains("true")
+    val base = readBaseline(baselineName)
+    // A Spark line other than the base's (4.1) reads some files differently -- Spark 4.2 reads geospatial types --
+    // so its overlay replaces the base's lines for exactly those files.
+    val overlayName = s"parquet-corpus-expected-spark-$sparkLine.tsv"
+    def fileOf(l: String) = l.takeWhile(_ != '\t')
     // Written before the mismatch check, so a run that finds a mismatch still records every other file's read.
-    if (update) Files.write(baselinePath, text.getBytes(StandardCharsets.UTF_8))
+    if (update) {
+      if (sparkLine == baseLine) Files.write(resourcePath(baselineName), text.getBytes(StandardCharsets.UTF_8))
+      else {
+        val baseByFile = base.getOrElse(Nil).groupBy(fileOf)
+        val differing = actual.groupBy(fileOf).filter { case (f, ls) => baseByFile.get(f).forall(_ != ls) }.keySet
+        val overlay = actual.filter(l => differing.contains(fileOf(l)))
+        Files.write(resourcePath(overlayName), overlay.mkString("", "\n", "\n").getBytes(StandardCharsets.UTF_8))
+      }
+    }
     assert(failures.isEmpty, s"${failures.size} corpus files differ from Spark:\n${failures.mkString("\n")}")
     if (!update) {
-      val url = getClass.getClassLoader.getResource(baselineName)
-      assert(url != null, s"missing $baselineName; run with CORPUS_UPDATE_BASELINE=true")
-      val expected = new String(Files.readAllBytes(Paths.get(url.toURI)), StandardCharsets.UTF_8).linesIterator.toSeq
+      assert(base.isDefined, s"missing $baselineName; run with CORPUS_UPDATE_BASELINE=true")
+      val overlay = if (sparkLine == baseLine) Nil else readBaseline(overlayName).getOrElse(Nil)
+      val replaced = overlay.map(fileOf).toSet
+      val expected = base.get.filterNot(l => replaced.contains(fileOf(l))) ++ overlay
       val moved = (expected.diff(actual).map("- " + _) ++ actual.diff(expected).map("+ " + _)).sorted
       assert(
         moved.isEmpty,
-        s"corpus reads moved from $baselineName (rerun with CORPUS_UPDATE_BASELINE=true if intended):\n" +
-          moved.mkString("\n")
+        s"corpus reads moved from $baselineName${if (overlay.nonEmpty) s" + $overlayName" else ""} on Spark " +
+          s"$sparkLine (rerun with CORPUS_UPDATE_BASELINE=true if intended):\n" + moved.mkString("\n")
       )
     }
     val counts = actual.filter(_.split('\t')(1) == "*").groupBy(_.split('\t')(2).takeWhile(_ != ':')).map {
