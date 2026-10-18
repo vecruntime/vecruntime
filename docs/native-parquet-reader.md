@@ -304,6 +304,17 @@ The corpus approach follows Hardwood (`hardwood-hq/hardwood`), as does bounding 
 
   At parity or ahead everywhere but the map (15% behind). The folding through the getters is a large share of both columns. Run with `benchmarks/scripts/run-parquet-e2e.sh`'s classpath and JVM options.
 
+  **#812, the getters.** A profile of the map read put a quarter of its time in Arrow's bounds-checked `isNull`, reached once per element through Spark's `ArrowColumnVector` accessors, and `getInt` and `getUTF8String` check the bit again inside Arrow. `VectorArrowColumnVector` now reads the validity bit, INT32 and INT64 values and string offsets and bytes straight from the buffers' addresses, as Spark's own vectors read theirs, with no allocation; it reads each buffer's address on every call, so a vector refilled between batches is read where it lives now (`VectorArrowColumnVectorSuite`). Same run settings, `-wi 3 -i 6`, ms per read, ours before / after, then Spark in the same session as after:
+
+  | column | ours, main | ours, #812 | Spark |
+  |---|---:|---:|---:|
+  | `map<string, int>` | 108.4 ± 1.6 | 92.6 ± 1.1 | 111.6 ± 2.0 |
+  | `array<string>` | 112.6 ± 5.1 | 101.6 ± 4.3 | 111.0 ± 3.7 |
+  | `array<int>` | | 66.5 ± 1.2 | 86.7 ± 1.5 |
+  | `struct<int, string>` | | 49.5 ± 0.5 | 56.3 ± 0.7 |
+
+  The map now reads 17% faster than Spark's reader. Since every Arrow-backed column a Spark operator reads goes through this wrapper, the gain is not specific to nested columns.
+
   `oursIds` reads the same columns with strings as dictionary ids, as the scan does by default (#612; in structs, lists and maps since #568). Same run settings, ms per read, `ours` / `oursIds`: `array<string>` 115.7 / 103.6, `struct<int, string>` 62.3 / 57.3, `map<string, int>` 112.6 / 109.0 (± 38), `array<struct<int, array<string>>>` 246.0 / 238.6. The read itself gains up to 10%; an operator that groups, joins or compares the strings by id gains more, which this benchmark does not measure.
 
 - **Column-index page filtering** (#568): **done**. `useColumnIndexFilter` is on (Parquet's `parquet.filter.columnindex.enabled` turns it off) for a file whose requested leaves are all flat, top level or in structs. `readNextFilteredRowGroup` then keeps only the pages overlapping the filter's row ranges, and the store carries the selected row indexes. `NativeParquetColumnReader` turns them into ranges and follows them: it moves the decoder to each range's first row, skipping rows within a page and over the pages Parquet dropped (each page's first row index gives the gap), then decodes the range. So every column emits the same selected rows although their pages start at different rows. A list or map counts entries, not rows, so a file that requests one keeps whole row groups. Before this, the column index was off: with it, the columns' pages misaligned. Tests: `NativeParquetColumnIndexSuite`, against Spark's own scan, over sorted data with small pages: every flat type and a struct, v1 and v2 pages, dictionary on and off, one and several ranges, a filter no page matches, `_metadata.row_index`, the switch off, and a file with a list. The native scan must output under a quarter of the rows it reads with the column index off.
