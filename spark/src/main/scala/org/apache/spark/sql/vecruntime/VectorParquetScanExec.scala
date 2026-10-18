@@ -93,6 +93,7 @@ case class VectorParquetScanExec(
     "numRowGroups" -> SQLMetrics.createMetric(sparkContext, "number of row groups read"),
     "numRuntimeFilters" -> SQLMetrics.createMetric(sparkContext, "number of runtime filters from joins"),
     "numLateSkippedRows" -> SQLMetrics.createMetric(sparkContext, "rows the decode filter dropped before decoding"),
+    "numPagesSkipped" -> SQLMetrics.createMetric(sparkContext, "pages the column index skipped"),
     "scanTime" -> SQLMetrics.createTimingMetric(sparkContext, "scan time")
   )
 
@@ -223,7 +224,8 @@ case class VectorParquetScanExec(
       longMetric("numOutputBatches"),
       longMetric("numRowGroups"),
       longMetric("scanTime"),
-      longMetric("numLateSkippedRows")
+      longMetric("numLateSkippedRows"),
+      longMetric("numPagesSkipped")
     )
     val required = requiredSchema
     val partSchema = partitionSchema
@@ -290,7 +292,8 @@ final case class ScanMetrics(
     numOutputBatches: SQLMetric,
     numRowGroups: SQLMetric,
     scanTime: SQLMetric,
-    numLateSkippedRows: SQLMetric
+    numLateSkippedRows: SQLMetric,
+    numPagesSkipped: SQLMetric
 ) extends Serializable
 
 /**
@@ -512,6 +515,23 @@ private[vecruntime] final class VectorParquetPartitionReader(
   private val aheadSizes = new java.util.ArrayDeque[java.lang.Long]()
   private val rgAheadSizes = new java.util.ArrayDeque[java.lang.Long]()
   private var requestedPaths: Set[Seq[String]] = Set.empty // the current file's clipped leaves
+  // #626: the current file requests a repeated leaf (a list or map), and the current row group's selected
+  // rows end each column-index range at these offsets (null when every row is read): a repeated leaf skips
+  // entries only at a batch's start, so a batch never crosses one.
+  private var fileRepeated = false
+  private var rangeBreaks: Array[Int] = _
+  private var rangeBreak = 0
+  // #626: pages the column index dropped, per row group read (on whichever thread read it), until consumed.
+  private val skippedPages = java.util.Collections.synchronizedMap(
+    new java.util.IdentityHashMap[org.apache.parquet.column.page.PageReadStore, java.lang.Long]()
+  )
+
+  /** The end of the current batch's range: the row group's end, or the column-index range's (#626). */
+  private def nextBreak(): Int = {
+    if (rangeBreaks == null) return rgRows
+    while (rangeBreak < rangeBreaks.length && rangeBreaks(rangeBreak) <= rgOffset) rangeBreak += 1
+    if (rangeBreak < rangeBreaks.length) rangeBreaks(rangeBreak) else rgRows
+  }
   private var currentFile: PartitionedFile = _ // the file being read (its batches carry it, #568)
 
   /** Whether one more read-ahead of `bytes` fits; one queued item is always allowed (`queued` = 0). */
@@ -645,7 +665,7 @@ private[vecruntime] final class VectorParquetPartitionReader(
         file = currentFile
       )
     }
-    val n = math.min(batchSize, rgRows - rgOffset)
+    val n = math.min(batchSize, nextBreak() - rgOffset)
     val columns = new Array[ColumnVector](attrs.length)
     val dataVectors = new Array[AnyRef](dataColumnCount)
     // With a decode filter, a column skipped whole is a null vector the batch owns, closed with the constants.
@@ -933,13 +953,13 @@ private[vecruntime] final class VectorParquetPartitionReader(
         .withRange(start, end)
         .withRecordFilter(rowGroupFilter(clipped, footer))
         // Column-index page filtering (#568): readNextFilteredRowGroup then drops the PAGES outside the filter's row
-        // ranges, and the store carries the selected row indexes; each flat leaf follows them (its pages carry
-        // their first row index), so every column emits the same selected rows. A repeated leaf (a list or map)
-        // counts entries, not rows, so a file with one keeps whole row groups. Parquet's own switch
-        // (`parquet.filter.columnindex.enabled`) turns it off. The predicate is still applied above the scan.
+        // ranges, and the store carries the selected row indexes; each leaf follows them (its pages carry their
+        // first row index), so every column emits the same selected rows. A repeated leaf (a list or map, #626)
+        // counts entries, not rows: it skips the entries of the rows before each range, and a batch then never
+        // crosses a range (`rangeBreaks`). Parquet's own switch (`parquet.filter.columnindex.enabled`) turns it
+        // off. The predicate is still applied above the scan.
         .useColumnIndexFilter(
-          hadoopConf.getBoolean(org.apache.parquet.hadoop.ParquetInputFormat.COLUMN_INDEX_FILTERING_ENABLED, true) &&
-            clipped.getColumns.asScala.forall(_.getMaxRepetitionLevel == 0)
+          hadoopConf.getBoolean(org.apache.parquet.hadoop.ParquetInputFormat.COLUMN_INDEX_FILTERING_ENABLED, true)
         )
       // #735: a reused-buffer codec factory (zstd/snappy decompress through one growable byte[] per chunk,
       // read in place by #786) and/or a bounded heap pool for parquet-java's per-row-group chunk buffers.
@@ -954,7 +974,7 @@ private[vecruntime] final class VectorParquetPartitionReader(
       stream = null
       r.setRequestedSchema(clipped)
       // #812: under two-pass the first row group is read by index too (twoPassRowGroup), not ahead here.
-      val first = if (readFirst && !twoPass) r.readNextFilteredRowGroup() else null
+      val first = if (readFirst && !twoPass) VectorParquetPartitionReader.readRowGroup(r, skippedPages) else null
       val p = new Prepared(file, r, clipped, readFirst && !twoPass, first, needsFallback = false, modes, read.get)
       r = null
       p
@@ -992,6 +1012,7 @@ private[vecruntime] final class VectorParquetPartitionReader(
     currentClipped = p.clipped
     twoPassDenseRun = 0
     requestedPaths = p.clipped.getColumns.asScala.map(_.getPath.toSeq).toSet
+    fileRepeated = p.clipped.getColumns.asScala.exists(_.getMaxRepetitionLevel > 0)
     rowGroupIndex = 0
     installedFirst = p.firstStore
     installedFirstPending = p.firstRead
@@ -1126,6 +1147,10 @@ private[vecruntime] final class VectorParquetPartitionReader(
   }
 
   private def startRowGroup(store: org.apache.parquet.column.page.PageReadStore, rowCount: Int): Unit = {
+    val skipped = skippedPages.remove(store)
+    if (skipped != null) metrics.numPagesSkipped += skipped.longValue
+    rangeBreaks = if (fileRepeated) VectorParquetPartitionReader.rangeBreaks(store) else null
+    rangeBreak = 0
     var c = 0
     while (c < dataColumnCount) {
       columnReaders(c).startRowGroup(store, rowCount)
@@ -1149,7 +1174,7 @@ private[vecruntime] final class VectorParquetPartitionReader(
       } else if (twoPass) {
         twoPassRowGroup(rowGroupIndex)
       } else {
-        reader.readNextFilteredRowGroup()
+        VectorParquetPartitionReader.readRowGroup(reader, skippedPages)
       }
     rowGroupIndex += 1
     if (store == null) {
@@ -1360,7 +1385,7 @@ private[vecruntime] final class VectorParquetPartitionReader(
   }
 
   private def readWithTask(r: ParquetFileReader): org.apache.parquet.column.page.PageReadStore =
-    onPrefetchThread(r.readNextFilteredRowGroup())
+    onPrefetchThread(VectorParquetPartitionReader.readRowGroup(r, skippedPages))
 
   /**
    * Runs one prefetched step for this task on a prefetch thread: the task's TaskContext is set for it, and
@@ -1681,6 +1706,7 @@ private[vecruntime] final class VectorParquetPartitionReader(
 
   override def close(): Unit = {
     try {
+      skippedPages.clear()
       releaseEmitted()
       closeFile()
     } finally {
@@ -1702,6 +1728,102 @@ private[vecruntime] final class VectorParquetPartitionReader(
 }
 
 private[vecruntime] object VectorParquetPartitionReader {
+
+  /**
+   * #626: the next row group of `r` (Parquet's `readNextFilteredRowGroup`), recording in `skipped` how many
+   * of its requested pages the column index dropped. Runs on the thread that reads the row group, which is
+   * the only one using `r` then; the offset indexes it reads were already read by Parquet's filter.
+   */
+  def readRowGroup(
+      r: ParquetFileReader,
+      skipped: java.util.Map[org.apache.parquet.column.page.PageReadStore, java.lang.Long]
+  ): org.apache.parquet.column.page.PageReadStore = {
+    val store = r.readNextFilteredRowGroup()
+    if (store != null) {
+      val n = pagesSkipped(r, store)
+      if (n > 0) skipped.put(store, java.lang.Long.valueOf(n))
+    }
+    store
+  }
+
+  /** The selected rows of a filtered `store` as ranges [start, end) of row indexes; null when every row is read. */
+  private def ranges(store: org.apache.parquet.column.page.PageReadStore): (Array[Long], Array[Long]) = {
+    val indexes = store.getRowIndexes
+    if (indexes.isEmpty) return null
+    val it = indexes.get
+    val starts = scala.collection.mutable.ArrayBuilder.make[Long]
+    val ends = scala.collection.mutable.ArrayBuilder.make[Long]
+    var start = -1L
+    var end = -1L
+    while (it.hasNext) {
+      val r = it.nextLong()
+      if (r != end) {
+        if (start >= 0) { starts += start; ends += end }
+        start = r
+      }
+      end = r + 1
+    }
+    if (start >= 0) { starts += start; ends += end }
+    (starts.result(), ends.result())
+  }
+
+  /**
+   * #626: the offsets, in a filtered row group's selected rows, where each column-index range ends; null when
+   * every row is read.
+   */
+  def rangeBreaks(store: org.apache.parquet.column.page.PageReadStore): Array[Int] = {
+    val r = ranges(store)
+    if (r == null) return null
+    val (starts, ends) = r
+    val out = new Array[Int](starts.length)
+    var at = 0L
+    var i = 0
+    while (i < starts.length) {
+      at += ends(i) - starts(i)
+      out(i) = at.toInt
+      i += 1
+    }
+    out
+  }
+
+  /**
+   * #626: the requested pages of a filtered row group that overlap none of its selected ranges: the pages
+   * Parquet's column-index filter dropped. Zero for a row group read whole.
+   */
+  private def pagesSkipped(r: ParquetFileReader, store: org.apache.parquet.column.page.PageReadStore): Long = {
+    val offset = store.getRowIndexOffset
+    if (offset.isEmpty || store.getRowIndexes.isEmpty) return 0L
+    val blocks = r.getRowGroups
+    var b = 0
+    while (b < blocks.size && blocks.get(b).getRowIndexOffset != offset.get.longValue) b += 1
+    if (b == blocks.size) return 0L
+    val block = blocks.get(b)
+    if (store.getRowCount == block.getRowCount) return 0L
+    val (starts, ends) = ranges(store)
+    val ci = r.getColumnIndexStore(b)
+    var skipped = 0L
+    val chunks = block.getColumns.iterator()
+    while (chunks.hasNext) {
+      val path = chunks.next().getPath
+      val oi =
+        try ci.getOffsetIndex(path)
+        catch {
+          case _: org.apache.parquet.internal.filter2.columnindex.ColumnIndexStore.MissingOffsetIndexException => null
+        }
+      if (oi != null) {
+        var p = 0
+        var k = 0
+        while (p < oi.getPageCount) {
+          val first = oi.getFirstRowIndex(p)
+          val last = oi.getLastRowIndex(p, block.getRowCount)
+          while (k < starts.length && ends(k) <= first) k += 1
+          if (k == starts.length || starts(k) > last) skipped += 1
+          p += 1
+        }
+      }
+    }
+    skipped
+  }
 
   /** #611: the largest surviving fraction a batch is decoded at its survivors for; `vecruntime.lateMaterialization.maxFraction`. */
   val LateMaxFraction: Double =
