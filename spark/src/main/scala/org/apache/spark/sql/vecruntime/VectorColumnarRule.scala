@@ -856,7 +856,19 @@ case class VectorExecRule(session: SparkSession) extends Rule[SparkPlan] with Lo
     if (plan.supportsColumnar) None
     else plan.output.find(a => TypeMapping.isCollated(a.dataType)).map(a =>
       s"child ${plan.nodeName} is a row plan with the collated column ${a.name} (no row-to-columnar conversion)"
-    )
+    ).orElse(plan.output.find(a => holdsTime(a.dataType)).map(a =>
+      // #812: nor for a time (Spark 4.1's RowToColumnConverter: UNSUPPORTED_DATATYPE TIME).
+      s"child ${plan.nodeName} is a row plan with the time column ${a.name} (no row-to-columnar conversion)"
+    ))
+
+  /** #812: a type holding a time anywhere inside it. */
+  private def holdsTime(dt: org.apache.spark.sql.types.DataType): Boolean = dt match {
+    case _: org.apache.spark.sql.types.TimeType => true
+    case a: org.apache.spark.sql.types.ArrayType => holdsTime(a.elementType)
+    case m: org.apache.spark.sql.types.MapType => holdsTime(m.keyType) || holdsTime(m.valueType)
+    case s: org.apache.spark.sql.types.StructType => s.fields.exists(f => holdsTime(f.dataType))
+    case _ => false
+  }
 
   private def forwardingInputReason(plan: SparkPlan): Option[String] =
     if (!columnarChild(plan)) Some(s"child ${plan.nodeName} is not columnar") else None

@@ -265,6 +265,44 @@ class FactBloomFilterSuite extends VectorQuerySuite {
     }
   }
 
+  test("a composite creation side over a relation the plan reads again gets no filter (q14a, #735)") {
+    // The returns, grouped: a creation side that is more than a filter over its scan.
+    val grouped =
+      """SELECT ss_item_sk, sum(ss_quantity) q, count(*) c, max(ss_pad) p
+        |FROM store_sales JOIN (SELECT sr_ticket_number t, sr_item_sk i FROM store_returns
+        |  WHERE isnotnull(nullif(sr_return_quantity, 0)) GROUP BY sr_ticket_number, sr_item_sk) r
+        |  ON ss_ticket_number = r.t AND ss_item_sk = r.i
+        |GROUP BY ss_item_sk""".stripMargin
+    val once = run(grouped)
+    assert(salesBlooms(once) >= 1, once.queryExecution.optimizedPlan.treeString)
+    // The returns read again elsewhere: the filter's subquery would compute the grouping a second time.
+    val again = run(
+      s"""SELECT * FROM ($grouped) a JOIN (SELECT sr_item_sk k, count(*) n FROM store_returns GROUP BY sr_item_sk) b
+         |  ON a.ss_item_sk = b.k""".stripMargin
+    )
+    assert(salesBlooms(again) === 0, again.queryExecution.optimizedPlan.treeString)
+    // A creation side that is a filter over its scan keeps its filter even when the returns are read again.
+    val plain = run(
+      s"""SELECT * FROM ($q93) a JOIN (SELECT sr_item_sk k, count(*) n FROM store_returns GROUP BY sr_item_sk) b
+         |  ON a.ss_item_sk = b.k""".stripMargin
+    )
+    assert(salesBlooms(plain) >= 1, plain.queryExecution.optimizedPlan.treeString)
+  }
+
+  test("a fact read again with other filters gets no probe (the relation is the same, #735)") {
+    val df = run(
+      s"""SELECT * FROM (
+         |  SELECT ss_item_sk, sum(ss_quantity - sr_return_quantity) q, count(*) c, max(ss_pad) p
+         |  FROM (SELECT * FROM store_sales WHERE ss_quantity > 2) s
+         |  JOIN (SELECT * FROM store_returns WHERE isnotnull(nullif(sr_return_quantity, 0))) r
+         |    ON ss_ticket_number = sr_ticket_number AND ss_item_sk = sr_item_sk
+         |  GROUP BY ss_item_sk) a
+         |JOIN (SELECT ss_item_sk k, count(*) n FROM store_sales WHERE ss_quantity < 5 GROUP BY ss_item_sk) b
+         |  ON a.ss_item_sk = b.k""".stripMargin
+    )
+    assert(salesBlooms(df) === 0, df.queryExecution.optimizedPlan.treeString)
+  }
+
   test("a relation the plan reads twice gets no probe: its copies keep their exchange reuse (q23b)") {
     val twice =
       s"""SELECT * FROM ($q93) a JOIN (SELECT ss_item_sk k, count(*) n FROM store_sales GROUP BY ss_item_sk) b

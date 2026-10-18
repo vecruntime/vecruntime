@@ -1669,10 +1669,12 @@ private[vecruntime] class VectorWindowOffsetIterator(
     val col = h.columns(c)
     if (col.isNullAt(r)) null
     else dt match {
-      case IntegerType | DateType => java.lang.Integer.valueOf(col.getInt(r))
+      case IntegerType | DateType | _: org.apache.spark.sql.types.YearMonthIntervalType =>
+        java.lang.Integer.valueOf(col.getInt(r))
       case ByteType => java.lang.Byte.valueOf(col.getByte(r)) // #327: the int lane read back as the declared type
       case ShortType => java.lang.Short.valueOf(col.getShort(r))
-      case LongType | TimestampType | TimestampNTZType => java.lang.Long.valueOf(col.getLong(r))
+      case LongType | TimestampType | TimestampNTZType | _: org.apache.spark.sql.types.TimeType | _: org.apache.spark.sql.types.DayTimeIntervalType =>
+        java.lang.Long.valueOf(col.getLong(r))
       case DoubleType => java.lang.Double.valueOf(col.getDouble(r))
       case FloatType => java.lang.Float.valueOf(col.getFloat(r)) // #712
       case BooleanType => java.lang.Boolean.valueOf(col.getBoolean(r))

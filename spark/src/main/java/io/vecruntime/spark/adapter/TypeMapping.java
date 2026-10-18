@@ -51,6 +51,13 @@ public final class TypeMapping {
             // sort it as a long; expressions that read the session time zone accept only TimestampType.
             return VecType.INT64;
         }
+        if (isCarriedLong(dt)) {
+            return VecType.INT64;
+        }
+        if (dt instanceof org.apache.spark.sql.types.YearMonthIntervalType) {
+            // #812: months, an int; see isCarriedLong.
+            return VecType.INT32;
+        }
         if (dt instanceof DoubleType) {
             return VecType.FLOAT64;
         }
@@ -99,6 +106,30 @@ public final class TypeMapping {
 
     /** Decimals wider than this have no 64-bit representation and fall back. */
     public static final int MAX_DECIMAL_PRECISION = 18;
+
+    /**
+     * #812: Spark 4.1's {@code time} (nanoseconds of the day) and {@code
+     * interval day to second} (microseconds) are longs, and {@code interval
+     * year to month} (months, {@link #vecTypeOf}) an int, in every Spark vector
+     * and row. On those lanes the kernels carry, compare, hash, sort, group and
+     * join them exactly as Spark does -- a long's order is the value's -- so
+     * these are lanes. Nothing else: arithmetic on them has its own semantics
+     * in Spark (an interval's {@code +} overflows with an error; {@code time}
+     * takes no {@code +}), and casts and functions read them as times and
+     * intervals, so {@link #isComputeRestricted} keeps every expression but
+     * references, literals, comparisons and null checks over them Spark's.
+     */
+    public static boolean isCarriedLong(DataType dt) {
+        return dt instanceof org.apache.spark.sql.types.TimeType || dt instanceof org.apache.spark.sql.types.DayTimeIntervalType;
+    }
+
+    /**
+     * #812: a type with a lane on which only carrying, comparison, null checks
+     * and keys run (isCarriedLong).
+     */
+    public static boolean isComputeRestricted(DataType dt) {
+        return isCarriedLong(dt) || dt instanceof org.apache.spark.sql.types.YearMonthIntervalType;
+    }
 
     public static boolean isDecimal(DataType dt) {
         return dt instanceof DecimalType;

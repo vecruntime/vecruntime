@@ -122,10 +122,11 @@ object VectorRowStages {
   private def putLeaf(v: WritableColumnVector, i: Int, dt: DataType, row: SpecializedGetters, c: Int): Unit =
     dt match {
       case BooleanType => v.putBoolean(i, row.getBoolean(c))
-      case IntegerType | DateType => v.putInt(i, row.getInt(c))
+      case IntegerType | DateType | _: org.apache.spark.sql.types.YearMonthIntervalType => v.putInt(i, row.getInt(c))
       case ByteType => v.putByte(i, row.getByte(c))
       case ShortType => v.putShort(i, row.getShort(c))
-      case LongType | TimestampType | TimestampNTZType => v.putLong(i, row.getLong(c))
+      case LongType | TimestampType | TimestampNTZType | _: org.apache.spark.sql.types.TimeType | _: org.apache.spark.sql.types.DayTimeIntervalType =>
+        v.putLong(i, row.getLong(c))
       case DoubleType => v.putDouble(i, row.getDouble(c))
       case FloatType => v.putFloat(i, row.getFloat(c)) // #712
       case d: DecimalType => v.putDecimal(i, row.getDecimal(c, d.precision, d.scale), d.precision)
