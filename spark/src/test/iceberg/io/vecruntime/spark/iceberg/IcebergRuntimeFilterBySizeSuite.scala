@@ -154,6 +154,27 @@ class IcebergRuntimeFilterBySizeSuite extends VectorQuerySuite {
     assert(blooms(df).isEmpty, df.queryExecution.optimizedPlan.treeString)
   }
 
+  test("no filter above a join that is a broadcast by its files (q27)", IcebergTest) {
+    // `dim` is large by its estimate and small by its files (q27's customer_demographics): before the broadcast
+    // hints Spark's rule takes fact JOIN dim for a shuffle join and filters the fact on the store-like key above it,
+    // and FactBloomFilter's transitive filter would plant the same one below that "shuffle join".
+    spark.sql(
+      s"""CREATE OR REPLACE TABLE $Db.sdim USING iceberg AS
+         |SELECT id AS s_key, concat('ST', CAST(id % 40 AS STRING)) AS s_state FROM range(0, 400)""".stripMargin
+    )
+    spark.table(s"$Db.sdim").createOrReplaceTempView("sdim")
+    val sql =
+      """SELECT f_qty, avg(f_key) a, max(d_status) m FROM fact JOIN dim ON f_dim = d_key
+        |JOIN sdim ON f_key % 400 = s_key
+        |WHERE d_gender = 'M' AND d_status = 'status-2' AND s_state IN ('ST1', 'ST2')
+        |GROUP BY f_qty""".stripMargin
+    val broadcast = "spark.sql.autoBroadcastJoinThreshold" -> threshold.toString
+    val off = run(sql, broadcast, VectorConf.V2RuntimeFilterBySizeEnabled -> "false")
+    assume(blooms(off).nonEmpty, s"Spark's rule must add the filter for the test: ${off.queryExecution.optimizedPlan}")
+    val df = run(sql, broadcast, VectorConf.FactBloomFilterEnabled -> "true")
+    assert(blooms(df).isEmpty, df.queryExecution.optimizedPlan.treeString)
+  }
+
   test("nothing is added when Spark's runtime bloom filter is off", IcebergTest) {
     val df = run(q, "spark.sql.optimizer.runtime.bloomFilter.enabled" -> "false")
     assert(blooms(df).isEmpty)

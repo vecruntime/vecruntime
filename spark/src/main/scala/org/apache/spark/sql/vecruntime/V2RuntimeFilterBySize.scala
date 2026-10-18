@@ -22,12 +22,14 @@ import org.apache.spark.sql.catalyst.expressions.{
   AttributeSet,
   BloomFilterMightContain,
   ExprId,
+  Expression,
   PredicateHelper,
   ScalarSubquery,
   XxHash64
 }
-import org.apache.spark.sql.catalyst.optimizer.{InjectRuntimeFilter, PushDownPredicates}
-import org.apache.spark.sql.catalyst.plans.logical.{Aggregate, Filter, LogicalPlan, Project}
+import org.apache.spark.sql.catalyst.optimizer.{InjectRuntimeFilter, JoinSelectionHelper, PushDownPredicates}
+import org.apache.spark.sql.catalyst.planning.ExtractEquiJoinKeys
+import org.apache.spark.sql.catalyst.plans.logical.{Aggregate, Filter, Join, LogicalPlan, Project, Window}
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.execution.datasources.{HadoopFsRelation, LogicalRelation}
 import org.apache.spark.sql.execution.datasources.v2.DataSourceV2ScanRelation
@@ -52,12 +54,74 @@ import org.apache.spark.sql.internal.SQLConf
  * `spark.vecruntime.optimizer.v2RuntimeFilterBySize.enabled=false`, with Spark's bloom filter off, and with the
  * plugin.
  */
-case class V2RuntimeFilterBySize(session: SparkSession) extends Rule[LogicalPlan] with PredicateHelper {
+case class V2RuntimeFilterBySize(session: SparkSession)
+    extends Rule[LogicalPlan] with PredicateHelper with JoinSelectionHelper {
 
   override def apply(plan: LogicalPlan): LogicalPlan = {
     val conf = session.sessionState.conf
     if (!VectorConf.v2RuntimeFilterBySizeEnabled(conf) || !conf.runtimeFilterBloomFilterEnabled) return plan
     if (!plan.exists(_.isInstanceOf[DataSourceV2ScanRelation])) return plan
+    addSmall(dropBroadcastOnly(plan, conf), conf) match {
+      case p if p.fastEquals(plan) => plan
+      case p => dropBroadcastOnly(p, conf)
+    }
+  }
+
+  /**
+   * Drops a runtime filter Spark's rule put on a join input whose join is, by the bytes of the Iceberg files,
+   * a broadcast join with no shuffle under that input (#735, q27, q14a).
+   *
+   * Spark's rule runs before the file-byte broadcast hints and skips a broadcast join with no shuffle below the side
+   * it would prune -- judged by size estimates. An Iceberg join input estimated large but small by its files (3 TB
+   * `customer_demographics`) makes a join look like a shuffle join there, so the joins above it get filters their
+   * Parquet copies do not (q27's `ss_store_sk`). With the joins judged as a Parquet copy's would be -- a broadcast
+   * hint, Spark's own size, or `V2BroadcastBySize.smallByFiles` -- Spark's condition is applied again and a filter it
+   * would not have added is removed.
+   */
+  private def dropBroadcastOnly(plan: LogicalPlan, conf: SQLConf): LogicalPlan = {
+    val threshold = conf.autoBroadcastJoinThreshold
+    if (threshold <= 0) return plan
+    val maxEstimated = VectorConf.v2BroadcastBySizeMaxEstimatedBytes(conf)
+    def small(p: LogicalPlan): Boolean =
+      canBroadcastBySize(p, conf) || V2BroadcastBySize.smallByFiles(p, threshold, maxEstimated)
+    def shuffleJoin(j: Join): Boolean =
+      !hintToBroadcastLeft(j.hint) && !hintToBroadcastRight(j.hint) && !small(j.left) && !small(j.right)
+    def hasShuffle(p: LogicalPlan): Boolean = p.exists {
+      case j: Join => shuffleJoin(j)
+      case _: Aggregate | _: Window => true
+      case _ => false
+    }
+    val drop = scala.collection.mutable.Set.empty[ExprId]
+    plan.foreach {
+      case j @ ExtractEquiJoinKeys(_, leftKeys, rightKeys, _, _, left, right, _) if !shuffleJoin(j) =>
+        def collect(side: LogicalPlan, keys: Seq[Expression]): Unit =
+          if (!hasShuffle(side)) side.foreach {
+            case f: Filter => splitConjunctivePredicates(f.condition).foreach {
+                case BloomFilterMightContain(s: ScalarSubquery, XxHash64(Seq(v), _))
+                    if keys.exists(_.semanticEquals(v)) => drop += s.exprId
+                case _ =>
+              }
+            case _ =>
+          }
+        collect(left, leftKeys)
+        collect(right, rightKeys)
+      case _ =>
+    }
+    if (drop.isEmpty) return plan
+    plan.transformUp {
+      case f @ Filter(cond, child) =>
+        val parts = splitConjunctivePredicates(cond)
+        val left = parts.filterNot {
+          case BloomFilterMightContain(s: ScalarSubquery, _) => drop.contains(s.exprId)
+          case _ => false
+        }
+        if (left.size == parts.size) f
+        else if (left.isEmpty) child
+        else Filter(left.reduce(And), child)
+    }
+  }
+
+  private def addSmall(plan: LogicalPlan, conf: SQLConf): LogicalPlan = {
     val threshold = conf.runtimeFilterCreationSideThreshold
     val raised = VectorConf.v2BroadcastBySizeMaxEstimatedBytes(conf)
     if (raised <= threshold) return plan
