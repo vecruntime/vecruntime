@@ -90,7 +90,8 @@ public final class NativeParquetColumnReader implements NativeParquetColumn, Row
     // A FIXED_LEN_BYTE_ARRAY / BINARY decimal, staged as bytes and converted at flush; its FLBA width (0: BINARY).
     private final boolean binaryDecimal;
     private final int fixedLength;
-    // TIMESTAMP stored as MILLIS: the lane holds micros, so each present value is scaled by 1000.
+    // TIMESTAMP stored as MILLIS (the lane holds micros) or TIME stored as MICROS (the lane holds nanos, #787):
+    // each present value is scaled by 1000.
     private final boolean millis;
     // #568 item 6: a TIMESTAMP stored as INT96 (12 bytes, staged like a fixed-length binary and converted at
     // flush), and the lane's kind for the file's calendar rebase (a date's days, or a timestamp's micros).
@@ -189,9 +190,12 @@ public final class NativeParquetColumnReader implements NativeParquetColumn, Row
         this.narrowBits = sparkType instanceof org.apache.spark.sql.types.ByteType
                 ? 8
                 : sparkType instanceof org.apache.spark.sql.types.ShortType ? 16 : 0;
-        this.millis = (sparkType instanceof org.apache.spark.sql.types.TimestampType || sparkType instanceof org.apache.spark.sql.types.TimestampNTZType)
-                      && column.getPrimitiveType().getLogicalTypeAnnotation() instanceof org.apache.parquet.schema.LogicalTypeAnnotation.TimestampLogicalTypeAnnotation t
-                      && t.getUnit() == org.apache.parquet.schema.LogicalTypeAnnotation.TimeUnit.MILLIS;
+        // x1000 at decode: TIMESTAMP / TIMESTAMP_NTZ stored as MILLIS onto the lane of micros, and TIME stored as
+        // MICROS onto Spark's nanoseconds of the day (#787: LongAsNanosUpdater's DateTimeUtils.microsToNanos).
+        this.millis = ((sparkType instanceof org.apache.spark.sql.types.TimestampType || sparkType instanceof org.apache.spark.sql.types.TimestampNTZType)
+                && column.getPrimitiveType().getLogicalTypeAnnotation() instanceof org.apache.parquet.schema.LogicalTypeAnnotation.TimestampLogicalTypeAnnotation t
+                && t.getUnit() == org.apache.parquet.schema.LogicalTypeAnnotation.TimeUnit.MILLIS)
+                      || sparkType instanceof org.apache.spark.sql.types.TimeType;
         // Dictionary scratch is GC-managed: closing a shared Arena runs a JVM-wide handshake that walks every
         // thread's stack, and a reader is made per column per file -- on 1 TB TPC-DS (14,594 store_sales
         // files) those handshakes were 8-9% of executor CPU in q88. An automatic arena has no close.
