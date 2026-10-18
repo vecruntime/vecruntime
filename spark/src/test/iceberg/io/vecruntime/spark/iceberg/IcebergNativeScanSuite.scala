@@ -219,6 +219,39 @@ class IcebergNativeScanSuite extends IcebergMorSuiteBase {
     assert(count("SELECT count(*) FROM t") === 20000 - (0 until 20000).count(_ % 11 == 4))
   }
 
+  icebergTest("a broadcast join's build keys skip the fact's row groups, by field id (#610 on Iceberg)") {
+    sortedTable("t_rf")
+    spark.sql(
+      s"CREATE OR REPLACE TABLE $Db.t_rf_dim USING iceberg AS " +
+        "SELECT CAST(id AS INT) AS k, id * 3 AS lk, concat('d', CAST(id AS STRING)) AS name FROM range(0, 20000)"
+    )
+    // The dimension is filtered on its name, not its key: Spark infers nothing for the fact side.
+    for (
+      (sql, inMax) <- Seq(
+        s"SELECT count(*), sum(f.b) FROM $Db.t_rf f JOIN $Db.t_rf_dim d ON f.a = d.k WHERE d.name LIKE 'd12__'" -> "1024",
+        s"SELECT count(*), sum(f.b) FROM $Db.t_rf f JOIN $Db.t_rf_dim d ON f.a = d.k WHERE d.name LIKE 'd12__'" -> "10",
+        s"SELECT count(*), sum(f.a) FROM $Db.t_rf f JOIN $Db.t_rf_dim d ON f.b = d.lk " +
+          "WHERE d.name LIKE 'd31__' AND f.s <> 's1'" -> "1024"
+      )
+    ) withConf(VectorConf.JoinRuntimeFiltersInMax -> inMax) {
+      val off = withConf(VectorConf.JoinRuntimeFilters -> "false") { checkVectorized(sql, Seq(Agg)) }
+      val on = withConf(VectorConf.JoinRuntimeFilters -> "true") { checkVectorized(sql, Seq(Agg)) }
+      def rf(df: DataFrame) = scans(df).map(_.metrics("numRuntimeFilters").value).sum
+      assert(rf(off) === 0)
+      assert(rf(on) > 0, s"$sql\n${finalPlan(on).treeString}")
+      assert(rowGroups(on) * 5 < rowGroups(off), s"read ${rowGroups(on)} of ${rowGroups(off)} row groups: $sql")
+    }
+    // A left join keeps every fact row: no filter.
+    val left = withConf(VectorConf.JoinRuntimeFilters -> "true") {
+      checkVectorized(
+        s"SELECT count(*), count(d.name) FROM $Db.t_rf f LEFT JOIN " +
+          s"(SELECT * FROM $Db.t_rf_dim WHERE name LIKE 'd12__') d ON f.a = d.k",
+        Seq(Agg)
+      )
+    }
+    assert(scans(left).map(_.metrics("numRuntimeFilters").value).sum === 0)
+  }
+
   icebergTest("a pushed filter on a renamed column skips row groups of the files written before the rename") {
     sortedTable("t_push_ren")
     spark.sql(s"ALTER TABLE $Db.t_push_ren RENAME COLUMN a TO a2")
