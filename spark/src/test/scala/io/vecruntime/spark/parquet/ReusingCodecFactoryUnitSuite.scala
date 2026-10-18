@@ -131,6 +131,36 @@ class ReusingCodecFactoryUnitSuite extends AnyFunSuite {
     factory.release() // idempotent
   }
 
+  // Every other codec (gzip, LZ4_RAW, LZ4, Brotli, LZO, uncompressed) goes to parquet-java's own CodecFactory,
+  // which keeps ONE decompressor per codec per factory (a Map lookup, not one per column chunk) and returns its
+  // Hadoop decompressor to CodecPool in release(). So no codec leaks a context per chunk; this pins it.
+  for (codec <- Seq(CompressionCodecName.GZIP, CompressionCodecName.LZ4_RAW, CompressionCodecName.UNCOMPRESSED)) {
+    test(s"$codec: delegated, one cached decompressor per factory (not per chunk), released with the factory") {
+      val original = payload(11, 20 * 1024)
+      val compressed = compress(codec, original)
+      val factory = new ReusingCodecFactory(conf, 1 << 16)
+      val perChunk = (0 until 4).map(_ => factory.getDecompressor(codec))
+      assert(perChunk.forall(_ eq perChunk.head), s"$codec: the same decompressor for every chunk of the file")
+      perChunk.foreach { d =>
+        assert(java.util.Arrays.equals(
+          d.decompress(BytesInput.from(compressed), original.length).toByteArray,
+          original
+        ))
+      }
+      assert(factory.liveDecompressors() == 0, "delegated decompressors are owned by parquet-java's factory")
+      factory.release()
+      // A new file's factory starts clean: its decompressor is a fresh one, not the released one.
+      val next = new ReusingCodecFactory(conf, 1 << 16)
+      try {
+        val d = next.getDecompressor(codec)
+        assert(java.util.Arrays.equals(
+          d.decompress(BytesInput.from(compressed), original.length).toByteArray,
+          original
+        ))
+      } finally next.release()
+    }
+  }
+
   test("PooledHeapAllocator is heap, bounded, and reuses a released buffer") {
     val pool = new PooledHeapAllocator(2, 1L << 20)
     assert(!pool.isDirect)
