@@ -111,6 +111,26 @@ class ReusingCodecFactoryUnitSuite extends AnyFunSuite {
     if (b.hasArray) b.array() else null
   }
 
+  test("release() frees every decompressor handed out: one per column chunk, zstd's native context closed") {
+    // parquet-java asks for a decompressor per column chunk and only ever releases the FACTORY (on file close),
+    // so the factory must release them all; zstd-jni frees a ZstdDecompressCtx only on close().
+    val factory = new ReusingCodecFactory(conf, 1 << 16)
+    val original = payload(7, 4096)
+    val compressed = compress(CompressionCodecName.ZSTD, original)
+    val chunks = (0 until 5).map(_ => factory.getDecompressor(CompressionCodecName.ZSTD))
+    val snappy = factory.getDecompressor(CompressionCodecName.SNAPPY)
+    chunks.foreach(d =>
+      assert(java.util.Arrays.equals(d.decompress(BytesInput.from(compressed), 4096).toByteArray, original))
+    )
+    assert(factory.liveDecompressors() == 6)
+    factory.release()
+    assert(factory.liveDecompressors() == 0)
+    // A released zstd decompressor's context is closed: using it again fails rather than reading freed memory.
+    intercept[Exception](chunks.head.decompress(BytesInput.from(compressed), 4096).toByteArray)
+    assert(snappy != null)
+    factory.release() // idempotent
+  }
+
   test("PooledHeapAllocator is heap, bounded, and reuses a released buffer") {
     val pool = new PooledHeapAllocator(2, 1L << 20)
     assert(!pool.isDirect)
