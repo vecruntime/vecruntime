@@ -7,7 +7,7 @@ title: Native Parquet reader
 
 This page is the design note for VecRuntime's own Parquet scan, #559. It covers what the scan does today, how it is put together, what it does not decode yet, and the work that is left.
 
-**In short (2026-10-17):** the scan reads every flat Parquet type and every encoding parquet-java's v1 and v2 writers produce, Spark 4.1's `time` and Spark 4's `variant` included (#787), shredded variants and variant extraction pushed into the scan at the top level too (#812). Structs, lists and maps of flat types, lists of structs of flat types, lists, maps and structs nested in one another at any depth are read natively too (#568). `INT96` timestamps and files in any calendar rebase mode (`LEGACY`, `EXCEPTION`, `CORRECTED`) are decoded natively too (#568 item 6), and so are files older than the table: columns and struct fields they lack are null, and types are widened as Spark widens them (#568 schema evolution). So are collated strings and bucketed tables (#568). A column with a type that has no decode path (an interval, say), anywhere in it, keeps Spark's scan for the plan. On the 1 TB TPC-DS run of 2026-10-02 it took VecRuntime to 1,542 s for the 103 queries, against 3,099 s for Spark, 1,999 s for Comet and 1,954 s for Comet's reader under our operators.
+**In short (2026-10-18):** the scan reads every Parquet type Spark 4.1 reads and every encoding parquet-java's v1 and v2 writers produce, natively: flat types, unsigned integers, integers read as wide decimals, ANSI intervals, Spark 4.1's `time` (any INT64 unit) and Spark 4's `variant`, shredded or not, with variant extraction pushed into the scan (#787, #812). Structs, lists and maps nested in one another at any depth are read natively too (#568), and so are `INT96` timestamps and files in any calendar rebase mode, files older than the table (missing columns, existence defaults, widened types), collated strings, bucketed tables and the `_metadata` columns. Over the whole `apache/parquet-testing` and Hardwood corpora (303 files, #808), every file gives Spark's rows or Spark's refusal, and all but two are read natively. What still goes to Spark's reader is listed, with the reason, under [Current limits](#current-limits). On the 1 TB TPC-DS run of 2026-10-02 it took VecRuntime to 1,542 s for the 103 queries, against 3,099 s for Spark, 1,999 s for Comet and 1,954 s for Comet's reader under our operators.
 
 The scan is **on by default** since 0.0.6 (`spark.vecruntime.scan.nativeParquet.enabled`), except in a session where Comet's scan is active: Comet's plugin or extension registered, with `spark.comet.enabled` and `spark.comet.scan.enabled` not false. There Comet's reader stays the scan unless the key is set. Setting the key to `false` brings back Spark's vectorized reader under our operators. Its configuration keys are in the [Configuration reference](configuration.html), and the planner's fallback reasons are on the [Operators](operators.html) page.
 
@@ -64,7 +64,7 @@ A few rules hold the design together:
 - **Task context.** Prefetch steps run with the task's `TaskContext` set. Files opened ahead and not used are closed at task end, including when a LIMIT stops the task early.
 - **Platform threads.** The pool is cached daemon platform threads; the number alive is bounded by task slots × depth. Virtual threads deadlocked on JDK 25. A file open runs class initializers (Parquet's `BloomFilterImpl`, the S3 client), and a virtual thread blocked in a class initializer still pins its carrier. On q88, every carrier of one executor was pinned behind `BloomFilterImpl.<clinit>`, which was waiting for a log4j lock held by an unmounted virtual thread. `VectorParquetPrefetchPoolSuite` checks the pool's thread kind.
 - **Metrics.** Task input metrics follow `FileScanRDD`: records are counted per batch, and bytes are the task thread's FileSystem read count plus the bytes each prefetch step read on its own thread.
-- **Memory.** Per task, read-ahead adds up to N opened files and M row groups of compressed pages. It is not yet capped in bytes; see the work list.
+- **Memory.** Per task, read-ahead adds up to N opened files and M row groups of compressed pages, capped in bytes by `prefetchMaxBytes` (default 256 MiB, #568; see the work list).
 
 **Decode-ahead (#606, off by default).** With `…nativeParquet.decodeAhead` = K, the reader loop runs on a producer thread of the task's own, up to K batches ahead (`DecodeAheadIterator`). The task thread takes batches in order and runs the operators above the scan on them, while the producer decodes the next ones across row groups and files.
 - **Ownership.** A batch is the consumer's until its next `next()`, when its vectors go back to their column reader's pool. The pool is guarded for the two threads; a vector released after its file closed is closed instead.
@@ -89,15 +89,35 @@ A few rules hold the design together:
 | Metadata columns | The file-constant `_metadata` fields (`file_path`, `file_name`, `file_size`, `file_block_start`, `file_block_length`, `file_modification_time`), `_metadata.row_index`, and `input_file_name()` with its block siblings (#568) | Constants per file, from the format's extractors as `FileScanRDD` fills them; the row index is the row group's first row index plus the position. Under decode-ahead too (#568) |
 | Codecs | Whatever parquet-java decompresses (snappy, zstd, gzip, lz4, …) | Decompression is done by parquet-java |
 
-What happens when a column is not supported:
-- **Spark's scan for the whole plan:** a nested column holding a type with no decode path, and a variant extraction Spark pushed into the scan below the top level (`spark.sql.variant.pushVariantIntoScan`; at the top level it is read natively, #812). `input_file_name()` under decode-ahead is native (#568). A bucketed scan is native (#568): it reports Spark's bucket partitioning and reads Spark's own bucketed file partitions (pruned and coalesced as Spark plans them), so a join of tables bucketed alike still needs no shuffle. The planner records the reason, so VecRuntime's operators still run above Spark's scan.
-- **Spark's reader for that one file**, with that file's own rebase modes and INT96 conversion: a shredded variant below the top level, a column or struct field the file does not hold that the native readers do not fill (below), or an encoding on a physical type the decoder has no path for. The rest of the scan stays native. Four stay on Spark's reader on purpose, because Spark's outcome there is an error or a reading only its reader defines: a UTC-adjusted timestamp read as `timestamp_ntz` (Spark refuses it), a `time` column stored as INT32 `TIME(MILLIS)` (Spark refuses it), a missing `REQUIRED` column (Spark fails the read), and the field-id corners below (a file with no ids under a read schema with ids, Spark's error unless `ignoreMissing`; an id match carrying a sibling's name, which Spark reads as the sibling).
-
-**Limitations, by design:**
-- **Encrypted Parquet** (Parquet modular encryption) is not a feature of the native scan. Decryption is parquet-java's: the scan opens files through `ParquetFileReader` with the Hadoop configuration, so with Spark's crypto factory and KMS settings (`parquet.crypto.factory.class`, ...) parquet-java decrypts the footer and pages and the scan decodes them; without the keys it fails as Spark's reader does. That one path is tested (`NativeParquetPerFileSuite`: footer and two columns encrypted, read with and without the keys); KMS integrations, plaintext footers and per-column key mixes are not, and are Spark's and parquet-java's to support.
-- **`CalendarInterval`** never reaches the scan: Spark cannot write it to Parquet, so no Parquet column holds one. The ANSI interval types it can write are read natively (#812).
+What happens when a column is not supported: the scan keeps Spark's result in every case, through Spark's reader for one file or Spark's scan for the plan, as listed under [Current limits](#current-limits) below. `input_file_name()` under decode-ahead is native (#568). A bucketed scan is native (#568): it reports Spark's bucket partitioning and reads Spark's own bucketed file partitions (pruned and coalesced as Spark plans them), so a join of tables bucketed alike still needs no shuffle.
 
 **Conformance corpus (#808).** `ParquetCorpusConformanceSuite` reads every file of `apache/parquet-testing` and of Hardwood's test corpus and pins how each one is read; see "Whole-corpus conformance" below.
+
+## Current limits
+
+Everything below returns Spark's own result: either Spark's reader decodes it, or Spark's scan stays in the plan, or the query fails with Spark's error. None of these limits is a wrong answer. The planner records a reason for each whole-plan fallback; the [Operators](operators.html) page lists them.
+
+**On Spark's reader on purpose**, because Spark's outcome there is an error, or a reading only Spark's reader defines:
+- **Encrypted Parquet** (modular encryption) is not a native feature. Decryption is parquet-java's: with Spark's crypto factory and KMS settings configured, parquet-java decrypts the footer and pages and the scan decodes them; without the keys the read fails as Spark's does. The footer-and-columns-encrypted path is tested (`NativeParquetPerFileSuite`). KMS integrations, plaintext footers and per-column key mixes are not tested; they are Spark's and parquet-java's to support.
+- **A UTC-adjusted timestamp read as `timestamp_ntz`** (Spark refuses it), **INT32 `TIME(MILLIS)`** (Spark refuses it), and **a missing `REQUIRED` column** (Spark fails the read).
+- **The field-id corners:** a file with no field ids under a read schema with ids (Spark's error unless `ignoreMissing`), and an id match carrying a sibling's name (Spark reads it as the sibling).
+- **A legacy two-level list whose element is a repeated group holding a repeated field** (Hardwood's `list_of_lists_legacy_two_level_test`). Spark's backward-compatibility rule reads it as `array<int>` over two repeated levels, returning `[1, 2]` where the file holds `[[1, 2], [3]]`. No writer produces that shape for that type, and the native readers do not follow it.
+- **A bare repeated group annotated `VARIANT`** (Hardwood's `repeated_variant_group_test`), which Spark clips only against its own `array<variant>`.
+
+**Spark's reader for that one file** (the rest of the scan stays native): a shredded variant below the top level, inside a struct, a list or a map.
+
+**Spark's scan for the whole plan:**
+- A variant extraction Spark pushed into the scan below the top level (`spark.sql.variant.pushVariantIntoScan`).
+- On Spark 4.2, its geospatial types (`geometry`, `geography`). There is no decode path for them; the file's other columns are native.
+- Any type Spark 4.1 cannot read itself (`FLOAT16`, `UUID`, the legacy `INTERVAL` converted type, 12-byte timestamps): Spark refuses the file before any scan runs. `CalendarInterval` never reaches the scan, because Spark cannot write it to Parquet.
+
+**In the operators above the scan:**
+- **`variant`** has no engine lane, by design. Spark defines no equality or order on a variant, so it can be no grouping, join or sort key, and every function over one interprets its binary encoding. Operators carry it; an operator that computes on one stays Spark's.
+- **`time` and the ANSI intervals** ride the INT64 / INT32 lanes for carrying, comparison, null tests, grouping, sorting, joins, windows, count, min, max, first and last. Arithmetic, casts, functions, sum and avg over them stay Spark's. A row input holding a `time` keeps the operator above it Spark's, because Spark 4.1's `RowToColumnConverter` has no `time` converter.
+
+**Performance, not correctness:**
+- **Late materialization** (`lateMaterialization`, #611) is off by default: at 1 TB q24b ran 10% slower with it on. Its two-pass mode, which also skips the I/O of pages with no surviving row (#812), is off by default until a 1 TB measurement settles it.
+- **Column-index page skipping** depends on the file's offset index, which parquet-java writes by default. A file without one is read over whole row groups, as Spark reads it.
 
 ## Status at 1 TB TPC-DS
 
@@ -323,7 +343,7 @@ The parquet-java reader tests themselves build their files in code; the cases th
   | `array<array<int>>` | nested list | 200.8 ± 16.0 | 230.6 ± 8.8 |
   | `array<struct<int, array<string>>>` | tree | 250.5 ± 8.6 | 250.6 ± 2.5 |
 
-  At parity or ahead everywhere but the map (15% behind). The folding through the getters is a large share of both columns. Run with `benchmarks/scripts/run-parquet-e2e.sh`'s classpath and JVM options.
+  At parity or ahead everywhere but the map (15% behind at the time of this table; since #812 the map reads faster than Spark's reader, below). The folding through the getters is a large share of both columns. Run with `benchmarks/scripts/run-parquet-e2e.sh`'s classpath and JVM options.
 
   **#812, the getters.** A profile of the map read put a quarter of its time in Arrow's bounds-checked `isNull`, reached once per element through Spark's `ArrowColumnVector` accessors, and `getInt` and `getUTF8String` check the bit again inside Arrow. `VectorArrowColumnVector` now reads the validity bit, INT32 and INT64 values and string offsets and bytes straight from the buffers' addresses, as Spark's own vectors read theirs, with no allocation; it reads each buffer's address on every call, so a vector refilled between batches is read where it lives now (`VectorArrowColumnVectorSuite`). Same run settings, `-wi 3 -i 6`, ms per read, ours before / after, then Spark in the same session as after:
 
