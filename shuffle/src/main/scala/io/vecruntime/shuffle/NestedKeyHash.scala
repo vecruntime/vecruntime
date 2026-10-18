@@ -65,8 +65,10 @@ object NestedKeyHash {
         f += 1
       }
       h
-    case IntegerType | DateType | ByteType | ShortType => PartitionKernels.hashInt(v.getInt(i), seed)
-    case LongType | TimestampType | TimestampNTZType => PartitionKernels.hashLong(v.getLong(i), seed)
+    case IntegerType | DateType | ByteType | ShortType | _: org.apache.spark.sql.types.YearMonthIntervalType =>
+      PartitionKernels.hashInt(v.getInt(i), seed)
+    case LongType | TimestampType | TimestampNTZType | _: org.apache.spark.sql.types.TimeType | _: org.apache.spark.sql.types.DayTimeIntervalType =>
+      PartitionKernels.hashLong(v.getLong(i), seed)
     case d: DecimalType => decimal(v, d, i, seed)
     case DoubleType => PartitionKernels.hashLong(PartitionKernels.doubleBits(v.getDouble(i)), seed)
     case BooleanType => PartitionKernels.hashInt(if (v.getBoolean(i)) 1 else 0, seed)

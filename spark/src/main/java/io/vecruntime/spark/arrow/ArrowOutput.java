@@ -106,6 +106,10 @@ public final class ArrowOutput {
              org.apache.arrow.vector.types.pojo.FieldType.nullable(new org.apache.arrow.vector.types.pojo.ArrowType.Duration(org.apache.arrow.vector.types.TimeUnit.MICROSECOND)),
                     allocator);
         }
+        if (dt instanceof org.apache.spark.sql.types.TimeType) {
+            // #787: nanoseconds of the day, Spark's TimeType value; ArrowColumnVector's TimeNanoAccessor reads it.
+            return new org.apache.arrow.vector.TimeNanoVector(name, allocator);
+        }
         throw new UnsupportedOperationException("unsupported output type " + dt);
     }
 

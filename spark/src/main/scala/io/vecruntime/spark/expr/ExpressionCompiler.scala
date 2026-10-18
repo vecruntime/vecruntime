@@ -257,6 +257,25 @@ object ExpressionCompiler {
   private def binaryOperand(e: Expression): Boolean =
     e.dataType == BinaryType || e.children.exists(_.dataType == BinaryType)
 
+  /** #812: an expression producing or reading a time or ANSI interval (TypeMapping.isComputeRestricted). */
+  private def restrictedOperand(e: Expression): Boolean =
+    TypeMapping.isComputeRestricted(e.dataType) || e.children.exists(c => TypeMapping.isComputeRestricted(c.dataType))
+
+  /**
+   * #812: the expressions whose result over a time or an ANSI interval is the long's (int's) on its lane:
+   * references, comparisons, null tests and the conditionals that pick a value. Arithmetic, casts and functions
+   * read the value as a time or an interval and stay Spark's.
+   */
+  private def restrictedNeutral(e: Expression): Boolean = e match {
+    case _: AttributeReference | _: BoundReference | _: Alias => true
+    case _: EqualTo | _: LessThan | _: LessThanOrEqual | _: GreaterThan | _: GreaterThanOrEqual => true
+    case Not(_: EqualTo) | _: EqualNullSafe => true
+    case _: IsNull | _: IsNotNull => true
+    case _: Coalesce | _: If | _: CaseWhen => true
+    case Literal(null, _) => true
+    case _ => false
+  }
+
   /** An expression producing or reading a collated string, anywhere inside its type (#705). */
   private def collatedOperand(e: Expression): Boolean =
     TypeMapping.isCollated(e.dataType) || e.children.exists(c => TypeMapping.isCollated(c.dataType))
@@ -398,6 +417,11 @@ object ExpressionCompiler {
     // substring, lpad, casts, hashes, ...) would count UTF-8 characters where Spark counts bytes.
     case e if binaryOperand(e) && !binaryNeutral(e) =>
       Left(s"unsupported ${e.prettyName} over binary")
+
+    // #812: a time or an ANSI interval rides its long (int) lane to be carried, compared, sorted, grouped and
+    // joined; anything that reads it as a time or an interval stays Spark's.
+    case e if restrictedOperand(e) && !restrictedNeutral(e) =>
+      Left(s"unsupported ${e.prettyName} over ${e.dataType.simpleString}")
 
     // A collated string (#705) rides the UTF8 lane only to be carried: whatever compares, hashes, orders,
     // matches or maps its characters follows the collation, not the bytes, and stays Spark's. A null test
