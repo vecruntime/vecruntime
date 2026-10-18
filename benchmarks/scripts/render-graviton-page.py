@@ -34,7 +34,7 @@ DEFAULT_META = {
     "dataset": "TPC-DS scale factor 1000 (1 TB), Parquet on Amazon S3 (103 query variants, one measured iteration each, no warm-up)",
     "cluster": "Amazon EKS 1.36; 9 x m8g.4xlarge (16 vCPU AWS Graviton4 / Neoverse V2 with SVE2, 64 GB, arm64), 300 GB root volume; one node group, the driver on the ninth node",
     "executors": "8 executors x 13 cores x 50 GB each (Spark: 20 GB heap / 30 GB overhead; VecRuntime: 30 GB heap / 20 GB overhead); driver 2 cores x 4 GB",
-    "storage": "Amazon S3 through Hadoop 3.4.3 S3A with the Analytics Accelerator input stream (the default in 3.4.3)",
+    "storage": "Amazon S3 through Hadoop 3.4.3 S3A with the classic input stream (fs.s3a.input.stream.type=classic, the Analytics Accelerator off, #835)",
     "versions": {
         "Spark": "4.1.3",
         "Scala": "2.13",

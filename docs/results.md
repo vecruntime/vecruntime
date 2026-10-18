@@ -2710,6 +2710,31 @@ frequency and double-pumping questions, `vpcompress` latency, whether decision 5
 Every switch above reads `Platform`, so those pools are a measurement away, not a code change.
 
 
+## The S3 Analytics Accelerator against S3A's classic stream, TPC-DS 1 TB on Graviton 4 (2026-10-18, #835)
+
+Same image (main `62ea8937`), 8 x m8gd.4xlarge (Graviton 4, local NVMe), 7 executors x 16 cores (30 GB
+heap / 20 GB overhead, one per node), 300 shuffle partitions, the 1 TB Parquet data, 103 queries, one pass
+each in one app. Only `fs.s3a.input.stream.type` differs. EMR 8.1 ARM64 (EMR Serverless, 7 x 16 vCPU,
+30 GB + 20 GB, its defaults) is the reference. Row counts are equal on all 103 queries.
+
+| Stream | Total | q44 | q94 | q93 | q24a | q88 |
+|---|---|---|---|---|---|---|
+| Classic | **664.4 s** | 11.9 | 11.8 | 13.8 | 23.5 | 5.7 |
+| Analytics Accelerator 1.3.1 (S3A's default) | 846.4 s | 33.1 | 37.8 | 30.2 | 48.6 | 11.4 |
+| Accelerator, with executor JFR | 934.9 s | 25.1 | 67.7 | 56.1 | 56.9 | 24.6 |
+| EMR 8.1 ARM64 | 882.8 s | 8.9 | 17.5 | 14.1 | 38.4 | 6.0 |
+
+The Accelerator's cost grows over the app: on a fresh app the 11 scan-bound queries took 110.8 s on it
+(111.6 s on a repeat), against 258.1 s for the same queries inside the full run. More S3 threads and
+deeper read-ahead made the fresh apps slower (122.8 s; 147.2 s with an 8 MiB Accelerator read-ahead).
+The executor profile shows why: `MetadataStore.asyncGet`, which every stream open calls, is
+`synchronized` and issues the HEAD for an uncached object inside the lock, so an executor's opens -- 16
+tasks, each opening files ahead -- queue behind one HEAD at a time. One executor spent 13,151 s of thread
+time blocked on that monitor (17.9 k contended entries, up to 1.6 s each); the `BlobStore` map lock of
+awslabs/analytics-accelerator-s3#370 was 98 s. The rest of the wait is in `Block.awaitData`. The method is
+still `synchronized` upstream. The benchmarks now use the classic stream for every engine and Iceberg's
+own stream for the Iceberg legs; the results below this section ran on the Accelerator.
+
 ## TPC-DS 3 TB against Gluten + Velox and DataFusion Comet, the data-on-eks benchmark (2026-10-16)
 
 The page `docs/benchmarks/tpcds-3tb-graviton.html` now shows VecRuntime at data-on-eks's own 200 shuffle partitions

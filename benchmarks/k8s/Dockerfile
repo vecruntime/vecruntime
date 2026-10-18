@@ -16,8 +16,9 @@
 ARG SPARK_VERSION=4.1.3
 ARG HADOOP_VERSION=3.4.3
 ARG AWS_SDK_V2_VERSION=2.35.4
-# The S3A Analytics Accelerator stream (Hadoop 3.4.3 reads through it by default); the version hadoop-aws is
+# The S3A Analytics Accelerator stream (Hadoop 3.4.3's default input stream); the version hadoop-aws is
 # built against, and the one the Iceberg AWS bundle carries -- pinned here so S3A does not depend on that bundle.
+# The benchmark runs do not read through it: render-run.sh sets fs.s3a.input.stream.type=classic (#835).
 ARG AAL_VERSION=1.3.1
 ARG COMET_VERSION=1.0.0
 ARG ICEBERG_VERSION=1.12.0

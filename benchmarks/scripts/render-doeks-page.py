@@ -41,7 +41,7 @@ DEFAULT_META = {
     "dataset": "TPC-DS scale factor 3000 (3 TB), Parquet on Amazon S3, generated with the data-on-eks generator image and arguments unchanged (103 query variants)",
     "cluster": "Amazon EKS; 12 x r8gd.12xlarge (48 vCPU AWS Graviton4, 384 GB, local NVMe as RAID0 for shuffle and spill), the data-on-eks benchmark's instance type and count",
     "executors": "23 executors x 5 cores x 58 GB each, as data-on-eks (Gluten / Comet: 20 GB heap + 6 GB overhead + 32 GB off-heap); VecRuntime: 44 GB heap + 14 GB overhead at 900 partitions, 35 GB + 23 GB at 200; driver 5 cores x 24 GB",
-    "storage": "Amazon S3 through Hadoop 3.4.3 S3A with the Analytics Accelerator input stream",
+    "storage": "Amazon S3 through Hadoop 3.4.3 S3A with the classic input stream (fs.s3a.input.stream.type=classic, the Analytics Accelerator off, #835)",
     "versions": {
         "VecRuntime": "0.0.7 + #690 (merge join, #688) + #691 (join probe strings, #687); arm64 image",
         "Spark (VecRuntime)": "4.1.3, Scala 2.13, Amazon Corretto 25.0.4.1",

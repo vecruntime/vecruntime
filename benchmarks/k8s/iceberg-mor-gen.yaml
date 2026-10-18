@@ -1,7 +1,7 @@
 # Generate an Iceberg merge-on-read warehouse ON THE CLUSTER, to S3, from lineitem Parquet already on
 # S3 (s3a://S3_BUCKET/DATA_PREFIX/lineitem). Distributed generation — the single-JVM IcebergMorGenerator
-# path does not scale to 100 GB. The catalog uses S3FileIO with the Analytics Accelerator stream
-# (IcebergMorGenerator.catalogConf detects the s3a warehouse). Rendered by run-iceberg-mor.sh.
+# path does not scale to 100 GB. The catalog uses S3FileIO with its own stream, the Analytics Accelerator
+# off (IcebergMorGenerator.catalogConf detects the s3a warehouse; #835). Rendered by run-iceberg-mor.sh.
 apiVersion: sparkoperator.k8s.io/v1beta2
 kind: SparkApplication
 metadata:

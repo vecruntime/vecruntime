@@ -124,11 +124,15 @@ cat <<EOF
     spark.eventLog.dir: "s3a://sfi-iceberg-wh-378683551918/spark-events"
     spark.hadoop.fs.s3a.connection.maximum: "1000"
     # S3 read concurrency for the native scan's read-ahead (#559/#566): each executor keeps up to 13 tasks x
-    # (prefetchFiles + prefetchRowGroups) file opens and row-group reads in flight, each holding a connection
-    # and an Analytics Accelerator block fetch. The 1 TB A/B rounds of #559 all ran with these values.
+    # (prefetchFiles + prefetchRowGroups) file opens and row-group reads in flight, each holding a connection.
     spark.hadoop.fs.s3a.threads.max: "256"
     spark.hadoop.fs.s3a.max.total.tasks: "128"
-    spark.hadoop.fs.s3a.analytics.accelerator.physicalio.thread.pool.size: "192"
+    # S3A's classic input stream, not the Analytics Accelerator (Hadoop 3.4.3's default, AAL 1.3.1), for every
+    # engine (#835). The Accelerator serializes every stream open of an executor behind one HEAD at a time
+    # (MetadataStore.asyncGet is synchronized with the HEAD inside) and its shared caches grow for the app's
+    # life (awslabs/analytics-accelerator-s3#370), so a long run slows down as it goes: TPC-DS 1 TB, 7 x 16
+    # Graviton 4, 846.4 s on the Accelerator against 664.4 s on the classic stream, same rows.
+    spark.hadoop.fs.s3a.input.stream.type: "classic"
     spark.hadoop.fs.s3a.aws.credentials.provider: "software.amazon.awssdk.auth.credentials.WebIdentityTokenFileCredentialsProvider"
 EOF
 # Last setting of a key wins, as it does for spark-submit (the strict configuration overrides VECTOR's).

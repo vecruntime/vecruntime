@@ -166,8 +166,8 @@ object IcebergMorGenerator {
   /**
    * Session configuration for a catalog under `warehouse` plus Iceberg's SQL extensions. A local
    * (schemeless) warehouse uses the default Hadoop `FileIO`; an `s3a://` warehouse uses Iceberg's
-   * `S3FileIO` with the Analytics Accelerator stream (#249), so the cluster legs read S3 through the
-   * same path the TPC-DS Iceberg campaign will.
+   * `S3FileIO` with its own S3 stream, the Analytics Accelerator off (#249, #835), so the cluster legs
+   * read S3 through the same path the TPC-DS Iceberg campaign does.
    */
   def catalogConf(warehouse: String): Map[String, String] = {
     val resolved = resolveWarehouse(warehouse)
@@ -181,7 +181,8 @@ object IcebergMorGenerator {
     )
     if (resolved.startsWith("s3")) base ++ Map(
       s"spark.sql.catalog.$Catalog.io-impl" -> "org.apache.iceberg.aws.s3.S3FileIO",
-      s"spark.sql.catalog.$Catalog.s3.analytics-accelerator.enabled" -> "true"
+      // Iceberg's own S3 stream, not the Analytics Accelerator: see benchmarks/k8s/README.md (#835).
+      s"spark.sql.catalog.$Catalog.s3.analytics-accelerator.enabled" -> "false"
     )
     else base
   }
