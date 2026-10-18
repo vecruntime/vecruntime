@@ -4,6 +4,19 @@ All notable changes to vecruntime. The format follows [Keep a Changelog](https:/
 the project uses [semantic versioning](https://semver.org/) once it reaches 1.0 -- until then a minor
 version may change configuration keys or defaults, always noted here.
 
+## Unreleased
+
+### Changed
+
+- The benchmarks read S3 through S3A's classic input stream (`fs.s3a.input.stream.type=classic`) and Iceberg's
+  own `S3FileIO` stream (`s3.analytics-accelerator.enabled=false`), not the S3 Analytics Accelerator, for every
+  engine (#835). With the Accelerator 1.3.1 every stream open of an executor waits behind one HEAD at a time
+  (`MetadataStore.asyncGet` is `synchronized` around the HEAD) and its shared caches grow over the app
+  (awslabs/analytics-accelerator-s3#370), so a long run slows down as it goes: TPC-DS 1 TB on 7 x 16-core
+  Graviton 4 executors, 846.4 s on the Accelerator against 664.4 s on the classic stream, the same rows.
+  Results published before this change ran on the Accelerator. #834 tracks porting its small-file prefetch
+  and range merging into the native scan.
+
 ## 0.0.8 -- 2026-10-16
 
 The native Parquet reader handles nested types; array, map and struct columns ride a nested lane through

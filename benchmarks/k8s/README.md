@@ -17,10 +17,21 @@ tables, 12,096 objects, 27 GB, exact row counts, in about 30 minutes on four 4-c
 `render-run.sh` renders the `SparkApplication` of one benchmark configuration from
 `submit-cluster.sh`'s own settings.
 
-**Iceberg legs (#249), decided 2026-09-24:** read S3 through Iceberg's `S3FileIO` with the S3 Analytics
-Accelerator's prefetching stream -- `spark.sql.catalog.<catalog>.io-impl=org.apache.iceberg.aws.s3.S3FileIO`
-and `spark.sql.catalog.<catalog>.s3.analytics-accelerator.enabled=true` (Iceberg 1.11; the `iceberg-aws-bundle`
-is on the image) -- on every engine alike; the `ours`/`csvo` legs add `spark.vecruntime.scan.prefetch=2` (#465) once
+**S3 input stream (#835), decided 2026-10-18:** every engine reads S3 without the S3 Analytics Accelerator.
+Parquet legs set `spark.hadoop.fs.s3a.input.stream.type=classic` (`render-run.sh`; Hadoop 3.4.3's default
+is the Accelerator), and Iceberg legs set `spark.sql.catalog.<catalog>.s3.analytics-accelerator.enabled=false`.
+With the Accelerator (1.3.1, the latest release) every stream open of an executor waits behind one HEAD at a
+time -- `MetadataStore.asyncGet` is `synchronized` and issues the HEAD inside it; an executor profile at 1 TB
+spent 13,151 s of thread time blocked there -- and its shared caches grow for the app's life
+(awslabs/analytics-accelerator-s3#370, #369). A long run slows down as it goes: TPC-DS 1 TB on 7 x 16-core
+Graviton 4 executors took 846.4 s on the Accelerator against 664.4 s on the classic stream, the same rows;
+q94 37.8 s against 11.8, q44 33.1 against 11.9. Our native scan does its own read-ahead, so the
+Accelerator's prefetching bought nothing a fresh app did not already have (#834 tracks the parts worth
+porting: small-file prefetch, range merging).
+
+**Iceberg legs (#249), decided 2026-09-24:** read S3 through Iceberg's `S3FileIO` --
+`spark.sql.catalog.<catalog>.io-impl=org.apache.iceberg.aws.s3.S3FileIO`, the Analytics Accelerator off as
+above (the `iceberg-aws-bundle` is on the image) -- on every engine alike; the `ours`/`csvo` legs add `spark.vecruntime.scan.prefetch=2` (#465) once
 its measurement is in. The runner's `--iceberg <warehouse>` resolves a local path today and must take an
 `s3a://` warehouse before these legs run.
 
@@ -79,8 +90,8 @@ placeholders (`IMAGE`, `S3_BUCKET`, `DATASET`, `CONFIG`) and add the engine `spa
 
 The `CdcMergeRunner` and `IcebergMorGenerator` accept an `s3a://` warehouse: a schemeless `--warehouse`
 is resolved to a local absolute path as before, but a `s3a://…` warehouse is passed through and the
-catalog is configured with `S3FileIO` and the Analytics Accelerator stream
-(`IcebergMorGenerator.catalogConf`, #249). Neither forces `local[N]` when spark-submit sets a master,
+catalog is configured with `S3FileIO`, the Analytics Accelerator off
+(`IcebergMorGenerator.catalogConf`, #249, #835). Neither forces `local[N]` when spark-submit sets a master,
 so both run distributed on the cluster.
 
 `run-iceberg-mor.sh <bucket> <tpch_sf_prefix> <image> [v2|v3|both] [variants]` does the whole thing:
