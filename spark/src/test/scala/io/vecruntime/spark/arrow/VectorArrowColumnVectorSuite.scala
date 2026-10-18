@@ -63,8 +63,11 @@ class VectorArrowColumnVectorSuite extends AnyFunSuite with BeforeAndAfterAll {
     val sv = new VarCharVector("s", allocator)
     try {
       iv.allocateNew(4); lv.allocateNew(4); sv.allocateNew(4)
-      val (oi, ol, os) = (new VectorArrowColumnVector(iv, false), new VectorArrowColumnVector(lv, false),
-        new VectorArrowColumnVector(sv, false))
+      val (oi, ol, os) = (
+        new VectorArrowColumnVector(iv, false),
+        new VectorArrowColumnVector(lv, false),
+        new VectorArrowColumnVector(sv, false)
+      )
       val (si, sl, ss) = (new ArrowColumnVector(iv), new ArrowColumnVector(lv), new ArrowColumnVector(sv))
       // A small batch, then one large enough that every buffer is reallocated under the same wrappers.
       for ((n, salt) <- Seq((21, 0), (5000, 1), (3, 2))) {

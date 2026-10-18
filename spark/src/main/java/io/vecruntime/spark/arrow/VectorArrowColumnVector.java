@@ -54,11 +54,13 @@ public final class VectorArrowColumnVector extends ArrowColumnVector {
         this.valueVector = vector;
         this.owns = owns;
         this.reusable = reusable;
-        this.bitValidity = vector instanceof org.apache.arrow.vector.BaseFixedWidthVector
-                || vector instanceof org.apache.arrow.vector.BaseVariableWidthVector;
+        this.bitValidity = vector instanceof org.apache.arrow.vector.BaseFixedWidthVector || vector instanceof org.apache.arrow.vector.BaseVariableWidthVector;
     }
 
-    /** Whether the vector keeps one validity bit per slot in its validity buffer (read by {@link #isNullAt}). */
+    /**
+     * Whether the vector keeps one validity bit per slot in its validity buffer
+     * (read by {@link #isNullAt}).
+     */
     private final boolean bitValidity;
 
     /**
@@ -114,8 +116,7 @@ public final class VectorArrowColumnVector extends ArrowColumnVector {
             long offsets = v.getOffsetBuffer().memoryAddress() + 4L * rowId;
             int start = org.apache.spark.unsafe.Platform.getInt(null, offsets);
             int end = org.apache.spark.unsafe.Platform.getInt(null, offsets + 4);
-            return org.apache.spark.unsafe.types.UTF8String.fromAddress(null, v.getDataBuffer().memoryAddress() + start,
-                    end - start);
+            return org.apache.spark.unsafe.types.UTF8String.fromAddress(null, v.getDataBuffer().memoryAddress() + start, end - start);
         }
         return super.getUTF8String(rowId);
     }
