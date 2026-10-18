@@ -289,6 +289,20 @@ class FactBloomFilterSuite extends VectorQuerySuite {
     assert(salesBlooms(plain) >= 1, plain.queryExecution.optimizedPlan.treeString)
   }
 
+  test("a fact read again with other filters gets no probe (the relation is the same, #735)") {
+    val df = run(
+      s"""SELECT * FROM (
+         |  SELECT ss_item_sk, sum(ss_quantity - sr_return_quantity) q, count(*) c, max(ss_pad) p
+         |  FROM (SELECT * FROM store_sales WHERE ss_quantity > 2) s
+         |  JOIN (SELECT * FROM store_returns WHERE isnotnull(nullif(sr_return_quantity, 0))) r
+         |    ON ss_ticket_number = sr_ticket_number AND ss_item_sk = sr_item_sk
+         |  GROUP BY ss_item_sk) a
+         |JOIN (SELECT ss_item_sk k, count(*) n FROM store_sales WHERE ss_quantity < 5 GROUP BY ss_item_sk) b
+         |  ON a.ss_item_sk = b.k""".stripMargin
+    )
+    assert(salesBlooms(df) === 0, df.queryExecution.optimizedPlan.treeString)
+  }
+
   test("a relation the plan reads twice gets no probe: its copies keep their exchange reuse (q23b)") {
     val twice =
       s"""SELECT * FROM ($q93) a JOIN (SELECT ss_item_sk k, count(*) n FROM store_sales GROUP BY ss_item_sk) b

@@ -77,8 +77,20 @@ import org.apache.spark.sql.internal.SQLConf
 case class FactBloomFilter(session: SparkSession) extends Rule[LogicalPlan] with PredicateHelper
     with JoinSelectionHelper {
 
-  /** Canonical forms of the relations the current plan reads more than once (set per `apply`). */
-  private var shared: Set[LogicalPlan] = Set.empty
+  /** The relations the current plan reads more than once, by [[readKey]] (set per `apply`). */
+  private var shared: Set[Any] = Set.empty
+
+  /**
+   * What makes two reads one relation. A file scan's copies are one relation under different filters, so its
+   * canonical form. A DSv2 scan holds the filters pushed into it, so two reads of one Iceberg table with different
+   * filters have different canonical forms: keyed by its table instead (#735, q14a: `store_sales` read by the
+   * outer channel and by `cross_items`, a bloom filter on the first, and `cross_items` computed again by the
+   * filter's subquery -- its Parquet copy is one relation and gets no filter).
+   */
+  private def readKey(r: LogicalPlan): Any = r match {
+    case v: DataSourceV2ScanRelation => ("dsv2", v.relation.catalog.map(_.name()), v.relation.table.name())
+    case other => other.canonicalized
+  }
 
   override def apply(plan: LogicalPlan): LogicalPlan = {
     val conf = session.sessionState.conf
@@ -89,7 +101,7 @@ case class FactBloomFilter(session: SparkSession) extends Rule[LogicalPlan] with
     // shuffle grew from 75 to 101 GB. Such a relation gets no probe.
     // Copies are told apart by their attribute ids: the same relation inside a subquery of the plan (Spark's
     // own runtime filter built from it) keeps its ids and is not a second read.
-    shared = plan.collect { case r if isScan(r) => (r.canonicalized, r.output.map(_.exprId)) }
+    shared = plan.collect { case r if isScan(r) => (readKey(r), r.output.map(_.exprId)) }
       .groupBy(_._1).collect { case (c, copies) if copies.map(_._2).distinct.size > 1 => c }.toSet
     val reduced = if (VectorConf.factBloomFilterTransitive(conf)) transitive(plan, conf) else plan
     budget -= countBlooms(reduced) - countBlooms(plan)
@@ -130,7 +142,7 @@ case class FactBloomFilter(session: SparkSession) extends Rule[LogicalPlan] with
       case Filter(_, c) => oneScan(c)
       case r => isScan(r)
     }
-    !oneScan(creation) && creation.exists(r => isScan(r) && shared.contains(r.canonicalized))
+    !oneScan(creation) && creation.exists(r => isScan(r) && shared.contains(readKey(r)))
   }
   private def prunesRight(jt: JoinType): Boolean = jt == Inner || jt == LeftOuter
 
@@ -458,7 +470,7 @@ case class FactBloomFilter(session: SparkSession) extends Rule[LogicalPlan] with
       else None
     case rel
         if isScan(rel) && key.references.subsetOf(rel.outputSet) && rel.stats.sizeInBytes >= BigInt(threshold) &&
-          !shared.contains(rel.canonicalized) =>
+          !shared.contains(readKey(rel)) =>
       Some(Filter(mk(key), rel))
     case _ => None
   }
