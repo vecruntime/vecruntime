@@ -58,6 +58,42 @@ public final class NativeParquetSupport {
 
     private NativeParquetSupport() {}
 
+    /**
+     * #812: whether the native reader can decode a top-level column of this
+     * type: {@link #isReadable}, or a struct of the paths Spark's
+     * PushVariantIntoScan extracts from a variant column (assembled per row from
+     * the variant group, {@code NativeParquetVariantColumn}).
+     */
+    public static boolean isReadableColumn(DataType dt) {
+        return isVariantStruct(dt) || isReadable(dt);
+    }
+
+    /** #812: Spark's PushVariantIntoScan struct of extracted variant paths. */
+    public static boolean isVariantStruct(DataType dt) {
+        return dt instanceof org.apache.spark.sql.types.StructType st && org.apache.spark.sql.execution.datasources.VariantMetadata$.MODULE$.isVariantStruct(st);
+    }
+
+    /** #812: whether a type holds a variant, or a pushed variant struct, anywhere. */
+    public static boolean containsVariant(DataType dt) {
+        if (dt instanceof org.apache.spark.sql.types.VariantType || isVariantStruct(dt)) {
+            return true;
+        }
+        if (dt instanceof org.apache.spark.sql.types.ArrayType at) {
+            return containsVariant(at.elementType());
+        }
+        if (dt instanceof org.apache.spark.sql.types.MapType mt) {
+            return containsVariant(mt.keyType()) || containsVariant(mt.valueType());
+        }
+        if (dt instanceof org.apache.spark.sql.types.StructType st) {
+            for (org.apache.spark.sql.types.StructField f : st.fields()) {
+                if (containsVariant(f.dataType())) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
     /** Whether the native reader can decode a column of this type. */
     public static boolean isReadable(DataType dt) {
         // #568: nested types are readable when every leaf below them is: lists, maps and structs at any depth.
@@ -71,8 +107,8 @@ public final class NativeParquetSupport {
             if (st.fields().length == 0) {
                 return false;
             }
-            // Spark's PushVariantIntoScan (#787): a struct of the paths a query extracts from a variant column,
-            // which Spark's reader computes from the variant group. Not a struct of the file's fields: Spark's scan.
+            // Spark's PushVariantIntoScan (#787): a struct of the paths a query extracts from a variant column. Read
+            // natively at the top level only (#812, isReadableColumn); below it, Spark's scan.
             if (org.apache.spark.sql.execution.datasources.VariantMetadata$.MODULE$.isVariantStruct(st)) {
                 return false;
             }
@@ -192,7 +228,8 @@ public final class NativeParquetSupport {
                     : new org.apache.spark.sql.types.MapType(k, v, mt.valueContainsNull());
         }
         if (dt instanceof org.apache.spark.sql.types.StructType st) {
-            return variantAsStruct(st);
+            // #812: a pushed variant struct is the variant group's own business (fileReadSchema), left as it is.
+            return isVariantStruct(st) ? dt : variantAsStruct(st);
         }
         return dt;
     }

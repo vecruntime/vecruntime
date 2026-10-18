@@ -94,14 +94,58 @@ class NativeParquetTimeSuite extends VectorQuerySuite {
     checkVectorized("SELECT i, p FROM t_time_part WHERE i % 3 = 0", Seq(node))
   }
 
-  test("only INT64 TIME(MICROS) matches the TIME lane; other units fall over per file (#787)") {
+  test("any INT64 matches the TIME lane, as Spark's LongAsNanosUpdater reads it; INT32 does not (#787, #812)") {
     def int64(unit: LogicalTypeAnnotation.TimeUnit) =
       Types.required(PrimitiveTypeName.INT64).as(LogicalTypeAnnotation.timeType(false, unit)).named("t")
     assert(VectorParquetScanExec.physicalMatches(TimeType(6), int64(LogicalTypeAnnotation.TimeUnit.MICROS)))
-    assert(!VectorParquetScanExec.physicalMatches(TimeType(6), int64(LogicalTypeAnnotation.TimeUnit.NANOS)))
+    assert(VectorParquetScanExec.physicalMatches(TimeType(6), int64(LogicalTypeAnnotation.TimeUnit.NANOS)))
+    assert(VectorParquetScanExec.physicalMatches(TimeType(6), Types.required(PrimitiveTypeName.INT64).named("t")))
     val millis = Types.required(PrimitiveTypeName.INT32)
       .as(LogicalTypeAnnotation.timeType(false, LogicalTypeAnnotation.TimeUnit.MILLIS)).named("t")
     assert(!VectorParquetScanExec.physicalMatches(TimeType(6), millis))
-    assert(!VectorParquetScanExec.physicalMatches(TimeType(6), Types.required(PrimitiveTypeName.INT64).named("t")))
+  }
+
+  test("TIME(NANOS), un-annotated INT64 and INT32 TIME(MILLIS) files give Spark's outcome (#812)") {
+    def outcome(f: => Array[org.apache.spark.sql.Row]): Either[String, Seq[String]] =
+      try Right(f.map(_.toString).toSeq.sorted)
+      catch {
+        case e: Throwable =>
+          Left(Iterator.iterate(e)(_.getCause).takeWhile(_ != null).collect {
+            case t: org.apache.spark.SparkThrowable => t.getCondition
+          }.toSeq.lastOption.getOrElse(e.getClass.getName))
+      }
+    for (
+      (name, decl, value) <- Seq[(String, String, Int => Any)](
+        ("nanos", "optional int64 t (TIME(NANOS,false))", k => (k * 1000003L) % 86400000000L),
+        ("bare", "optional int64 t", k => (k * 1000003L) % 86400000000L),
+        ("millis", "optional int32 t (TIME(MILLIS,false))", k => (k * 1003) % 86400000)
+      )
+    ) {
+      val path = newTempPath(s"t_time_$name")
+      new java.io.File(path).mkdirs()
+      val schema = org.apache.parquet.schema.MessageTypeParser.parseMessageType(
+        s"message m { required int32 id; $decl; }"
+      )
+      val writer = org.apache.parquet.hadoop.example.ExampleParquetWriter
+        .builder(new org.apache.hadoop.fs.Path(path + "/part-0.parquet"))
+        .withConf(new org.apache.hadoop.conf.Configuration())
+        .withType(schema)
+        .build()
+      val factory = new org.apache.parquet.example.data.simple.SimpleGroupFactory(schema)
+      try {
+        for (k <- 0 until 2000) {
+          val g = factory.newGroup().append("id", k)
+          if (k % 7 != 0) value(k) match {
+            case l: Long => g.append("t", l)
+            case i: Int => g.append("t", i)
+          }
+          writer.write(g)
+        }
+      } finally writer.close()
+      def q() = spark.read.schema("id int, t time(6)").parquet(path).where("id % 3 = 0").collect()
+      val expected = withPlugin(enabled = false)(outcome(q()))
+      val actual = withPlugin(enabled = true)(outcome(q()))
+      assert(actual == expected, s"$name: expected ${expected.map(_.take(3))}, actual ${actual.map(_.take(3))}")
+    }
   }
 }

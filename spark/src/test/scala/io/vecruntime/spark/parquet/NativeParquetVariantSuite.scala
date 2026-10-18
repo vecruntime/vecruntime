@@ -103,29 +103,58 @@ class NativeParquetVariantSuite extends VectorQuerySuite {
     assert(expected.map(_.toString).sorted.toSeq == actual.map(_.toString).sorted.toSeq)
   }
 
-  test("a shredded VARIANT file is read by Spark's reader (#787)") {
-    val path = newTempPath("t_var_shredded")
+  // #812: a shredded variant is read natively too: the file group decoded as its own struct (typed columns and
+  // residual binary), each row rebuilt by Spark's SparkShreddingUtils.
+  for ((version, dict) <- Seq("v1" -> "true", "v1" -> "false", "v2" -> "true")) {
+    test(s"a shredded VARIANT decodes natively, Spark's values (version=$version, dictionary=$dict) (#812)") {
+      val path = newTempPath(s"t_var_shredded_${version}_$dict")
+      withPlugin(enabled = false) {
+        withConf(
+          "spark.sql.variant.writeShredding.enabled" -> "true",
+          "spark.sql.variant.forceShreddingSchemaForTest" -> "a int, d decimal(18, 3), b struct<c: array<int>>"
+        ) {
+          spark.sql(s"SELECT CAST(id AS INT) AS i, $variantExpr AS v FROM range(0, 6000)")
+            .coalesce(1).write.option("parquet.writer.version", version).option("parquet.enable.dictionary", dict)
+            .mode("overwrite").parquet(path)
+        }
+        spark.read.parquet(path).createOrReplaceTempView("t_var_shredded")
+      }
+      checkVectorized("SELECT i, v FROM t_var_shredded", Seq(node))
+      checkVectorized(
+        "SELECT i, to_json(v), variant_get(v, '$.a', 'int'), variant_get(v, '$.b.c[1]', 'int'), " +
+          "schema_of_variant(v), is_variant_null(v) FROM t_var_shredded",
+        Seq(node)
+      )
+      checkVectorized(
+        "SELECT count(*), sum(variant_get(v, '$.a', 'int')) FROM t_var_shredded WHERE i % 3 = 1",
+        Seq(node)
+      )
+      assert(nativeRowGroupsOf("SELECT i, v FROM t_var_shredded") > 0, "the shredded file was not decoded natively")
+    }
+  }
+
+  test("variant extraction pushed into the scan decodes natively, shredded or not (#812)") {
+    writeVariantTable("t_var_push", "v1", "true")
+    val shredded = newTempPath("t_var_push_shredded")
     withPlugin(enabled = false) {
       withConf(
         "spark.sql.variant.writeShredding.enabled" -> "true",
         "spark.sql.variant.forceShreddingSchemaForTest" -> "a int, d decimal(18, 3)"
       ) {
-        spark.sql(s"SELECT CAST(id AS INT) AS i, $variantExpr AS v FROM range(0, 3000)")
-          .coalesce(1).write.mode("overwrite").parquet(path)
+        spark.sql(s"SELECT CAST(id AS INT) AS i, $variantExpr AS v FROM range(0, 6000)")
+          .coalesce(1).write.mode("overwrite").parquet(shredded)
       }
-      spark.read.parquet(path).createOrReplaceTempView("t_var_shredded")
+      spark.read.parquet(shredded).createOrReplaceTempView("t_var_push_shredded")
     }
-    checkVectorized("SELECT i, to_json(v), variant_get(v, '$.a', 'int') FROM t_var_shredded", Seq(node))
-    assert(nativeRowGroupsOf("SELECT i, v FROM t_var_shredded") == 0, "a shredded file was decoded natively")
-  }
-
-  test("variant extraction pushed into the scan keeps Spark's scan (#787)") {
-    writeVariantTable("t_var_push", "v1", "true")
     withConf("spark.sql.variant.pushVariantIntoScan" -> "true") {
-      val sql = "SELECT i, variant_get(v, '$.a', 'int'), variant_get(v, '$.d', 'string') FROM t_var_push"
-      val expected = withPlugin(enabled = false)(spark.sql(sql).collect())
-      val actual = withPlugin(enabled = true)(spark.sql(sql).collect())
-      assert(expected.map(_.toString).sorted.toSeq == actual.map(_.toString).sorted.toSeq)
+      for (view <- Seq("t_var_push", "t_var_push_shredded")) {
+        val sql = s"SELECT i, variant_get(v, '$$.a', 'int'), variant_get(v, '$$.d', 'string'), " +
+          s"try_variant_get(v, '$$.a', 'date'), variant_get(v, '$$.b', 'variant') FROM $view"
+        val expected = withPlugin(enabled = false)(spark.sql(sql).collect())
+        val actual = withPlugin(enabled = true)(spark.sql(sql).collect())
+        assert(expected.map(_.toString).sorted.toSeq == actual.map(_.toString).sorted.toSeq, view)
+        assert(withPlugin(enabled = true)(nativeRowGroupsOf(sql)) > 0, s"$view: the pushed struct was not native")
+      }
     }
   }
 }
