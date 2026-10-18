@@ -61,13 +61,39 @@ case class VectorIcebergScanExec(
     // file's columns by field id; the filter above still decides which rows pass.
     pushedFilters: Seq[org.apache.spark.sql.sources.Filter] = Nil
 ) extends LeafExecNode
-    with VectorPlan {
+    with VectorPlan
+    with RuntimeFilterTarget {
 
   override val output: Seq[Attribute] = scan.output
   override def outputPartitioning: Partitioning = scan.outputPartitioning
   override def outputOrdering: Seq[SortOrder] = scan.outputOrdering
 
+  /**
+   * Filters a broadcast hash join above derived from its build keys (#610), set on the driver before this node's
+   * RDD is made, as [[VectorParquetScanExec]] takes them. ANDed with `pushedFilters`, they skip row groups by their
+   * statistics, each column matched by field id; the join above still decides which rows pass.
+   */
+  @transient @volatile private[vecruntime] var runtimeFilters: Seq[org.apache.spark.sql.sources.Filter] = Nil
+
+  /** The runtime filters attached so far (tests). */
+  def runtimeFilterCount: Int = runtimeFilters.size
+
+  private[vecruntime] def addRuntimeFilter(f: org.apache.spark.sql.sources.Filter): Unit = synchronized {
+    if (!runtimeFilters.contains(f)) runtimeFilters = runtimeFilters :+ f
+  }
+
+  /**
+   * A data column of the files (not an Iceberg metadata column) whose name needs no quoting: the pushed filters
+   * are matched to field ids by quoted name, and a runtime filter names the column as it is.
+   */
+  private[vecruntime] def isDataColumn(name: String): Boolean =
+    output.zip(fieldIds).exists { case (a, id) =>
+      a.name == name && IcebergTasks.columnKind(a.name, id) == IcebergTasks.DataColumn &&
+      org.apache.spark.sql.catalyst.util.quoteIfNeeded(name) == name
+    }
+
   override lazy val metrics: Map[String, SQLMetric] = Map(
+    "numRuntimeFilters" -> SQLMetrics.createMetric(sparkContext, "number of runtime filters from joins"),
     "numFiles" -> SQLMetrics.createMetric(sparkContext, "number of files read"),
     "numOutputRows" -> SQLMetrics.createMetric(sparkContext, "number of output rows"),
     "numOutputBatches" -> SQLMetrics.createMetric(sparkContext, "number of output batches"),
@@ -95,6 +121,13 @@ case class VectorIcebergScanExec(
 
   override protected def doExecuteColumnar(): RDD[ColumnarBatch] = {
     val sqlConf = session.sessionState.conf
+    // The static pushed filters and the joins' runtime filters (#610), read now: the joins attached them on the
+    // driver before executing this side.
+    val runtime = if (sqlConf.parquetFilterPushDown) runtimeFilters else Nil
+    val filters = pushedFilters ++ runtime
+    // As the Parquet scan: runtime filters prune row groups by statistics only; with no static filter but null
+    // checks, Parquet's dictionary and bloom checks (an object-store request per row group) are off.
+    val statsOnly = runtime.nonEmpty && pushedFilters.forall(_.isInstanceOf[org.apache.spark.sql.sources.IsNotNull])
     // The output's data columns (metadata columns aside), each carrying its Iceberg field id, so the reader
     // matches the file's columns by id.
     val kinds = output.zip(fieldIds).map { case (a, id) => IcebergTasks.columnKind(a.name, id) }
@@ -128,6 +161,10 @@ case class VectorIcebergScanExec(
       hadoopConf.setBoolean(SQLConf.PARQUET_INT96_AS_TIMESTAMP.key, sqlConf.isParquetINT96AsTimestamp)
       hadoopConf.setBoolean(SQLConf.PARQUET_INFER_TIMESTAMP_NTZ_ENABLED.key, sqlConf.parquetInferTimestampNTZEnabled)
       hadoopConf.setBoolean(SQLConf.LEGACY_PARQUET_NANOS_AS_LONG.key, sqlConf.legacyParquetNanosAsLong)
+      if (statsOnly) {
+        hadoopConf.setBoolean(org.apache.parquet.hadoop.ParquetInputFormat.DICTIONARY_FILTERING_ENABLED, false)
+        hadoopConf.setBoolean(org.apache.parquet.hadoop.ParquetInputFormat.BLOOM_FILTERING_ENABLED, false)
+      }
       session.sparkContext.broadcast(new SerializableConfiguration(hadoopConf))
     }
     val confBroadcast = confFor(requiredSchema)
@@ -143,7 +180,7 @@ case class VectorIcebergScanExec(
 
     // Pushed filters by field id: the data columns' quoted names, as the translated filters name them.
     val filterFieldIds =
-      if (pushedFilters.isEmpty || !sqlConf.parquetFilterPushDown) null
+      if (filters.isEmpty || !sqlConf.parquetFilterPushDown) null
       else dataColumns.map { case (a, id) => org.apache.spark.sql.catalyst.util.quoteIfNeeded(a.name) -> id }.toMap
     val m = ScanMetrics(
       longMetric("numFiles"),
@@ -153,7 +190,7 @@ case class VectorIcebergScanExec(
       longMetric("scanTime"),
       longMetric("numLateSkippedRows")
     )
-    new VectorIcebergRDD(
+    val rdd = new VectorIcebergRDD(
       session.sparkContext,
       scan.inputRDD.partitions,
       scan.readerFactory,
@@ -185,7 +222,7 @@ case class VectorIcebergScanExec(
       m,
       longMetric("numNativeGroups"),
       longMetric("numIcebergGroups"),
-      if (filterFieldIds == null) Nil else pushedFilters,
+      if (filterFieldIds == null) Nil else filters,
       filterFieldIds,
       PushDownConf(
         sqlConf.parquetFilterPushDownDate,
@@ -195,6 +232,13 @@ case class VectorIcebergScanExec(
         sqlConf.parquetFilterPushDownInFilterThreshold
       )
     )
+    // Counted by the task of partition 0, once per execution, as the Parquet scan counts them.
+    if (runtime.isEmpty) rdd
+    else {
+      val counter = longMetric("numRuntimeFilters")
+      val n = runtime.size.toLong
+      rdd.mapPartitionsWithIndexInternal { (i, it) => if (i == 0) counter += n; it }
+    }
   }
 
 }
