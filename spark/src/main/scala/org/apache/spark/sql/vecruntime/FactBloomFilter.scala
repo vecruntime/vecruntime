@@ -115,6 +115,20 @@ case class FactBloomFilter(session: SparkSession) extends Rule[LogicalPlan] with
   }
 
   private def prunesLeft(jt: JoinType): Boolean = jt == Inner || jt == LeftSemi || jt == RightOuter
+
+  /**
+   * Small enough that the join with it is a broadcast: Spark's size estimate, or -- for an Iceberg input, whose
+   * estimate is rows times default column widths -- the bytes of the files its scan planned, as
+   * `V2BroadcastBySize` hints the join and as its Parquet copy is judged (#735: 3 TB q27's `customer_demographics`
+   * made `store_sales JOIN customer_demographics` look like a shuffle join, and the store filter was planted below it).
+   */
+  private def broadcastable(p: LogicalPlan, conf: SQLConf): Boolean =
+    canBroadcastBySize(p, conf) || (VectorConf.v2BroadcastBySizeEnabled(conf) && conf.autoBroadcastJoinThreshold > 0 &&
+      V2BroadcastBySize.smallByFiles(
+        p,
+        conf.autoBroadcastJoinThreshold,
+        VectorConf.v2BroadcastBySizeMaxEstimatedBytes(conf)
+      ))
   private def prunesRight(jt: JoinType): Boolean = jt == Inner || jt == LeftOuter
 
   private def countBlooms(plan: LogicalPlan): Int =
@@ -377,7 +391,7 @@ case class FactBloomFilter(session: SparkSession) extends Rule[LogicalPlan] with
   private def transitive(plan: LogicalPlan, conf: SQLConf): LogicalPlan = plan.transformDown {
     case j @ ExtractEquiJoinKeys(Inner, leftKeys, rightKeys, _, _, left, right, _) =>
       def reduceWith(x: LogicalPlan, d: LogicalPlan, xKeys: Seq[Expression], dKeys: Seq[Expression]): LogicalPlan =
-        if (!canBroadcastBySize(d, conf) || !KeyStats.reduced(d) || canBroadcastBySize(x, conf)) x
+        if (!broadcastable(d, conf) || !KeyStats.reduced(d) || broadcastable(x, conf)) x
         else xKeys.zip(dKeys).foldLeft(x) {
           case (acc, (xk: org.apache.spark.sql.catalyst.expressions.Attribute, dk)) if dk.references.nonEmpty =>
             belowShuffleJoin(acc, xk, dimensionFilter(d, dk), conf).getOrElse(acc)
@@ -412,7 +426,10 @@ case class FactBloomFilter(session: SparkSession) extends Rule[LogicalPlan] with
       val inLeft = l.outputSet.contains(key)
       val side = if (inLeft) l else r
       if (!inLeft && !r.outputSet.contains(key)) None
-      else if (!canBroadcastBySize(l, conf) && !canBroadcastBySize(r, conf))
+      else if (
+        !broadcastable(l, conf) && !broadcastable(r, conf) && !hintToBroadcastLeft(jn.hint) &&
+        !hintToBroadcastRight(jn.hint)
+      )
         onScan(side, key, 0L, mk).map(c => if (inLeft) jn.copy(left = c) else jn.copy(right = c))
       else belowShuffleJoin(side, key, mk, conf).map(c => if (inLeft) jn.copy(left = c) else jn.copy(right = c))
     case _ => None
