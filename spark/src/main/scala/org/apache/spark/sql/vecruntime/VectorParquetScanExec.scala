@@ -931,8 +931,9 @@ private[vecruntime] final class VectorParquetPartitionReader(
         case _ if i == rowIndexOrdinal =>
           new io.vecruntime.spark.parquet.NativeParquetRowIndexColumn(field.name, allocator)
         case dt if !NativeParquetStructReader.holds(fileSchema, Array(clippedName(p.clipped, i))) =>
-          // #568 schema evolution: a column added since the file was written, null in every row.
-          new io.vecruntime.spark.parquet.NativeParquetNullColumn(field.name, dt, allocator)
+          // #568 schema evolution: a column added since the file was written, null in every row, or its
+          // existence default when it was added with one (#812).
+          new io.vecruntime.spark.parquet.NativeParquetNullColumn(field.name, dt, allocator, existenceDefault(i))
         case st: StructType =>
           val name = clippedName(p.clipped, i)
           NativeParquetStructReader.create(p.clipped, fileSchema, Array(name), st, field.name, batchSize, allocator)
@@ -1148,6 +1149,18 @@ private[vecruntime] final class VectorParquetPartitionReader(
    *   - when a struct field, in a struct the file holds some other field of (its nulls come from that field;
    *     when it holds none, Spark 4.1 reads an extra unrequested field, which our readers do not).
    */
+  /** #812: requested column `ordinal`'s existence default (Spark's internal value), or null. */
+  private def existenceDefault(ordinal: Int): Any =
+    if (
+      ordinal < requiredSchema.length && requiredSchema.fields(ordinal).metadata.contains(
+        org.apache.spark.sql.catalyst.util.ResolveDefaultColumns.EXISTS_DEFAULT_COLUMN_METADATA_KEY
+      )
+    ) existenceDefaults(ordinal)
+    else null
+
+  private lazy val existenceDefaults: Array[Any] =
+    org.apache.spark.sql.catalyst.util.ResolveDefaultColumns.existenceDefaultValues(requiredSchema)
+
   private def missingReadable(clipped: MessageType, file: MessageType, path: Array[String]): Boolean = {
     var k = 0
     while (k < path.length && NativeParquetStructReader.holds(file, path.take(k + 1))) k += 1
@@ -1164,10 +1177,16 @@ private[vecruntime] final class VectorParquetPartitionReader(
     val missing = parent.getType(path(k))
     if (!missing.isRepetition(org.apache.parquet.schema.Type.Repetition.OPTIONAL)) return false
     if (k == 0) {
+      // #812: a column with an existence default is that default in every row: a constant of a type with an
+      // engine lane, a string or a binary; another type stays on Spark's reader.
       val ordinal = clipped.getFieldIndex(path(0))
       ordinal >= requiredSchema.length || !requiredSchema.fields(ordinal).metadata.contains(
         org.apache.spark.sql.catalyst.util.ResolveDefaultColumns.EXISTS_DEFAULT_COLUMN_METADATA_KEY
-      )
+      ) || existenceDefault(ordinal) == null || (requiredSchema.fields(ordinal).dataType match {
+        case _: org.apache.spark.sql.types.StringType | org.apache.spark.sql.types.BinaryType => true
+        case dt: AtomicType => io.vecruntime.spark.adapter.TypeMapping.vecTypeOf(dt) != null
+        case _ => false
+      })
     } else {
       parent.getFields.asScala.exists(f => NativeParquetStructReader.holds(file, path.take(k) :+ f.getName))
     }
@@ -1498,7 +1517,8 @@ object VectorParquetScanExec {
     "DELTA_BINARY_PACKED" -> Set(INT32, INT64),
     "DELTA_LENGTH_BYTE_ARRAY" -> Set(BINARY),
     "DELTA_BYTE_ARRAY" -> Set(BINARY, FIXED_LEN_BYTE_ARRAY),
-    "BYTE_STREAM_SPLIT" -> Set(INT32, INT64, DOUBLE, PrimitiveType.PrimitiveTypeName.FLOAT)
+    // #812: FIXED_LEN_BYTE_ARRAY too, put back into PLAIN order per page by the decoder.
+    "BYTE_STREAM_SPLIT" -> Set(INT32, INT64, DOUBLE, PrimitiveType.PrimitiveTypeName.FLOAT, FIXED_LEN_BYTE_ARRAY)
   )
 
   /**
@@ -1602,8 +1622,12 @@ object VectorParquetScanExec {
     dt match {
       case IntegerType | DateType | ByteType | ShortType => p == INT32
       case LongType =>
-        // INT32 widens by sign extension, so an unsigned INT32 (Spark reads UINT_32 as a long) does not match.
-        p == INT64 || (p == INT32 && !isUnsigned(physical))
+        // INT32 widens by sign extension; an unsigned INT32 (UINT_32, which Spark reads as a long) by zero
+        // extension (#812, Spark's UnsignedIntegerUpdater).
+        p == INT64 || p == INT32
+      // #812: ANSI intervals, as Spark's updaters read them: year-month on INT32, day-time on INT64 (micros).
+      case _: YearMonthIntervalType => p == INT32
+      case _: DayTimeIntervalType => p == INT64
       case TimestampType =>
         // INT64 MICROS or MILLIS, as Spark's ParquetVectorUpdaterFactory matches them (either isAdjustedToUTC), and
         // INT96 (#568 item 6: converted at flush, with the file's INT96 rebase and time-zone conversion). NANOS
@@ -1640,6 +1664,10 @@ object VectorParquetScanExec {
         // (10 / 20). INT32 and INT64 feed the INT64 lane only (p' <= 18); the DECIMAL128 lane takes
         // FIXED_LEN_BYTE_ARRAY and BINARY, converted from big-endian bytes (flushDecimal).
         val matched = physical.getLogicalTypeAnnotation match {
+          // #812: an unsigned INT64 (UINT_64) reads as decimal(20, 0) only (Spark's UnsignedLongUpdater).
+          case i: org.apache.parquet.schema.LogicalTypeAnnotation.IntLogicalTypeAnnotation
+              if !i.isSigned && p == INT64 =>
+            i.getBitWidth == 64 && d.precision == 20 && d.scale == 0
           case a: org.apache.parquet.schema.LogicalTypeAnnotation.DecimalLogicalTypeAnnotation =>
             val scaleUp = d.scale - a.getScale
             scaleUp >= 0 && d.precision - a.getPrecision >= scaleUp
@@ -1648,10 +1676,9 @@ object VectorParquetScanExec {
             d.precision - d.scale >= (if (p == INT32) 10 else 20)
           case _ => false
         }
-        matched && (
-          if (d.precision <= 18) p == INT32 || p == INT64 || p == FIXED_LEN_BYTE_ARRAY || p == BINARY
-          else p == FIXED_LEN_BYTE_ARRAY || p == BINARY
-        )
+        // #812: INT32 / INT64 feed the DECIMAL128 lane too, each value sign-extended (zero-extended for
+        // UINT_64) to 16 bytes and rescaled.
+        matched && (p == INT32 || p == INT64 || p == FIXED_LEN_BYTE_ARRAY || p == BINARY)
       case _ => false
     }
   }

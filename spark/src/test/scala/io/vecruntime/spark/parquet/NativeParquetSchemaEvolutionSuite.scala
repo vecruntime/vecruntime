@@ -29,8 +29,8 @@ import org.apache.spark.sql.vecruntime.{PlanUtils, VectorParquetScanExec}
  *   - type widening as Spark's ParquetVectorUpdaterFactory does it: INT32 and FLOAT as double, DATE as
  *     timestamp_ntz (with the file's date rebase), decimals at a larger scale and precision, signed integers
  *     as decimals; flat, in a struct and in a list; Spark's and parquet-java's files;
- *   - what stays on Spark's reader: a column with an existence default,
- *     an integer read as a decimal wider than 18 digits. Spark's rows either way.
+ *   - #812: a column with an existence default (the default in every row of a file without it), an integer
+ *     read as a decimal wider than 18 digits, and a struct the file holds none of the requested fields of.
  */
 class NativeParquetSchemaEvolutionSuite extends VectorQuerySuite {
 
@@ -172,8 +172,9 @@ class NativeParquetSchemaEvolutionSuite extends VectorQuerySuite {
     check("SELECT * FROM t")
     check("SELECT id, s IS NULL, s.a, s.b FROM t")
     // Pruned to s.a and s.c, the file holds none of the struct's fields: Spark 4.1 reads one more of the file's
-    // fields for the struct's nulls, which our readers do not, so this file stays on Spark's reader.
-    check("SELECT id, s IS NULL, s.a, s.c FROM t", native = false)
+    // fields for the struct's nulls, and so do our readers (#812).
+    check("SELECT id, s IS NULL, s.a, s.c FROM t")
+    check("SELECT count(*), count(s), count(s.a) FROM t")
   }
 
   for (v2 <- Seq(false, true); dictionary <- Seq(true, false)) {
@@ -301,9 +302,9 @@ class NativeParquetSchemaEvolutionSuite extends VectorQuerySuite {
     // field-id slice (NativeParquetFieldIdSuite has the full cases).
     view(path, "id bigint, l array<struct<x: int, y: string>>")
     check("SELECT * FROM t")
-    // An INT32 read as a decimal of more than 18 digits (the DECIMAL128 lane takes binary decimals only).
+    // An INT32 read as a decimal of more than 18 digits (#812: sign-extended into the DECIMAL128 lane).
     view(path, "id bigint, i decimal(25,3)", "w")
-    check("SELECT * FROM w", native = false)
+    check("SELECT * FROM w")
     // A column added with a default: Spark fills the default in the files without it.
     try {
       withPlugin(enabled = false) {
@@ -311,10 +312,20 @@ class NativeParquetSchemaEvolutionSuite extends VectorQuerySuite {
         spark.sql("CREATE TABLE evolve_default (id int) USING parquet")
         spark.sql("INSERT INTO evolve_default SELECT cast(id as int) FROM range(0, 500)")
         spark.sql("ALTER TABLE evolve_default ADD COLUMN v int DEFAULT 42")
-        spark.sql("INSERT INTO evolve_default SELECT cast(id as int), cast(id as int) FROM range(500, 600)")
+        spark.sql("ALTER TABLE evolve_default ADD COLUMN w string DEFAULT 'none'")
+        spark.sql("ALTER TABLE evolve_default ADD COLUMN x decimal(25,2) DEFAULT 1234567.25")
+        spark.sql("ALTER TABLE evolve_default ADD COLUMN y date DEFAULT date'2020-02-29'")
+        spark.sql("ALTER TABLE evolve_default ADD COLUMN z bigint DEFAULT NULL")
       }
-      check("SELECT * FROM evolve_default", native = false)
-      check("SELECT count(*), sum(v) FROM evolve_default", native = false)
+      // No file holds the new columns yet: every row is the defaults, decoded natively (#812).
+      check("SELECT * FROM evolve_default")
+      withPlugin(enabled = false) {
+        spark.sql("INSERT INTO evolve_default SELECT cast(id as int), cast(id as int), concat('w', id), " +
+          "cast(id as decimal(25,2)), date'2021-01-01', id FROM range(500, 600)")
+      }
+      // #812: the files without the columns hold their existence defaults, natively.
+      check("SELECT * FROM evolve_default")
+      check("SELECT count(*), sum(v), max(w), sum(x), min(y), count(z) FROM evolve_default")
     } finally withPlugin(enabled = false)(spark.sql("DROP TABLE IF EXISTS evolve_default"))
   }
 }

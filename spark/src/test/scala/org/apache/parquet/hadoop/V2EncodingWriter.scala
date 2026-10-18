@@ -54,6 +54,13 @@ object V2EncodingWriter {
           new ByteStreamSplitValuesWriter.LongByteStreamSplitValuesWriter(init, page, alloc)
         case PrimitiveTypeName.DOUBLE =>
           new ByteStreamSplitValuesWriter.DoubleByteStreamSplitValuesWriter(init, page, alloc)
+        case PrimitiveTypeName.FIXED_LEN_BYTE_ARRAY => // #812
+          new ByteStreamSplitValuesWriter.FixedLenByteArrayByteStreamSplitValuesWriter(
+            d.getPrimitiveType.getTypeLength,
+            init,
+            page,
+            alloc
+          )
         case other => throw new IllegalArgumentException(s"no test writer for $other")
       }
     }

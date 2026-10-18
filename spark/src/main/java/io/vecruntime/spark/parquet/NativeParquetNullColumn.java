@@ -34,6 +34,10 @@ import org.apache.spark.sql.vectorized.ColumnVector;
  * A flat column is an all-null Arrow vector; a nested one is Spark's own
  * all-null vector, which the operators read as such
  * ({@code SparkColumnVectorBuffers}: {@code isAllNull}).
+ *
+ * <p>#812: a top-level column added with a {@code DEFAULT} holds its existence
+ * default in every row instead, as Spark's reader fills it: a constant vector
+ * of the default (types with an engine lane, strings and binaries).
  */
 public final class NativeParquetNullColumn implements NativeParquetColumn {
 
@@ -41,10 +45,21 @@ public final class NativeParquetNullColumn implements NativeParquetColumn {
     private final DataType type;
     private final BufferAllocator allocator;
     private final boolean nested;
+    private final Object value; // #812: the existence default (Spark's internal value), or null
     private int position;
     private int rows;
 
     public NativeParquetNullColumn(String name, DataType type, BufferAllocator allocator) {
+        this(name, type, allocator, null);
+    }
+
+    /**
+     * A missing column whose every row is {@code value} (Spark's internal
+     * value; null: null rows).
+     */
+    public NativeParquetNullColumn(String name, DataType type, BufferAllocator allocator,
+            Object value) {
+        this.value = value;
         this.name = name;
         this.type = type;
         this.allocator = allocator;
@@ -60,6 +75,9 @@ public final class NativeParquetNullColumn implements NativeParquetColumn {
     @Override
     public Object readBatch(int n) {
         position += n;
+        if (value != null) {
+            return ArrowOutput.constant(name, type, value, n, allocator);
+        }
         if (nested) {
             OnHeapColumnVector v = new OnHeapColumnVector(n, type);
             v.setMissing();

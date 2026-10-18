@@ -133,6 +133,14 @@ public final class NativeParquetSupport {
         if (dt instanceof TimestampNTZType) {
             return VecType.INT64;
         }
+        // #812: ANSI intervals, as stored: months on INT32 (Arrow IntervalYearVector), micros on INT64 (Arrow
+        // DurationVector); Spark's ArrowColumnVector reads both.
+        if (dt instanceof org.apache.spark.sql.types.YearMonthIntervalType) {
+            return VecType.INT32;
+        }
+        if (dt instanceof org.apache.spark.sql.types.DayTimeIntervalType) {
+            return VecType.INT64;
+        }
         return TypeMapping.vecTypeOf(dt);
     }
 
