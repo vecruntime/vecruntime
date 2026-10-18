@@ -465,7 +465,7 @@ private[vecruntime] final class VectorParquetPartitionReader(
         } else None
       dt match {
         case _: org.apache.spark.sql.types.VariantType
-            if group.exists(_.containsField(SparkShreddingUtils.TypedValueFieldName)) =>
+            if group.exists(_.containsField("typed_value")) => // the spec's name; Spark 4.2 drops TypedValueFieldName
           out(i) = out(i).copy(dataType = SparkShreddingUtils.parquetTypeToSparkType(group.get))
           changed = true
         case st if io.vecruntime.spark.parquet.NativeParquetSupport.isVariantStruct(st) =>
