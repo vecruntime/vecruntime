@@ -48,6 +48,41 @@ filter and project, `EvalContexts.withBatch` for aggregate and sort). The wrappe
 selection bitmap; Iceberg keeps owning the vectors and may reuse them for the next batch, as with
 any columnar producer.
 
+## Catalog settings for short queries (#735)
+
+Every query plans its Iceberg scans on the driver, and with the catalog's defaults that planning
+reads S3. A Parquet table's file listing stays cached in the session, so on short queries the
+Iceberg copy starts its first job later. A driver JFR profile of seven short 3 TB TPC-DS queries
+(q21, q77, q1, q7, q25, q10, q60) found about 1.4 s of driver time per query blocked on S3,
+against under 0.1 s before the first job on Parquet; our own planner rules took a few samples.
+Two Iceberg defaults cause it:
+
+- **The catalog's table cache expires** 30 s after a table was last used
+  (`cache.expiration-interval-ms`), so most queries load the table again. With a Hadoop catalog
+  on S3 each load is several round trips (the version hint, a listing, the metadata file).
+- **Manifests are not cached** (`io.manifest.cache-enabled` is `false`), so each scan reads its
+  table's manifest list and manifests again while Spark asks it for its task groups.
+
+For a read-heavy workload over tables that are not being written during the session, set both on
+the catalog:
+
+```
+spark.sql.catalog.<name>.cache.expiration-interval-ms=-1
+spark.sql.catalog.<name>.io.manifest.cache-enabled=true
+spark.sql.catalog.<name>.io.manifest.cache.expiration-interval-ms=3600000
+```
+
+`-1` keeps a loaded table until the session ends: a commit by another writer is then not seen
+until `REFRESH TABLE` (or a new session), so leave it at its default where tables change under
+running sessions. The manifest cache holds manifest files' bytes in the driver's heap, keyed by
+path (manifests are immutable, so it cannot serve stale data), up to
+`io.manifest.cache.max-total-bytes` (100 MB by default; a 3 TB TPC-DS fact table has one manifest
+of about 1 MB).
+
+On 15 short 3 TB TPC-DS queries (10 nodes, two passes each) the two settings took Iceberg's total
+from 86.4 s to 79.3 s, against 62.1 s for the Parquet copy; q21, q10 and q27 came level with
+Parquet. They are catalog properties, so the plugin cannot set them for you.
+
 ## Tests
 
 ```bash
