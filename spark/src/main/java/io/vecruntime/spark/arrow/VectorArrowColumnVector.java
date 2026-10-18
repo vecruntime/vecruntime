@@ -54,6 +54,70 @@ public final class VectorArrowColumnVector extends ArrowColumnVector {
         this.valueVector = vector;
         this.owns = owns;
         this.reusable = reusable;
+        this.bitValidity = vector instanceof org.apache.arrow.vector.BaseFixedWidthVector
+                || vector instanceof org.apache.arrow.vector.BaseVariableWidthVector;
+    }
+
+    /** Whether the vector keeps one validity bit per slot in its validity buffer (read by {@link #isNullAt}). */
+    private final boolean bitValidity;
+
+    /**
+     * #812: the validity bit read straight from the buffer's address. Arrow's
+     * {@code isNull} goes through the accessor and a bounds-checked {@code
+     * ArrowBuf.getByte}; in a nested read that is a quarter of the time, once per
+     * element (the map benchmark). The buffer is read on every call, so a vector
+     * refilled or reallocated between batches is still read where it lives now.
+     */
+    @Override
+    public boolean isNullAt(int rowId) {
+        if (bitValidity) {
+            long addr = valueVector.getValidityBuffer().memoryAddress();
+            return ((org.apache.spark.unsafe.Platform.getByte(null, addr + (rowId >>> 3)) >> (rowId & 7)) & 1) == 0;
+        }
+        return super.isNullAt(rowId);
+    }
+
+    /**
+     * #812: Arrow's {@code IntVector.get} checks the validity bit again (and
+     * throws on a null slot) before reading; Spark only reads a value it has
+     * checked with {@link #isNullAt} or does not care about, so the value is read
+     * straight from the data buffer, as Spark's own vectors read it.
+     */
+    @Override
+    public int getInt(int rowId) {
+        if (valueVector instanceof org.apache.arrow.vector.IntVector v) {
+            return org.apache.spark.unsafe.Platform.getInt(null, v.getDataBuffer().memoryAddress() + 4L * rowId);
+        }
+        return super.getInt(rowId);
+    }
+
+    /** #812: as {@link #getInt}, for a {@code BigIntVector}. */
+    @Override
+    public long getLong(int rowId) {
+        if (valueVector instanceof org.apache.arrow.vector.BigIntVector v) {
+            return org.apache.spark.unsafe.Platform.getLong(null, v.getDataBuffer().memoryAddress() + 8L * rowId);
+        }
+        return super.getLong(rowId);
+    }
+
+    /**
+     * #812: a string read as Spark's accessor reads it (null for a null slot,
+     * else the bytes in place, no copy), without Arrow's bounds-checked buffer
+     * reads: the offsets and bytes straight from their addresses.
+     */
+    @Override
+    public org.apache.spark.unsafe.types.UTF8String getUTF8String(int rowId) {
+        if (valueVector instanceof org.apache.arrow.vector.VarCharVector v) {
+            if (isNullAt(rowId)) {
+                return null;
+            }
+            long offsets = v.getOffsetBuffer().memoryAddress() + 4L * rowId;
+            int start = org.apache.spark.unsafe.Platform.getInt(null, offsets);
+            int end = org.apache.spark.unsafe.Platform.getInt(null, offsets + 4);
+            return org.apache.spark.unsafe.types.UTF8String.fromAddress(null, v.getDataBuffer().memoryAddress() + start,
+                    end - start);
+        }
+        return super.getUTF8String(rowId);
     }
 
     /**
