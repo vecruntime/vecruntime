@@ -245,6 +245,24 @@ object VectorConf {
     "spark.vecruntime.scan.nativeParquet.lateMaterialization.minScanBytes"
 
   /**
+   * #812: two-pass late materialization. With a decode filter (#611), each row group's filter columns are read
+   * and the filter evaluated over the whole row group first; the row group is then read again, every column,
+   * over only the rows the filter keeps (`ParquetFileReader.readFilteredRowGroup` with those row ranges), so the
+   * pages of the other columns that hold no surviving row are not fetched or decompressed at all. Needs the
+   * file's offset index; off by default. Read from the Hadoop configuration, which carries the session's
+   * `spark.*` settings.
+   */
+  val ScanNativeParquetLateMaterializationTwoPass =
+    "spark.vecruntime.scan.nativeParquet.lateMaterialization.twoPass"
+
+  /**
+   * #812: the largest fraction of a row group's rows the filter may keep for the second pass to read only
+   * those (default 0.5); above it the row group is read whole, as with one pass.
+   */
+  val ScanNativeParquetLateMaterializationTwoPassMaxFraction =
+    "spark.vecruntime.scan.nativeParquet.lateMaterialization.twoPass.maxFraction"
+
+  /**
    * #735: a column chunk's data pages decompress through one reused `byte[]` per decompressor (zstd, snappy)
    * instead of a fresh array per page, read in place by #786. Default on.
    */
