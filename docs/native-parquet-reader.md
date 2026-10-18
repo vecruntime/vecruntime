@@ -87,7 +87,7 @@ A few rules hold the design together:
 | Data pages | v1 and v2 | v2 levels and data are read separately |
 | Schema | Flat columns; structs, structs of structs included; top-level lists and maps of flat types, lists of structs of flat types, lists of lists of any depth ending in a flat type, maps of structs of flat types, any of these as a struct's field, and any other nesting of lists, maps and structs (#568) | A nested column holding a type with no decode path keeps Spark's scan for the plan |
 | Metadata columns | The file-constant `_metadata` fields (`file_path`, `file_name`, `file_size`, `file_block_start`, `file_block_length`, `file_modification_time`), `_metadata.row_index`, and `input_file_name()` with its block siblings (#568) | Constants per file, from the format's extractors as `FileScanRDD` fills them; the row index is the row group's first row index plus the position. Under decode-ahead too (#568) |
-| Codecs | Whatever parquet-java decompresses (snappy, zstd, gzip, lz4, …) | Decompression is done by parquet-java |
+| Codecs | Whatever parquet-java decompresses (snappy, zstd, gzip, lz4, lz4_raw, brotli and lzo with their codec jars, uncompressed) | zstd and snappy decompress into one reused buffer per column chunk, which the decoder reads in place (#810, #786); uncompressed pages are read in place; every other codec is parquet-java's own decompressor, one copy per page. See [Codecs](#codecs) under Current limits |
 
 What happens when a column is not supported: the scan keeps Spark's result in every case, through Spark's reader for one file or Spark's scan for the plan, as listed under [Current limits](#current-limits) below. `input_file_name()` under decode-ahead is native (#568). A bucketed scan is native (#568): it reports Spark's bucket partitioning and reads Spark's own bucketed file partitions (pruned and coalesced as Spark plans them), so a join of tables bucketed alike still needs no shuffle.
 
@@ -118,6 +118,20 @@ Everything below returns Spark's own result: either Spark's reader decodes it, o
 **Performance, not correctness:**
 - **Late materialization** (`lateMaterialization`, #611) is off by default: at 1 TB q24b ran 10% slower with it on. Its two-pass mode, which also skips the I/O of pages with no surviving row (#812), is off by default until a 1 TB measurement settles it.
 - **Column-index page skipping** depends on the file's offset index, which parquet-java writes by default. A file without one is read over whole row groups, as Spark reads it.
+
+### Codecs
+
+Every Parquet codec is read correctly, and every codec's decompressor lives as long as its file (#828, #829). Only zstd and snappy have a dedicated path. The others are no slower than in Spark's own reader, which uses the same parquet-java decompressors, but they do not get the per-page reuse zstd and snappy have. Dedicated gzip and LZ4_RAW paths are tracked in [#830](https://github.com/vecruntime/vecruntime/issues/830), to be measured first.
+
+| Codec | Decompression | Page into the decoder |
+|---|---|---|
+| ZSTD, SNAPPY | The scan's own (`ReusingCodecFactory`, #810): one reused buffer per column chunk | Read in place, no copy (#786) |
+| UNCOMPRESSED | None | Read in place from the chunk buffer |
+| GZIP, LZ4 (Hadoop framing), LZO | parquet-java, through a Hadoop stream codec, decompressor from Hadoop's `CodecPool` | One copy into the reader's reused page buffer; no new array per page |
+| LZ4_RAW | parquet-java's own codec, through the same stream interface | One copy into the reused page buffer |
+| BROTLI | As GZIP, once its codec jar is on the classpath | One copy into the reused page buffer |
+
+LZO and Brotli need codec libraries VecRuntime does not bundle (LZO is GPL and not shipped with Hadoop), so they stay on parquet-java's path.
 
 ## Status at 1 TB TPC-DS
 
