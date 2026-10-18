@@ -1130,9 +1130,7 @@ class VectorParquetScanSuite extends VectorQuerySuite {
 
   // ---------------------------------------------------------------- fallbacks
 
-  test(
-    "fallback: a list of intervals keeps Spark's scan with a recorded reason (every nesting of readable types is native, #568)"
-  ) {
+  test("a list of ANSI intervals is read by the native scan (#812)") {
     val path = newTempPath("t_nested")
     withPlugin(enabled = false) {
       spark.sql(
@@ -1141,7 +1139,8 @@ class VectorParquetScanSuite extends VectorQuerySuite {
         .write.mode("overwrite").parquet(path)
       spark.read.parquet(path).createOrReplaceTempView("t_nested")
     }
-    checkFallback("SELECT i, st FROM t_nested", Seq(node), reasonContains = "nested or complex column")
+    checkVectorized("SELECT i, st FROM t_nested", Seq(node))
+    assert(nativeRowGroupsOf("SELECT i, st FROM t_nested") > 0, "the interval file was not decoded natively")
   }
 
   test("a binary column alone is read by the native scan (#559, option A)") {
