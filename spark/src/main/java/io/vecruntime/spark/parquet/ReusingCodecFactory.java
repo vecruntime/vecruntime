@@ -73,6 +73,13 @@ import org.xerial.snappy.Snappy;
 final class ReusingCodecFactory implements CompressionCodecFactory {
 
     private final CodecFactory delegate;
+    // parquet-java asks for a decompressor once per COLUMN CHUNK (ParquetFileReader.readChunkPages) and never
+    // releases one itself; it only calls release() on the factory when the file closes. A zstd decompressor
+    // holds a native ZstdDecompressCtx, which zstd-jni frees only on close() (no finalizer, no cleaner), so
+    // every decompressor handed out is kept here and released with the factory. Without it each chunk leaked
+    // its context: at 1 TB TPC-DS the executors' native memory grew about 1 GiB a minute until the container
+    // was OOM-killed. Synchronized: prefetch opens a file on another thread before the task thread reads it.
+    private final java.util.List<ReusingDecompressor> handedOut = java.util.Collections.synchronizedList(new java.util.ArrayList<>());
 
     ReusingCodecFactory(org.apache.hadoop.conf.Configuration conf, int pageSizeHint) {
         // The delegate owns the Hadoop codecs for every non-reused codec, and the compressors (write path,
@@ -89,17 +96,36 @@ final class ReusingCodecFactory implements CompressionCodecFactory {
     public BytesInputDecompressor getDecompressor(CompressionCodecName codecName) {
         switch (codecName) {
             case ZSTD:
-                return new ZstdReusingDecompressor();
+                return track(new ZstdReusingDecompressor());
             case SNAPPY:
-                return new SnappyReusingDecompressor();
+                return track(new SnappyReusingDecompressor());
             default:
                 return delegate.getDecompressor(codecName);
         }
     }
 
+    private ReusingDecompressor track(ReusingDecompressor d) {
+        handedOut.add(d);
+        return d;
+    }
+
+    /** Decompressors handed out and not yet released (tests). */
+    int liveDecompressors() {
+        return handedOut.size();
+    }
+
     @Override
     public void release() {
-        delegate.release();
+        try {
+            synchronized (handedOut) {
+                for (ReusingDecompressor d : handedOut) {
+                    d.release();
+                }
+                handedOut.clear();
+            }
+        } finally {
+            delegate.release();
+        }
     }
 
     /**
