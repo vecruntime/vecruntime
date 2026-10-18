@@ -101,6 +101,7 @@ public final class BuildPayloadColumn implements AutoCloseable {
                 || dt instanceof TimestampNTZType
                 || dt instanceof YearMonthIntervalType
                 || dt instanceof DayTimeIntervalType
+                || dt instanceof org.apache.spark.sql.types.TimeType // #812: a long, as Spark holds it
                 || dt instanceof StringType
                 || dt instanceof BinaryType
                 || dt instanceof DecimalType
@@ -196,7 +197,8 @@ public final class BuildPayloadColumn implements AutoCloseable {
         } else if (dt instanceof LongType
                 || dt instanceof TimestampType
                 || dt instanceof TimestampNTZType
-                || dt instanceof DayTimeIntervalType) {
+                || dt instanceof DayTimeIntervalType
+                || dt instanceof org.apache.spark.sql.types.TimeType) {
             v.appendLong(src.getLong(ordinal));
             bytes += 8;
         } else if (dt instanceof FloatType) {

@@ -71,6 +71,15 @@ public final class ArrowVectorBuffers implements VectorBuffers {
         if (v instanceof BigIntVector || v instanceof TimeStampVector) {
             return VecType.INT64;
         }
+        // #812: time (nanoseconds of the day) and interval day to second (micros) are longs, interval year to
+        // month (months) an int, lanes like any (TypeMapping.isCarriedLong); Spark's ArrowColumnVector reads
+        // these classes back as its time and interval types.
+        if (v instanceof org.apache.arrow.vector.TimeNanoVector || v instanceof org.apache.arrow.vector.DurationVector) {
+            return VecType.INT64;
+        }
+        if (v instanceof org.apache.arrow.vector.IntervalYearVector) {
+            return VecType.INT32;
+        }
         if (v instanceof Float8Vector) {
             return VecType.FLOAT64;
         }

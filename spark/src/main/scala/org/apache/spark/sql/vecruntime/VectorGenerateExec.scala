@@ -156,8 +156,10 @@ private[vecruntime] class VectorGenerateIterator(
   private def element(arr: ColumnarArray, k: Int, dt: DataType): Any =
     if (arr.isNullAt(k)) null
     else dt match {
-      case IntegerType | DateType => java.lang.Integer.valueOf(arr.getInt(k))
-      case LongType | TimestampType | TimestampNTZType => java.lang.Long.valueOf(arr.getLong(k))
+      case IntegerType | DateType | _: org.apache.spark.sql.types.YearMonthIntervalType =>
+        java.lang.Integer.valueOf(arr.getInt(k))
+      case LongType | TimestampType | TimestampNTZType | _: org.apache.spark.sql.types.TimeType | _: org.apache.spark.sql.types.DayTimeIntervalType =>
+        java.lang.Long.valueOf(arr.getLong(k))
       case DoubleType => java.lang.Double.valueOf(arr.getDouble(k))
       case FloatType => java.lang.Float.valueOf(arr.getFloat(k)) // #712
       case BooleanType => java.lang.Boolean.valueOf(arr.getBoolean(k))
