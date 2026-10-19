@@ -173,7 +173,7 @@ case class TransitiveDpp(session: SparkSession) extends Rule[LogicalPlan] with P
             } else None
           case _ => None
         }
-      // #735: a DSv2 table (Iceberg) by its identity partition columns: not scanned yet when this rule runs, so
+      // #735, #806: a DSv2 table (Iceberg) by its partition source columns: not scanned yet when this rule runs, so
       // the pruning subquery's dimension plan is pushed down here (V2PruningColumns.scanned).
       case r: org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation =>
         val partCols = V2PruningColumns.of(r)

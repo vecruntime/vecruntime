@@ -85,7 +85,9 @@ case class V2RuntimeFilterBySize(session: SparkSession)
     // from one month of `date_dim`). In this batch the pruning filter is no longer in that form, so a new filter on
     // a partition column is dropped here: it would only cost its build (two exchanges in q14a) and its probe.
     val partitionKeys = AttributeSet(plan.collect {
-      case s: DataSourceV2ScanRelation => V2PruningColumns.of(s.relation).toSeq
+      // Identity columns only (#806): a filter on a transform's source column (`days(ts)`, `bucket(n, k)`) prunes
+      // whole partitions, so a row-level bloom filter on it still filters.
+      case s: DataSourceV2ScanRelation => V2PruningColumns.identityColumns(s.relation).toSeq
       case l: LogicalRelation if l.relation.isInstanceOf[HadoopFsRelation] =>
         val names = l.relation.asInstanceOf[HadoopFsRelation].partitionSchema.fieldNames
         val resolver = conf.resolver
