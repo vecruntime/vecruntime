@@ -74,6 +74,20 @@ class VectorPlugin extends SparkPlugin {
     override def init(ctx: PluginContext, extraConf: java.util.Map[String, String]): Unit = {
       VectorPlugin.requireVectorApi()
       io.vecruntime.spark.comet.CometVectorAdapter.tryRegister()
+      // #868: the executor's Arrow budget, and its use as executor metrics (current and peak bytes) for sizing it.
+      io.vecruntime.spark.arrow.VectorAllocators.setLimit(VectorConf.arrowMaxBytes(ctx.conf()))
+      ctx.metricRegistry().register(
+        "arrowAllocatedBytes",
+        new com.codahale.metrics.Gauge[Long] {
+          override def getValue: Long = io.vecruntime.spark.arrow.VectorAllocators.allocatedBytes()
+        }
+      )
+      ctx.metricRegistry().register(
+        "arrowPeakBytes",
+        new com.codahale.metrics.Gauge[Long] {
+          override def getValue: Long = io.vecruntime.spark.arrow.VectorAllocators.peakBytes()
+        }
+      )
       // Starts the Flight shuffle server on this executor when the shuffle module is present, its
       // manager configured and the backend is Flight (#288).
       org.apache.spark.sql.vecruntime.VectorShuffle.executorInit(ctx)

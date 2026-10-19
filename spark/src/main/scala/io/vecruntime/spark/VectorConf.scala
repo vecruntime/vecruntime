@@ -528,6 +528,20 @@ object VectorConf {
     scala.util.Try(conf.getConfString(JoinSpillBuckets, "").trim.toInt).toOption.getOrElse(32)
 
   /**
+   * #868: the executor's cap on Arrow memory (size string; `0`, the default, for none). Every Arrow buffer of the
+   * plugin -- the Flight shuffle's server and client, the shuffle readers, the operators' output vectors -- comes from
+   * one root allocator per executor, and past the cap an allocation fails (the task fails and is retried) instead of
+   * the container being OOM-killed. Not part of `spark.memory.offHeap.size`: size it inside the memory overhead
+   * (about 1 GB per executor was the Flight shuffle's share at 10 TB, #840). Read once, when the executor starts.
+   */
+  val ArrowMaxBytes = "spark.vecruntime.arrow.maxBytes"
+  def arrowMaxBytes(sparkConf: org.apache.spark.SparkConf): Long =
+    org.apache.spark.network.util.JavaUtils.byteStringAsBytes(sparkConf.get(ArrowMaxBytes, "0").trim match {
+      case "" => "0"
+      case s => s
+    })
+
+  /**
    * The most a sort-merge join's build side may weigh per task, by statistics, for `mode=auto` to
    * re-express it as the hash join: within `spark.vecruntime.join.spillBytes` it builds in memory, within
    * this cap it splits into buckets on disk once (`spillBuckets` buckets of at most `spillBytes`
