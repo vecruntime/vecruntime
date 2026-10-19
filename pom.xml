@@ -18,6 +18,7 @@
 
   <modules>
     <module>kernels</module>
+    <module>parquet-writer</module>
     <module>spark</module>
     <module>shuffle</module>
     <module>benchmarks</module>
