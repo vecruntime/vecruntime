@@ -100,6 +100,8 @@ final class FixedWidthChunkWriter implements ChunkWriter {
     private long[] entries = new long[1024];
     private int entryCount;
     private int[] table = new int[2048];
+    // The key of each table slot, inline, so a probe reads one array.
+    private long[] tableKeys = new long[2048];
 
     private final ByteSink body = new ByteSink(64 * 1024);
 
@@ -221,13 +223,14 @@ final class FixedWidthChunkWriter implements ChunkWriter {
                     entries = Arrays.copyOf(entries, entries.length * 2);
                 }
                 entries[entryCount] = raw;
+                tableKeys[h] = raw;
                 table[h] = ++entryCount;
                 if (entryCount * 2 > table.length) {
                     rehash();
                 }
                 return entryCount - 1;
             }
-            if (entries[slot - 1] == raw) {
+            if (tableKeys[h] == raw) {
                 return slot - 1;
             }
             h = (h + 1) & mask;
@@ -236,6 +239,7 @@ final class FixedWidthChunkWriter implements ChunkWriter {
 
     private void rehash() {
         int[] t = new int[table.length * 2];
+        long[] k = new long[t.length];
         int mask = t.length - 1;
         for (int e = 0; e < entryCount; e++) {
             int h = mix(entries[e]) & mask;
@@ -243,8 +247,10 @@ final class FixedWidthChunkWriter implements ChunkWriter {
                 h = (h + 1) & mask;
             }
             t[h] = e + 1;
+            k[h] = entries[e];
         }
         table = t;
+        tableKeys = k;
     }
 
     private static int mix(long x) {
@@ -301,13 +307,10 @@ final class FixedWidthChunkWriter implements ChunkWriter {
     }
 
     private void writePlain(long[] raw, int n, ByteSink out) {
-        out.ensure(n * kind.width);
-        for (int k = 0; k < n; k++) {
-            if (kind.width == 4) {
-                out.writeIntLE((int) raw[k]);
-            } else {
-                out.writeLongLE(raw[k]);
-            }
+        if (kind.width == 4) {
+            out.writeIntsLE(raw, n);
+        } else {
+            out.writeLongsLE(raw, n);
         }
     }
 

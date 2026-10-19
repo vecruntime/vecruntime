@@ -81,6 +81,23 @@ final class ByteSink {
         size += 8;
     }
 
+    /** Appends {@code n} longs, little-endian, in one copy. */
+    void writeLongsLE(long[] values, int n) {
+        ensure(n * 8);
+        MemorySegment.copy(values, 0, seg, LE_LONG, size, n);
+        size += n * 8;
+    }
+
+    /** Appends the low 32 bits of {@code n} longs, little-endian. */
+    void writeIntsLE(long[] values, int n) {
+        ensure(n * 4);
+        long at = size;
+        for (int k = 0; k < n; k++) {
+            seg.set(LE_INT, at + 4L * k, (int) values[k]);
+        }
+        size += n * 4;
+    }
+
     /**
      * Overwrites four bytes at {@code at} (a length prefix written after its
      * body).
