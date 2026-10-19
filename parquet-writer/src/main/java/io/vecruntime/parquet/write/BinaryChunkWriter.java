@@ -226,6 +226,8 @@ final class BinaryChunkWriter implements ChunkWriter {
         int id = entryCount;
         if (id + 2 > entryStart.length) {
             entryStart = Arrays.copyOf(entryStart, entryStart.length * 2);
+        }
+        if (id >= entryHash.length) {
             entryHash = Arrays.copyOf(entryHash, entryHash.length * 2);
         }
         entryStart[id] = entryBytes.size();

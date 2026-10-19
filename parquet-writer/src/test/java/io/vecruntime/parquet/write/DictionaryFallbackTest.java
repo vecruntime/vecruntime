@@ -72,10 +72,12 @@ class DictionaryFallbackTest {
 
     private final Configuration conf = new Configuration();
 
-    private static ParquetProperties props() {
+    private int dictionaryPageSize = 32 * 1024;
+
+    private ParquetProperties props() {
         return ParquetProperties.builder()
                 .withPageSize(16 * 1024)
-                .withDictionaryPageSize(32 * 1024)
+                .withDictionaryPageSize(dictionaryPageSize)
                 .build();
     }
 
@@ -140,7 +142,7 @@ class DictionaryFallbackTest {
         try (ParquetWriter<Group> w = ExampleParquetWriter.builder(HadoopOutputFile.fromPath(p, conf))
                 .withType(SCHEMA)
                 .withPageSize(16 * 1024)
-                .withDictionaryPageSize(32 * 1024)
+                .withDictionaryPageSize(dictionaryPageSize)
                 .build()) {
             for (Row r : rows) {
                 Group g = f.newGroup();
@@ -211,5 +213,28 @@ class DictionaryFallbackTest {
         assertTrue(x[1].getEncodings().contains(Encoding.PLAIN),
                 Arrays.toString(x));
         assertTrue(!x[2].getEncodings().contains(Encoding.PLAIN) && x[2].getEncodings().contains(Encoding.PLAIN_DICTIONARY));
+    }
+
+    @Test
+    void largeDictionariesStayDictionaryEncoded() throws Exception {
+        // 4 MB dictionary pages: tens of thousands of distinct strings and longs grow the chunk dictionaries well
+        // past their initial capacity without falling back.
+        dictionaryPageSize = 4 << 20;
+        List<Row> rows = rows(30_000);
+        org.apache.hadoop.fs.Path a = ours(rows);
+        org.apache.hadoop.fs.Path b = parquetJava(rows);
+        assertEquals(readAll(b), readAll(a));
+        ColumnChunkMetaData[] x = footer(a).getBlocks()
+                .get(0)
+                .getColumns()
+                .toArray(new ColumnChunkMetaData[0]);
+        ColumnChunkMetaData[] y = footer(b).getBlocks()
+                .get(0)
+                .getColumns()
+                .toArray(new ColumnChunkMetaData[0]);
+        for (int c = 0; c < y.length; c++) {
+            assertEquals(y[c].getEncodings(), x[c].getEncodings(),
+                    y[c].getPath().toDotString());
+        }
     }
 }
