@@ -25,7 +25,8 @@
         { "title": "Comet as the scan", "url": "/comet.html" },
         { "title": "Apache Iceberg", "url": "/iceberg.html" },
         { "title": "Flight shuffle", "url": "/flight-shuffle.html" },
-        { "title": "Native Parquet reader", "url": "/native-parquet-reader.html" }
+        { "title": "Native Parquet reader", "url": "/native-parquet-reader.html" },
+        { "title": "Columnar Parquet writer", "url": "/parquet-writer.html" }
       ]
     },
     {

@@ -4,6 +4,18 @@ All notable changes to vecruntime. The format follows [Keep a Changelog](https:/
 the project uses [semantic versioning](https://semver.org/) once it reaches 1.0 -- until then a minor
 version may change configuration keys or defaults, always noted here.
 
+## Unreleased
+
+### Added
+
+- Columnar Parquet writer (#64), behind `spark.vecruntime.write.columnar.enabled` (default off):
+  `VectorWriteFilesExec` writes unpartitioned, unbucketed Parquet writes of flat types straight from our
+  batches. **It writes Parquet v2** (data page v2; `RLE_DICTIONARY`, falling back to
+  `DELTA_BINARY_PACKED`, `DELTA_BYTE_ARRAY` or `PLAIN`). The encoder lives in a new Spark-free
+  `parquet-writer` module, tested against parquet-java's v2 writer; `DELTA_BINARY_PACKED` blocks use the
+  Vector API. Partitions, buckets, nested types and Iceberg writes are #842. See `docs/parquet-writer.md`.
+- JMH `ParquetWriteBenchmark` and `DeltaEncodeBenchmark`.
+
 ## 0.0.9 -- 2026-10-19
 
 Iceberg tables are read by the native Parquet reader over Iceberg's own planning, with position deletes,
