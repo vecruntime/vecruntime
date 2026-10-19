@@ -22,6 +22,7 @@ import org.apache.parquet.bytes.ByteBufferInputStream;
 import org.apache.parquet.column.values.delta.DeltaBinaryPackingValuesReader;
 import org.junit.jupiter.api.Test;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
 /**
@@ -72,7 +73,10 @@ class DeltaBinaryPackedEncoderTest {
             }) {
                 long[] v = data(r, n, shape);
                 ByteSink s = new ByteSink(16);
-                new DeltaBinaryPackedEncoder().encodeInts(v, n, s);
+                new DeltaBinaryPackedEncoder(true).encodeInts(v, n, s);
+                ByteSink scalar = new ByteSink(16);
+                new DeltaBinaryPackedEncoder(false).encodeInts(v, n, scalar);
+                assertArrayEquals(scalar.toByteArray(), s.toByteArray(), "vector and scalar bytes, shape " + shape);
                 DeltaBinaryPackingValuesReader d = reader(s, n);
                 for (int i = 0; i < n; i++) {
                     assertEquals((int) v[i], d.readInteger(),
@@ -102,7 +106,10 @@ class DeltaBinaryPackedEncoderTest {
             }) {
                 long[] v = data(r, n, shape);
                 ByteSink s = new ByteSink(16);
-                new DeltaBinaryPackedEncoder().encodeLongs(v, n, s);
+                new DeltaBinaryPackedEncoder(true).encodeLongs(v, n, s);
+                ByteSink scalar = new ByteSink(16);
+                new DeltaBinaryPackedEncoder(false).encodeLongs(v, n, scalar);
+                assertArrayEquals(scalar.toByteArray(), s.toByteArray(), "vector and scalar bytes, shape " + shape);
                 DeltaBinaryPackingValuesReader d = reader(s, n);
                 for (int i = 0; i < n; i++) {
                     assertEquals(v[i], d.readLong(), "shape " + shape + ", n " + n + ", i " + i);

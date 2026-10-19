@@ -25,7 +25,7 @@ import java.util.Arrays;
  * appends copy whole {@link MemorySegment} ranges; nothing is written a byte at
  * a time on the fixed-width paths.
  */
-final class ByteSink {
+public final class ByteSink {
 
     private static final ValueLayout.OfInt LE_INT = ValueLayout.JAVA_INT_UNALIGNED.withOrder(java.nio.ByteOrder.LITTLE_ENDIAN);
     private static final ValueLayout.OfLong LE_LONG = ValueLayout.JAVA_LONG_UNALIGNED.withOrder(java.nio.ByteOrder.LITTLE_ENDIAN);
@@ -34,12 +34,12 @@ final class ByteSink {
     private MemorySegment seg;
     private int size;
 
-    ByteSink(int capacity) {
+    public ByteSink(int capacity) {
         buf = new byte[Math.max(16, capacity)];
         seg = MemorySegment.ofArray(buf);
     }
 
-    int size() {
+    public int size() {
         return size;
     }
 
@@ -52,7 +52,7 @@ final class ByteSink {
         return seg;
     }
 
-    void reset() {
+    public void reset() {
         size = 0;
     }
 

@@ -140,6 +140,16 @@ public final class ColumnarParquetWriter implements AutoCloseable {
      * entries).
      */
     public void write(List<? extends VectorBuffers> vectors, int rowCount) throws IOException {
+        write(vectors, 0, rowCount);
+    }
+
+    /**
+     * Appends rows {@code [first, end)} of {@code columns}, one per schema
+     * field, in order: a range of a batch (a file rolled at {@code
+     * maxRecordsPerFile} in the middle of a batch).
+     */
+    public void write(List<? extends VectorBuffers> vectors, int first, int end) throws IOException {
+        int rowCount = end - first;
         if (vectors.size() != columns.size()) {
             throw new IllegalArgumentException("expected " + columns.size() + " columns, got " + vectors.size());
         }
@@ -181,8 +191,8 @@ public final class ColumnarParquetWriter implements AutoCloseable {
                 columnStore = props.newColumnWriteStore(slowSchema, pageStore, pageStore);
             }
         }
-        for (int from = 0; from < rowCount; from += SLICE) {
-            int to = Math.min(rowCount, from + SLICE);
+        for (int from = first; from < end; from += SLICE) {
+            int to = Math.min(end, from + SLICE);
             for (int i = 0; i < encoders.length; i++) {
                 if (fast[i] != null) {
                     fast[i].write(vectors.get(i), from, to);
