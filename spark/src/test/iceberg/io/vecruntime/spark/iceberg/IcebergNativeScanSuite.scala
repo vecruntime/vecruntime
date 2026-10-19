@@ -352,6 +352,39 @@ class IcebergNativeScanSuite extends IcebergMorSuiteBase {
     assert(count("SELECT count(*) FROM t WHERE ci = 7 AND cs = 'it''s'") === 2700)
   }
 
+  icebergTest("v3 variant columns, shredded or not, are read natively, also under deletion vectors") {
+    Seq(false, true).foreach { shred =>
+      val name = s"t_variant_${if (shred) "shredded" else "plain"}"
+      // Iceberg's vectorized reader cannot read a shredded variant ("Unsupported variant: shredded typed_value
+      // primitive"), so the shredded table is read row-wise by Iceberg: Spark's reference results, and the DELETE.
+      // Our scan then takes the non-vectorized path, every task group read natively.
+      spark.sql(
+        s"""CREATE OR REPLACE TABLE $Db.$name (k INT, v VARIANT, s STRUCT<w: VARIANT, n: INT>) USING iceberg
+           |TBLPROPERTIES ('format-version' = '3', 'write.delete.mode' = 'merge-on-read',
+           |  'write.parquet.shred-variants' = '$shred', 'read.parquet.vectorization.enabled' = '${!shred}')""".stripMargin
+      )
+      spark.sql(
+        s"""INSERT INTO $Db.$name SELECT CAST(id AS INT),
+           |  IF(id % 13 = 0, NULL, parse_json(concat('{"a": ', id, ', "b": "x', id % 7, '", "c": [', id % 3, ', 2]}'))),
+           |  named_struct('w', parse_json(concat('[', id % 5, ', {"z": ', id, '}]')), 'n', CAST(id % 4 AS INT))
+           |FROM range(0, 3000)""".stripMargin
+      )
+      spark.sql(s"DELETE FROM $Db.$name WHERE k % 6 = 0")
+      useTable(name)
+      Seq(
+        "SELECT k, v, s FROM t WHERE k % 31 = 2",
+        "SELECT variant_get(v, '$.b', 'string') b, count(*), sum(variant_get(v, '$.a', 'int')) FROM t GROUP BY b",
+        "SELECT k, variant_get(v, '$.c[0]', 'int'), variant_get(s.w, '$[1].z', 'bigint'), s.n FROM t WHERE k > 2950",
+        "SELECT count(v), count(*) FROM t WHERE is_variant_null(v) = false"
+      ).foreach { q =>
+        val df = checkVectorized(q, Nil)
+        assert(df.collect().nonEmpty, s"the query should return rows: $q")
+        val (native, iceberg) = groups(df)
+        assert(native > 0 && iceberg == 0, s"shredded=$shred native $native, Iceberg $iceberg: $q")
+      }
+    }
+  }
+
   /**
    * #849: a table over files written without Parquet field ids (plain Spark Parquet, added with `add_files`), whose
    * columns Iceberg matches through the table's name mapping; then files Iceberg writes (with ids), a renamed top
