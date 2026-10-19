@@ -155,7 +155,6 @@ class SortMemoryBudgetSuite extends AnyFunSuite {
     val mm = new UnifiedMemoryManager(conf, 128L * 1024, 0L, 1)
     val tmm = new TaskMemoryManager(mm, 0L)
     val ctx = new PoolTaskContext(tmm)
-    VectorSortIterator.modeOverride = MemoryMode.OFF_HEAP
     TaskContext.setTaskContext(ctx)
     try {
       val it = new VectorSortIterator(
@@ -165,17 +164,24 @@ class SortMemoryBudgetSuite extends AnyFunSuite {
         Array(true),
         Array("k" -> LongType, "v" -> LongType),
         metrics,
-        runRows = 4096
+        runRows = 4096,
+        memoryMode = MemoryMode.OFF_HEAP // #879: passed in, as the plan does
       )
       check(it)
       assert(it.spilledRuns > 0, "the on-heap pool refused the heap side, so runs went to disk")
       it.close()
       ctx.complete()
       assert(mm.executionMemoryUsed === 0L)
-    } finally {
-      VectorSortIterator.modeOverride = null
-      TaskContext.unset()
-    }
+    } finally TaskContext.unset()
+  }
+
+  test("#879: the memory mode is the conf's, and ON_HEAP without a SparkEnv") {
+    assert(VectorSortIterator.memoryMode() === MemoryMode.ON_HEAP)
+    assert(VectorSortIterator.memoryMode(new SparkConf(false)) === MemoryMode.ON_HEAP)
+    assert(
+      VectorSortIterator.memoryMode(new SparkConf(false).set("spark.memory.offHeap.enabled", "true")) ===
+        MemoryMode.OFF_HEAP
+    )
   }
 
   // #868: the shuffled hash join's build side on the same pool.
