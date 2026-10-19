@@ -175,21 +175,6 @@ final class RleHybridEncoder {
         if (bitWidth == 0) {
             return;
         }
-        out.ensure(groups * bitWidth);
-        long acc = 0;
-        int bits = 0;
-        for (int g = 0; g < groups; g++) {
-            for (int k = 0; k < 8; k++) {
-                int idx = from + (g << 3) + k;
-                long v = idx < to ? values[idx] & 0xFFFFFFFFL : 0;
-                acc |= v << bits;
-                bits += bitWidth;
-                while (bits >= 8) {
-                    out.writeByte((int) acc);
-                    acc >>>= 8;
-                    bits -= 8;
-                }
-            }
-        }
+        out.packBits(values, from, to, groups << 3, bitWidth);
     }
 }

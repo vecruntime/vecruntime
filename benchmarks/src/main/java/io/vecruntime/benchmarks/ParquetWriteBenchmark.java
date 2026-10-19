@@ -59,9 +59,10 @@ import org.openjdk.jmh.annotations.Warmup;
  * The Parquet encoding cost of a {@code store_sales}-shaped write (#64),
  * without I/O: the same rows written to a discarding {@link OutputFile} by the
  * columnar writer ({@link ColumnarParquetWriter}, from the engine's {@link
- * VectorBuffers}, in 8,192-row batches) and by parquet-java's record writer
- * ({@code ExampleParquetWriter} over prebuilt {@link Group}s, the record path
- * Spark's {@code ParquetWriteSupport} also takes).
+ * VectorBuffers}, in 8,192-row batches, Parquet v2) and by parquet-java's
+ * record writer ({@code ExampleParquetWriter} over prebuilt {@link Group}s,
+ * the record path Spark's {@code ParquetWriteSupport} also takes), as v2 (the
+ * same encodings as ours) and as v1 (Spark's default).
  *
  * <p>Columns: six int surrogate keys (one with 4.5 % nulls, as {@code
  * ss_sold_date_sk}), a long ticket number, a decimal(7,2) quantity-like value
@@ -106,7 +107,7 @@ public class ParquetWriteBenchmark {
             """);
 
     /** The writer under test. */
-    @Param({"columnar", "parquet-java"})
+    @Param({"columnar", "parquet-java-v2", "parquet-java-v1"})
     public String writer;
 
     private final Configuration conf = new Configuration();
@@ -209,6 +210,7 @@ public class ParquetWriteBenchmark {
                     .withType(SCHEMA)
                     .withCompressionCodec(CompressionCodecName.UNCOMPRESSED)
                     .withRowGroupSize(128L << 20)
+                    .withWriterVersion(writer.equals("parquet-java-v1") ? ParquetProperties.WriterVersion.PARQUET_1_0 : ParquetProperties.WriterVersion.PARQUET_2_0)
                     .build()) {
                 for (Group g : groups) {
                     w.write(g);

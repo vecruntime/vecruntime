@@ -148,26 +148,6 @@ final class DeltaBinaryPackedEncoder {
         if (width == 0) {
             return;
         }
-        out.ensure(MINIBLOCK * width / 8);
-        long acc = 0;
-        int bits = 0;
-        for (int k = 0; k < MINIBLOCK; k++) {
-            long v = from + k < to ? deltas[from + k] : 0;
-            int rem = width;
-            int shift = 0;
-            while (rem > 0) {
-                int take = Math.min(64 - bits, rem);
-                long part = take == 64 ? v >>> shift : (v >>> shift) & ((1L << take) - 1);
-                acc |= part << bits;
-                bits += take;
-                shift += take;
-                rem -= take;
-                while (bits >= 8) {
-                    out.writeByte((int) acc);
-                    acc >>>= 8;
-                    bits -= 8;
-                }
-            }
-        }
+        out.packBits(deltas, from, to, MINIBLOCK, width);
     }
 }

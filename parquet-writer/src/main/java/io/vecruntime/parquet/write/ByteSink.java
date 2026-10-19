@@ -88,6 +88,63 @@ final class ByteSink {
         size += n * 8;
     }
 
+    /** {@link #packBits(long[], int, int, int, int)} over unsigned 32-bit values. */
+    void packBits(int[] values, int from, int to,
+                  int count, int width) {
+        int bytes = (count * width) >>> 3;
+        ensure(bytes + 8);
+        long pos = size;
+        long acc = 0;
+        int bits = 0;
+        for (int k = 0; k < count; k++) {
+            long v = from + k < to ? values[from + k] & 0xFFFFFFFFL : 0L;
+            acc |= v << bits;
+            int next = bits + width;
+            if (next >= 64) {
+                seg.set(LE_LONG, pos, acc);
+                pos += 8;
+                acc = bits == 0 ? 0L : v >>> (64 - bits);
+                next -= 64;
+            }
+            bits = next;
+        }
+        if (bits > 0) {
+            seg.set(LE_LONG, pos, acc);
+        }
+        size += bytes;
+    }
+
+    /**
+     * Bit-packs {@code count} values at {@code width} bits each, least
+     * significant bit first: {@code values[from, to)}, then zeros up to {@code
+     * count}. {@code count * width} must be a multiple of 8 (a miniblock of 32
+     * or a group of 8 values). Whole 64-bit words are stored at a time.
+     */
+    void packBits(long[] values, int from, int to,
+                  int count, int width) {
+        int bytes = (count * width) >>> 3;
+        ensure(bytes + 8);
+        long pos = size;
+        long acc = 0;
+        int bits = 0;
+        for (int k = 0; k < count; k++) {
+            long v = from + k < to ? values[from + k] : 0L;
+            acc |= v << bits;
+            int next = bits + width;
+            if (next >= 64) {
+                seg.set(LE_LONG, pos, acc);
+                pos += 8;
+                acc = bits == 0 ? 0L : v >>> (64 - bits);
+                next -= 64;
+            }
+            bits = next;
+        }
+        if (bits > 0) {
+            seg.set(LE_LONG, pos, acc); // within the slack ensured above; the size below cuts it to the exact bytes
+        }
+        size += bytes;
+    }
+
     /** Appends the low 32 bits of {@code n} longs, little-endian. */
     void writeIntsLE(long[] values, int n) {
         ensure(n * 4);
