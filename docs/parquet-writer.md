@@ -99,9 +99,31 @@ fallback list:
 
 ## Measurements
 
+**1 TB TPC-DS `store_sales`** (2.88 billion rows), read and written in full by `WriteBenchRunner`:
+- 9 x m5.4xlarge, 8 executors x 13 cores, x86, 2026-10-19;
+- two iterations per case;
+- executor CPU in CPU-seconds;
+- for our writer, the build with the per-lane write loops.
+
+| Case | Our writer | Spark's writer under VecRuntime | Plain Spark |
+|---|---|---|---|
+| no-op sink (scan only) | 53.6 / 39.1 s | 51.9 / 38.3 s | 68.6 / 56.0 s |
+| snappy | **86.4 / 84.5 s**, 3,749 / 3,494 CPU-s, 103.9 GB | 198.7 / 197.6 s, 14,991 / 14,884 CPU-s, 135.0 GB | 212.3 / 209.3 s |
+| zstd | **90.0 / 92.8 s**, 4,093 / 4,051 CPU-s, 99.2 GB | 217.8 / 201.1 s, 15,949 / 15,174 CPU-s, 104.4 GB | 230.3 / 218.2 s |
+
+- **Speed:** 2.2–2.3x faster than Spark's writer under VecRuntime, and 2.4–2.5x faster than plain Spark.
+- **Write alone** (time minus the no-op scan): 33–45 s, against 147–159 s.
+- **CPU:** about 4x less executor CPU.
+- **Size:** the v2 files are 23% smaller on snappy and 5% smaller on zstd. Our snappy output is already as small as Spark's zstd output.
+- **Where the CPU goes** (executor JFR): mostly dictionary encoding of the fixed-width columns, then RLE / bit packing. Compression (1.7%) and the S3A upload (2.6%) take little.
+
+**Partitioned writes:** a partitioned 1 TB write (`DISTRIBUTE BY ss_sold_date_sk`, then `partitionBy`) does not complete under VecRuntime yet.
+- Executors are killed for exceeding their container memory in the stage after that shuffle.
+- This happens with this writer and with Spark's writer, so the cause is upstream of the writer.
+
 JMH `ParquetWriteBenchmark`, 262,144 `store_sales`-shaped rows, uncompressed, output discarded (shared
-x86 host, indicative): ours 4,085 rows/ms, parquet-java v2 1,160, parquet-java v1 (Spark's default)
-1,042 -- about 3.5x.
+x86 host, indicative): ours 4,085 rows/ms before the per-lane write loops and about 4,700 after them, parquet-java v2 1,160,
+parquet-java v1 (Spark's default) 1,042.
 
 The `DELTA_BINARY_PACKED` block (deltas, minimum, reduction, miniblock widths) has a Vector API path,
 byte-identical to the scalar loops (`-Dvecruntime.parquet.write.scalarDelta=true` selects them).

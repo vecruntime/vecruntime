@@ -107,7 +107,7 @@ public class ParquetWriteBenchmark {
             """);
 
     /** The writer under test. */
-    @Param({"columnar", "columnar-no-early-abort", "parquet-java-v2", "parquet-java-v1"})
+    @Param({"columnar", "parquet-java-v2", "parquet-java-v1"})
     public String writer;
 
     private final Configuration conf = new Configuration();
@@ -197,10 +197,9 @@ public class ParquetWriteBenchmark {
     @Benchmark
     public long write() throws IOException {
         DiscardFile out = new DiscardFile();
-        if (writer.startsWith("columnar")) {
-            // `columnar-no-early-abort`: the dictionary decisions exactly parquet-java's (no early abort).
-            try (ColumnarParquetWriter w = new ColumnarParquetWriter(out, SCHEMA, props, codecs.getCompressor(CompressionCodecName.UNCOMPRESSED), 128L << 20, Map.of())
-                    .dictionaryEarlyAbort(writer.equals("columnar"))) {
+        if (writer.equals("columnar")) {
+            try (ColumnarParquetWriter w = new ColumnarParquetWriter(out, SCHEMA, props, codecs.getCompressor(CompressionCodecName.UNCOMPRESSED),
+                    128L << 20, Map.of())) {
                 for (List<VectorBuffers> b : batches) {
                     w.write(b, b.get(0)
                                 .length());

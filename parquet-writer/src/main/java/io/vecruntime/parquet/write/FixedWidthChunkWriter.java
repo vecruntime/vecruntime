@@ -82,7 +82,6 @@ final class FixedWidthChunkWriter implements ChunkWriter {
     private final int pageRowLimit;
     private final int dictionaryLimit;
     private final boolean dictionaryEnabled;
-    private final boolean earlyAbort;
 
     private PageWriter pages;
 
@@ -97,7 +96,6 @@ final class FixedWidthChunkWriter implements ChunkWriter {
     // The chunk's dictionary: insertion-ordered entries, an open-addressing table of entry index + 1.
     private boolean dictionary;
     private boolean firstPageDone;
-    private boolean earlyChecked;
     private int dictionaryPagesWritten;
     private long[] entries = new long[1024];
     private int entryCount;
@@ -141,21 +139,6 @@ final class FixedWidthChunkWriter implements ChunkWriter {
     }
 
     FixedWidthChunkWriter(Kind kind, ColumnDescriptor column, ParquetProperties props) {
-        this(kind, column, props, true);
-    }
-
-    /**
-     * {@code earlyAbort}: give the dictionary up after {@link #EARLY_ROWS}
-     * values of a chunk's first page when nearly all of them are distinct
-     * ({@link #EARLY_DISTINCT}), rather than hashing the whole first page to
-     * find out it does not pay. The pages are the same standard encodings
-     * either way; only the choice can differ from parquet-java's on a column
-     * parquet-java would also have written without a dictionary after its first
-     * page.
-     */
-    FixedWidthChunkWriter(Kind kind, ColumnDescriptor column, ParquetProperties props,
-                          boolean earlyAbort) {
-        this.earlyAbort = earlyAbort;
         this.kind = kind;
         this.column = column;
         this.optional = column.getMaxDefinitionLevel() > 0;
@@ -176,20 +159,7 @@ final class FixedWidthChunkWriter implements ChunkWriter {
         dictionaryPagesWritten = 0;
         firstPageDone = false;
         dictionary = dictionaryEnabled;
-        earlyChecked = !earlyAbort;
     }
-
-    /**
-     * Values of a chunk's first page after which the dictionary is judged early
-     * (see the constructor).
-     */
-    static final int EARLY_ROWS = 8192;
-
-    /**
-     * The distinct fraction of those values above which the dictionary is given
-     * up.
-     */
-    static final double EARLY_DISTINCT = 0.9;
 
     /** Appends rows {@code [from, to)} of {@code v}. */
     @Override
@@ -245,12 +215,6 @@ final class FixedWidthChunkWriter implements ChunkWriter {
         if (dictionary) {
             for (int k = start; k < pageValues; k++) {
                 ids[k] = idOf(values[k]);
-            }
-            if (!earlyChecked && pageValues >= EARLY_ROWS) {
-                earlyChecked = true;
-                if (!firstPageDone && entryCount > EARLY_DISTINCT * pageValues) {
-                    fallBack();
-                }
             }
         }
         if (dictionary && (long) entryCount * kind.width > dictionaryLimit) {

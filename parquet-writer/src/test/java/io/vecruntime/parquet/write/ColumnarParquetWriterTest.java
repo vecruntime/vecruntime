@@ -90,12 +90,6 @@ class ColumnarParquetWriterTest {
 
     private int files;
 
-    /**
-     * Whether our writer may give a dictionary up early; off where encodings
-     * are compared with parquet-java's.
-     */
-    private boolean earlyAbort;
-
     private static String[] dictionary() {
         String[] d = new String[200];
         for (int k = 0; k < d.length; k++) {
@@ -214,8 +208,8 @@ class ColumnarParquetWriterTest {
         org.apache.hadoop.fs.Path p = new org.apache.hadoop.fs.Path(dir.resolve("ours-" + (files++) + ".parquet")
                 .toString());
         CodecFactory codecs = new CodecFactory(conf, 64 * 1024);
-        try (ColumnarParquetWriter w = new ColumnarParquetWriter(HadoopOutputFile.fromPath(p, conf), SCHEMA, props(), codecs.getCompressor(CompressionCodecName.SNAPPY), rowGroupSize, Map.of("writer", "vecruntime"))
-                .dictionaryEarlyAbort(earlyAbort)) {
+        try (ColumnarParquetWriter w = new ColumnarParquetWriter(HadoopOutputFile.fromPath(p, conf), SCHEMA, props(),
+                codecs.getCompressor(CompressionCodecName.SNAPPY), rowGroupSize, Map.of("writer", "vecruntime"))) {
             for (int from = 0; from < rows.size(); from += batch) {
                 List<Row> slice = rows.subList(from,
                         Math.min(rows.size(), from + batch));
@@ -299,35 +293,6 @@ class ColumnarParquetWriterTest {
         }
     }
 
-    /**
-     * The early dictionary abort: a column whose first values are nearly all
-     * distinct (the random longs of {@code l}) is written without a dictionary
-     * from its first page, as DELTA_BINARY_PACKED, while a column of few values
-     * ({@code day}) keeps its dictionary; the values read back as
-     * parquet-java's file holds them.
-     */
-    @Test
-    void earlyDictionaryAbortOnDistinctValues() throws Exception {
-        List<Row> rows = rows(30_000, 5);
-        earlyAbort = true;
-        org.apache.hadoop.fs.Path ours = writeOurs(rows, 4096, 128L << 20);
-        org.apache.hadoop.fs.Path theirs = writeParquetJava(rows, 128L << 20);
-        assertEquals(readAll(theirs), readAll(ours));
-        for (BlockMetaData b : footer(ours).getBlocks()) {
-            for (ColumnChunkMetaData c : b.getColumns()) {
-                String name = c.getPath().toDotString();
-                if (name.equals("l")) {
-                    assertTrue(!c.getEncodings().contains(org.apache.parquet.column.Encoding.RLE_DICTIONARY) && c.getEncodings().contains(org.apache.parquet.column.Encoding.DELTA_BINARY_PACKED),
-                            () -> "l: " + c.getEncodings());
-                }
-                if (name.equals("day")) {
-                    assertTrue(c.getEncodings().contains(org.apache.parquet.column.Encoding.RLE_DICTIONARY),
-                            () -> "day: " + c.getEncodings());
-                }
-            }
-        }
-    }
-
     @Test
     void sameValuesAsParquetJava() throws Exception {
         List<Row> rows = rows(20_000, 1);
@@ -344,7 +309,6 @@ class ColumnarParquetWriterTest {
      */
     @Test
     void hardwoodReadsOurFiles() throws Exception {
-        earlyAbort = true;
         List<Row> dictionaryRows = rows(20_000, 3);
         List<Row> uniqueRows = new ArrayList<>();
         for (Row r : rows(50_000, 4)) {
