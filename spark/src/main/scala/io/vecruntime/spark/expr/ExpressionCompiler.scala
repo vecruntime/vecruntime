@@ -534,6 +534,21 @@ object ExpressionCompiler {
       children.foldLeft[Either[String, Vector[VectorExpr]]](Right(Vector.empty)) { (acc, c) =>
         for (done <- acc; v <- compile(c, input)) yield done :+ v
       }.map(vs => Murmur3HashExpr(vs, children.map(_.dataType), seed))
+    // Spark 4's bucket and partitioning hash (#842): Murmur3Hash itself unless a string key is collated.
+    case org.apache.spark.sql.catalyst.expressions.CollationAwareMurmur3Hash(children, seed)
+        if children.nonEmpty && children.forall { c =>
+          XxHash64Expr.supports(c.dataType) && (c.dataType match {
+            case _: StringType => c.dataType == StringType
+            case _ => true
+          })
+        } =>
+      compile(Murmur3Hash(children, seed), input)
+    // V1Writes wraps a string partition column so an empty string writes the default partition (#842).
+    case org.apache.spark.sql.catalyst.expressions.Empty2Null(child) =>
+      compile(
+        If(EqualTo(child, Literal.create("", child.dataType)), Literal.create(null, child.dataType), child),
+        input
+      )
     case Md5(BinaryFromString(str)) => stringSubject(str, input, "md5").map(DigestExpr(DigestExpr.Md5, _))
     case Sha1(BinaryFromString(str)) => stringSubject(str, input, "sha1").map(DigestExpr(DigestExpr.Sha1, _))
     case Sha2(BinaryFromString(str), Literal(bits: Int, IntegerType)) =>

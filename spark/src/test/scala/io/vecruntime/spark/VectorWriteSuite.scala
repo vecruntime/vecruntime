@@ -79,11 +79,12 @@ class VectorWriteSuite extends VectorQuerySuite {
       df: DataFrame,
       path: String,
       columnar: Boolean,
-      options: Map[String, String] = Map.empty
+      options: Map[String, String] = Map.empty,
+      partitionBy: Seq[String] = Nil
   ): SparkPlan = {
     lastWritePlan = null
     withConf(VectorConf.WriteColumnar -> columnar.toString) {
-      df.write.mode("overwrite").options(options).parquet(path)
+      df.write.mode("overwrite").options(options).partitionBy(partitionBy: _*).parquet(path)
     }
     org.apache.spark.sql.vecruntime.TestListenerSync.drain(spark)
     assert(lastWritePlan != null, "no write plan captured")
@@ -96,11 +97,34 @@ class VectorWriteSuite extends VectorQuerySuite {
   private def footers(path: String): Seq[ParquetMetadata] = {
     val p = new Path(path)
     val fs = p.getFileSystem(spark.sparkContext.hadoopConfiguration)
-    fs.listStatus(p).filter(_.getPath.getName.endsWith(".parquet")).toSeq.map { st =>
-      val r = ParquetFileReader.open(HadoopInputFile.fromStatus(st, spark.sparkContext.hadoopConfiguration))
-      try r.getFooter
-      finally r.close()
-    }
+    val files = fs.listFiles(p, true)
+    Iterator
+      .continually(files)
+      .takeWhile(_.hasNext)
+      .map(_.next())
+      .filter(_.getPath.getName.endsWith(".parquet"))
+      .toSeq
+      .map { st =>
+        val r = ParquetFileReader.open(HadoopInputFile.fromStatus(st, spark.sparkContext.hadoopConfiguration))
+        try r.getFooter
+        finally r.close()
+      }
+  }
+
+  /** The partition directories under `path`, relative to it, and how many rows each holds. */
+  private def partitionDirs(path: String): Map[String, Long] = {
+    val p = new Path(path)
+    val fs = p.getFileSystem(spark.sparkContext.hadoopConfiguration)
+    val root = fs.makeQualified(p).toString
+    footers(path).zip(parquetFiles(path)).groupMapReduce { case (_, f) =>
+      f.getParent.toString.stripPrefix(root)
+    } { case (m, _) => m.getBlocks.asScala.map(_.getRowCount).sum }(_ + _)
+  }
+
+  private def parquetFiles(path: String): Seq[Path] = {
+    val p = new Path(path)
+    val files = p.getFileSystem(spark.sparkContext.hadoopConfiguration).listFiles(p, true)
+    Iterator.continually(files).takeWhile(_.hasNext).map(_.next().getPath).filter(_.getName.endsWith(".parquet")).toSeq
   }
 
   private def hasVectorWrite(plan: SparkPlan): Boolean =
@@ -113,12 +137,14 @@ class VectorWriteSuite extends VectorQuerySuite {
   private def compareWrites(
       name: String,
       df: SparkSession => DataFrame,
-      options: Map[String, String] = Map.empty
+      options: Map[String, String] = Map.empty,
+      partitionBy: Seq[String] = Nil
   ): (SparkPlan, Seq[ParquetMetadata]) = {
     val ours = newTempPath(s"write/$name-ours")
     val theirs = newTempPath(s"write/$name-spark")
-    val plan = write(df(spark), ours, columnar = true, options)
-    write(df(spark), theirs, columnar = false, options)
+    val plan = write(df(spark), ours, columnar = true, options, partitionBy)
+    write(df(spark), theirs, columnar = false, options, partitionBy)
+    assert(partitionDirs(ours) === partitionDirs(theirs), s"$name: partition directories")
     val a = readSorted(ours)
     val b = readSorted(theirs)
     assert(a.length === b.length, s"$name: row counts")
@@ -215,6 +241,82 @@ class VectorWriteSuite extends VectorQuerySuite {
     spark.sql("DROP TABLE ctas_ours")
   }
 
+  test("partitioned writes: the same directories, row counts and rows as Spark's") {
+    // A boolean, then a date and a string with nulls (`__HIVE_DEFAULT_PARTITION__`), escaped characters.
+    val (p1, _) = compareWrites("part-b", s => s.table("t"), partitionBy = Seq("b"))
+    assert(hasVectorWrite(p1), s"${p1.treeString}\n${fallbackReasons(p1)}")
+    val (p2, _) = compareWrites(
+      "part-dt-s",
+      s =>
+        s.table("t").selectExpr(
+          "i",
+          "l",
+          "d",
+          "date_add(dt, i % 3) as day",
+          "if(s is null, null, concat(s, '/x=%')) as k"
+        ),
+      partitionBy = Seq("day", "k")
+    )
+    assert(hasVectorWrite(p2), s"${p2.treeString}\n${fallbackReasons(p2)}")
+  }
+
+  test("partitioned writes roll files at maxRecordsPerFile within a partition") {
+    val (plan, files) = compareWrites(
+      "part-max",
+      s => s.table("t"),
+      options = Map("maxRecordsPerFile" -> "700"),
+      partitionBy = Seq("b")
+    )
+    assert(hasVectorWrite(plan))
+    assert(files.forall(_.getBlocks.asScala.map(_.getRowCount).sum <= 700))
+  }
+
+  test("bucketed tables: each bucket file holds the rows Spark's bucket file holds") {
+    def bucketed(table: String, columnar: Boolean, partitioned: Boolean): SparkPlan = {
+      lastWritePlan = null
+      withConf(VectorConf.WriteColumnar -> columnar.toString) {
+        spark.sql(s"DROP TABLE IF EXISTS $table")
+        val w = spark.table("t").selectExpr("i", "l", "s", "d2", "b").write.bucketBy(5, "s", "i")
+        (if (partitioned) w.partitionBy("b") else w).format("parquet").saveAsTable(table)
+      }
+      org.apache.spark.sql.vecruntime.TestListenerSync.drain(spark)
+      lastWritePlan
+    }
+    def byBucket(table: String): Map[(String, Int), Seq[String]] = {
+      val location =
+        spark.sessionState.catalog.getTableMetadata(spark.sessionState.sqlParser.parseTableIdentifier(table)).location
+      val root = location.toString
+      parquetFiles(root).groupBy { f =>
+        (
+          f.getParent.toString.stripPrefix(new Path(root).toString),
+          org.apache.spark.sql.execution.datasources.BucketingUtils.getBucketId(f.getName).get
+        )
+      }.map { case (k, fs) =>
+        k -> withPlugin(enabled =
+          false
+        )(spark.read.parquet(fs.map(_.toString): _*).collect()).map(_.toString).toSeq.sorted
+      }
+    }
+    Seq(false, true).foreach { partitioned =>
+      val plan = bucketed("bk_ours", columnar = true, partitioned)
+      assert(hasVectorWrite(plan), s"${plan.treeString}\n${fallbackReasons(plan)}")
+      bucketed("bk_spark", columnar = false, partitioned)
+      val ours = byBucket("bk_ours")
+      val theirs = byBucket("bk_spark")
+      assert(ours.keySet === theirs.keySet, s"partitioned=$partitioned: bucket files")
+      ours.foreach { case (k, rows) => assert(rows === theirs(k), s"partitioned=$partitioned: bucket $k") }
+      // A bucketed join reads our table without a shuffle on its side, as Spark's.
+      val joined = withPlugin(enabled =
+        false
+      )(spark.sql("SELECT count(*) FROM bk_ours a JOIN bk_spark b ON a.s = b.s AND a.i = b.i").collect())
+      assert(joined.head.getLong(0) === withPlugin(enabled =
+        false
+      )(spark.sql("SELECT count(*) FROM t WHERE s IS NOT NULL").collect()).head.getLong(0))
+    }
+    spark.sql("DROP TABLE bk_ours")
+    spark.sql("DROP TABLE bk_spark")
+  }
+
   test("writes the prototype does not take keep Spark's writer, with the reason") {
     def reasonsOf(f: String => Unit): Seq[String] = {
       lastWritePlan = null
@@ -223,7 +325,13 @@ class VectorWriteSuite extends VectorQuerySuite {
       assert(!hasVectorWrite(lastWritePlan))
       fallbackReasons(lastWritePlan)
     }
-    assert(reasonsOf(p => spark.table("t").write.partitionBy("b").parquet(p)).exists(_.contains("partitioned")))
+    withConf("spark.sql.maxConcurrentOutputFileWriters" -> "4") {
+      assert(
+        reasonsOf(p => spark.table("t").write.partitionBy("b").parquet(p)).exists(_.contains(
+          "maxConcurrentOutputFileWriters"
+        ))
+      )
+    }
     assert(
       reasonsOf(p => spark.table("t").write.option("parquet.writer.version", "v1").parquet(p))
         .exists(_.contains("writes Parquet v2"))

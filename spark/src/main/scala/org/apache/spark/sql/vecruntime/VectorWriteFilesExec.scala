@@ -40,6 +40,8 @@ import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.connector.write.WriterCommitMessage
 import org.apache.spark.sql.execution.SparkPlan
 import org.apache.spark.sql.execution.datasources.{
+  BaseDynamicPartitionDataWriter,
+  BucketingUtils,
   FileFormatDataWriter,
   OutputWriter,
   OutputWriterFactory,
@@ -70,7 +72,9 @@ import org.apache.spark.util.Utils
  * The task mirrors `FileFormatWriter.executeTask` with `SingleDirectoryDataWriter`: the same task attempt context,
  * the committer's `newTaskTempFile` for each file (so file names and the commit are Spark's), `maxRecordsPerFile`
  * honoured by splitting a batch between files, the job's stats trackers told of every file and row, and the
- * committer's `abortTask` on failure. Only unpartitioned, unbucketed writes convert ([[VectorWritePlanner]]).
+ * committer's `abortTask` on failure; partitioned and bucketed writes go through
+ * [[VectorDynamicPartitionDataWriter]] (Spark's `DynamicPartitionDataSingleWriter`). Which writes convert:
+ * [[VectorWritePlanner]].
  */
 case class VectorWriteFilesExec(
     child: SparkPlan,
@@ -103,6 +107,8 @@ case class VectorWriteFilesExec(
     )
     val ordinals = spec.dataColumns.map(a => child.output.indexWhere(_.exprId == a.exprId)).toArray
     require(ordinals.forall(_ >= 0), s"write columns ${spec.dataColumns} not all in ${child.output}")
+    val allOrdinals = spec.allColumns.map(a => child.output.indexWhere(_.exprId == a.exprId)).toArray
+    require(allOrdinals.forall(_ >= 0), s"columns ${spec.allColumns} not all in ${child.output}")
     val committer = writeFilesSpec.committer
     val jobTrackerID = SparkHadoopWriterUtils.createJobTrackerID(new Date())
     nonEmpty.mapPartitionsInternal { batches =>
@@ -116,7 +122,8 @@ case class VectorWriteFilesExec(
           ctx.taskAttemptId().toInt & Int.MaxValue,
           committer,
           batches,
-          ordinals
+          ordinals,
+          allOrdinals
         )
       )
     }
@@ -141,10 +148,11 @@ object VectorWritePlanner {
     val conf = session.sessionState.conf
     if (w.fileFormat.getClass != classOf[ParquetFileFormat]) {
       Some(s"columnar write: format ${w.fileFormat.getClass.getSimpleName} is not Parquet")
-    } else if (w.partitionColumns.nonEmpty) {
-      Some("columnar write: partitioned writes are not supported yet (#842)")
-    } else if (w.bucketSpec.isDefined) {
-      Some("columnar write: bucketed writes are not supported yet (#842)")
+    } else if ((w.partitionColumns.nonEmpty || w.bucketSpec.isDefined) && conf.maxConcurrentOutputFileWriters > 0) {
+      // Spark then writes unsorted input through concurrent writers (`DynamicPartitionDataConcurrentWriter`).
+      Some("columnar write: spark.sql.maxConcurrentOutputFileWriters > 0 is not supported yet (#842)")
+    } else if (w.options.contains(BucketingUtils.optionForHiveCompatibleBucketWrite)) {
+      Some("columnar write: Hive-compatible bucketing is not supported yet (#842)")
     } else if (!w.child.supportsColumnar) {
       Some(s"columnar write: child ${w.child.nodeName} is not columnar")
     } else {
@@ -202,7 +210,8 @@ private[vecruntime] object VectorWriteTask {
       sparkAttemptNumber: Int,
       committer: FileCommitProtocol,
       batches: Iterator[ColumnarBatch],
-      ordinals: Array[Int]
+      ordinals: Array[Int],
+      allOrdinals: Array[Int]
   ): WriteTaskResult = {
     val jobId = SparkHadoopWriterUtils.createJobID(jobTrackerID, sparkStageId)
     val taskId = new TaskID(jobId, TaskType.MAP, sparkPartitionId)
@@ -217,11 +226,16 @@ private[vecruntime] object VectorWriteTask {
       new TaskAttemptContextImpl(hadoopConf, taskAttemptId)
     }
     committer.setupTask(taskAttemptContext)
-    var dataWriter: VectorSingleDirectoryDataWriter = null
+    var dataWriter: FileFormatDataWriter with VectorBatchWriter = null
     Utils.tryWithSafeFinallyAndFailureCallbacks(block = {
       // As Spark: an empty partition other than the first writes no file (the first writes the schema).
       val writeFile = sparkPartitionId == 0 || batches.hasNext
-      dataWriter = new VectorSingleDirectoryDataWriter(description, taskAttemptContext, committer, writeFile)
+      dataWriter =
+        if (description.partitionColumns.isEmpty && description.bucketSpec.isEmpty) {
+          new VectorSingleDirectoryDataWriter(description, taskAttemptContext, committer, writeFile)
+        } else {
+          new VectorDynamicPartitionDataWriter(description, taskAttemptContext, committer, allOrdinals)
+        }
       while (batches.hasNext) {
         dataWriter.writeBatch(batches.next(), ordinals)
       }
@@ -247,7 +261,8 @@ private[vecruntime] class VectorSingleDirectoryDataWriter(
     taskAttemptContext: TaskAttemptContext,
     committer: FileCommitProtocol,
     writeFile: Boolean
-) extends FileFormatDataWriter(description, taskAttemptContext, committer, Map.empty) {
+) extends FileFormatDataWriter(description, taskAttemptContext, committer, Map.empty)
+    with VectorBatchWriter {
 
   private var fileCounter = 0
   private var recordsInFile = 0L
@@ -270,16 +285,10 @@ private[vecruntime] class VectorSingleDirectoryDataWriter(
   override def write(record: InternalRow): Unit =
     throw new UnsupportedOperationException("VectorWriteFilesExec writes batches")
 
-  def writeBatch(batch: ColumnarBatch, ordinals: Array[Int]): Unit = {
+  override def writeBatch(batch: ColumnarBatch, ordinals: Array[Int]): Unit = {
     val arena = Arena.ofConfined()
     try {
-      val rows = batch.numRows()
-      val columns = ordinals.map(o => ColumnVectorAdapters.adapt(batch.column(o), rows, arena))
-      val (cols, n) = batch match {
-        case s: SelectedColumnarBatch if s.selectedCount() < rows =>
-          (columns.map(c => VectorWriteTask2.compact(c, s.selection(), s.selectedCount(), arena)), s.selectedCount())
-        case _ => (columns, rows)
-      }
+      val (cols, n) = VectorWriteTask2.columns(batch, ordinals, arena)
       var from = 0
       while (from < n) {
         if (description.maxRecordsPerFile > 0 && recordsInFile >= description.maxRecordsPerFile) {
@@ -304,7 +313,260 @@ private[vecruntime] class VectorSingleDirectoryDataWriter(
   }
 }
 
+/** A data writer fed batches: `ordinals` are the data columns' positions in the batch. */
+private[vecruntime] trait VectorBatchWriter {
+  def writeBatch(batch: ColumnarBatch, ordinals: Array[Int]): Unit
+}
+
+/**
+ * `DynamicPartitionDataSingleWriter` for batches (#842): partitioned and/or bucketed writes over input sorted by
+ * the partition columns and then the bucket id, as `V1Writes` orders a `WriteFiles` child. Each batch is cut into
+ * runs of equal partition values and bucket id; every run is written as one range of the batch's columns into
+ * the current file, and a new run opens the next file through Spark's own `renewCurrentWriter` -- so the
+ * partition directories (escaping, `__HIVE_DEFAULT_PARTITION__`, custom partition locations), the
+ * `-bucketid.cNNN` file names, `maxRecordsPerFile` and the stats trackers' `newPartition` / `newFile` are Spark's.
+ *
+ * Partition values are compared lane by lane between adjacent rows and projected (Spark's `getPartitionValues`)
+ * once per run. Bucket ids are Spark's `pmod(murmur3hash(columns, 42), numBuckets)` computed per batch by the
+ * shuffle's hash kernels over the data lanes; a bucket expression of another shape (or key types those kernels
+ * do not hash as Spark does) is evaluated row by row with Spark's own projection.
+ */
+private[vecruntime] class VectorDynamicPartitionDataWriter(
+    description: WriteJobDescription,
+    taskAttemptContext: TaskAttemptContext,
+    committer: FileCommitProtocol,
+    allOrdinals: Array[Int]
+) extends BaseDynamicPartitionDataWriter(description, taskAttemptContext, committer, Map.empty)
+    with VectorBatchWriter {
+
+  import org.apache.spark.sql.catalyst.expressions.{
+    Attribute,
+    CollationAwareMurmur3Hash,
+    Literal,
+    Murmur3Hash,
+    Pmod,
+    UnsafeRow
+  }
+  import io.vecruntime.kernels.PartitionKernels
+  import io.vecruntime.kernels.PartitionKernels.KeyKind
+
+  private var currentPartitionValues: Option[UnsafeRow] = None
+  private var currentBucketId: Option[Int] = None
+
+  /** Positions of the partition columns in `allColumns` (and so in the reordered batch), with their types. */
+  private val partitionOrdinals: Array[Int] =
+    description.partitionColumns.map(p => description.allColumns.indexWhere(_.exprId == p.exprId)).toArray
+  private val partitionTypes: Array[DataType] = description.partitionColumns.map(_.dataType).toArray
+
+  /**
+   * The bucket keys as positions in the data columns with their hash kinds, when the bucket expression is Spark's
+   * `Pmod(Murmur3Hash(keys, 42), n)` over data columns of types the kernels hash as Spark does.
+   */
+  private val vectorBuckets: Option[(Array[Int], Array[KeyKind], Int)] = description.bucketSpec.flatMap { spec =>
+    spec.bucketIdExpression match {
+      case p: Pmod =>
+        val hashed = p.left match {
+          case Murmur3Hash(children, 42) => Some(children)
+          case CollationAwareMurmur3Hash(children, 42) => Some(children)
+          case _ => None
+        }
+        (hashed, p.right) match {
+          case (Some(children), Literal(n: Int, IntegerType)) if children.forall(_.isInstanceOf[Attribute]) =>
+            val keys =
+              children.map(c => description.dataColumns.indexWhere(_.exprId == c.asInstanceOf[Attribute].exprId))
+            val kinds = children.map(c => VectorDynamicPartitionDataWriter.hashKind(c.dataType))
+            if (keys.forall(_ >= 0) && kinds.forall(_ != null)) Some((keys.toArray, kinds.toArray, n)) else None
+          case _ => None
+        }
+      case _ => None
+    }
+  }
+
+  override def write(record: InternalRow): Unit =
+    throw new UnsupportedOperationException("VectorWriteFilesExec writes batches")
+
+  override def writeBatch(batch: ColumnarBatch, ordinals: Array[Int]): Unit = {
+    val arena = Arena.ofConfined()
+    try {
+      val (cols, n) = VectorWriteTask2.columns(batch, ordinals, arena)
+      if (n == 0) return
+      // The batch's columns in allColumns order, which Spark's projections are bound to; `rowOf(k)` is the
+      // physical row of logical (selected) row k.
+      val all = new ColumnarBatch(allOrdinals.map(batch.column), batch.numRows())
+      val physical: Array[Int] = batch match {
+        case s: SelectedColumnarBatch if s.selectedCount() < batch.numRows() =>
+          VectorWriteTask2.selectedRows(s.selection(), batch.numRows(), n)
+        case _ => null
+      }
+      def rowOf(k: Int): Int = if (physical == null) k else physical(k)
+      val bucketIds: Array[Int] = if (!isBucketed) null else bucketIdsOf(cols, n, all, rowOf)
+
+      var from = 0
+      while (from < n) {
+        // The run of rows equal to `from` in partition values and bucket id.
+        var to = from + 1
+        while (
+          to < n && samePartition(
+            all,
+            rowOf(to - 1),
+            rowOf(to)
+          ) && (bucketIds == null || bucketIds(to) == bucketIds(from))
+        ) {
+          to += 1
+        }
+        startRun(all, rowOf(from), if (bucketIds == null) None else Some(bucketIds(from)))
+        writeRun(cols, from, to)
+        from = to
+      }
+    } finally arena.close()
+  }
+
+  /** Opens the run's file when its partition or bucket differs from the current one (Spark's `write`). */
+  private def startRun(all: ColumnarBatch, row: Int, bucketId: Option[Int]): Unit = {
+    val partitionValues = if (isPartitioned) Some(getPartitionValues(all.getRow(row))) else None
+    if (currentWriter == null || currentPartitionValues != partitionValues || currentBucketId != bucketId) {
+      if (isPartitioned && currentPartitionValues != partitionValues) {
+        currentPartitionValues = Some(partitionValues.get.copy())
+        statsTrackers.foreach(_.newPartition(currentPartitionValues.get))
+      }
+      if (isBucketed) currentBucketId = bucketId
+      fileCounter = 0
+      renewCurrentWriter(currentPartitionValues, currentBucketId, closeCurrentWriter = true)
+    }
+  }
+
+  /** Rows `[from, to)` into the current file, rolling files at `maxRecordsPerFile`. */
+  private def writeRun(cols: Array[VectorBuffers], from0: Int, to0: Int): Unit = {
+    var from = from0
+    while (from < to0) {
+      if (description.maxRecordsPerFile > 0 && recordsInFile >= description.maxRecordsPerFile) {
+        renewCurrentWriterIfTooManyRecords(currentPartitionValues, currentBucketId)
+      }
+      val room =
+        if (description.maxRecordsPerFile > 0) math.min(to0 - from, description.maxRecordsPerFile - recordsInFile).toInt
+        else to0 - from
+      val to = from + room
+      val w = currentWriter.asInstanceOf[VectorParquetOutputWriter]
+      w.writeColumns(cols, from, to)
+      var r = from
+      while (r < to) {
+        statsTrackers.foreach(_.newRow(w.path(), null))
+        r += 1
+      }
+      recordsInFile += to - from
+      from = to
+    }
+  }
+
+  private def bucketIdsOf(cols: Array[VectorBuffers], n: Int, all: ColumnarBatch, rowOf: Int => Int): Array[Int] = {
+    val ids = new Array[Int](n)
+    vectorBuckets match {
+      case Some((keys, kinds, num)) =>
+        PartitionKernels.hashPartitionIds(keys.map(cols), kinds, n, num, new Array[Int](n), ids)
+      case None =>
+        var k = 0
+        while (k < n) {
+          ids(k) = getBucketId(all.getRow(rowOf(k)))
+          k += 1
+        }
+    }
+    ids
+  }
+
+  /** Whether physical rows `a` and `b` hold the same partition values (nulls equal), as `UnsafeRow` equality. */
+  private def samePartition(all: ColumnarBatch, a: Int, b: Int): Boolean = {
+    var i = 0
+    while (i < partitionOrdinals.length) {
+      val c = all.column(partitionOrdinals(i))
+      val na = c.isNullAt(a)
+      if (na != c.isNullAt(b)) return false
+      if (!na) {
+        val same = partitionTypes(i) match {
+          case BooleanType => c.getBoolean(a) == c.getBoolean(b)
+          case ByteType => c.getByte(a) == c.getByte(b)
+          case ShortType => c.getShort(a) == c.getShort(b)
+          case IntegerType | DateType => c.getInt(a) == c.getInt(b)
+          case LongType | TimestampType | TimestampNTZType => c.getLong(a) == c.getLong(b)
+          case FloatType =>
+            java.lang.Float.floatToIntBits(c.getFloat(a)) == java.lang.Float.floatToIntBits(c.getFloat(b))
+          case DoubleType =>
+            java.lang.Double.doubleToLongBits(c.getDouble(a)) == java.lang.Double.doubleToLongBits(c.getDouble(b))
+          case _: StringType => c.getUTF8String(a) == c.getUTF8String(b)
+          case BinaryType => java.util.Arrays.equals(c.getBinary(a), c.getBinary(b))
+          case d: DecimalType => c.getDecimal(a, d.precision, d.scale) == c.getDecimal(b, d.precision, d.scale)
+          case _ => getPartitionValues(all.getRow(a)).copy() == getPartitionValues(all.getRow(b))
+        }
+        if (!same) return false
+      }
+      i += 1
+    }
+    true
+  }
+}
+
+private[vecruntime] object VectorDynamicPartitionDataWriter {
+
+  /**
+   * The kernels' hash kind for a bucket key of type `dt` when it equals Spark's `Murmur3Hash` of that type over
+   * our lane; null otherwise (the bucket ids are then evaluated by Spark's projection).
+   */
+  def hashKind(dt: DataType): io.vecruntime.kernels.PartitionKernels.KeyKind = {
+    import io.vecruntime.kernels.PartitionKernels.KeyKind
+    dt match {
+      case ByteType | ShortType | IntegerType | DateType => KeyKind.INT
+      case LongType | TimestampType | TimestampNTZType => KeyKind.LONG
+      case d: DecimalType if d.precision <= Decimal.MAX_LONG_DIGITS => KeyKind.LONG
+      case _: DecimalType => KeyKind.DECIMAL128
+      case DoubleType => KeyKind.DOUBLE
+      case FloatType => KeyKind.FLOAT
+      case BooleanType => KeyKind.BOOL
+      case s: StringType if s.supportsBinaryEquality => KeyKind.UTF8
+      case _ => null
+    }
+  }
+}
+
 private[vecruntime] object VectorWriteTask2 {
+
+  /** The data columns of `batch` as `VectorBuffers` (at `ordinals`), compacted to its selection; and their rows. */
+  def columns(batch: ColumnarBatch, ordinals: Array[Int], arena: Arena): (Array[VectorBuffers], Int) = {
+    val rows = batch.numRows()
+    val columns = ordinals.map(o => ColumnVectorAdapters.adapt(batch.column(o), rows, arena))
+    batch match {
+      case s: SelectedColumnarBatch if s.selectedCount() < rows =>
+        (columns.map(c => compact(c, s.selection(), s.selectedCount(), arena)), s.selectedCount())
+      case _ => (columns, rows)
+    }
+  }
+
+  /** The physical rows set in a selection bitmap of `rows` bits, `count` of them, in order. */
+  def selectedRows(selection: MemorySegment, rows: Int, count: Int): Array[Int] = {
+    val out = new Array[Int](count)
+    var k = 0
+    var w = 0
+    while (w * 64 < rows) {
+      var word =
+        if ((w + 1) * 64 <= rows) selection.get(java.lang.foreign.ValueLayout.JAVA_LONG_UNALIGNED, w * 8L)
+        else {
+          var v = 0L
+          var b = w * 64
+          while (b < rows) {
+            if ((selection.get(java.lang.foreign.ValueLayout.JAVA_BYTE, (b >>> 3).toLong) & (1 << (b & 7))) != 0) {
+              v |= 1L << (b - w * 64)
+            }
+            b += 1
+          }
+          v
+        }
+      while (word != 0) {
+        out(k) = w * 64 + java.lang.Long.numberOfTrailingZeros(word)
+        k += 1
+        word &= word - 1
+      }
+      w += 1
+    }
+    out
+  }
 
   /** A column compacted to the selected rows, into `arena` (dictionary ids keep their dictionary). */
   def compact(in: VectorBuffers, selection: MemorySegment, count: Int, arena: Arena): VectorBuffers = {

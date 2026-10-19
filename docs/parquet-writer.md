@@ -8,7 +8,7 @@ title: Columnar Parquet writer
 `spark.vecruntime.write.columnar.enabled` (default `false`) writes a Spark Parquet write
 (`df.write.parquet`, `INSERT` into a Parquet table, `CREATE TABLE ... USING parquet AS SELECT`) straight
 from our columnar batches, with no conversion to rows and no parquet-java `ParquetWriteSupport` in
-between. The work list for a complete writer (partitions, buckets, nested types, Iceberg) is #842.
+between. The work list for a complete writer (nested types, Iceberg, the remaining options) is #842.
 
 **The writer writes Parquet v2 only**: data page v2, and the v2 encodings. There is no v1 code path.
 v2 pages keep the repetition and definition levels outside the compressed body and the v2 encodings
@@ -48,18 +48,27 @@ index are written as parquet-java writes them; binary min/max compare unsigned.
   `org.apache.spark.version` and `org.apache.spark.sql.parquet.row.metadata` keys, and the compression
   codec, page, dictionary-page and row-group sizes are read from the same keys as Spark's writer.
   `maxRecordsPerFile` rolls files in the middle of a batch.
+- **Partitions and buckets** (`VectorDynamicPartitionDataWriter`, Spark's `DynamicPartitionDataSingleWriter`
+  for batches): the input is sorted by the partition columns and then the bucket id, as `V1Writes` orders it
+  (the sort is ours: `empty2null` and Spark 4's `collation_aware_hash` bucket expression compile). Each batch
+  is cut into runs of equal partition values and bucket id -- adjacent rows compared lane by lane, partition
+  values projected once per run -- and each run is one range of the batch's columns written into the current
+  file. Opening a file goes through Spark's own `renewCurrentWriter`, so the partition directories (escaping,
+  `__HIVE_DEFAULT_PARTITION__`, custom locations), the bucket file names and the stats trackers are Spark's.
+  Bucket ids are `pmod(murmur3hash(keys, 42), n)` from the shuffle's hash kernels over the data lanes;
+  another bucket expression or key type is evaluated row by row by Spark's projection.
 
 ## Scope of the prototype, and fallbacks
 
-Taken: unpartitioned, unbucketed Parquet writes of flat types -- boolean, byte, short, int, long, float,
+Taken: Parquet writes of flat types, unpartitioned, partitioned (dynamic partitions) and bucketed -- boolean, byte, short, int, long, float,
 double, decimal (every precision), date, timestamp (INT96, `TIMESTAMP_MICROS`, `TIMESTAMP_MILLIS`),
 string, binary -- over a columnar child. Other writes keep Spark's writer, with the reason in the plan's
 fallback list:
 
 | Write | Reason |
 |---|---|
-| Partitioned (`partitionBy`) | `partitioned writes are not supported yet (#842)` |
-| Bucketed | `bucketed writes are not supported yet (#842)` |
+| Partitioned or bucketed under `spark.sql.maxConcurrentOutputFileWriters` > 0 (unsorted input) | `... maxConcurrentOutputFileWriters > 0 is not supported yet (#842)` |
+| Hive-compatible bucketing (Hive tables) | `Hive-compatible bucketing is not supported yet (#842)` |
 | Struct, array, map columns | `column <name> has type <type>, not supported yet (#842)` |
 | `parquet.writer.version=v1` | `parquet.writer.version is v1, the columnar writer writes Parquet v2` |
 | Bloom filters, encryption, per-column `#` options | named in the reason |
@@ -77,7 +86,10 @@ fallback list:
 - `VectorWriteSuite` (Spark) writes each case through our writer and Spark's, reads both back with
   Spark's reader and ours, and compares rows, the Spark and Parquet schemas and the footer keys: every
   flat type, zstd / snappy / none, filtered and projected input (selection vectors), `maxRecordsPerFile`,
-  empty input, CTAS, and the fallbacks above.
+  empty input, CTAS, partitioned writes (a boolean; a date and a string with nulls and characters that
+  need escaping; `maxRecordsPerFile` within a partition: the same directories and row counts as Spark's),
+  bucketed tables with and without partitions (every bucket file holds the rows Spark's bucket file holds;
+  a bucketed join reads them), and the fallbacks above.
 
 ## Measurements
 
