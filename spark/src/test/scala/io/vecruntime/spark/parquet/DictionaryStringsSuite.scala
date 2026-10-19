@@ -25,6 +25,7 @@ import org.apache.spark.sql.vecruntime.{PlanUtils, VectorFilterExec, VectorHashA
  * group's dictionary), as Spark's scan path hands them to our operators; a chunk that falls back from its
  * dictionary mid-way is decoded flat from that page on. Results must be Spark's either way.
  */
+@io.vecruntime.spark.test.tags.Scan
 class DictionaryStringsSuite extends VectorQuerySuite {
 
   override protected def extraSparkConf: Map[String, String] =

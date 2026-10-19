@@ -51,6 +51,7 @@ import org.apache.spark.sql.vecruntime.VectorWindowExec
  * ties in the order key, a null partition, a null value, plus a decimal measure `d` for the decimal
  * running-frame cases -- written as Parquet so the scan is columnar.
  */
+@io.vecruntime.spark.test.tags.SortWindow
 class VectorPortedCometWindowSuite extends VectorQuerySuite {
 
   private val Window = classOf[VectorWindowExec]

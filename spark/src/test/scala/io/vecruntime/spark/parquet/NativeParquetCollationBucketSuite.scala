@@ -31,6 +31,7 @@ import org.apache.spark.sql.vecruntime.{PlanUtils, VectorParquetScanExec}
  *   - a bucketed table: Spark's bucket partitioning reported (a join of two tables bucketed alike needs no
  *     shuffle), bucket pruning, buckets coalesced for a join, and a bucketed and sorted table.
  */
+@io.vecruntime.spark.test.tags.Scan
 class NativeParquetCollationBucketSuite extends VectorQuerySuite {
 
   override protected def extraSparkConf: Map[String, String] =

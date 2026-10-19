@@ -32,6 +32,7 @@ import org.apache.spark.sql.vecruntime.{
  * keys (NaN and -0.0 normalised), min / max / sum / avg, sorts and top-k, joins and windows -- over the
  * edge values NaN, +-0.0, +-Infinity, subnormals and Float.MAX_VALUE, in dictionary and plain Parquet.
  */
+@io.vecruntime.spark.test.tags.Expr
 class VectorFloatSuite extends VectorQuerySuite {
   private val Filter = classOf[VectorFilterExec]
   private val Project = classOf[VectorProjectExec]

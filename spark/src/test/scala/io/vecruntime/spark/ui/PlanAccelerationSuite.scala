@@ -27,6 +27,7 @@ import org.scalatest.funsuite.AnyFunSuite
  * Classification rules that do not need a SparkSession: Comet operators (matched by package, so
  * they can be exercised without Comet installed) and the name-based path used for running queries.
  */
+@io.vecruntime.spark.test.tags.Core
 class PlanAccelerationSuite extends AnyFunSuite {
 
   private val attrs = Seq(AttributeReference("a", LongType)())

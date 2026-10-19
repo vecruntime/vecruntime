@@ -33,6 +33,8 @@ import org.apache.spark.sql.vecruntime.{PlanUtils, VectorIcebergScanExec}
  * transitively through a second dimension), checks the result against Spark with the plugin off, asserts the
  * pruning subquery on the scan, and counts the files the scan reads with the rule on and off.
  */
+@io.vecruntime.spark.test.tags.Iceberg
+@io.vecruntime.spark.test.tags.Join
 class IcebergTransformDppSuite extends VectorQuerySuite {
 
   private lazy val warehouse = Files.createTempDirectory("vecruntime-iceberg-dpp-transforms").toString

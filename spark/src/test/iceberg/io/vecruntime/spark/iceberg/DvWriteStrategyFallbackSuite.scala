@@ -37,6 +37,8 @@ import org.scalatest.Tag
  * `VectorWriteDeltaExec` must therefore NEVER appear in a plan built in this module. The check is by
  * simple class name so it does not depend on the operator being loadable here.
  */
+@io.vecruntime.spark.test.tags.Iceberg
+@io.vecruntime.spark.test.tags.Write
 class DvWriteStrategyFallbackSuite extends VectorQuerySuite {
 
   override protected def extraSparkConf: Map[String, String] =

@@ -19,6 +19,8 @@ import io.vecruntime.spark.test.VectorQuerySuite
 import org.apache.spark.sql.DataFrame
 import org.apache.spark.sql.catalyst.plans.logical.{Aggregate, Join, LogicalPlan}
 
+@io.vecruntime.spark.test.tags.Agg
+@io.vecruntime.spark.test.tags.Join
 class AggregateBelowJoinSuite extends VectorQuerySuite {
 
   override protected def beforeAll(): Unit = {

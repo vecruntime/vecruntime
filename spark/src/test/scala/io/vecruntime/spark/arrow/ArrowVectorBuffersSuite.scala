@@ -22,6 +22,7 @@ import org.apache.arrow.vector._
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.funsuite.AnyFunSuite
 
+@io.vecruntime.spark.test.tags.Core
 class ArrowVectorBuffersSuite extends AnyFunSuite with BeforeAndAfterAll {
 
   private val allocator = new RootAllocator(Long.MaxValue)

@@ -28,6 +28,7 @@ import org.apache.spark.sql.vecruntime.{PlanUtils, VectorParquetScanExec}
  * `TimeNanoVector`; no engine lane holds it, so operators carry it as a foreign column. Compared with Spark's reader
  * row for row: flat, inside a list and inside a struct, dictionary and plain, v1 and v2 pages, with nulls.
  */
+@io.vecruntime.spark.test.tags.Scan
 class NativeParquetTimeSuite extends VectorQuerySuite {
 
   override protected def extraSparkConf: Map[String, String] =

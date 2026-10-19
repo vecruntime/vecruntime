@@ -20,6 +20,7 @@ import org.apache.spark.sql.execution.aggregate.HashAggregateExec
 import org.apache.spark.sql.vecruntime.AggSpillPolicy
 import org.apache.spark.sql.vecruntime.{VectorFilterExec, VectorHashAggregateExec}
 
+@io.vecruntime.spark.test.tags.Agg
 class VectorAggregateSuite extends VectorQuerySuite {
 
   private val Agg = classOf[VectorHashAggregateExec]

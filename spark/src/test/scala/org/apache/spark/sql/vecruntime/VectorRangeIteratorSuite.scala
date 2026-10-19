@@ -24,6 +24,7 @@ import org.scalatest.funsuite.AnyFunSuite
  * read through Spark's own `ArrowColumnVector` accessor -- and surviving the `closeIfFreeable()` Spark's
  * `ColumnarToRowExec` calls on every batch it has consumed, which is what makes reuse possible at all.
  */
+@io.vecruntime.spark.test.tags.Core
 class VectorRangeIteratorSuite extends AnyFunSuite {
 
   private def metrics(): VectorMetrics =

@@ -32,6 +32,7 @@ import org.apache.spark.sql.vecruntime.{PlanUtils, VectorBroadcastBatches, Vecto
  * several row groups and pages; each supported type is covered, with nulls and dictionary vs plain columns,
  * plus partition columns, a pushed filter that prunes row groups, and a dynamic-partition-pruning query.
  */
+@io.vecruntime.spark.test.tags.Scan
 class VectorParquetScanSuite extends VectorQuerySuite {
 
   override protected def extraSparkConf: Map[String, String] =

@@ -22,6 +22,7 @@ import org.apache.spark.sql.execution.FileSourceScanExec
  * Day-one viability check: Spark 4.1 must start and run a vectorized Parquet scan on the JDK we
  * target (25), and that scan must report itself as columnar so our operators can consume it.
  */
+@io.vecruntime.spark.test.tags.Core
 class SparkOnJdkSmokeSuite extends SparkVectorFunSuite {
 
   test("JVM is the targeted release and Vector API module is loaded") {

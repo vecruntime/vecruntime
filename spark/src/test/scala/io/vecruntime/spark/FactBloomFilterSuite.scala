@@ -20,6 +20,7 @@ import org.apache.spark.sql.DataFrame
 import org.apache.spark.sql.catalyst.expressions.BloomFilterMightContain
 
 /** A bloom filter from a smaller fact onto a larger one it joins (#641), against Spark with the plugin off. */
+@io.vecruntime.spark.test.tags.Join
 class FactBloomFilterSuite extends VectorQuerySuite {
 
   override protected def afterAll(): Unit = {

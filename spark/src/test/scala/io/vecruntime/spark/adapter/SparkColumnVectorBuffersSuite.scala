@@ -23,6 +23,7 @@ import org.apache.spark.sql.execution.vectorized.{OffHeapColumnVector, OnHeapCol
 import org.apache.spark.sql.types._
 import org.apache.spark.unsafe.types.UTF8String
 
+@io.vecruntime.spark.test.tags.Core
 class SparkColumnVectorBuffersSuite extends SparkVectorFunSuite {
 
   private val n = 101

@@ -29,6 +29,8 @@ import org.apache.spark.sql.execution.datasources.v2.DataSourceV2ScanRelation
  * pushed down (each with its own filters and columns); they are merged as a file table's are, and the merged
  * aggregate's scan pushed down again. TPC-DS q9 read `store_sales` fifteen times on Iceberg without this.
  */
+@io.vecruntime.spark.test.tags.Iceberg
+@io.vecruntime.spark.test.tags.Agg
 class IcebergMergeAggregatesSuite extends VectorQuerySuite {
 
   private lazy val warehouse = Files.createTempDirectory("vecruntime-iceberg-merge").toString

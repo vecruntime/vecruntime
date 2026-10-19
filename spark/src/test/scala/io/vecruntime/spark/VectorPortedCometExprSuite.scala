@@ -42,6 +42,7 @@ import org.apache.spark.sql.vecruntime.VectorProjectExec
  * `ignore` here with a one-line reason and a minimal repro in the PR, per the task's rule not to
  * fix engine code in a coverage change; none did on this slice.
  */
+@io.vecruntime.spark.test.tags.Expr
 class VectorPortedCometExprSuite extends VectorQuerySuite {
 
   private val Project = classOf[VectorProjectExec]

@@ -33,6 +33,7 @@ import org.apache.spark.sql.vecruntime.{
  * Spark's relation. The join semantics themselves are VectorJoinSuite's (which runs over this
  * exchange by default); this suite pins the exchange's placement and its bridges.
  */
+@io.vecruntime.spark.test.tags.Join
 class VectorBroadcastExchangeSuite extends VectorQuerySuite {
 
   private val BHJ = classOf[VectorBroadcastHashJoinExec]

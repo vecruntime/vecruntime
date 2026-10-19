@@ -31,6 +31,8 @@ import org.apache.spark.sql.vecruntime.{PlanUtils, VectorParquetScanExec}
  * list, a bare repeated leaf, required and optional elements and values), Hardwood's dictionary-encoded list
  * spanning batches, and the `apache/parquet-testing` list and map files.
  */
+@io.vecruntime.spark.test.tags.Scan
+@io.vecruntime.spark.test.tags.Nested
 class NativeParquetListSuite extends VectorQuerySuite {
 
   override protected def extraSparkConf: Map[String, String] =

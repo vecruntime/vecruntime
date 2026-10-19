@@ -26,6 +26,7 @@ import org.apache.spark.sql.vecruntime.{VectorFilterExec, VectorHashAggregateExe
  * the generic copy, and the two ways a scan stops being one -- the reader switched off, or a column
  * type with no lane.
  */
+@io.vecruntime.spark.test.tags.Scan
 class VectorScanSuite extends VectorQuerySuite {
 
   // This suite is about our operators over Spark's own Parquet scan (the adapter seam, off-heap views, the

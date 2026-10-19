@@ -52,6 +52,7 @@ import org.apache.spark.sql.vecruntime.{
  * `ignore` with a one-line reason and a minimal repro in the PR, per the task's rule not to fix
  * engine code in a coverage change.
  */
+@io.vecruntime.spark.test.tags.Join
 class VectorPortedCometJoinSuite extends VectorQuerySuite {
 
   private val BHJ = classOf[VectorBroadcastHashJoinExec]

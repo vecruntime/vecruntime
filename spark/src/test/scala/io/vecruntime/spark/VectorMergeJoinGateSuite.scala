@@ -24,6 +24,7 @@ import org.apache.spark.sql.vecruntime.VectorFallback
  * stage of its own; measured by the logical product it read as 11.7 GB for a few thousand rows and
  * the join was left to Spark, taking the Project and the top-N above it along.
  */
+@io.vecruntime.spark.test.tags.Join
 class VectorMergeJoinGateSuite extends VectorQuerySuite {
   override def beforeAll(): Unit = {
     super.beforeAll()

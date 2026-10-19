@@ -30,6 +30,7 @@ import org.apache.spark.sql.vecruntime.{
  * sequence of key values per partition must be identical to Spark's (ties in non-key columns may
  * legitimately differ in order, so only the keys are compared positionally).
  */
+@io.vecruntime.spark.test.tags.SortWindow
 class VectorSortSuite extends VectorQuerySuite {
 
   private val Sort = classOf[VectorSortExec]

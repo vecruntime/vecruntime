@@ -22,6 +22,7 @@ import org.apache.spark.sql.execution.adaptive.{AdaptiveSparkPlanExec, QueryStag
 import org.apache.spark.sql.execution.exchange.ReusedExchangeExec
 
 /** Repeated aggregate subplans differing only by an inferred IsNotNull share their input (#632), against Spark. */
+@io.vecruntime.spark.test.tags.Agg
 class SharedAggregateInputsSuite extends VectorQuerySuite {
 
   override protected def beforeAll(): Unit = {

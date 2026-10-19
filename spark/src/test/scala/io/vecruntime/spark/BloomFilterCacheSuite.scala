@@ -23,6 +23,7 @@ import org.apache.spark.util.sketch.BloomFilter
 import org.scalatest.BeforeAndAfterEach
 import org.scalatest.funsuite.AnyFunSuite
 
+@io.vecruntime.spark.test.tags.Join
 class BloomFilterCacheSuite extends AnyFunSuite with BeforeAndAfterEach {
 
   override def beforeEach(): Unit = BloomFilterCache.clearForTest()

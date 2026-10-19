@@ -28,6 +28,7 @@ import org.apache.spark.sql.vecruntime.VectorFallback
  * after `array_sort` of its set. The runtime bloom filter is exercised through a join whose build
  * side is `bloom_filter_agg`, with the plugin building it and Spark's probe reading it unchanged.
  */
+@io.vecruntime.spark.test.tags.Agg
 class VectorObjectAggregateSuite extends VectorQuerySuite {
 
   private val Agg = classOf[VectorHashAggregateExec]

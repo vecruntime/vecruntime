@@ -24,6 +24,7 @@ import org.apache.spark.sql.vecruntime.{VectorFilterExec, VectorHashAggregateExe
  * (casts to and from strings and dates, hour/minute/second, date_trunc, ...) still accept only
  * TIMESTAMP, so over NTZ they fall back to Spark and must give Spark's answer under any session zone.
  */
+@io.vecruntime.spark.test.tags.Expr
 class VectorTimestampNtzSuite extends VectorQuerySuite {
   private val Filter = classOf[VectorFilterExec]
   private val Project = classOf[VectorProjectExec]

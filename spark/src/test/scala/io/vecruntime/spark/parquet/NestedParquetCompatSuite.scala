@@ -39,6 +39,8 @@ import org.apache.spark.sql.vecruntime.{VectorFilterExec, VectorProjectExec}
  * legacy form (`spark.sql.parquet.writeLegacyFormat`), and the queries our lanes compute are asserted to
  * run in our operators.
  */
+@io.vecruntime.spark.test.tags.Scan
+@io.vecruntime.spark.test.tags.Nested
 class NestedParquetCompatSuite extends VectorQuerySuite {
   private val Project = classOf[VectorProjectExec]
   private val Filter = classOf[VectorFilterExec]

@@ -57,6 +57,8 @@ import org.apache.spark.sql.vecruntime.{PlanUtils, VectorFilterExec, VectorMerge
  * literals, nulls, columns, computed values and a struct passed through, the cardinality check --
  * and the results compared row by row.
  */
+@io.vecruntime.spark.test.tags.Join
+@io.vecruntime.spark.test.tags.Write
 class VectorMergeRowsSuite extends VectorQuerySuite {
 
   private val Rows = 20000

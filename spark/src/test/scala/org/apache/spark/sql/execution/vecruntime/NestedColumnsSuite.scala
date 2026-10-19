@@ -30,6 +30,8 @@ import org.apache.spark.sql.vectorized.{ColumnVector, ColumnarBatch}
  * STRUCT `NestedVectorBuffers` and handed back to Spark as `VectorNestedColumnVector`s read the same
  * rows -- null values, null elements, empty arrays and maps, nested elements, every leaf lane.
  */
+@io.vecruntime.spark.test.tags.Nested
+@io.vecruntime.spark.test.tags.Scan
 class NestedColumnsSuite extends SparkVectorFunSuite {
 
   private val schemaSql =

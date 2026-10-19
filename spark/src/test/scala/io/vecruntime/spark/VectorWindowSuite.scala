@@ -25,6 +25,7 @@ import org.apache.spark.sql.vecruntime.{
 }
 
 /** Window functions (#58), first layer: row_number, rank, dense_rank over sorted input. */
+@io.vecruntime.spark.test.tags.SortWindow
 class VectorWindowSuite extends VectorQuerySuite {
   private val Window = classOf[VectorWindowExec]
 

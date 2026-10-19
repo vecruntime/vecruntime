@@ -25,6 +25,8 @@ import org.apache.spark.sql.vecruntime.{VectorFilterExec, VectorProjectExec}
  * containers, null elements, null and out-of-range indexes, negative `element_at` indexes, missing
  * keys, struct fields holding arrays -- and under ANSI raise Spark's own errors for active rows only.
  */
+@io.vecruntime.spark.test.tags.Expr
+@io.vecruntime.spark.test.tags.Nested
 class VectorElementAccessSuite extends VectorQuerySuite {
   private val Project = classOf[VectorProjectExec]
   private val Filter = classOf[VectorFilterExec]

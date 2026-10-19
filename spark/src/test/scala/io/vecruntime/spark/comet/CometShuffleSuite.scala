@@ -32,6 +32,8 @@ import org.apache.spark.sql.vecruntime.{
  * batches to the shuffle writer through the Arrow C Data bridge, the Final aggregate reads Comet's
  * shuffle output zero copy. Requires the Comet jar (`mvn -Pcomet`).
  */
+@io.vecruntime.spark.test.tags.Comet
+@io.vecruntime.spark.test.tags.Shuffle
 class CometShuffleSuite extends VectorQuerySuite {
   private val Filter = classOf[VectorFilterExec]
   private val Agg = classOf[VectorHashAggregateExec]

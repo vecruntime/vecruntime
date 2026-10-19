@@ -20,6 +20,7 @@ import org.apache.spark.sql.DataFrame
 import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanHelper
 
 /** #635: grouping keys a unique broadcast key determines are dropped at run time, results unchanged. */
+@io.vecruntime.spark.test.tags.Agg
 class RemoveRedundantGroupKeysSuite extends VectorQuerySuite with AdaptiveSparkPlanHelper {
 
   override protected def beforeAll(): Unit = {

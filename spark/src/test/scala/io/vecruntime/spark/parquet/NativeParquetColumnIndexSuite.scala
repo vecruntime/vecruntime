@@ -32,6 +32,7 @@ import org.apache.spark.sql.vecruntime.{PlanUtils, VectorParquetScanExec}
  *   - Parquet's own switch off (whole row groups): Spark's rows either way; the pages skipped are counted;
  *   - lists, maps and their nestings (#626), under late materialization and with small batches too.
  */
+@io.vecruntime.spark.test.tags.Scan
 class NativeParquetColumnIndexSuite extends VectorQuerySuite {
 
   override protected def extraSparkConf: Map[String, String] =

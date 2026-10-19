@@ -29,6 +29,8 @@ import org.apache.spark.sql.vecruntime.V2BroadcastBySize
  * the broadcast threshold), is broadcast by the bytes of its files, as its Parquet copy would be. AQE is off so the
  * plan-time join choice is what runs; every result is checked against Spark with the plugin off.
  */
+@io.vecruntime.spark.test.tags.Iceberg
+@io.vecruntime.spark.test.tags.Join
 class IcebergBroadcastBySizeSuite extends VectorQuerySuite {
 
   private lazy val warehouse = Files.createTempDirectory("vecruntime-iceberg-bcast").toString

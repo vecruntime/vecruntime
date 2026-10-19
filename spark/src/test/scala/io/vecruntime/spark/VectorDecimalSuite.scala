@@ -29,6 +29,7 @@ import org.apache.spark.sql.vecruntime.{
  * Decimals of up to 18 digits as unscaled long lanes. Results are compared exactly (no double
  * tolerance): decimal arithmetic is integer arithmetic and must match Spark to the last digit.
  */
+@io.vecruntime.spark.test.tags.Expr
 class VectorDecimalSuite extends VectorQuerySuite {
 
   private val Filter = classOf[VectorFilterExec]

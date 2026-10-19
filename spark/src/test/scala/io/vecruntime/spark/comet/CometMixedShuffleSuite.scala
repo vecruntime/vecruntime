@@ -25,6 +25,8 @@ import org.apache.spark.sql.vecruntime.{PlanUtils, VectorFilterExec, VectorToCom
  * over our export node already (`useCometShuffle`). Comet's filter is off so the leaves are ours,
  * its shuffle, joins and aggregate on, ours off. Requires the Comet jar (`mvn -Pcomet`).
  */
+@io.vecruntime.spark.test.tags.Comet
+@io.vecruntime.spark.test.tags.Shuffle
 class CometMixedShuffleSuite extends VectorQuerySuite {
 
   private val Filter = classOf[VectorFilterExec]

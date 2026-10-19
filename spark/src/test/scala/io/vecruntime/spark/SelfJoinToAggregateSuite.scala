@@ -22,6 +22,8 @@ import org.apache.spark.sql.catalyst.plans.Inner
 import org.apache.spark.sql.catalyst.plans.logical.{Aggregate, Join, LogicalPlan}
 
 /** The existence-only self-join to min/max aggregate rewrite (`SelfJoinToAggregate`), against Spark. */
+@io.vecruntime.spark.test.tags.Join
+@io.vecruntime.spark.test.tags.Agg
 class SelfJoinToAggregateSuite extends VectorQuerySuite {
 
   override protected def beforeAll(): Unit = {

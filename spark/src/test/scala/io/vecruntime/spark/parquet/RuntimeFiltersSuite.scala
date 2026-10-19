@@ -25,6 +25,8 @@ import org.apache.spark.sql.vecruntime.{PlanUtils, VectorBroadcastHashJoinExec, 
  * row groups with no matching key are not read. The fact table is written sorted on its keys with small
  * row groups, so each row group holds a narrow key range.
  */
+@io.vecruntime.spark.test.tags.Scan
+@io.vecruntime.spark.test.tags.Join
 class RuntimeFiltersSuite extends VectorQuerySuite {
 
   override protected def extraSparkConf: Map[String, String] =

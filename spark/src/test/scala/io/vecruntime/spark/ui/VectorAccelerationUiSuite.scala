@@ -32,6 +32,7 @@ import org.scalatest.time.{Seconds, Span}
  * End to end check of the acceleration tab: the plugin attaches it to a real (bound) Spark UI, a
  * query is classified, and both pages serve HTML that names the engines.
  */
+@io.vecruntime.spark.test.tags.Core
 class VectorAccelerationUiSuite extends SparkVectorFunSuite with Eventually {
 
   private val ExecutionIdPattern = """/vector/execution/\?id=(\d+)""".r

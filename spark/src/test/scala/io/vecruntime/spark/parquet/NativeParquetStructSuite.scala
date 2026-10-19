@@ -32,6 +32,8 @@ import org.apache.spark.sql.vecruntime.{PlanUtils, VectorParquetScanExec}
  * optional groups, an optional group under a required one); and Hardwood's (hardwood-hq/hardwood)
  * `NestedSchemaTest` struct-of-struct shapes plus the `apache/parquet-testing` deep struct from arrow-rs.
  */
+@io.vecruntime.spark.test.tags.Scan
+@io.vecruntime.spark.test.tags.Nested
 class NativeParquetStructSuite extends VectorQuerySuite {
 
   override protected def extraSparkConf: Map[String, String] =

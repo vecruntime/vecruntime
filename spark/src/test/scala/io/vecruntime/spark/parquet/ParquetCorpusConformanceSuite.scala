@@ -43,6 +43,7 @@ import org.apache.spark.sql.vecruntime.{PlanUtils, VectorFallback, VectorParquet
  * native read that starts falling back, or a fallback that becomes native -- fails the suite until the file is
  * regenerated with `CORPUS_UPDATE_BASELINE=true`, so every fallback is a recorded choice, never a silent gap.
  */
+@io.vecruntime.spark.test.tags.Scan
 class ParquetCorpusConformanceSuite extends VectorQuerySuite {
 
   override protected def extraSparkConf: Map[String, String] =

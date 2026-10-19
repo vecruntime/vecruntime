@@ -28,6 +28,7 @@ import org.apache.spark.sql.vecruntime.{PlanUtils, VectorParquetScanExec}
  * Every query is compared with Spark's row-based parquet-java reader. The `apache/parquet-testing` v2 files are
  * read by ParquetTestingCorpusSuite.
  */
+@io.vecruntime.spark.test.tags.Scan
 class NativeParquetPageInPlaceSuite extends VectorQuerySuite {
 
   override protected def extraSparkConf: Map[String, String] =

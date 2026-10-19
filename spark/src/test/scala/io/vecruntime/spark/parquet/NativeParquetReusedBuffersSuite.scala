@@ -31,6 +31,7 @@ import org.apache.spark.sql.vecruntime.{PlanUtils, VectorParquetScanExec}
  * many columns at once -- and compares every row with Spark's own row-based parquet-java reader, with the two
  * confs ON and OFF. Mirrors {@link NativeParquetPageInPlaceSuite}.
  */
+@io.vecruntime.spark.test.tags.Scan
 class NativeParquetReusedBuffersSuite extends VectorQuerySuite {
 
   override protected def extraSparkConf: Map[String, String] =

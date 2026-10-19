@@ -30,6 +30,7 @@ import org.apache.spark.sql.vecruntime.{
  * characters (length, substring, lpad, hex, ...) count bytes over binary in Spark, so the compiler
  * refuses them and they stay Spark's.
  */
+@io.vecruntime.spark.test.tags.Expr
 class VectorBinarySuite extends VectorQuerySuite {
   private val Filter = classOf[VectorFilterExec]
   private val Project = classOf[VectorProjectExec]

@@ -33,6 +33,7 @@ import org.apache.spark.sql.vecruntime.{
  * stays ours; a listed one Comet declines is converted by ours after all, never left to Spark. Comet's
  * filter is off here so the chain's leaf is ours. Requires the Comet jar (`mvn -Pcomet`).
  */
+@io.vecruntime.spark.test.tags.Comet
 class CometPreferCometSuite extends VectorQuerySuite {
 
   private val Filter = classOf[VectorFilterExec]

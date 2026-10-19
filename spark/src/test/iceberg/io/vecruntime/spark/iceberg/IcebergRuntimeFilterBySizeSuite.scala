@@ -31,6 +31,8 @@ import org.apache.spark.sql.vecruntime.V2BroadcastBySize
  * get it (TPC-DS q72's `customer_demographics`). AQE and broadcasts are off and our own fact bloom filter is off, so
  * the filters counted are Spark's; every result is checked against Spark with the plugin off.
  */
+@io.vecruntime.spark.test.tags.Iceberg
+@io.vecruntime.spark.test.tags.Join
 class IcebergRuntimeFilterBySizeSuite extends VectorQuerySuite {
 
   private lazy val warehouse = Files.createTempDirectory("vecruntime-iceberg-rf").toString

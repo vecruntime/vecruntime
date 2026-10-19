@@ -25,6 +25,7 @@ import org.apache.spark.sql.vecruntime.{PlanUtils, VectorFilterExec, VectorProje
  * the CometTest tag. Comet's project is on and its filter off, so a filter is ours and a projection
  * above it is Comet's when mixing is on.
  */
+@io.vecruntime.spark.test.tags.Comet
 class CometMixedChainSuite extends VectorQuerySuite {
 
   private val Filter = classOf[VectorFilterExec]

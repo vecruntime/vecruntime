@@ -27,6 +27,8 @@ import org.scalatest.Tag
  * Iceberg's reader inside the node, the others natively, and every result is checked against Spark. Needs only
  * the Iceberg runtime (`mvn -Piceberg`).
  */
+@io.vecruntime.spark.test.tags.Iceberg
+@io.vecruntime.spark.test.tags.Scan
 class IcebergNativeScanSuite extends IcebergMorSuiteBase {
 
   override protected def suiteTags: Seq[Tag] = Seq(IcebergTest)

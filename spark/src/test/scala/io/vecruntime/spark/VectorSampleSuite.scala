@@ -29,6 +29,7 @@ import org.apache.spark.sql.vecruntime.{
  * Sampling must return exactly Spark's rows for a seed: the operator drives Spark's own Bernoulli
  * sampler over the live rows in order, so every shape below is compared row for row, not by count.
  */
+@io.vecruntime.spark.test.tags.Core
 class VectorSampleSuite extends VectorQuerySuite {
 
   private val Sample = classOf[VectorSampleExec]

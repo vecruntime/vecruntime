@@ -32,6 +32,7 @@ import org.apache.spark.sql.vecruntime.{PlanUtils, VectorParquetScanExec}
  *   - #812: a column with an existence default (the default in every row of a file without it), an integer
  *     read as a decimal wider than 18 digits, and a struct the file holds none of the requested fields of.
  */
+@io.vecruntime.spark.test.tags.Scan
 class NativeParquetSchemaEvolutionSuite extends VectorQuerySuite {
 
   override protected def extraSparkConf: Map[String, String] =

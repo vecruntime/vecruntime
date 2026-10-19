@@ -36,6 +36,7 @@ import org.scalatest.funsuite.AnyFunSuite
  * against a from-scratch encoder, this pins it against the reference writer whose bytes the real
  * scan node will feed it.
  */
+@io.vecruntime.spark.test.tags.Scan
 class ParquetPageDecoderCrossCheckSuite extends AnyFunSuite {
 
   private val LE_INT = ValueLayout.JAVA_INT_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN)

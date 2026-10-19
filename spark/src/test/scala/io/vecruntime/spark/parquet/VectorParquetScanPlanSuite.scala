@@ -24,6 +24,7 @@ import org.apache.spark.sql.vecruntime.{PlanUtils, VectorFallback, VectorParquet
  * Plan-level tests for the native Parquet scan: the node is planned only with the flag on and a supported
  * scan; a recorded reason otherwise; and Spark's own `FileSourceScanExec` stays when the flag is off.
  */
+@io.vecruntime.spark.test.tags.Scan
 class VectorParquetScanPlanSuite extends VectorQuerySuite {
 
   override protected def extraSparkConf: Map[String, String] =

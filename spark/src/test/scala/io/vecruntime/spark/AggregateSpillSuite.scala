@@ -30,6 +30,7 @@ import org.scalatest.funsuite.AnyFunSuite
  * by the same hash spreads the rows over `buckets / gcd(partitions, buckets)` buckets only. With its own
  * seed the spill fills every bucket.
  */
+@io.vecruntime.spark.test.tags.Agg
 class AggregateSpillSuite extends AnyFunSuite {
 
   /** Keys a reduce task at `partitions` partitions receives: ints whose Spark hash lands in partition 7. */

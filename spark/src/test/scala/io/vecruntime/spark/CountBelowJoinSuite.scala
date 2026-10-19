@@ -22,6 +22,8 @@ import org.apache.spark.sql.execution.exchange.ShuffleExchangeLike
 import org.apache.spark.sql.vecruntime.LocalPreAggregate
 
 /** #692: a join input that only supplies grouping columns, collapsed to its distinct rows and their count. */
+@io.vecruntime.spark.test.tags.Agg
+@io.vecruntime.spark.test.tags.Join
 class CountBelowJoinSuite extends VectorQuerySuite {
 
   override protected def beforeAll(): Unit = {

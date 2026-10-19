@@ -21,6 +21,7 @@ import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.apache.spark.sql.execution.datasources.LogicalRelation
 
 /** Global aggregates with different filters merged into one pass (`MergeFilteredAggregates`), against Spark. */
+@io.vecruntime.spark.test.tags.Agg
 class MergeFilteredAggregatesSuite extends VectorQuerySuite {
 
   override protected def beforeAll(): Unit = {

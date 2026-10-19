@@ -26,6 +26,7 @@ import org.apache.spark.sql.vecruntime.{
 }
 
 /** The structural operators: union and coalesce keep a columnar chain whole without computing anything. */
+@io.vecruntime.spark.test.tags.Core
 class VectorUnionSuite extends VectorQuerySuite {
 
   private val Union = classOf[VectorUnionExec]

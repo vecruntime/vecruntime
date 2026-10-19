@@ -29,6 +29,7 @@ import org.apache.spark.sql.vecruntime.{PlanUtils, VectorFallback, VectorParquet
  * hands to Spark's reader; `input_file_name()` and its block siblings; and `_metadata.row_index`. Files come
  * from Spark's writer and from parquet-java's `ExampleParquetWriter`.
  */
+@io.vecruntime.spark.test.tags.Scan
 class NativeParquetMetadataSuite extends VectorQuerySuite {
 
   override protected def extraSparkConf: Map[String, String] =
