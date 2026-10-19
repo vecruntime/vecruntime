@@ -59,7 +59,11 @@ case class VectorIcebergScanExec(
     fieldIds: Seq[Int],
     // The filter above the scan, translated (see VectorColumnarRule): row groups are skipped by it, matched to each
     // file's columns by field id; the filter above still decides which rows pass.
-    pushedFilters: Seq[org.apache.spark.sql.sources.Filter] = Nil
+    pushedFilters: Seq[org.apache.spark.sql.sources.Filter] = Nil,
+    // Whether the parent is one of our operators, which reads a batch's selection (a file's deleted rows
+    // deselected). Otherwise -- Spark's ColumnarToRow under a row operator -- every batch is compacted to its
+    // selected rows, since Spark reads every physical row (see VectorColumnarRule.markSelectionProducers).
+    emitSelection: Boolean = false
 ) extends LeafExecNode
     with VectorPlan
     with RuntimeFilterTarget {
@@ -245,15 +249,38 @@ case class VectorIcebergScanExec(
         sqlConf.parquetFilterPushDownInFilterThreshold
       )
     )
+    val out: RDD[ColumnarBatch] =
+      if (emitSelection) rdd else rdd.mapPartitionsInternal(_.map(VectorIcebergScanExec.compacted))
     // Counted by the task of partition 0, once per execution, as the Parquet scan counts them.
-    if (runtime.isEmpty) rdd
+    if (runtime.isEmpty) out
     else {
       val counter = longMetric("numRuntimeFilters")
       val n = runtime.size.toLong
-      rdd.mapPartitionsWithIndexInternal { (i, it) => if (i == 0) counter += n; it }
+      out.mapPartitionsWithIndexInternal { (i, it) => if (i == 0) counter += n; it }
     }
   }
 
+}
+
+object VectorIcebergScanExec {
+
+  /**
+   * A batch whose deleted rows are deselected (a [[io.vecruntime.spark.arrow.SelectedColumnarBatch]]) as a plain
+   * batch of its selected rows, for a consumer that reads every physical row: each column a view over the
+   * selected row ids. Any other batch as it is.
+   */
+  def compacted(batch: ColumnarBatch): ColumnarBatch = batch match {
+    case b: io.vecruntime.spark.arrow.SelectedColumnarBatch =>
+      val n = b.numRows()
+      val count = b.selectedCount()
+      val columns = io.vecruntime.spark.arrow.SelectedColumnarBatch.columnsOf(b)
+      if (count == n) new ColumnarBatch(columns, n)
+      else {
+        val rows = io.vecruntime.spark.arrow.RemappedColumnVector.rowsOf(b.selection(), n, count)
+        new ColumnarBatch(columns.map(c => io.vecruntime.spark.arrow.RemappedColumnVector.of(c, rows)), count)
+      }
+    case other => other
+  }
 }
 
 /**
