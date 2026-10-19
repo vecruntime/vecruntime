@@ -12,11 +12,11 @@ Spark's and Iceberg's, apart from an opt-in columnar deletion-vector writer for 
 
 **In short (2026-10-19):**
 - **Native scan:** with `spark.vecruntime.scan.nativeIceberg.enabled=true` (off by default), our native Parquet
-  reader reads the data files of an Iceberg table. It applies position deletes, deletion vectors and equality
-  deletes itself, and reads `_file`, `_pos` and `_spec_id`.
+  reader reads the data files of an Iceberg table, flat and nested columns alike. It applies position deletes,
+  deletion vectors and equality deletes itself, and reads `_file`, `_pos` and `_spec_id`.
 - **When it is declined:** the whole scan or a single task group is read by Iceberg's vectorized reader, and our
-  operators adapt its batches. That reader is also the path when the switch is off. Declined are nested and some
-  v3 column types, other metadata columns, name mappings, initial defaults, and ORC, Avro or encrypted files.
+  operators adapt its batches. That reader is also the path when the switch is off. Declined are some v3 and
+  other column types, other metadata columns, name mappings, initial defaults, and ORC, Avro or encrypted files.
 - **No Comet:** Comet is not needed for any of this.
 
 The tables below give the state of each feature, by format version.
@@ -56,7 +56,7 @@ Format version 1 reads as version 2 does, without delete files.
 | Metadata columns `_partition`, `_deleted` | scan | |
 | Types: boolean, int, long, float, double, date, timestamp (with zone and without), string, binary, decimal | yes | `decimal(p > 18)` becomes a DECIMAL128 lane |
 | Types: uuid, fixed, time | scan | Iceberg's reader reads them as Spark types our reader does not produce from these files |
-| Types: struct, list, map | scan or row | Our Iceberg scan reads flat columns only. Our Parquet reader reads nested columns, but the Iceberg path does not use it for them yet |
+| Types: struct, list, map | yes | At any depth, when every leaf is one of the flat types above. Nested struct fields are matched by their Iceberg field ids, so a renamed nested field reads as Iceberg reads it, and a field added to a struct later reads as nulls from older files. Iceberg's reader does not vectorize nested columns, so such a scan is taken only when every task group reads natively; otherwise it stays Spark's row path |
 | Encrypted files | group | Iceberg's `FileIO` decrypts them |
 | `DELETE`, `UPDATE`, `MERGE INTO` (merge-on-read) | partly | Their reads run on our operators, and the `MERGE INTO` join and `MergeRows` are columnar (#21, #273). The delete and data files are written by Spark's `WriteDeltaExec` and Iceberg's writers |
 | Copy-on-write rewrites, `INSERT`, CTAS | reads only | The write is Spark's row path into Iceberg's Parquet writer. A columnar writer is #64 |
@@ -97,11 +97,14 @@ The node reports how many task groups each reader read (`numNativeGroups`, `numI
 groups and pages skipped.
 
 At plan time the node declines, and Spark's `BatchScanExec` stays:
-- a scan that is not vectorized or that reports an ordering;
+- a scan that reports an ordering;
+- a scan Iceberg does not vectorize (nested columns) with a task group our reader cannot read: an ORC or Avro
+  file, an encrypted file, or equality deletes on a column it does not read;
 - a table with a name mapping;
 - a metadata column other than `_file`, `_pos` and `_spec_id`;
 - a column with an initial default;
-- a column type outside the flat types in the table above.
+- a column type outside the flat types in the table above, or a nested type with such a leaf or a nested field
+  with an initial default.
 
 The switch is off by default until the TPC-DS Iceberg A/B is in.
 
@@ -221,7 +224,8 @@ mvn -Piceberg -pl spark verify -Dsuites=io.vecruntime.spark.iceberg.IcebergScanS
 - **Merge-on-read battery:** `IcebergNativeScanSuite` (the native scan) and `IcebergScanSuite` (Iceberg's reader
   under our operators) share `IcebergMorSuiteBase` and run the same queries. Only the expected scan node differs.
 - **Native scan:** `IcebergNativeScanSuite` also covers the native readers of position deletes, deletion vectors
-  and equality deletes; the metadata columns; renamed, added and promoted columns (int to bigint, float to double,
+  and equality deletes; struct, list and map columns (with renamed and added nested fields, under deletes); the
+  metadata columns; renamed, added and promoted columns (int to bigint, float to double,
   decimal precision, on v2 and v3 with deletes); pushed and runtime filters by field id; and task-group packing.
 - **Planner rules on Iceberg:** `IcebergDppSuite`, `IcebergFactBloomFilterSuite`, `IcebergBroadcastBySizeSuite`,
   `IcebergRuntimeFilterBySizeSuite` and `IcebergMergeAggregatesSuite`.

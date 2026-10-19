@@ -211,6 +211,76 @@ class IcebergNativeScanSuite extends IcebergMorSuiteBase {
     }
   }
 
+  /**
+   * #nested: a table with struct, list and map columns, nested in one another, some values null. The old files are
+   * written before a nested field is renamed and another added inside the struct.
+   */
+  private def createNested(name: String, props: String): Unit = {
+    spark.sql(
+      s"""CREATE OR REPLACE TABLE $Db.$name (
+         |  k INT, st STRUCT<a: INT, b: STRING, inner: STRUCT<x: DOUBLE, ys: ARRAY<BIGINT>>>,
+         |  arr ARRAY<BIGINT>, m MAP<STRING, STRUCT<p: INT, q: STRING>>, lst ARRAY<STRUCT<u: INT, v: ARRAY<STRING>>>)
+         |USING iceberg TBLPROPERTIES ($props)""".stripMargin
+    )
+    def rows(from: Int, to: Int, withC: Boolean): String = {
+      val b = if (withC) "b2" else "b"
+      val c = if (withC) ", 'c', CAST(id % 3 AS INT)" else ""
+      val inner = "named_struct('x', id / 4.0, 'ys', IF(id % 5 = 0, NULL, array(id, id + 1, id * 2)))"
+      val st = s"named_struct('a', CAST(id % 97 AS INT), '$b', IF(id % 7 = 0, NULL, concat('b', id % 13)), " +
+        s"'inner', $inner$c)"
+      s"""SELECT CAST(id AS INT), IF(id % 11 = 0, NULL, $st),
+         |  IF(id % 9 = 0, NULL, sequence(0L, id % 6)),
+         |  IF(id % 8 = 0, NULL, map(concat('k', id % 4), named_struct('p', CAST(id AS INT), 'q', concat('q', id % 3)))),
+         |  array(named_struct('u', CAST(id % 10 AS INT), 'v', array(concat('v', id % 2), NULL)),
+         |        named_struct('u', CAST(id % 7 AS INT), 'v', IF(id % 4 = 0, NULL, array('w'))))
+         |FROM range($from, $to)""".stripMargin
+    }
+    spark.sql(s"INSERT INTO $Db.$name ${rows(0, 3000, withC = false)}")
+    spark.sql(s"ALTER TABLE $Db.$name RENAME COLUMN st.b TO b2")
+    spark.sql(s"ALTER TABLE $Db.$name ADD COLUMN st.c INT")
+    spark.sql(s"INSERT INTO $Db.$name ${rows(3000, 3600, withC = true)}")
+  }
+
+  private val nestedQueries = Seq(
+    "SELECT k, st, arr, m, lst FROM t WHERE k % 17 = 3",
+    "SELECT st.a, count(*), count(st.b2), sum(st.c), sum(st.inner.x), sum(size(st.inner.ys)) FROM t GROUP BY st.a",
+    "SELECT k, st.b2, st.c, st.inner.ys, arr FROM t WHERE st.a > 90",
+    "SELECT k, m['k1'].p, m['k2'].q, lst[0].u, lst[1].v FROM t WHERE k > 2900",
+    "SELECT sum(size(arr)), sum(size(m)), sum(size(lst)), count(st.inner) FROM t"
+  )
+
+  private def checkNestedNatively(label: String): Unit = nestedQueries.foreach { q =>
+    val df = checkVectorized(q, Nil)
+    assert(df.collect().nonEmpty, s"the query should return rows: $q")
+    val (native, iceberg) = groups(df)
+    assert(native > 0 && iceberg == 0, s"$label native $native, Iceberg $iceberg: $q")
+  }
+
+  icebergTest("struct, list and map columns are read natively, a renamed and an added nested field by field id") {
+    createNested("t_nested", "'format-version' = '2'")
+    useTable("t_nested")
+    checkNestedNatively("v2")
+  }
+
+  icebergTest("nested columns under position deletes and deletion vectors are read natively") {
+    Seq(2, 3).foreach { v =>
+      val name = s"t_nested_v$v"
+      createNested(name, s"'format-version' = '$v', 'write.delete.mode' = 'merge-on-read'")
+      spark.sql(s"DELETE FROM $Db.$name WHERE k % 5 = 0")
+      useTable(name)
+      assert(count("SELECT count(*) FROM t") === 3600 - 720)
+      checkNestedNatively(s"v$v")
+    }
+  }
+
+  icebergTest("nested columns with equality deletes on a top-level key are read natively") {
+    createNested("t_nested_eq", "'format-version' = '2', 'write.delete.mode' = 'merge-on-read'")
+    IcebergTables.addEqualityDeletesOn(spark, s"$Db.t_nested_eq", "k", (0 until 3600 by 7).map(Int.box))
+    useTable("t_nested_eq")
+    assert(count("SELECT count(*) FROM t") === 3600 - (0 until 3600 by 7).size)
+    checkNestedNatively("equality")
+  }
+
   icebergTest("an identity-partitioned table reads its partition column from the files") {
     spark.sql(
       s"CREATE OR REPLACE TABLE $Db.t_parted USING iceberg PARTITIONED BY (b) AS SELECT i, l, s, b, d2 FROM $Db.t_pos"

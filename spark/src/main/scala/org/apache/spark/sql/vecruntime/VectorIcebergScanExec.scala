@@ -136,7 +136,9 @@ case class VectorIcebergScanExec(
     val requiredSchema = StructType(dataColumns.map { case (a, id) =>
       StructField(
         a.name,
-        a.dataType,
+        // #nested: nested struct fields matched by their Iceberg field ids too.
+        if (a.dataType.isInstanceOf[AtomicType]) a.dataType
+        else IcebergTasks.withFieldIds(a.dataType, IcebergTasks.projectedType(scan, id)),
         a.nullable,
         new MetadataBuilder().putLong(ParquetUtils.FIELD_ID_METADATA_KEY, id.toLong).build()
       )
@@ -430,6 +432,10 @@ private[vecruntime] final class VectorIcebergRDD(
   }
 
   private def icebergIterator(p: InputPartition, context: TaskContext): Iterator[ColumnarBatch] = {
+    // The planner admits a scan Iceberg does not vectorize only when every task group reads natively.
+    if (!readerFactory.supportColumnarReads(p)) {
+      throw new IllegalStateException("an Iceberg task group needs Iceberg's reader, which is not columnar here")
+    }
     val reader = readerFactory.createColumnarReader(p)
     context.addTaskCompletionListener[Unit](_ => reader.close())
     new Iterator[ColumnarBatch] {
@@ -528,17 +534,27 @@ object VectorIcebergScanPlanner {
   /** The field ids of the scan's output columns when it can be read natively, else why not. */
   def plan(b: BatchScanExec, conf: SQLConf): Either[String, VectorIcebergScanExec] = {
     if (!b.scan.getClass.getName.startsWith("org.apache.iceberg.spark.source.")) return Left("not an Iceberg scan")
-    if (!b.supportsColumnar) return Left("Iceberg scan is not vectorized")
     if (b.outputOrdering.nonEmpty) return Left("Iceberg scan reports an ordering")
     val ids = IcebergTasks.outputFieldIds(b) match {
       case Left(reason) => return Left(reason)
       case Right(v) => v
     }
+    // #nested: lists, maps and structs at any depth, as our Parquet reader reads them.
     b.output.foreach { a =>
-      if (
-        !a.dataType.isInstanceOf[AtomicType] || !io.vecruntime.spark.parquet.NativeParquetSupport.isReadable(a.dataType)
-      ) {
+      if (!io.vecruntime.spark.parquet.NativeParquetSupport.isReadable(a.dataType)) {
         return Left(s"unsupported column type ${a.name}:${a.dataType.simpleString}")
+      }
+    }
+    // Iceberg's reader is not vectorized for some scans (nested columns): every task group must then be read
+    // natively, since the node cannot fall back to Iceberg's columnar reader for one of them.
+    if (!b.supportsColumnar) {
+      val kinds = b.output.zip(ids).map { case (a, id) => IcebergTasks.columnKind(a.name, id) }
+      val constants = kinds.exists(k => k == IcebergTasks.FileColumn || k == IcebergTasks.SpecIdColumn)
+      val parts = b.inputPartitions
+      val projected = b.output.zip(ids).zip(kinds).collect { case ((_, id), IcebergTasks.DataColumn) => id }.toSet
+      val equality = IcebergTasks.equalityColumnsOf(parts, IcebergTasks.tableSchema(b), projected).isDefined
+      if (!parts.forall(p => IcebergTasks.nativeTasks(p, equality, constants).isDefined)) {
+        return Left("Iceberg scan is not vectorized and a task group needs Iceberg's reader")
       }
     }
     Right(VectorIcebergScanExec(b, ids))
@@ -623,14 +639,74 @@ private[vecruntime] object IcebergTasks {
             if (id >= MetadataIdFloor) return Left(s"Iceberg metadata column ${a.name}")
             // A v3 initial default fills the column for files written before it was added; our reader reads nulls.
             if (call(field, "initialDefault") != null) return Left(s"Iceberg column ${a.name} has an initial default")
-            val typeId = call(call(field, "type"), "typeId").toString
-            if (!NativeTypes.contains(typeId)) return Left(s"Iceberg type $typeId of ${a.name}")
+            unsupportedType(call(field, "type"), a.name).foreach(reason => return Left(reason))
             id
         }
       })
     } catch {
       case e: ReflectiveOperationException => Left(s"Iceberg scan not recognised: $e")
     }
+
+  /**
+   * Why an Iceberg column type is not read natively, or None: a flat type of [[NativeTypes]], or (#nested) a struct,
+   * list or map whose every leaf is one, at any depth. A nested field with an initial default is not: Iceberg fills
+   * it for files written before it was added, our reader reads nulls.
+   */
+  private def unsupportedType(icebergType: AnyRef, path: String): Option[String] =
+    call(icebergType, "typeId").toString match {
+      case "STRUCT" =>
+        call(icebergType, "fields").asInstanceOf[java.util.List[AnyRef]].asScala.iterator.map { f =>
+          val name = s"$path.${call(f, "name")}"
+          if (call(f, "initialDefault") != null) Some(s"Iceberg field $name has an initial default")
+          else unsupportedType(call(f, "type"), name)
+        }.collectFirst { case Some(r) => r }
+      case "LIST" => unsupportedType(call(icebergType, "elementType"), s"$path.element")
+      case "MAP" =>
+        unsupportedType(call(icebergType, "keyType"), s"$path.key")
+          .orElse(unsupportedType(call(icebergType, "valueType"), s"$path.value"))
+      case t if NativeTypes.contains(t) => None
+      case t => Some(s"Iceberg type $t of $path")
+    }
+
+  /**
+   * `dt`, the Spark type of a column whose Iceberg type is `icebergType`, with every nested struct field carrying
+   * its Iceberg field id as its Parquet field id, so the reader matches nested fields by id as it matches the
+   * top-level columns: a renamed nested field reads as Iceberg reads it. Struct fields are paired by name (the
+   * Spark type is Iceberg's projection converted); lists and maps are matched by their structure.
+   */
+  def withFieldIds(dt: org.apache.spark.sql.types.DataType, icebergType: AnyRef): org.apache.spark.sql.types.DataType =
+    dt match {
+      case st: StructType =>
+        val fields = call(icebergType, "fields").asInstanceOf[java.util.List[AnyRef]].asScala
+        val byName = fields.map(f => call(f, "name").asInstanceOf[String].toLowerCase -> f).toMap
+        StructType(st.fields.map { f =>
+          byName.get(f.name.toLowerCase) match {
+            case Some(nf) =>
+              val id = call(nf, "fieldId").asInstanceOf[Integer].longValue()
+              f.copy(
+                dataType = withFieldIds(f.dataType, call(nf, "type")),
+                metadata = new MetadataBuilder().withMetadata(f.metadata)
+                  .putLong(ParquetUtils.FIELD_ID_METADATA_KEY, id).build()
+              )
+            case None => f
+          }
+        })
+      case at: org.apache.spark.sql.types.ArrayType =>
+        at.copy(elementType = withFieldIds(at.elementType, call(icebergType, "elementType")))
+      case mt: org.apache.spark.sql.types.MapType =>
+        mt.copy(
+          keyType = withFieldIds(mt.keyType, call(icebergType, "keyType")),
+          valueType = withFieldIds(mt.valueType, call(icebergType, "valueType"))
+        )
+      case other => other
+    }
+
+  /** The Iceberg type of the projected field `id` of `b`'s scan. */
+  def projectedType(b: BatchScanExec, id: Int): AnyRef = {
+    val projection = call(b.scan, "projection")
+    val field = projection.getClass.getMethod("findField", classOf[Int]).invoke(projection, Int.box(id))
+    call(field, "type")
+  }
 
   /**
    * One file scan task read natively: its split, the data file's location, its position delete files (and deletion
@@ -735,17 +811,19 @@ private[vecruntime] object IcebergTasks {
    * carrying it as its Parquet field id. None when one of them is not a top-level column of a type our reader
    * decodes as Iceberg does: the files with those deletes then keep Iceberg's reader.
    */
-  def equalityColumns(parts: Array[Partition], schema: AnyRef, projected: Set[Int]): Option[Seq[StructField]] = {
+  def equalityColumns(parts: Array[Partition], schema: AnyRef, projected: Set[Int]): Option[Seq[StructField]] =
+    equalityColumnsOf(parts.toSeq.flatMap(shims.SparkShims.dataSourceInputPartitions), schema, projected)
+
+  /** As [[equalityColumns]], over the scan's input partitions themselves (at plan time). */
+  def equalityColumnsOf(inputs: Seq[InputPartition], schema: AnyRef, projected: Set[Int]): Option[Seq[StructField]] = {
     val ids = scala.collection.mutable.LinkedHashSet.empty[Int]
-    parts.foreach { part =>
-      shims.SparkShims.dataSourceInputPartitions(part).foreach { p =>
-        if (p.getClass.getName == "org.apache.iceberg.spark.source.SparkInputPartition") {
-          call(call(p, "taskGroup"), "tasks").asInstanceOf[java.util.Collection[AnyRef]].asScala.foreach { task =>
-            if (task.getClass.getName.contains("FileScanTask")) {
-              val deletes = call(task, "deletes").asInstanceOf[java.util.List[AnyRef]]
-              if (deletes != null) deletes.asScala.foreach { d =>
-                if (call(d, "content").toString == "EQUALITY_DELETES") ids ++= equalityFieldIds(d)
-              }
+    inputs.foreach { p =>
+      if (p.getClass.getName == "org.apache.iceberg.spark.source.SparkInputPartition") {
+        call(call(p, "taskGroup"), "tasks").asInstanceOf[java.util.Collection[AnyRef]].asScala.foreach { task =>
+          if (task.getClass.getName.contains("FileScanTask")) {
+            val deletes = call(task, "deletes").asInstanceOf[java.util.List[AnyRef]]
+            if (deletes != null) deletes.asScala.foreach { d =>
+              if (call(d, "content").toString == "EQUALITY_DELETES") ids ++= equalityFieldIds(d)
             }
           }
         }
