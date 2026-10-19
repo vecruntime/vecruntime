@@ -32,6 +32,7 @@ import org.apache.spark.sql.vecruntime.{PlanUtils, VectorParquetScanExec}
  *   - EXCEPTION: a file without Spark's metadata reads natively when no value needs a rebase, and fails with
  *     Spark's own error when one does; CORRECTED reads it as stored.
  */
+@io.vecruntime.spark.test.tags.Scan
 class NativeParquetRebaseSuite extends VectorQuerySuite {
 
   override protected def extraSparkConf: Map[String, String] =

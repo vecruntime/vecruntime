@@ -29,6 +29,7 @@ import org.scalatest.funsuite.AnyFunSuite
  * snappy against parquet-java's default {@link CodecFactory} and grows its reused buffer; the pooled allocator
  * ({@link PooledHeapAllocator}) is bounded and reuses buffers.
  */
+@io.vecruntime.spark.test.tags.Scan
 class ReusingCodecFactoryUnitSuite extends AnyFunSuite {
 
   private val conf = new Configuration(false)

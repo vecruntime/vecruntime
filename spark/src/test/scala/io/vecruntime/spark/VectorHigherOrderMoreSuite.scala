@@ -27,6 +27,8 @@ import org.apache.spark.sql.vecruntime.{VectorFilterExec, VectorProjectExec}
  * values, null values and empty maps -- whole and under a filter's selection, and a merge's ANSI error
  * raised only for the rows Spark folds.
  */
+@io.vecruntime.spark.test.tags.Expr
+@io.vecruntime.spark.test.tags.Nested
 class VectorHigherOrderMoreSuite extends VectorQuerySuite {
   private val Project = classOf[VectorProjectExec]
   private val Filter = classOf[VectorFilterExec]

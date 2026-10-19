@@ -19,6 +19,7 @@ import io.vecruntime.spark.test.{SparkVectorFunSuite, TestTables}
 import org.apache.spark.sql.vecruntime.{PlanUtils, VectorFilterExec}
 
 /** The `spark.plugins` entry point must register the extension without any other configuration. */
+@io.vecruntime.spark.test.tags.Core
 class VectorPluginSuite extends SparkVectorFunSuite {
 
   override protected def extraSparkConf: Map[String, String] =

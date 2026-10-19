@@ -27,6 +27,8 @@ import org.apache.spark.sql.vecruntime.{
  * joins under every join type Spark plans for them -- the build side's in a row store (#547), which keeps a shuffled
  * build side in memory -- and of the merge join, whose column builders copy nested lanes.
  */
+@io.vecruntime.spark.test.tags.Nested
+@io.vecruntime.spark.test.tags.Join
 class VectorNestedJoinSuite extends VectorQuerySuite {
 
   override protected def beforeAll(): Unit = {

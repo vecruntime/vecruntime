@@ -35,6 +35,7 @@ import org.scalatest.funsuite.AnyFunSuite
  * registered on it: the memory the bucketing path holds per task must not grow with the buckets, nor
  * with the rows it held before it started bucketing.
  */
+@io.vecruntime.spark.test.tags.Join
 class GraceHashJoinSuite extends AnyFunSuite {
 
   /** Streamed `(k: long)` on the left, build `(bk: long, v: int)` on the right, joined on `k = bk`. */

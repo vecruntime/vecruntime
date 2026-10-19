@@ -32,6 +32,7 @@ import org.apache.spark.sql.vecruntime.{
  * joined on ints, longs (with nulls), strings and decimals; some dimension keys have no match and
  * some have several rows so inner, outer, semi and anti joins all exercise their edge.
  */
+@io.vecruntime.spark.test.tags.Join
 class VectorJoinSuite extends VectorQuerySuite {
 
   private val BHJ = classOf[VectorBroadcastHashJoinExec]

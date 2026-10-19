@@ -31,6 +31,7 @@ import org.apache.spark.sql.vecruntime.{PlanUtils, VectorParquetScanExec}
  * whole pages drop) and not, with several row groups per file, decode-ahead and row-group read-ahead; and a
  * selective filter on sorted data must read fewer bytes than one pass does.
  */
+@io.vecruntime.spark.test.tags.Scan
 class TwoPassLateMaterializationSuite extends VectorQuerySuite {
 
   override protected def extraSparkConf: Map[String, String] =

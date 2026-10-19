@@ -28,6 +28,7 @@ import org.scalatest.funsuite.AnyFunSuite
  * Every read must equal Spark's own [[ArrowColumnVector]] over the same vector, across byte boundaries of the
  * validity bitmap, and after the vector is refilled with more rows (its buffers reallocated) under the same wrapper.
  */
+@io.vecruntime.spark.test.tags.Core
 class VectorArrowColumnVectorSuite extends AnyFunSuite with BeforeAndAfterAll {
 
   private val allocator = new RootAllocator(Long.MaxValue)

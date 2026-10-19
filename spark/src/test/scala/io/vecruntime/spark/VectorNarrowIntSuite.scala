@@ -30,6 +30,7 @@ import org.apache.spark.sql.vecruntime.{
  * out, arithmetic narrowed into the type, and the operators the ROLLUP queries of TPC-DS (q27, q36,
  * q70, q86) run them through: grouping keys, window partitions, sort keys, joins.
  */
+@io.vecruntime.spark.test.tags.Expr
 class VectorNarrowIntSuite extends VectorQuerySuite {
   private val Filter = classOf[VectorFilterExec]
   private val Project = classOf[VectorProjectExec]

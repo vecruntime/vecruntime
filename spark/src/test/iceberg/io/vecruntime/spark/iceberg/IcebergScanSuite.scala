@@ -28,6 +28,8 @@ import org.scalatest.Tag
  * batch over the physical rows and reads the Arrow buffers in place. Needs only the Iceberg
  * runtime (`mvn -Piceberg`).
  */
+@io.vecruntime.spark.test.tags.Iceberg
+@io.vecruntime.spark.test.tags.Scan
 class IcebergScanSuite extends IcebergMorSuiteBase {
 
   override protected def suiteTags: Seq[Tag] = Seq(IcebergTest)

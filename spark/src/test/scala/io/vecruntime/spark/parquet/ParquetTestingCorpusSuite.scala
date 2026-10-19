@@ -36,6 +36,7 @@ import org.apache.spark.sql.vecruntime.{PlanUtils, VectorParquetScanExec}
  *    configuration -- the same rows, or the same refusal.
  * A corrupt file must fail the query when Spark's reader fails it, never return rows.
  */
+@io.vecruntime.spark.test.tags.Scan
 class ParquetTestingCorpusSuite extends VectorQuerySuite {
 
   override protected def extraSparkConf: Map[String, String] =

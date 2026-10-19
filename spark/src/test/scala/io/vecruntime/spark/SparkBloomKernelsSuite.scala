@@ -28,6 +28,7 @@ import org.scalatest.funsuite.AnyFunSuite
  * SparkBloomKernels (#692): Spark's version-2 runtime bloom filter probed a batch at a time answers exactly what
  * Spark's own `mightContainLong` answers, for every key, hash count, size and seed.
  */
+@io.vecruntime.spark.test.tags.Join
 class SparkBloomKernelsSuite extends AnyFunSuite with BeforeAndAfterEach {
 
   override def beforeEach(): Unit = BloomFilterCache.clearForTest()

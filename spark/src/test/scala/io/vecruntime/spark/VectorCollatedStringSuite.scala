@@ -25,6 +25,7 @@ import org.apache.spark.sql.vecruntime.{VectorBroadcastHashJoinExec, VectorFilte
  * the collations and differ in bytes ('a' / 'A', 'É' / 'é', trailing case), so a byte comparison anywhere
  * changes the answer, which every query here compares against Spark's.
  */
+@io.vecruntime.spark.test.tags.Expr
 class VectorCollatedStringSuite extends VectorQuerySuite {
 
   override protected def beforeAll(): Unit = {

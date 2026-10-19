@@ -20,6 +20,7 @@ import org.apache.spark.sql.execution.ExpandExec
 import org.apache.spark.sql.vecruntime.{VectorExpandExec, VectorFilterExec, VectorHashAggregateExec, VectorRollupExec}
 
 /** ExpandExec: grouping sets and the distinct-aggregate rewrite, row for row against Spark. */
+@io.vecruntime.spark.test.tags.Agg
 class VectorExpandSuite extends VectorQuerySuite {
 
   private val Expand = classOf[VectorExpandExec]

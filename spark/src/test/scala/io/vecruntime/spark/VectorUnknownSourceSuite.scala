@@ -27,6 +27,8 @@ import org.apache.spark.sql.vecruntime.{VectorFilterExec, VectorHashAggregateExe
  * must match Spark's, our operators must sit directly on the scan, and the counters must show every
  * column went through the copy, not a zero-copy adapter.
  */
+@io.vecruntime.spark.test.tags.Scan
+@io.vecruntime.spark.test.tags.Core
 class VectorUnknownSourceSuite extends VectorQuerySuite {
 
   private val Filter = classOf[VectorFilterExec]

@@ -25,6 +25,7 @@ import org.apache.spark.scheduler.{JobSucceeded, SparkListenerJobEnd, SparkListe
 import org.apache.spark.sql.execution.SQLExecution
 import org.apache.spark.sql.execution.ui.SparkListenerSQLExecutionEnd
 
+@io.vecruntime.spark.test.tags.Core
 class EndedExecutionJobCancellerSuite extends SparkVectorFunSuite {
 
   private def props(exec: Option[Long]): Properties = {

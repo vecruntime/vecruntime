@@ -25,6 +25,8 @@ import org.apache.spark.sql.vecruntime.{VectorShuffledHashJoinExec, VectorSortMe
  * order-preserving, so the comparison is positional -- unlike the hash join suites, which compare
  * row sets.
  */
+@io.vecruntime.spark.test.tags.Join
+@io.vecruntime.spark.test.tags.SortWindow
 class VectorSortMergeJoinSuite extends VectorQuerySuite {
 
   private val SMJ = classOf[VectorSortMergeJoinExec]

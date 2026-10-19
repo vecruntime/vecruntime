@@ -28,6 +28,7 @@ import org.scalatest.funsuite.AnyFunSuite
  * range is indexed by value. Built on the same build side, the dense and the hash probe must return
  * the same rows for every join type; the dense form must be chosen only when the range rule allows.
  */
+@io.vecruntime.spark.test.tags.Join
 class DenseKeyJoinSuite extends AnyFunSuite {
 
   private def metrics =

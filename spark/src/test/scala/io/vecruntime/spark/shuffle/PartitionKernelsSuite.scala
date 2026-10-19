@@ -32,6 +32,7 @@ import org.scalatest.funsuite.AnyFunSuite
  * assumptions break silently. Property test: random rows of every lane type, with nulls, with
  * dictionary-encoded strings, in several key orders, against Spark's own `Murmur3HashFunction`.
  */
+@io.vecruntime.spark.test.tags.Shuffle
 class PartitionKernelsSuite extends AnyFunSuite {
 
   private val rnd = new Random(288)

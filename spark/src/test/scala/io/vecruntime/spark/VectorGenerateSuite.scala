@@ -25,6 +25,7 @@ import org.apache.spark.sql.vecruntime.{
   VectorProjectExec
 }
 
+@io.vecruntime.spark.test.tags.Nested
 class VectorGenerateSuite extends VectorQuerySuite {
 
   private val Generate = classOf[VectorGenerateExec]

@@ -22,6 +22,8 @@ import org.apache.spark.sql.vecruntime.VectorSortExec
  * Array, map and struct columns through our sort (#705): payload columns copied by the column builders' nested
  * lanes and gathered in the sorted order, nulls and empty values kept; such a partition is one in-memory run.
  */
+@io.vecruntime.spark.test.tags.Nested
+@io.vecruntime.spark.test.tags.SortWindow
 class VectorNestedSortSuite extends VectorQuerySuite {
   private val Sort = classOf[VectorSortExec]
 

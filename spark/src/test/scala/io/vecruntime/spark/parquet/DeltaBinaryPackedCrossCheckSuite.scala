@@ -43,6 +43,7 @@ import org.scalatest.funsuite.AnyFunSuite
  * reader against a from-scratch encoder of the spec; this pins it against the writer whose bytes Spark's
  * `parquet.writer.version=v2` files carry.
  */
+@io.vecruntime.spark.test.tags.Scan
 class DeltaBinaryPackedCrossCheckSuite extends AnyFunSuite {
 
   @SuppressWarnings(Array("deprecation"))

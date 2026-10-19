@@ -41,6 +41,7 @@ import org.apache.spark.sql.vecruntime.{
  * split and the partitioning contract. The batch size is set small in some tests so a partition spans
  * several batches with a short tail.
  */
+@io.vecruntime.spark.test.tags.Core
 class VectorRangeSuite extends VectorQuerySuite {
 
   private val Range_ = classOf[VectorRangeExec]

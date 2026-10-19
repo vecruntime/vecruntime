@@ -35,6 +35,7 @@ import org.apache.spark.sql.vecruntime.{PlanUtils, VectorParquetScanExec}
  *   - ANSI intervals (year-month and day-time), flat, in a list and in a struct;
  *   - an encrypted file (parquet-java decrypts it), read with and without its keys: Spark's outcome either way.
  */
+@io.vecruntime.spark.test.tags.Scan
 class NativeParquetPerFileSuite extends VectorQuerySuite {
 
   override protected def extraSparkConf: Map[String, String] =

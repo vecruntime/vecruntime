@@ -20,6 +20,7 @@ import org.apache.spark.sql.DataFrame
 import org.apache.spark.sql.catalyst.expressions.{Expression, Substring}
 import org.apache.spark.sql.catalyst.plans.logical.{Join, LogicalPlan, Project}
 
+@io.vecruntime.spark.test.tags.Join
 class NarrowBelowJoinSuite extends VectorQuerySuite {
 
   override protected def beforeAll(): Unit = {

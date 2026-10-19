@@ -35,6 +35,7 @@ import org.apache.spark.sql.vecruntime.{
  * the count and that every row belongs to the input; where the limit exceeds the data the result is
  * compared row for row against Spark as usual.
  */
+@io.vecruntime.spark.test.tags.SortWindow
 class VectorLimitSuite extends VectorQuerySuite {
 
   private val Collect = classOf[VectorCollectLimitExec]

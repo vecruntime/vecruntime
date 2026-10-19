@@ -26,6 +26,7 @@ import org.apache.spark.sql.vecruntime.{VectorFilterExec, VectorProjectExec}
  * and reads back through Spark's `getDecimal` exactly. No kernel computes on the lane yet (#258), so
  * an expression over a wide column still falls back with its type reason.
  */
+@io.vecruntime.spark.test.tags.Expr
 class VectorWideDecimalSuite extends VectorQuerySuite {
   private val Filter = classOf[VectorFilterExec]
   private val Project = classOf[VectorProjectExec]

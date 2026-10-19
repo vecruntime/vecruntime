@@ -30,6 +30,7 @@ import org.apache.spark.sql.vecruntime.{VectorFilterExec, VectorHashAggregateExe
  * the query projects. When it is columnar, the batches (Spark's on-heap vectors) feed our operators
  * through the adapter seam's copy like any other Spark columnar scan.
  */
+@io.vecruntime.spark.test.tags.Scan
 class VectorCacheSuite extends VectorQuerySuite {
 
   private val Filter = classOf[VectorFilterExec]

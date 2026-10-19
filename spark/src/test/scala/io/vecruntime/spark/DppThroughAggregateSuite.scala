@@ -22,6 +22,8 @@ import org.apache.spark.sql.execution.SparkPlan
 import org.apache.spark.sql.execution.adaptive.{AdaptiveSparkPlanExec, QueryStageExec}
 
 /** Dynamic partition pruning through an aggregate (#633), against Spark with the plugin off. */
+@io.vecruntime.spark.test.tags.Join
+@io.vecruntime.spark.test.tags.Agg
 class DppThroughAggregateSuite extends VectorQuerySuite {
 
   override protected def beforeAll(): Unit = {

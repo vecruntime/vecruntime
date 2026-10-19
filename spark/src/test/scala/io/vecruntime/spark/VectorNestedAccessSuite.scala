@@ -26,6 +26,7 @@ import org.apache.spark.sql.vecruntime.{VectorFilterExec, VectorProjectExec}
  * starts, lengths past the end, column bounds, under a filter's selection -- and `slice`'s start-0 and
  * negative-length errors are Spark's.
  */
+@io.vecruntime.spark.test.tags.Nested
 class VectorNestedAccessSuite extends VectorQuerySuite {
   private val Project = classOf[VectorProjectExec]
   private val Filter = classOf[VectorFilterExec]

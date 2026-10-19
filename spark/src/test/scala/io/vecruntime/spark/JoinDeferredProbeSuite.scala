@@ -24,6 +24,7 @@ import org.apache.spark.sql.vecruntime.VectorBroadcastHashJoinExec
  * chain of joins composes the ids, so a column carried through the chain is gathered once by whichever
  * operator reads it. Results must be Spark's with the views on and off, for every join type that probes.
  */
+@io.vecruntime.spark.test.tags.Join
 class JoinDeferredProbeSuite extends VectorQuerySuite {
 
   private val Bhj = classOf[VectorBroadcastHashJoinExec]

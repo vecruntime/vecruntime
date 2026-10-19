@@ -29,6 +29,8 @@ import org.apache.spark.sql.execution.datasources.v2.DataSourceV2ScanRelation
  * file scan (TPC-DS q93's shape), and the creation side's rows come from the scan's own statistics. Results are
  * checked against Spark with the plugin off.
  */
+@io.vecruntime.spark.test.tags.Iceberg
+@io.vecruntime.spark.test.tags.Join
 class IcebergFactBloomFilterSuite extends VectorQuerySuite {
 
   private lazy val warehouse = Files.createTempDirectory("vecruntime-iceberg-bloom").toString

@@ -27,6 +27,7 @@ import org.apache.spark.sql.vecruntime.{PlanUtils, VectorParquetScanExec}
  * all), for every type and encoding the scan decodes, with nulls, small pages (runs cross pages) and small
  * batches, and with decode-ahead on.
  */
+@io.vecruntime.spark.test.tags.Scan
 class LateMaterializationSuite extends VectorQuerySuite {
 
   override protected def extraSparkConf: Map[String, String] =

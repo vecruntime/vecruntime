@@ -43,6 +43,7 @@ import org.apache.spark.unsafe.types.UTF8String
  * of ours above a Spark file scan, the rows it hands over, and the converter itself over a slow and
  * a failing child (overlap, error propagation, early close without leaks).
  */
+@io.vecruntime.spark.test.tags.Scan
 class VectorPrefetchScanSuite extends VectorQuerySuite {
 
   // VectorPrefetchScanExec sits over Spark's own scan (the native scan has its own read-ahead), so this

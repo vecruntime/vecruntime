@@ -24,6 +24,8 @@ import org.apache.spark.sql.vecruntime.{VectorFilterExec, VectorProjectExec}
  * lambda's variable, and an outer array read from inside a lambda -- with nulls at every level (a
  * null outer array, a null inner array, a null leaf).
  */
+@io.vecruntime.spark.test.tags.Nested
+@io.vecruntime.spark.test.tags.Expr
 class VectorNestedLambdaSuite extends VectorQuerySuite {
   private val Project = classOf[VectorProjectExec]
   private val Filter = classOf[VectorFilterExec]

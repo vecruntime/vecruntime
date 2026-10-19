@@ -19,6 +19,7 @@ import io.vecruntime.spark.test.{TestTables, VectorQuerySuite}
 import org.apache.spark.sql.execution.FilterExec
 import org.apache.spark.sql.vecruntime.VectorFilterExec
 
+@io.vecruntime.spark.test.tags.Expr
 class VectorFilterSuite extends VectorQuerySuite {
 
   private val Filter = classOf[VectorFilterExec]

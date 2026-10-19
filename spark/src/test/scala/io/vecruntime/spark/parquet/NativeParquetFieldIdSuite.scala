@@ -34,6 +34,7 @@ import org.apache.spark.sql.vecruntime.{PlanUtils, VectorParquetScanExec}
  *   - a filter on id-matched columns (row-group pushdown is by name over the file's schema, as Spark's);
  *   - a struct field missing inside a list or a map of structs is null.
  */
+@io.vecruntime.spark.test.tags.Scan
 class NativeParquetFieldIdSuite extends VectorQuerySuite {
 
   override protected def extraSparkConf: Map[String, String] =

@@ -166,6 +166,28 @@ intermittent dynamic-partition-pruning timing issue, also documented there.)
 
 ## 5. Running everything locally
 
+- **The fast loop while working** -- `dev/test-changed.sh` builds and tests only what a change can affect:
+  the changed modules of the gate set and every module after them in build order, and inside `spark` only the
+  suites tagged with the changed areas. Every concrete `spark` suite carries one or more area tags
+  (`io.vecruntime.spark.test.tags.{Scan,Expr,Agg,Join,SortWindow,Nested,Write,Iceberg,Comet,Shuffle,Core}`,
+  ScalaTest tag annotations), and the script refuses to run while a suite has none, so a tagged run never
+  skips a new suite silently. Areas come from the changed main sources' paths and from the tags of changed
+  suites; a change it cannot place -- `VectorColumnarRule`, the operator base, adapters, shims, test bases,
+  resources, a pom, `kernels` -- runs every `spark` suite.
+
+  ```bash
+  dev/test-changed.sh --dry-run          # what it would run, against origin/main plus the working tree
+  dev/test-changed.sh                    # run it
+  dev/test-changed.sh --area Join,Agg    # choose the spark areas yourself
+  dev/test-changed.sh --full             # every suite of the affected modules
+  mvn -pl spark install -DtagsToInclude=io.vecruntime.spark.test.tags.Scan   # one area by hand
+  ```
+
+  A change to `VectorSortExec` runs the `SortWindow` suites plus `shuffle` and `benchmarks` in about 6
+  minutes, against about 50 for the gate. It is the inner loop only: a PR is ready after the gate below,
+  run once on the final commit with the worktree left untouched while it runs (its formatting check reads the
+  working tree).
+
 - **The CI gate the crews run before a PR:**
 
   ```bash

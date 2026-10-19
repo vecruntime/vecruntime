@@ -24,6 +24,8 @@ import org.apache.spark.sql.vecruntime.{VectorFilterExec, VectorProjectExec}
  * Spark does -- null arrays, null elements (contains is then null, not false), empty arrays, null
  * values to look for, strings ordered by bytes, struct fields holding arrays.
  */
+@io.vecruntime.spark.test.tags.Expr
+@io.vecruntime.spark.test.tags.Nested
 class VectorArrayFunctionsSuite extends VectorQuerySuite {
   private val Project = classOf[VectorProjectExec]
   private val Filter = classOf[VectorFilterExec]

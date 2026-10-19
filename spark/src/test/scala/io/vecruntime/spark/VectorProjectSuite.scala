@@ -20,6 +20,7 @@ import io.vecruntime.spark.test.{TestTables, VectorQuerySuite}
 import org.apache.spark.sql.execution.{ColumnarToRowExec, RowToColumnarExec}
 import org.apache.spark.sql.vecruntime.{VectorFilterExec, VectorHashAggregateExec, VectorProjectExec}
 
+@io.vecruntime.spark.test.tags.Expr
 class VectorProjectSuite extends VectorQuerySuite {
 
   private val Project = classOf[VectorProjectExec]

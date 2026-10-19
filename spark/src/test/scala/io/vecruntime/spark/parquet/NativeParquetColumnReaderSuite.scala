@@ -44,6 +44,7 @@ import org.scalatest.funsuite.AnyFunSuite
  * size (page-spanning batches); a with-nulls batch followed by a no-nulls batch (no stale validity, no
  * getNullCount); UTF8 batches; and pool reuse (a released vector instance is handed back on the next batch).
  */
+@io.vecruntime.spark.test.tags.Scan
 class NativeParquetColumnReaderSuite extends AnyFunSuite {
 
   private def rleEncode(levels: Array[Int], bitWidth: Int): Array[Byte] = {

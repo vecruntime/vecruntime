@@ -38,6 +38,8 @@ import org.scalatest.Tag
  * The delete-writer share of the write is then delete-task-time / (delete + data task time), and the
  * MERGE's own write-stage task time is reported beside it as the ground truth those two sum toward.
  */
+@io.vecruntime.spark.test.tags.Iceberg
+@io.vecruntime.spark.test.tags.Write
 class DvWriteProfileSuite extends VectorQuerySuite {
 
   override protected def extraSparkConf: Map[String, String] =

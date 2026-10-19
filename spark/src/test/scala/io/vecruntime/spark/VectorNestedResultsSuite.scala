@@ -24,6 +24,7 @@ import org.apache.spark.sql.vecruntime.{VectorFilterExec, VectorProjectExec}
  * with an index and with outer columns, string elements, struct fields holding arrays -- whole or
  * under a filter's selection.
  */
+@io.vecruntime.spark.test.tags.Nested
 class VectorNestedResultsSuite extends VectorQuerySuite {
   private val Project = classOf[VectorProjectExec]
   private val Filter = classOf[VectorFilterExec]

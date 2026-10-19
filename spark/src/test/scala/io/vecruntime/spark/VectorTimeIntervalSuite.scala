@@ -31,6 +31,7 @@ import org.apache.spark.sql.vecruntime.{
  * grouped, sorted, joined and windowed by the operators, min / max / count over them included. Everything that reads
  * them as a time or an interval -- arithmetic, casts, functions, sum and avg -- stays Spark's, with Spark's answer.
  */
+@io.vecruntime.spark.test.tags.Expr
 class VectorTimeIntervalSuite extends VectorQuerySuite {
   private val Filter = classOf[VectorFilterExec]
   private val Project = classOf[VectorProjectExec]

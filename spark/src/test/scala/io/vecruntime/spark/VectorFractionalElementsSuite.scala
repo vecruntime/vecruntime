@@ -24,6 +24,8 @@ import org.apache.spark.sql.vecruntime.{VectorFilterExec, VectorProjectExec}
  * equals NaN and is the greatest -- and decimals of both widths compare on their unscaled values,
  * null elements and null arrays included.
  */
+@io.vecruntime.spark.test.tags.Expr
+@io.vecruntime.spark.test.tags.Nested
 class VectorFractionalElementsSuite extends VectorQuerySuite {
   private val Project = classOf[VectorProjectExec]
   private val Filter = classOf[VectorFilterExec]

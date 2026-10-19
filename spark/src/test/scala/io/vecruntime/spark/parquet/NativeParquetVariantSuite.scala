@@ -25,6 +25,8 @@ import org.apache.spark.sql.vecruntime.{PlanUtils, VectorParquetScanExec}
  * value and child 1 as the metadata). A file with a shredded variant goes to Spark's reader. Compared with Spark's
  * reader row for row: flat, inside a list and inside a struct, dictionary and plain, v1 and v2 pages, with nulls.
  */
+@io.vecruntime.spark.test.tags.Scan
+@io.vecruntime.spark.test.tags.Nested
 class NativeParquetVariantSuite extends VectorQuerySuite {
 
   override protected def extraSparkConf: Map[String, String] =

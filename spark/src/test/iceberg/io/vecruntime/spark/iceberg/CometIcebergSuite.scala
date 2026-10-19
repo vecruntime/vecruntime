@@ -25,6 +25,8 @@ import org.scalatest.Tag
  * operators therefore see plain Comet batches and adapt them zero-copy, exactly as over Comet's
  * Parquet scan. Needs both the Comet jar and the Iceberg runtime (`mvn -Pcomet,iceberg`).
  */
+@io.vecruntime.spark.test.tags.Iceberg
+@io.vecruntime.spark.test.tags.Comet
 class CometIcebergSuite extends IcebergMorSuiteBase {
 
   override protected def suiteTags: Seq[Tag] = Seq(CometTest, IcebergTest)

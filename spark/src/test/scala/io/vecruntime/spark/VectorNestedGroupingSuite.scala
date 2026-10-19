@@ -24,6 +24,8 @@ import org.apache.spark.sql.vecruntime.VectorHashAggregateExec
  * key lane and decodes them back for its output, in both stages -- null keys, empty arrays, null
  * elements and fields, string, long and wide decimal leaves, a struct holding an array, beside a narrow key.
  */
+@io.vecruntime.spark.test.tags.Nested
+@io.vecruntime.spark.test.tags.Agg
 class VectorNestedGroupingSuite extends VectorQuerySuite {
   private val Agg = classOf[VectorHashAggregateExec]
 

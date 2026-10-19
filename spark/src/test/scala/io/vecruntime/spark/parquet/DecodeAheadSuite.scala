@@ -25,6 +25,7 @@ import org.apache.spark.sql.vecruntime.{DecodeAheadIterator, PlanUtils, VectorPa
  * up to K batches ahead; the results must be the reader's, in its order, on virtual and platform threads, across
  * row groups, files and per-file fallbacks, and nothing may leak when a LIMIT or a failure ends the task early.
  */
+@io.vecruntime.spark.test.tags.Scan
 class DecodeAheadSuite extends VectorQuerySuite {
 
   override protected def extraSparkConf: Map[String, String] =

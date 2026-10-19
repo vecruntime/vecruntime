@@ -26,6 +26,7 @@ import org.scalatest.funsuite.AnyFunSuite
  * pins its carrier, and on 1 TB TPC-DS q88 that pinned every carrier of one executor behind
  * `BloomFilterImpl.<clinit>` waiting for a log4j lock: the executor's 13 tasks hung with no CPU use.
  */
+@io.vecruntime.spark.test.tags.Scan
 class VectorParquetPrefetchPoolSuite extends AnyFunSuite {
 
   private def onPool(): Thread =

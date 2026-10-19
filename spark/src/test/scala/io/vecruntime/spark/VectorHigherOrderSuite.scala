@@ -26,6 +26,8 @@ import org.apache.spark.sql.vecruntime.{VectorFilterExec, VectorProjectExec}
  * fields holding arrays, both settings of `followThreeValuedLogicInArrayExists` -- and a lambda's ANSI
  * error is raised only for rows Spark evaluates.
  */
+@io.vecruntime.spark.test.tags.Expr
+@io.vecruntime.spark.test.tags.Nested
 class VectorHigherOrderSuite extends VectorQuerySuite {
   private val Project = classOf[VectorProjectExec]
   private val Filter = classOf[VectorFilterExec]

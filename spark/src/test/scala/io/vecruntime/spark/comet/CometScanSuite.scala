@@ -24,6 +24,8 @@ import org.apache.spark.sql.vecruntime.{VectorFilterExec, VectorHashAggregateExe
  * classpath (`mvn -Pcomet`); on macOS that means a Comet built from source, since the published
  * jar only bundles Linux native libraries. Excluded by default through the CometTest tag.
  */
+@io.vecruntime.spark.test.tags.Comet
+@io.vecruntime.spark.test.tags.Scan
 class CometScanSuite extends VectorQuerySuite {
 
   private val Filter = classOf[VectorFilterExec]

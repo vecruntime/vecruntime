@@ -29,6 +29,8 @@ import org.apache.spark.sql.execution.datasources.v2.DataSourceV2ScanRelation
  * (q72) -- prune a DSv2 scan by the columns it takes runtime filters on (an Iceberg identity partition), as they
  * prune a partitioned file table. Every result is checked against Spark with the plugin off.
  */
+@io.vecruntime.spark.test.tags.Iceberg
+@io.vecruntime.spark.test.tags.Join
 class IcebergDppSuite extends VectorQuerySuite {
 
   private lazy val warehouse = Files.createTempDirectory("vecruntime-iceberg-dpp").toString
