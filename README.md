@@ -19,14 +19,17 @@ any unsupported operator, expression or data type, always with a recorded reason
   on x86 (AVX2, AVX-512) and arm64 (NEON, SVE).
 * **Columnar by design:** operators consume and produce Arrow-layout batches.
 * **Spark-compatible:** unsupported operators, expressions, and types transparently fall back to Spark.
-* **Zero-copy integration:** interoperates with columnar native components such as Comet without
-  serialization between execution stages.
+* **Arrow Flight Columnar Shuffle:** implements a Columnar Shuffle based in Arrow Flight.
+* **Native Async Columnar Parquet Reader/Writer:** native columnar Parquet reader/writer.
+* **Broad Iceberg compatibility:** broad support of Iceberg V2/V3 speqs.
 * **Incremental adoption:** operators can be accelerated individually while the rest of the plan runs on
   Spark as usual.
 
 ## Status
 
-Version 0.0.9, a preview release under the Apache License 2.0 (see `LICENSE` and `NOTICE`). VecRuntime runs
+Version 0.0.9, a preview release under the Apache License 2.0 (see `LICENSE` and `NOTICE`). 
+
+VecRuntime runs
 the whole of TPC-DS (103 queries) and TPC-H (22) and returns Spark's results. Benchmark results, with the
 hardware and settings behind them, are on the [project site](https://vecruntime.github.io/vecruntime/):
 [TPC-DS 1 TB on x86](https://vecruntime.github.io/vecruntime/benchmarks/tpcds-1tb.html),
@@ -131,15 +134,16 @@ Contributions are welcome: bug reports, failing queries, benchmarks on other har
   performance claims need a number (JMH or TPC-H / TPC-DS).
 * **Conventions.** [AGENTS.md](AGENTS.md) holds the design decisions, the coding rules and what "done" means
   for a change; read it before a larger change. Update `CHANGELOG.md` and the docs in the same PR.
-* **Releases.** A release is cut by pushing a `v<version>` tag on `main`: `.github/workflows/release.yml`
-  builds both Spark lines on JDK 25, attaches the jars and their checksums to the GitHub release, and
-  publishes them to the `maven-repo` branch.
 
 ## Contributors
 
 * Angel Conde ([@Neuw84](https://github.com/Neuw84)), author and maintainer.
 
 The full list is on the [contributors page](https://github.com/vecruntime/vecruntime/graphs/contributors).
+
+## Disclaimer
+
+VecRuntime is provided “AS IS” and “AS AVAILABLE,” without warranties or representations of any kind, express or implied, including but not limited to warranties of merchantability, fitness for a particular purpose, correctness, performance, or non-infringement. The software is experimental and may contain bugs, errors, or other defects. You are solely responsible for evaluating its suitability, testing it, and determining whether it is safe and appropriate for your intended use. To the maximum extent permitted by applicable law, the authors and contributors shall not be liable for any claims, damages, losses, or other liabilities arising from or related to the use of, inability to use, or distribution of VecRuntime, including any direct, indirect, incidental, special, or consequential damages, loss of data, or business interruption.
 
 ## License
 
