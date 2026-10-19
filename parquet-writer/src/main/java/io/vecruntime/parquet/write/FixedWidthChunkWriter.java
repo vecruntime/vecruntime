@@ -82,6 +82,7 @@ final class FixedWidthChunkWriter implements ChunkWriter {
     private final int pageRowLimit;
     private final int dictionaryLimit;
     private final boolean dictionaryEnabled;
+    private final boolean earlyAbort;
 
     private PageWriter pages;
 
@@ -96,6 +97,7 @@ final class FixedWidthChunkWriter implements ChunkWriter {
     // The chunk's dictionary: insertion-ordered entries, an open-addressing table of entry index + 1.
     private boolean dictionary;
     private boolean firstPageDone;
+    private boolean earlyChecked;
     private int dictionaryPagesWritten;
     private long[] entries = new long[1024];
     private int entryCount;
@@ -139,6 +141,21 @@ final class FixedWidthChunkWriter implements ChunkWriter {
     }
 
     FixedWidthChunkWriter(Kind kind, ColumnDescriptor column, ParquetProperties props) {
+        this(kind, column, props, true);
+    }
+
+    /**
+     * {@code earlyAbort}: give the dictionary up after {@link #EARLY_ROWS}
+     * values of a chunk's first page when nearly all of them are distinct
+     * ({@link #EARLY_DISTINCT}), rather than hashing the whole first page to
+     * find out it does not pay. The pages are the same standard encodings
+     * either way; only the choice can differ from parquet-java's on a column
+     * parquet-java would also have written without a dictionary after its first
+     * page.
+     */
+    FixedWidthChunkWriter(Kind kind, ColumnDescriptor column, ParquetProperties props,
+                          boolean earlyAbort) {
+        this.earlyAbort = earlyAbort;
         this.kind = kind;
         this.column = column;
         this.optional = column.getMaxDefinitionLevel() > 0;
@@ -159,7 +176,20 @@ final class FixedWidthChunkWriter implements ChunkWriter {
         dictionaryPagesWritten = 0;
         firstPageDone = false;
         dictionary = dictionaryEnabled;
+        earlyChecked = !earlyAbort;
     }
+
+    /**
+     * Values of a chunk's first page after which the dictionary is judged early
+     * (see the constructor).
+     */
+    static final int EARLY_ROWS = 8192;
+
+    /**
+     * The distinct fraction of those values above which the dictionary is given
+     * up.
+     */
+    static final double EARLY_DISTINCT = 0.9;
 
     /** Appends rows {@code [from, to)} of {@code v}. */
     @Override
@@ -168,30 +198,84 @@ final class FixedWidthChunkWriter implements ChunkWriter {
         MemorySegment data = v.data();
         int n = to - from;
         ensurePage(n);
-        for (int i = from; i < to; i++) {
-            if (validity != null && !Bitmap.isSet(validity, i)) {
+        int start = pageValues;
+        if (validity == null) {
+            // No nulls: the values in one pass, the validity bits as whole words.
+            switch (kind) {
+                case INT32 -> {
+                    for (int i = from; i < to; i++) {
+                        values[pageValues++] = data.get(LE_INT, (long) i << 2);
+                    }
+                }
+                case INT32_FROM_INT64 -> {
+                    for (int i = from; i < to; i++) {
+                        values[pageValues++] = (int) data.get(LE_LONG, (long) i << 3);
+                    }
+                }
+                case INT64 -> {
+                    for (int i = from; i < to; i++) {
+                        values[pageValues++] = data.get(LE_LONG, (long) i << 3);
+                    }
+                }
+                case DOUBLE -> {
+                    for (int i = from; i < to; i++) {
+                        values[pageValues++] = Double.doubleToRawLongBits(data.get(LE_DOUBLE, (long) i << 3));
+                    }
+                }
+            }
+            setValidRange(pageRows, n);
+            pageRows += n;
+        } else {
+            for (int i = from; i < to; i++) {
+                if (!Bitmap.isSet(validity, i)) {
+                    pageRows++;
+                    continue;
+                }
+                long raw = switch (kind) {
+                    case INT32 -> data.get(LE_INT, (long) i << 2);
+                    case INT32_FROM_INT64 -> (int) data.get(LE_LONG, (long) i << 3);
+                    case INT64 -> data.get(LE_LONG, (long) i << 3);
+                    case DOUBLE -> Double.doubleToRawLongBits(data.get(LE_DOUBLE, (long) i << 3));
+                };
+                pageValidity[pageRows >>> 6] |= 1L << pageRows;
                 pageRows++;
-                continue;
+                values[pageValues++] = raw;
             }
-            long raw = switch (kind) {
-                case INT32 -> data.get(LE_INT, (long) i << 2);
-                case INT32_FROM_INT64 -> (int) data.get(LE_LONG, (long) i << 3);
-                case INT64 -> data.get(LE_LONG, (long) i << 3);
-                case DOUBLE -> Double.doubleToRawLongBits(data.get(LE_DOUBLE, (long) i << 3));
-            };
-            pageValidity[pageRows >>> 6] |= 1L << pageRows;
-            pageRows++;
-            values[pageValues] = raw;
-            if (dictionary) {
-                ids[pageValues] = idOf(raw);
+        }
+        if (dictionary) {
+            for (int k = start; k < pageValues; k++) {
+                ids[k] = idOf(values[k]);
             }
-            pageValues++;
+            if (!earlyChecked && pageValues >= EARLY_ROWS) {
+                earlyChecked = true;
+                if (!firstPageDone && entryCount > EARLY_DISTINCT * pageValues) {
+                    fallBack();
+                }
+            }
         }
         if (dictionary && (long) entryCount * kind.width > dictionaryLimit) {
             fallBack();
         }
         if (pageRows >= pageRowLimit || encodedBytes() >= pageSize) {
             flushPage();
+        }
+    }
+
+    /** Sets validity bits {@code [from, from + count)} of the page being built. */
+    private void setValidRange(int from, int count) {
+        int i = from;
+        int end = from + count;
+        while (i < end && (i & 63) != 0) {
+            pageValidity[i >>> 6] |= 1L << i;
+            i++;
+        }
+        while (i + 64 <= end) {
+            pageValidity[i >>> 6] = -1L;
+            i += 64;
+        }
+        while (i < end) {
+            pageValidity[i >>> 6] |= 1L << i;
+            i++;
         }
     }
 

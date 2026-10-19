@@ -77,6 +77,19 @@ public final class ColumnarParquetWriter implements AutoCloseable {
     private long rowGroupRows;
     private long totalRows;
     private boolean closed;
+    private boolean dictionaryEarlyAbort = true;
+
+    /**
+     * Whether a fixed-width column gives its dictionary up early when the first
+     * values of a chunk are nearly all distinct (default true; see {@code
+     * FixedWidthChunkWriter}). Off, the dictionary decisions are exactly
+     * parquet-java's, which the tests comparing encodings with parquet-java
+     * need. Set before the first write.
+     */
+    public ColumnarParquetWriter dictionaryEarlyAbort(boolean on) {
+        this.dictionaryEarlyAbort = on;
+        return this;
+    }
 
     /**
      * @param out the file to write (created, not overwritten)
@@ -159,7 +172,7 @@ public final class ColumnarParquetWriter implements AutoCloseable {
                 lanes[i] = lane;
                 FixedWidthChunkWriter.Kind kind = FixedWidthChunkWriter.kindFor(lane, columns.get(i));
                 if (kind != null) {
-                    fast[i] = new FixedWidthChunkWriter(kind, columns.get(i), props);
+                    fast[i] = new FixedWidthChunkWriter(kind, columns.get(i), props, dictionaryEarlyAbort);
                     fast[i].startChunk(pageStore.getPageWriter(columns.get(i)));
                 } else if (lane == VecType.UTF8 && columns.get(i).getMaxRepetitionLevel() == 0 && columns.get(i)
                         .getPrimitiveType()

@@ -103,8 +103,8 @@ class DictionaryFallbackTest {
         org.apache.hadoop.fs.Path p = new org.apache.hadoop.fs.Path(dir.resolve("ours.parquet")
                 .toString());
         CodecFactory codecs = new CodecFactory(conf, 64 * 1024);
-        try (ColumnarParquetWriter w = new ColumnarParquetWriter(HadoopOutputFile.fromPath(p, conf), SCHEMA, props(),
-                codecs.getCompressor(CompressionCodecName.UNCOMPRESSED), 128L << 20, Map.of())) {
+        try (ColumnarParquetWriter w = new ColumnarParquetWriter(HadoopOutputFile.fromPath(p, conf), SCHEMA, props(), codecs.getCompressor(CompressionCodecName.UNCOMPRESSED), 128L << 20, Map.of())
+                .dictionaryEarlyAbort(false)) {
             for (int from = 0; from < rows.size(); from += 3000) {
                 List<Row> s = rows.subList(from,
                         Math.min(rows.size(), from + 3000));
