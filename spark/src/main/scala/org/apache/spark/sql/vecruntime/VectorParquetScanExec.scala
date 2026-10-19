@@ -433,7 +433,10 @@ private[vecruntime] final class VectorParquetPartitionReader(
     poolChunkBuffers: Boolean = false,
     // #735: pushed filters name the requested columns, matched to each file's columns by field id (quoted
     // column name -> field id); null: by name, as Spark does. Iceberg files are never rebased.
-    filterFieldIds: Map[String, Int] = null
+    filterFieldIds: Map[String, Int] = null,
+    // #849: an Iceberg table's name mapping: a file written without field ids gets them from it before it is
+    // clipped, so its columns are matched by id as every other file's; null: none.
+    nameMapping: IcebergNameMapping = null
 ) extends Iterator[ColumnarBatch]
     with AutoCloseable {
 
@@ -822,7 +825,8 @@ private[vecruntime] final class VectorParquetPartitionReader(
       val firstStore: org.apache.parquet.column.page.PageReadStore,
       val needsFallback: Boolean,
       val fallbackModes: FallbackModes = null,
-      val read: StructType = null // #812: this file's read schema (fileReadSchema)
+      val read: StructType = null, // #812: this file's read schema (fileReadSchema)
+      val fallbackConf: Configuration = null // #849: Spark's reader's conf for this file, when not the scan's
   )
 
   // Prefetch (`spark.vecruntime.scan.nativeParquet.prefetchFiles` = N > 0): the next N files of the split
@@ -917,7 +921,23 @@ private[vecruntime] final class VectorParquetPartitionReader(
     var r: ParquetFileReader = null
     try {
       stream = inputFile.newStream()
-      val footer: ParquetMetadata = ParquetFileReader.readFooter(inputFile, rangeOpts, stream)
+      val read0: ParquetMetadata = ParquetFileReader.readFooter(inputFile, rangeOpts, stream)
+      // #849: a file without field ids, of a table with a name mapping: its schema with the mapping's ids.
+      val unmapped = read0.getFileMetaData.getSchema
+      val mapped = nameMapping != null && !VectorParquetScanExec.hasFieldIds(unmapped)
+      val footer: ParquetMetadata =
+        if (!mapped) read0
+        else {
+          val m = read0.getFileMetaData
+          new ParquetMetadata(
+            new org.apache.parquet.hadoop.metadata.FileMetaData(
+              nameMapping(unmapped),
+              m.getKeyValueMetaData,
+              m.getCreatedBy
+            ),
+            read0.getBlocks
+          )
+        }
       val fileSchema = footer.getFileMetaData.getSchema
       val read = fileReadSchema(fileSchema)
       val clipped =
@@ -945,7 +965,17 @@ private[vecruntime] final class VectorParquetPartitionReader(
       ) {
         stream.close()
         stream = null
-        return new Prepared(file, null, clipped, false, null, needsFallback = true, modes, readSchema)
+        // #849: Spark's reader reads a mapped file by name (it applies no name mapping): the requested schema with
+        // each column renamed to its name in this file and no field ids.
+        val conf =
+          if (!mapped) null
+          else {
+            val c = new Configuration(hadoopConf)
+            c.set(ParquetReadSupport.SPARK_ROW_REQUESTED_SCHEMA, nameMapping.byName(requiredSchema, unmapped).json)
+            c.setBoolean(SQLConf.PARQUET_FIELD_ID_READ_ENABLED.key, false)
+            c
+          }
+        return new Prepared(file, null, clipped, false, null, needsFallback = true, modes, readSchema, conf)
       }
       // The reader owns the stream from here (closed by reader.close()); clear our handle.
       val readOptsBuilder = HadoopReadOptions
@@ -989,7 +1019,7 @@ private[vecruntime] final class VectorParquetPartitionReader(
     if (p.needsFallback) {
       fallback = new SparkFallbackFileReader(
         p.file,
-        hadoopConf,
+        if (p.fallbackConf != null) p.fallbackConf else hadoopConf,
         requiredSchema,
         partitionSchema,
         batchSize,

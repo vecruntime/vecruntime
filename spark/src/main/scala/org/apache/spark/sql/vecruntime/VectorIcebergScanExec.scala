@@ -247,7 +247,8 @@ case class VectorIcebergScanExec(
         sqlConf.parquetFilterPushDownDecimal,
         sqlConf.parquetFilterPushDownStringPredicate,
         sqlConf.parquetFilterPushDownInFilterThreshold
-      )
+      ),
+      IcebergTasks.nameMapping(scan)
     )
     val out: RDD[ColumnarBatch] =
       if (emitSelection) rdd else rdd.mapPartitionsInternal(_.map(VectorIcebergScanExec.compacted))
@@ -316,7 +317,8 @@ private[vecruntime] final class VectorIcebergRDD(
     icebergGroups: SQLMetric,
     pushedFilters: Seq[org.apache.spark.sql.sources.Filter],
     filterFieldIds: Map[String, Int], // null: nothing pushed
-    pushDown: PushDownConf
+    pushDown: PushDownConf,
+    nameMapping: IcebergNameMapping // #849: null when the table has none
 ) extends RDD[ColumnarBatch](sc, Nil) {
 
   override protected def getPartitions: Array[Partition] = parts
@@ -462,7 +464,8 @@ private[vecruntime] final class VectorIcebergRDD(
       prefetchExecutorMaxBytes = prefetchExecutorMaxBytes,
       reuseDecompressBuffers = reuseDecompressBuffers,
       poolChunkBuffers = poolChunkBuffers,
-      filterFieldIds = filterFieldIds
+      filterFieldIds = filterFieldIds,
+      nameMapping = nameMapping
     )
     if (decodeAhead > 0) new DecodeAheadIterator(reader, decodeAhead, decodeAheadVirtual, context) else reader
   }
@@ -655,11 +658,7 @@ private[vecruntime] object IcebergTasks {
    */
   def outputFieldIds(b: BatchScanExec): Either[String, Seq[Int]] =
     try {
-      val table = call(b.scan, "table")
-      val props = call(table, "properties").asInstanceOf[java.util.Map[String, String]]
-      if (props.containsKey("schema.name-mapping.default")) {
-        return Left("Iceberg table has a name mapping (files may carry no field ids)")
-      }
+      // #849: a name mapping (files written without field ids) is applied by our reader, see nameMapping.
       val schema = call(b.scan, "projection")
       val columns = call(schema, "columns").asInstanceOf[java.util.List[AnyRef]].asScala
       val byName = columns.map(f => call(f, "name").asInstanceOf[String].toLowerCase -> f).toMap
@@ -894,6 +893,12 @@ private[vecruntime] object IcebergTasks {
   }
 
   /** The scanned table's current schema (an `org.apache.iceberg.Schema`, serializable), the ids equality deletes use. */
+  /** #849: the table's `schema.name-mapping.default`, parsed; null when it has none. */
+  def nameMapping(b: BatchScanExec): IcebergNameMapping = {
+    val props = call(call(b.scan, "table"), "properties").asInstanceOf[java.util.Map[String, String]]
+    Option(props.get("schema.name-mapping.default")).map(IcebergNameMapping.parse).orNull
+  }
+
   def tableSchema(b: BatchScanExec): AnyRef = call(call(b.scan, "table"), "schema")
 
   private def equalityFieldIds(d: AnyRef): Seq[Int] =

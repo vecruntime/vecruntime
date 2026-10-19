@@ -385,6 +385,68 @@ class IcebergNativeScanSuite extends IcebergMorSuiteBase {
     }
   }
 
+  /**
+   * #849: a table over files written without Parquet field ids (plain Spark Parquet, added with `add_files`), whose
+   * columns Iceberg matches through the table's name mapping; then files Iceberg writes (with ids), a renamed top
+   * level column and nested field, an added column, and position deletes over both kinds of file.
+   */
+  icebergTest("files without field ids are read natively through the table's name mapping") {
+    val dir = java.nio.file.Files.createTempDirectory("vecruntime-namemap").resolve("src").toString
+    withPlugin(enabled = false) {
+      spark.sql(
+        """SELECT CAST(id AS INT) k, concat('s', id % 7) s,
+          |  named_struct('a', CAST(id % 11 AS INT), 'b', IF(id % 5 = 0, NULL, concat('b', id % 3))) st,
+          |  IF(id % 9 = 0, NULL, sequence(0L, id % 4)) arr,
+          |  map(concat('m', id % 3), CAST(id AS INT)) m
+          |FROM range(0, 4000)""".stripMargin
+      ).repartition(4).write.parquet(dir)
+    }
+    spark.sql(
+      s"""CREATE OR REPLACE TABLE $Db.t_mapped (k INT, s STRING, st STRUCT<a: INT, b: STRING>, arr ARRAY<BIGINT>,
+         |  m MAP<STRING, INT>) USING iceberg
+         |TBLPROPERTIES ('format-version' = '2', 'write.delete.mode' = 'merge-on-read')""".stripMargin
+    )
+    val table = org.apache.iceberg.spark.Spark3Util.loadIcebergTable(spark, s"$Db.t_mapped")
+    table.updateProperties()
+      .set(
+        "schema.name-mapping.default",
+        org.apache.iceberg.mapping.NameMappingParser.toJson(
+          org.apache.iceberg.mapping.MappingUtil.create(table.schema())
+        )
+      )
+      .commit()
+    spark.sql(
+      s"CALL ${IcebergTables.Catalog}.system.add_files(table => 'db.t_mapped', source_table => '`parquet`.`$dir`')"
+    )
+    useTable("t_mapped")
+    val q0 = checkVectorized("SELECT k, s, st, arr, m FROM t WHERE k % 97 = 3", Nil)
+    assert(groups(q0)._1 > 0 && groups(q0)._2 == 0, s"plain files: ${groups(q0)}")
+
+    // Evolve: Iceberg keeps the old names as aliases in the mapping, so the old files still resolve.
+    spark.sql(s"ALTER TABLE $Db.t_mapped RENAME COLUMN s TO s2")
+    spark.sql(s"ALTER TABLE $Db.t_mapped RENAME COLUMN st.b TO b2")
+    spark.sql(s"ALTER TABLE $Db.t_mapped ADD COLUMN c INT")
+    spark.sql(
+      s"""INSERT INTO $Db.t_mapped SELECT CAST(id AS INT), concat('n', id % 3),
+         |  named_struct('a', CAST(id % 11 AS INT), 'b2', concat('x', id % 2)), sequence(1L, 2L),
+         |  map('m1', CAST(id AS INT)), CAST(id % 4 AS INT)
+         |FROM range(4000, 4600)""".stripMargin
+    )
+    spark.sql(s"DELETE FROM $Db.t_mapped WHERE k % 10 = 3")
+    useTable("t_mapped")
+    assert(count("SELECT count(*) FROM t") === 4600 - 460)
+    Seq(
+      "SELECT k, s2, st, arr, m, c FROM t WHERE k % 53 = 4",
+      "SELECT s2, count(*), count(st.b2), sum(st.a), sum(size(arr)), sum(m['m1']), count(c) FROM t GROUP BY s2",
+      "SELECT k, st.b2, c FROM t WHERE k > 3990 AND k < 4010"
+    ).foreach { q =>
+      val df = checkVectorized(q, Nil)
+      assert(df.collect().nonEmpty, s"the query should return rows: $q")
+      val (native, iceberg) = groups(df)
+      assert(native > 0 && iceberg == 0, s"native $native, Iceberg $iceberg: $q")
+    }
+  }
+
   icebergTest("an identity-partitioned table reads its partition column from the files") {
     spark.sql(
       s"CREATE OR REPLACE TABLE $Db.t_parted USING iceberg PARTITIONED BY (b) AS SELECT i, l, s, b, d2 FROM $Db.t_pos"

@@ -16,7 +16,7 @@ Spark's and Iceberg's, apart from an opt-in columnar deletion-vector writer for 
   deletion vectors and equality deletes itself, and reads `_file`, `_pos` and `_spec_id`.
 - **When it is declined:** the whole scan or a single task group is read by Iceberg's vectorized reader, and our
   operators adapt its batches. That reader is also the path when the switch is off. Declined are some v3 and
-  other column types, other metadata columns, name mappings, nested initial defaults, and ORC, Avro or
+  other column types, other metadata columns, nested initial defaults, and ORC, Avro or
   encrypted files.
 - **No Comet:** Comet is not needed for any of this.
 
@@ -45,7 +45,7 @@ Format version 1 reads as version 2 does, without delete files.
 | Equality deletes | yes, or group | Read natively when every equality column is a top-level column of a native type. Columns the query does not project are added for the match and dropped afterwards. Iceberg's `DeleteFilter` semantics apply, nulls matching nulls. A nested equality column, or one of another type, sends the group to Iceberg's reader |
 | Schema evolution: add, drop, rename, reorder | yes | Columns are matched by Iceberg field id, never by name. A column added after a file was written reads as nulls from that file |
 | Type promotion (int to long, float to double, decimal precision) | yes | The native reader widens a file's narrower type as it does for Parquet tables, with and without position deletes and deletion vectors; a pushed filter compares the old files' narrow statistics with the wide literal. A decimal promoted past 18 digits reads its 64-bit files into a DECIMAL128 lane |
-| Name mapping (`schema.name-mapping.default`) | scan | Files may carry no field ids |
+| Name mapping (`schema.name-mapping.default`) | yes | A file written without field ids (a table migrated or imported from plain Parquet, `migrate` or `add_files`) gets each column's Iceberg field id from the mapping by name, nested fields included, before our reader resolves its columns. Old names stay aliases after a rename, as Iceberg keeps them. A file that falls back to Spark's reader is read by name (#849) |
 | Hidden partitioning and partition transforms (identity, bucket, truncate, year, month, day, hour) | yes | Iceberg's planning prunes by every transform. Partition values are read from the files, not filled in as constants |
 | Partition-spec evolution | yes | Each file is planned and pruned under its own spec |
 | Filter pushdown | yes | The filter above the scan skips row groups and pages by their statistics. Each column is matched to the file's by field id, so a renamed column is tested under its name in the file, and a conjunct on a column a file lacks is not pushed for that file |
@@ -101,7 +101,6 @@ At plan time the node declines, and Spark's `BatchScanExec` stays:
 - a scan that reports an ordering;
 - a scan Iceberg does not vectorize (nested columns) with a task group our reader cannot read: an ORC or Avro
   file, an encrypted file, or equality deletes on a column it does not read;
-- a table with a name mapping;
 - a metadata column other than `_file`, `_pos` and `_spec_id`;
 - a nested field with an initial default, or a top-level default our reader cannot fill as a constant;
 - a column type outside the flat types in the table above, or a nested type with such a leaf.
