@@ -74,6 +74,8 @@ final class BinaryChunkWriter implements ChunkWriter {
     private final ByteSink plain = new ByteSink(64 * 1024);
     private byte[] min;
     private byte[] max;
+    private MemorySegment minSeg;
+    private MemorySegment maxSeg;
     private long[] pageSeen = new long[16];
 
     // The chunk's dictionary.
@@ -207,7 +209,7 @@ final class BinaryChunkWriter implements ChunkWriter {
         int h = hash(data, start, len);
         int mask = table.length - 1;
         int slot = h & mask;
-        MemorySegment entries = MemorySegment.ofArray(entryBytes.array());
+        MemorySegment entries = entryBytes.segment();
         while (true) {
             int e = table[slot];
             if (e == 0) {
@@ -267,7 +269,7 @@ final class BinaryChunkWriter implements ChunkWriter {
         plain.reset();
         min = null;
         max = null;
-        MemorySegment entries = MemorySegment.ofArray(entryBytes.array());
+        MemorySegment entries = entryBytes.segment();
         for (int k = 0; k < pageValues; k++) {
             int s = entryStart[ids[k]];
             int l = entryStart[ids[k] + 1] - s;
@@ -280,13 +282,17 @@ final class BinaryChunkWriter implements ChunkWriter {
     private void updateMinMax(MemorySegment data, int start, int len) {
         if (min == null) {
             min = copy(data, start, len);
+            minSeg = MemorySegment.ofArray(min);
             max = min;
+            maxSeg = minSeg;
             return;
         }
-        if (compare(data, start, len, min) < 0) {
+        if (compare(data, start, len, minSeg) < 0) {
             min = copy(data, start, len);
-        } else if (compare(data, start, len, max) > 0) {
+            minSeg = MemorySegment.ofArray(min);
+        } else if (compare(data, start, len, maxSeg) > 0) {
             max = copy(data, start, len);
+            maxSeg = MemorySegment.ofArray(max);
         }
     }
 
@@ -301,20 +307,20 @@ final class BinaryChunkWriter implements ChunkWriter {
      * with {@code b}.
      */
     private static int compare(MemorySegment data, int start, int len,
-            byte[] b) {
-        MemorySegment other = MemorySegment.ofArray(b);
+            MemorySegment other) {
+        long n = other.byteSize();
         long m = MemorySegment.mismatch(data, start, start + len, other, 0,
-                b.length);
+                n);
         if (m < 0) {
             return 0;
         }
         if (m == len) {
             return -1;
         }
-        if (m == b.length) {
+        if (m == n) {
             return 1;
         }
-        return Integer.compare(data.get(ValueLayout.JAVA_BYTE, start + m) & 0xFF, b[(int) m] & 0xFF);
+        return Integer.compare(data.get(ValueLayout.JAVA_BYTE, start + m) & 0xFF, other.get(ValueLayout.JAVA_BYTE, m) & 0xFF);
     }
 
     void flushPage() throws IOException {
@@ -374,7 +380,7 @@ final class BinaryChunkWriter implements ChunkWriter {
         } else {
             Arrays.fill(pageSeen, 0, words, 0L);
         }
-        MemorySegment entries = MemorySegment.ofArray(entryBytes.array());
+        MemorySegment entries = entryBytes.segment();
         for (int k = 0; k < pageValues; k++) {
             int id = ids[k];
             long bit = 1L << id;
@@ -391,7 +397,7 @@ final class BinaryChunkWriter implements ChunkWriter {
         flushPage();
         if (dictionaryPagesWritten > 0) {
             ByteSink d = new ByteSink((int) dictionaryByteSize);
-            MemorySegment entries = MemorySegment.ofArray(entryBytes.array());
+            MemorySegment entries = entryBytes.segment();
             for (int e = 0; e < entryCount; e++) {
                 int s = entryStart[e];
                 int l = entryStart[e + 1] - s;

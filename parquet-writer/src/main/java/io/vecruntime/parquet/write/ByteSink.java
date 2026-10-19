@@ -47,6 +47,11 @@ final class ByteSink {
         return buf;
     }
 
+    /** The bytes as a segment, valid until the next append that grows the buffer. */
+    MemorySegment segment() {
+        return seg;
+    }
+
     void reset() {
         size = 0;
     }

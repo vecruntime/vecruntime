@@ -60,6 +60,11 @@ final class FixedWidthChunkWriter implements ChunkWriter {
 
     enum Kind {
         INT32(4),
+        /**
+         * A decimal of precision up to 9 carried in an INT64 lane of unscaled
+         * values, written as INT32.
+         */
+        INT32_FROM_INT64(4),
         INT64(8),
         DOUBLE(8);
 
@@ -110,13 +115,21 @@ final class FixedWidthChunkWriter implements ChunkWriter {
         }
         var type = column.getPrimitiveType();
         var logical = type.getLogicalTypeAnnotation();
+        var p = type.getPrimitiveTypeName();
+        boolean millis = logical instanceof org.apache.parquet.schema.LogicalTypeAnnotation.TimestampLogicalTypeAnnotation ts && ts.getUnit() == org.apache.parquet.schema.LogicalTypeAnnotation.TimeUnit.MILLIS;
+        boolean decimal = logical instanceof org.apache.parquet.schema.LogicalTypeAnnotation.DecimalLogicalTypeAnnotation;
         return switch (lane) {
-            case INT32 -> type.getPrimitiveTypeName() == org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.INT32 ? Kind.INT32 : null;
-            case INT64 ->
-                    type.getPrimitiveTypeName() == org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.INT64 && !(logical instanceof org.apache.parquet.schema.LogicalTypeAnnotation.TimestampLogicalTypeAnnotation ts && ts.getUnit() == org.apache.parquet.schema.LogicalTypeAnnotation.TimeUnit.MILLIS)
-                            ? Kind.INT64
-                            : null;
-            case FLOAT64 -> type.getPrimitiveTypeName() == org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.DOUBLE ? Kind.DOUBLE : null;
+            case INT32 -> p == org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.INT32 ? Kind.INT32 : null;
+            case INT64 -> {
+                if (p == org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.INT64 && !millis) {
+                    yield Kind.INT64;
+                }
+                if (p == org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.INT32 && decimal) {
+                    yield Kind.INT32_FROM_INT64;
+                }
+                yield null;
+            }
+            case FLOAT64 -> p == org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.DOUBLE ? Kind.DOUBLE : null;
             default -> null;
         };
     }
@@ -158,6 +171,7 @@ final class FixedWidthChunkWriter implements ChunkWriter {
             }
             long raw = switch (kind) {
                 case INT32 -> data.get(LE_INT, (long) i << 2);
+                case INT32_FROM_INT64 -> (int) data.get(LE_LONG, (long) i << 3);
                 case INT64 -> data.get(LE_LONG, (long) i << 3);
                 case DOUBLE -> Double.doubleToRawLongBits(data.get(LE_DOUBLE, (long) i << 3));
             };
@@ -289,7 +303,7 @@ final class FixedWidthChunkWriter implements ChunkWriter {
     private void writePlain(long[] raw, int n, ByteSink out) {
         out.ensure(n * kind.width);
         for (int k = 0; k < n; k++) {
-            if (kind == Kind.INT32) {
+            if (kind.width == 4) {
                 out.writeIntLE((int) raw[k]);
             } else {
                 out.writeLongLE(raw[k]);
@@ -304,7 +318,7 @@ final class FixedWidthChunkWriter implements ChunkWriter {
             return s;
         }
         switch (kind) {
-            case INT32 -> {
+            case INT32, INT32_FROM_INT64 -> {
                 int min = Integer.MAX_VALUE, max = Integer.MIN_VALUE;
                 for (int k = 0; k < pageValues; k++) {
                     int x = (int) values[k];
