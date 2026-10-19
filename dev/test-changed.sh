@@ -83,7 +83,7 @@ areas_of() {
   [[ $p =~ Write ]] && { add_tags Write; hit=1; }
   [[ $p =~ /comet/|Comet ]] && { add_tags Comet; hit=1; }
   [[ $p =~ /agg/|Aggregate|Rollup|Expand|GroupKeys|ObjectAgg|KeyStats ]] && { add_tags Agg; hit=1; }
-  [[ $p =~ Join|Bloom|Dpp|RuntimeFilter|Broadcast|Hash ]] && { add_tags Join; hit=1; }
+  [[ $p =~ Join|Bloom|Dpp|RuntimeFilter|Broadcast ]] && { add_tags Join; hit=1; }
   [[ $p =~ Sort|Window|Limit|TakeOrdered ]] && { add_tags SortWindow; hit=1; }
   [[ $p =~ Nested|Generate|Structural|Lambda ]] && { add_tags Nested; hit=1; }
   [[ $p =~ /expr/|Filter|Project|Cast|Formatters|Errors ]] && { add_tags Expr; hit=1; }

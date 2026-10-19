@@ -48,6 +48,7 @@ unset JAVA_TOOL_OPTIONS; export JAVA_HOME=/path/to/jdk-25
 mvn -B -q clean install                    # kernels + Spark suites, Comet suites skipped (~3 min)
 mvn -B -q -Pcomet clean install            # also the Comet-backed suites (needs the Comet jar in ~/.m2)
 mvn -B -q -Pcomet,iceberg clean install    # plus the Iceberg suites (Iceberg 1.11 runtime from Maven Central)
+dev/test-changed.sh                         # the fast loop: changed modules + the spark suites of the changed areas (docs/testing.md section 5)
 mvn -B -Pcomet,iceberg -pl kernels,spark,shuffle,benchmarks install   # THE GATE every change runs before a PR
 mvn -pl kernels test -Dvector.jvm.args="--add-modules=jdk.incubator.vector --enable-native-access=ALL-UNNAMED --sun-misc-unsafe-memory-access=allow -Dvecruntime.vectorBits=512"
 mvn -pl spark install -Dsuites=io.vecruntime.spark.VectorAggregateSuite   # one suite
@@ -106,7 +107,9 @@ under test.
   queries the change should not help (q67, q18), so a regression elsewhere shows up.
 - **Testing conventions.** Correctness first, by comparison with an oracle: the scalar reference for
   kernels, Spark itself for SQL (`checkVectorized` / `checkFallback`), byte-for-byte results for
-  shuffle and Iceberg writes. Every change runs the gate above, exit 0; planner or expression changes
+  shuffle and Iceberg writes. A new `spark` suite carries an area tag (`io.vecruntime.spark.test.tags.*`;
+  `dev/test-changed.sh` refuses to run while one has none). While working, `dev/test-changed.sh` runs what a
+  change affects; every change still runs the gate above once, exit 0, on its final commit; planner or expression changes
   also run the SQL golden suite with no arguments and must hold its coverage floor (section 7.2). A
   performance claim needs a measurement (JMH for the kernel itself; a run on real executors, with
   matching checksums, for any claim about queries -- see the JMH rule above); a
