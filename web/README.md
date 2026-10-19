@@ -86,9 +86,9 @@ benchmarks/scripts/render-graviton-page.py \
   --out   docs/benchmarks/tpcds-1tb-graviton.html \
   --web-out web/site/benchmarks/tpcds-1tb-graviton.html --web-base /vecruntime
 
-R=benchmarks/results/tpcds-sf3000-doeks-2026-10-16
+R=benchmarks/results/tpcds-sf3000-doeks-2026-10-18
 benchmarks/scripts/render-doeks-page.py \
-  --vector $R/vecruntime-p200.jsonl --vector-label "VecRuntime (200 partitions)" --meta $R/meta.json \
+  --vector $R/vecruntime-p300.jsonl --vector-label "VecRuntime (300 partitions)" --meta $R/meta.json \
   --gluten $R/doeks-gluten-velox-1.6.0-arm64.csv --comet $R/doeks-comet-0.16.0.csv \
   --out   docs/benchmarks/tpcds-3tb-graviton.html \
   --web-out web/site/benchmarks/tpcds-3tb-graviton.html --web-base /vecruntime

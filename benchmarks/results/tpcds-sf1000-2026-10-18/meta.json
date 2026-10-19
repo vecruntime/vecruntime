@@ -1,11 +1,11 @@
 {
   "title": "Apache Spark vs VecRuntime vs DataFusion Comet on TPC-DS 1 TB",
   "dataset": "TPC-DS scale factor 1000 (1 TB), Parquet on Amazon S3 (103 query variants, one measured iteration each, no warm-up), no table statistics",
-  "cluster": "Amazon EKS 1.36; 9 x m5.4xlarge (16 vCPU, 64 GB, x86-64 with AVX-512); one node group in us-east-1b for Spark and VecRuntime on 2026-10-18 (us-east-1a for Comet on 2026-10-03), the driver on the ninth node",
+  "cluster": "Amazon EKS 1.36; 9 x m5.4xlarge (16 vCPU, 64 GB, x86-64 with AVX-512); one node group in us-east-1b for VecRuntime on 2026-10-18 and Spark on 2026-10-10 (us-east-1a for Comet on 2026-10-03), the driver on the ninth node",
   "executors": "8 executors x 13 cores x 50 GB each (Spark and VecRuntime: 30 GB heap / 20 GB overhead; Comet: 20 GB heap / 8 GB overhead / 22 GB off-heap); driver 2 cores x 4 GB",
-  "storage": "Amazon S3 through an S3 gateway VPC endpoint, Hadoop 3.4.3 S3A. Spark and VecRuntime (2026-10-18): the classic input stream (fs.s3a.input.stream.type=classic, the Analytics Accelerator off, #835). Comet (2026-10-03): the Analytics Accelerator stream, S3A's default. fs.s3a.connection.maximum=1000, threads.max=256, max.total.tasks=128 for every engine",
+  "storage": "Amazon S3 through an S3 gateway VPC endpoint, Hadoop 3.4.3 S3A. VecRuntime (2026-10-18): the classic input stream (fs.s3a.input.stream.type=classic, the Analytics Accelerator off, #835). Spark (2026-10-10) and Comet (2026-10-03): the Analytics Accelerator stream, S3A's default. fs.s3a.connection.maximum=1000, threads.max=256, max.total.tasks=128 for every engine",
   "versions": {
-    "Spark": "4.1.3",
+    "Spark": "4.1.3 (2026-10-10 session)",
     "Scala": "2.13",
     "JDK": "Amazon Corretto 25, -XX:+UseCompactObjectHeaders and Amazon Corretto Crypto Provider on driver and executors (#578, #566)",
     "VecRuntime": "main at af9d367 (2026-10-18)",
@@ -44,18 +44,18 @@
   ],
   "notes": [
     "Every engine returned Spark's row counts on every query, and Spark's checksums on every query except q65, whose result has ties that every engine orders differently.",
-    "Spark and VecRuntime ran on 2026-10-10 in one cluster session on the same nine nodes, one after another, each alone on the cluster. The Comet column is Comet 1.0.0's leg of the 2026-10-03 session (same image settings, S3A settings and node type, another availability zone, without the 64 MB shuffled-hash-join threshold). S3 throughput varies between sessions, so the Comet comparison crosses sessions.",
-    "Spark's total is 2,997 s on 2026-10-10, against 3,132 s on 2026-10-08 and 2,963 s on 2026-10-03: its scan-bound queries move with S3 throughput between sessions (q88 130.6 s on 2026-10-10, 153.2 s on 2026-10-08).",
-    "The 64 MB shuffled-hash-join threshold moves Spark's own plans: sort-merge joins become shuffled hash joins in q93, q23a/b, q64 and q50 (faster) and in q95's web_sales self-join (170.6 s against 98.4 s without it).",
-    "Comet is the 1.0.0 release from Maven Central. The S3A settings, ACCP and compact object headers are the benchmark launcher's defaults since #566 and #578 and apply to all engines.",
+    "The columns come from three sessions on the same node type and S3 data: VecRuntime 2026-10-18 (classic stream), Spark 2026-10-10 and Comet 1.0.0 2026-10-03 (both on the Analytics Accelerator). S3 throughput varies between sessions, so every comparison crosses sessions.",
+    "Each engine is shown on the S3 stream that is faster for it. VecRuntime's own Parquet reader plans and prefetches its ranges itself and is faster on the classic stream on long applications (#835). Spark's reader issues one column-chunk read at a time and relies on the Analytics Accelerator's footer cache and range prefetch: on the classic stream on 2026-10-18 Spark took 3,642 s (q88 214.0 s, q28 162.3, q9 133.8), against 2,997 s on 2026-10-10. Those classic-stream timings are kept as spark-classic.jsonl.",
+    "The 64 MB shuffled-hash-join threshold moves Spark's own plans: sort-merge joins become shuffled hash joins in q93, q23a/b, q64 and q50 (faster) and in q95's web_sales self-join (170.6 s against 98.4 s without it). The 2026-10-03 Comet leg ran without it.",
+    "Comet is the 1.0.0 release from Maven Central. Comet 1.1.0 was tried on 2026-10-18 and stopped after q14a took 967 s. The S3A settings, ACCP and compact object headers are the benchmark launcher's defaults since #566 and #578 and apply to all engines.",
     "AQE is at its defaults for every engine apart from the shuffled-hash-join threshold."
   ],
-  "methodology_html": "<p><b>Methodology.</b> Spark and VecRuntime ran one after another in one cluster session on 2026-10-18, on the same nine nodes, each alone on its nodes, over the same S3 data with the same Spark settings and S3A's classic input stream; Comet 1.0.0 is its leg of the 2026-10-03 session on the same node type, on S3A's default Analytics Accelerator stream. Each query ran once after the plan was compiled; the time is the wall-clock of the query's execution as the runner measures it.</p>",
-  "wins_html": "<p>The scan-bound queries are VecRuntime's, on its own Parquet reader: q88 5.5 s against Spark's 130.6 and Comet's 83.0; q90 4.6 against 34.8 and 27.8; q9 11.4 against 97.1 and 52.0; q28 27.1 against 111.8 and 69.2. So are the heavy joins: q95 10.6 against 170.6 and 54.6; q93 16.2 against 86.1 and 76.9; q23b 30.7 against 231.5 and 133.2; q64 26.8 against 61.7 and 54.7; and the heavy aggregates (q4 33.7 against 88.1 and 51.4). Comet leads on q47 (9.0 s against VecRuntime's 22.8) and q57 (4.9 against 11.1), on q44, q18, q65 and q34, and by fractions of a second on a set of short queries. VecRuntime's losses to Spark are q47 (22.8 s against 12.0), q57 (11.1 against 6.5) and q44 (35.7 against 35.0).</p>",
+  "methodology_html": "<p><b>Methodology.</b> VecRuntime ran on 2026-10-18 on S3A's classic input stream. The Spark column is Spark's leg of the 2026-10-10 session and the Comet column Comet 1.0.0's leg of the 2026-10-03 session, both on the same node type and S3 data, on S3A's default Analytics Accelerator stream, which suits Spark's Parquet reader better: Spark on the classic stream took 3,642 s on 2026-10-18, against 2,997 s on the Analytics Accelerator. Each query ran once after the plan was compiled; the time is the wall-clock of the query's execution as the runner measures it.</p>",
+  "wins_html": "<p>The scan-bound queries are VecRuntime's, on its own Parquet reader: q88 6.4 s against Spark's 130.6 and Comet's 83.0; q90 6.1 against 34.8 and 27.8; q9 14.0 against 97.1 and 52.0; q28 27.5 against 111.8 and 69.2. So are the heavy joins: q95 15.9 against 170.6 and 54.6; q93 17.0 against 86.1 and 76.9; q23b 31.4 against 231.5 and 133.2; q64 26.9 against 61.7 and 54.7; and the heavy aggregates (q4 31.6 against 88.1 and 51.4). q47 (7.8 s against Spark's 12.0 and Comet's 9.0) and q44 (14.1 against 35.0 and 24.1) are VecRuntime's now too. Comet leads on q18 (3.7 s against VecRuntime's 7.9), q79 (3.4 against 7.1), q19, q39a/b, q61 and q57, and by fractions of a second on a set of short queries. VecRuntime's losses to Spark are q18 (7.9 s against 6.3), q79 (7.1 against 5.2), q83 (1.9 against 1.5) and q36 (5.6 against 5.5).</p>",
   "results_doc": "https://github.com/vecruntime/vecruntime/blob/main/docs/results.md",
   "repo": "https://github.com/vecruntime/vecruntime",
   "run_doc": "https://github.com/vecruntime/vecruntime/blob/main/benchmarks/k8s/README.md",
-  "vector_vs_comet": " and leads on the scan-bound queries, the heavy joins and the heavy aggregates; Comet leads on q47, q57, q44 and q18",
+  "vector_vs_comet": " and leads on the scan-bound queries, the heavy joins and the heavy aggregates; Comet leads on q18, q79, q19, q39a/b, q61 and q57",
   "results_line": "Every engine returned Spark's results (q65: ties, ordered differently by every engine).",
   "query_notes": {
     "q65": "ties"
