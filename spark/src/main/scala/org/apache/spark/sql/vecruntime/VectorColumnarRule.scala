@@ -762,6 +762,8 @@ case class VectorExecRule(session: SparkSession) extends Rule[SparkPlan] with Lo
         case f: VectorFilterExec if !f.emitSelection => f.copy(emitSelection = true)
         case p: VectorProjectExec if !p.emitSelection => p.copy(emitSelection = true)
         case s: VectorSampleExec if !s.emitSelection => s.copy(emitSelection = true)
+        // #735: the native Iceberg scan deselects deleted rows; compacted unless an operator of ours reads it.
+        case i: VectorIcebergScanExec if !i.emitSelection => i.copy(emitSelection = true)
         case other => other
       })
   }

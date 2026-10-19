@@ -75,6 +75,25 @@ class IcebergNativeScanSuite extends IcebergMorSuiteBase {
     checkVectorized("SELECT s, count(*), sum(l) FROM t WHERE i % 3 = 1 GROUP BY s", Seq(Filter, Agg))
   }
 
+  icebergTest("deleted rows stay deleted when a Spark row operator reads the scan directly") {
+    // A Scala UDF is not one of our expressions: Spark's filter and aggregate stay, over a ColumnarToRow that
+    // reads every physical row of a batch, so the scan must hand it only the rows its deletes keep.
+    spark.udf.register("andr_keep", (i: Int) => i % 3 != 1)
+    Seq("t_pos", "t_dv", "t_eq").foreach { name =>
+      useTable(name)
+      Seq(
+        "SELECT count(*), sum(l), min(i), max(i) FROM t WHERE andr_keep(i)",
+        "SELECT s, count(*), sum(l) FROM t WHERE andr_keep(i) GROUP BY s",
+        "SELECT i, l, s FROM t WHERE andr_keep(i) AND i % 101 = 5"
+      ).foreach { q =>
+        val df = checkVectorized(q, Nil)
+        assert(df.collect().nonEmpty, s"the query should return rows: $q")
+        val (native, iceberg) = groups(df)
+        assert(native > 0 && iceberg == 0, s"$name native $native, Iceberg $iceberg: $q")
+      }
+    }
+  }
+
   icebergTest("deletion vectors are applied natively as a selection") {
     useTable("t_dv")
     val df = checkVectorized("SELECT count(*), sum(d2), min(i), max(i) FROM t", Seq(Agg))
