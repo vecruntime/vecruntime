@@ -604,7 +604,8 @@ object VectorIcebergScanPlanner {
 private[vecruntime] object IcebergTasks {
 
   // Iceberg types whose Spark type and Parquet encoding our reader decodes as Iceberg's reader does. Not: uuid
-  // (16 bytes in the file, a string in Spark), fixed, time, timestamp_ns, variant, geometry, unknown.
+  // (16 bytes in the file, a string in Spark), fixed, time, timestamp_ns, geometry, unknown. A variant column is
+  // read natively too (see unsupportedType), but is never an equality column.
   private val NativeTypes =
     Set("BOOLEAN", "INTEGER", "LONG", "FLOAT", "DOUBLE", "DATE", "TIMESTAMP", "STRING", "BINARY", "DECIMAL")
 
@@ -750,6 +751,9 @@ private[vecruntime] object IcebergTasks {
         unsupportedType(call(icebergType, "keyType"), s"$path.key")
           .orElse(unsupportedType(call(icebergType, "valueType"), s"$path.value"))
       case t if NativeTypes.contains(t) => None
+      // A v3 variant, shredded or not: Iceberg writes the spec's Parquet variant group (metadata, value and the
+      // shredded typed_value), which our reader reads as it reads Spark's (#787, #812).
+      case "VARIANT" => None
       case t => Some(s"Iceberg type $t of $path")
     }
 
