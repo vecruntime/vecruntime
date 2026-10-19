@@ -73,7 +73,7 @@ Everything in the version 2 table applies. The version 3 additions:
 | Default values: `initial-default` | yes, or scan | A top-level column's default is filled into the files written before the column existed, as a constant (Spark's existence default), for boolean, int, long, float, double, decimal, string, binary, date and timestamp columns. A default on a nested field, or of another type, keeps Iceberg's reader for the scan |
 | Default values: `write-default` | n/a | Applied by Iceberg's writer |
 | Row lineage (`_row_id`, `_last_updated_sequence_number`) | scan | Iceberg derives them from the manifests and the files' first row ids |
-| `variant`, shredded or not | scan or row | Our Parquet reader reads Spark's `variant` and shredded variants for Parquet tables (#787, #812), but the Iceberg path does not use it yet |
+| `variant`, shredded or not | yes | Iceberg writes the spec's Parquet variant group, with `typed_value` when `write.parquet.shred-variants` is on. Our Parquet reader reads it as it reads Spark's variants (#787, #812), at the top level and inside structs, under deletes. Iceberg's own vectorized reader cannot read a shredded variant ("Unsupported variant: shredded typed_value primitive"); our scan reads it either way |
 | `timestamp_ns`, `timestamptz_ns` | scan | |
 | `geometry`, `geography` | scan or row | |
 | `unknown` | scan | |

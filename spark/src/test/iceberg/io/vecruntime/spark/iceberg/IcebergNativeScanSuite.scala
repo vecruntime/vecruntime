@@ -355,10 +355,13 @@ class IcebergNativeScanSuite extends IcebergMorSuiteBase {
   icebergTest("v3 variant columns, shredded or not, are read natively, also under deletion vectors") {
     Seq(false, true).foreach { shred =>
       val name = s"t_variant_${if (shred) "shredded" else "plain"}"
+      // Iceberg's vectorized reader cannot read a shredded variant ("Unsupported variant: shredded typed_value
+      // primitive"), so the shredded table is read row-wise by Iceberg: Spark's reference results, and the DELETE.
+      // Our scan then takes the non-vectorized path, every task group read natively.
       spark.sql(
         s"""CREATE OR REPLACE TABLE $Db.$name (k INT, v VARIANT, s STRUCT<w: VARIANT, n: INT>) USING iceberg
            |TBLPROPERTIES ('format-version' = '3', 'write.delete.mode' = 'merge-on-read',
-           |  'write.parquet.shred-variants' = '$shred')""".stripMargin
+           |  'write.parquet.shred-variants' = '$shred', 'read.parquet.vectorization.enabled' = '${!shred}')""".stripMargin
       )
       spark.sql(
         s"""INSERT INTO $Db.$name SELECT CAST(id AS INT),
