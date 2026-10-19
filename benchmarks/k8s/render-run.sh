@@ -194,8 +194,11 @@ cat <<EOF
     labels:
       app: vecruntime-bench
 EOF
-if [ -n "$NODE_SELECTOR" ]; then
-  echo "    nodeSelector:"; echo "      ${NODE_SELECTOR%%=*}: \"${NODE_SELECTOR#*=}\""
+# DRIVER_NODE_SELECTOR (default NODE_SELECTOR): the driver on its own node group, so the executors' nodes hold
+# one full-size executor each.
+DRIVER_SEL="${DRIVER_NODE_SELECTOR-$NODE_SELECTOR}"
+if [ -n "$DRIVER_SEL" ]; then
+  echo "    nodeSelector:"; echo "      ${DRIVER_SEL%%=*}: \"${DRIVER_SEL#*=}\""
 fi
 cat <<EOF
   executor:
