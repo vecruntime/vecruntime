@@ -30,12 +30,14 @@ public final class VectorAllocators {
     private VectorAllocators() {}
 
     /**
-     * #868: the executor's cap on Arrow memory -- the Flight shuffle's server and client buffers, the
-     * shuffle readers' batches, the operators' output vectors -- all of which share this root. The
-     * Flight server's threads and the buffers that outlive their task cannot be charged to a task's
-     * {@code TaskMemoryManager}, so the budget is the executor's: past it an allocation fails with
-     * Arrow's {@code OutOfMemoryException} (the task fails and is retried) instead of the container
-     * being killed. {@code Long.MAX_VALUE} (the default) for no cap.
+     * #868: the executor's cap on Arrow memory -- the Flight shuffle's server
+     * and client buffers, the shuffle readers' batches, the operators' output
+     * vectors -- all of which share this root. The Flight server's threads and
+     * the buffers that outlive their task cannot be charged to a task's {@code
+     * TaskMemoryManager}, so the budget is the executor's: past it an
+     * allocation fails with Arrow's {@code OutOfMemoryException} (the task
+     * fails and is retried) instead of the container being killed. {@code
+     * Long.MAX_VALUE} (the default) for no cap.
      */
     public static void setLimit(long bytes) {
         ROOT.setLimit(bytes <= 0 ? Long.MAX_VALUE : bytes);
