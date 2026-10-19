@@ -38,6 +38,8 @@ class NativeParquetColumnIndexSuite extends VectorQuerySuite {
   override protected def extraSparkConf: Map[String, String] =
     super.extraSparkConf ++ Map(
       VectorConf.ScanNativeParquet -> "true",
+      // Off by default since #873; this suite tests the page filtering itself.
+      "parquet.filter.columnindex.enabled" -> "true",
       "parquet.block.size" -> (1024 * 1024).toString,
       "parquet.page.size" -> (2 * 1024).toString,
       "parquet.page.row.count.limit" -> "700",
