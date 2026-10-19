@@ -40,6 +40,17 @@ import org.apache.spark.sql.vectorized.{ColumnarBatch, ColumnVector}
  * emitted can be gathered from the batch they refer to, and the next batch is loaded after. An
  * output batch is therefore up to `OutputBatchSize` rows, fewer where a spilled run's batch ended.
  */
+private[vecruntime] object VectorSortIterator {
+
+  /** #867: the pool the sort's memory comes from: off-heap execution memory when Spark has one. */
+  def memoryMode(): org.apache.spark.memory.MemoryMode = {
+    val env = org.apache.spark.SparkEnv.get
+    if (env != null && env.conf.getBoolean("spark.memory.offHeap.enabled", false))
+      org.apache.spark.memory.MemoryMode.OFF_HEAP
+    else org.apache.spark.memory.MemoryMode.ON_HEAP
+  }
+}
+
 private[vecruntime] class VectorSortIterator(
     input: Iterator[ColumnarBatch],
     keyExprs: Array[VectorExpr],
@@ -82,11 +93,12 @@ private[vecruntime] class VectorSortIterator(
       val keys: Array[VectorBuffers],
       val rows: Int,
       val bytes: Long,
-      val arena: Arena
+      val arena: Arena,
+      builders: Array[ColumnBuilder] // #867: owning builders whose views the run holds
   ) extends Run {
     val permutation: Array[Int] = SortKernels.sortIndices(keys, ascending, nullsFirst, rows)
     val kept: Int = math.min(rows, limit)
-    def close(): Unit = arena.close()
+    def close(): Unit = { builders.foreach(_.close()); arena.close() }
   }
 
   /**
@@ -146,8 +158,57 @@ private[vecruntime] class VectorSortIterator(
   private var sorted = false
   private val runs = ArrayBuffer.empty[Run]
 
-  /** Bytes of the runs held in memory (sealed and being built), the quantity `spillBytes` bounds. */
+  /** Bytes of the sealed runs held in memory: their builders' allocated capacity (#867). */
   private var residentBytes = 0L
+
+  /**
+   * #867: the sort's memory from Spark's execution memory, as the task's share of the executor's pool: OFF_HEAP
+   * when `spark.memory.offHeap.enabled` (our runs are native), else ON_HEAP as the hash aggregate's (#367). The
+   * runs' allocated bytes are acquired as they grow, a refusal seals and spills, and another consumer of the task
+   * can ask the sort to spill its sealed runs while it drains. `spillBytes` stays a hard cap.
+   */
+  private val consumer: SortMemoryConsumer =
+    Option(TaskContext.get()).map(tc => new SortMemoryConsumer(tc.taskMemoryManager())).orNull
+  private var reserved = 0L
+  private var draining = false
+
+  private final class SortMemoryConsumer(tmm: org.apache.spark.memory.TaskMemoryManager)
+      extends org.apache.spark.memory.MemoryConsumer(tmm, tmm.pageSizeBytes(), VectorSortIterator.memoryMode()) {
+    override def spill(size: Long, trigger: org.apache.spark.memory.MemoryConsumer): Long =
+      if ((trigger eq this) || !draining || hasNested) 0L else spillResident(size)
+  }
+
+  /** Holds `bytes` of the pool for the sort, acquiring what is missing; false when the pool grants less. */
+  private def hold(bytes: Long): Boolean = {
+    if (consumer == null || bytes <= reserved) return true
+    reserved += consumer.acquireMemory(bytes - reserved)
+    reserved >= bytes
+  }
+
+  /** Returns what the sort holds past `bytes` to the pool. */
+  private def releaseTo(bytes: Long): Unit =
+    if (consumer != null && reserved > bytes) {
+      val give = reserved - math.max(bytes, 0L)
+      consumer.freeMemory(give)
+      reserved -= give
+    }
+
+  /** Spills sealed in-memory runs, the largest first, until `size` bytes are freed; the bytes freed. */
+  private def spillResident(size: Long): Long = {
+    var freed = 0L
+    val inMemory = runs.indices.collect { case i if runs(i).isInstanceOf[MemoryRun] => i }
+      .sortBy(i => -runs(i).asInstanceOf[MemoryRun].bytes)
+    val it = inMemory.iterator
+    while (freed < size && it.hasNext) {
+      val i = it.next()
+      val r = runs(i).asInstanceOf[MemoryRun]
+      runs(i) = spill(r)
+      residentBytes -= r.bytes
+      freed += r.bytes
+    }
+    if (freed > 0) releaseTo(reserved - freed)
+    freed
+  }
 
   /** Runs written to disk and their bytes, for the operator's description and the tests. */
   var spilledRuns = 0
@@ -197,20 +258,6 @@ private[vecruntime] class VectorSortIterator(
         allocator
       )
     } finally arena.close()
-  }
-
-  private def estimateBytes(in: VectorBuffers, count: Int): Long = {
-    val n = math.max(in.length(), 1)
-    val perRow: Long = in.`type`() match {
-      case VecType.UTF8 =>
-        val off = in.offsets()
-        val data = if (off == null) 0L
-        else off.get(VectorBuffers.LE_INT, n.toLong << 2).toLong - off.get(VectorBuffers.LE_INT, 0L)
-        4L + math.max(0L, data) / n
-      case VecType.BOOL => 1L
-      case t => math.max(1, t.byteWidth)
-    }
-    perRow * count
   }
 
   /** Writes `run`'s kept rows in sorted order to a local file and frees its memory. */
@@ -274,7 +321,6 @@ private[vecruntime] class VectorSortIterator(
     var keyBuilders: Array[ColumnBuilder] = null
     var runArena: Arena = null
     var runTotal = 0
-    var runBytes = 0L
 
     /** Seals the builders into a run: plain string columns (a dictionary decoded once), the keys, the permutation. */
     def seal(): Unit = {
@@ -291,26 +337,33 @@ private[vecruntime] class VectorSortIterator(
           else { keys(k) = computed(computedIdx); computedIdx += 1 }
           k += 1
         }
-        val run = new MemoryRun(cols, keys, runTotal, runBytes, runArena)
+        val builders = columnBuilders ++ keyBuilders
+        val bytes = builders.map(_.allocatedBytes()).sum
+        val run = new MemoryRun(cols, keys, runTotal, bytes, runArena, builders)
         total += runTotal
-        // Past the budget the newest run goes to disk in sorted order and its memory is returned;
-        // what stays resident is at most the budget plus one run.
-        if (residentBytes > spillLimit) {
+        residentBytes += bytes
+        // Past the budget -- the cap, or what the pool grants this task (#867) -- the newest run goes to disk in
+        // sorted order and its memory is returned, then the largest resident runs until the rest fit.
+        if (!hasNested && (residentBytes > spillLimit || !hold(residentBytes))) {
           runs += spill(run)
-          residentBytes -= runBytes
+          residentBytes -= bytes
+          val allowed = if (consumer == null) spillLimit else math.min(spillLimit, reserved)
+          if (residentBytes > allowed) spillResident(residentBytes - allowed)
+          releaseTo(residentBytes)
         } else {
           runs += run
         }
         runArena = null
       } else if (runArena != null) {
+        (columnBuilders ++ keyBuilders).foreach(_.close())
         runArena.close(); runArena = null
       }
       columnBuilders = null
       keyBuilders = null
       runTotal = 0
-      runBytes = 0L
     }
 
+    draining = true
     while (input.hasNext) {
       val batch = input.next()
       if (batch.numRows() > 0) {
@@ -319,35 +372,50 @@ private[vecruntime] class VectorSortIterator(
           EvalContexts.withBatch(batch) { ctx =>
             val count = ctx.selectedCount
             if (count > 0) {
+              // #867: reserve before growing. A builder doubles when it fills, so the append that crosses a
+              // capacity boundary can double the run's bytes at once; when the grown run would not fit the
+              // budget, the run is sealed (and spilled) as it is and the batch starts a fresh one. The computed
+              // keys are counted at their current capacity; the check after the append covers their growth.
+              if (columnBuilders != null && !hasNested && runTotal > 0) {
+                var projected = residentBytes
+                var c = 0
+                while (c < numColumns) {
+                  projected += columnBuilders(c).bytesAfterAppend(inputLane(ctx, batch, c), ctx.selection, count)
+                  c += 1
+                }
+                keyBuilders.foreach(b => projected += b.allocatedBytes())
+                if (projected > spillLimit || !hold(projected)) seal()
+              }
               if (columnBuilders == null) {
                 val expected = math.max(math.min(runRowLimit, count), 1)
                 runArena = Arena.ofShared()
-                columnBuilders =
-                  Array.tabulate(numColumns)(c =>
-                    new ColumnBuilder(runArena, inputLane(ctx, batch, c).`type`(), expected)
-                  )
-                keyBuilders = Array.tabulate(computedKeys.length)(k =>
-                  new ColumnBuilder(runArena, keyExprs(computedKeys(k)).vecType, expected)
-                )
+                // #867: owning builders -- a buffer the run outgrows is freed at once, where the run's shared arena
+                // kept every doubling's leftovers (a column of C bytes held 2C). Nested lanes stay in the arena.
+                def builder(t: VecType): ColumnBuilder =
+                  if (t.isNested) new ColumnBuilder(runArena, t, expected) else ColumnBuilder.owning(t, expected)
+                columnBuilders = Array.tabulate(numColumns)(c => builder(inputLane(ctx, batch, c).`type`()))
+                keyBuilders = Array.tabulate(computedKeys.length)(k => builder(keyExprs(computedKeys(k)).vecType))
               }
               var c = 0
               while (c < numColumns) {
                 val in = inputLane(ctx, batch, c)
                 columnBuilders(c).append(in, ctx.selection, count)
-                val b = estimateBytes(in, count)
-                runBytes += b; residentBytes += b
                 c += 1
               }
               var k = 0
               while (k < computedKeys.length) {
                 val v = keyExprs(computedKeys(k)).eval(ctx)
                 keyBuilders(k).append(v, ctx.selection, count)
-                val b = estimateBytes(v, count)
-                runBytes += b; residentBytes += b
                 k += 1
               }
               runTotal += count
+              // #867: the run being built counts too: once it and the sealed runs pass the budget (the cap or the
+              // pool's grant) it is sealed now rather than at its row limit, and sealing spills.
               if (runTotal >= runRowLimit) seal()
+              else if (!hasNested && runTotal >= OutputBatchSize) {
+                val building = (columnBuilders ++ keyBuilders).map(_.allocatedBytes()).sum
+                if (residentBytes + building > spillLimit || !hold(residentBytes + building)) seal()
+              }
             }
           }
         }
@@ -355,6 +423,7 @@ private[vecruntime] class VectorSortIterator(
     }
     metrics.timed {
       seal()
+      draining = false
       // Every spilled run's first batch is loaded so the merge can seat it; an empty one leaves.
       val loaded = runs.filter {
         case r: SpilledRun => r.load()
@@ -460,6 +529,7 @@ private[vecruntime] class VectorSortIterator(
       runColumns = null
       runs.foreach(_.close())
       runs.clear()
+      releaseTo(0L)
       allocator.close()
     }
   }

@@ -516,10 +516,11 @@ private[vecruntime] class VectorGroupedAggregateIterator(
   // Spark's execution memory as the arbiter (#367): the estimate is acquired from the task's share of the
   // pool as the table grows, and a refusal -- the executor's tasks share it fairly -- is what triggers the
   // emit or the spill, with the configured threshold as a hard cap. Nothing is spilled on another
-  // consumer's request; the memory is returned on every reset and at close.
+  // consumer's request; the memory is returned on every reset and at close. #867: the off-heap pool when
+  // Spark has one (the table is native), the on-heap one otherwise, as the sort's.
   private val consumer: org.apache.spark.memory.MemoryConsumer = Option(TaskContext.get()).map { tc =>
     val tmm = tc.taskMemoryManager()
-    new org.apache.spark.memory.MemoryConsumer(tmm, tmm.pageSizeBytes(), org.apache.spark.memory.MemoryMode.ON_HEAP) {
+    new org.apache.spark.memory.MemoryConsumer(tmm, tmm.pageSizeBytes(), VectorSortIterator.memoryMode()) {
       override def spill(size: Long, trigger: org.apache.spark.memory.MemoryConsumer): Long = 0L
     }
   }.orNull
