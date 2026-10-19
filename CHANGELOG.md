@@ -4,10 +4,44 @@ All notable changes to vecruntime. The format follows [Keep a Changelog](https:/
 the project uses [semantic versioning](https://semver.org/) once it reaches 1.0 -- until then a minor
 version may change configuration keys or defaults, always noted here.
 
-## Unreleased
+## 0.0.9 -- 2026-10-19
+
+Iceberg tables are read by the native Parquet reader over Iceberg's own planning, with position deletes,
+deletion vectors, equality deletes and metadata columns, and our planner rules (dynamic partition pruning,
+the fact bloom filter, merged scalar subqueries, runtime filters) now apply to Iceberg scans. At TPC-DS 3 TB
+on 12 x r8gd.12xlarge (2026-10-18, one pass), the Iceberg copy ran in 985 s against 995 s for Parquet, after
+1,064 s against 938 s in the previous round. The native Parquet reader decodes the
+remaining file kinds it used to hand to Spark's reader (unsigned ints, wide decimals from ints, intervals,
+TIME, unshredded and shredded VARIANT) and passes the parquet-testing and Hardwood conformance files. The
+benchmarks now read S3 through S3A's classic stream. Fixes a native memory leak of zstd contexts that
+OOM-killed executors at 1 TB.
+
+### Added
+
+- Native Parquet reads over Iceberg's planning (`VectorIcebergScanExec`, #796), Iceberg 1.12.0 (#795):
+  position deletes and v3 deletion vectors (#797), equality deletes (#798), the metadata columns `_file`,
+  `_pos` and `_spec_id` (#799), and the filter above the scan pushed by field id for row-group and page
+  skipping (#800).
+- The native Parquet reader decodes unsigned ints, wide decimals stored as ints, `BYTE_STREAM_SPLIT` on
+  `FIXED_LEN_BYTE_ARRAY` and intervals (#814); existence defaults and all-missing structs, native `TIME` and
+  unshredded and shredded `VARIANT` with pushed extraction, and passes every parquet-testing and Hardwood
+  conformance file (#824, landing #815, #809, #817 and #818; closes #808, #787, #750).
+- Two-pass late materialization (`spark.vecruntime.scan.nativeParquet.lateMaterialization.twoPass`, off by
+  default) reads the decode filter's columns first and skips the I/O of pages with no surviving row (#822).
+- Column-index page filtering for lists and maps, and a pages-skipped metric (#811).
 
 ### Changed
 
+- Our planner rules on Iceberg tables: dynamic partition pruning (#802), the fact bloom filter (#803),
+  merged filtered scalar subqueries (#801); a small Iceberg join input broadcast by its file bytes (#804) and
+  sized by files for runtime filters (#807); no file-byte broadcast for an input a rollup groups by (#813);
+  broadcast-join runtime filters reach the native Iceberg scan (#820); Iceberg task groups packed as Spark
+  packs file splits (#821); no fact bloom filter from a composite input read again (#823, q14a); Spark's
+  runtime filters dropped where our Iceberg broadcast hints remove their shuffle premise (#827, q7/q26/q27).
+- The native Parquet reader reads data pages in place, v2 sections apart (#805), reuses page-decompress
+  buffers and pools chunk buffers (#810), and reads null bits, ints, longs and strings by address (#819).
+- A count-only pass-through forwards batches instead of hashing them, removing `CountBelowJoin`'s cost on
+  a side that does not reduce (#794).
 - The benchmarks read S3 through S3A's classic input stream (`fs.s3a.input.stream.type=classic`) and Iceberg's
   own `S3FileIO` stream (`s3.analytics-accelerator.enabled=false`), not the S3 Analytics Accelerator, for every
   engine (#835). With the Accelerator 1.3.1 every stream open of an executor waits behind one HEAD at a time
@@ -16,6 +50,17 @@ version may change configuration keys or defaults, always noted here.
   Graviton 4 executors, 846.4 s on the Accelerator against 664.4 s on the classic stream, the same rows.
   Results published before this change ran on the Accelerator. #834 tracks porting its small-file prefetch
   and range merging into the native scan.
+
+### Fixed
+
+- The native Parquet scan's codec factory released only itself, never the zstd decompress contexts it handed
+  out per column chunk, so native memory grew until Kubernetes OOM-killed the executors at 1 TB (#828); a
+  test now checks every codec's decompressor is released (#829).
+
+### Documentation
+
+- The native reader's current state and limits (#825), how it decompresses each codec (#831), and the Iceberg
+  catalog settings that keep per-query planning off S3 (#826).
 
 ## 0.0.8 -- 2026-10-16
 
