@@ -15,24 +15,18 @@
  */
 package io.vecruntime.parquet.write;
 
-import java.math.BigDecimal;
-import java.nio.charset.StandardCharsets;
+import java.lang.foreign.Arena;
+import java.math.BigInteger;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
 
-import org.apache.arrow.memory.BufferAllocator;
-import org.apache.arrow.memory.RootAllocator;
-import org.apache.arrow.vector.BigIntVector;
-import org.apache.arrow.vector.BitVector;
-import org.apache.arrow.vector.DateDayVector;
-import org.apache.arrow.vector.DecimalVector;
-import org.apache.arrow.vector.FieldVector;
-import org.apache.arrow.vector.Float8Vector;
-import org.apache.arrow.vector.IntVector;
-import org.apache.arrow.vector.VarCharVector;
+import io.vecruntime.kernels.ArrowLayout;
+import io.vecruntime.kernels.SegmentVectorBuffers;
+import io.vecruntime.kernels.VecType;
+import io.vecruntime.kernels.VectorBuffers;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.parquet.column.ParquetProperties;
 import org.apache.parquet.column.statistics.Statistics;
@@ -53,8 +47,6 @@ import org.apache.parquet.hadoop.util.HadoopOutputFile;
 import org.apache.parquet.io.api.Binary;
 import org.apache.parquet.schema.MessageType;
 import org.apache.parquet.schema.MessageTypeParser;
-import org.junit.jupiter.api.AfterEach;
-import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -63,11 +55,15 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * Round trips through parquet-java: the same rows written by {@link
- * ArrowParquetWriter} and by parquet-java's own {@code ExampleParquetWriter},
- * read back with parquet-java's reader, must agree value by value and in each
- * column chunk's statistics, value count and encodings.
+ * ColumnarParquetWriter} and by parquet-java's own {@code
+ * ExampleParquetWriter}, read back with parquet-java's reader, must agree value
+ * by value and in each column chunk's statistics, value count and encodings.
+ * The columns are built in the engine's layout with {@link ArrowLayout},
+ * including a dictionary-encoded string column (ids into a dictionary) and a
+ * float column carried in a FLOAT64 lane, as the scan and the operators hand
+ * them over.
  */
-class ArrowParquetWriterTest {
+class ColumnarParquetWriterTest {
 
     private static final MessageType SCHEMA = MessageTypeParser
             .parseMessageType("""
@@ -75,40 +71,48 @@ class ArrowParquetWriterTest {
               optional int32 i;
               optional int64 l;
               optional double d;
+              optional float f;
               optional boolean b;
               optional binary s (STRING);
+              optional binary ds (STRING);
               optional int32 day (DATE);
               optional int64 dec (DECIMAL(15,2));
               optional fixed_len_byte_array(16) wide (DECIMAL(38,6));
             }
             """);
 
+    private static final String[] DICTIONARY = dictionary();
+
     @TempDir
     Path dir;
 
-    private BufferAllocator allocator;
     private final Configuration conf = new Configuration();
 
-    @BeforeEach
-    void setUp() {
-        allocator = new RootAllocator();
+    private int files;
+
+    private static String[] dictionary() {
+        String[] d = new String[200];
+        for (int k = 0; k < d.length; k++) {
+            d[k] = "dict-" + k;
+        }
+        return d;
     }
 
-    @AfterEach
-    void tearDown() {
-        allocator.close();
-    }
-
-    /** One row of the test data; null fields are null. */
+    /**
+     * One row of the test data; null fields are null. {@code ds} is an id into
+     * {@link #DICTIONARY}.
+     */
     private record Row(
             Integer i,
             Long l,
             Double d,
+            Float f,
             Boolean b,
             String s,
+            Integer ds,
             Integer day,
             Long dec,
-            BigDecimal wide) {}
+            BigInteger wide) {}
 
     private static List<Row> rows(int n, long seed) {
         Random r = new Random(seed);
@@ -120,81 +124,72 @@ class ArrowParquetWriterTest {
                             nulls ? null : r.nextInt(),
                             nulls ? null : r.nextLong(),
                             r.nextInt(17) == 0 ? null : r.nextGaussian(),
+                            r.nextInt(19) == 0 ? null : (float) r.nextGaussian(),
                             r.nextInt(13) == 0 ? null : r.nextBoolean(),
-                            r.nextInt(11) == 0 ? null : "v" + r.nextInt(500), // few distinct: dictionary-encoded
+                            r.nextInt(11) == 0 ? null : "v" + r.nextInt(500),
+                            r.nextInt(8) == 0 ? null : r.nextInt(DICTIONARY.length),
                             nulls ? null : 10_000 + r.nextInt(5000),
                             r.nextInt(7) == 0 ? null : (long) r.nextInt(1_000_000_000)
                                     * (r.nextBoolean() ? 1 : -1),
-                            r.nextInt(9) == 0 ? null : new BigDecimal(new java.math.BigInteger(100, r).subtract(java.math.BigInteger.ONE.shiftLeft(99)), 6)));
+                            r.nextInt(9) == 0 ? null : new BigInteger(100, r).subtract(BigInteger.ONE.shiftLeft(99))));
         }
         return out;
     }
 
-    private List<FieldVector> vectors(List<Row> rows) {
-        int n = rows.size();
-        IntVector i = new IntVector("i", allocator);
-        BigIntVector l = new BigIntVector("l", allocator);
-        Float8Vector d = new Float8Vector("d", allocator);
-        BitVector b = new BitVector("b", allocator);
-        VarCharVector s = new VarCharVector("s", allocator);
-        DateDayVector day = new DateDayVector("day", allocator);
-        DecimalVector dec = new DecimalVector("dec", allocator, 15, 2);
-        DecimalVector wide = new DecimalVector("wide", allocator, 38, 6);
-        List<FieldVector> all = List.of(i, l, d, b, s, day,
-                dec, wide);
-        all.forEach(FieldVector::allocateNew);
-        for (int k = 0; k < n; k++) {
-            Row row = rows.get(k);
-            if (row.i() != null) {
-                i.setSafe(k, row.i());
-            } else {
-                i.setNull(k);
-            }
-            if (row.l() != null) {
-                l.setSafe(k, row.l());
-            } else {
-                l.setNull(k);
-            }
-            if (row.d() != null) {
-                d.setSafe(k, row.d());
-            } else {
-                d.setNull(k);
-            }
-            if (row.b() != null) {
-                b.setSafe(k, row.b() ? 1 : 0);
-            } else {
-                b.setNull(k);
-            }
-            if (row.s() != null) {
-                s.setSafe(k, row.s()
-                                .getBytes(StandardCharsets.UTF_8));
-            } else {
-                s.setNull(k);
-            }
-            if (row.day() != null) {
-                day.setSafe(k, row.day());
-            } else {
-                day.setNull(k);
-            }
-            if (row.dec() != null) {
-                dec.setSafe(k, BigDecimal.valueOf(row.dec(), 2));
-            } else {
-                dec.setNull(k);
-            }
-            if (row.wide() != null) {
-                wide.setSafe(k, row.wide());
-            } else {
-                wide.setNull(k);
-            }
+    private static boolean[] nulls(List<Row> rows, java.util.function.Function<Row, Object> f) {
+        boolean[] out = new boolean[rows.size()];
+        for (int k = 0; k < out.length; k++) {
+            out[k] = f.apply(rows.get(k)) == null;
         }
-        all.forEach(v -> v.setValueCount(n));
-        return all;
+        return out;
     }
 
-    private static Binary fixed(BigDecimal v, int length) {
-        byte[] be = v.unscaledValue().toByteArray();
+    private static List<VectorBuffers> columns(Arena a, List<Row> rows) {
+        int n = rows.size();
+        int[] i = new int[n];
+        long[] l = new long[n];
+        double[] d = new double[n];
+        double[] f = new double[n];
+        boolean[] b = new boolean[n];
+        String[] s = new String[n];
+        int[] ds = new int[n];
+        int[] day = new int[n];
+        long[] dec = new long[n];
+        BigInteger[] wide = new BigInteger[n];
+        for (int k = 0; k < n; k++) {
+            Row r = rows.get(k);
+            i[k] = r.i() == null ? 0 : r.i();
+            l[k] = r.l() == null ? 0 : r.l();
+            d[k] = r.d() == null ? 0 : r.d();
+            f[k] = r.f() == null ? 0 : r.f();
+            b[k] = r.b() != null && r.b();
+            s[k] = r.s();
+            ds[k] = r.ds() == null ? 0 : r.ds();
+            day[k] = r.day() == null ? 0 : r.day();
+            dec[k] = r.dec() == null ? 0 : r.dec();
+            wide[k] = r.wide();
+        }
+        SegmentVectorBuffers ids = ArrowLayout.ofInts(a, ds, nulls(rows, Row::ds));
+        VectorBuffers dict = ArrowLayout.ofStrings(a, DICTIONARY);
+        VectorBuffers dsColumn = new SegmentVectorBuffers(VecType.UTF8, n, ids.validity(), ids.data(),
+                null, dict);
+        return List.of(
+                ArrowLayout.ofInts(a, i, nulls(rows, Row::i)),
+                ArrowLayout.ofLongs(a, l, nulls(rows, Row::l)),
+                ArrowLayout.ofDoubles(a, d, nulls(rows, Row::d)),
+                ArrowLayout.ofDoubles(a, f, nulls(rows, Row::f)),
+                ArrowLayout.ofBooleans(a, b, nulls(rows, Row::b)),
+                ArrowLayout.ofStrings(a, s),
+                dsColumn,
+                ArrowLayout.ofInts(a, day, nulls(rows, Row::day)),
+                ArrowLayout.ofLongs(a, dec, nulls(rows, Row::dec)),
+                ArrowLayout.ofDecimal128(a, wide, nulls(rows, Row::wide)));
+    }
+
+    private static Binary fixed(BigInteger unscaled, int length) {
+        byte[] be = unscaled.toByteArray();
         byte[] out = new byte[length];
-        byte pad = (byte) (v.signum() < 0 ? -1 : 0);
+        byte pad = (byte) (unscaled.signum() < 0 ? -1 : 0);
         int off = length - be.length;
         for (int k = 0; k < length; k++) {
             out[k] = k < off ? pad : be[k - off];
@@ -202,7 +197,7 @@ class ArrowParquetWriterTest {
         return Binary.fromConstantByteArray(out);
     }
 
-    private ParquetProperties props() {
+    private static ParquetProperties props() {
         return ParquetProperties.builder()
                 .withPageSize(64 * 1024)
                 .withDictionaryPageSize(64 * 1024)
@@ -210,19 +205,16 @@ class ArrowParquetWriterTest {
     }
 
     private org.apache.hadoop.fs.Path writeOurs(List<Row> rows, int batch, long rowGroupSize) throws Exception {
-        org.apache.hadoop.fs.Path p = new org.apache.hadoop.fs.Path(dir.resolve("ours.parquet")
+        org.apache.hadoop.fs.Path p = new org.apache.hadoop.fs.Path(dir.resolve("ours-" + (files++) + ".parquet")
                 .toString());
         CodecFactory codecs = new CodecFactory(conf, 64 * 1024);
-        try (ArrowParquetWriter w = new ArrowParquetWriter(HadoopOutputFile.fromPath(p, conf), SCHEMA, props(),
+        try (ColumnarParquetWriter w = new ColumnarParquetWriter(HadoopOutputFile.fromPath(p, conf), SCHEMA, props(),
                 codecs.getCompressor(CompressionCodecName.SNAPPY), rowGroupSize, Map.of("writer", "vecruntime"))) {
             for (int from = 0; from < rows.size(); from += batch) {
                 List<Row> slice = rows.subList(from,
                         Math.min(rows.size(), from + batch));
-                List<FieldVector> vs = vectors(slice);
-                try {
-                    w.write(vs, slice.size());
-                } finally {
-                    vs.forEach(FieldVector::close);
+                try (Arena a = Arena.ofConfined()) {
+                    w.write(columns(a, slice), slice.size());
                 }
             }
         } finally {
@@ -253,11 +245,17 @@ class ArrowParquetWriterTest {
                 if (r.d() != null) {
                     g.add("d", r.d());
                 }
+                if (r.f() != null) {
+                    g.add("f", r.f());
+                }
                 if (r.b() != null) {
                     g.add("b", r.b());
                 }
                 if (r.s() != null) {
                     g.add("s", r.s());
+                }
+                if (r.ds() != null) {
+                    g.add("ds", DICTIONARY[r.ds()]);
                 }
                 if (r.day() != null) {
                     g.add("day", r.day());
@@ -333,12 +331,14 @@ class ArrowParquetWriterTest {
     @Test
     void rowGroupsAreCutByBufferedSize() throws Exception {
         List<Row> rows = rows(60_000, 3);
-        ParquetMetadata ours = footer(writeOurs(rows, 2048, 256 * 1024));
+        org.apache.hadoop.fs.Path path = writeOurs(rows, 2048, 256 * 1024);
+        ParquetMetadata ours = footer(path);
         assertTrue(ours.getBlocks().size() > 1, "expected several row groups, got " + ours.getBlocks().size());
         long total = ours.getBlocks().stream()
                 .mapToLong(BlockMetaData::getRowCount)
                 .sum();
         assertEquals(rows.size(), total);
+        assertEquals(readAll(writeParquetJava(rows, 128L << 20)), readAll(path));
     }
 
     @Test
@@ -348,5 +348,16 @@ class ArrowParquetWriterTest {
                             .size());
         assertEquals(SCHEMA, ours.getFileMetaData()
                 .getSchema());
+    }
+
+    @Test
+    void batchSizeDoesNotChangeTheValues() throws Exception {
+        List<Row> rows = rows(9_999, 4);
+        List<String> a = readAll(writeOurs(rows, 1, 128L << 20));
+        List<String> b = readAll(writeOurs(rows, 777, 128L << 20));
+        List<String> c = readAll(writeOurs(rows, 9_999, 128L << 20));
+        assertEquals(a, b);
+        assertEquals(a, c);
+        assertEquals(rows.size(), a.size());
     }
 }

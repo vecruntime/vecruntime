@@ -19,7 +19,8 @@ import java.io.IOException;
 import java.util.List;
 import java.util.Map;
 
-import org.apache.arrow.vector.FieldVector;
+import io.vecruntime.kernels.VecType;
+import io.vecruntime.kernels.VectorBuffers;
 import org.apache.parquet.bytes.HeapByteBufferAllocator;
 import org.apache.parquet.column.ColumnDescriptor;
 import org.apache.parquet.column.ColumnWriteStore;
@@ -31,8 +32,8 @@ import org.apache.parquet.io.OutputFile;
 import org.apache.parquet.schema.MessageType;
 
 /**
- * Writes Arrow column vectors to one Parquet file, column by column (#64,
- * #842).
+ * Writes columns in the engine's Arrow layout ({@link VectorBuffers}) to one
+ * Parquet file, column by column (#64, #842).
  *
  * <p>The rows never exist: each batch is written one column at a time into
  * parquet-java's {@link ColumnWriteStore}, whose pages go through a {@link
@@ -45,14 +46,14 @@ import org.apache.parquet.schema.MessageType;
  * the vectors handed to {@link #write}; the caller derives it (the Spark
  * adapter uses Spark's own schema converter, so the file's schema is the one
  * Spark would write). Each column is bound to a {@link ColumnEncoder} by its
- * Arrow vector type and Parquet primitive type.
+ * lane ({@link VecType}) and Parquet primitive type.
  *
  * <p>Pages are cut by parquet-java's own size checks, which run when a record
  * ends: a batch is written in slices of {@link #SLICE} rows, every column's
  * slice first, then the slice's records are ended, so a page is at most one
  * slice past the page-size threshold.
  */
-public final class ArrowParquetWriter implements AutoCloseable {
+public final class ColumnarParquetWriter implements AutoCloseable {
 
     /** Rows per slice: the granularity of the page-size checks. */
     static final int SLICE = 1024;
@@ -65,6 +66,7 @@ public final class ArrowParquetWriter implements AutoCloseable {
     private final Map<String, String> footer;
     private final List<ColumnDescriptor> columns;
     private final ColumnEncoder[] encoders;
+    private final VecType[] lanes;
 
     private ColumnChunkPageWriteStore pageStore;
     private ColumnWriteStore columnStore;
@@ -85,7 +87,7 @@ public final class ArrowParquetWriter implements AutoCloseable {
      * @param footer key-value metadata for the footer (Spark's version and
      *     schema keys)
      */
-    public ArrowParquetWriter(OutputFile out, MessageType schema, ParquetProperties props,
+    public ColumnarParquetWriter(OutputFile out, MessageType schema, ParquetProperties props,
             CompressionCodecFactory.BytesInputCompressor compressor, long rowGroupSize, Map<String, String> footer)
             throws IOException {
         this.schema = schema;
@@ -100,6 +102,7 @@ public final class ArrowParquetWriter implements AutoCloseable {
             }
         }
         this.encoders = new ColumnEncoder[columns.size()];
+        this.lanes = new VecType[columns.size()];
         this.file = new ParquetFileWriter(out, schema, ParquetFileWriter.Mode.CREATE, rowGroupSize, 0, null,
                 props);
         this.file.start();
@@ -114,17 +117,20 @@ public final class ArrowParquetWriter implements AutoCloseable {
     }
 
     /**
-     * Appends the first {@code rowCount} rows of {@code vectors}, one vector
-     * per schema field, in order. The vectors are read, not retained.
+     * Appends the first {@code rowCount} rows of {@code columns}, one per
+     * schema field, in order. The buffers are read, not retained past the
+     * call (a dictionary may be kept, by identity, to reuse its converted
+     * entries).
      */
-    public void write(List<? extends FieldVector> vectors, int rowCount) throws IOException {
+    public void write(List<? extends VectorBuffers> vectors, int rowCount) throws IOException {
         if (vectors.size() != columns.size()) {
-            throw new IllegalArgumentException("expected " + columns.size() + " vectors, got " + vectors.size());
+            throw new IllegalArgumentException("expected " + columns.size() + " columns, got " + vectors.size());
         }
         for (int i = 0; i < encoders.length; i++) {
-            FieldVector v = vectors.get(i);
-            if (encoders[i] == null || !encoders[i].accepts(v)) {
-                encoders[i] = ColumnEncoder.forVector(v, columns.get(i));
+            VecType lane = vectors.get(i).type();
+            if (encoders[i] == null || lanes[i] != lane) {
+                encoders[i] = ColumnEncoder.forColumn(lane, columns.get(i));
+                lanes[i] = lane;
             }
         }
         for (int from = 0; from < rowCount; from += SLICE) {

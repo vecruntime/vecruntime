@@ -15,22 +15,12 @@
  */
 package io.vecruntime.parquet.write;
 
-import org.apache.arrow.memory.ArrowBuf;
-import org.apache.arrow.vector.BigIntVector;
-import org.apache.arrow.vector.BitVector;
-import org.apache.arrow.vector.BitVectorHelper;
-import org.apache.arrow.vector.DateDayVector;
-import org.apache.arrow.vector.DecimalVector;
-import org.apache.arrow.vector.FieldVector;
-import org.apache.arrow.vector.Float4Vector;
-import org.apache.arrow.vector.Float8Vector;
-import org.apache.arrow.vector.IntVector;
-import org.apache.arrow.vector.SmallIntVector;
-import org.apache.arrow.vector.TimeStampMicroTZVector;
-import org.apache.arrow.vector.TimeStampMicroVector;
-import org.apache.arrow.vector.TinyIntVector;
-import org.apache.arrow.vector.VarBinaryVector;
-import org.apache.arrow.vector.VarCharVector;
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
+
+import io.vecruntime.kernels.Bitmap;
+import io.vecruntime.kernels.VecType;
+import io.vecruntime.kernels.VectorBuffers;
 import org.apache.parquet.column.ColumnDescriptor;
 import org.apache.parquet.column.ColumnWriter;
 import org.apache.parquet.io.api.Binary;
@@ -38,18 +28,24 @@ import org.apache.parquet.schema.LogicalTypeAnnotation;
 import org.apache.parquet.schema.PrimitiveType;
 import org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName;
 
+import static io.vecruntime.kernels.VectorBuffers.LE_DOUBLE;
+import static io.vecruntime.kernels.VectorBuffers.LE_INT;
+import static io.vecruntime.kernels.VectorBuffers.LE_LONG;
+
 /**
- * Writes a row range of one Arrow vector into a parquet-java {@link
- * ColumnWriter}, reading the vector's buffers directly. One implementation per
- * (Arrow vector, Parquet physical type) pair; {@link #forVector} binds a
- * column.
+ * Writes a row range of one column, in the engine's Arrow layout ({@link
+ * VectorBuffers}), into a parquet-java {@link ColumnWriter}. One implementation
+ * per (lane, Parquet physical type) pair; {@link #forColumn} binds a column.
  *
  * <p>The values are the ones Spark's {@code ParquetWriteSupport} writes for the
- * same Spark type: dates as {@code INT32} days, timestamps as {@code INT64}
- * micros or millis or as Spark's {@code INT96} (Julian day and nanoseconds of
- * day, proleptic Gregorian, no rebase), decimals as {@code INT32} / {@code
- * INT64} unscaled values or big-endian {@code FIXED_LEN_BYTE_ARRAY} of the
- * precision's minimal width.
+ * same Spark type: byte, short, int and date as {@code INT32}; long as {@code
+ * INT64}; timestamps (an {@code INT64} lane of microseconds) as {@code INT64}
+ * micros or millis, or as Spark's {@code INT96} (Julian day and nanoseconds of
+ * the day, proleptic Gregorian, no rebase); float (a {@code FLOAT64} lane) as
+ * {@code FLOAT}; decimals as {@code INT32} / {@code INT64} unscaled values or a
+ * big-endian {@code FIXED_LEN_BYTE_ARRAY} of the precision's minimal width. A
+ * dictionary-encoded string column is written from its ids, each dictionary
+ * entry converted to a {@link Binary} once per dictionary.
  */
 abstract class ColumnEncoder {
 
@@ -62,67 +58,76 @@ abstract class ColumnEncoder {
         this.maxDef = column.getMaxDefinitionLevel();
     }
 
-    /** Whether this encoder was bound to this vector's class. */
-    abstract boolean accepts(FieldVector v);
-
     /** Writes rows {@code [from, to)} of {@code v}. */
-    abstract void write(FieldVector v, int from, int to,
+    abstract void write(VectorBuffers v, int from, int to,
                         ColumnWriter w);
 
-    static boolean isNull(FieldVector v, int i) {
-        ArrowBuf validity = v.getValidityBuffer();
-        return validity.capacity() > 0 && BitVectorHelper.get(validity, i) == 0;
+    final boolean isNull(MemorySegment validity, int i) {
+        return validity != null && !Bitmap.isSet(validity, i);
     }
 
-    static ColumnEncoder forVector(FieldVector v, ColumnDescriptor column) {
+    final void writeNull(ColumnWriter w) {
+        if (maxDef == 0) {
+            throw new IllegalStateException("null in a required column");
+        }
+        w.writeNull(0, maxDef - 1);
+    }
+
+    static ColumnEncoder forColumn(VecType lane, ColumnDescriptor column) {
         PrimitiveType type = column.getPrimitiveType();
         PrimitiveTypeName p = type.getPrimitiveTypeName();
         LogicalTypeAnnotation logical = type.getLogicalTypeAnnotation();
-        if (v instanceof BitVector && p == PrimitiveTypeName.BOOLEAN) {
-            return new Bool(column);
+        boolean decimal = logical instanceof LogicalTypeAnnotation.DecimalLogicalTypeAnnotation;
+        switch (lane) {
+            case BOOL:
+                if (p == PrimitiveTypeName.BOOLEAN) {
+                    return new Bool(column);
+                }
+                break;
+            case INT32:
+                if (p == PrimitiveTypeName.INT32) {
+                    return new Int32(column);
+                }
+                break;
+            case INT64:
+                if (p == PrimitiveTypeName.INT64) {
+                    long divisor = logical instanceof LogicalTypeAnnotation.TimestampLogicalTypeAnnotation ts && ts.getUnit() == LogicalTypeAnnotation.TimeUnit.MILLIS
+                            ? 1000
+                            : 1;
+                    return new Int64(column, divisor);
+                }
+                if (p == PrimitiveTypeName.INT32 && decimal) {
+                    return new LongToInt32(column);
+                }
+                if (p == PrimitiveTypeName.INT96) {
+                    return new Int96(column);
+                }
+                break;
+            case FLOAT64:
+                if (p == PrimitiveTypeName.DOUBLE) {
+                    return new Float64(column, false);
+                }
+                if (p == PrimitiveTypeName.FLOAT) {
+                    return new Float64(column, true);
+                }
+                break;
+            case UTF8:
+                if (p == PrimitiveTypeName.BINARY) {
+                    return new Bytes(column);
+                }
+                break;
+            case DECIMAL128:
+                if (p == PrimitiveTypeName.INT32 || p == PrimitiveTypeName.INT64) {
+                    return new Decimal128Long(column, p == PrimitiveTypeName.INT32);
+                }
+                if (p == PrimitiveTypeName.FIXED_LEN_BYTE_ARRAY) {
+                    return new Decimal128Fixed(column, type.getTypeLength());
+                }
+                break;
+            default:
+                break;
         }
-        if (p == PrimitiveTypeName.INT32 && (v instanceof IntVector || v instanceof DateDayVector)) {
-            return new Int32(column, v.getClass(), 4);
-        }
-        if (p == PrimitiveTypeName.INT32 && v instanceof SmallIntVector) {
-            return new Int32(column, v.getClass(), 2);
-        }
-        if (p == PrimitiveTypeName.INT32 && v instanceof TinyIntVector) {
-            return new Int32(column, v.getClass(), 1);
-        }
-        if (p == PrimitiveTypeName.INT64 && v instanceof BigIntVector) {
-            return new Int64(column, v.getClass(), 1);
-        }
-        if (v instanceof TimeStampMicroTZVector || v instanceof TimeStampMicroVector) {
-            if (p == PrimitiveTypeName.INT96) {
-                return new Int96(column, v.getClass());
-            }
-            if (p == PrimitiveTypeName.INT64 && logical instanceof LogicalTypeAnnotation.TimestampLogicalTypeAnnotation ts) {
-                return new Int64(column, v.getClass(),
-                        ts.getUnit() == LogicalTypeAnnotation.TimeUnit.MILLIS ? 1000 : 1);
-            }
-        }
-        if (p == PrimitiveTypeName.FLOAT && v instanceof Float4Vector) {
-            return new Float32(column);
-        }
-        if (p == PrimitiveTypeName.DOUBLE && v instanceof Float8Vector) {
-            return new Float64(column);
-        }
-        if (p == PrimitiveTypeName.BINARY && (v instanceof VarCharVector || v instanceof VarBinaryVector)) {
-            return new Bytes(column, v.getClass());
-        }
-        if (v instanceof DecimalVector) {
-            switch (p) {
-                case INT32:
-                case INT64:
-                    return new DecimalLong(column, p == PrimitiveTypeName.INT32);
-                case FIXED_LEN_BYTE_ARRAY:
-                    return new DecimalFixed(column, type.getTypeLength());
-                default:
-                    break;
-            }
-        }
-        throw new IllegalArgumentException("no encoder for " + v.getClass().getSimpleName() + " as " + type);
+        throw new IllegalArgumentException("no encoder for a " + lane + " lane as " + type);
     }
 
     // ------------------------------------------------------------------------------------------------------------
@@ -133,89 +138,89 @@ abstract class ColumnEncoder {
         }
 
         @Override
-        boolean accepts(FieldVector v) {
-            return v instanceof BitVector;
-        }
-
-        @Override
-        void write(FieldVector v, int from, int to,
+        void write(VectorBuffers v, int from, int to,
                    ColumnWriter w) {
-            ArrowBuf data = v.getDataBuffer();
+            MemorySegment validity = v.validity();
+            MemorySegment data = v.data();
             for (int i = from; i < to; i++) {
-                if (isNull(v, i)) {
-                    w.writeNull(0, maxDef - 1);
+                if (isNull(validity, i)) {
+                    writeNull(w);
                 } else {
-                    w.write(BitVectorHelper.get(data, i) != 0, 0, maxDef);
+                    w.write(Bitmap.isSet(data, i), 0, maxDef);
                 }
             }
         }
     }
 
-    /** INT32 from a 1-, 2- or 4-byte signed vector (byte, short, int, date). */
+    /** INT32 from an INT32 lane (byte, short, int, date). */
     private static final class Int32 extends ColumnEncoder {
-        private final Class<?> cls;
-        private final int width;
-
-        Int32(ColumnDescriptor c, Class<?> cls, int width) {
+        Int32(ColumnDescriptor c) {
             super(c);
-            this.cls = cls;
-            this.width = width;
         }
 
         @Override
-        boolean accepts(FieldVector v) {
-            return v.getClass() == cls;
-        }
-
-        @Override
-        void write(FieldVector v, int from, int to,
+        void write(VectorBuffers v, int from, int to,
                    ColumnWriter w) {
-            ArrowBuf data = v.getDataBuffer();
+            MemorySegment validity = v.validity();
+            MemorySegment data = v.data();
             for (int i = from; i < to; i++) {
-                if (isNull(v, i)) {
-                    w.writeNull(0, maxDef - 1);
-                    continue;
+                if (isNull(validity, i)) {
+                    writeNull(w);
+                } else {
+                    w.write(data.get(LE_INT, (long) i << 2), 0, maxDef);
                 }
-                int x = switch (width) {
-                    case 4 -> data.getInt((long) i * 4);
-                    case 2 -> data.getShort((long) i * 2);
-                    default -> data.getByte(i);
-                };
-                w.write(x, 0, maxDef);
             }
         }
     }
 
     /**
-     * INT64 from a long or microsecond-timestamp vector, divided by {@code
+     * INT64 from an INT64 lane (long, timestamp micros), divided by {@code
      * divisor} (1000 for millis).
      */
     private static final class Int64 extends ColumnEncoder {
-        private final Class<?> cls;
         private final long divisor;
 
-        Int64(ColumnDescriptor c, Class<?> cls, long divisor) {
+        Int64(ColumnDescriptor c, long divisor) {
             super(c);
-            this.cls = cls;
             this.divisor = divisor;
         }
 
         @Override
-        boolean accepts(FieldVector v) {
-            return v.getClass() == cls;
+        void write(VectorBuffers v, int from, int to,
+                   ColumnWriter w) {
+            MemorySegment validity = v.validity();
+            MemorySegment data = v.data();
+            for (int i = from; i < to; i++) {
+                if (isNull(validity, i)) {
+                    writeNull(w);
+                } else {
+                    long x = data.get(LE_LONG, (long) i << 3);
+                    w.write(divisor == 1 ? x : Math.floorDiv(x, divisor), 0,
+                            maxDef);
+                }
+            }
+        }
+    }
+
+    /**
+     * A decimal of precision up to 9 held as an INT64 unscaled lane, written as
+     * INT32.
+     */
+    private static final class LongToInt32 extends ColumnEncoder {
+        LongToInt32(ColumnDescriptor c) {
+            super(c);
         }
 
         @Override
-        void write(FieldVector v, int from, int to,
+        void write(VectorBuffers v, int from, int to,
                    ColumnWriter w) {
-            ArrowBuf data = v.getDataBuffer();
+            MemorySegment validity = v.validity();
+            MemorySegment data = v.data();
             for (int i = from; i < to; i++) {
-                if (isNull(v, i)) {
-                    w.writeNull(0, maxDef - 1);
+                if (isNull(validity, i)) {
+                    writeNull(w);
                 } else {
-                    long x = data.getLong((long) i * 8);
-                    w.write(divisor == 1 ? x : Math.floorDiv(x, divisor), 0,
-                            maxDef);
+                    w.write((int) data.get(LE_LONG, (long) i << 3), 0, maxDef);
                 }
             }
         }
@@ -226,151 +231,154 @@ abstract class ColumnEncoder {
      * of Julian day, little-endian.
      */
     private static final class Int96 extends ColumnEncoder {
-        private final Class<?> cls;
-
-        Int96(ColumnDescriptor c, Class<?> cls) {
+        Int96(ColumnDescriptor c) {
             super(c);
-            this.cls = cls;
         }
 
         @Override
-        boolean accepts(FieldVector v) {
-            return v.getClass() == cls;
-        }
-
-        @Override
-        void write(FieldVector v, int from, int to,
+        void write(VectorBuffers v, int from, int to,
                    ColumnWriter w) {
-            ArrowBuf data = v.getDataBuffer();
+            MemorySegment validity = v.validity();
+            MemorySegment data = v.data();
             for (int i = from; i < to; i++) {
-                if (isNull(v, i)) {
-                    w.writeNull(0, maxDef - 1);
+                if (isNull(validity, i)) {
+                    writeNull(w);
                     continue;
                 }
-                long micros = data.getLong((long) i * 8);
+                long micros = data.get(LE_LONG, (long) i << 3);
                 long day = Math.floorDiv(micros, MICROS_PER_DAY);
                 long nanos = Math.floorMod(micros, MICROS_PER_DAY) * 1000L;
                 byte[] b = new byte[12];
-                for (int k = 0; k < 8; k++) {
-                    b[k] = (byte) (nanos >>> (8 * k));
-                }
-                int julian = (int) (day + JULIAN_DAY_OF_EPOCH);
-                for (int k = 0; k < 4; k++) {
-                    b[8 + k] = (byte) (julian >>> (8 * k));
-                }
+                MemorySegment s = MemorySegment.ofArray(b);
+                s.set(LE_LONG, 0, nanos);
+                s.set(LE_INT, 8, (int) (day + JULIAN_DAY_OF_EPOCH));
                 w.write(Binary.fromConstantByteArray(b), 0, maxDef);
             }
         }
     }
 
-    private static final class Float32 extends ColumnEncoder {
-        Float32(ColumnDescriptor c) {
-            super(c);
-        }
-
-        @Override
-        boolean accepts(FieldVector v) {
-            return v instanceof Float4Vector;
-        }
-
-        @Override
-        void write(FieldVector v, int from, int to,
-                   ColumnWriter w) {
-            ArrowBuf data = v.getDataBuffer();
-            for (int i = from; i < to; i++) {
-                if (isNull(v, i)) {
-                    w.writeNull(0, maxDef - 1);
-                } else {
-                    w.write(data.getFloat((long) i * 4), 0, maxDef);
-                }
-            }
-        }
-    }
-
+    /**
+     * DOUBLE, or FLOAT narrowed from the FLOAT64 lane a float column is carried
+     * in (#712).
+     */
     private static final class Float64 extends ColumnEncoder {
-        Float64(ColumnDescriptor c) {
+        private final boolean narrow;
+
+        Float64(ColumnDescriptor c, boolean narrow) {
             super(c);
+            this.narrow = narrow;
         }
 
         @Override
-        boolean accepts(FieldVector v) {
-            return v instanceof Float8Vector;
-        }
-
-        @Override
-        void write(FieldVector v, int from, int to,
+        void write(VectorBuffers v, int from, int to,
                    ColumnWriter w) {
-            ArrowBuf data = v.getDataBuffer();
+            MemorySegment validity = v.validity();
+            MemorySegment data = v.data();
             for (int i = from; i < to; i++) {
-                if (isNull(v, i)) {
-                    w.writeNull(0, maxDef - 1);
+                if (isNull(validity, i)) {
+                    writeNull(w);
                 } else {
-                    w.write(data.getDouble((long) i * 8), 0, maxDef);
+                    double x = data.get(LE_DOUBLE, (long) i << 3);
+                    if (narrow) {
+                        w.write((float) x, 0, maxDef);
+                    } else {
+                        w.write(x, 0, maxDef);
+                    }
                 }
             }
         }
     }
 
-    /** BINARY from a string or binary vector (32-bit offsets). */
+    /**
+     * BINARY from a UTF8 lane (string or binary): plain offsets and bytes, or
+     * dictionary ids into a UTF8 dictionary, whose entries are converted to
+     * {@link Binary} once and reused for every id that names them.
+     */
     private static final class Bytes extends ColumnEncoder {
-        private final Class<?> cls;
+        private VectorBuffers dictionary;
+        private Binary[] entries;
 
-        Bytes(ColumnDescriptor c, Class<?> cls) {
+        Bytes(ColumnDescriptor c) {
             super(c);
-            this.cls = cls;
         }
 
         @Override
-        boolean accepts(FieldVector v) {
-            return v.getClass() == cls;
-        }
-
-        @Override
-        void write(FieldVector v, int from, int to,
+        void write(VectorBuffers v, int from, int to,
                    ColumnWriter w) {
-            ArrowBuf offsets = v.getOffsetBuffer();
-            ArrowBuf data = v.getDataBuffer();
-            for (int i = from; i < to; i++) {
-                if (isNull(v, i)) {
-                    w.writeNull(0, maxDef - 1);
-                    continue;
+            MemorySegment validity = v.validity();
+            VectorBuffers dict = v.dictionary();
+            if (dict != null) {
+                Binary[] values = entries(dict);
+                MemorySegment ids = v.data();
+                for (int i = from; i < to; i++) {
+                    if (isNull(validity, i)) {
+                        writeNull(w);
+                    } else {
+                        w.write(values[ids.get(LE_INT, (long) i << 2)], 0, maxDef);
+                    }
                 }
-                int start = offsets.getInt((long) i * 4);
-                int end = offsets.getInt((long) (i + 1) * 4);
-                byte[] b = new byte[end - start];
-                data.getBytes(start, b);
-                // Constant: the dictionary and the statistics may keep the value past this call.
-                w.write(Binary.fromConstantByteArray(b), 0, maxDef);
+                return;
             }
+            MemorySegment offsets = v.offsets();
+            MemorySegment data = v.data();
+            for (int i = from; i < to; i++) {
+                if (isNull(validity, i)) {
+                    writeNull(w);
+                } else {
+                    // Constant: the dictionary and the statistics may keep the value past this call.
+                    w.write(Binary.fromConstantByteArray(bytes(offsets, data, i)), 0, maxDef);
+                }
+            }
+        }
+
+        @SuppressWarnings("ReferenceEquality") // the converted entries are keyed on the dictionary object itself
+        private Binary[] entries(VectorBuffers dict) {
+            if (dict != dictionary) {
+                int n = dict.length();
+                Binary[] out = new Binary[n];
+                MemorySegment offsets = dict.offsets();
+                MemorySegment data = dict.data();
+                for (int k = 0; k < n; k++) {
+                    out[k] = Binary.fromConstantByteArray(bytes(offsets, data, k));
+                }
+                dictionary = dict;
+                entries = out;
+            }
+            return entries;
+        }
+
+        private static byte[] bytes(MemorySegment offsets, MemorySegment data, int i) {
+            int start = offsets.get(LE_INT, (long) i << 2);
+            int end = offsets.get(LE_INT, (long) (i + 1) << 2);
+            byte[] b = new byte[end - start];
+            MemorySegment.copy(data, ValueLayout.JAVA_BYTE, start, b, 0, b.length);
+            return b;
         }
     }
 
-    /** A decimal of precision up to 18 as its unscaled value, INT32 or INT64. */
-    private static final class DecimalLong extends ColumnEncoder {
+    /**
+     * A DECIMAL128 lane of precision up to 18 as its unscaled value, INT32 or
+     * INT64: the low limb.
+     */
+    private static final class Decimal128Long extends ColumnEncoder {
         private final boolean int32;
 
-        DecimalLong(ColumnDescriptor c, boolean int32) {
+        Decimal128Long(ColumnDescriptor c, boolean int32) {
             super(c);
             this.int32 = int32;
         }
 
         @Override
-        boolean accepts(FieldVector v) {
-            return v instanceof DecimalVector;
-        }
-
-        @Override
-        void write(FieldVector v, int from, int to,
+        void write(VectorBuffers v, int from, int to,
                    ColumnWriter w) {
-            ArrowBuf data = v.getDataBuffer();
+            MemorySegment validity = v.validity();
+            MemorySegment data = v.data();
             for (int i = from; i < to; i++) {
-                if (isNull(v, i)) {
-                    w.writeNull(0, maxDef - 1);
+                if (isNull(validity, i)) {
+                    writeNull(w);
                     continue;
                 }
-                // Arrow decimals are 16-byte little-endian two's complement: a value of precision <= 18 is its
-                // low 8 bytes.
-                long unscaled = data.getLong((long) i * 16);
+                long unscaled = data.get(LE_LONG, (long) i << 4);
                 if (int32) {
                     w.write((int) unscaled, 0, maxDef);
                 } else {
@@ -381,36 +389,32 @@ abstract class ColumnEncoder {
     }
 
     /**
-     * A decimal as a big-endian FIXED_LEN_BYTE_ARRAY of {@code length} bytes,
-     * as Spark writes it.
+     * A DECIMAL128 lane as a big-endian FIXED_LEN_BYTE_ARRAY of {@code length}
+     * bytes, as Spark writes it.
      */
-    private static final class DecimalFixed extends ColumnEncoder {
+    private static final class Decimal128Fixed extends ColumnEncoder {
         private final int length;
 
-        DecimalFixed(ColumnDescriptor c, int length) {
+        Decimal128Fixed(ColumnDescriptor c, int length) {
             super(c);
             this.length = length;
         }
 
         @Override
-        boolean accepts(FieldVector v) {
-            return v instanceof DecimalVector;
-        }
-
-        @Override
-        void write(FieldVector v, int from, int to,
+        void write(VectorBuffers v, int from, int to,
                    ColumnWriter w) {
-            ArrowBuf data = v.getDataBuffer();
+            MemorySegment validity = v.validity();
+            MemorySegment data = v.data();
             for (int i = from; i < to; i++) {
-                if (isNull(v, i)) {
-                    w.writeNull(0, maxDef - 1);
+                if (isNull(validity, i)) {
+                    writeNull(w);
                     continue;
                 }
-                long base = (long) i * 16;
+                long base = (long) i << 4;
                 byte[] b = new byte[length];
                 // Little-endian 16 bytes to big-endian: the low `length` bytes, most significant first.
                 for (int k = 0; k < length; k++) {
-                    b[length - 1 - k] = data.getByte(base + k);
+                    b[length - 1 - k] = data.get(ValueLayout.JAVA_BYTE, base + k);
                 }
                 w.write(Binary.fromConstantByteArray(b), 0, maxDef);
             }

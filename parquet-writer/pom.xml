@@ -14,12 +14,12 @@
     writers (#64, #842). No Spark dependency, so it is tested against parquet-java's and Hardwood's readers and writers.</description>
 
   <dependencies>
-    <!-- Spark ships Arrow and parquet-java at these versions: compiled against, never shipped. -->
+    <!-- The engine's Arrow-layout columns (VectorBuffers); Spark-free, shaded into the plugin jar. -->
     <dependency>
-      <groupId>org.apache.arrow</groupId>
-      <artifactId>arrow-vector</artifactId>
-      <scope>provided</scope>
+      <groupId>io.github.vecruntime</groupId>
+      <artifactId>vecruntime-kernels_${spark.line}</artifactId>
     </dependency>
+    <!-- Spark ships parquet-java and Hadoop at these versions: compiled against, never shipped. -->
     <dependency>
       <groupId>org.apache.hadoop</groupId>
       <artifactId>hadoop-client-api</artifactId>
@@ -32,21 +32,8 @@
       <scope>provided</scope>
     </dependency>
     <dependency>
-      <groupId>org.apache.arrow</groupId>
-      <artifactId>arrow-memory-netty</artifactId>
-      <scope>test</scope>
-    </dependency>
-    <dependency>
       <groupId>org.apache.hadoop</groupId>
       <artifactId>hadoop-client-runtime</artifactId>
-      <scope>test</scope>
-    </dependency>
-    <!-- Arrow's allocator classes carry checker-framework annotations: without the jar javac warns
-         ([classfile]), and warnings fail the build. -->
-    <dependency>
-      <groupId>org.checkerframework</groupId>
-      <artifactId>checker-qual</artifactId>
-      <version>3.43.0</version>
       <scope>test</scope>
     </dependency>
     <dependency>
