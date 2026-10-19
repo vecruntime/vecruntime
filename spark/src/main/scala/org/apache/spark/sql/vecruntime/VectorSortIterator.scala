@@ -453,6 +453,9 @@ private[vecruntime] class VectorSortIterator(
           releaseTo(residentBytes)
           releaseHeapTo(residentHeap)
         } else {
+          // #878: a nested run is never spilled (the spill files hold lanes only), but its bytes are held in the
+          // pool all the same -- a refusal is not acted on -- so the task's other consumers can be made to spill.
+          if (hasNested) { hold(residentBytes); holdHeap(residentHeap) }
           runs += run
         }
         runArena = null

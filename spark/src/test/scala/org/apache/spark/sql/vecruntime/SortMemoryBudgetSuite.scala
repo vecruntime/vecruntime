@@ -184,6 +184,49 @@ class SortMemoryBudgetSuite extends AnyFunSuite {
     )
   }
 
+  test("#878: a sort with a nested column stays one in-memory run, and its bytes are held in the pool") {
+    withPool(1L << 30) { (tmm, _) =>
+      val schema = new StructType().add("k", LongType).add("a", org.apache.spark.sql.types.ArrayType(LongType))
+      val in = Iterator.tabulate(4) { b =>
+        VectorRowStages.toBatch(
+          schema,
+          Array.tabulate(4096) { i =>
+            val n = b.toLong * 4096 + i
+            InternalRow(16384L - n, new org.apache.spark.sql.catalyst.util.GenericArrayData(Array[Any](n, n + 1)))
+          }
+        )
+      }
+      val it = new VectorSortIterator(
+        in,
+        Array(ColumnRef(0, LongType)),
+        Array(true),
+        Array(true),
+        Array("k" -> LongType, "a" -> org.apache.spark.sql.types.ArrayType(LongType)),
+        metrics,
+        runRows = 4096,
+        spillBytes = 1L // a cap the nested sort cannot honour: it stays in memory
+      )
+      var rows = 0
+      var last = Long.MinValue
+      var peak = 0L
+      while (it.hasNext) {
+        val batch = it.next()
+        peak = math.max(peak, tmm.getMemoryConsumptionForThisTask())
+        var i = 0
+        while (i < batch.numRows()) {
+          val k = batch.column(0).getLong(i)
+          assert(k >= last)
+          assert(batch.column(1).getArray(i).getLong(0) === 16384L - k)
+          last = k; i += 1; rows += 1
+        }
+      }
+      assert(rows === 16384)
+      assert(it.spilledRuns === 0, "nested runs are never spilled")
+      assert(peak > 0, "but they are held in the pool")
+      it.close()
+    }
+  }
+
   // #868: the shuffled hash join's build side on the same pool.
   private val joinSpec = JoinSpec(
     joinType = org.apache.spark.sql.catalyst.plans.Inner,
