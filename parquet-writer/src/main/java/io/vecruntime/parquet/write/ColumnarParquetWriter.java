@@ -67,9 +67,13 @@ public final class ColumnarParquetWriter implements AutoCloseable {
     private final List<ColumnDescriptor> columns;
     private final ColumnEncoder[] encoders;
     private final VecType[] lanes;
+    private final FixedWidthChunkWriter[] fast;
 
     private ColumnChunkPageWriteStore pageStore;
     private ColumnWriteStore columnStore;
+    // The columns that go through parquet-java's column writers, once the first batch has bound every column; a
+    // column store covers only these, so it never cuts pages for a column written by a FixedWidthChunkWriter.
+    private MessageType slowSchema;
     private long rowGroupRows;
     private long totalRows;
     private boolean closed;
@@ -103,6 +107,7 @@ public final class ColumnarParquetWriter implements AutoCloseable {
         }
         this.encoders = new ColumnEncoder[columns.size()];
         this.lanes = new VecType[columns.size()];
+        this.fast = new FixedWidthChunkWriter[columns.size()];
         this.file = new ParquetFileWriter(out, schema, ParquetFileWriter.Mode.CREATE, rowGroupSize, 0, null,
                 props);
         this.file.start();
@@ -112,8 +117,17 @@ public final class ColumnarParquetWriter implements AutoCloseable {
     private void newRowGroup() {
         pageStore = new ColumnChunkPageWriteStore(compressor, schema, new HeapByteBufferAllocator(), props.getColumnIndexTruncateLength(),
                 props.getPageWriteChecksumEnabled());
-        columnStore = props.newColumnWriteStore(schema, pageStore, pageStore);
+        columnStore = slowSchema == null || slowSchema.getFieldCount() == 0
+                ? null
+                : props.newColumnWriteStore(slowSchema, pageStore, pageStore);
         rowGroupRows = 0;
+        if (fast != null) {
+            for (int i = 0; i < fast.length; i++) {
+                if (fast[i] != null) {
+                    fast[i].startChunk(pageStore.getPageWriter(columns.get(i)));
+                }
+            }
+        }
     }
 
     /**
@@ -128,23 +142,54 @@ public final class ColumnarParquetWriter implements AutoCloseable {
         }
         for (int i = 0; i < encoders.length; i++) {
             VecType lane = vectors.get(i).type();
-            if (encoders[i] == null || lanes[i] != lane) {
-                encoders[i] = ColumnEncoder.forColumn(lane, columns.get(i));
+            if (lanes[i] == null) {
                 lanes[i] = lane;
+                FixedWidthChunkWriter.Kind kind = FixedWidthChunkWriter.kindFor(lane, columns.get(i));
+                if (kind != null) {
+                    fast[i] = new FixedWidthChunkWriter(kind, columns.get(i), props);
+                    fast[i].startChunk(pageStore.getPageWriter(columns.get(i)));
+                } else {
+                    encoders[i] = ColumnEncoder.forColumn(lane, columns.get(i));
+                }
+            } else if (lanes[i] != lane) {
+                throw new IllegalArgumentException("column "
+                        + columns.get(i)
+                        + " changed lane from "
+                        + lanes[i]
+                        + " to "
+                        + lane);
+            }
+        }
+        if (slowSchema == null) {
+            List<org.apache.parquet.schema.Type> slow = new java.util.ArrayList<>();
+            for (int i = 0; i < encoders.length; i++) {
+                if (fast[i] == null) {
+                    slow.add(schema.getType(i));
+                }
+            }
+            slowSchema = new MessageType(schema.getName(), slow);
+            if (!slow.isEmpty()) {
+                columnStore = props.newColumnWriteStore(slowSchema, pageStore, pageStore);
             }
         }
         for (int from = 0; from < rowCount; from += SLICE) {
             int to = Math.min(rowCount, from + SLICE);
             for (int i = 0; i < encoders.length; i++) {
-                encoders[i].write(vectors.get(i), from, to, columnStore.getColumnWriter(columns.get(i)));
+                if (fast[i] != null) {
+                    fast[i].write(vectors.get(i), from, to);
+                } else {
+                    encoders[i].write(vectors.get(i), from, to, columnStore.getColumnWriter(columns.get(i)));
+                }
             }
-            for (int r = from; r < to; r++) {
-                columnStore.endRecord();
+            if (columnStore != null) {
+                for (int r = from; r < to; r++) {
+                    columnStore.endRecord();
+                }
             }
         }
         rowGroupRows += rowCount;
         totalRows += rowCount;
-        if (columnStore.getBufferedSize() >= rowGroupSize) {
+        if (bufferedSize() >= rowGroupSize) {
             flushRowGroup();
         }
     }
@@ -154,12 +199,31 @@ public final class ColumnarParquetWriter implements AutoCloseable {
             return;
         }
         file.startBlock(rowGroupRows);
-        columnStore.flush();
+        for (FixedWidthChunkWriter f : fast) {
+            if (f != null) {
+                f.endChunk();
+            }
+        }
+        if (columnStore != null) {
+            columnStore.flush();
+        }
         pageStore.flushToFileWriter(file);
         file.endBlock();
-        columnStore.close();
+        if (columnStore != null) {
+            columnStore.close();
+        }
         pageStore.close();
         newRowGroup();
+    }
+
+    private long bufferedSize() {
+        long size = columnStore == null ? 0 : columnStore.getBufferedSize();
+        for (FixedWidthChunkWriter f : fast) {
+            if (f != null) {
+                size += f.bufferedBytes();
+            }
+        }
+        return size;
     }
 
     /** Rows written so far. */
@@ -178,7 +242,9 @@ public final class ColumnarParquetWriter implements AutoCloseable {
             flushRowGroup();
             file.end(footer);
         } finally {
-            columnStore.close();
+            if (columnStore != null) {
+                columnStore.close();
+            }
             pageStore.close();
         }
     }
