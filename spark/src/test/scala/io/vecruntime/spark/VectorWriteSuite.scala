@@ -35,6 +35,7 @@ import org.apache.spark.sql.vecruntime.{PlanUtils, VectorFallback, VectorWriteFi
  * with the plugin off; the rows, the Spark schema and the footer keys must agree, and the plan of the write must
  * hold `VectorWriteFilesExec`, or Spark's `WriteFilesExec` with the expected reason.
  */
+@io.vecruntime.spark.test.tags.Write
 class VectorWriteSuite extends VectorQuerySuite {
 
   @volatile private var lastWritePlan: SparkPlan = _
