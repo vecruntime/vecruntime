@@ -31,6 +31,7 @@ import org.apache.spark.sql.SparkSession
  *  - `noop`: Spark's no-op sink. The scan, the source query and the columnar-to-row conversion, no encoding.
  *  - `parquet-<codec>`: Parquet through `FileFormatWriter` with that codec (`snappy`, `zstd`, `lz4_raw`,
  *    `uncompressed`, ...) to `<write-base>/<case>-<iteration>`, deleted after it is measured.
+ *  - `parquet-<codec>@<col>[+<col>...]`: the same, partitioned by those columns (`partitionBy`).
  *
  * The difference between a Parquet case and `noop` is the write; between `parquet-uncompressed` and a codec,
  * the compression. Rows are `.jsonl` like the query runners': wall time, executor run and CPU time, GC, and
@@ -118,7 +119,11 @@ object WriteBenchRunner {
           c match {
             case "noop" => df.write.format("noop").mode("overwrite").save()
             case p if p.startsWith("parquet-") =>
-              df.write.mode("overwrite").option("compression", p.stripPrefix("parquet-")).parquet(target)
+              // `parquet-<codec>` or `parquet-<codec>@<col>[+<col>]`: the latter partitioned by those columns.
+              val spec = p.stripPrefix("parquet-")
+              val codec = spec.takeWhile(_ != '@')
+              val cols = spec.drop(codec.length + 1).split("\\+").filter(_.nonEmpty).toSeq
+              df.write.mode("overwrite").option("compression", codec).partitionBy(cols: _*).parquet(target)
             case other => throw new IllegalArgumentException(s"unknown case $other")
           }
         } finally spark.sparkContext.clearJobGroup()
