@@ -179,6 +179,7 @@ case class VectorHashAggregateExec(
     "numOutputBatches" -> SQLMetrics.createMetric(sparkContext, "number of output batches"),
     "numOutputRows" -> SQLMetrics.createMetric(sparkContext, "number of output rows"),
     "time" -> SQLMetrics.createNanoTimingMetric(sparkContext, "time in spark-vector kernels"),
+    "peakNativeBytes" -> SQLMetrics.createSizeMetric(sparkContext, "peak native memory (#874)"),
     "spills" -> SQLMetrics.createMetric(sparkContext, "number of spills (#363)"),
     "spilledGroups" -> SQLMetrics.createMetric(sparkContext, "groups spilled or emitted early")
   )
@@ -973,6 +974,7 @@ private[vecruntime] class VectorGroupedAggregateIterator(
       }
       releaseMemory()
       releaseDictionaries()
+      metrics.recordPeakNative(allocator.getPeakMemoryAllocation) // #874: measured, not reserved
       allocator.close()
     }
   }

@@ -174,7 +174,9 @@ final class VectorMetrics(
     val numInputBatches: SQLMetric,
     val numOutputBatches: SQLMetric,
     val numOutputRows: SQLMetric,
-    val time: SQLMetric
+    val time: SQLMetric,
+    /** #874: the most native memory one task of the operator held at once; null when the operator has none. */
+    val peakNativeBytes: SQLMetric = null
 ) extends Serializable {
 
   def timed[T](f: => T): T = {
@@ -182,4 +184,12 @@ final class VectorMetrics(
     try f
     finally time += System.nanoTime() - start
   }
+
+  /**
+   * #874: records a high-water mark of the native bytes the operator actually allocated -- its Arrow allocator's
+   * peak, plus what it holds outside Arrow (sorted runs, build tables) -- as measured, not as reserved. The task's
+   * copy of the metric keeps the largest, so several iterators of one task (a grace join's buckets) do not add up.
+   */
+  def recordPeakNative(bytes: Long): Unit =
+    if (peakNativeBytes != null && bytes > peakNativeBytes.value) peakNativeBytes.set(bytes)
 }

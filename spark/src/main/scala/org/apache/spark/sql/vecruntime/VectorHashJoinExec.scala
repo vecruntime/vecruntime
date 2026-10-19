@@ -1647,6 +1647,8 @@ private[vecruntime] class VectorHashJoinIterator(
       closed = true
       if (emitted != null) { emitted.close(); emitted = null }
       while (!pending.isEmpty) pending.poll().close()
+      // #874: measured, not reserved -- the Arrow output's peak plus the build table this task built.
+      metrics.recordPeakNative(allocator.getPeakMemoryAllocation + (if (build.shared) 0L else build.nativeBytes))
       build.close()
       allocator.close()
       heapMemory.releaseTo(0L)
