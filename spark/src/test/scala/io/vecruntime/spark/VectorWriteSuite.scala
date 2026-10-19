@@ -359,6 +359,60 @@ class VectorWriteSuite extends VectorQuerySuite {
     assert(project.nonEmpty, s"${finalPlan(df).treeString}\n${VectorFallback.reasons(finalPlan(df)).map(_._2)}")
   }
 
+  test("concurrent output writers: unsorted input, and the sorted rest past the writer limit, as Spark writes it") {
+    // 4 writers for 7 partitions x 3 buckets (21 files per task): each task opens 4, then sorts the rest.
+    // 64 writers: every task stays concurrent.
+    Seq("4", "64").foreach { max =>
+      withConf("spark.sql.maxConcurrentOutputFileWriters" -> max) {
+        val (p1, _) = compareWrites(
+          s"conc-part-$max",
+          s => s.table("t").selectExpr("i", "l", "s", "i % 7 as p"),
+          partitionBy = Seq("p")
+        )
+        assert(hasVectorWrite(p1), s"${p1.treeString}\n${fallbackReasons(p1)}")
+        val (p2, _) = compareWrites(
+          s"conc-max-$max",
+          s => s.table("t").selectExpr("i", "l", "s", "i % 7 as p"),
+          options = Map("maxRecordsPerFile" -> "300"),
+          partitionBy = Seq("p")
+        )
+        assert(hasVectorWrite(p2))
+        def bucketed(table: String, columnar: Boolean): SparkPlan = {
+          lastWritePlan = null
+          withConf(VectorConf.WriteColumnar -> columnar.toString) {
+            spark.sql(s"DROP TABLE IF EXISTS $table")
+            spark.table("t").selectExpr("i", "l", "s", "i % 7 as p").write.partitionBy("p").bucketBy(3, "i")
+              .format("parquet").saveAsTable(table)
+          }
+          org.apache.spark.sql.vecruntime.TestListenerSync.drain(spark)
+          lastWritePlan
+        }
+        val plan = bucketed("cbk_ours", columnar = true)
+        assert(hasVectorWrite(plan), s"${plan.treeString}\n${fallbackReasons(plan)}")
+        bucketed("cbk_spark", columnar = false)
+        assertRowsEqual(
+          withPlugin(enabled = false)(spark.table("cbk_spark").collect()).sortBy(_.toString),
+          withPlugin(enabled = false)(spark.table("cbk_ours").collect()).sortBy(_.toString),
+          0.0,
+          s"concurrent bucketed $max"
+        )
+        // Every file of ours holds one bucket's rows, as Spark's files do.
+        val location = spark.sessionState.catalog.getTableMetadata(
+          spark.sessionState.sqlParser.parseTableIdentifier("cbk_ours")
+        ).location
+        parquetFiles(location.toString).foreach { f =>
+          val id = org.apache.spark.sql.execution.datasources.BucketingUtils.getBucketId(f.getName).get
+          val ids = withPlugin(enabled =
+            false
+          )(spark.read.parquet(f.toString).selectExpr("pmod(hash(i), 3)").collect()).map(_.getInt(0)).toSet
+          assert(ids.subsetOf(Set(id)), s"$f holds buckets $ids")
+        }
+        spark.sql("DROP TABLE cbk_ours")
+        spark.sql("DROP TABLE cbk_spark")
+      }
+    }
+  }
+
   test("writes the prototype does not take keep Spark's writer, with the reason") {
     def reasonsOf(f: String => Unit): Seq[String] = {
       lastWritePlan = null
@@ -366,13 +420,6 @@ class VectorWriteSuite extends VectorQuerySuite {
       org.apache.spark.sql.vecruntime.TestListenerSync.drain(spark)
       assert(!hasVectorWrite(lastWritePlan))
       fallbackReasons(lastWritePlan)
-    }
-    withConf("spark.sql.maxConcurrentOutputFileWriters" -> "4") {
-      assert(
-        reasonsOf(p => spark.table("t").write.partitionBy("b").parquet(p)).exists(_.contains(
-          "maxConcurrentOutputFileWriters"
-        ))
-      )
     }
     assert(
       reasonsOf(p => spark.table("t").write.option("parquet.writer.version", "v1").parquet(p))

@@ -57,6 +57,11 @@ index are written as parquet-java writes them; binary min/max compare unsigned.
   `__HIVE_DEFAULT_PARTITION__`, custom locations), the bucket file names and the stats trackers are Spark's.
   Bucket ids are `pmod(murmur3hash(keys, 42), n)` from the shuffle's hash kernels over the data lanes;
   another bucket expression or key type is evaluated row by row by Spark's projection.
+- **Concurrent output writers** (`spark.sql.maxConcurrentOutputFileWriters` > 0, Spark's
+  `DynamicPartitionDataConcurrentWriter` for batches): the input is not sorted; up to that many files stay open
+  per task, one per partition and bucket, each run of a batch written to its own. Opening the last one switches
+  the task to sorted mode, as Spark does: the batch's remaining rows and every later batch go through our sort
+  (by the partition columns, then the bucket id), and each file is closed when its run ends.
 
 ## Scope of the prototype, and fallbacks
 
@@ -67,7 +72,7 @@ fallback list:
 
 | Write | Reason |
 |---|---|
-| Partitioned or bucketed under `spark.sql.maxConcurrentOutputFileWriters` > 0 (unsorted input) | `... maxConcurrentOutputFileWriters > 0 is not supported yet (#842)` |
+| Concurrent output writers whose past-the-limit sort keys do not compile | `concurrent writers' sort key ...` |
 | Hive-compatible bucketing (Hive tables) | `Hive-compatible bucketing is not supported yet (#842)` |
 | Struct, array, map columns | `column <name> has type <type>, not supported yet (#842)` |
 | `parquet.writer.version=v1` | `parquet.writer.version is v1, the columnar writer writes Parquet v2` |
@@ -89,7 +94,8 @@ fallback list:
   empty input, CTAS, partitioned writes (a boolean; a date and a string with nulls and characters that
   need escaping; `maxRecordsPerFile` within a partition: the same directories and row counts as Spark's),
   bucketed tables with and without partitions (every bucket file holds the rows Spark's bucket file holds;
-  a bucketed join reads them), and the fallbacks above.
+  a bucketed join reads them), concurrent output writers with a limit of 4 (the sorted rest past it) and of 64,
+  partitioned and bucketed, with `maxRecordsPerFile`, and the fallbacks above.
 
 ## Measurements
 

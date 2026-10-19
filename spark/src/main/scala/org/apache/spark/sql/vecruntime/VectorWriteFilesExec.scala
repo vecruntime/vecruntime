@@ -22,6 +22,7 @@ import scala.jdk.CollectionConverters._
 
 import io.vecruntime.kernels.{ArrowLayout, CompactKernels, SegmentVectorBuffers, VecType, VectorBuffers}
 import io.vecruntime.parquet.write.ColumnarParquetWriter
+import io.vecruntime.spark.VectorConf
 import io.vecruntime.spark.adapter.ColumnVectorAdapters
 import io.vecruntime.spark.arrow.SelectedColumnarBatch
 import org.apache.hadoop.conf.Configuration
@@ -109,6 +110,33 @@ case class VectorWriteFilesExec(
     require(ordinals.forall(_ >= 0), s"write columns ${spec.dataColumns} not all in ${child.output}")
     val allOrdinals = spec.allColumns.map(a => child.output.indexWhere(_.exprId == a.exprId)).toArray
     require(allOrdinals.forall(_ >= 0), s"columns ${spec.allColumns} not all in ${child.output}")
+    // Spark decides whether the task uses concurrent writers (its spec is defined then); the sort it would run
+    // past the limit is ours, by the partition columns and the bucket id (FileFormatWriter's required ordering).
+    val concurrent = writeFilesSpec.concurrentOutputWriterSpecFunc(child).map { c =>
+      val order =
+        VectorWritePlanner.concurrentSortOrder(spec.partitionColumns, spec.bucketSpec.map(_.bucketIdExpression))
+      val keys = order.map(o =>
+        VectorSortPlanner.compileKey(
+          o,
+          child.output
+        ).fold(r => throw new IllegalStateException(s"sort key ${o.sql}: $r"), k => k)
+      )
+      VectorConcurrentWriters(
+        c.maxWriters,
+        keys.toArray,
+        order.map(_ => true).toArray,
+        order.map(_ => true).toArray,
+        child.output.map(a => (a.name, a.dataType)).toArray,
+        new VectorMetrics(
+          sortMetric("numInputBatches"),
+          sortMetric("numOutputBatches"),
+          sortMetric("numOutputRows"),
+          sortMetric("sortTime")
+        ),
+        VectorConf.sortRunRows(conf),
+        VectorConf.sortSpillBytes(conf, sparkContext.getConf)
+      )
+    }
     val committer = writeFilesSpec.committer
     val jobTrackerID = SparkHadoopWriterUtils.createJobTrackerID(new Date())
     nonEmpty.mapPartitionsInternal { batches =>
@@ -123,11 +151,15 @@ case class VectorWriteFilesExec(
           committer,
           batches,
           ordinals,
-          allOrdinals
+          allOrdinals,
+          concurrent
         )
       )
     }
   }
+
+  private def sortMetric(name: String) =
+    org.apache.spark.sql.execution.metric.SQLMetrics.createMetric(sparkContext, s"concurrent writers' sort $name")
 
   override protected def stringArgs: Iterator[Any] = Iterator(child)
 
@@ -148,9 +180,8 @@ object VectorWritePlanner {
     val conf = session.sessionState.conf
     if (w.fileFormat.getClass != classOf[ParquetFileFormat]) {
       Some(s"columnar write: format ${w.fileFormat.getClass.getSimpleName} is not Parquet")
-    } else if ((w.partitionColumns.nonEmpty || w.bucketSpec.isDefined) && conf.maxConcurrentOutputFileWriters > 0) {
-      // Spark then writes unsorted input through concurrent writers (`DynamicPartitionDataConcurrentWriter`).
-      Some("columnar write: spark.sql.maxConcurrentOutputFileWriters > 0 is not supported yet (#842)")
+    } else if (concurrentKeysReason(w, conf).isDefined) {
+      concurrentKeysReason(w, conf)
     } else if (w.options.contains(BucketingUtils.optionForHiveCompatibleBucketWrite)) {
       Some("columnar write: Hive-compatible bucketing is not supported yet (#842)")
     } else if (!w.child.supportsColumnar) {
@@ -173,6 +204,38 @@ object VectorWritePlanner {
           .orElse(perColumn.map(k => s"columnar write: per-column option $k is not supported yet (#842)"))
           .orElse(w.child.output.iterator.flatMap(a => typeReason(a.name, a.dataType, conf)).nextOption())
       }
+    }
+  }
+
+  /**
+   * FileFormatWriter's required ordering of a dynamic-partition write: the partition columns, then the bucket id,
+   * ascending (nulls first).
+   */
+  def concurrentSortOrder(
+      partitionColumns: Seq[org.apache.spark.sql.catalyst.expressions.Attribute],
+      bucketId: Option[org.apache.spark.sql.catalyst.expressions.Expression]
+  ): Seq[org.apache.spark.sql.catalyst.expressions.SortOrder] =
+    (partitionColumns ++ bucketId).map(e =>
+      org.apache.spark.sql.catalyst.expressions.SortOrder(e, org.apache.spark.sql.catalyst.expressions.Ascending)
+    )
+
+  /**
+   * With concurrent writers (`spark.sql.maxConcurrentOutputFileWriters` > 0 and no bucket sort columns) the input
+   * is not sorted, and past the writer limit the task sorts the rest itself -- with our sort, whose keys must
+   * compile; why not, if one does not.
+   */
+  private def concurrentKeysReason(w: WriteFilesExec, conf: SQLConf): Option[String] = {
+    val dynamic = w.partitionColumns.nonEmpty || w.bucketSpec.isDefined
+    if (!dynamic || conf.maxConcurrentOutputFileWriters <= 0 || w.bucketSpec.exists(_.sortColumnNames.nonEmpty)) None
+    else {
+      val dataColumns = w.child.output.filterNot(a => w.partitionColumns.exists(_.exprId == a.exprId))
+      val bucketId = org.apache.spark.sql.execution.datasources.V1WritesUtils
+        .getWriterBucketSpec(w.bucketSpec, dataColumns, w.options)
+        .map(_.bucketIdExpression)
+      concurrentSortOrder(w.partitionColumns, bucketId).iterator
+        .flatMap(o => VectorSortPlanner.compileKey(o, w.child.output).left.toOption.map(r => s"${o.sql}: $r"))
+        .nextOption()
+        .map(r => s"columnar write: concurrent writers' sort key $r")
     }
   }
 
@@ -211,7 +274,8 @@ private[vecruntime] object VectorWriteTask {
       committer: FileCommitProtocol,
       batches: Iterator[ColumnarBatch],
       ordinals: Array[Int],
-      allOrdinals: Array[Int]
+      allOrdinals: Array[Int],
+      concurrent: Option[VectorConcurrentWriters]
   ): WriteTaskResult = {
     val jobId = SparkHadoopWriterUtils.createJobID(jobTrackerID, sparkStageId)
     val taskId = new TaskID(jobId, TaskType.MAP, sparkPartitionId)
@@ -234,10 +298,22 @@ private[vecruntime] object VectorWriteTask {
         if (description.partitionColumns.isEmpty && description.bucketSpec.isEmpty) {
           new VectorSingleDirectoryDataWriter(description, taskAttemptContext, committer, writeFile)
         } else {
-          new VectorDynamicPartitionDataWriter(description, taskAttemptContext, committer, allOrdinals)
+          new VectorDynamicPartitionDataWriter(description, taskAttemptContext, committer, allOrdinals, concurrent)
         }
-      while (batches.hasNext) {
-        dataWriter.writeBatch(batches.next(), ordinals)
+      dataWriter match {
+        case d: VectorDynamicPartitionDataWriter if concurrent.isDefined =>
+          // `sorted` first: a reader may reuse its vectors on `hasNext`, and the pending rows still borrow them.
+          while (!d.sorted && batches.hasNext) d.writeBatch(batches.next(), ordinals)
+          if (d.sorted) {
+            // The limit was reached: the rest, sorted, through the same writer (the sort keeps the columns).
+            val rest = d.sortedRest(batches)
+            try while (rest.hasNext) d.writeBatch(rest.next(), ordinals)
+            finally rest.close()
+          }
+        case _ =>
+          while (batches.hasNext) {
+            dataWriter.writeBatch(batches.next(), ordinals)
+          }
       }
       dataWriter.commit()
     })(
@@ -313,6 +389,22 @@ private[vecruntime] class VectorSingleDirectoryDataWriter(
   }
 }
 
+/**
+ * Concurrent output writers for one write (`spark.sql.maxConcurrentOutputFileWriters` > 0): the writer limit, and
+ * our sort of the rest of a task's input once it is reached -- by the partition columns, then the bucket id, as
+ * Spark's `FileFormatWriter` sorts it (compiled sort keys over the child's output).
+ */
+private[vecruntime] final case class VectorConcurrentWriters(
+    maxWriters: Int,
+    keys: Array[io.vecruntime.spark.expr.VectorExpr],
+    ascending: Array[Boolean],
+    nullsFirst: Array[Boolean],
+    outputAttrs: Array[(String, DataType)],
+    metrics: VectorMetrics,
+    runRows: Int,
+    spillBytes: Long
+)
+
 /** A data writer fed batches: `ordinals` are the data columns' positions in the batch. */
 private[vecruntime] trait VectorBatchWriter {
   def writeBatch(batch: ColumnarBatch, ordinals: Array[Int]): Unit
@@ -335,7 +427,8 @@ private[vecruntime] class VectorDynamicPartitionDataWriter(
     description: WriteJobDescription,
     taskAttemptContext: TaskAttemptContext,
     committer: FileCommitProtocol,
-    allOrdinals: Array[Int]
+    allOrdinals: Array[Int],
+    concurrent: Option[VectorConcurrentWriters] = None
 ) extends BaseDynamicPartitionDataWriter(description, taskAttemptContext, committer, Map.empty)
     with VectorBatchWriter {
 
@@ -417,6 +510,17 @@ private[vecruntime] class VectorDynamicPartitionDataWriter(
         startRun(all, rowOf(from), if (bucketIds == null) None else Some(bucketIds(from)))
         writeRun(cols, from, to)
         from = to
+        if (concurrent.isDefined && sorted && !sortStarted && from < n) {
+          // The writers reached their limit within this batch: its remaining rows go to the sort first.
+          pending = SelectedColumnarBatch.ofIndices(
+            SelectedColumnarBatch.columnsOf(batch),
+            batch.numRows(),
+            Array.tabulate(n - from)(k => rowOf(from + k)),
+            n - from,
+            false
+          )
+          return
+        }
       }
     } finally arena.close()
   }
@@ -424,7 +528,11 @@ private[vecruntime] class VectorDynamicPartitionDataWriter(
   /** Opens the run's file when its partition or bucket differs from the current one (Spark's `write`). */
   private def startRun(all: ColumnarBatch, row: Int, bucketId: Option[Int]): Unit = {
     val partitionValues = if (isPartitioned) Some(getPartitionValues(all.getRow(row))) else None
-    if (currentWriter == null || currentPartitionValues != partitionValues || currentBucketId != bucketId) {
+    if (concurrent.isDefined) {
+      if (currentWriter == null || currentPartitionValues != partitionValues || currentBucketId != bucketId) {
+        switchConcurrent(partitionValues.map(_.copy()), bucketId)
+      }
+    } else if (currentWriter == null || currentPartitionValues != partitionValues || currentBucketId != bucketId) {
       if (isPartitioned && currentPartitionValues != partitionValues) {
         currentPartitionValues = Some(partitionValues.get.copy())
         statsTrackers.foreach(_.newPartition(currentPartitionValues.get))
@@ -435,12 +543,119 @@ private[vecruntime] class VectorDynamicPartitionDataWriter(
     }
   }
 
+  // --- Concurrent writers (`spark.sql.maxConcurrentOutputFileWriters` > 0): Spark's
+  // `DynamicPartitionDataConcurrentWriter` for batches. The input is not sorted; up to `maxWriters` files stay
+  // open, one per partition and bucket, and each run goes to its own. Opening the `maxWriters`-th file switches
+  // to sorted mode: the rest of the input (the batch's remaining rows, then every later batch) is sorted by our
+  // sort and written as runs, a file closed when its run ends.
+
+  private final class Status(var writer: OutputWriter, var records: Long, var counter: Int)
+
+  private val writers = scala.collection.mutable.HashMap[(Option[UnsafeRow], Option[Int]), Status]()
+
+  /** Whether the writers reached their limit (always, without concurrent writers). */
+  private[vecruntime] var sorted: Boolean = concurrent.isEmpty
+
+  /** Whether the sorted rest of the input has started. */
+  private var sortStarted: Boolean = false
+
+  /** The rows of the batch during which the limit was reached that are still to write, as a selection. */
+  private var pending: ColumnarBatch = null
+
+  /** `pending` once handed to the sort, closed (its selection) with the writer. */
+  private var sortedPending: ColumnarBatch = null
+
+  private def currentKey: (Option[UnsafeRow], Option[Int]) = (currentPartitionValues, currentBucketId)
+
+  /** Stores the current writer's file and counters under its partition and bucket. */
+  private def saveStatus(): Unit = writers.get(currentKey).foreach { s =>
+    s.writer = currentWriter
+    s.records = recordsInFile
+    s.counter = fileCounter
+  }
+
+  /** Spark's `setupCurrentWriterUsingMap`: makes the writer of `(partitionValues, bucketId)` current. */
+  private def switchConcurrent(partitionValues: Option[UnsafeRow], bucketId: Option[Int]): Unit = {
+    if (currentWriter != null) {
+      if (!sorted || !sortStarted) saveStatus()
+      else {
+        writers.remove(currentKey)
+        releaseCurrentWriter()
+      }
+    }
+    val key = (partitionValues, bucketId)
+    if (isPartitioned && currentPartitionValues != partitionValues && !writers.contains(key)) {
+      statsTrackers.foreach(_.newPartition(partitionValues.get))
+    }
+    currentPartitionValues = partitionValues
+    currentBucketId = bucketId
+    writers.get(key) match {
+      case Some(s) =>
+        currentWriter = s.writer
+        recordsInFile = s.records
+        fileCounter = s.counter
+      case None =>
+        fileCounter = 0
+        renewCurrentWriter(partitionValues, bucketId, closeCurrentWriter = false)
+        writers.put(key, new Status(currentWriter, recordsInFile, fileCounter))
+        if (!sorted && writers.size >= concurrent.get.maxWriters) sorted = true
+    }
+  }
+
+  /**
+   * The rest of the input in our sort's order, once the writers reached their limit: the pending rows of the
+   * batch that reached it, then `rest`. Spark's `clearCurrentWriterStatus` first.
+   */
+  private[vecruntime] def sortedRest(rest: Iterator[ColumnarBatch]): VectorSortIterator = {
+    val c = concurrent.get
+    if (currentWriter != null) saveStatus()
+    currentPartitionValues = None
+    currentBucketId = None
+    currentWriter = null
+    recordsInFile = 0
+    fileCounter = 0
+    sortStarted = true
+    val first = pending
+    pending = null
+    sortedPending = first
+    new VectorSortIterator(
+      Option(first).iterator ++ rest,
+      c.keys,
+      c.ascending,
+      c.nullsFirst,
+      c.outputAttrs,
+      c.metrics,
+      runRows = c.runRows,
+      spillBytes = c.spillBytes
+    )
+  }
+
+  override protected def releaseResources(): Unit =
+    if (concurrent.isEmpty) super.releaseResources()
+    else {
+      if (pending != null) { pending.close(); pending = null }
+      if (sortedPending != null) { sortedPending.close(); sortedPending = null }
+      if (currentWriter != null && !writers.contains(currentKey)) super.releaseResources()
+      else if (currentWriter != null) saveStatus()
+      currentWriter = null
+      writers.values.foreach { s =>
+        if (s.writer != null) {
+          try {
+            s.writer.close()
+            statsTrackers.foreach(_.closeFile(s.writer.path()))
+          } finally s.writer = null
+        }
+      }
+      writers.clear()
+    }
+
   /** Rows `[from, to)` into the current file, rolling files at `maxRecordsPerFile`. */
   private def writeRun(cols: Array[VectorBuffers], from0: Int, to0: Int): Unit = {
     var from = from0
     while (from < to0) {
       if (description.maxRecordsPerFile > 0 && recordsInFile >= description.maxRecordsPerFile) {
         renewCurrentWriterIfTooManyRecords(currentPartitionValues, currentBucketId)
+        if (concurrent.isDefined) saveStatus()
       }
       val room =
         if (description.maxRecordsPerFile > 0) math.min(to0 - from, description.maxRecordsPerFile - recordsInFile).toInt
