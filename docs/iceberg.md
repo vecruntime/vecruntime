@@ -43,7 +43,7 @@ Format version 1 reads as version 2 does, without delete files.
 | Position deletes | yes | The file is read with its row positions. Iceberg's `BaseDeleteLoader` loads the deletes and the deleted rows are deselected, with no copy |
 | Equality deletes | yes, or group | Read natively when every equality column is a top-level column of a native type. Columns the query does not project are added for the match and dropped afterwards. Iceberg's `DeleteFilter` semantics apply, nulls matching nulls. A nested equality column, or one of another type, sends the group to Iceberg's reader |
 | Schema evolution: add, drop, rename, reorder | yes | Columns are matched by Iceberg field id, never by name. A column added after a file was written reads as nulls from that file |
-| Type promotion (int to long, float to double, decimal precision) | yes, untested | The native reader widens a file's narrower type as it does for Parquet tables, but no Iceberg test covers a promoted column yet |
+| Type promotion (int to long, float to double, decimal precision) | yes | The native reader widens a file's narrower type as it does for Parquet tables, with and without position deletes and deletion vectors; a pushed filter compares the old files' narrow statistics with the wide literal. A decimal promoted past 18 digits reads its 64-bit files into a DECIMAL128 lane |
 | Name mapping (`schema.name-mapping.default`) | scan | Files may carry no field ids |
 | Hidden partitioning and partition transforms (identity, bucket, truncate, year, month, day, hour) | yes | Iceberg's planning prunes by every transform. Partition values are read from the files, not filled in as constants |
 | Partition-spec evolution | yes | Each file is planned and pruned under its own spec |
@@ -221,8 +221,8 @@ mvn -Piceberg -pl spark verify -Dsuites=io.vecruntime.spark.iceberg.IcebergScanS
 - **Merge-on-read battery:** `IcebergNativeScanSuite` (the native scan) and `IcebergScanSuite` (Iceberg's reader
   under our operators) share `IcebergMorSuiteBase` and run the same queries. Only the expected scan node differs.
 - **Native scan:** `IcebergNativeScanSuite` also covers the native readers of position deletes, deletion vectors
-  and equality deletes; the metadata columns; renamed and added columns; pushed and runtime filters by field id;
-  and task-group packing.
+  and equality deletes; the metadata columns; renamed, added and promoted columns (int to bigint, float to double,
+  decimal precision, on v2 and v3 with deletes); pushed and runtime filters by field id; and task-group packing.
 - **Planner rules on Iceberg:** `IcebergDppSuite`, `IcebergFactBloomFilterSuite`, `IcebergBroadcastBySizeSuite`,
   `IcebergRuntimeFilterBySizeSuite` and `IcebergMergeAggregatesSuite`.
 - **DV writer:** `DvWriteStrategyFallbackSuite` and `DvWriteProfileSuite`.
