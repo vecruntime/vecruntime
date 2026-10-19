@@ -254,16 +254,43 @@ class SortMemoryBudgetSuite extends AnyFunSuite {
     }
   }
 
-  test("#868: with off-heap memory the sort's default cap is the task's share of the pool") {
+  test("#877: with off-heap memory the pool is the ceiling and the task's share only the spill trigger") {
     val conf = new SparkConf(false)
       .set("spark.memory.offHeap.enabled", "true")
       .set("spark.memory.offHeap.size", "24g")
       .set("spark.executor.cores", "15")
     val sql = new org.apache.spark.sql.internal.SQLConf
-    assert(io.vecruntime.spark.VectorConf.sortSpillBytes(sql, conf) === (24L << 30) / 15)
+    assert(io.vecruntime.spark.VectorConf.sortSpillBytes(sql, conf) === Long.MaxValue, "no cap: the grant decides")
+    assert(io.vecruntime.spark.VectorConf.sortFairShareBytes(sql, conf) === (24L << 30) / 15)
     assert(io.vecruntime.spark.VectorConf.sortSpillBytes(sql, new SparkConf(false)) === (1L << 30))
+    assert(io.vecruntime.spark.VectorConf.sortFairShareBytes(sql, new SparkConf(false)) === 0L)
     sql.setConfString("spark.vecruntime.sort.spillBytes", "256m")
     assert(io.vecruntime.spark.VectorConf.sortSpillBytes(sql, conf) === (256L << 20), "an explicit setting wins")
+    assert(io.vecruntime.spark.VectorConf.sortFairShareBytes(sql, conf) === 0L, "and is a hard cap, not a trigger")
+  }
+
+  test("#877: past its fair share the sort keeps runs resident while the pool has room, spills when it has none") {
+    // Fair share 64 KiB: the partition's runs (~256 KiB of longs) pass it. With 4 MiB free in the pool the trigger is
+    // share + 2 MiB and nothing spills; with nothing free the trigger is the share and runs go to disk.
+    def run(free: Long): Int = withPool(1L << 30) { (_, _) =>
+      val it = new VectorSortIterator(
+        input,
+        Array(ColumnRef(0, LongType)),
+        Array(true),
+        Array(true),
+        Array("k" -> LongType, "v" -> LongType),
+        metrics,
+        runRows = 4096,
+        fairShareBytes = 64L * 1024,
+        poolFree = () => free
+      )
+      check(it)
+      val spilled = it.spilledRuns
+      it.close()
+      spilled
+    }
+    assert(run(free = 4L << 20) === 0, "a pool with room keeps the runs resident past the share")
+    assert(run(free = 0L) > 0, "a full pool brings the trigger back to the share")
   }
 
   /** A task context over `tmm` that records and runs its completion listeners. */

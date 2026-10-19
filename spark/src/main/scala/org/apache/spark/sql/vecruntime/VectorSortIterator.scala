@@ -47,6 +47,18 @@ private[vecruntime] object VectorSortIterator {
     if (conf.getBoolean("spark.memory.offHeap.enabled", false)) org.apache.spark.memory.MemoryMode.OFF_HEAP
     else org.apache.spark.memory.MemoryMode.ON_HEAP
 
+  /**
+   * #877: the bytes the executor's off-heap memory pool has free right now (execution and storage share it); 0
+   * without a SparkEnv or an off-heap pool.
+   */
+  def offHeapPoolFree(): Long = {
+    val env = org.apache.spark.SparkEnv.get
+    if (env == null) return 0L
+    val mm = env.memoryManager
+    val size = env.conf.getSizeAsBytes("spark.memory.offHeap.size", "0")
+    math.max(0L, size - mm.offHeapExecutionMemoryUsed - mm.offHeapStorageMemoryUsed)
+  }
+
   // #879: resolved once per SparkEnv (it cannot change within one), not on every consumer's construction.
   @volatile private var cached: (AnyRef, org.apache.spark.memory.MemoryMode) = (new Object, null)
 
@@ -78,7 +90,11 @@ private[vecruntime] class VectorSortIterator(
     runRows: Int = 1 << 20,
     spillBytes: Long = Long.MaxValue,
     /** #879: the pool of the runs' memory, resolved at plan time (or once per SparkEnv). */
-    memoryMode: org.apache.spark.memory.MemoryMode = VectorSortIterator.memoryMode()
+    memoryMode: org.apache.spark.memory.MemoryMode = VectorSortIterator.memoryMode(),
+    /** #877: the soft spill trigger, the task's fair share of the off-heap pool; 0 for none (the cap alone). */
+    fairShareBytes: Long = 0L,
+    /** #877: the executor's free off-heap pool, read at each trigger check (a function, so tests can drive it). */
+    poolFree: () => Long = () => VectorSortIterator.offHeapPoolFree()
 ) extends Iterator[ColumnarBatch]
     with AutoCloseable {
 
@@ -90,6 +106,20 @@ private[vecruntime] class VectorSortIterator(
   private val hasNested: Boolean = outputAttrs.exists { case (_, dt) => TypeMapping.nestedTypeOf(dt) != null }
   private val runRowLimit: Int = if (hasNested) Int.MaxValue else runRows
   private val spillLimit: Long = if (hasNested) Long.MaxValue else spillBytes
+
+  /**
+   * #877: where the resident runs start spilling. The cap (`spillLimit`) when there is no fair share; otherwise the
+   * fair share plus half of what the executor's off-heap pool has free right now, never past the cap -- the pool's
+   * grant (`hold`) stays the hard ceiling. A task alone on an idle executor keeps more resident; among busy
+   * siblings the pool's free bytes shrink and the trigger falls back to the share, so no task pins what its
+   * siblings are about to ask for.
+   */
+  private def spillTrigger: Long =
+    if (fairShareBytes <= 0L || hasNested) spillLimit
+    else {
+      val free = poolFree()
+      math.min(spillLimit, fairShareBytes + free / 2)
+    }
 
   /** A run the merge reads: its key columns and output columns as they currently stand. */
   private sealed trait Run {
@@ -411,11 +441,12 @@ private[vecruntime] class VectorSortIterator(
         // Past the budget -- the cap, or what the pool grants this task (#867), native or heap side (#868) -- the
         // newest run goes to disk in sorted order and its memory is returned, then the largest resident runs until
         // the rest fit.
-        if (!hasNested && (residentBytes > spillLimit || !hold(residentBytes) || !holdHeap(residentHeap))) {
+        if (!hasNested && (residentBytes > spillTrigger || !hold(residentBytes) || !holdHeap(residentHeap))) {
           runs += spill(run)
           residentBytes -= bytes
           residentHeap -= run.heapBytes
-          val allowed = if (consumer == null) spillLimit else math.min(spillLimit, reserved)
+          val trigger = spillTrigger
+          val allowed = if (consumer == null) trigger else math.min(trigger, reserved)
           val heapAllowed = if (heapConsumer == null) Long.MaxValue else heapReserved
           if (residentBytes > allowed || residentHeap > heapAllowed)
             spillResident(math.max(0L, residentBytes - allowed), math.max(0L, residentHeap - heapAllowed))
@@ -455,7 +486,7 @@ private[vecruntime] class VectorSortIterator(
                   c += 1
                 }
                 keyBuilders.foreach(b => projected += b.allocatedBytes())
-                if (projected > spillLimit || !hold(projected)) seal()
+                if (projected > spillTrigger || !hold(projected)) seal()
               }
               if (columnBuilders == null) {
                 val expected = math.max(math.min(runRowLimit, count), 1)
@@ -485,7 +516,7 @@ private[vecruntime] class VectorSortIterator(
               if (runTotal >= runRowLimit) seal()
               else if (!hasNested && runTotal >= OutputBatchSize) {
                 val building = (columnBuilders ++ keyBuilders).map(_.allocatedBytes()).sum
-                if (residentBytes + building > spillLimit || !hold(residentBytes + building)) seal()
+                if (residentBytes + building > spillTrigger || !hold(residentBytes + building)) seal()
               }
             }
           }

@@ -338,10 +338,23 @@ object VectorConf {
   val DefaultSortSpillBytes: Long = 1L << 30
   def sortSpillBytes(conf: SQLConf, sparkConf: org.apache.spark.SparkConf): Long = {
     val explicit = conf.getConfString(SortSpillBytes, "").trim
+    // #877: with off-heap memory and no explicit setting there is no cap -- the pool's grant is the ceiling and the
+    // task's fair share is only where the sort starts preferring to spill (sortFairShareBytes).
     val v = if (explicit.nonEmpty) org.apache.spark.network.util.JavaUtils.byteStringAsBytes(explicit)
-    else offHeapTaskShare(sparkConf).getOrElse(DefaultSortSpillBytes)
+    else if (offHeapTaskShare(sparkConf).isDefined) Long.MaxValue
+    else DefaultSortSpillBytes
     if (v <= 0) Long.MaxValue else v
   }
+
+  /**
+   * #877: the sort's soft spill trigger with off-heap memory and no explicit `spark.vecruntime.sort.spillBytes`: the
+   * task's fair share of the pool ([[offHeapTaskShare]]), past which resident runs spill unless the pool has room
+   * to spare -- the sort may grow by half of the pool's free bytes past it, so a task alone on an idle executor uses
+   * what is free while one among busy siblings stays near its share. 0 when not applicable (an explicit cap or no
+   * off-heap memory: the cap alone decides).
+   */
+  def sortFairShareBytes(conf: SQLConf, sparkConf: org.apache.spark.SparkConf): Long =
+    if (conf.getConfString(SortSpillBytes, "").trim.nonEmpty) 0L else offHeapTaskShare(sparkConf).getOrElse(0L)
 
   /**
    * #868: a task's fair share of the off-heap execution pool, `spark.memory.offHeap.size /
