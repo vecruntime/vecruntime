@@ -58,6 +58,9 @@ object GraceHashJoin extends Logging {
    */
   val SpillChunkRows: Int = 262144
 
+  /** Joins that went to buckets in this JVM, for tests (#868). */
+  private[vecruntime] val bucketedJoins = new java.util.concurrent.atomic.AtomicLong
+
   def iterator(
       buildIter: Iterator[ColumnarBatch],
       streamIter: Iterator[ColumnarBatch],
@@ -77,6 +80,10 @@ object GraceHashJoin extends Logging {
 
     val arena = Arena.ofShared() // the table's scratch; the columns live in the builders
     val builders = spec.buildTypes.map(dt => ColumnBuilder.owning(TypeMapping.vecTypeOf(dt), 4096))
+    // #868: the build side's bytes come from Spark's execution memory (the sort's pool: off-heap when Spark
+    // has one). Held before every append; a refusal starts the bucketing as the budget does. A build side
+    // that cannot bucket is still counted, so the pool can make the task's other consumers spill.
+    val memory = new BuildMemory
     var total = 0
     // The batch that would have grown the builders past the budget: not appended, bucketed first below.
     var overflowBatch: ColumnarBatch = null
@@ -87,7 +94,9 @@ object GraceHashJoin extends Logging {
       val batch = buildIter.next()
       if (batch.numRows() > 0) {
         EvalContexts.withBatch(batch) { ctx =>
-          if (canSpill && bytesAfter(builders, ctx) > budgetBytes) overflowBatch = batch
+          val after = bytesAfter(builders, ctx)
+          val granted = memory.hold(after)
+          if (canSpill && (after > budgetBytes || !granted)) overflowBatch = batch
           else {
             var c = 0
             while (c < builders.length) { builders(c).append(ctx.input(c), ctx.selection, ctx.selectedCount); c += 1 }
@@ -97,14 +106,16 @@ object GraceHashJoin extends Logging {
       }
     }
     if (overflowBatch == null) {
-      // As before #416: the whole build side in one table.
+      // As before #416: the whole build side in one table, its bytes held until the task ends.
       val table = new BuildTable(arena, builders.map(_.view()), total, spec, builders = builders).build()
+      memory.releaseTo(heldBytes(builders))
       return new VectorHashJoinIterator(streamIter, table, spec, metrics)
     }
 
     logInfo(
       s"hash join: build side past $budgetBytes bytes after $total rows (${heldBytes(builders)} bytes held), bucketing both sides into $buckets buckets on disk"
     )
+    bucketedJoins.incrementAndGet()
     val allocator = VectorAllocators.newChild("VectorShuffledHashJoinExec.grace")
     val buildAttrs =
       if (spec.buildIsLeft) spec.joinedAttrs.take(spec.buildTypes.length) else spec.joinedAttrs.drop(spec.streamedWidth)
@@ -131,6 +142,7 @@ object GraceHashJoin extends Logging {
     spilledRows += total
     builders.foreach(_.close())
     arena.close()
+    memory.releaseTo(0L)
     def spillBuild(batch: ColumnarBatch): Unit = if (batch.numRows() > 0) EvalContexts.withBatch(batch) { ctx =>
       val cols = Array.tabulate(spec.buildTypes.length)(c => plain(ctx.input(c), ctx.arena))
       buildSpill.writeBuffers(cols, spec.buildKeys.map(_.eval(ctx)), ctx.numRows, ctx.arena, ctx.selection)
@@ -228,4 +240,37 @@ object GraceHashJoin extends Logging {
   /** The buckets are written plain: a dictionary-encoded string column is decoded once here. */
   private def plain(b: VectorBuffers, arena: Arena): VectorBuffers =
     if (b.`type`() == VecType.UTF8 && b.isDictionaryEncoded()) ArrowOutput.decodeDictionary(b, arena) else b
+}
+
+/**
+ * #868: a join build's bytes in Spark's execution memory -- the task's `TaskMemoryManager`, in the sort's
+ * memory mode (off-heap when Spark has an off-heap pool). [[hold]] acquires what is missing and answers
+ * whether the whole amount is held; [[releaseTo]] returns the excess. Nothing is spilled on another
+ * consumer's request (a built table cannot give back part of itself); everything is returned when the task
+ * ends. Without a task (a driver-side call, a unit test) it holds nothing and always grants.
+ */
+private[vecruntime] final class BuildMemory {
+  private val consumer: org.apache.spark.memory.MemoryConsumer =
+    Option(org.apache.spark.TaskContext.get()).flatMap(tc => Option(tc.taskMemoryManager())).map { tmm =>
+      new org.apache.spark.memory.MemoryConsumer(tmm, tmm.pageSizeBytes(), VectorSortIterator.memoryMode()) {
+        override def spill(size: Long, trigger: org.apache.spark.memory.MemoryConsumer): Long = 0L
+      }
+    }.orNull
+  private var held = 0L
+  if (consumer != null) org.apache.spark.TaskContext.get().addTaskCompletionListener[Unit](_ => releaseTo(0L))
+
+  /** The bytes currently held. */
+  def bytes: Long = held
+
+  def hold(bytes: Long): Boolean = {
+    if (consumer == null || bytes <= held) return true
+    held += consumer.acquireMemory(bytes - held)
+    held >= bytes
+  }
+
+  def releaseTo(bytes: Long): Unit =
+    if (consumer != null && held > bytes) {
+      consumer.freeMemory(held - math.max(0L, bytes))
+      held = math.max(0L, bytes)
+    }
 }

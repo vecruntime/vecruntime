@@ -146,6 +146,68 @@ class SortMemoryBudgetSuite extends AnyFunSuite {
     }
   }
 
+  // #868: the shuffled hash join's build side on the same pool.
+  private val joinSpec = JoinSpec(
+    joinType = org.apache.spark.sql.catalyst.plans.Inner,
+    buildIsLeft = false,
+    buildKeys = Array(ColumnRef(0, LongType)),
+    streamedKeys = Array(ColumnRef(0, LongType)),
+    condition = None,
+    outputAttrs = Array("k" -> LongType, "bk" -> LongType),
+    joinedAttrs = Array("k" -> LongType, "bk" -> LongType),
+    buildTypes = Array(LongType),
+    streamedWidth = 1
+  )
+
+  /** Build keys 0 until 32768, streamed even keys 0 until 65536: (matches, sum of the streamed keys). */
+  private def join(budgetBytes: Long): (Long, Long) = {
+    val schema = new StructType().add("k", LongType)
+    def batches(n: Int)(v: Long => Long) =
+      Iterator.tabulate(8)(b =>
+        VectorRowStages.toBatch(schema, Array.tabulate(n)(i => InternalRow(v(b.toLong * n + i))))
+      )
+    val it = GraceHashJoin.iterator(batches(4096)(identity), batches(4096)(_ * 2), joinSpec, metrics, budgetBytes, 32)
+    var rows = 0L
+    var sum = 0L
+    while (it.hasNext) {
+      val b = it.next()
+      var i = 0
+      while (i < b.numRows()) { sum += b.column(0).getLong(i); i += 1 }
+      rows += b.numRows()
+    }
+    (rows, sum)
+  }
+
+  private val joinExpected = (16384L, (0L until 32768L by 2).sum)
+
+  test("#868: a pool too small for the build side makes the hash join bucket, within a large budget") {
+    withPool(64L * 1024) { (_, _) =>
+      val before = GraceHashJoin.bucketedJoins.get()
+      assert(join(budgetBytes = 1L << 30) === joinExpected)
+      assert(GraceHashJoin.bucketedJoins.get() > before, "the pool refused, so the join went to buckets")
+    }
+  }
+
+  test("#868: a pool large enough keeps the build side in memory") {
+    withPool(1L << 30) { (_, _) =>
+      val before = GraceHashJoin.bucketedJoins.get()
+      assert(join(budgetBytes = 1L << 30) === joinExpected)
+      assert(GraceHashJoin.bucketedJoins.get() === before)
+    }
+  }
+
+  test("#868: with off-heap memory the sort's default cap is the task's share of the pool") {
+    val conf = new SparkConf(false)
+      .set("spark.memory.offHeap.enabled", "true")
+      .set("spark.memory.offHeap.size", "24g")
+      .set("spark.executor.cores", "15")
+    val sql = new org.apache.spark.sql.internal.SQLConf
+    assert(io.vecruntime.spark.VectorConf.sortSpillBytes(sql, conf) === (24L << 30) / 15)
+    assert(io.vecruntime.spark.VectorConf.sortSpillBytes(sql, new SparkConf(false)) === (1L << 30))
+    sql.setConfString("spark.vecruntime.sort.spillBytes", "256m")
+    assert(io.vecruntime.spark.VectorConf.sortSpillBytes(sql, conf) === (256L << 20), "an explicit setting wins")
+  }
+
   /** A task context over `tmm` that records and runs its completion listeners. */
   private final class PoolTaskContext(tmm: TaskMemoryManager)
       extends org.apache.spark.sql.vecruntime.shims.TestTaskContextBase {
