@@ -281,6 +281,58 @@ class IcebergNativeScanSuite extends IcebergMorSuiteBase {
     checkNestedNatively("equality")
   }
 
+  icebergTest("v3 initial defaults fill the files written before their columns were added, read natively") {
+    import org.apache.iceberg.expressions.Literal
+    import org.apache.iceberg.types.Types
+    spark.sql(
+      s"""CREATE OR REPLACE TABLE $Db.t_defaults (k INT, s STRING) USING iceberg
+         |TBLPROPERTIES ('format-version' = '3', 'write.delete.mode' = 'merge-on-read')""".stripMargin
+    )
+    spark.sql(s"INSERT INTO $Db.t_defaults SELECT CAST(id AS INT), concat('s', id % 5) FROM range(0, 3000)")
+    val table = org.apache.iceberg.spark.Spark3Util.loadIcebergTable(spark, s"$Db.t_defaults")
+    table.updateSchema()
+      .addColumn("ci", Types.IntegerType.get(), "", Literal.of(7))
+      .addColumn("cl", Types.LongType.get(), "", Literal.of(9000000000L))
+      .addColumn("cb", Types.BooleanType.get(), "", Literal.of(true))
+      .addColumn("cf", Types.DoubleType.get(), "", Literal.of(2.5d))
+      .addColumn("cd", Types.DecimalType.of(9, 2), "", Literal.of(new java.math.BigDecimal("12.34")))
+      .addColumn("cs", Types.StringType.get(), "", Literal.of("it's"))
+      .addColumn("cdt", Types.DateType.get(), "", Literal.of(19000).to(Types.DateType.get()))
+      .addColumn(
+        "cts",
+        Types.TimestampType.withZone(),
+        "",
+        Literal.of(1704067200123456L).to(Types.TimestampType.withZone())
+      )
+      .addColumn(
+        "cnt",
+        Types.TimestampType.withoutZone(),
+        "",
+        Literal.of(1704067200123456L).to(Types.TimestampType.withoutZone())
+      )
+      .commit()
+    spark.sql(
+      s"""INSERT INTO $Db.t_defaults SELECT CAST(id AS INT), concat('n', id % 3), CAST(id AS INT), id, id % 2 = 0,
+         |  id / 3.0, CAST(id / 100.0 AS DECIMAL(9, 2)), concat('v', id), date_add(DATE '2020-01-01', CAST(id AS INT)),
+         |  timestamp_seconds(id), CAST(timestamp_seconds(id) AS TIMESTAMP_NTZ)
+         |FROM range(3000, 3500)""".stripMargin
+    )
+    // One position delete, so a deleted file is read with its defaults too.
+    spark.sql(s"DELETE FROM $Db.t_defaults WHERE k % 10 = 1")
+    useTable("t_defaults")
+    Seq(
+      "SELECT k, s, ci, cl, cb, cf, cd, cs, cdt, cts, cnt FROM t WHERE k % 97 = 3",
+      "SELECT ci, cb, count(*), sum(cl), sum(cf), sum(cd), min(cs), max(cdt), max(cts), min(cnt) FROM t GROUP BY ci, cb",
+      "SELECT count(*) FROM t WHERE ci = 7 AND cs = 'it''s' AND cd = 12.34"
+    ).foreach { q =>
+      val df = checkVectorized(q, Nil)
+      assert(df.collect().nonEmpty, s"the query should return rows: $q")
+      val (native, iceberg) = groups(df)
+      assert(native > 0 && iceberg == 0, s"native $native, Iceberg $iceberg: $q")
+    }
+    assert(count("SELECT count(*) FROM t WHERE ci = 7 AND cs = 'it''s'") === 2700)
+  }
+
   icebergTest("an identity-partitioned table reads its partition column from the files") {
     spark.sql(
       s"CREATE OR REPLACE TABLE $Db.t_parted USING iceberg PARTITIONED BY (b) AS SELECT i, l, s, b, d2 FROM $Db.t_pos"

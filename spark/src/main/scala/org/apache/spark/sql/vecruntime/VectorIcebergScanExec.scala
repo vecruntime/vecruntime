@@ -139,8 +139,17 @@ case class VectorIcebergScanExec(
         // #nested: nested struct fields matched by their Iceberg field ids too.
         if (a.dataType.isInstanceOf[AtomicType]) a.dataType
         else IcebergTasks.withFieldIds(a.dataType, IcebergTasks.projectedType(scan, id)),
-        a.nullable,
-        new MetadataBuilder().putLong(ParquetUtils.FIELD_ID_METADATA_KEY, id.toLong).build()
+        a.nullable, {
+          val md = new MetadataBuilder().putLong(ParquetUtils.FIELD_ID_METADATA_KEY, id.toLong)
+          // A v3 initial default: our reader fills it into files written before the column was added.
+          IcebergTasks.initialDefaultSql(scan, id, a.dataType).foreach { sql =>
+            md.putString(
+              org.apache.spark.sql.catalyst.util.ResolveDefaultColumns.EXISTS_DEFAULT_COLUMN_METADATA_KEY,
+              sql
+            )
+          }
+          md.build()
+        }
       )
     })
     def confFor(schema: StructType) = {
@@ -638,7 +647,11 @@ private[vecruntime] object IcebergTasks {
             // Other metadata columns (_deleted, _partition, row lineage) keep Iceberg's reader.
             if (id >= MetadataIdFloor) return Left(s"Iceberg metadata column ${a.name}")
             // A v3 initial default fills the column for files written before it was added; our reader reads nulls.
-            if (call(field, "initialDefault") != null) return Left(s"Iceberg column ${a.name} has an initial default")
+            // A v3 initial default fills the column for files written before it was added: read as an existence
+            // default (a constant of the column's type) when it can be written as one, else Iceberg's reader.
+            if (call(field, "initialDefault") != null && existenceDefaultSql(field, a.dataType).isEmpty) {
+              return Left(s"Iceberg column ${a.name} has an initial default")
+            }
             unsupportedType(call(field, "type"), a.name).foreach(reason => return Left(reason))
             id
         }
@@ -646,6 +659,51 @@ private[vecruntime] object IcebergTasks {
     } catch {
       case e: ReflectiveOperationException => Left(s"Iceberg scan not recognised: $e")
     }
+
+  /**
+   * A top-level Iceberg column's v3 initial default as Spark's existence default (the SQL text Spark keeps under
+   * `EXISTS_DEFAULT`), which our reader fills into the rows of a file written before the column was added. None
+   * when the column has no initial default, or one of a type our reader cannot fill as a constant (only a lane
+   * type, a string or a binary; see `missingReadable`).
+   */
+  def existenceDefaultSql(field: AnyRef, dt: org.apache.spark.sql.types.DataType): Option[String] = {
+    import org.apache.spark.sql.types._
+    val v = call(field, "initialDefault")
+    if (v == null) return None
+    def quoted(x: String) = "'" + x.replace("\\", "\\\\").replace("'", "\\'") + "'"
+    val sql: Option[String] = (dt, v) match {
+      case (BooleanType, b: java.lang.Boolean) => Some(b.toString)
+      case (IntegerType, i: java.lang.Integer) => Some(s"CAST(${i.intValue()} AS INT)")
+      case (LongType, l: java.lang.Long) => Some(s"CAST(${l.longValue()} AS BIGINT)")
+      case (FloatType, f: java.lang.Float) => Some(s"CAST(${quoted(f.toString)} AS FLOAT)")
+      case (DoubleType, d: java.lang.Double) => Some(s"CAST(${quoted(d.toString)} AS DOUBLE)")
+      case (d: DecimalType, b: java.math.BigDecimal) =>
+        Some(s"CAST(${quoted(b.toPlainString)} AS DECIMAL(${d.precision}, ${d.scale}))")
+      case (StringType, cs: CharSequence) => Some(quoted(cs.toString))
+      case (DateType, days: java.lang.Integer) =>
+        Some(s"DATE ${quoted(java.time.LocalDate.ofEpochDay(days.longValue()).toString)}")
+      case (TimestampType, micros: java.lang.Long) => Some(s"timestamp_micros(${micros.longValue()})")
+      case (TimestampNTZType, micros: java.lang.Long) =>
+        val t = java.time.LocalDateTime.ofEpochSecond(
+          Math.floorDiv(micros.longValue(), 1000000L),
+          (Math.floorMod(micros.longValue(), 1000000L) * 1000).toInt,
+          java.time.ZoneOffset.UTC
+        )
+        Some(s"TIMESTAMP_NTZ ${quoted(t.toString.replace('T', ' '))}")
+      case (BinaryType, bb: java.nio.ByteBuffer) =>
+        val bytes = new Array[Byte](bb.remaining()); bb.duplicate().get(bytes)
+        Some("X'" + bytes.map(b => f"${b & 0xff}%02X").mkString + "'")
+      case _ => None
+    }
+    // Only a type our reader fills as a constant (an engine lane, a string or a binary).
+    sql.filter { _ =>
+      dt match {
+        case StringType | BinaryType => true
+        case a: AtomicType => io.vecruntime.spark.adapter.TypeMapping.vecTypeOf(a) != null
+        case _ => false
+      }
+    }
+  }
 
   /**
    * Why an Iceberg column type is not read natively, or None: a flat type of [[NativeTypes]], or (#nested) a struct,
@@ -701,12 +759,17 @@ private[vecruntime] object IcebergTasks {
       case other => other
     }
 
-  /** The Iceberg type of the projected field `id` of `b`'s scan. */
-  def projectedType(b: BatchScanExec, id: Int): AnyRef = {
+  /** The projected field `id`'s initial default as an existence default (see [[existenceDefaultSql]]). */
+  def initialDefaultSql(b: BatchScanExec, id: Int, dt: org.apache.spark.sql.types.DataType): Option[String] =
+    if (dt.isInstanceOf[AtomicType]) existenceDefaultSql(projectedField(b, id), dt) else None
+
+  private def projectedField(b: BatchScanExec, id: Int): AnyRef = {
     val projection = call(b.scan, "projection")
-    val field = projection.getClass.getMethod("findField", classOf[Int]).invoke(projection, Int.box(id))
-    call(field, "type")
+    projection.getClass.getMethod("findField", classOf[Int]).invoke(projection, Int.box(id))
   }
+
+  /** The Iceberg type of the projected field `id` of `b`'s scan. */
+  def projectedType(b: BatchScanExec, id: Int): AnyRef = call(projectedField(b, id), "type")
 
   /**
    * One file scan task read natively: its split, the data file's location, its position delete files (and deletion
