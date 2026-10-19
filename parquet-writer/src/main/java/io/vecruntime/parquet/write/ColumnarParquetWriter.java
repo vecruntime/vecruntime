@@ -67,7 +67,7 @@ public final class ColumnarParquetWriter implements AutoCloseable {
     private final List<ColumnDescriptor> columns;
     private final ColumnEncoder[] encoders;
     private final VecType[] lanes;
-    private final FixedWidthChunkWriter[] fast;
+    private final ChunkWriter[] fast;
 
     private ColumnChunkPageWriteStore pageStore;
     private ColumnWriteStore columnStore;
@@ -107,7 +107,7 @@ public final class ColumnarParquetWriter implements AutoCloseable {
         }
         this.encoders = new ColumnEncoder[columns.size()];
         this.lanes = new VecType[columns.size()];
-        this.fast = new FixedWidthChunkWriter[columns.size()];
+        this.fast = new ChunkWriter[columns.size()];
         this.file = new ParquetFileWriter(out, schema, ParquetFileWriter.Mode.CREATE, rowGroupSize, 0, null,
                 props);
         this.file.start();
@@ -147,6 +147,12 @@ public final class ColumnarParquetWriter implements AutoCloseable {
                 FixedWidthChunkWriter.Kind kind = FixedWidthChunkWriter.kindFor(lane, columns.get(i));
                 if (kind != null) {
                     fast[i] = new FixedWidthChunkWriter(kind, columns.get(i), props);
+                    fast[i].startChunk(pageStore.getPageWriter(columns.get(i)));
+                } else if (lane == VecType.UTF8 && columns.get(i).getMaxRepetitionLevel() == 0 && columns.get(i)
+                        .getPrimitiveType()
+                        .getPrimitiveTypeName()
+                        == org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.BINARY) {
+                    fast[i] = new BinaryChunkWriter(columns.get(i), props);
                     fast[i].startChunk(pageStore.getPageWriter(columns.get(i)));
                 } else {
                     encoders[i] = ColumnEncoder.forColumn(lane, columns.get(i));
@@ -199,7 +205,7 @@ public final class ColumnarParquetWriter implements AutoCloseable {
             return;
         }
         file.startBlock(rowGroupRows);
-        for (FixedWidthChunkWriter f : fast) {
+        for (ChunkWriter f : fast) {
             if (f != null) {
                 f.endChunk();
             }
@@ -218,7 +224,7 @@ public final class ColumnarParquetWriter implements AutoCloseable {
 
     private long bufferedSize() {
         long size = columnStore == null ? 0 : columnStore.getBufferedSize();
-        for (FixedWidthChunkWriter f : fast) {
+        for (ChunkWriter f : fast) {
             if (f != null) {
                 size += f.bufferedBytes();
             }

@@ -56,7 +56,7 @@ import static io.vecruntime.kernels.VectorBuffers.LE_LONG;
  */
 // PLAIN_DICTIONARY and BIT_PACKED are deprecated names, but they are what parquet-java's v1 writer records.
 @SuppressWarnings("deprecation")
-final class FixedWidthChunkWriter {
+final class FixedWidthChunkWriter implements ChunkWriter {
 
     enum Kind {
         INT32(4),
@@ -132,7 +132,8 @@ final class FixedWidthChunkWriter {
     }
 
     /** Starts a column chunk (a row group) on {@code pages}. */
-    void startChunk(PageWriter pageWriter) {
+    @Override
+    public void startChunk(PageWriter pageWriter) {
         this.pages = pageWriter;
         pageRows = 0;
         pageValues = 0;
@@ -144,7 +145,8 @@ final class FixedWidthChunkWriter {
     }
 
     /** Appends rows {@code [from, to)} of {@code v}. */
-    void write(VectorBuffers v, int from, int to) throws IOException {
+    @Override
+    public void write(VectorBuffers v, int from, int to) throws IOException {
         MemorySegment validity = v.validity();
         MemorySegment data = v.data();
         int n = to - from;
@@ -335,7 +337,8 @@ final class FixedWidthChunkWriter {
     }
 
     /** Writes the last page and, if any page used it, the dictionary page. */
-    void endChunk() throws IOException {
+    @Override
+    public void endChunk() throws IOException {
         flushPage();
         if (dictionaryPagesWritten > 0) {
             ByteSink d = new ByteSink(entryCount * kind.width);
@@ -348,7 +351,8 @@ final class FixedWidthChunkWriter {
      * Bytes buffered for the row-group size check: the open page's values and
      * the dictionary.
      */
-    long bufferedBytes() {
+    @Override
+    public long bufferedBytes() {
         return pages.getMemSize() + encodedBytes() + (long) entryCount * kind.width;
     }
 }
