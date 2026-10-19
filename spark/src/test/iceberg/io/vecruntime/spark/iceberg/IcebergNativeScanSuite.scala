@@ -146,6 +146,71 @@ class IcebergNativeScanSuite extends IcebergMorSuiteBase {
     checkVectorized("SELECT s, count(extra), sum(l) FROM t WHERE extra IS NULL AND i > 2 GROUP BY s", Seq(Filter, Agg))
   }
 
+  /**
+   * A table whose columns were promoted after files were written: int to bigint, float to double, decimal(9,2) to
+   * decimal(18,2) (both 64-bit unscaled) and decimal(9,2) to decimal(30,2) (a 128-bit lane). The old files keep
+   * the narrow physical types; the new ones carry values only the wide types hold.
+   */
+  private def createPromoted(name: String, props: String): Unit = {
+    spark.sql(
+      s"""CREATE OR REPLACE TABLE $Db.$name (k INT, i INT, f FLOAT, dm DECIMAL(9, 2), dw DECIMAL(9, 2), s STRING)
+         |USING iceberg TBLPROPERTIES ($props)""".stripMargin
+    )
+    spark.sql(
+      s"""INSERT INTO $Db.$name SELECT CAST(id AS INT), CAST(id * 7 - 9000 AS INT), CAST(id / 8.0 AS FLOAT),
+         |  CAST(id * 13 % 99999 / 10.0 AS DECIMAL(9, 2)), CAST(id * 11 % 99999 / 10.0 AS DECIMAL(9, 2)),
+         |  IF(id % 13 = 0, NULL, concat('s', id % 7))
+         |FROM range(0, 3000)""".stripMargin
+    )
+    spark.sql(s"ALTER TABLE $Db.$name ALTER COLUMN i TYPE BIGINT")
+    spark.sql(s"ALTER TABLE $Db.$name ALTER COLUMN f TYPE DOUBLE")
+    spark.sql(s"ALTER TABLE $Db.$name ALTER COLUMN dm TYPE DECIMAL(18, 2)")
+    spark.sql(s"ALTER TABLE $Db.$name ALTER COLUMN dw TYPE DECIMAL(30, 2)")
+    spark.sql(
+      s"""INSERT INTO $Db.$name SELECT CAST(id AS INT), id * 3000000000, id / 3.0,
+         |  CAST(id * 100000000 AS DECIMAL(18, 2)), CAST(CAST(id AS DECIMAL(30, 2)) * 100000000000000000 AS DECIMAL(30, 2)),
+         |  concat('n', id % 5)
+         |FROM range(3000, 3600)""".stripMargin
+    )
+  }
+
+  private val promotedQueries = Seq(
+    "SELECT count(*), sum(i), min(i), max(i), sum(f), max(f), sum(dm), max(dm), sum(dw), max(dw) FROM t",
+    "SELECT s, count(*), sum(i), sum(dm), sum(dw) FROM t WHERE i > 100 GROUP BY s",
+    // Old files' statistics are on the narrow types: a pushed filter compares them against wide literals.
+    "SELECT k, i, f, dm, dw FROM t WHERE i > 2000000000 OR i < -8000",
+    "SELECT k, f, dm FROM t WHERE f >= 300.5 AND dm < 5000.00",
+    "SELECT k, dw FROM t WHERE dw > 100000000000000.00 OR dw < 1.00",
+    "SELECT k, i FROM t WHERE i = -8993 OR i = 9000000000000"
+  )
+
+  icebergTest("promoted columns read their old files widened: int to bigint, float to double, decimal precision") {
+    createPromoted("t_promoted", "'format-version' = '2'")
+    useTable("t_promoted")
+    promotedQueries.foreach { q =>
+      val df = checkVectorized(q, Nil)
+      assert(df.collect().nonEmpty, s"the query should return rows: $q")
+      val (native, iceberg) = groups(df)
+      assert(native > 0 && iceberg == 0, s"native $native, Iceberg $iceberg: $q")
+    }
+  }
+
+  icebergTest("promoted columns under position deletes and deletion vectors read their old files widened") {
+    Seq(2, 3).foreach { v =>
+      val name = s"t_promoted_v$v"
+      createPromoted(name, s"'format-version' = '$v', 'write.delete.mode' = 'merge-on-read'")
+      spark.sql(s"DELETE FROM $Db.$name WHERE k % 5 = 0")
+      useTable(name)
+      assert(count("SELECT count(*) FROM t") === 3600 - 720)
+      promotedQueries.foreach { q =>
+        val df = checkVectorized(q, Nil)
+        assert(df.collect().nonEmpty, s"the query should return rows: $q")
+        val (native, iceberg) = groups(df)
+        assert(native > 0 && iceberg == 0, s"v$v native $native, Iceberg $iceberg: $q")
+      }
+    }
+  }
+
   icebergTest("an identity-partitioned table reads its partition column from the files") {
     spark.sql(
       s"CREATE OR REPLACE TABLE $Db.t_parted USING iceberg PARTITIONED BY (b) AS SELECT i, l, s, b, d2 FROM $Db.t_pos"
