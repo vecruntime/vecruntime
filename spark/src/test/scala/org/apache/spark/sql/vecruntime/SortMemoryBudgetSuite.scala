@@ -146,6 +146,38 @@ class SortMemoryBudgetSuite extends AnyFunSuite {
     }
   }
 
+  test("#868: with off-heap runs, a heap too small for the merge's heap side makes the sort spill") {
+    // Off-heap pool large enough for every run; on-heap pool of 128 KiB, a third of the permutations and normalised
+    // keys of 32768 rows (4 + 9 bytes per row and key). The heap side's refusal must spill, not OOM the heap.
+    val conf = new SparkConf(false)
+      .set("spark.memory.offHeap.enabled", "true")
+      .set("spark.memory.offHeap.size", "1g")
+    val mm = new UnifiedMemoryManager(conf, 128L * 1024, 0L, 1)
+    val tmm = new TaskMemoryManager(mm, 0L)
+    val ctx = new PoolTaskContext(tmm)
+    VectorSortIterator.modeOverride = MemoryMode.OFF_HEAP
+    TaskContext.setTaskContext(ctx)
+    try {
+      val it = new VectorSortIterator(
+        input,
+        Array(ColumnRef(0, LongType)),
+        Array(true),
+        Array(true),
+        Array("k" -> LongType, "v" -> LongType),
+        metrics,
+        runRows = 4096
+      )
+      check(it)
+      assert(it.spilledRuns > 0, "the on-heap pool refused the heap side, so runs went to disk")
+      it.close()
+      ctx.complete()
+      assert(mm.executionMemoryUsed === 0L)
+    } finally {
+      VectorSortIterator.modeOverride = null
+      TaskContext.unset()
+    }
+  }
+
   // #868: the shuffled hash join's build side on the same pool.
   private val joinSpec = JoinSpec(
     joinType = org.apache.spark.sql.catalyst.plans.Inner,
