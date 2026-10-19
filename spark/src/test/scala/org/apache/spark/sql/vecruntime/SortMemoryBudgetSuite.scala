@@ -163,7 +163,9 @@ class SortMemoryBudgetSuite extends AnyFunSuite {
   private def join(budgetBytes: Long): (Long, Long) = {
     val schema = new StructType().add("k", LongType)
     def batches(n: Int)(v: Long => Long) =
-      Iterator.tabulate(8)(b => VectorRowStages.toBatch(schema, Array.tabulate(n)(i => InternalRow(v(b.toLong * n + i)))))
+      Iterator.tabulate(8)(b =>
+        VectorRowStages.toBatch(schema, Array.tabulate(n)(i => InternalRow(v(b.toLong * n + i))))
+      )
     val it = GraceHashJoin.iterator(batches(4096)(identity), batches(4096)(_ * 2), joinSpec, metrics, budgetBytes, 32)
     var rows = 0L
     var sum = 0L
