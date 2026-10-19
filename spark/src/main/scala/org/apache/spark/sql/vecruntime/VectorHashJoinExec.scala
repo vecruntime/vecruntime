@@ -429,9 +429,17 @@ final class BuildTable(
     if (m == null && columns(c) != null && io.vecruntime.kernels.HeapMirror.mirrors(columns(c))) {
       m = io.vecruntime.kernels.HeapMirror.of(columns(c))
       mirrors(c) = m
+      mirrorHeapBytes += BuildTable.mirrorBytes(columns(c), numRows)
     }
     m
   }
+
+  /**
+   * #876: the heap the table's mirrors (plain and key-clustered) take, estimated from their columns as they are
+   * made: the probe iterators of a task's own table count it in the ON_HEAP pool. A shared (broadcast) table's
+   * mirrors are the executor's, not a task's, and are not counted.
+   */
+  @volatile var mirrorHeapBytes: Long = 0L
 
   /**
    * Heap mirrors of the plain UTF8 columns the output gathers (#565), made on first use: the build side
@@ -460,6 +468,7 @@ final class BuildTable(
       if (plain != null) {
         m = io.vecruntime.kernels.RangeResidual.cluster(plain, rangeRows)
         clustered(c) = m
+        mirrorHeapBytes += BuildTable.mirrorBytes(columns(c), numRows)
       }
     }
     m
@@ -563,6 +572,15 @@ final class BuildTable(
 }
 
 object BuildTable {
+
+  /**
+   * #876: the heap bytes a `HeapMirror` of `in` takes at `rows` capacity -- an `int` or a `long` per row (INT32, or
+   * INT64 / FLOAT64, the types it mirrors) and, when the column has nulls, a validity word per 64 rows.
+   */
+  private[vecruntime] def mirrorBytes(in: io.vecruntime.kernels.VectorBuffers, rows: Int): Long = {
+    val width = if (in.`type`() == io.vecruntime.kernels.VecType.INT32) 4L else 8L
+    width * rows + (if (in.hasNulls()) 8L * ((rows + 63) / 64) else 0L)
+  }
 
   /**
    * Where build dictionaries live: a root of their own, because a broadcast table is released by a
@@ -895,6 +913,20 @@ private[vecruntime] class VectorHashJoinIterator(
    */
   private val streamedMirrorPool = new Array[io.vecruntime.kernels.HeapMirror](spec.streamedWidth)
 
+  /**
+   * #876: the heap the join's mirrors take -- the streamed batches' reused mirrors (their high water) and, for a
+   * task's own table, the build side's -- held in the ON_HEAP execution pool after every probed batch, so Spark can
+   * make the task's other on-heap consumers spill around them. Counted, never spilled: a mirror backs the pair
+   * loop in flight. Returned at close.
+   */
+  private val streamedMirrorBytes = new Array[Long](spec.streamedWidth)
+  private val heapMemory = new BuildMemory(org.apache.spark.memory.MemoryMode.ON_HEAP)
+  private def trackHeap(): Unit =
+    heapMemory.track(streamedMirrorBytes.sum + (if (build.shared) 0L else build.mirrorHeapBytes))
+
+  /** The on-heap bytes this join holds in the pool (#876), for the tests. */
+  private[vecruntime] def heapBytesHeld: Long = heapMemory.bytes
+
   private def streamedMirror(ctx: EvalContext, ordinal: Int): io.vecruntime.kernels.HeapMirror = {
     if (!streamedMirrorTried(ordinal)) {
       streamedMirrorTried(ordinal) = true
@@ -902,6 +934,9 @@ private[vecruntime] class VectorHashJoinIterator(
       if (io.vecruntime.kernels.HeapMirror.mirrors(in)) {
         streamedMirrorPool(ordinal) = io.vecruntime.kernels.HeapMirror.reuse(in, streamedMirrorPool(ordinal))
         streamedMirrors(ordinal) = streamedMirrorPool(ordinal)
+        // #876: `reuse` keeps the larger of the arrays it had and the batch's rows (at least 4096): its high water.
+        streamedMirrorBytes(ordinal) =
+          math.max(streamedMirrorBytes(ordinal), BuildTable.mirrorBytes(in, math.max(in.length(), 4096)))
       }
     }
     streamedMirrors(ordinal)
@@ -1029,6 +1064,7 @@ private[vecruntime] class VectorHashJoinIterator(
           while (from < n) { val until = math.min(n, from + rowsPerChunk); emitMatches(ctx, from, until); from = until }
       }
     }
+    trackHeap() // #876: the mirrors this batch made or grew
   }
 
   // The batch's selection as heap words, built once per selection segment. `selected` runs once per
@@ -1612,6 +1648,7 @@ private[vecruntime] class VectorHashJoinIterator(
       while (!pending.isEmpty) pending.poll().close()
       build.close()
       allocator.close()
+      heapMemory.releaseTo(0L)
     }
   }
 }

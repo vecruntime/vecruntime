@@ -227,6 +227,19 @@ class SortMemoryBudgetSuite extends AnyFunSuite {
     }
   }
 
+  test("#876: a build table counts its heap mirrors as it makes them") {
+    val schema = new StructType().add("k", LongType)
+    val batches = Iterator(VectorRowStages.toBatch(schema, Array.tabulate(1000)(i => InternalRow(i.toLong))))
+    val table = BuildTable.fromBatches(batches, joinSpec)
+    try {
+      assert(table.mirrorHeapBytes === 0L)
+      assert(table.mirror(0) != null)
+      assert(table.mirrorHeapBytes === 8L * 1000, "a long per row, no nulls")
+      table.mirror(0)
+      assert(table.mirrorHeapBytes === 8L * 1000, "made once")
+    } finally table.close()
+  }
+
   // #868: the shuffled hash join's build side on the same pool.
   private val joinSpec = JoinSpec(
     joinType = org.apache.spark.sql.catalyst.plans.Inner,
