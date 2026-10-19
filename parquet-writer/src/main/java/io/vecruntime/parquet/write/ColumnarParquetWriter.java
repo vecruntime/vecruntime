@@ -95,7 +95,10 @@ public final class ColumnarParquetWriter implements AutoCloseable {
             CompressionCodecFactory.BytesInputCompressor compressor, long rowGroupSize, Map<String, String> footer)
             throws IOException {
         this.schema = schema;
-        this.props = props;
+        // The writer writes Parquet v2 only (#64): data page v2 and the v2 encodings, also on the column-store path.
+        this.props = ParquetProperties.copy(props)
+                .withWriterVersion(ParquetProperties.WriterVersion.PARQUET_2_0)
+                .build();
         this.compressor = compressor;
         this.rowGroupSize = rowGroupSize;
         this.footer = footer;

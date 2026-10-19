@@ -229,6 +229,7 @@ class ColumnarParquetWriterTest {
         SimpleGroupFactory f = new SimpleGroupFactory(SCHEMA);
         try (ParquetWriter<Group> w = ExampleParquetWriter.builder(HadoopOutputFile.fromPath(p, conf))
                 .withType(SCHEMA)
+                .withWriterVersion(ParquetProperties.WriterVersion.PARQUET_2_0)
                 .withCompressionCodec(CompressionCodecName.SNAPPY)
                 .withRowGroupSize(rowGroupSize)
                 .withPageSize(64 * 1024)

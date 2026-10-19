@@ -52,8 +52,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /**
  * Dictionary fallback against parquet-java: high-cardinality strings and longs
  * outgrow the dictionary page size in the middle of a chunk, so pages switch to
- * PLAIN; low-cardinality columns stay dictionary-encoded. Values, encodings and
- * chunk statistics must equal parquet-java's.
+ * DELTA_BYTE_ARRAY / DELTA_BINARY_PACKED (Parquet v2); low-cardinality columns
+ * stay dictionary-encoded. Values, encodings and chunk statistics must equal
+ * parquet-java's.
  */
 class DictionaryFallbackTest {
 
@@ -141,6 +142,7 @@ class DictionaryFallbackTest {
         SimpleGroupFactory f = new SimpleGroupFactory(SCHEMA);
         try (ParquetWriter<Group> w = ExampleParquetWriter.builder(HadoopOutputFile.fromPath(p, conf))
                 .withType(SCHEMA)
+                .withWriterVersion(ParquetProperties.WriterVersion.PARQUET_2_0)
                 .withPageSize(16 * 1024)
                 .withDictionaryPageSize(dictionaryPageSize)
                 .build()) {
@@ -183,7 +185,6 @@ class DictionaryFallbackTest {
     }
 
     @Test
-    @SuppressWarnings("deprecation") // PLAIN_DICTIONARY is the name parquet-java's v1 writer records
     void fallsBackWhereParquetJavaDoes() throws Exception {
         List<Row> rows = rows(30_000);
         org.apache.hadoop.fs.Path a = ours(rows);
@@ -207,12 +208,12 @@ class DictionaryFallbackTest {
             assertEquals(y[c].getStatistics().genericGetMax(),
                     x[c].getStatistics().genericGetMax(), col);
         }
-        // hc and big fall back to PLAIN; lc and small stay dictionary-encoded only.
-        assertTrue(x[0].getEncodings().contains(Encoding.PLAIN),
+        // hc falls back to DELTA_BYTE_ARRAY and big to DELTA_BINARY_PACKED; lc stays dictionary-encoded only.
+        assertTrue(x[0].getEncodings().contains(Encoding.DELTA_BYTE_ARRAY),
                 Arrays.toString(x));
-        assertTrue(x[1].getEncodings().contains(Encoding.PLAIN),
+        assertTrue(x[1].getEncodings().contains(Encoding.DELTA_BINARY_PACKED),
                 Arrays.toString(x));
-        assertTrue(!x[2].getEncodings().contains(Encoding.PLAIN) && x[2].getEncodings().contains(Encoding.PLAIN_DICTIONARY));
+        assertTrue(!x[2].getEncodings().contains(Encoding.DELTA_BYTE_ARRAY) && x[2].getEncodings().contains(Encoding.RLE_DICTIONARY));
     }
 
     @Test

@@ -39,11 +39,11 @@ import static io.vecruntime.kernels.VectorBuffers.LE_INT;
  * its {@link PageWriter}, from plain offsets and bytes or from dictionary ids,
  * with no per-value object.
  *
- * <p>As {@link FixedWidthChunkWriter}, it makes parquet-java's v1 choices:
- * {@code PLAIN_DICTIONARY} while the dictionary stays under {@code
- * parquet.dictionary.page.size} bytes (each entry counted with its 4-byte
- * length) and pays on the first page, {@code PLAIN} (4-byte little-endian
- * length, then the bytes) from the page where it stops.
+ * <p>As {@link FixedWidthChunkWriter}, it writes Parquet v2 with parquet-java's
+ * v2 choices: {@code RLE_DICTIONARY} pages while the dictionary stays under
+ * {@code parquet.dictionary.page.size} bytes (each entry counted with its
+ * 4-byte length) and pays on the first page, {@code DELTA_BYTE_ARRAY} from the
+ * page where it stops.
  *
  * <p>The chunk's dictionary is its own: entries are the distinct values in
  * first-seen order, kept as bytes in one buffer and found through an
@@ -53,8 +53,6 @@ import static io.vecruntime.kernels.VectorBuffers.LE_INT;
  * (min, max, null count) compare unsigned bytes, the order parquet-java uses
  * for strings; in dictionary mode only the page's distinct ids are compared.
  */
-// PLAIN_DICTIONARY and BIT_PACKED are deprecated names, but they are what parquet-java's v1 writer records.
-@SuppressWarnings("deprecation")
 final class BinaryChunkWriter implements ChunkWriter {
 
     private final ColumnDescriptor column;
@@ -94,6 +92,11 @@ final class BinaryChunkWriter implements ChunkWriter {
     private int[] inputMap = new int[0];
 
     private final ByteSink body = new ByteSink(64 * 1024);
+    private final ByteSink levels = new ByteSink(1024);
+    private final ByteSink suffixes = new ByteSink(64 * 1024);
+    private final DeltaBinaryPackedEncoder delta = new DeltaBinaryPackedEncoder();
+    private int[] prefixLengths = new int[4096];
+    private int[] suffixLengths = new int[4096];
 
     BinaryChunkWriter(ColumnDescriptor column, ParquetProperties props) {
         this.column = column;
@@ -337,24 +340,22 @@ final class BinaryChunkWriter implements ChunkWriter {
             }
         }
         firstPageDone = true;
-        body.reset();
+        levels.reset();
         if (optional) {
-            int at = body.size();
-            body.writeIntLE(0);
-            RleHybridEncoder.encodeValidity(MemorySegment.ofArray(pageValidity), 0, pageRows, body);
-            body.setIntLE(at, body.size() - at - 4);
+            RleHybridEncoder.encodeValidity(MemorySegment.ofArray(pageValidity), 0, pageRows, levels);
         }
+        body.reset();
         Encoding valuesEncoding;
         if (dictionary) {
             pageMinMaxFromIds();
             int bitWidth = RleHybridEncoder.bitWidth(Math.max(0, entryCount - 1));
             body.writeByte(bitWidth);
             RleHybridEncoder.encode(ids, pageValues, bitWidth, body);
-            valuesEncoding = Encoding.PLAIN_DICTIONARY;
+            valuesEncoding = Encoding.RLE_DICTIONARY;
             dictionaryPagesWritten++;
         } else {
-            body.write(plain);
-            valuesEncoding = Encoding.PLAIN;
+            deltaByteArray(body);
+            valuesEncoding = Encoding.DELTA_BYTE_ARRAY;
         }
         BinaryStatistics s = (BinaryStatistics) Statistics.createStats(column.getPrimitiveType());
         s.incrementNumNulls(pageRows - pageValues);
@@ -362,14 +363,56 @@ final class BinaryChunkWriter implements ChunkWriter {
             s.updateStats(Binary.fromConstantByteArray(min));
             s.updateStats(Binary.fromConstantByteArray(max));
         }
-        pages.writePage(BytesInput.from(body.toByteArray()), pageRows, pageRows, s, Encoding.BIT_PACKED,
-                optional ? Encoding.RLE : Encoding.BIT_PACKED, valuesEncoding);
+        pages.writePageV2(
+                pageRows,
+                pageRows - pageValues,
+                pageRows,
+                BytesInput.empty(),
+                BytesInput.from(levels.toByteArray()),
+                valuesEncoding,
+                BytesInput.from(body.toByteArray()),
+                s);
         Arrays.fill(pageValidity, 0, (pageRows + 63) >>> 6, 0L);
         pageRows = 0;
         pageValues = 0;
         plain.reset();
         min = null;
         max = null;
+    }
+
+    /**
+     * The page's values ({@link #plain}: 4-byte length, bytes, per value) as
+     * {@code DELTA_BYTE_ARRAY}: the lengths of the prefix each value shares
+     * with the previous one, then the suffix lengths, both {@code
+     * DELTA_BINARY_PACKED}, then the suffixes back to back. The prefix chain
+     * starts afresh on each page.
+     */
+    private void deltaByteArray(ByteSink out) {
+        if (prefixLengths.length < pageValues) {
+            prefixLengths = new int[Math.max(pageValues, prefixLengths.length * 2)];
+            suffixLengths = new int[prefixLengths.length];
+        }
+        suffixes.reset();
+        MemorySegment p = plain.segment();
+        int pos = 0;
+        int prevStart = 0;
+        int prevLen = 0;
+        for (int k = 0; k < pageValues; k++) {
+            int len = p.get(LE_INT, pos);
+            int start = pos + 4;
+            long m = k == 0 ? 0 : MemorySegment.mismatch(p, prevStart, prevStart + prevLen, p, start,
+                    start + len);
+            int prefix = m < 0 ? Math.min(prevLen, len) : (int) m;
+            prefixLengths[k] = prefix;
+            suffixLengths[k] = len - prefix;
+            suffixes.write(p, start + prefix, len - prefix);
+            prevStart = start;
+            prevLen = len;
+            pos = start + len;
+        }
+        delta.encodeInts(prefixLengths, pageValues, out);
+        delta.encodeInts(suffixLengths, pageValues, out);
+        out.write(suffixes);
     }
 
     /** The page's min and max over its distinct ids. */
@@ -404,7 +447,7 @@ final class BinaryChunkWriter implements ChunkWriter {
                 d.writeIntLE(l);
                 d.write(entries, s, l);
             }
-            pages.writeDictionaryPage(new DictionaryPage(BytesInput.from(d.toByteArray()), entryCount, Encoding.PLAIN_DICTIONARY));
+            pages.writeDictionaryPage(new DictionaryPage(BytesInput.from(d.toByteArray()), entryCount, Encoding.PLAIN));
         }
     }
 

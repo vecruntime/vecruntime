@@ -43,19 +43,19 @@ import static io.vecruntime.kernels.VectorBuffers.LE_LONG;
  * ColumnWriter}, so there is no call, no boxing and no byte-at-a-time write per
  * value.
  *
- * <p>It makes the choices parquet-java's v1 writer makes, so the file is the
- * one parquet-java would write: dictionary encoding first ({@code
- * PLAIN_DICTIONARY}), kept while the dictionary stays under {@code
- * parquet.dictionary.page.size} and, at the end of the first page, only if it
- * is smaller than the plain values; otherwise {@code PLAIN} from that page on.
- * Repetition levels are {@code BIT_PACKED} and empty (a flat column),
- * definition levels {@code RLE} with a 4-byte length prefix, taken from the
- * validity bitmap. Pages are cut at {@code parquet.page.size} bytes of values
- * or {@code parquet.page.row.count.limit} rows, checked once per slice. Page
- * statistics are the min and max of the page's values and its null count.
+ * <p>The file is Parquet v2, with the choices parquet-java's v2 writer
+ * ({@code PARQUET_2_0}) makes: data page v2, dictionary encoding first ({@code
+ * RLE_DICTIONARY} pages, a {@code PLAIN} dictionary page), kept while the
+ * dictionary stays under {@code parquet.dictionary.page.size} and, at the end
+ * of the first page, only if it is smaller than the plain values; otherwise,
+ * from that page on, {@code DELTA_BINARY_PACKED} for INT32 and INT64 and
+ * {@code PLAIN} for DOUBLE. Definition levels are RLE, taken from the validity
+ * bitmap, stored apart from the values as data page v2 keeps them, and there
+ * are no repetition levels (a flat column). Pages are cut at {@code
+ * parquet.page.size} bytes of values or {@code parquet.page.row.count.limit}
+ * rows, checked once per slice. Page statistics are the min and max of the
+ * page's values and its null count.
  */
-// PLAIN_DICTIONARY and BIT_PACKED are deprecated names, but they are what parquet-java's v1 writer records.
-@SuppressWarnings("deprecation")
 final class FixedWidthChunkWriter implements ChunkWriter {
 
     enum Kind {
@@ -104,6 +104,8 @@ final class FixedWidthChunkWriter implements ChunkWriter {
     private long[] tableKeys = new long[2048];
 
     private final ByteSink body = new ByteSink(64 * 1024);
+    private final ByteSink levels = new ByteSink(1024);
+    private final DeltaBinaryPackedEncoder delta = new DeltaBinaryPackedEncoder();
 
     /**
      * The fast path for a (lane, column) pair, or {@code null} when the column
@@ -280,27 +282,38 @@ final class FixedWidthChunkWriter implements ChunkWriter {
             }
         }
         firstPageDone = true;
-        body.reset();
+        levels.reset();
         if (optional) {
-            int at = body.size();
-            body.writeIntLE(0);
-            MemorySegment v = MemorySegment.ofArray(pageValidity);
-            RleHybridEncoder.encodeValidity(v, 0, pageRows, body);
-            body.setIntLE(at, body.size() - at - 4);
+            RleHybridEncoder.encodeValidity(MemorySegment.ofArray(pageValidity), 0, pageRows, levels);
         }
+        body.reset();
         Encoding valuesEncoding;
         if (dictionary) {
             int bitWidth = RleHybridEncoder.bitWidth(Math.max(0, entryCount - 1));
             body.writeByte(bitWidth);
             RleHybridEncoder.encode(ids, pageValues, bitWidth, body);
-            valuesEncoding = Encoding.PLAIN_DICTIONARY;
+            valuesEncoding = Encoding.RLE_DICTIONARY;
             dictionaryPagesWritten++;
-        } else {
+        } else if (kind == Kind.DOUBLE) {
             writePlain(values, pageValues, body);
             valuesEncoding = Encoding.PLAIN;
+        } else {
+            if (kind.width == 4) {
+                delta.encodeInts(values, pageValues, body);
+            } else {
+                delta.encodeLongs(values, pageValues, body);
+            }
+            valuesEncoding = Encoding.DELTA_BINARY_PACKED;
         }
-        pages.writePage(BytesInput.from(body.toByteArray()), pageRows, pageRows, statistics(),
-                Encoding.BIT_PACKED, optional ? Encoding.RLE : Encoding.BIT_PACKED, valuesEncoding);
+        pages.writePageV2(
+                pageRows,
+                pageRows - pageValues,
+                pageRows,
+                BytesInput.empty(),
+                BytesInput.from(levels.toByteArray()),
+                valuesEncoding,
+                BytesInput.from(body.toByteArray()),
+                statistics());
         Arrays.fill(pageValidity, 0, (pageRows + 63) >>> 6, 0L);
         pageRows = 0;
         pageValues = 0;
@@ -360,7 +373,7 @@ final class FixedWidthChunkWriter implements ChunkWriter {
         if (dictionaryPagesWritten > 0) {
             ByteSink d = new ByteSink(entryCount * kind.width);
             writePlain(entries, entryCount, d);
-            pages.writeDictionaryPage(new DictionaryPage(BytesInput.from(d.toByteArray()), entryCount, Encoding.PLAIN_DICTIONARY));
+            pages.writeDictionaryPage(new DictionaryPage(BytesInput.from(d.toByteArray()), entryCount, Encoding.PLAIN));
         }
     }
 
