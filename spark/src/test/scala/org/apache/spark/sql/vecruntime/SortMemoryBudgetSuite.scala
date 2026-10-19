@@ -180,6 +180,26 @@ class SortMemoryBudgetSuite extends AnyFunSuite {
 
   private val joinExpected = (16384L, (0L until 32768L by 2).sum)
 
+  test("#868: a bucketed join's per-bucket tables are held in the pool while probed, and returned") {
+    withPool(1L << 30) { (tmm, _) =>
+      val schema = new StructType().add("k", LongType)
+      def batches(n: Int)(v: Long => Long) =
+        Iterator.tabulate(8)(b =>
+          VectorRowStages.toBatch(schema, Array.tabulate(n)(i => InternalRow(v(b.toLong * n + i))))
+        )
+      // A budget of 1 byte buckets at once; the pool is large, so each bucket's table is granted.
+      val it = GraceHashJoin.iterator(batches(4096)(identity), batches(4096)(_ * 2), joinSpec, metrics, 1L, 32)
+      var rows = 0L
+      var peak = 0L
+      while (it.hasNext) {
+        rows += it.next().numRows()
+        peak = math.max(peak, tmm.getMemoryConsumptionForThisTask())
+      }
+      assert(rows === joinExpected._1)
+      assert(peak > 0, "the bucket being probed was held")
+    }
+  }
+
   test("#868: a pool too small for the build side makes the hash join bucket, within a large budget") {
     withPool(64L * 1024) { (_, _) =>
       val before = GraceHashJoin.bucketedJoins.get()
