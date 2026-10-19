@@ -253,7 +253,7 @@ class VectorWriteSuite extends VectorQuerySuite {
           "l",
           "d",
           "date_add(dt, i % 3) as day",
-          "if(s is null, null, concat(s, '/x=%')) as k"
+          "if(s is null, null, if(i % 7 = 0, '', concat(s, '/x=%'))) as k"
         ),
       partitionBy = Seq("day", "k")
     )
@@ -315,6 +315,48 @@ class VectorWriteSuite extends VectorQuerySuite {
     }
     spark.sql("DROP TABLE bk_ours")
     spark.sql("DROP TABLE bk_spark")
+  }
+
+  test("empty2null and collation_aware_hash run in our projection, as Spark computes them") {
+    import org.apache.spark.sql.catalyst.analysis.UnresolvedAttribute
+    import org.apache.spark.sql.catalyst.expressions.{CollationAwareMurmur3Hash, Empty2Null}
+    import org.apache.spark.sql.vecruntime.TestExprs.column
+    // The collated column comes from a file, so the projection over the scan is ours.
+    val src = newTempPath("write/exprs-src")
+    withPlugin(enabled = false) {
+      spark
+        .table("t")
+        .selectExpr(
+          "i",
+          "l",
+          "dt",
+          "if(i % 5 = 0, '', s) as e",
+          "if(i % 2 = 0, upper(s), s) collate UTF8_LCASE as c",
+          "s"
+        )
+        .write
+        .parquet(src)
+    }
+    def query(s: SparkSession): DataFrame =
+      s.read
+        .parquet(src)
+        .select(
+          column(Empty2Null(UnresolvedAttribute("e"))).as("e2n"),
+          column(CollationAwareMurmur3Hash(Seq(UnresolvedAttribute("s"), UnresolvedAttribute("i")), 42)).as("h1"),
+          column(
+            CollationAwareMurmur3Hash(
+              Seq(UnresolvedAttribute("c"), UnresolvedAttribute("l"), UnresolvedAttribute("dt")),
+              42
+            )
+          ).as("h2"),
+          column(CollationAwareMurmur3Hash(Seq(UnresolvedAttribute("c")), 42)).as("h3")
+        )
+    val expected = withPlugin(enabled = false)(query(spark).collect())
+    val df = withPlugin(enabled = true) { val d = query(spark); d.collect(); d }
+    assertRowsEqual(expected, withPlugin(enabled = true)(df.collect()), 0.0, "empty2null / collation_aware_hash")
+    assert(expected.exists(_.isNullAt(0)) && expected.exists(r => !r.isNullAt(0)))
+    val project = nodesOf[org.apache.spark.sql.vecruntime.VectorProjectExec](df)
+    assert(project.nonEmpty, s"${finalPlan(df).treeString}\n${VectorFallback.reasons(finalPlan(df)).map(_._2)}")
   }
 
   test("writes the prototype does not take keep Spark's writer, with the reason") {

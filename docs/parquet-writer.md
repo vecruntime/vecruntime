@@ -50,7 +50,7 @@ index are written as parquet-java writes them; binary min/max compare unsigned.
   `maxRecordsPerFile` rolls files in the middle of a batch.
 - **Partitions and buckets** (`VectorDynamicPartitionDataWriter`, Spark's `DynamicPartitionDataSingleWriter`
   for batches): the input is sorted by the partition columns and then the bucket id, as `V1Writes` orders it
-  (the sort is ours: `empty2null` and Spark 4's `collation_aware_hash` bucket expression compile). Each batch
+  (the projection and sort are ours: `empty2null` and Spark 4's `collation_aware_hash`, collated keys included, compile -- see the expressions page). Each batch
   is cut into runs of equal partition values and bucket id -- adjacent rows compared lane by lane, partition
   values projected once per run -- and each run is one range of the batch's columns written into the current
   file. Opening a file goes through Spark's own `renewCurrentWriter`, so the partition directories (escaping,

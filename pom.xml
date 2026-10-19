@@ -54,6 +54,7 @@
     <hadoop.version>3.4.3</hadoop.version>
 
     <junit.version>5.13.4</junit.version>
+    <hardwood.version>1.1.0.Beta2</hardwood.version>
     <scalatest.version>3.2.20</scalatest.version>
     <jmh.version>1.37</jmh.version>
     <comet.version>1.0.0</comet.version>
@@ -147,6 +148,11 @@
         <groupId>commons-codec</groupId>
         <artifactId>commons-codec</artifactId>
         <version>1.19.0</version>
+      </dependency>
+      <dependency>
+        <groupId>dev.hardwood</groupId>
+        <artifactId>hardwood-core</artifactId>
+        <version>${hardwood.version}</version>
       </dependency>
       <dependency>
         <groupId>io.github.vecruntime</groupId>

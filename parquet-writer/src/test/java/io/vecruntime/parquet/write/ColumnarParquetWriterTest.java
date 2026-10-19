@@ -301,6 +301,80 @@ class ColumnarParquetWriterTest {
         assertEquals(readAll(theirs), readAll(ours));
     }
 
+    /**
+     * Hardwood (an independent reader, no parquet-java code) reads our files to
+     * the written values: dictionary pages, and -- with unique strings and
+     * several row groups -- the fallback encodings ({@code
+     * DELTA_BINARY_PACKED}, {@code DELTA_BYTE_ARRAY}, {@code PLAIN}).
+     */
+    @Test
+    void hardwoodReadsOurFiles() throws Exception {
+        List<Row> dictionaryRows = rows(20_000, 3);
+        List<Row> uniqueRows = new ArrayList<>();
+        for (Row r : rows(50_000, 4)) {
+            uniqueRows.add(
+                    new Row(
+                            r.i(),
+                            r.l(),
+                            r.d(),
+                            r.f(),
+                            r.b(),
+                            r.s() == null ? null : r.s()
+                                    + "-"
+                                    + Integer.toHexString(r.hashCode())
+                                    + "-"
+                                    + uniqueRows.size(),
+                            r.ds(),
+                            r.day(),
+                            r.dec(),
+                            r.wide()));
+        }
+        org.apache.hadoop.fs.Path dictionaryFile = writeOurs(dictionaryRows, 4096, 128L << 20);
+        org.apache.hadoop.fs.Path uniqueFile = writeOurs(uniqueRows, 3000, 1L << 20);
+        assertEquals(dictionaryRows, readHardwood(dictionaryFile));
+        assertEquals(uniqueRows, readHardwood(uniqueFile));
+        java.util.Set<org.apache.parquet.column.Encoding> encodings = new java.util.HashSet<>();
+        ParquetMetadata f = footer(uniqueFile);
+        assertTrue(f.getBlocks().size() > 1, "several row groups");
+        for (BlockMetaData b : f.getBlocks()) {
+            for (ColumnChunkMetaData c : b.getColumns()) {
+                encodings.addAll(c.getEncodings());
+            }
+        }
+        assertTrue(encodings.contains(org.apache.parquet.column.Encoding.DELTA_BINARY_PACKED), encodings::toString);
+        assertTrue(encodings.contains(org.apache.parquet.column.Encoding.DELTA_BYTE_ARRAY), encodings::toString);
+        assertTrue(encodings.contains(org.apache.parquet.column.Encoding.RLE_DICTIONARY), encodings::toString);
+    }
+
+    /**
+     * The rows of {@code p} as Hardwood reads them, back in the shape of {@link
+     * Row}.
+     */
+    private static List<Row> readHardwood(org.apache.hadoop.fs.Path p) throws Exception {
+        List<Row> out = new ArrayList<>();
+        try (dev.hardwood.reader.ParquetFileReader file = dev.hardwood.reader.ParquetFileReader.open(dev.hardwood.InputFile.of(Path.of(p.toUri()
+                     .getPath())));
+             dev.hardwood.reader.RowReader r = file.rowReader()) {
+            while (r.hasNext()) {
+                r.next();
+                String ds = r.isNull(6) ? null : r.getString(6);
+                out.add(
+                        new Row(
+                                r.isNull(0) ? null : r.getInt(0),
+                                r.isNull(1) ? null : r.getLong(1),
+                                r.isNull(2) ? null : r.getDouble(2),
+                                r.isNull(3) ? null : r.getFloat(3),
+                                r.isNull(4) ? null : r.getBoolean(4),
+                                r.isNull(5) ? null : r.getString(5),
+                                ds == null ? null : java.util.Arrays.asList(DICTIONARY).indexOf(ds),
+                                r.isNull(7) ? null : (Integer) r.getRawValue(7),
+                                r.isNull(8) ? null : (Long) r.getRawValue(8),
+                                r.isNull(9) ? null : new BigInteger((byte[]) r.getRawValue(9))));
+            }
+        }
+        return out;
+    }
+
     @Test
     void sameChunkStatisticsAndEncodings() throws Exception {
         List<Row> rows = rows(20_000, 2);
