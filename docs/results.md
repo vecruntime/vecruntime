@@ -2735,6 +2735,35 @@ awslabs/analytics-accelerator-s3#370 was 98 s. The rest of the wait is in `Block
 still `synchronized` upstream. The benchmarks now use the classic stream for every engine and Iceberg's
 own stream for the Iceberg legs; the results below this section ran on the Accelerator.
 
+## TPC-DS 3 TB against Gluten + Velox and DataFusion Comet, the data-on-eks benchmark (2026-10-18)
+
+The page `docs/benchmarks/tpcds-3tb-graviton.html` now shows VecRuntime at 300 shuffle partitions on S3A's
+classic input stream. The result files are in `benchmarks/results/tpcds-sf3000-doeks-2026-10-18/`. The setup is
+as on 2026-10-16 below: the same data, 12 x r8gd.12xlarge, 23 x 5 cores x 58 GB, and the 35/23 heap / overhead
+split.
+
+**Code:** main at af9d367, arm64 image `d565-main-af9d367e-arm64`, with `fs.s3a.input.stream.type=classic` (#835)
+and `spark.sql.shuffle.partitions=300`. data-on-eks's Gluten and Comet runs use 200 partitions.
+
+**Totals** (103 queries):
+
+| engine | total (s) | vs Gluten | vs Comet | geomean vs Gluten / Comet | faster than Gluten / Comet on |
+|---|---:|---:|---:|---:|---:|
+| VecRuntime, 300 partitions, classic stream | 1,069.1 | 2.10x | 2.31x | 1.74x / 1.71x | 92 / 94 |
+| VecRuntime 2026-10-16, 200 partitions, Analytics Accelerator | 1,118.6 | 2.00x | 2.21x | 1.80x / 1.76x | 94 / 95 |
+| Gluten + Velox 1.6.0 | 2,239.9 | | | | |
+| Comet 0.16.0 | 2,467.5 | | | | |
+
+- **Moved most against 2026-10-16:**
+  - q67 59.7 -> 34.1 s and q78 69.3 -> 47.5 (now 1.1 s behind Gluten's 46.4, #689);
+  - q14b 59.8 -> 49.5 and q14a 62.7 -> 55.5.
+- **Slower:** q99 6.4 -> 11.0 s, q4 29.1 -> 32.9, q28 39.7 -> 42.4, q72 9.5 -> 11.8. The per-query geomean falls
+  a little while the total improves; the run changes both the partition count and the S3 stream, so the two are
+  not separated here.
+- **Behind the faster of Gluten and Comet:** q87 14.6 s against 11.2, q38 14.3 against 11.1, q99 11.0 against
+  8.0, q1 6.1 against 3.7, and nine more by 1.2 s or less.
+- **Correctness:** every row count and checksum equals the 2026-10-16 run's, q39a included.
+
 ## TPC-DS 3 TB against Gluten + Velox and DataFusion Comet, the data-on-eks benchmark (2026-10-16)
 
 The page `docs/benchmarks/tpcds-3tb-graviton.html` now shows VecRuntime at data-on-eks's own 200 shuffle partitions
@@ -3036,6 +3065,41 @@ The x86 page (`docs/benchmarks/tpcds-1tb.html`) now shows this run.
   - **Caveat:** the comparison crosses two cluster sessions. A same-session baseline leg (ours on Spark's reader) was started and cancelled at the owner's request.
   - **What it means for #559:** Spark's Parquet reader accounts for the scan-bound gap to Comet. A faster reader of our own would recover it without the native crossing's fixed cost.
 - **Against the earlier x86 run:** that run used a 128m advisory size and `minPartitionNum=208`, with Comet 1.0.0 failing q64. It measured Spark 3,309 s, ours 2,557 s (1.29x) and Comet 2,514 s.
+
+## x86 TPC-DS 1 TB, VecRuntime on S3A's classic stream, Spark from 2026-10-10 and Comet from 2026-10-03 (2026-10-18)
+
+The x86 page (`docs/benchmarks/tpcds-1tb.html`) now shows this run. The result files and the page's metadata are
+in `benchmarks/results/tpcds-sf1000-2026-10-18/`.
+
+**Setup:** as on 2026-10-10 (below), with main at `af9d367`, image `d565-main-af9d367e-c110`, and S3A's classic
+input stream (`fs.s3a.input.stream.type=classic`, #835) for the VecRuntime leg. The Spark column stays Spark's
+leg of the 2026-10-10 session and the Comet column Comet 1.0.0's leg of the 2026-10-03 session, both on the
+Analytics Accelerator, which is the faster stream for Spark's reader (below). A Comet 1.1.0 leg in this session
+was stopped after q14a took 967.1 s.
+
+**Totals:**
+
+| engine | total (s) | vs Spark | geomean | faster than Spark on | executor time (h) | GC (h) | shuffle read (TB) |
+|---|---|---|---|---|---|---|---|
+| Spark 4.1.3 (2026-10-10) | 2,997.4 | baseline | -- | -- | 75.9 | 0.44 | 0.94 |
+| VecRuntime (own reader, classic stream) | 923.9 | 3.24x | 2.24x | 99 | 21.0 | 0.15 | 0.29 |
+| Comet 1.0.0 (2026-10-03) | 1,964.1 | 1.53x | 1.50x | 97 | 48.8 | 0.02 | 0.43 |
+
+- **Correctness:** every engine returned Spark's row counts on all 103 queries and Spark's checksums on all
+  but q65 (ties).
+- **Fastest engine per query:** VecRuntime 73, Comet 29, Spark 1. VecRuntime against Comet: 2.13x in total,
+  1.49x geomean.
+- **Against 2026-10-10:** VecRuntime 1,011.9 -> 923.9 s (-9%): q24b 62.3 -> 30.9 s, q24a 61.5 -> 33.1, q44
+  35.7 -> 14.1, q47 22.8 -> 7.8, q57 11.1 -> 5.4, q50 25.0 -> 19.8.
+- **Slower than on 2026-10-10:** q95 10.6 -> 15.9 s, q85 7.2 -> 12.1, q79 2.8 -> 7.1, q75 22.6 -> 26.8, q80
+  9.8 -> 14.0. A recheck with two iterations each puts most of it on the code between `a62c17c` and `af9d367`
+  (3-6 s on q75, q95, q85, q80 and q44 on the classic stream), about 2 s of q85 and q80 on the classic stream,
+  and q79 on a first-run cost.
+- **Spark on the classic stream:** 3,642.0 s in this session (`spark-classic.jsonl`), against 2,997.4 s on the
+  Analytics Accelerator; the gap is in the scan-bound queries (q88 214.0 against 130.6 s, q28 162.3 against
+  111.8, q9 133.8 against 97.1). Spark's Parquet reader issues one column-chunk read at a time and gains from
+  the Analytics Accelerator's footer cache and range prefetch; VecRuntime's own reader plans and prefetches its
+  ranges itself. Each engine is shown on its faster stream.
 
 ## x86 TPC-DS 1 TB, Spark and VecRuntime in one session, Comet from 2026-10-03 (2026-10-10)
 
