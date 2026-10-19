@@ -537,6 +537,14 @@ object VectorConf {
     else DefaultJoinSpillBytes
     if (v <= 0) Long.MaxValue else v
   }
+
+  /**
+   * #875: what a shuffled hash join's build side may hold in memory before it buckets to disk: `joinSpillBytes`, but
+   * never past the task's fair share of the off-heap pool (`offHeapTaskShare`), so a build that cannot be asked to
+   * give memory back does not win the race to the pool and pin more than its share.
+   */
+  def joinBuildAdmissionBytes(conf: SQLConf, sparkConf: org.apache.spark.SparkConf): Long =
+    offHeapTaskShare(sparkConf).fold(joinSpillBytes(conf, sparkConf))(math.min(joinSpillBytes(conf, sparkConf), _))
   def joinSpillBuckets(conf: SQLConf): Int =
     scala.util.Try(conf.getConfString(JoinSpillBuckets, "").trim.toInt).toOption.getOrElse(32)
 
