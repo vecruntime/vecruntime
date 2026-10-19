@@ -346,8 +346,22 @@ object VectorConf {
   def sortSpillBytes(conf: SQLConf, sparkConf: org.apache.spark.SparkConf): Long = {
     val explicit = conf.getConfString(SortSpillBytes, "").trim
     val v = if (explicit.nonEmpty) org.apache.spark.network.util.JavaUtils.byteStringAsBytes(explicit)
-    else DefaultSortSpillBytes
+    else offHeapTaskShare(sparkConf).getOrElse(DefaultSortSpillBytes)
     if (v <= 0) Long.MaxValue else v
+  }
+
+  /**
+   * #868: a task's fair share of the off-heap execution pool, `spark.memory.offHeap.size /
+   * spark.executor.cores`, when off-heap memory is enabled -- the most `TaskMemoryManager` grants a task
+   * while every core runs one. The default cap of the operators whose memory the pool budgets, so the
+   * cap follows the pool instead of being fixed; within it the pool's grant decides.
+   */
+  def offHeapTaskShare(sparkConf: org.apache.spark.SparkConf): Option[Long] = {
+    val offHeap =
+      if (sparkConf.getBoolean("spark.memory.offHeap.enabled", false))
+        sparkConf.getSizeAsBytes("spark.memory.offHeap.size", "0")
+      else 0L
+    if (offHeap > 0) Some(math.max(1L, offHeap / math.max(1, sparkConf.getInt("spark.executor.cores", 1)))) else None
   }
   def sortRunRows(conf: SQLConf): Int =
     scala.util.Try(conf.getConfString(SortRunRows, "").trim.toInt).toOption.filter(_ > 0).getOrElse(1 << 20)
@@ -540,12 +554,7 @@ object VectorConf {
   def joinMaxBuildSize(conf: SQLConf, sparkConf: org.apache.spark.SparkConf): Long = {
     val explicit = conf.getConfString(JoinMaxBuildSize, "")
     if (explicit.nonEmpty) org.apache.spark.network.util.JavaUtils.byteStringAsBytes(explicit)
-    else {
-      val offHeap = if (sparkConf.getBoolean("spark.memory.offHeap.enabled", false))
-        sparkConf.getSizeAsBytes("spark.memory.offHeap.size", "0")
-      else 0L
-      if (offHeap > 0) math.max(1L, offHeap / math.max(1, sparkConf.getInt("spark.executor.cores", 1))) else 1L << 30
-    }
+    else offHeapTaskShare(sparkConf).getOrElse(1L << 30)
   }
 
   /** Also hand range-partitioned exchanges (global sorts) to Comet's native shuffle. */
