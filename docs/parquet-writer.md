@@ -67,18 +67,32 @@ index are written as parquet-java writes them; binary min/max compare unsigned.
 
 Taken: Parquet writes of flat types, unpartitioned, partitioned (dynamic partitions) and bucketed -- boolean, byte, short, int, long, float,
 double, decimal (every precision), date, timestamp (INT96, `TIMESTAMP_MICROS`, `TIMESTAMP_MILLIS`),
-string, binary -- over a columnar child. Other writes keep Spark's writer, with the reason in the plan's
+string, binary, and structs, arrays and maps of those types (#842) -- over a columnar child. Other writes keep Spark's writer, with the reason in the plan's
 fallback list:
 
 | Write | Reason |
 |---|---|
 | Concurrent output writers whose past-the-limit sort keys do not compile | `concurrent writers' sort key ...` |
 | Hive-compatible bucketing (Hive tables) | `Hive-compatible bucketing is not supported yet (#842)` |
-| Struct, array, map columns | `column <name> has type <type>, not supported yet (#842)` |
+| Struct, array, map columns under `spark.sql.parquet.writeLegacyFormat` | `column <name> is nested and writeLegacyFormat is on` |
+| Other types (intervals, variant, ...) | `column <name> has type <type>, not supported yet (#842)` |
 | `parquet.writer.version=v1` | `parquet.writer.version is v1, the columnar writer writes Parquet v2` |
 | Bloom filters, encryption, per-column `#` options | named in the reason |
 | A date or timestamp with a rebase mode in write other than `CORRECTED` (Spark 4 default) | `... is not CORRECTED` |
 | A decimal under `spark.sql.parquet.writeLegacyFormat` | `... writeLegacyFormat is on` |
+
+**Nested columns** (#842) use Spark's standard layout: a struct is a group, an array the 3-level `LIST`, a map
+the `MAP` with `key_value`.
+- `NestedFieldWriter` walks each row's nested lane (Arrow's layout) and works out the Dremel repetition and
+  definition levels for every leaf. A null at any level writes a null to each leaf under it; an empty array
+  or map writes one a level deeper.
+- The leaves are written through parquet-java's column writers, so they get its v2 encodings and statistics,
+  not the flat fast path.
+- On the Spark side the lane is built from Spark's getters, and a filtered batch is gathered by its
+  selection.
+- Tests: `NestedWriteTest` against parquet-java (nulls at every level, a list of structs holding a list,
+  several batch sizes and row groups), and `VectorWriteSuite` against Spark's writer, unpartitioned and
+  partitioned.
 | ORC, JSON, CSV | `... is not Parquet` |
 | A child that is not columnar | `child <op> is not columnar` |
 

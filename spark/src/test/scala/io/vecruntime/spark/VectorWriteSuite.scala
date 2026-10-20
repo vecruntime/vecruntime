@@ -414,6 +414,34 @@ class VectorWriteSuite extends VectorQuerySuite {
     }
   }
 
+  test("structs, arrays and maps (#842): columnar, the same Parquet schema and rows as Spark's") {
+    // Nulls at every level, empty arrays and maps, a list of structs holding a list, every leaf type the flat
+    // writer takes (INT96 timestamps, the three decimal widths, float, binary), and a filter (a selection).
+    val nested = (s: SparkSession) =>
+      wide(s).selectExpr(
+        "i",
+        "IF(i % 9 = 0, NULL, named_struct('a', i, 'b', s, 'ts', ts, 'dec7', dec7, 'dec30', dec30)) AS st",
+        "CASE WHEN i % 5 = 0 THEN NULL WHEN i % 5 = 1 THEN array() ELSE array(l, NULL, l + 1) END AS arr",
+        "CASE WHEN i % 7 = 0 THEN NULL WHEN i % 7 = 1 THEN map() ELSE map(coalesce(s, 'x'), dec15, 'k', NULL) END AS m",
+        "array(named_struct('x', by, 'ys', IF(i % 4 = 0, NULL, array(s, cast(b as string))), 'f', f), NULL) AS deep",
+        "array(array(sh), array(), NULL) AS aa",
+        "map(i, named_struct('d', dt, 'bin', cast(s as binary))) AS ms"
+      )
+    // Written once by Spark, then read by our scan (nested columns) and written by both writers.
+    val src = newTempPath("write/nested-src")
+    withPlugin(enabled = false)(nested(spark).write.mode("overwrite").parquet(src))
+    val (plan, footers) = compareWrites("nested", s => s.read.parquet(src).where("i % 11 <> 3"))
+    assert(hasVectorWrite(plan), s"${plan.treeString}\n${fallbackReasons(plan)}")
+    assert(footers.head.getFileMetaData.getSchema.getColumns.asScala.exists(_.getMaxRepetitionLevel == 2))
+    // Partitioned: the runs of a batch, cut at partition boundaries, slice the nested lanes too.
+    val (pp, _) = compareWrites(
+      "nested-part",
+      s => s.read.parquet(src).selectExpr("*", "i % 3 AS pk"),
+      partitionBy = Seq("pk")
+    )
+    assert(hasVectorWrite(pp), s"${pp.treeString}\n${fallbackReasons(pp)}")
+  }
+
   test("writes the prototype does not take keep Spark's writer, with the reason") {
     def reasonsOf(f: String => Unit): Seq[String] = {
       lastWritePlan = null
@@ -427,8 +455,11 @@ class VectorWriteSuite extends VectorQuerySuite {
         .exists(_.contains("writes Parquet v2"))
     )
     assert(
-      reasonsOf(p => spark.table("t").selectExpr("i", "named_struct('a', i, 'b', s) AS st").write.parquet(p))
-        .exists(_.contains("not supported yet"))
+      reasonsOf { p =>
+        withConf("spark.sql.parquet.writeLegacyFormat" -> "true") {
+          spark.table("t").selectExpr("i", "named_struct('a', i, 'b', s) AS st").write.parquet(p)
+        }
+      }.exists(_.contains("is nested and writeLegacyFormat is on"))
     )
     assert(reasonsOf(p => spark.table("t").write.orc(p)).exists(_.contains("is not Parquet")))
   }

@@ -257,6 +257,15 @@ object VectorWritePlanner {
       case d: DecimalType if d.precision <= Decimal.MAX_LONG_DIGITS && conf.writeLegacyParquetFormat =>
         Some(s"columnar write: column $name is a decimal(${d.precision},${d.scale}) and writeLegacyFormat is on")
       case _: DecimalType => None
+      // Structs, arrays and maps (#842) in Spark's standard layout, of the types above.
+      case _: StructType | _: ArrayType | _: MapType if conf.writeLegacyParquetFormat =>
+        Some(s"columnar write: column $name is nested and writeLegacyFormat is on")
+      case s: StructType if s.isEmpty => Some(s"columnar write: column $name is an empty struct")
+      case s: StructType =>
+        s.fields.iterator.flatMap(f => typeReason(s"$name.${f.name}", f.dataType, conf)).nextOption()
+      case a: ArrayType => typeReason(s"$name.element", a.elementType, conf)
+      case m: MapType =>
+        typeReason(s"$name.key", m.keyType, conf).orElse(typeReason(s"$name.value", m.valueType, conf))
       case other => Some(s"columnar write: column $name has type ${other.simpleString}, not supported yet (#842)")
     }
   }
@@ -746,10 +755,31 @@ private[vecruntime] object VectorWriteTask2 {
   /** The data columns of `batch` as `VectorBuffers` (at `ordinals`), compacted to its selection; and their rows. */
   def columns(batch: ColumnarBatch, ordinals: Array[Int], arena: Arena): (Array[VectorBuffers], Int) = {
     val rows = batch.numRows()
-    val columns = ordinals.map(o => ColumnVectorAdapters.adapt(batch.column(o), rows, arena))
+    // A struct, array or map column (#842) as its nested lane, built from Spark's getters.
+    def adapt(o: Int): VectorBuffers = {
+      val cv = batch.column(o)
+      cv.dataType() match {
+        case dt @ (_: StructType | _: ArrayType | _: MapType) =>
+          io.vecruntime.spark.adapter.NestedColumns.adapt(cv, dt, rows, arena)
+        case _ => ColumnVectorAdapters.adapt(cv, rows, arena)
+      }
+    }
+    val columns = ordinals.map(adapt)
     batch match {
       case s: SelectedColumnarBatch if s.selectedCount() < rows =>
-        (columns.map(c => compact(c, s.selection(), s.selectedCount(), arena)), s.selectedCount())
+        lazy val selected: Array[Int] = {
+          val out = new Array[Int](s.selectedCount())
+          var i = 0
+          var k = 0
+          while (i < rows) { if (io.vecruntime.kernels.Bitmap.isSet(s.selection(), i)) { out(k) = i; k += 1 }; i += 1 }
+          out
+        }
+        val compacted = columns.map { c =>
+          if (c.`type`().isNested())
+            io.vecruntime.spark.expr.ElementAccessExpr.gather(c, selected, s.selectedCount(), arena)
+          else compact(c, s.selection(), s.selectedCount(), arena)
+        }
+        (compacted, s.selectedCount())
       case _ => (columns, rows)
     }
   }
