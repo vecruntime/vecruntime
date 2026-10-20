@@ -28,6 +28,7 @@ import org.apache.parquet.column.ParquetProperties;
 import org.apache.parquet.compression.CompressionCodecFactory;
 import org.apache.parquet.hadoop.ColumnChunkPageWriteStore;
 import org.apache.parquet.hadoop.ParquetFileWriter;
+import org.apache.parquet.hadoop.metadata.ParquetMetadata;
 import org.apache.parquet.io.OutputFile;
 import org.apache.parquet.schema.MessageType;
 
@@ -271,6 +272,25 @@ public final class ColumnarParquetWriter implements AutoCloseable {
     /** Rows written so far. */
     public long rowCount() {
         return totalRows;
+    }
+
+    /**
+     * The footer this writer wrote -- schema, row groups, and each column
+     * chunk's statistics, encodings, sizes and value counts -- once {@link
+     * #close} has returned (#900, #901). It is what a table format needs to
+     * describe the file without reading it back: Iceberg builds its {@code
+     * Metrics} from it ({@code ParquetUtil.footerMetrics}), keyed by the field
+     * ids the schema carries. Like parquet-java's {@code
+     * ParquetWriter.getFooter()}.
+     *
+     * @throws IllegalStateException before {@link #close}, or when close failed
+     *     before the footer was written
+     */
+    public ParquetMetadata footer() {
+        if (!closed) {
+            throw new IllegalStateException("the footer is written by close()");
+        }
+        return file.getFooter();
     }
 
     /** Flushes the open row group and writes the footer. */

@@ -51,6 +51,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -213,8 +214,10 @@ class ColumnarParquetWriterTest {
         org.apache.hadoop.fs.Path p = new org.apache.hadoop.fs.Path(dir.resolve("ours-" + (files++) + ".parquet")
                 .toString());
         CodecFactory codecs = new CodecFactory(conf, 64 * 1024);
+        ColumnarParquetWriter written = null;
         try (ColumnarParquetWriter w = new ColumnarParquetWriter(HadoopOutputFile.fromPath(p, conf), SCHEMA, props(),
                 codecs.getCompressor(CompressionCodecName.SNAPPY), rowGroupSize, Map.of("writer", "vecruntime"))) {
+            written = w;
             for (int from = 0; from < rows.size(); from += batch) {
                 List<Row> slice = rows.subList(from,
                         Math.min(rows.size(), from + batch));
@@ -225,8 +228,15 @@ class ColumnarParquetWriterTest {
         } finally {
             codecs.release();
         }
+        lastFooter = written.footer();
         return p;
     }
+
+    /**
+     * The footer the last {@link #writeOurs} writer returned from {@link
+     * ColumnarParquetWriter#footer}.
+     */
+    private ParquetMetadata lastFooter;
 
     private org.apache.hadoop.fs.Path writeParquetJava(List<Row> rows, long rowGroupSize) throws Exception {
         org.apache.hadoop.fs.Path p = new org.apache.hadoop.fs.Path(dir.resolve("parquet-java.parquet")
@@ -473,6 +483,63 @@ class ColumnarParquetWriterTest {
                 .sum();
         assertEquals(rows.size(), total);
         assertEquals(readAll(writeParquetJava(rows, 128L << 20)), readAll(path));
+    }
+
+    /**
+     * #900 phase 3: the footer the writer hands back after close is the one in
+     * the file -- what Iceberg builds its {@code Metrics} from without reading
+     * the file again.
+     */
+    @Test
+    void footerAfterCloseIsTheFileFooter() throws Exception {
+        List<Row> rows = rows(30_000, 3);
+        ParquetMetadata file = footer(writeOurs(rows, 4096, 256L << 10));
+        ParquetMetadata returned = lastFooter;
+        assertTrue(file.getBlocks().size() > 1, "several row groups");
+        assertEquals(file.getFileMetaData().getSchema(),
+                returned.getFileMetaData().getSchema());
+        assertEquals(file.getFileMetaData().getKeyValueMetaData(),
+                returned.getFileMetaData().getKeyValueMetaData());
+        assertEquals(file.getBlocks().size(),
+                returned.getBlocks().size());
+        long total = 0;
+        for (int g = 0; g < file.getBlocks().size(); g++) {
+            BlockMetaData a = returned.getBlocks().get(g);
+            BlockMetaData b = file.getBlocks().get(g);
+            assertEquals(b.getRowCount(), a.getRowCount(), "rows of row group " + g);
+            assertEquals(b.getTotalByteSize(), a.getTotalByteSize(), "bytes of row group " + g);
+            total += a.getRowCount();
+            for (int c = 0; c < b.getColumns().size(); c++) {
+                ColumnChunkMetaData x = a.getColumns().get(c);
+                ColumnChunkMetaData y = b.getColumns().get(c);
+                String col = "row group " + g + ", " + y.getPath().toDotString();
+                assertEquals(y.getPath(), x.getPath(), col);
+                assertEquals(y.getValueCount(), x.getValueCount(), col);
+                assertEquals(y.getEncodings(), x.getEncodings(), col);
+                assertEquals(y.getTotalSize(), x.getTotalSize(), col);
+                assertEquals(y.getTotalUncompressedSize(), x.getTotalUncompressedSize(), col);
+                assertEquals(y.getStatistics().getNumNulls(),
+                        x.getStatistics().getNumNulls(), col);
+                assertEquals(y.getStatistics().genericGetMin(),
+                        x.getStatistics().genericGetMin(), col);
+                assertEquals(y.getStatistics().genericGetMax(),
+                        x.getStatistics().genericGetMax(), col);
+            }
+        }
+        assertEquals(rows.size(), total);
+    }
+
+    @Test
+    void footerBeforeCloseIsRefused() throws Exception {
+        org.apache.hadoop.fs.Path p = new org.apache.hadoop.fs.Path(dir.resolve("open.parquet")
+                .toString());
+        CodecFactory codecs = new CodecFactory(conf, 64 * 1024);
+        try (ColumnarParquetWriter w = new ColumnarParquetWriter(HadoopOutputFile.fromPath(p, conf), SCHEMA, props(),
+                codecs.getCompressor(CompressionCodecName.SNAPPY), 128L << 20, Map.of())) {
+            assertThrows(IllegalStateException.class, w::footer);
+        } finally {
+            codecs.release();
+        }
     }
 
     @Test
