@@ -77,6 +77,9 @@ object VectorConf {
   /** Logical rewrite (#840): a left semi join's right side reduced to its distinct join columns, per task. */
   val DistinctBelowSemiJoinEnabled = "spark.vecruntime.optimizer.distinctBelowSemiJoin.enabled"
 
+  /** Logical rewrite (#904): a left anti join's right side reduced to its distinct join columns, per task. */
+  val DistinctBelowAntiJoinEnabled = "spark.vecruntime.optimizer.distinctBelowAntiJoin.enabled"
+
   /** The reduction (rows / groups) statistics must allow for CountBelowJoin to collapse a side (#692; default 2). */
   val CountBelowJoinMinReduction = "spark.vecruntime.optimizer.countBelowJoin.minReduction"
 
@@ -814,6 +817,10 @@ object VectorConf {
   /** A left semi join's right side as its distinct join columns, one aggregate per task (#840); off with the plugin. */
   def distinctBelowSemiJoinEnabled(conf: SQLConf): Boolean =
     isEnabled(conf) && bool(conf, DistinctBelowSemiJoinEnabled, default = true)
+
+  /** A left anti join's right side as its distinct join columns, one aggregate per task (#904); off with the plugin. */
+  def distinctBelowAntiJoinEnabled(conf: SQLConf): Boolean =
+    isEnabled(conf) && bool(conf, DistinctBelowAntiJoinEnabled, default = true)
 
   /** CountBelowJoin leaves a side alone when statistics bound its groups above rows / this (default 2, #692). */
   def countBelowJoinMinReduction(conf: SQLConf): Double =
