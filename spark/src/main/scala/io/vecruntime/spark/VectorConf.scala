@@ -342,9 +342,34 @@ object VectorConf {
     // task's fair share is only where the sort starts preferring to spill (sortFairShareBytes).
     val v = if (explicit.nonEmpty) org.apache.spark.network.util.JavaUtils.byteStringAsBytes(explicit)
     else if (offHeapTaskShare(sparkConf).isDefined) Long.MaxValue
-    else DefaultSortSpillBytes
+    else overheadTaskShare(sparkConf).fold(DefaultSortSpillBytes)(math.min(DefaultSortSpillBytes, _))
     if (v <= 0) Long.MaxValue else v
   }
+
+  /**
+   * Without off-heap memory the sort's native runs are held against the on-heap pool, which is sized from the heap
+   * and does not bound native memory against `spark.executor.memoryOverhead`, where those runs actually live. At
+   * 1 TB, 30g heap / 20g overhead / 13 cores, the flat 1 GiB budget let the runs reach 17.5 GB native and an
+   * executor was lost in every run; 64 MiB kept it at 6.5 GB. So the default is also bounded by half the task's share
+   * of the overhead left after direct memory: `(memoryOverhead - direct) / (2 * executor.cores)` -- half, because the
+   * runs' malloc arenas hold more than their counted bytes and the overhead also carries the JVM's own native memory;
+   * `direct` is `-XX:MaxDirectMemorySize` from the executor's Java options, or half the overhead when it is not set
+   * (the JVM's default is the heap size, which would leave nothing). At least 64 MiB. None when the overhead is not
+   * set.
+   */
+  def overheadTaskShare(sparkConf: org.apache.spark.SparkConf): Option[Long] =
+    sparkConf.getOption("spark.executor.memoryOverhead").map { o =>
+      val overhead = org.apache.spark.network.util.JavaUtils.byteStringAsBytes(o.trim match {
+        case s if s.nonEmpty && s.forall(_.isDigit) => s + "m" // Spark reads a bare number as MiB
+        case s => s
+      })
+      val direct = "-XX:MaxDirectMemorySize=(\\S+)".r
+        .findFirstMatchIn(sparkConf.get("spark.executor.extraJavaOptions", ""))
+        .map(m => org.apache.spark.network.util.JavaUtils.byteStringAsBytes(m.group(1)))
+        .getOrElse(overhead / 2)
+      val cores = math.max(1, sparkConf.getInt("spark.executor.cores", 1))
+      math.max(64L << 20, (overhead - direct) / (2L * cores))
+    }
 
   /**
    * #877: the sort's soft spill trigger with off-heap memory and no explicit `spark.vecruntime.sort.spillBytes`: the
