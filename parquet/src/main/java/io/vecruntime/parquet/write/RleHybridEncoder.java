@@ -18,6 +18,7 @@ package io.vecruntime.parquet.write;
 import java.lang.foreign.MemorySegment;
 
 import io.vecruntime.kernels.Bitmap;
+import io.vecruntime.parquet.codec.ParquetFraming;
 
 /**
  * Parquet's RLE / bit-packing hybrid encoding over whole arrays: the definition
@@ -42,7 +43,7 @@ final class RleHybridEncoder {
 
     /** Bits needed for values {@code 0 .. maxValue}. */
     static int bitWidth(int maxValue) {
-        return 32 - Integer.numberOfLeadingZeros(maxValue);
+        return ParquetFraming.bitWidth(maxValue);
     }
 
     /** Encodes {@code values[0, n)} at {@code bitWidth} into {@code out}. */
@@ -156,8 +157,8 @@ final class RleHybridEncoder {
 
     static void writeRle(int value, int count, int bitWidth,
                          ByteSink out) {
-        out.writeUnsignedVarInt(count << 1);
-        int bytes = (bitWidth + 7) >>> 3;
+        out.writeUnsignedVarInt(ParquetFraming.rleRunHeader(count));
+        int bytes = ParquetFraming.rleValueBytes(bitWidth);
         for (int b = 0; b < bytes; b++) {
             out.writeByte(value >>> (8 * b));
         }
@@ -170,8 +171,8 @@ final class RleHybridEncoder {
         if (n == 0) {
             return;
         }
-        int groups = (n + 7) >>> 3;
-        out.writeUnsignedVarInt(groups << 1 | 1);
+        int groups = ParquetFraming.bitPackedGroups(n);
+        out.writeUnsignedVarInt(ParquetFraming.bitPackedRunHeader(groups));
         if (bitWidth == 0) {
             return;
         }

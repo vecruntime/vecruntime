@@ -443,6 +443,6 @@ public final class DeltaBinaryPackedReader {
     }
 
     private static long zigzag(long v) {
-        return (v >>> 1) ^ -(v & 1);
+        return ParquetFraming.zigzagDecode(v);
     }
 }

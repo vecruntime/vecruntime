@@ -18,6 +18,7 @@ package io.vecruntime.parquet.write;
 import java.util.Arrays;
 
 import io.vecruntime.kernels.Species;
+import io.vecruntime.parquet.codec.ParquetFraming;
 import jdk.incubator.vector.LongVector;
 import jdk.incubator.vector.VectorOperators;
 import jdk.incubator.vector.VectorSpecies;
@@ -37,9 +38,9 @@ import jdk.incubator.vector.VectorSpecies;
  */
 public final class DeltaBinaryPackedEncoder {
 
-    static final int BLOCK = 128;
-    static final int MINIBLOCKS = 4;
-    static final int MINIBLOCK = BLOCK / MINIBLOCKS;
+    static final int BLOCK = ParquetFraming.DELTA_BLOCK_SIZE;
+    static final int MINIBLOCKS = ParquetFraming.DELTA_MINIBLOCKS;
+    static final int MINIBLOCK = ParquetFraming.DELTA_MINIBLOCK_SIZE;
 
     /**
      * The vector path is the default;
@@ -145,7 +146,7 @@ public final class DeltaBinaryPackedEncoder {
     }
 
     private static long zigzag(long v) {
-        return (v << 1) ^ (v >> 63);
+        return ParquetFraming.zigzagEncode(v);
     }
 
     private static void writeVarLong(long v, ByteSink out) {

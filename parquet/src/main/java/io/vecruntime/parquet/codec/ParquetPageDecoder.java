@@ -428,7 +428,7 @@ public final class ParquetPageDecoder {
         if (maxLevel == 0) {
             return 0;
         }
-        return 32 - Integer.numberOfLeadingZeros(maxLevel);
+        return ParquetFraming.bitWidth(maxLevel);
     }
 
     /**

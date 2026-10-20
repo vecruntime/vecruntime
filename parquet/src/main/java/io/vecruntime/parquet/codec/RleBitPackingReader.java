@@ -103,7 +103,7 @@ public final class RleBitPackingReader {
         this.pos = offset;
         this.end = offset + length;
         this.bitWidth = bitWidth;
-        this.byteWidthOfValue = (bitWidth + 7) / 8;
+        this.byteWidthOfValue = ParquetFraming.rleValueBytes(bitWidth);
         this.mask = bitWidth == 32 ? -1 : ((1 << bitWidth) - 1);
     }
 
@@ -333,8 +333,8 @@ public final class RleBitPackingReader {
 
     private void readRunHeader() {
         int header = readUleb128();
-        boolean bitPacked = (header & 1) != 0;
-        int count = header >>> 1;
+        boolean bitPacked = ParquetFraming.isBitPackedRun(header);
+        int count = ParquetFraming.runCount(header);
         if (bitPacked) {
             packedRemaining = count * 8;
             packedIndex = 8; // force a refill on the first read of this run
