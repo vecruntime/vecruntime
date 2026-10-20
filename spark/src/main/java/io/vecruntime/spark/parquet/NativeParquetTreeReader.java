@@ -15,17 +15,14 @@
  */
 package io.vecruntime.spark.parquet;
 
-import java.lang.foreign.MemorySegment;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.function.BiConsumer;
 
-import io.vecruntime.parquet.read.RowLevels;
+import io.vecruntime.parquet.read.TreeColumnReader;
 import io.vecruntime.spark.arrow.VectorNestedColumnVector;
 import org.apache.arrow.memory.BufferAllocator;
-import org.apache.arrow.vector.FieldVector;
 import org.apache.parquet.column.ColumnDescriptor;
-import org.apache.parquet.column.page.PageReadStore;
 import org.apache.parquet.schema.GroupType;
 import org.apache.parquet.schema.MessageType;
 import org.apache.parquet.schema.Type;
@@ -68,58 +65,10 @@ import org.apache.spark.sql.vectorized.ColumnVector;
  * (Spark's {@code isElementType} rule), a bare repeated field, and {@code MAP}
  * groups.
  */
-public final class NativeParquetTreeReader implements NativeParquetColumn, RowLevels {
-
-    private abstract static class Node {
-        DataType type;
-        int depth; // enclosing lists
-        int existDef; // the innermost enclosing list's element level (0 at the top)
-        Leaf rep; // the first leaf below: its levels give this node's structure
-    }
-
-    private static final class ListNode extends Node {
-        int listDef;
-        int elemDef;
-        Node element; // or a map's key
-        Node value; // a map's value, else null
-    }
-
-    private static final class StructNode extends Node {
-        int structDef;
-        Node[] fields;
-    }
-
-    private static final class Leaf extends Node {
-        ColumnDescriptor column;
-        NativeParquetColumnReader reader;
-        int entries; // this batch
-    }
-
-    /**
-     * A struct field the file does not hold (#568 schema evolution): null in
-     * every instance of its struct, as Spark's reader makes it.
-     */
-    private static final class Missing extends Node {}
-
-    /** One node's result in a batch. */
-    private static final class Res {
-        int count;
-        boolean[] nulls;
-        int[] offsets;
-        Res[] kids;
-        FieldVector vector;
-    }
-
-    private final ListNode root;
-    private final List<Leaf> leaves;
-    private int[] rowLevels = new int[0];
+public final class NativeParquetTreeReader extends TreeColumnReader implements NativeParquetColumn {
 
     private NativeParquetTreeReader(ListNode root, List<Leaf> leaves) {
-        this.root = root;
-        this.leaves = leaves;
-        for (Leaf l : leaves) {
-            l.reader.setDictionaryIds(false);
-        }
+        super(root, leaves);
     }
 
     // ----- building the node tree from the clipped schema and the Spark type -----
@@ -375,7 +324,7 @@ public final class NativeParquetTreeReader implements NativeParquetColumn, RowLe
             return false;
         }
         for (Leaf l : leaves) {
-            leaf.accept(l.column, l.type);
+            leaf.accept(l.column, (DataType) l.type);
         }
         return true;
     }
@@ -399,174 +348,22 @@ public final class NativeParquetTreeReader implements NativeParquetColumn, RowLe
         }
         int i = 0;
         for (Leaf l : leaves) {
-            l.reader = new NativeParquetColumnReader(l.column, NativeParquetSupport.decodeLane(l.type), l.type, name + ".leaf" + i++,
-                    batchRows, allocator);
+            l.reader = new NativeParquetColumnReader(l.column, NativeParquetSupport.decodeLane((DataType) l.type), (DataType) l.type,
+                    name + ".leaf" + i++, batchRows, allocator);
         }
         return new NativeParquetTreeReader(root, leaves);
-    }
-
-    // ----- a batch -----
-
-    /** A batch: the root's result, and the leaves' vectors to release. */
-    private static final class Batch {
-        final Res root;
-        final FieldVector[] vectors;
-
-        Batch(Res root, FieldVector[] vectors) {
-            this.root = root;
-            this.vectors = vectors;
-        }
-    }
-
-    @Override
-    public void startRowGroup(PageReadStore store, int rows) {
-        for (Leaf l : leaves) {
-            l.reader.startRowGroup(store, rows);
-        }
-    }
-
-    @Override
-    public Object readBatch(int n) {
-        for (Leaf l : leaves) {
-            l.entries = l.reader.entriesForRows(n);
-        }
-        if (rowLevels.length < n) {
-            rowLevels = new int[n];
-        }
-        // Structure first, from the leaves' levels (each leaf's levels stay put until it decodes).
-        Res res = structure(root, n);
-        FieldVector[] vectors = new FieldVector[leaves.size()];
-        try {
-            for (int i = 0; i < vectors.length; i++) {
-                Leaf l = leaves.get(i);
-                vectors[i] = l.reader.readElements(n, l.entries, l.existDef);
-            }
-        } catch (RuntimeException | Error e) {
-            for (int i = 0; i < vectors.length; i++) {
-                if (vectors[i] != null) {
-                    leaves.get(i).reader.release(vectors[i]);
-                }
-            }
-            throw e;
-        }
-        attach(root, res, vectors);
-        return new Batch(res, vectors);
-    }
-
-    /**
-     * A node's instances, nulls and offsets from its first leaf's levels; its
-     * children's in turn.
-     */
-    private Res structure(Node node, int rows) {
-        Res res = new Res();
-        if (node instanceof Leaf) {
-            return res;
-        }
-        Leaf rl = node.rep;
-        int[] r = rl.reader.repLevels();
-        int[] d = rl.reader.defLevels();
-        int off = rl.reader.levelOffset();
-        int e = rl.entries;
-        int j = node.depth;
-        if (node instanceof ListNode ln) {
-            int k = j + 1;
-            int[] offsets = new int[(j == 0 ? rows : e) + 1];
-            boolean[] nulls = null;
-            int inst = 0;
-            int elems = 0;
-            for (int x = 0; x < e; x++) {
-                int rep = r[off + x];
-                int def = d[off + x];
-                if (rep <= j && def >= node.existDef) {
-                    if (j == 0) {
-                        rowLevels[inst] = def;
-                    }
-                    offsets[inst] = elems;
-                    if (def < ln.listDef) {
-                        if (nulls == null) {
-                            nulls = new boolean[offsets.length];
-                        }
-                        nulls[inst] = true;
-                    }
-                    inst++;
-                }
-                if (rep <= k && def >= ln.elemDef) {
-                    elems++;
-                }
-            }
-            if (j == 0 && inst != rows) {
-                throw new IllegalStateException("a list column ended at row " + inst + " of " + rows);
-            }
-            offsets[inst] = elems;
-            res.count = inst;
-            res.nulls = nulls;
-            res.offsets = offsets;
-            res.kids = ln.value == null ? new Res[] {structure(ln.element, rows)} : new Res[] {structure(ln.element, rows), structure(ln.value, rows)};
-            return res;
-        }
-        StructNode sn = (StructNode) node;
-        boolean[] nulls = null;
-        int inst = 0;
-        for (int x = 0; x < e; x++) {
-            int def = d[off + x];
-            if (r[off + x] <= j && def >= node.existDef) {
-                if (def < sn.structDef) {
-                    if (nulls == null) {
-                        nulls = new boolean[e];
-                    }
-                    nulls[inst] = true;
-                }
-                inst++;
-            }
-        }
-        res.count = inst;
-        res.nulls = nulls;
-        res.kids = new Res[sn.fields.length];
-        for (int i = 0; i < sn.fields.length; i++) {
-            if (sn.fields[i] instanceof Missing) {
-                Res m = new Res();
-                m.count = inst;
-                res.kids[i] = m;
-                continue;
-            }
-            res.kids[i] = structure(sn.fields[i], rows);
-        }
-        return res;
-    }
-
-    /** Puts each leaf's decoded vector into its result. */
-    private void attach(Node node, Res res, FieldVector[] vectors) {
-        if (node instanceof Missing) {
-            return;
-        }
-        if (node instanceof Leaf l) {
-            res.vector = vectors[leaves.indexOf(l)];
-            res.count = res.vector.getValueCount();
-            return;
-        }
-        if (node instanceof ListNode ln) {
-            attach(ln.element, res.kids[0], vectors);
-            if (ln.value != null) {
-                attach(ln.value, res.kids[1], vectors);
-            }
-            return;
-        }
-        StructNode sn = (StructNode) node;
-        for (int i = 0; i < sn.fields.length; i++) {
-            attach(sn.fields[i], res.kids[i], vectors);
-        }
     }
 
     private ColumnVector wrap(Node node, Res res) {
         if (node instanceof Missing) {
             // Spark's own all-null vector (setMissing), as its reader makes a missing column; on the heap, so
             // nothing to release with the batch.
-            org.apache.spark.sql.execution.vectorized.OnHeapColumnVector v = new org.apache.spark.sql.execution.vectorized.OnHeapColumnVector(Math.max(1, res.count), node.type);
+            org.apache.spark.sql.execution.vectorized.OnHeapColumnVector v = new org.apache.spark.sql.execution.vectorized.OnHeapColumnVector(Math.max(1, res.count), (DataType) node.type);
             v.setMissing();
             return v;
         }
         if (node instanceof Leaf l) {
-            return l.reader.wrap(res.vector);
+            return ((NativeParquetColumnReader) l.reader).wrap(res.vector);
         }
         if (node instanceof ListNode ln) {
             ColumnVector e = wrap(ln.element, res.kids[0]);
@@ -586,89 +383,7 @@ public final class NativeParquetTreeReader implements NativeParquetColumn, RowLe
     }
 
     @Override
-    public Object readBatchSelected(int n, MemorySegment selection) {
-        return readBatch(n);
-    }
-
-    @Override
-    public boolean decodesSelectedFaster() {
-        return false;
-    }
-
-    @Override
-    public void skipRows(int n) {
-        for (Leaf l : leaves) {
-            l.reader.skipRows(n);
-        }
-    }
-
-    @Override
     public ColumnVector wrap(Object batch) {
-        return wrap(root, ((Batch) batch).root);
+        return wrap(root(), result(batch));
     }
-
-    @Override
-    public void release(Object batch) {
-        if (batch != null) {
-            FieldVector[] vs = ((Batch) batch).vectors;
-            for (int i = 0; i < vs.length; i++) {
-                if (vs[i] != null) {
-                    leaves.get(i).reader.release(vs[i]);
-                }
-            }
-        }
-    }
-
-    @Override
-    public void setPoolLimit(int limit) {
-        for (Leaf l : leaves) {
-            l.reader.setPoolLimit(limit);
-        }
-    }
-
-    @Override
-    public void setReuseDecompress(boolean reuse) {
-        for (Leaf l : leaves) {
-            l.reader.setReuseDecompress(reuse);
-        }
-    }
-
-    /**
-     * The file's calendar rebase and INT96 conversion, for every leaf (#568
-     * item 6).
-     */
-    @Override
-    public void setRebase(io.vecruntime.parquet.read.CalendarRebase rebase) {
-        for (Leaf l : leaves) {
-            l.reader.setRebase(rebase);
-        }
-    }
-
-    @Override
-    public void setDictionaryIds(boolean enabled) {
-        for (Leaf l : leaves) {
-            l.reader.setDictionaryIds(enabled); // #568: every string leaf as dictionary ids (#612)
-        }
-    }
-
-    @Override
-    public int rowsRemaining() {
-        return leaves.get(0).reader.rowsRemaining();
-    }
-
-    @Override
-    public void close() {
-        for (Leaf l : leaves) {
-            l.reader.close();
-        }
-    }
-
-    @Override
-    public int[] rowLevels() {
-        return rowLevels;
-    }
-
-    /** Always kept: one store per row while the root's offsets are built. */
-    @Override
-    public void recordRowLevels() {}
 }
