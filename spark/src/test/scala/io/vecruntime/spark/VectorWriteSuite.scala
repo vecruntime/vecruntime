@@ -442,6 +442,24 @@ class VectorWriteSuite extends VectorQuerySuite {
     assert(hasVectorWrite(pp), s"${pp.treeString}\n${fallbackReasons(pp)}")
   }
 
+  test("parquet.enable.dictionary#<column>: the column named is written without a dictionary, as Spark writes it") {
+    val (plan, ours) =
+      compareWrites(
+        "dict-col",
+        s => s.table("t").selectExpr("i % 10 AS k", "s", "l"),
+        Map("parquet.enable.dictionary#s" -> "false")
+      )
+    assert(hasVectorWrite(plan), s"${plan.treeString}\n${fallbackReasons(plan)}")
+    // Spark's writer writes v1 by default, so the encodings differ; which columns use a dictionary does not.
+    def dictionary(f: ParquetMetadata): Map[String, Boolean] =
+      f.getBlocks.get(0).getColumns.asScala.map(c =>
+        c.getPath.toDotString -> c.getEncodings.asScala.exists(_.usesDictionary())
+      ).toMap
+    val theirs = dictionary(footers(newTempPath("write/dict-col-spark")).head)
+    assert(dictionary(ours.head) === theirs)
+    assert(!theirs("s") && theirs("k"), theirs)
+  }
+
   test("field ids (spark.sql.parquet.fieldId.write.enabled): the same Parquet schema, ids included, as Spark's") {
     def id(n: Int) = new org.apache.spark.sql.types.MetadataBuilder().putLong("parquet.field.id", n).build()
     withConf("spark.sql.parquet.fieldId.write.enabled" -> "true") {

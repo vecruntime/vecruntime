@@ -191,7 +191,9 @@ object VectorWritePlanner {
       def option(k: String): Option[String] = w.options.get(k).orElse(Option(hadoopConf.get(k)))
       val options = UnsupportedOptions.find(k => option(k).exists(v => v != "false"))
       lazy val perColumn = (hadoopConf.iterator().asScala.map(_.getKey) ++ w.options.keys)
-        .find(k => k.startsWith("parquet.") && k.contains("#"))
+        .find(k =>
+          k.startsWith("parquet.") && k.contains("#") && !k.startsWith(ParquetOutputFormat.ENABLE_DICTIONARY + "#")
+        )
       // The columnar writer writes Parquet v2 only (data page v2, the v2 encodings); a write that asks for v1 by
       // name keeps Spark's writer.
       val v1 =
@@ -860,7 +862,7 @@ private[vecruntime] class VectorParquetOutputWriter(val filePath: String, dataSc
 
   private val writer: ColumnarParquetWriter = {
     val schema = new SparkToParquetSchemaConverter(conf).convert(dataSchema)
-    val props = ParquetProperties
+    val builder = ParquetProperties
       .builder()
       .withPageSize(ParquetOutputFormat.getPageSize(conf))
       .withDictionaryPageSize(ParquetOutputFormat.getDictionaryPageSize(conf))
@@ -876,7 +878,12 @@ private[vecruntime] class VectorParquetOutputWriter(val filePath: String, dataSc
         conf.getInt("parquet.statistics.truncate.length", ParquetProperties.DEFAULT_STATISTICS_TRUNCATE_LENGTH)
       )
       .withPageWriteChecksumEnabled(ParquetOutputFormat.getPageWriteChecksumEnabled(conf))
-      .build()
+    // Per-column dictionary switches (`parquet.enable.dictionary#<column path>`), as ParquetOutputFormat reads them.
+    val dictionaryPrefix = ParquetOutputFormat.ENABLE_DICTIONARY + "#"
+    conf.iterator().asScala.map(e => e.getKey -> e.getValue).filter(_._1.startsWith(dictionaryPrefix)).foreach {
+      case (k, v) => builder.withDictionaryEncoding(k.substring(dictionaryPrefix.length), v.trim.toBoolean)
+    }
+    val props = builder.build()
     val footer = Map(
       org.apache.spark.sql.SPARK_VERSION_METADATA_KEY -> SPARK_VERSION_SHORT,
       ParquetReadSupport.SPARK_METADATA_KEY -> conf.get(ParquetWriteSupport.SPARK_ROW_SCHEMA, dataSchema.json)
