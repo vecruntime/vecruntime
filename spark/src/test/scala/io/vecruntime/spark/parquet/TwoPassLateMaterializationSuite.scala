@@ -39,6 +39,8 @@ class TwoPassLateMaterializationSuite extends VectorQuerySuite {
       VectorConf.ScanNativeParquet -> "true",
       VectorConf.ScanNativeParquetLateMaterializationMinBytes -> "0",
       VectorConf.ScanNativeParquetLateMaterialization -> "true",
+      // Both passes compared with column-index page filtering on, as before #873 turned its default off.
+      "parquet.filter.columnindex.enabled" -> "true",
       "parquet.block.size" -> (256 * 1024).toString,
       "parquet.page.size" -> (4 * 1024).toString,
       "spark.sql.parquet.columnarReaderBatchSize" -> "1000"

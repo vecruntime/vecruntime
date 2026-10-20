@@ -17,6 +17,14 @@ version may change configuration keys or defaults, always noted here.
   Vector API. Nested types and Iceberg writes are #842. See `docs/parquet-writer.md`.
 - JMH `ParquetWriteBenchmark` and `DeltaEncodeBenchmark`.
 
+### Changed
+
+- The native Parquet scan no longer filters pages by the column index by default (#873):
+  `parquet.filter.columnindex.enabled` now defaults to `false` in `VectorParquetScanExec`. On the classic S3A
+  stream every selected page was a separate request; at 1 TB TPC-DS (x86, 9 x m5.4xlarge) q75, q95, q85, q80
+  and q44 took 100.2 s with it on and 73.2 s off (75.4 s before #748 turned it on). Set the key to `true` to turn it
+  back on. Range merging (#834) is what would make it pay.
+
 ## 0.0.9 -- 2026-10-19
 
 Iceberg tables are read by the native Parquet reader over Iceberg's own planning, with position deletes,

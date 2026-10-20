@@ -125,7 +125,9 @@ final class PartitionedIpcWriter(
      * cluster CDC MERGE the first version lost on cold executors (#487, #488), which the kernel
      * warm-up and 64K-row chunks address.
      */
-    scatterFlush: Boolean = false
+    scatterFlush: Boolean = false,
+    /** The zstd level of the partition streams' frames when `compression` is zstd (#840). */
+    zstdLevel: Int = ShuffleCompression.DefaultZstdLevel
 ) extends AutoCloseable {
 
   private val arrowSchema: Schema = PartitionedIpcFile.arrowSchema(schema)
@@ -1347,7 +1349,8 @@ final class PartitionedIpcWriter(
     org.apache.arrow.vector.compression.NoCompressionCodec.INSTANCE
 
   /** The writer's one compression context and its output scratch, reused for every frame of every partition. */
-  private val frameCompressor: ShuffleCompression.FrameCompressor = ShuffleCompression.frameCompressor(compression)
+  private val frameCompressor: ShuffleCompression.FrameCompressor =
+    ShuffleCompression.frameCompressor(compression, zstdLevel)
   private def compressFrame(raw: Array[Byte]): Array[Byte] = frameCompressor.compress(raw)
 
   /**
