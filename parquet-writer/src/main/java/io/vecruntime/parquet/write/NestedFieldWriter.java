@@ -57,6 +57,7 @@ final class NestedFieldWriter {
     private static final class Leaf {
         final ColumnDescriptor column;
         ColumnEncoder encoder;
+        VecType lane;
         ColumnWriter writer;
 
         Leaf(ColumnDescriptor column) {
@@ -134,8 +135,10 @@ final class NestedFieldWriter {
         }
         if (t.isPrimitive()) {
             Leaf l = leaves.get(t);
-            if (l.encoder == null) {
+            if (l.encoder == null || l.lane != v.type()) {
+                // Bound per lane type: a batch from another source may carry the same leaf in another lane.
                 l.encoder = ColumnEncoder.forColumn(v.type(), l.column);
+                l.lane = v.type();
             }
             l.encoder.put(v, i, rep, def, l.writer);
             return;

@@ -58,6 +58,60 @@ public final class NestedColumns {
     private NestedColumns() {}
 
     /**
+     * The nested lane of {@code numRows} values of {@code cv} for the columnar
+     * writer (#842): a column of our native scan ({@link
+     * io.vecruntime.spark.arrow.VectorNestedColumnVector}) is read in place --
+     * its null flags and offsets copied, its leaves adapted as flat columns,
+     * zero-copy over Arrow -- and any other column through {@link #adapt}. The
+     * leaves' lanes are the flat adapter's (a decimal of precision up to 18 is
+     * an INT64 lane), which the writer's encoders take; the sort and the
+     * expressions keep {@link #adapt}'s lanes.
+     */
+    public static VectorBuffers adaptForWrite(ColumnVector cv, DataType dt, int numRows,
+            Arena arena) {
+        boolean nested = dt instanceof StructType || dt instanceof ArrayType || dt instanceof MapType;
+        if (!nested) {
+            return ColumnVectorAdapters.adapt(cv, numRows, arena);
+        }
+        if (!(cv instanceof io.vecruntime.spark.arrow.VectorNestedColumnVector n)) {
+            return adapt(cv, dt, numRows, arena);
+        }
+        boolean[] nulls = n.nullFlags();
+        MemorySegment validity = null;
+        if (nulls != null) {
+            boolean any = false;
+            for (int i = 0;
+                 i < numRows && !any;
+                 i++) {
+                any = nulls[i];
+            }
+            if (any) {
+                validity = ArrowLayout.validityFrom(arena, Arrays.copyOf(nulls, numRows), numRows);
+            }
+        }
+        ColumnVector[] kids = n.childColumns();
+        if (dt instanceof StructType s) {
+            StructField[] fs = s.fields();
+            List<VectorBuffers> fields = new ArrayList<>(fs.length);
+            for (int f = 0; f < fs.length; f++) {
+                fields.add(adaptForWrite(kids[f], fs[f].dataType(), numRows, arena));
+            }
+            return NestedVectorBuffers.struct(numRows, validity, fields);
+        }
+        int[] off = n.offsetArray();
+        MemorySegment offsets = ArrowLayout.allocateOffsets(arena, numRows);
+        MemorySegment.copy(off, 0, offsets, VectorBuffers.LE_INT, 0,
+                numRows + 1);
+        int childRows = off[numRows];
+        if (dt instanceof ArrayType a) {
+            return NestedVectorBuffers.list(numRows, validity, offsets, adaptForWrite(kids[0], a.elementType(), childRows, arena));
+        }
+        MapType m = (MapType) dt;
+        return NestedVectorBuffers.map(numRows, validity, offsets, adaptForWrite(kids[0], m.keyType(), childRows, arena),
+                adaptForWrite(kids[1], m.valueType(), childRows, arena));
+    }
+
+    /**
      * The nested lane of {@code numRows} values of {@code cv}, of type {@code
      * dt}.
      */

@@ -755,32 +755,33 @@ private[vecruntime] object VectorWriteTask2 {
   /** The data columns of `batch` as `VectorBuffers` (at `ordinals`), compacted to its selection; and their rows. */
   def columns(batch: ColumnarBatch, ordinals: Array[Int], arena: Arena): (Array[VectorBuffers], Int) = {
     val rows = batch.numRows()
-    // A struct, array or map column (#842) as its nested lane, built from Spark's getters.
+    val selection = batch match {
+      case s: SelectedColumnarBatch if s.selectedCount() < rows => Some(s)
+      case _ => None
+    }
+    // A struct, array or map column (#842) as its nested lane: read in place from our scan; built from Spark's
+    // getters (plain strings, which the gather below takes) when the batch has a selection to apply.
     def adapt(o: Int): VectorBuffers = {
       val cv = batch.column(o)
       cv.dataType() match {
+        case dt @ (_: StructType | _: ArrayType | _: MapType) if selection.isEmpty =>
+          io.vecruntime.spark.adapter.NestedColumns.adaptForWrite(cv, dt, rows, arena)
         case dt @ (_: StructType | _: ArrayType | _: MapType) =>
           io.vecruntime.spark.adapter.NestedColumns.adapt(cv, dt, rows, arena)
         case _ => ColumnVectorAdapters.adapt(cv, rows, arena)
       }
     }
     val columns = ordinals.map(adapt)
-    batch match {
-      case s: SelectedColumnarBatch if s.selectedCount() < rows =>
-        lazy val selected: Array[Int] = {
-          val out = new Array[Int](s.selectedCount())
-          var i = 0
-          var k = 0
-          while (i < rows) { if (io.vecruntime.kernels.Bitmap.isSet(s.selection(), i)) { out(k) = i; k += 1 }; i += 1 }
-          out
-        }
+    selection match {
+      case Some(s) =>
+        lazy val selected = selectedRows(s.selection(), rows, s.selectedCount())
         val compacted = columns.map { c =>
           if (c.`type`().isNested())
             io.vecruntime.spark.expr.ElementAccessExpr.gather(c, selected, s.selectedCount(), arena)
           else compact(c, s.selection(), s.selectedCount(), arena)
         }
         (compacted, s.selectedCount())
-      case _ => (columns, rows)
+      case None => (columns, rows)
     }
   }
 
