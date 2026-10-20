@@ -74,6 +74,33 @@ class VectorPlugin extends SparkPlugin {
     override def init(ctx: PluginContext, extraConf: java.util.Map[String, String]): Unit = {
       VectorPlugin.requireVectorApi()
       io.vecruntime.spark.comet.CometVectorAdapter.tryRegister()
+      // #868: the executor's Arrow budget, and its use as executor metrics (current and peak bytes) for sizing it.
+      io.vecruntime.spark.arrow.VectorAllocators.setLimit(VectorConf.arrowMaxBytes(ctx.conf()))
+      ctx.metricRegistry().register(
+        "arrowAllocatedBytes",
+        new com.codahale.metrics.Gauge[Long] {
+          override def getValue: Long = io.vecruntime.spark.arrow.VectorAllocators.allocatedBytes()
+        }
+      )
+      ctx.metricRegistry().register(
+        "arrowPeakBytes",
+        new com.codahale.metrics.Gauge[Long] {
+          override def getValue: Long = io.vecruntime.spark.arrow.VectorAllocators.peakBytes()
+        }
+      )
+      // #875: the execution memory pinned by consumers that do not spill on request (join builds, aggregates).
+      ctx.metricRegistry().register(
+        "pinnedUnspillableBytes",
+        new com.codahale.metrics.Gauge[Long] {
+          override def getValue: Long = org.apache.spark.sql.vecruntime.PinnedMemory.bytes
+        }
+      )
+      ctx.metricRegistry().register(
+        "pinnedUnspillablePeakBytes",
+        new com.codahale.metrics.Gauge[Long] {
+          override def getValue: Long = org.apache.spark.sql.vecruntime.PinnedMemory.peakBytes
+        }
+      )
       // Starts the Flight shuffle server on this executor when the shuffle module is present, its
       // manager configured and the backend is Flight (#288).
       org.apache.spark.sql.vecruntime.VectorShuffle.executorInit(ctx)

@@ -67,13 +67,20 @@ object GraceHashJoin extends Logging {
       spec: JoinSpec,
       metrics: VectorMetrics,
       budgetBytes: Long,
-      buckets: Int
+      buckets: Int,
+      /** #879: the pool of the build's memory, resolved at plan time. */
+      memoryMode: org.apache.spark.memory.MemoryMode = VectorSortIterator.memoryMode()
   ): Iterator[ColumnarBatch] = {
     val keyTypes: Array[DataType] = spec.buildKeys.map(_.dataType)
     // A build column without a lane (an array or struct payload, #705) is held in a row store, which only the
-    // in-memory table has: the build side stays in memory, as for a key type the bucket hash cannot read.
-    if (!spec.buildTypes.forall(TypeMapping.hasLane))
-      return new VectorHashJoinIterator(streamIter, BuildTable.fromBatches(buildIter, spec), spec, metrics)
+    // in-memory table has: the build side stays in memory, as for a key type the bucket hash cannot read. #878: its
+    // lane columns' bytes are held in the pool while it is probed (the row store is on the heap), so the task's
+    // other consumers can be made to spill around it.
+    if (!spec.buildTypes.forall(TypeMapping.hasLane)) {
+      val table = BuildTable.fromBatches(buildIter, spec)
+      new BuildMemory(memoryMode).hold(table.nativeBytes)
+      return new VectorHashJoinIterator(streamIter, table, spec, metrics)
+    }
     // A key type the bucket hash has no lane for (float, binary...): the build side stays in memory.
     val canSpill =
       budgetBytes > 0 && budgetBytes < Long.MaxValue && buckets >= 2 && AggregateSpill.supportsKeys(keyTypes.toSeq)
@@ -83,7 +90,7 @@ object GraceHashJoin extends Logging {
     // #868: the build side's bytes come from Spark's execution memory (the sort's pool: off-heap when Spark
     // has one). Held before every append; a refusal starts the bucketing as the budget does. A build side
     // that cannot bucket is still counted, so the pool can make the task's other consumers spill.
-    val memory = new BuildMemory
+    val memory = new BuildMemory(memoryMode)
     var total = 0
     // The batch that would have grown the builders past the budget: not appended, bucketed first below.
     var overflowBatch: ColumnarBatch = null
@@ -254,10 +261,30 @@ object GraceHashJoin extends Logging {
  * consumer's request (a built table cannot give back part of itself); everything is returned when the task
  * ends. Without a task (a driver-side call, a unit test) it holds nothing and always grants.
  */
-private[vecruntime] final class BuildMemory {
+/**
+ * #875: the execution memory this executor's tasks hold through consumers that never spill on another consumer's
+ * request -- the hash join's builds and heap mirrors ([[BuildMemory]]) and the hash aggregates' tables -- current and
+ * peak, published as the executor metrics `pinnedUnspillableBytes` and `pinnedUnspillablePeakBytes`. When it nears
+ * the pool, the sort (the one consumer that yields) is the one squeezed.
+ */
+object PinnedMemory {
+  private val current = new java.util.concurrent.atomic.AtomicLong()
+  private val peak = new java.util.concurrent.atomic.AtomicLong()
+
+  def add(delta: Long): Unit = if (delta != 0) {
+    val now = current.addAndGet(delta)
+    if (delta > 0) peak.accumulateAndGet(now, (a, b) => math.max(a, b))
+  }
+  def bytes: Long = current.get()
+  def peakBytes: Long = peak.get()
+}
+
+private[vecruntime] final class BuildMemory(
+    mode: org.apache.spark.memory.MemoryMode = VectorSortIterator.memoryMode()
+) {
   private val consumer: org.apache.spark.memory.MemoryConsumer =
     Option(org.apache.spark.TaskContext.get()).flatMap(tc => Option(tc.taskMemoryManager())).map { tmm =>
-      new org.apache.spark.memory.MemoryConsumer(tmm, tmm.pageSizeBytes(), VectorSortIterator.memoryMode()) {
+      new org.apache.spark.memory.MemoryConsumer(tmm, tmm.pageSizeBytes(), mode) {
         override def spill(size: Long, trigger: org.apache.spark.memory.MemoryConsumer): Long = 0L
       }
     }.orNull
@@ -269,13 +296,17 @@ private[vecruntime] final class BuildMemory {
 
   def hold(bytes: Long): Boolean = {
     if (consumer == null || bytes <= held) return true
-    held += consumer.acquireMemory(bytes - held)
+    val got = consumer.acquireMemory(bytes - held)
+    held += got
+    PinnedMemory.add(got)
     held >= bytes
   }
 
   def releaseTo(bytes: Long): Unit =
     if (consumer != null && held > bytes) {
-      consumer.freeMemory(held - math.max(0L, bytes))
+      val freed = held - math.max(0L, bytes)
+      consumer.freeMemory(freed)
+      PinnedMemory.add(-freed)
       held = math.max(0L, bytes)
     }
 
