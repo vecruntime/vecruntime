@@ -1,0 +1,29 @@
+# Copyright 2026-2027 Angel Conde and the vecruntime contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Bench-only layer (#840 direct memory): adds Arrow's malloc-backed allocation manager next to the Netty one
+# Spark ships, so `-Darrow.allocation.manager.type=Unsafe` moves Arrow buffers out of MaxDirectMemorySize.
+#
+#   kaniko --dockerfile=benchmarks/k8s/Dockerfile.arrow-unsafe --build-arg BASE=<registry>/spark:<tag>
+ARG BASE
+FROM ${BASE}
+ARG ARROW_VERSION=18.3.0
+# sha256 of arrow-memory-unsafe-18.3.0.jar (Maven Central; sha1 12cf6b2b0323899ef4f8909ed5411efbd82d6d9b)
+ARG AMU_SHA256=e9652f322d7be306c400ea0d775b3114a11b48d2afe23e8b8566f13c469d5483
+USER root
+RUN curl -fsSL -o /opt/spark/jars/arrow-memory-unsafe-${ARROW_VERSION}.jar \
+      "https://repo1.maven.org/maven2/org/apache/arrow/arrow-memory-unsafe/${ARROW_VERSION}/arrow-memory-unsafe-${ARROW_VERSION}.jar" \
+    && echo "${AMU_SHA256}  /opt/spark/jars/arrow-memory-unsafe-${ARROW_VERSION}.jar" | sha256sum -c - \
+    && chmod 644 /opt/spark/jars/arrow-memory-unsafe-${ARROW_VERSION}.jar
+USER spark
