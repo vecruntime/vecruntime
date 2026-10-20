@@ -36,8 +36,13 @@ index are written as parquet-java writes them; binary min/max compare unsigned.
 
 ## Layout
 
-- **`parquet-writer` module** (`io.vecruntime.parquet.write`), with no Spark dependency: it depends on
-  `kernels` and parquet-java (provided). `ColumnarParquetWriter` takes our `VectorBuffers` columns and
+- **`parquet` module** (`io.vecruntime.parquet.write`), with no Spark dependency: it depends on
+  `kernels` and parquet-java (provided). Since #900 the module also holds the page decoders the native scan
+  reads with (`io.vecruntime.parquet.codec`), and both sides take the `DELTA_BINARY_PACKED` and RLE / bit-packed
+  hybrid framing from one class (`ParquetFraming`); `CodecRoundTripTest` decodes the writer's output with the
+  reader's decoders, and `VectorWriteReadRoundTripSuite` reads the writer's files with our scan.
+  `ColumnarParquetWriter.footer()` returns the footer it wrote (statistics, encodings, sizes per column chunk),
+  which is what a table format such as Iceberg builds its file metrics from. `ColumnarParquetWriter` takes our `VectorBuffers` columns and
   writes a file through parquet-java's `ParquetFileWriter`, so the footer, the column and offset indexes
   and compression are parquet-java's own. INT32, INT64, DOUBLE and string columns are encoded by our chunk
   writers (`FixedWidthChunkWriter`, `BinaryChunkWriter`); the other types go to parquet-java's column

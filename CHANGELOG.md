@@ -16,8 +16,15 @@ version may change configuration keys or defaults, always noted here.
   `parquet-writer` module, tested against parquet-java's v2 writer; `DELTA_BINARY_PACKED` blocks use the
   Vector API. Nested types and Iceberg writes are #842. See `docs/parquet-writer.md`.
 - JMH `ParquetWriteBenchmark` and `DeltaEncodeBenchmark`.
+- `ColumnarParquetWriter.footer()`: the footer the writer wrote, after close (#900, #901).
 
 ### Changed
+
+- One Spark-free `parquet` module (`vecruntime-parquet_<spark line>`, #900) replaces `parquet-writer` and takes
+  the page decoders out of `kernels`: `io.vecruntime.kernels.parquet` is now `io.vecruntime.parquet.codec`, beside
+  the writer's `io.vecruntime.parquet.write`. The encoders and decoders share their `DELTA_BINARY_PACKED` and
+  RLE / bit-packed hybrid framing (`ParquetFraming`). The plugin jar shades `kernels` and `parquet`; code that
+  imported the decoders from `kernels` imports them from the new package.
 
 - The native Parquet scan no longer filters pages by the column index by default (#873):
   `parquet.filter.columnindex.enabled` now defaults to `false` in `VectorParquetScanExec`. On the classic S3A
