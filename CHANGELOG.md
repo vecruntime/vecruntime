@@ -13,6 +13,11 @@ version may change configuration keys or defaults, always noted here.
   stream every selected page was a separate request; at 1 TB TPC-DS (x86, 9 x m5.4xlarge) q75, q95, q85, q80
   and q44 took 100.2 s with it on and 73.2 s off (75.4 s before #748 turned it on). Set the key to `true` to turn it
   back on. Range merging (#834) is what would make it pay.
+- The benchmark image carries `arrow-memory-unsafe` (Spark's Arrow version, 18.3.0) and the Kubernetes manifests
+  run the executors with `-Darrow.allocation.manager.type=Unsafe` (#894; `ARROW_ALLOCATOR=` for Netty). Arrow's
+  buffers leave `-XX:MaxDirectMemorySize`, which then holds only the Flight transport's: TPC-DS 10 TB passed with a
+  6 GB direct cap at Netty's speed, where Arrow on Netty needed about 10 GB. Older images lack the jar: render
+  their runs with `ARROW_ALLOCATOR=`.
 
 ## 0.0.9 -- 2026-10-19
 

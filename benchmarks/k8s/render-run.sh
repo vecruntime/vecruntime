@@ -22,6 +22,10 @@
 #   ACCP (1; 0 = the JDK's own crypto: 1 puts Amazon Corretto Crypto Provider first for the S3 TLS cipher and
 #     SigV4 hashing, -Djava.security.properties=/opt/spark/accp/accp.security, #566; needs an image with it)
 #   DIRECT_MEM (EXEC_OVERHEAD minus 2g; the executors' -XX:MaxDirectMemorySize)
+#   ARROW_ALLOCATOR (Unsafe; Arrow's allocation manager on the executors, -Darrow.allocation.manager.type.
+#             Unsafe keeps Arrow's buffers out of direct memory, which then holds only the Flight/gRPC
+#             transport's Netty buffers: 6g was enough at 10 TB, where Netty for Arrow needed ~10g (#894).
+#             Empty = Arrow's default, Netty. Needs an image with arrow-memory-unsafe on the class path.)
 #   AOT_CACHE (0; 1 = the executors start from the image's AOT cache, trained on the cluster (#416):
 #             an init container fetches s3://<bucket>/aot/<image tag>/executor.aot (AOT_BUCKET, default
 #             the results bucket) to /aot and the JVM gets -XX:AOTCache=/aot/executor.aot. No object
@@ -147,7 +151,10 @@ done
 # the first in the YAML map (it did: the direct-memory bound never reached the executors before this).
 EXEC_OPTS="${SEEN[spark.executor.extraJavaOptions]:-}"
 ACCP_OPTS=""; [ "${ACCP:-1}" = 1 ] && ACCP_OPTS=" -Djava.security.properties=/opt/spark/accp/accp.security"
-EXEC_OPTS="${EXEC_OPTS:+$EXEC_OPTS }-XX:MaxDirectMemorySize=$DIRECT_MEM$ACCP_OPTS${EXEC_JAVA_OPTS:+ $EXEC_JAVA_OPTS}"
+# Arrow's allocation manager on the executors (#894): Unsafe = plain malloc, outside -XX:MaxDirectMemorySize and
+# bounded by our root allocator's cap (#883); empty = Arrow's default, Netty's pooled direct memory.
+ARROW_OPTS=""; [ -n "${ARROW_ALLOCATOR-Unsafe}" ] && ARROW_OPTS=" -Darrow.allocation.manager.type=${ARROW_ALLOCATOR-Unsafe}"
+EXEC_OPTS="${EXEC_OPTS:+$EXEC_OPTS }-XX:MaxDirectMemorySize=$DIRECT_MEM$ACCP_OPTS${ARROW_OPTS}${EXEC_JAVA_OPTS:+ $EXEC_JAVA_OPTS}"
 # The executor's AOT cache (#416), trained on the cluster by real executors. A training run
 # (AOT_RECORD=1) records each executor's configuration to the node; a normal run fetches the assembled
 # cache for this image tag from S3 in an init container and points the JVM at it. A missing object,
