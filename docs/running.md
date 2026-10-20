@@ -116,6 +116,17 @@ cluster manifests use the overhead minus 2 GB), and size the overhead for the da
 input batch, its output batch, the shuffle writer's `bufferBytes` (64 MB per task) and, on a reducer,
 the fetched blocks of the partition it is merging.
 
+**Arrow off direct memory (#894).** With `arrow-memory-unsafe` on the class path (Spark ships only
+`arrow-memory-netty`; add the jar of Spark's Arrow version, 18.3.0 for Spark 4.1) and
+`-Darrow.allocation.manager.type=Unsafe` on the executors, Arrow's buffers are plain `malloc` memory
+instead of Netty's pooled direct memory. They no longer count against `-XX:MaxDirectMemorySize`; the
+executor-wide cap on our root allocator and its gauges (#883) bound them instead. Direct memory then holds
+only the Flight/gRPC transport's Netty buffers: at 10 TB (TPC-DS, 15-core executors) 6 GB was enough
+where Arrow on Netty needed about 10 GB, at the same speed, and 4 GB was not. The benchmark manifests
+(`benchmarks/k8s/render-run.sh`, `ARROW_ALLOCATOR`) select it by default and the image carries the jar.
+Arrow Java's FFM allocation manager ([apache/arrow-java#1334](https://github.com/apache/arrow-java/pull/1334))
+will replace it, with `-Darrow.allocation.manager.type=FFM`, once released.
+
 **On-heap: the tables.** The grouped aggregate's key table and accumulators, and a hash join's build
 table and its heap mirrors, are Java arrays on the heap. The aggregate registers with Spark's task
 memory manager and asks for its real footprint as its table grows (#367), so it lives inside the
@@ -139,7 +150,9 @@ their footprint by the same factor -- strict mode is the cheapest in memory as w
 
 The sort holds runs of `spark.vecruntime.sort.runRows` rows and spills them as Arrow IPC once their bytes
 pass `spark.vecruntime.sort.spillBytes` or what Spark's execution memory grants the task (default cap
-1 GiB, or `spark.memory.offHeap.size / spark.executor.cores` with off-heap memory enabled; #867, #868; the
+1 GiB; with off-heap memory enabled no cap: the grant is the ceiling and the task's fair share,
+`spark.memory.offHeap.size / spark.executor.cores`, plus half the pool's free bytes is where runs start to
+spill; #867, #868, #877; the
 runs are merged on the way out), and the shuffled hash join spills its build side into buckets past
 `spark.vecruntime.join.spillBytes` (default 256 MB, the grace join) or when the pool refuses it. The window
 does not spill yet (#872): a whole-partition frame (`OVER (PARTITION BY ...)` without `ORDER BY`) holds every
