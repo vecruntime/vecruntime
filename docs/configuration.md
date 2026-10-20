@@ -193,6 +193,8 @@ These matter only with Comet's jar on the classpath; see `docs/comet.md`.
   defaults to the heap size: set it to the executor's memory overhead less what the JVM itself needs
   (the 1 TB campaign ran a 30 GB heap and 20 GB of overhead per 13-core executor, the cluster
   manifests setting the bound to the overhead less 2 GB; see [Memory tuning](running.html#memory-tuning)).
+  With `arrow-memory-unsafe` on the class path and `-Darrow.allocation.manager.type=Unsafe`, Arrow's
+  buffers leave direct memory and only the Flight transport's stay in it (#894; same section).
 - **Registering the plugin.** `spark.plugins=io.vecruntime.spark.VectorPlugin` registers the
   session extension and attaches the UI tab; alternatively
   `spark.sql.extensions=io.vecruntime.spark.VectorSparkSessionExtensions` injects the planner
