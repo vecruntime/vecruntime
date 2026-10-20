@@ -118,7 +118,9 @@ class ColumnBuilderTest {
                 // The view is the whole column, in memory the builder owns: readable until close.
                 valueAt(out, rows - 1);
                 b.close();
-                assertThrows(IllegalStateException.class, () -> valueAt(out, 0), "closed with the builder");
+                // #840: the buffers are freed (NativeArena -- no shared-arena handshake), so the view is
+                // no longer checked after close; a second close is a no-op.
+                b.close();
                 // A no-op for a builder over a caller's arena.
                 ColumnBuilder shared = new ColumnBuilder(arena, type, 16);
                 shared.append(randomColumn(arena, type, 100, rnd, true));
