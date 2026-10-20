@@ -134,7 +134,8 @@ case class VectorWriteFilesExec(
           sortMetric("sortTime")
         ),
         VectorConf.sortRunRows(conf),
-        VectorConf.sortSpillBytes(conf, sparkContext.getConf)
+        VectorConf.sortSpillBytes(conf, sparkContext.getConf),
+        VectorSortIterator.memoryMode(sparkContext.getConf) // #879: the runs' pool, resolved at plan time
       )
     }
     val committer = writeFilesSpec.committer
@@ -432,7 +433,8 @@ private[vecruntime] final case class VectorConcurrentWriters(
     outputAttrs: Array[(String, DataType)],
     metrics: VectorMetrics,
     runRows: Int,
-    spillBytes: Long
+    spillBytes: Long,
+    memoryMode: org.apache.spark.memory.MemoryMode
 )
 
 /** A data writer fed batches: `ordinals` are the data columns' positions in the batch. */
@@ -656,7 +658,8 @@ private[vecruntime] class VectorDynamicPartitionDataWriter(
       c.outputAttrs,
       c.metrics,
       runRows = c.runRows,
-      spillBytes = c.spillBytes
+      spillBytes = c.spillBytes,
+      memoryMode = c.memoryMode
     )
   }
 
