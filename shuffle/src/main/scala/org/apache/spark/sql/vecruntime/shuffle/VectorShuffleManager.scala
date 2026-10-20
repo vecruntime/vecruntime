@@ -259,7 +259,9 @@ final class VectorShuffleWriter(
       // local reader prepend it; Spark's block transfer delivers a block's bytes alone, so it keeps the
       // per-block dictionaries.
       fileDictionary = VectorShuffleBackend.backendName(conf).equalsIgnoreCase("flight"),
-      scatterFlush = conf.getBoolean(VectorShuffleWriter.ScatterFlushKey, false)
+      scatterFlush = conf.getBoolean(VectorShuffleWriter.ScatterFlushKey, false),
+      zstdLevel =
+        conf.getInt(VectorShuffleWriter.ZstdLevelKey, io.vecruntime.shuffle.ShuffleCompression.DefaultZstdLevel)
     )
   }
   private var lengths: Array[Long] = _
@@ -437,6 +439,12 @@ object VectorShuffleWriter {
    * shuffle's record batches.
    */
   val CompressionKey = "spark.vecruntime.shuffle.compression"
+
+  /**
+   * The zstd level of the shuffle's frames (default 3; zstd accepts 1 to 22 and negative "fast" levels). Read by
+   * the writer only: a frame decompresses the same at any level, so readers need no setting (#840).
+   */
+  val ZstdLevelKey = "spark.vecruntime.shuffle.zstdLevel"
   def compression(conf: SparkConf): Option[org.apache.arrow.vector.compression.CompressionUtil.CodecType] =
     conf.get(CompressionKey, "zstd").trim.toLowerCase match {
       case "lz4" => Some(org.apache.arrow.vector.compression.CompressionUtil.CodecType.LZ4_FRAME)

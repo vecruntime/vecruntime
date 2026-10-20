@@ -154,7 +154,8 @@ class PartitionedIpcSuite extends AnyFunSuite with BeforeAndAfterAll {
       compression: Option[org.apache.arrow.vector.compression.CompressionUtil.CodecType] =
         Some(org.apache.arrow.vector.compression.CompressionUtil.CodecType.ZSTD),
       scatterFlush: Boolean = true,
-      keep: Option[java.nio.file.Path] = None
+      keep: Option[java.nio.file.Path] = None,
+      zstdLevel: Int = ShuffleCompression.DefaultZstdLevel
   ): Long = {
     val dir = Files.createTempDirectory("svipc")
     val path = dir.resolve("map.ipc")
@@ -169,7 +170,8 @@ class PartitionedIpcSuite extends AnyFunSuite with BeforeAndAfterAll {
       batchRows,
       1L << 20,
       bufferBytes,
-      scatterFlush = scatterFlush
+      scatterFlush = scatterFlush,
+      zstdLevel = zstdLevel
     )
     try {
       batches.foreach { case (n, dictStrings) =>
@@ -341,6 +343,14 @@ class PartitionedIpcSuite extends AnyFunSuite with BeforeAndAfterAll {
 
   test("every lane type round-trips per partition, in order, dictionary strings staying encoded") {
     roundTrip(numPartitions = 5, batches = Seq((300, true), (200, true), (0, true), (257, true)), flushBytes = 1L << 20)
+  }
+
+  test("#840: the shuffle's zstd level is the writer's alone -- every level round-trips, a higher one writes less") {
+    val batches = Seq.fill(4)((8192, false))
+    val bytes = Seq(-5, 1, 3, 9).map { level =>
+      level -> roundTrip(numPartitions = 20, batches = batches, flushBytes = 1L << 20, zstdLevel = level)
+    }.toMap
+    assert(bytes(9) <= bytes(-5), s"level 9 wrote ${bytes(9)} bytes, level -5 ${bytes(-5)}")
   }
 
   test("#20: the staged flush's scatter writes the gather's bytes, every lane type, nulls and both string forms") {

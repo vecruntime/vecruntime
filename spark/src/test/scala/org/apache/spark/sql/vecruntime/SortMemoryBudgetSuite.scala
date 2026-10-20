@@ -33,6 +33,7 @@ import org.scalatest.funsuite.AnyFunSuite
  * `spillBytes` cap), a pool large enough keeps it in memory, another consumer of the task can make it spill its
  * sealed runs, and everything it held is returned at the end. The rows come out sorted and complete every time.
  */
+@io.vecruntime.spark.test.tags.SortWindow
 class SortMemoryBudgetSuite extends AnyFunSuite {
 
   private val Rows = 8 * 4096

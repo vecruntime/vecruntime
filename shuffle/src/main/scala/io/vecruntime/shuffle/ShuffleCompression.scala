@@ -54,7 +54,12 @@ object ShuffleCompression {
     }
   }
 
-  private val DefaultZstdLevel = 3
+  /**
+   * The zstd level of the shuffle's frames when `spark.vecruntime.shuffle.zstdLevel` is not set. At 10 TB the
+   * compression of q93's shuffle write at this level was 35% of the query's CPU (#840); lower levels (1, or
+   * negative "fast" levels) trade bytes on disk and the wire for that CPU.
+   */
+  val DefaultZstdLevel = 3
 
   /**
    * The partition stream's compression (#411): the writer compresses a partition's IPC messages as
@@ -67,9 +72,12 @@ object ShuffleCompression {
     def compress(raw: Array[Byte]): Array[Byte]
   }
 
-  def frameCompressor(codec: Option[CompressionUtil.CodecType]): FrameCompressor = codec match {
+  def frameCompressor(
+      codec: Option[CompressionUtil.CodecType],
+      zstdLevel: Int = DefaultZstdLevel
+  ): FrameCompressor = codec match {
     case Some(CompressionUtil.CodecType.ZSTD) => new FrameCompressor {
-        private val ctx = new com.github.luben.zstd.ZstdCompressCtx().setLevel(DefaultZstdLevel)
+        private val ctx = new com.github.luben.zstd.ZstdCompressCtx().setLevel(zstdLevel)
         private var scratch = new Array[Byte](1 << 16)
         override def compress(raw: Array[Byte]): Array[Byte] = {
           val bound = Zstd.compressBound(raw.length).toInt
