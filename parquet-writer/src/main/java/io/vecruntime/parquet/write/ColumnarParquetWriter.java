@@ -127,6 +127,14 @@ public final class ColumnarParquetWriter implements AutoCloseable {
         newRowGroup();
     }
 
+    /**
+     * Where the row group's Bloom filter for {@code column} goes, or {@code
+     * null} when it has none (#842).
+     */
+    private org.apache.parquet.column.values.bloomfilter.BloomFilterWriter blooms(ColumnDescriptor column) {
+        return props.isBloomFilterEnabled(column) ? pageStore.getBloomFilterWriter(column) : null;
+    }
+
     private void newRowGroup() {
         pageStore = new ColumnChunkPageWriteStore(compressor, schema, new HeapByteBufferAllocator(), props.getColumnIndexTruncateLength(),
                 props.getPageWriteChecksumEnabled());
@@ -137,7 +145,7 @@ public final class ColumnarParquetWriter implements AutoCloseable {
         if (fast != null) {
             for (int i = 0; i < fast.length; i++) {
                 if (fast[i] != null) {
-                    fast[i].startChunk(pageStore.getPageWriter(columns.get(i)));
+                    fast[i].startChunk(pageStore.getPageWriter(columns.get(i)), blooms(columns.get(i)));
                 }
             }
         }
@@ -173,13 +181,13 @@ public final class ColumnarParquetWriter implements AutoCloseable {
                 FixedWidthChunkWriter.Kind kind = FixedWidthChunkWriter.kindFor(lane, columns.get(i));
                 if (kind != null) {
                     fast[i] = new FixedWidthChunkWriter(kind, columns.get(i), props);
-                    fast[i].startChunk(pageStore.getPageWriter(columns.get(i)));
+                    fast[i].startChunk(pageStore.getPageWriter(columns.get(i)), blooms(columns.get(i)));
                 } else if (lane == VecType.UTF8 && columns.get(i).getMaxRepetitionLevel() == 0 && columns.get(i)
                         .getPrimitiveType()
                         .getPrimitiveTypeName()
                         == org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.BINARY) {
                     fast[i] = new BinaryChunkWriter(columns.get(i), props);
-                    fast[i].startChunk(pageStore.getPageWriter(columns.get(i)));
+                    fast[i].startChunk(pageStore.getPageWriter(columns.get(i)), blooms(columns.get(i)));
                 } else {
                     encoders[i] = ColumnEncoder.forColumn(lane, columns.get(i));
                 }

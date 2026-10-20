@@ -460,6 +460,32 @@ class VectorWriteSuite extends VectorQuerySuite {
     assert(!theirs("s") && theirs("k"), theirs)
   }
 
+  test("Bloom filters (parquet.bloom.filter.*#<column>): the same filter per chunk as Spark's writer") {
+    val opts = Map(
+      "parquet.bloom.filter.enabled#l" -> "true",
+      "parquet.bloom.filter.expected.ndv#l" -> "5000",
+      "parquet.bloom.filter.enabled#i" -> "true"
+    )
+    val (plan, ours) = compareWrites("bloom", s => s.table("t").select("i", "s", "l"), opts)
+    assert(hasVectorWrite(plan), s"${plan.treeString}\n${fallbackReasons(plan)}")
+    def filters(dir: String): Seq[(String, org.apache.parquet.column.values.bloomfilter.BloomFilter)] =
+      parquetFiles(dir).sortBy(_.getName).flatMap { p =>
+        val r = org.apache.parquet.hadoop.ParquetFileReader
+          .open(org.apache.parquet.hadoop.util.HadoopInputFile.fromPath(p, spark.sparkContext.hadoopConfiguration))
+        try r.getFooter.getBlocks.asScala.flatMap { b =>
+            val bf = r.getBloomFilterDataReader(b)
+            b.getColumns.asScala.map(c => c.getPath.toDotString -> bf.readBloomFilter(c))
+          }.toSeq
+        finally r.close()
+      }
+    val a = filters(newTempPath("write/bloom-ours"))
+    val b = filters(newTempPath("write/bloom-spark"))
+    assert(a.map(_._1) === b.map(_._1))
+    a.zip(b).foreach { case ((c, x), (_, y)) => assert(x === y, c) }
+    assert(a.exists { case (c, f) => c == "l" && f != null } && a.forall { case (c, f) => c != "s" || f == null })
+    assert(ours.nonEmpty)
+  }
+
   test("field ids (spark.sql.parquet.fieldId.write.enabled): the same Parquet schema, ids included, as Spark's") {
     def id(n: Int) = new org.apache.spark.sql.types.MetadataBuilder().putLong("parquet.field.id", n).build()
     withConf("spark.sql.parquet.fieldId.write.enabled" -> "true") {

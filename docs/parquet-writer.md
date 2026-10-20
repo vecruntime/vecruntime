@@ -81,6 +81,14 @@ fallback list:
 | A date or timestamp with a rebase mode in write other than `CORRECTED` (Spark 4 default) | `... is not CORRECTED` |
 | A decimal under `spark.sql.parquet.writeLegacyFormat` | `... writeLegacyFormat is on` |
 
+**Bloom filters** (#842): `parquet.bloom.filter.enabled`, globally or `#<column>`, with `expected.ndv#`, `fpp#`,
+`max.bytes`, `adaptive.enabled` and `candidates.number#`, read as parquet-java reads them.
+- Each chunk's filter is sized as parquet-java's column writers size it, and the fast writers hash every non-null
+  value with the filter's own hash.
+- A chunk whose pages are all dictionary-encoded gets no filter, as with parquet-java.
+- `ColumnarParquetWriterTest` checks that every chunk's filter is the bitset parquet-java writes, and
+  `VectorWriteSuite` checks it against Spark's writer.
+
 **Nested columns** (#842) use Spark's standard layout: a struct is a group, an array the 3-level `LIST`, a map
 the `MAP` with `key_value`.
 - `NestedFieldWriter` walks each row's nested lane (Arrow's layout) and works out the Dremel repetition and

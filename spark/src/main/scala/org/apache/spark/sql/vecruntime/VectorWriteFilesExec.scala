@@ -171,7 +171,6 @@ object VectorWritePlanner {
 
   /** Hadoop / Parquet options the prototype does not reproduce: the write keeps Spark's writer. */
   private val UnsupportedOptions = Seq(
-    "parquet.bloom.filter.enabled",
     "parquet.crypto.factory.class",
     "parquet.encryption.kms.client.class"
   )
@@ -190,10 +189,16 @@ object VectorWritePlanner {
       val hadoopConf = session.sessionState.newHadoopConfWithOptions(w.options)
       def option(k: String): Option[String] = w.options.get(k).orElse(Option(hadoopConf.get(k)))
       val options = UnsupportedOptions.find(k => option(k).exists(v => v != "false"))
+      // The per-column options the writer reads (#842); any other `parquet.*#<column>` key keeps Spark's writer.
+      val readPerColumn = Seq(
+        ParquetOutputFormat.ENABLE_DICTIONARY,
+        ParquetOutputFormat.BLOOM_FILTER_ENABLED,
+        ParquetOutputFormat.BLOOM_FILTER_EXPECTED_NDV,
+        ParquetOutputFormat.BLOOM_FILTER_FPP,
+        ParquetOutputFormat.BLOOM_FILTER_CANDIDATES_NUMBER
+      ).map(_ + "#")
       lazy val perColumn = (hadoopConf.iterator().asScala.map(_.getKey) ++ w.options.keys)
-        .find(k =>
-          k.startsWith("parquet.") && k.contains("#") && !k.startsWith(ParquetOutputFormat.ENABLE_DICTIONARY + "#")
-        )
+        .find(k => k.startsWith("parquet.") && k.contains("#") && !readPerColumn.exists(k.startsWith))
       // The columnar writer writes Parquet v2 only (data page v2, the v2 encodings); a write that asks for v1 by
       // name keeps Spark's writer.
       val v1 =
@@ -882,6 +887,25 @@ private[vecruntime] class VectorParquetOutputWriter(val filePath: String, dataSc
     val dictionaryPrefix = ParquetOutputFormat.ENABLE_DICTIONARY + "#"
     conf.iterator().asScala.map(e => e.getKey -> e.getValue).filter(_._1.startsWith(dictionaryPrefix)).foreach {
       case (k, v) => builder.withDictionaryEncoding(k.substring(dictionaryPrefix.length), v.trim.toBoolean)
+    }
+    // Bloom filters (#842), global and per column, as ParquetOutputFormat reads them.
+    builder
+      .withBloomFilterEnabled(ParquetOutputFormat.getBloomFilterEnabled(conf))
+      .withMaxBloomFilterBytes(ParquetOutputFormat.getBloomFilterMaxBytes(conf))
+      .withAdaptiveBloomFilterEnabled(ParquetOutputFormat.getAdaptiveBloomFilterEnabled(conf))
+    conf.iterator().asScala.map(e => e.getKey -> e.getValue.trim).foreach {
+      case (k, v) if k.startsWith(ParquetOutputFormat.BLOOM_FILTER_ENABLED + "#") =>
+        builder.withBloomFilterEnabled(k.substring(ParquetOutputFormat.BLOOM_FILTER_ENABLED.length + 1), v.toBoolean)
+      case (k, v) if k.startsWith(ParquetOutputFormat.BLOOM_FILTER_EXPECTED_NDV + "#") =>
+        builder.withBloomFilterNDV(k.substring(ParquetOutputFormat.BLOOM_FILTER_EXPECTED_NDV.length + 1), v.toLong)
+      case (k, v) if k.startsWith(ParquetOutputFormat.BLOOM_FILTER_FPP + "#") =>
+        builder.withBloomFilterFPP(k.substring(ParquetOutputFormat.BLOOM_FILTER_FPP.length + 1), v.toDouble)
+      case (k, v) if k.startsWith(ParquetOutputFormat.BLOOM_FILTER_CANDIDATES_NUMBER + "#") =>
+        builder.withBloomFilterCandidatesNumber(
+          k.substring(ParquetOutputFormat.BLOOM_FILTER_CANDIDATES_NUMBER.length + 1),
+          v.toInt
+        )
+      case _ =>
     }
     val props = builder.build()
     val footer = Map(

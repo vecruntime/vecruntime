@@ -25,8 +25,12 @@ import org.apache.parquet.column.page.PageWriter;
  */
 interface ChunkWriter {
 
-    /** Starts a column chunk (a row group) on {@code pages}. */
-    void startChunk(PageWriter pages);
+    /**
+     * Starts a column chunk (a row group) on {@code pages}; {@code blooms}
+     * receives the chunk's Bloom filter at its end, {@code null} when the
+     * column has none.
+     */
+    void startChunk(PageWriter pages, org.apache.parquet.column.values.bloomfilter.BloomFilterWriter blooms);
 
     /** Appends rows {@code [from, to)} of {@code v}. */
     void write(VectorBuffers v, int from, int to) throws IOException;

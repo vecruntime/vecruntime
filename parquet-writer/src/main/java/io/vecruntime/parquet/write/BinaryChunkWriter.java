@@ -63,6 +63,10 @@ final class BinaryChunkWriter implements ChunkWriter {
     private final boolean dictionaryEnabled;
 
     private PageWriter pages;
+    private final ParquetProperties props;
+    // The chunk's Bloom filter and where it goes at the end of the chunk; null when the column has none.
+    private org.apache.parquet.column.values.bloomfilter.BloomFilterWriter bloomWriter;
+    private org.apache.parquet.column.values.bloomfilter.BloomFilter bloom;
 
     // The page being built.
     private long[] pageValidity = new long[64];
@@ -102,6 +106,7 @@ final class BinaryChunkWriter implements ChunkWriter {
 
     BinaryChunkWriter(ColumnDescriptor column, ParquetProperties props) {
         this.column = column;
+        this.props = props;
         this.optional = column.getMaxDefinitionLevel() > 0;
         this.pageSize = props.getPageSizeThreshold();
         this.pageRowLimit = props.getPageRowCountLimit();
@@ -110,7 +115,9 @@ final class BinaryChunkWriter implements ChunkWriter {
     }
 
     @Override
-    public void startChunk(PageWriter pageWriter) {
+    public void startChunk(PageWriter pageWriter, org.apache.parquet.column.values.bloomfilter.BloomFilterWriter blooms) {
+        this.bloomWriter = blooms;
+        this.bloom = blooms == null ? null : ChunkBloom.newFilter(column, props);
         this.pages = pageWriter;
         pageRows = 0;
         pageValues = 0;
@@ -156,6 +163,10 @@ final class BinaryChunkWriter implements ChunkWriter {
             int start = offsets.get(LE_INT, (long) src << 2);
             int len = offsets.get(LE_INT, (long) (src + 1) << 2) - start;
             pageDataBytes += len;
+            if (bloom != null) {
+                bloom.insertHash(bloom.hash(org.apache.parquet.io.api.Binary.fromConstantByteBuffer(data.asSlice(start, len)
+                        .asByteBuffer())));
+            }
             if (dictionary) {
                 int id;
                 if (inIds != null) {
@@ -448,6 +459,9 @@ final class BinaryChunkWriter implements ChunkWriter {
     @Override
     public void endChunk() throws IOException {
         flushPage();
+        if (bloom != null) {
+            bloomWriter.writeBloomFilter(bloom);
+        }
         if (dictionaryPagesWritten > 0) {
             ByteSink d = new ByteSink((int) dictionaryByteSize);
             MemorySegment entries = entryBytes.segment();
