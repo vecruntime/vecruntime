@@ -349,6 +349,23 @@ class SortMemoryBudgetSuite extends AnyFunSuite {
     assert(io.vecruntime.spark.VectorConf.joinBuildAdmissionBytes(sql, offHeap) === (64L << 20), "the budget")
   }
 
+  test("#886: an aggregate's reservation survives a reset, and a refusal under the floor is not acted on") {
+    withPool(1L << 20) { (_, _) =>
+      val m = new AggregateMemory(minRefusalBytes = 4L << 20)
+      assert(!m.overBudget(512L << 10, Long.MaxValue), "granted")
+      assert(m.held === (512L << 10))
+      assert(!m.overBudget(2L << 20, Long.MaxValue), "refused, but a 2 MiB table is under the floor: it goes on")
+      assert(m.overBudget(8L << 20, Long.MaxValue), "past the floor a refusal emits or spills the table")
+      val held = m.held
+      // A reset keeps the reservation: the next table regrows into it without asking the pool.
+      assert(!m.overBudget(held, Long.MaxValue))
+      assert(m.held === held)
+      assert(m.overBudget(2L << 20, 1L << 20), "the fixed threshold stays a hard cap")
+      m.release()
+      assert(m.held === 0L)
+    }
+  }
+
   test("#868: a pool too small for the build side makes the hash join bucket, within a large budget") {
     withPool(64L * 1024) { (_, _) =>
       val before = GraceHashJoin.bucketedJoins.get()

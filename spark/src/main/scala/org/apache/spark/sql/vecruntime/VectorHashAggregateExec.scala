@@ -409,6 +409,53 @@ private[vecruntime] class VectorUngroupedAggregateIterator(
 }
 
 /**
+ * A grouped aggregate's table in Spark's on-heap execution memory (#367): the estimate is acquired from the task's
+ * share of the pool as the table grows, and a refusal -- the executor's tasks share it fairly -- is what triggers
+ * the emit or the spill, with the configured threshold as a hard cap. Nothing is spilled on another consumer's
+ * request (#875 counts it as pinned).
+ *
+ * #886: returning the reservation on every reset let another task take it, and the regrowing table was refused
+ * again a few batches later -- q67 at 10 TB on a 20g heap emitted 19 billion groups early (50 million on 30g), which
+ * ran the shuffle's direct memory out. The reservation is now kept across a reset (a table that starts over regrows
+ * into memory it already holds) and returned by `release` at close, and a refusal for a table under
+ * `minRefusalBytes` is not acted on: so small a table goes on growing on the heap.
+ */
+private[vecruntime] final class AggregateMemory(minRefusalBytes: Long = AggregateMemory.DefaultMinRefusalBytes) {
+  private val consumer: org.apache.spark.memory.MemoryConsumer = Option(TaskContext.get()).map { tc =>
+    val tmm = tc.taskMemoryManager()
+    new org.apache.spark.memory.MemoryConsumer(tmm, tmm.pageSizeBytes(), org.apache.spark.memory.MemoryMode.ON_HEAP) {
+      override def spill(size: Long, trigger: org.apache.spark.memory.MemoryConsumer): Long = 0L
+    }
+  }.orNull
+  private var reserved = 0L
+
+  /** The bytes held in the pool. */
+  def held: Long = reserved
+
+  /** Whether a table of `estimate` bytes has outgrown `budget` (the hard cap) or what the pool grants. */
+  def overBudget(estimate: Long, budget: Long): Boolean = {
+    if (estimate > budget) return true
+    if (consumer != null && estimate > reserved) {
+      val got = consumer.acquireMemory(estimate - reserved)
+      reserved += got
+      PinnedMemory.add(got) // #875: never spilled on request
+      if (reserved < estimate && estimate >= minRefusalBytes) return true
+    }
+    false
+  }
+
+  /** Returns what is held to the pool: at close, not at a reset. */
+  def release(): Unit =
+    if (consumer != null && reserved > 0) {
+      consumer.freeMemory(reserved); PinnedMemory.add(-reserved); reserved = 0L
+    }
+}
+
+object AggregateMemory {
+  val DefaultMinRefusalBytes: Long = 64L << 20
+}
+
+/**
  * Drains the partition into a group table, then emits the groups in batches. Past its memory budget
  * (#363) it either emits the table and starts over (buffer-emitting modes: the next stage merges)
  * or spills the table hash-partitioned and merges one bucket at a time (Final: [[AggregateSpill]]).
@@ -514,35 +561,13 @@ private[vecruntime] class VectorGroupedAggregateIterator(
     total
   }
 
-  // Spark's execution memory as the arbiter (#367): the estimate is acquired from the task's share of the
-  // pool as the table grows, and a refusal -- the executor's tasks share it fairly -- is what triggers the
-  // emit or the spill, with the configured threshold as a hard cap. Nothing is spilled on another
-  // consumer's request; the memory is returned on every reset and at close.
-  private val consumer: org.apache.spark.memory.MemoryConsumer = Option(TaskContext.get()).map { tc =>
-    val tmm = tc.taskMemoryManager()
-    new org.apache.spark.memory.MemoryConsumer(tmm, tmm.pageSizeBytes(), org.apache.spark.memory.MemoryMode.ON_HEAP) {
-      override def spill(size: Long, trigger: org.apache.spark.memory.MemoryConsumer): Long = 0L
-    }
-  }.orNull
-  private var reserved = 0L
+  // Spark's execution memory as the arbiter (#367, #886): see [[AggregateMemory]].
+  private val memory = new AggregateMemory()
 
   /** Whether the table has outgrown its budget: the cap, or what Spark's pool grants this task. */
-  private def overBudget(budget: Long): Boolean = {
-    val estimate = estimatedBytes
-    if (estimate > budget) return true
-    if (consumer != null && estimate > reserved) {
-      val got = consumer.acquireMemory(estimate - reserved)
-      reserved += got
-      PinnedMemory.add(got) // #875: never spilled on request
-      if (reserved < estimate) return true
-    }
-    false
-  }
+  private def overBudget(budget: Long): Boolean = memory.overBudget(estimatedBytes, budget)
 
-  private def releaseMemory(): Unit =
-    if (consumer != null && reserved > 0) {
-      consumer.freeMemory(reserved); PinnedMemory.add(-reserved); reserved = 0L
-    }
+  private def releaseMemory(): Unit = memory.release()
 
   Option(TaskContext.get()).foreach(_.addTaskCompletionListener[Unit](_ => close()))
 
@@ -622,7 +647,7 @@ private[vecruntime] class VectorGroupedAggregateIterator(
   }
 
   private def reset(): Unit = {
-    releaseMemory()
+    // #886: the reservation stays -- the next table regrows into it; close returns it.
     releaseDictionaries()
     table = new GroupKeyTable(keyExprs.map(_.vecType), dictionaryStrings)
     states = aggs.map(_.newGroupedState())
