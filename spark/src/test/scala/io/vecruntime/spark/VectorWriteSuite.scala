@@ -442,6 +442,24 @@ class VectorWriteSuite extends VectorQuerySuite {
     assert(hasVectorWrite(pp), s"${pp.treeString}\n${fallbackReasons(pp)}")
   }
 
+  test("field ids (spark.sql.parquet.fieldId.write.enabled): the same Parquet schema, ids included, as Spark's") {
+    def id(n: Int) = new org.apache.spark.sql.types.MetadataBuilder().putLong("parquet.field.id", n).build()
+    withConf("spark.sql.parquet.fieldId.write.enabled" -> "true") {
+      val (plan, footers) = compareWrites(
+        "field-ids",
+        s =>
+          s.table("t").select(
+            org.apache.spark.sql.functions.col("i").as("i", id(1)),
+            org.apache.spark.sql.functions.col("s").as("s", id(7)),
+            org.apache.spark.sql.functions.col("l")
+          )
+      )
+      assert(hasVectorWrite(plan), s"${plan.treeString}\n${fallbackReasons(plan)}")
+      val fields = footers.head.getFileMetaData.getSchema.getFields.asScala
+      assert(fields.map(f => Option(f.getId).map(_.intValue())) === Seq(Some(1), Some(7), None))
+    }
+  }
+
   test("writes the prototype does not take keep Spark's writer, with the reason") {
     def reasonsOf(f: String => Unit): Seq[String] = {
       lastWritePlan = null
