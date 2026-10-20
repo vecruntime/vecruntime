@@ -65,6 +65,7 @@ public final class ColumnarParquetWriter implements AutoCloseable {
     private final long rowGroupSize;
     private final Map<String, String> footer;
     private final List<ColumnDescriptor> columns;
+    private final NestedFieldWriter[] nested;
     private final ColumnEncoder[] encoders;
     private final VecType[] lanes;
     private final ChunkWriter[] fast;
@@ -102,10 +103,19 @@ public final class ColumnarParquetWriter implements AutoCloseable {
         this.compressor = compressor;
         this.rowGroupSize = rowGroupSize;
         this.footer = footer;
-        this.columns = schema.getColumns();
-        for (ColumnDescriptor c : columns) {
-            if (c.getMaxRepetitionLevel() != 0 || c.getPath().length != 1) {
-                throw new IllegalArgumentException("nested column not supported yet: " + String.join(".", c.getPath()));
+        // One entry per top-level field: a flat field's column, or, for a struct, array or map, its nested writer
+        // (always on the column-store path).
+        this.columns = new java.util.ArrayList<>(schema.getFieldCount());
+        this.nested = new NestedFieldWriter[schema.getFieldCount()];
+        for (int i = 0; i < schema.getFieldCount(); i++) {
+            org.apache.parquet.schema.Type f = schema.getType(i);
+            if (f.isPrimitive() && !f.isRepetition(org.apache.parquet.schema.Type.Repetition.REPEATED)) {
+                columns.add(schema.getColumnDescription(new String[] {f.getName()}));
+            } else if (f.isPrimitive()) {
+                throw new IllegalArgumentException("repeated primitive field not supported: " + f.getName());
+            } else {
+                columns.add(null);
+                nested[i] = new NestedFieldWriter(schema, f);
             }
         }
         this.encoders = new ColumnEncoder[columns.size()];
@@ -157,6 +167,9 @@ public final class ColumnarParquetWriter implements AutoCloseable {
             VecType lane = vectors.get(i).type();
             if (lanes[i] == null) {
                 lanes[i] = lane;
+                if (nested[i] != null) {
+                    continue;
+                }
                 FixedWidthChunkWriter.Kind kind = FixedWidthChunkWriter.kindFor(lane, columns.get(i));
                 if (kind != null) {
                     fast[i] = new FixedWidthChunkWriter(kind, columns.get(i), props);
@@ -196,6 +209,8 @@ public final class ColumnarParquetWriter implements AutoCloseable {
             for (int i = 0; i < encoders.length; i++) {
                 if (fast[i] != null) {
                     fast[i].write(vectors.get(i), from, to);
+                } else if (nested[i] != null) {
+                    nested[i].write(vectors.get(i), from, to, columnStore);
                 } else {
                     encoders[i].write(vectors.get(i), from, to, columnStore.getColumnWriter(columns.get(i)));
                 }

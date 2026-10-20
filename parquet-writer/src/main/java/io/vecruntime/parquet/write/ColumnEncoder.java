@@ -62,6 +62,14 @@ abstract class ColumnEncoder {
     abstract void write(VectorBuffers v, int from, int to,
                         ColumnWriter w);
 
+    /**
+     * Writes the non-null value at row {@code i} of {@code v} at repetition
+     * level {@code rep} and definition level {@code def}: a leaf of a nested
+     * column, whose levels {@link NestedFieldWriter} works out.
+     */
+    abstract void put(VectorBuffers v, int i, int rep,
+                      int def, ColumnWriter w);
+
     final boolean isNull(MemorySegment validity, int i) {
         return validity != null && !Bitmap.isSet(validity, i);
     }
@@ -138,6 +146,12 @@ abstract class ColumnEncoder {
         }
 
         @Override
+        void put(VectorBuffers v, int i, int rep,
+                 int def, ColumnWriter w) {
+            w.write(Bitmap.isSet(v.data(), i), rep, def);
+        }
+
+        @Override
         void write(VectorBuffers v, int from, int to,
                    ColumnWriter w) {
             MemorySegment validity = v.validity();
@@ -156,6 +170,13 @@ abstract class ColumnEncoder {
     private static final class Int32 extends ColumnEncoder {
         Int32(ColumnDescriptor c) {
             super(c);
+        }
+
+        @Override
+        void put(VectorBuffers v, int i, int rep,
+                 int def, ColumnWriter w) {
+            w.write(v.data().get(LE_INT, (long) i << 2), rep,
+                    def);
         }
 
         @Override
@@ -186,6 +207,14 @@ abstract class ColumnEncoder {
         }
 
         @Override
+        void put(VectorBuffers v, int i, int rep,
+                 int def, ColumnWriter w) {
+            long x = v.data().get(LE_LONG, (long) i << 3);
+            w.write(divisor == 1 ? x : Math.floorDiv(x, divisor), rep,
+                    def);
+        }
+
+        @Override
         void write(VectorBuffers v, int from, int to,
                    ColumnWriter w) {
             MemorySegment validity = v.validity();
@@ -212,6 +241,12 @@ abstract class ColumnEncoder {
         }
 
         @Override
+        void put(VectorBuffers v, int i, int rep,
+                 int def, ColumnWriter w) {
+            w.write((int) v.data().get(LE_LONG, (long) i << 3), rep, def);
+        }
+
+        @Override
         void write(VectorBuffers v, int from, int to,
                    ColumnWriter w) {
             MemorySegment validity = v.validity();
@@ -233,6 +268,23 @@ abstract class ColumnEncoder {
     private static final class Int96 extends ColumnEncoder {
         Int96(ColumnDescriptor c) {
             super(c);
+        }
+
+        @Override
+        void put(VectorBuffers v, int i, int rep,
+                 int def, ColumnWriter w) {
+            w.write(int96(v.data().get(LE_LONG, (long) i << 3)),
+                    rep, def);
+        }
+
+        private static Binary int96(long micros) {
+            long day = Math.floorDiv(micros, MICROS_PER_DAY);
+            long nanos = Math.floorMod(micros, MICROS_PER_DAY) * 1000L;
+            byte[] b = new byte[12];
+            MemorySegment s = MemorySegment.ofArray(b);
+            s.set(LE_LONG, 0, nanos);
+            s.set(LE_INT, 8, (int) (day + JULIAN_DAY_OF_EPOCH));
+            return Binary.fromConstantByteArray(b);
         }
 
         @Override
@@ -270,6 +322,17 @@ abstract class ColumnEncoder {
         }
 
         @Override
+        void put(VectorBuffers v, int i, int rep,
+                 int def, ColumnWriter w) {
+            double x = v.data().get(LE_DOUBLE, (long) i << 3);
+            if (narrow) {
+                w.write((float) x, rep, def);
+            } else {
+                w.write(x, rep, def);
+            }
+        }
+
+        @Override
         void write(VectorBuffers v, int from, int to,
                    ColumnWriter w) {
             MemorySegment validity = v.validity();
@@ -300,6 +363,18 @@ abstract class ColumnEncoder {
 
         Bytes(ColumnDescriptor c) {
             super(c);
+        }
+
+        @Override
+        void put(VectorBuffers v, int i, int rep,
+                 int def, ColumnWriter w) {
+            VectorBuffers dict = v.dictionary();
+            if (dict != null) {
+                w.write(entries(dict)[v.data().get(LE_INT, (long) i << 2)], rep, def);
+            } else {
+                w.write(Binary.fromConstantByteArray(bytes(v.offsets(), v.data(), i)),
+                        rep, def);
+            }
         }
 
         @Override
@@ -369,6 +444,17 @@ abstract class ColumnEncoder {
         }
 
         @Override
+        void put(VectorBuffers v, int i, int rep,
+                 int def, ColumnWriter w) {
+            long unscaled = v.data().get(LE_LONG, (long) i << 4);
+            if (int32) {
+                w.write((int) unscaled, rep, def);
+            } else {
+                w.write(unscaled, rep, def);
+            }
+        }
+
+        @Override
         void write(VectorBuffers v, int from, int to,
                    ColumnWriter w) {
             MemorySegment validity = v.validity();
@@ -398,6 +484,18 @@ abstract class ColumnEncoder {
         Decimal128Fixed(ColumnDescriptor c, int length) {
             super(c);
             this.length = length;
+        }
+
+        @Override
+        void put(VectorBuffers v, int i, int rep,
+                 int def, ColumnWriter w) {
+            MemorySegment data = v.data();
+            long base = (long) i << 4;
+            byte[] b = new byte[length];
+            for (int k = 0; k < length; k++) {
+                b[length - 1 - k] = data.get(ValueLayout.JAVA_BYTE, base + k);
+            }
+            w.write(Binary.fromConstantByteArray(b), rep, def);
         }
 
         @Override
