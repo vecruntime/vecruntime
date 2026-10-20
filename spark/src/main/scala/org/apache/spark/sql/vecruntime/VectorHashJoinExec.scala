@@ -353,8 +353,9 @@ case class VectorShuffledHashJoinExec(
     // Past the build budget the task splits both sides into buckets on disk (#416, GraceHashJoin).
     val budget = io.vecruntime.spark.VectorConf.joinSpillBytes(conf, sparkContext.getConf)
     val buckets = io.vecruntime.spark.VectorConf.joinSpillBuckets(conf)
+    val mode = VectorSortIterator.memoryMode(sparkContext.getConf) // #879: resolved at plan time
     buildPlan.executeColumnar().zipPartitions(streamedPlan.executeColumnar()) { (buildIter, streamIter) =>
-      GraceHashJoin.iterator(buildIter, streamIter, spec, m, budget, buckets)
+      GraceHashJoin.iterator(buildIter, streamIter, spec, m, budget, buckets, mode)
     }
   }
 

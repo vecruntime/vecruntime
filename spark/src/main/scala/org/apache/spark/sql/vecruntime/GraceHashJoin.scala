@@ -67,7 +67,9 @@ object GraceHashJoin extends Logging {
       spec: JoinSpec,
       metrics: VectorMetrics,
       budgetBytes: Long,
-      buckets: Int
+      buckets: Int,
+      /** #879: the pool of the build's memory, resolved at plan time. */
+      memoryMode: org.apache.spark.memory.MemoryMode = VectorSortIterator.memoryMode()
   ): Iterator[ColumnarBatch] = {
     val keyTypes: Array[DataType] = spec.buildKeys.map(_.dataType)
     // A build column without a lane (an array or struct payload, #705) is held in a row store, which only the
@@ -83,7 +85,7 @@ object GraceHashJoin extends Logging {
     // #868: the build side's bytes come from Spark's execution memory (the sort's pool: off-heap when Spark
     // has one). Held before every append; a refusal starts the bucketing as the budget does. A build side
     // that cannot bucket is still counted, so the pool can make the task's other consumers spill.
-    val memory = new BuildMemory
+    val memory = new BuildMemory(memoryMode)
     var total = 0
     // The batch that would have grown the builders past the budget: not appended, bucketed first below.
     var overflowBatch: ColumnarBatch = null
@@ -254,10 +256,12 @@ object GraceHashJoin extends Logging {
  * consumer's request (a built table cannot give back part of itself); everything is returned when the task
  * ends. Without a task (a driver-side call, a unit test) it holds nothing and always grants.
  */
-private[vecruntime] final class BuildMemory {
+private[vecruntime] final class BuildMemory(
+    mode: org.apache.spark.memory.MemoryMode = VectorSortIterator.memoryMode()
+) {
   private val consumer: org.apache.spark.memory.MemoryConsumer =
     Option(org.apache.spark.TaskContext.get()).flatMap(tc => Option(tc.taskMemoryManager())).map { tmm =>
-      new org.apache.spark.memory.MemoryConsumer(tmm, tmm.pageSizeBytes(), VectorSortIterator.memoryMode()) {
+      new org.apache.spark.memory.MemoryConsumer(tmm, tmm.pageSizeBytes(), mode) {
         override def spill(size: Long, trigger: org.apache.spark.memory.MemoryConsumer): Long = 0L
       }
     }.orNull

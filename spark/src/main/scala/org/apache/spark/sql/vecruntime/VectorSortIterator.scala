@@ -42,16 +42,28 @@ import org.apache.spark.sql.vectorized.{ColumnarBatch, ColumnVector}
  */
 private[vecruntime] object VectorSortIterator {
 
-  /** For tests driving the operators without a SparkEnv: the memory mode to report instead of the conf's. */
-  @volatile private[vecruntime] var modeOverride: org.apache.spark.memory.MemoryMode = null
-
-  /** #867: the pool the sort's memory comes from: off-heap execution memory when Spark has one. */
-  def memoryMode(): org.apache.spark.memory.MemoryMode = {
-    if (modeOverride != null) return modeOverride
-    val env = org.apache.spark.SparkEnv.get
-    if (env != null && env.conf.getBoolean("spark.memory.offHeap.enabled", false))
-      org.apache.spark.memory.MemoryMode.OFF_HEAP
+  /** #867: the pool the operators' native memory comes from: off-heap execution memory when Spark has one. */
+  def memoryMode(conf: org.apache.spark.SparkConf): org.apache.spark.memory.MemoryMode =
+    if (conf.getBoolean("spark.memory.offHeap.enabled", false)) org.apache.spark.memory.MemoryMode.OFF_HEAP
     else org.apache.spark.memory.MemoryMode.ON_HEAP
+
+  // #879: resolved once per SparkEnv (it cannot change within one), not on every consumer's construction.
+  @volatile private var cached: (AnyRef, org.apache.spark.memory.MemoryMode) = (new Object, null)
+
+  /**
+   * The mode of this JVM's SparkEnv, for an operator that did not get one at plan time; ON_HEAP without a SparkEnv
+   * (a unit test driving an iterator directly -- such a test passes the mode it wants instead).
+   */
+  def memoryMode(): org.apache.spark.memory.MemoryMode = {
+    val env = org.apache.spark.SparkEnv.get
+    if (env == null) return org.apache.spark.memory.MemoryMode.ON_HEAP
+    val c = cached
+    if (c._1 eq env) c._2
+    else {
+      val m = memoryMode(env.conf)
+      cached = (env, m)
+      m
+    }
   }
 }
 
@@ -64,7 +76,9 @@ private[vecruntime] class VectorSortIterator(
     metrics: VectorMetrics,
     limit: Int = Int.MaxValue,
     runRows: Int = 1 << 20,
-    spillBytes: Long = Long.MaxValue
+    spillBytes: Long = Long.MaxValue,
+    /** #879: the pool of the runs' memory, resolved at plan time (or once per SparkEnv). */
+    memoryMode: org.apache.spark.memory.MemoryMode = VectorSortIterator.memoryMode()
 ) extends Iterator[ColumnarBatch]
     with AutoCloseable {
 
@@ -180,7 +194,7 @@ private[vecruntime] class VectorSortIterator(
   private var draining = false
 
   private final class SortMemoryConsumer(tmm: org.apache.spark.memory.TaskMemoryManager)
-      extends org.apache.spark.memory.MemoryConsumer(tmm, tmm.pageSizeBytes(), VectorSortIterator.memoryMode()) {
+      extends org.apache.spark.memory.MemoryConsumer(tmm, tmm.pageSizeBytes(), memoryMode) {
     override def spill(size: Long, trigger: org.apache.spark.memory.MemoryConsumer): Long =
       if ((trigger eq this) || !draining || hasNested) 0L else spillResident(size, 0L)._1
   }
@@ -194,7 +208,7 @@ private[vecruntime] class VectorSortIterator(
    */
   private lazy val heapBytesPerRow: Long = 4L + 9L * keyExprs.length
   private val heapConsumer: HeapSideConsumer =
-    if (VectorSortIterator.memoryMode() != org.apache.spark.memory.MemoryMode.OFF_HEAP) null
+    if (memoryMode != org.apache.spark.memory.MemoryMode.OFF_HEAP) null
     else Option(TaskContext.get()).map(tc => new HeapSideConsumer(tc.taskMemoryManager())).orNull
   private var heapReserved = 0L
   private var residentHeap = 0L
