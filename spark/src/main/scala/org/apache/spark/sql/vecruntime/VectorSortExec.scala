@@ -78,6 +78,7 @@ case class VectorSortExec(sortOrder: Seq[SortOrder], global: Boolean, child: Spa
     val runRows = VectorConf.sortRunRows(conf)
     val spillBytes = VectorConf.sortSpillBytes(conf, sparkContext.getConf)
     val mode = VectorSortIterator.memoryMode(sparkContext.getConf) // #879: resolved at plan time
+    val fairShare = VectorConf.sortFairShareBytes(conf, sparkContext.getConf) // #877: the soft spill trigger
     child.executeColumnar().mapPartitionsInternal { iter =>
       new VectorSortIterator(
         iter,
@@ -88,7 +89,8 @@ case class VectorSortExec(sortOrder: Seq[SortOrder], global: Boolean, child: Spa
         m,
         runRows = runRows,
         spillBytes = spillBytes,
-        memoryMode = mode
+        memoryMode = mode,
+        fairShareBytes = fairShare
       )
     }
   }
