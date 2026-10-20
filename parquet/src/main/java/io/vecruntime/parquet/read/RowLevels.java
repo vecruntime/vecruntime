@@ -13,7 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package io.vecruntime.spark.parquet;
+package io.vecruntime.parquet.read;
 
 /**
  * Each row's definition level in the last batch (#568): for a flat leaf, the
@@ -21,7 +21,7 @@ package io.vecruntime.spark.parquet;
  * struct's nulls are where that level is below the struct's own, whichever of
  * its fields supplies it.
  */
-interface RowLevels {
+public interface RowLevels {
 
     /** The last batch's per-row levels, valid until the next batch. */
     int[] rowLevels();

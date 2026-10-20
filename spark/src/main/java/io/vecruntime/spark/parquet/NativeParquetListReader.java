@@ -20,6 +20,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.function.BiConsumer;
 
+import io.vecruntime.parquet.read.RowLevels;
 import io.vecruntime.spark.arrow.VectorNestedColumnVector;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.FieldVector;
