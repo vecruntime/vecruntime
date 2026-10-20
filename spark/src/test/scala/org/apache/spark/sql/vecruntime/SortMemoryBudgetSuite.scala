@@ -325,6 +325,24 @@ class SortMemoryBudgetSuite extends AnyFunSuite {
     assert(io.vecruntime.spark.VectorConf.sortFairShareBytes(sql, conf) === 0L, "and is a hard cap, not a trigger")
   }
 
+  test("#877: without off-heap memory the default cap is bounded by the task's share of the overhead") {
+    val sql = new org.apache.spark.sql.internal.SQLConf
+    def cap(c: SparkConf) = io.vecruntime.spark.VectorConf.sortSpillBytes(sql, c)
+    val base = new SparkConf(false).set("spark.executor.cores", "13").set("spark.executor.memoryOverhead", "20g")
+    // No MaxDirectMemorySize: half the overhead is set aside for direct memory, half of the rest per task.
+    assert(cap(base) === (10L << 30) / 26)
+    val wide = base.clone.set("spark.executor.memoryOverhead", "40g")
+    assert(
+      cap(wide.set("spark.executor.extraJavaOptions", "-XX:+UseG1GC -XX:MaxDirectMemorySize=4g")) === (1L << 30),
+      "36g left over 26 is past the 1 GiB default, which stays the ceiling"
+    )
+    assert(cap(base.clone.set("spark.executor.extraJavaOptions", "-XX:MaxDirectMemorySize=19g")) === (64L << 20))
+    assert(cap(base.clone.set("spark.executor.memoryOverhead", "4096")) === (2L << 30) / 26, "a bare number is MiB")
+    assert(cap(new SparkConf(false)) === (1L << 30), "no overhead set: the 1 GiB default")
+    sql.setConfString("spark.vecruntime.sort.spillBytes", "2g")
+    assert(cap(base) === (2L << 30), "an explicit setting wins")
+  }
+
   test("#877: past its fair share the sort keeps runs resident while the pool has room, spills when it has none") {
     // Fair share 64 KiB: the partition's runs (~256 KiB of longs) pass it. With 4 MiB free in the pool the trigger is
     // share + 2 MiB and nothing spills; with nothing free the trigger is the share and runs go to disk.
