@@ -16,6 +16,7 @@
 package io.vecruntime.parquet.read;
 
 import io.vecruntime.kernels.VecType;
+import org.apache.arrow.vector.types.pojo.ArrowType;
 
 /**
  * How one Parquet leaf column is read (#900 phase 2): the target lane and the
@@ -55,6 +56,12 @@ public final class LeafReadSpec {
 
     /** An unsigned INT64 (UINT_64) read as a 128-bit decimal, zero-extended. */
     public static final int WIDEN_ULONG_TO_DEC128 = 6;
+
+    /**
+     * The Arrow type of the vectors the values are written into; null: the
+     * lane's own (see {@link #arrowType()}).
+     */
+    private final ArrowType arrowType;
 
     /** The lane the values land on. */
     public final VecType lane;
@@ -106,6 +113,7 @@ public final class LeafReadSpec {
 
     private LeafReadSpec(Builder b) {
         this.lane = b.lane;
+        this.arrowType = b.arrowType;
         this.widen = b.widen;
         this.rescale = b.rescale;
         this.narrowBits = b.narrowBits;
@@ -120,6 +128,27 @@ public final class LeafReadSpec {
     /** A spec that reads the column onto {@code lane} as stored. */
     public static Builder onLane(VecType lane) {
         return new Builder(lane);
+    }
+
+    /**
+     * The Arrow type of the vectors this leaf's batches are written into: the
+     * one the adapter set, else the lane's own vector type. A type with no
+     * engine lane (FLOAT's bits, TIME, intervals, TIMESTAMP_NTZ, a timestamp
+     * with its zone) is always set by the adapter, which knows what the engine
+     * above reads.
+     */
+    public ArrowType arrowType() {
+        if (arrowType != null) {
+            return arrowType;
+        }
+        return switch (lane) {
+            case BOOL -> ArrowType.Bool.INSTANCE;
+            case INT32 -> new ArrowType.Int(32, true);
+            case INT64 -> new ArrowType.Int(64, true);
+            case FLOAT64 -> new ArrowType.FloatingPoint(org.apache.arrow.vector.types.FloatingPointPrecision.DOUBLE);
+            case UTF8 -> ArrowType.Utf8.INSTANCE;
+            default -> throw new IllegalStateException("no Arrow type for lane " + lane + "; the adapter must set one");
+        };
     }
 
     @Override
@@ -141,6 +170,7 @@ public final class LeafReadSpec {
     /** Builds a {@link LeafReadSpec}; every field defaults to "as stored". */
     public static final class Builder {
         private final VecType lane;
+        private ArrowType arrowType;
         private int widen = WIDEN_NONE;
         private int rescale;
         private int narrowBits;
@@ -209,6 +239,15 @@ public final class LeafReadSpec {
 
         public Builder dictionaryIdsAllowed(boolean on) {
             this.dictionaryIdsAllowed = on;
+            return this;
+        }
+
+        /**
+         * The Arrow type of the batch vectors (default: the lane's own; see
+         * {@link LeafReadSpec#arrowType()}).
+         */
+        public Builder arrowType(ArrowType type) {
+            this.arrowType = type;
             return this;
         }
 

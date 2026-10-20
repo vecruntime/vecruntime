@@ -27,8 +27,7 @@ import io.vecruntime.kernels.VectorBuffers;
 import io.vecruntime.parquet.codec.ColumnChunkDecoder;
 import io.vecruntime.parquet.codec.GroupUnpacker;
 import io.vecruntime.parquet.codec.ParquetPageDecoder;
-import io.vecruntime.spark.arrow.ArrowOutput;
-import io.vecruntime.spark.arrow.ArrowVectorBuffers;
+import io.vecruntime.parquet.read.ArrowWrite;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.BaseFixedWidthVector;
 import org.apache.arrow.vector.FieldVector;
@@ -90,6 +89,8 @@ public final class NativeParquetColumnReader implements NativeParquetColumn, Row
     // #900: FLOAT kept as its own 4-byte bits (a Float4Vector); a string whose dictionary batches may be ids.
     private final boolean float32;
     private final boolean dictionaryIdsAllowed;
+    // #900: the Arrow type of this leaf's batch vectors (the spec's), so vectors are made without the Spark type.
+    private final org.apache.arrow.vector.types.pojo.ArrowType arrowType;
     // A FIXED_LEN_BYTE_ARRAY / BINARY decimal, staged as bytes and converted at flush; its FLBA width (0: BINARY).
     private final boolean binaryDecimal;
     private final int fixedLength;
@@ -213,6 +214,7 @@ public final class NativeParquetColumnReader implements NativeParquetColumn, Row
         this.millis = spec.millis;
         this.float32 = spec.float32;
         this.dictionaryIdsAllowed = spec.dictionaryIdsAllowed;
+        this.arrowType = spec.arrowType();
         // Dictionary scratch is GC-managed: closing a shared Arena runs a JVM-wide handshake that walks every
         // thread's stack, and a reader is made per column per file -- on 1 TB TPC-DS (14,594 store_sales
         // files) those handshakes were 8-9% of executor CPU in q88. An automatic arena has no close.
@@ -485,7 +487,7 @@ public final class NativeParquetColumnReader implements NativeParquetColumn, Row
                     : binaryDecimal ? flushDecimal(n, nulls) : flushBool(n, nulls);
         }
         BaseFixedWidthVector v = (BaseFixedWidthVector) borrowFixed(n);
-        ArrowVectorBuffers out = ArrowVectorBuffers.forWrite(v, n, sparkType);
+        ArrowWrite.Buffers out = ArrowWrite.forWrite(v, n);
         java.lang.foreign.MemorySegment data = out.data();
         java.lang.foreign.MemorySegment validity = maxDefLevel > 0 ? out.validity() : null;
         if (validity != null) {
@@ -501,7 +503,7 @@ public final class NativeParquetColumnReader implements NativeParquetColumn, Row
         }
         rebaseLane(data, hasNulls ? validity : null, n);
         widenLane(data, hasNulls ? validity : null, n);
-        io.vecruntime.spark.arrow.ArrowOutput.finish(out, n, !hasNulls);
+        ArrowWrite.finish(out, n, !hasNulls);
         return v;
     }
 
@@ -569,7 +571,7 @@ public final class NativeParquetColumnReader implements NativeParquetColumn, Row
             decoder.setDictionary(dict);
             if (dictionaryIds) {
                 // #612: the row group's dictionary as one Arrow vector, shared by every batch emitted as ids.
-                chunkDict = new SharedDictionary(io.vecruntime.spark.arrow.ArrowOutput.copyDictionary(name + ".dictionary", dict, allocator));
+                chunkDict = new SharedDictionary(ArrowWrite.copyDictionary(name + ".dictionary", dict, allocator));
             }
         }
     }
@@ -653,10 +655,10 @@ public final class NativeParquetColumnReader implements NativeParquetColumn, Row
             v = new org.apache.arrow.vector.IntVector(name, allocator);
             v.allocateNew(rows);
         }
-        ArrowVectorBuffers out = ArrowVectorBuffers.forWrite(v, rows, org.apache.spark.sql.types.DataTypes.IntegerType);
+        ArrowWrite.Buffers out = ArrowWrite.forWrite(v, rows);
         decoder.flushIds(rows, out.data(),
                 hasNulls ? out.validity() : null);
-        io.vecruntime.spark.arrow.ArrowOutput.finish(out, rows, !hasNulls);
+        ArrowWrite.finish(out, rows, !hasNulls);
         chunkDict.retain();
         synchronized (pool) {
             idBatches.put(v, chunkDict);
@@ -1057,12 +1059,12 @@ public final class NativeParquetColumnReader implements NativeParquetColumn, Row
         decoder.startBatch(elements);
         boolean staged = type == VecType.UTF8 || type == VecType.BOOL || binaryDecimal || int96;
         BaseFixedWidthVector fixed = null;
-        ArrowVectorBuffers out = null;
+        ArrowWrite.Buffers out = null;
         MemorySegment data = null;
         MemorySegment validity = null;
         if (!staged) {
             fixed = (BaseFixedWidthVector) borrowFixed(elements);
-            out = ArrowVectorBuffers.forWrite(fixed, elements, sparkType);
+            out = ArrowWrite.forWrite(fixed, elements);
             data = out.data();
             validity = out.validity();
             validity.asSlice(0L, (long) ((elements + 63) >>> 6) * 8).fill((byte) 0);
@@ -1117,7 +1119,7 @@ public final class NativeParquetColumnReader implements NativeParquetColumn, Row
         }
         rebaseLane(data, nulls ? validity : null, elements);
         widenLane(data, nulls ? validity : null, elements);
-        ArrowOutput.finish(out, elements, !nulls);
+        ArrowWrite.finish(out, elements, !nulls);
         return fixed;
     }
 
@@ -1203,7 +1205,7 @@ public final class NativeParquetColumnReader implements NativeParquetColumn, Row
                     : binaryDecimal ? flushDecimal(n, nulls) : flushBool(n, nulls);
         }
         BaseFixedWidthVector v = (BaseFixedWidthVector) borrowFixed(n);
-        ArrowVectorBuffers out = ArrowVectorBuffers.forWrite(v, n, sparkType);
+        ArrowWrite.Buffers out = ArrowWrite.forWrite(v, n);
         java.lang.foreign.MemorySegment data = out.data();
         java.lang.foreign.MemorySegment validity = maxDefLevel > 0 ? out.validity() : null;
         if (validity != null) {
@@ -1232,7 +1234,7 @@ public final class NativeParquetColumnReader implements NativeParquetColumn, Row
         }
         rebaseLane(data, hasNulls ? validity : null, n);
         widenLane(data, hasNulls ? validity : null, n);
-        io.vecruntime.spark.arrow.ArrowOutput.finish(out, n, !hasNulls);
+        ArrowWrite.finish(out, n, !hasNulls);
         return v;
     }
 
@@ -1309,12 +1311,12 @@ public final class NativeParquetColumnReader implements NativeParquetColumn, Row
      */
     private FieldVector flushDecimal(int rows, boolean hasNulls) {
         BaseFixedWidthVector v = (BaseFixedWidthVector) borrowFixed(rows);
-        ArrowVectorBuffers out = ArrowVectorBuffers.forWrite(v, rows, sparkType);
+        ArrowWrite.Buffers out = ArrowWrite.forWrite(v, rows);
         decoder.flushDecimal(rows, out.data(),
                 hasNulls ? out.validity() : null, type == VecType.DECIMAL128);
         widenLane(out.data(), hasNulls ? out.validity() : null,
                 rows);
-        ArrowOutput.finish(out, rows, !hasNulls);
+        ArrowWrite.finish(out, rows, !hasNulls);
         return v;
     }
 
@@ -1324,12 +1326,12 @@ public final class NativeParquetColumnReader implements NativeParquetColumn, Row
      */
     private FieldVector flushInt96(int rows, boolean hasNulls) {
         BaseFixedWidthVector v = (BaseFixedWidthVector) borrowFixed(rows);
-        ArrowVectorBuffers out = ArrowVectorBuffers.forWrite(v, rows, sparkType);
+        ArrowWrite.Buffers out = ArrowWrite.forWrite(v, rows);
         decoder.flushInt96(rows, out.data(),
                 hasNulls ? out.validity() : null);
         rebase.fixMicros(out.data(), hasNulls ? out.validity() : null,
                 rows, true);
-        ArrowOutput.finish(out, rows, !hasNulls);
+        ArrowWrite.finish(out, rows, !hasNulls);
         return v;
     }
 
@@ -1375,7 +1377,7 @@ public final class NativeParquetColumnReader implements NativeParquetColumn, Row
      */
     private FieldVector fillFixed(int n, boolean modeA) {
         BaseFixedWidthVector v = (BaseFixedWidthVector) borrowFixed(n);
-        ArrowVectorBuffers out = ArrowVectorBuffers.forWrite(v, n, sparkType);
+        ArrowWrite.Buffers out = ArrowWrite.forWrite(v, n);
         java.lang.foreign.MemorySegment data = out.data();
         java.lang.foreign.MemorySegment validity = maxDefLevel > 0 ? out.validity() : null;
         if (validity != null) {
@@ -1400,7 +1402,7 @@ public final class NativeParquetColumnReader implements NativeParquetColumn, Row
         }
         rebaseLane(data, hasNulls ? validity : null, n);
         widenLane(data, hasNulls ? validity : null, n);
-        io.vecruntime.spark.arrow.ArrowOutput.finish(out, n, !hasNulls);
+        ArrowWrite.finish(out, n, !hasNulls);
         return v;
     }
 
@@ -1476,7 +1478,7 @@ public final class NativeParquetColumnReader implements NativeParquetColumn, Row
 
     private FieldVector flushFixed(int rows, boolean hasNulls) {
         BaseFixedWidthVector v = (BaseFixedWidthVector) borrowFixed(rows);
-        ArrowVectorBuffers out = ArrowVectorBuffers.forWrite(v, rows, sparkType);
+        ArrowWrite.Buffers out = ArrowWrite.forWrite(v, rows);
         decoder.flushFixed(rows, out.data(),
                 hasNulls ? out.validity() : null);
         if (narrowBits != 0) {
@@ -1487,23 +1489,23 @@ public final class NativeParquetColumnReader implements NativeParquetColumn, Row
                     rows);
         }
         // finish: set the Arrow value count and (when no nulls) mark all valid without a validity scan.
-        ArrowOutput.finish(out, rows, !hasNulls);
+        ArrowWrite.finish(out, rows, !hasNulls);
         return v;
     }
 
     private FieldVector flushBool(int rows, boolean hasNulls) {
         BaseFixedWidthVector v = (BaseFixedWidthVector) borrowFixed(rows);
-        ArrowVectorBuffers out = ArrowVectorBuffers.forWrite(v, rows, sparkType);
+        ArrowWrite.Buffers out = ArrowWrite.forWrite(v, rows);
         decoder.flushBool(rows, out.data(),
                 hasNulls ? out.validity() : null);
-        ArrowOutput.finish(out, rows, !hasNulls);
+        ArrowWrite.finish(out, rows, !hasNulls);
         return v;
     }
 
     private FieldVector flushUtf8(int rows, boolean hasNulls) {
         long bytes = decoder.utf8Bytes();
         org.apache.arrow.vector.BaseVariableWidthVector v = (org.apache.arrow.vector.BaseVariableWidthVector) borrowUtf8(rows, bytes);
-        ArrowVectorBuffers vb = ArrowVectorBuffers.forWrite(v, rows, sparkType);
+        ArrowWrite.Buffers vb = ArrowWrite.forWrite(v, rows);
         decoder.flushUtf8(rows, vb.offsets(), vb.data(),
                 hasNulls ? vb.validity() : null);
         if (!hasNulls) {
@@ -1532,7 +1534,7 @@ public final class NativeParquetColumnReader implements NativeParquetColumn, Row
         }
         // FLOAT is decoded as its own 4-byte bits (#559) into a Float4Vector; the operators widen it to the
         // FLOAT64 lane on the way in (#712), and every other type is the lane's own vector.
-        BaseFixedWidthVector nv = float32 ? new org.apache.arrow.vector.Float4Vector(name, allocator) : (BaseFixedWidthVector) ArrowOutput.newVector(name, sparkType, allocator);
+        BaseFixedWidthVector nv = float32 ? new org.apache.arrow.vector.Float4Vector(name, allocator) : (BaseFixedWidthVector) ArrowWrite.newVector(name, arrowType, allocator);
         nv.allocateNew(rows);
         return nv;
     }
@@ -1547,7 +1549,7 @@ public final class NativeParquetColumnReader implements NativeParquetColumn, Row
             v.close();
             v = pooled();
         }
-        org.apache.arrow.vector.BaseVariableWidthVector nv = (org.apache.arrow.vector.BaseVariableWidthVector) ArrowOutput.newVector(name, sparkType, allocator);
+        org.apache.arrow.vector.BaseVariableWidthVector nv = (org.apache.arrow.vector.BaseVariableWidthVector) ArrowWrite.newVector(name, arrowType, allocator);
         nv.allocateNew(Math.max(bytes, 1L), rows);
         return nv;
     }

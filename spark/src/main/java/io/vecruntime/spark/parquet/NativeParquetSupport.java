@@ -237,7 +237,62 @@ public final class NativeParquetSupport {
                 .float32(dt instanceof FloatType)
                 // A collated string (#568) is carried to Spark's operators, which compare it by collation: values.
                 .dictionaryIdsAllowed(dt instanceof StringType st && st.isUTF8BinaryCollation())
+                .arrowType(arrowTypeOf(dt))
                 .build();
+    }
+
+    /**
+     * The Arrow type of the vectors a leaf read as {@code dt} is written into:
+     * the vector classes {@code ArrowOutput.newVector} makes for the engine's
+     * lanes and for the types the scan carries with no lane, and FLOAT as its
+     * own 4-byte bits (#559; the operators widen it on the way in, #712). Null
+     * for a type the leaf readers never take.
+     */
+    static org.apache.arrow.vector.types.pojo.ArrowType arrowTypeOf(DataType dt) {
+        if (dt instanceof IntegerType || dt instanceof ByteType || dt instanceof ShortType) {
+            return new org.apache.arrow.vector.types.pojo.ArrowType.Int(32, true);
+        }
+        if (dt instanceof DateType) {
+            return new org.apache.arrow.vector.types.pojo.ArrowType.Date(org.apache.arrow.vector.types.DateUnit.DAY);
+        }
+        if (dt instanceof LongType) {
+            return new org.apache.arrow.vector.types.pojo.ArrowType.Int(64, true);
+        }
+        if (dt instanceof TimestampType) {
+            return new org.apache.arrow.vector.types.pojo.ArrowType.Timestamp(org.apache.arrow.vector.types.TimeUnit.MICROSECOND, "UTC");
+        }
+        if (dt instanceof TimestampNTZType) {
+            return new org.apache.arrow.vector.types.pojo.ArrowType.Timestamp(org.apache.arrow.vector.types.TimeUnit.MICROSECOND, null);
+        }
+        if (dt instanceof FloatType) {
+            return new org.apache.arrow.vector.types.pojo.ArrowType.FloatingPoint(org.apache.arrow.vector.types.FloatingPointPrecision.SINGLE);
+        }
+        if (dt instanceof DoubleType) {
+            return new org.apache.arrow.vector.types.pojo.ArrowType.FloatingPoint(org.apache.arrow.vector.types.FloatingPointPrecision.DOUBLE);
+        }
+        if (dt instanceof BooleanType) {
+            return org.apache.arrow.vector.types.pojo.ArrowType.Bool.INSTANCE;
+        }
+        if (dt instanceof StringType || dt instanceof BinaryType) {
+            // BINARY rides the UTF8 lane in a VarCharVector (#705), as every UTF8 kernel output does.
+            return org.apache.arrow.vector.types.pojo.ArrowType.Utf8.INSTANCE;
+        }
+        if (dt instanceof DecimalType d && d.precision() <= TypeMapping.MAX_DECIMAL_PRECISION) {
+            return new org.apache.arrow.vector.types.pojo.ArrowType.Int(64, true); // unscaled values (VectorDecimalColumnVector)
+        }
+        if (dt instanceof DecimalType d) {
+            return new org.apache.arrow.vector.types.pojo.ArrowType.Decimal(d.precision(), d.scale(), 128);
+        }
+        if (dt instanceof org.apache.spark.sql.types.YearMonthIntervalType) {
+            return new org.apache.arrow.vector.types.pojo.ArrowType.Interval(org.apache.arrow.vector.types.IntervalUnit.YEAR_MONTH);
+        }
+        if (dt instanceof org.apache.spark.sql.types.DayTimeIntervalType) {
+            return new org.apache.arrow.vector.types.pojo.ArrowType.Duration(org.apache.arrow.vector.types.TimeUnit.MICROSECOND);
+        }
+        if (dt instanceof org.apache.spark.sql.types.TimeType) {
+            return new org.apache.arrow.vector.types.pojo.ArrowType.Time(org.apache.arrow.vector.types.TimeUnit.NANOSECOND, 64);
+        }
+        return null;
     }
 
     /**

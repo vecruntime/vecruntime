@@ -56,6 +56,14 @@
       <artifactId>hadoop-client-runtime</artifactId>
       <scope>test</scope>
     </dependency>
+    <!-- Arrow's allocator classes carry checker-framework annotations: without them on the test classpath
+         javac warns (-Werror) on every test that names RootAllocator. Annotations only. -->
+    <dependency>
+      <groupId>org.checkerframework</groupId>
+      <artifactId>checker-qual</artifactId>
+      <version>3.43.0</version>
+      <scope>test</scope>
+    </dependency>
     <dependency>
       <groupId>org.junit.jupiter</groupId>
       <artifactId>junit-jupiter</artifactId>
