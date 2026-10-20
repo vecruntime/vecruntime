@@ -361,7 +361,12 @@ final class FixedWidthChunkWriter implements ChunkWriter {
                 BytesInput.from(levels.toByteArray()),
                 valuesEncoding,
                 BytesInput.from(body.toByteArray()),
-                statistics());
+                statistics(),
+                // Size statistics (Parquet 2.10), as parquet-java writes them for a flat fixed-width column: no
+                // byte-array bytes and no level histograms.
+                new org.apache.parquet.column.statistics.SizeStatistics(column.getPrimitiveType(), 0L,
+                        java.util.List.of(), java.util.List.of()),
+                null); // no geospatial statistics
         Arrays.fill(pageValidity, 0, (pageRows + 63) >>> 6, 0L);
         pageRows = 0;
         pageValues = 0;

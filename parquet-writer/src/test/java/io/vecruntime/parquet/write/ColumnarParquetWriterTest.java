@@ -375,6 +375,10 @@ class ColumnarParquetWriterTest {
         return out;
     }
 
+    private static String d(org.apache.parquet.column.statistics.SizeStatistics s) {
+        return s == null ? "null" : s.getUnencodedByteArrayDataBytes() + " rep=" + s.getRepetitionLevelHistogram() + " def=" + s.getDefinitionLevelHistogram();
+    }
+
     @Test
     void sameChunkStatisticsAndEncodings() throws Exception {
         List<Row> rows = rows(20_000, 2);
@@ -396,6 +400,7 @@ class ColumnarParquetWriterTest {
             assertEquals(sy.getNumNulls(), sx.getNumNulls(), col);
             assertEquals(sy.genericGetMin(), sx.genericGetMin(), col);
             assertEquals(sy.genericGetMax(), sx.genericGetMax(), col);
+            assertEquals(d(y.getSizeStatistics()), d(x.getSizeStatistics()), col + ": size statistics");
         }
         assertEquals("vecruntime",
                 ours.getFileMetaData()
