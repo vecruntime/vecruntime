@@ -73,9 +73,14 @@ object GraceHashJoin extends Logging {
   ): Iterator[ColumnarBatch] = {
     val keyTypes: Array[DataType] = spec.buildKeys.map(_.dataType)
     // A build column without a lane (an array or struct payload, #705) is held in a row store, which only the
-    // in-memory table has: the build side stays in memory, as for a key type the bucket hash cannot read.
-    if (!spec.buildTypes.forall(TypeMapping.hasLane))
-      return new VectorHashJoinIterator(streamIter, BuildTable.fromBatches(buildIter, spec), spec, metrics)
+    // in-memory table has: the build side stays in memory, as for a key type the bucket hash cannot read. #878: its
+    // lane columns' bytes are held in the pool while it is probed (the row store is on the heap), so the task's
+    // other consumers can be made to spill around it.
+    if (!spec.buildTypes.forall(TypeMapping.hasLane)) {
+      val table = BuildTable.fromBatches(buildIter, spec)
+      new BuildMemory(memoryMode).hold(table.nativeBytes)
+      return new VectorHashJoinIterator(streamIter, table, spec, metrics)
+    }
     // A key type the bucket hash has no lane for (float, binary...): the build side stays in memory.
     val canSpill =
       budgetBytes > 0 && budgetBytes < Long.MaxValue && buckets >= 2 && AggregateSpill.supportsKeys(keyTypes.toSeq)
