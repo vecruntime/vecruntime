@@ -117,17 +117,22 @@ fallback list:
 - **Size:** the v2 files are 23% smaller on snappy and 5% smaller on zstd. Our snappy output is already as small as Spark's zstd output.
 - **Where the CPU goes** (executor JFR): mostly dictionary encoding of the fixed-width columns, then RLE / bit packing. Compression (1.7%) and the S3A upload (2.6%) take little.
 
-**Partitioned writes** (1 TB `store_sales`, snappy, `DISTRIBUTE BY ss_sold_date_sk`, then `partitionBy("ss_sold_date_sk")`; same cluster, one run each):
+**Run writes with Spark's off-heap pool** (`spark.memory.offHeap.enabled=true` and a `spark.memory.offHeap.size`). Every write that sorts before it writes keeps its sorted runs in native memory, and only the off-heap pool tracks that memory. That covers a partitioned or bucketed write (the sort `V1Writes` plans) and concurrent writers past their limit. Without the off-heap pool:
+- Spark counts that memory against the on-heap pool. That pool is sized from the heap, so it does not keep the runs inside the container's overhead.
+- Large writes then need manual tuning (a smaller `spark.vecruntime.sort.spillBytes`, fewer tasks per executor), or executors are killed for exceeding container memory.
+
+The numbers below use a 10g pool. The container is the same 50 GB as before: heap 22g, overhead 18g, off-heap 10g.
+
+**Partitioned writes** (1 TB `store_sales`, snappy, `DISTRIBUTE BY ss_sold_date_sk`, then `partitionBy("ss_sold_date_sk")`; 8 executors x 13 cores, one run each):
 
 | Source | This writer | Spark's writer under VecRuntime | Plain Spark |
 |---|---|---|---|
-| `WHERE ss_sold_date_sk IS NOT NULL` | **324 s**, 100.4 GB | -- | 542 s, 137.6 GB |
-| all rows | 1137 s, 104.1 GB | 1657 s, 135.2 GB | 985 s, 143.0 GB |
-| all rows, `spark.vecruntime.sort.spillBytes=64m`, `sort.runRows=131072` | 653 s and 1156 s (two runs) | 1043 s | -- |
+| all rows, off-heap 10g | **961 s**, 104.1 GB, 11.6 M core-ms | 1312 s, 135.2 GB, 22.3 M core-ms | 985 s, 143.0 GB, 18.9 M core-ms |
+| `WHERE ss_sold_date_sk IS NOT NULL`, off-heap disabled | **322 s / 324 s**, 100.4 GB, 11.1 M core-ms | -- | 542 s, 137.6 GB, 17.7 M core-ms |
 
-- With all rows, one task receives every null `ss_sold_date_sk` row (about 4.5% of the table, written as one file). That task runs alone at the end, for more than 10 minutes in the slower 64 MiB run, so the wall time varies from run to run.
-- At the default sort settings, each all-rows run also lost one executor near its 53.7 GB container limit. The fetch failure that follows recomputes the map stage. With off-heap disabled, the sort's native runs are budgeted against the on-heap pool (#868). A 64 MiB budget lost none.
-- These writes used to fail with container OOMs, with this writer and with Spark's. The cause was the sort that `V1Writes` plans before the write: its native runs held about 4x their budget. #870 and #871 fixed that.
+- **All rows:** one task receives every null `ss_sold_date_sk` row (about 4.5% of the table, written as one file). It runs alone for the last 10 minutes or more, so the wall time is mostly that task. Executor CPU is the clearer comparison.
+- **Without off-heap:** the all-rows write lost executors near the 53.7 GB container limit in every run, and the fetch failures recomputed the map stage: 1137–1363 s. With off-heap, no executor was lost and no stage was retried.
+- **History:** before #870/#871 these writes failed with container OOMs, with both writers. The cause was the sort `V1Writes` plans before the write, whose native runs held about 4x their budget.
 
 JMH `ParquetWriteBenchmark`, 262,144 `store_sales`-shaped rows, uncompressed, output discarded (shared
 x86 host, indicative): ours 4,085 rows/ms before the per-lane write loops and about 4,700 after them, parquet-java v2 1,160,
