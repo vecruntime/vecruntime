@@ -25,5 +25,9 @@ USER root
 RUN curl -fsSL -o /opt/spark/jars/arrow-memory-unsafe-${ARROW_VERSION}.jar \
       "https://repo1.maven.org/maven2/org/apache/arrow/arrow-memory-unsafe/${ARROW_VERSION}/arrow-memory-unsafe-${ARROW_VERSION}.jar" \
     && echo "${AMU_SHA256}  /opt/spark/jars/arrow-memory-unsafe-${ARROW_VERSION}.jar" | sha256sum -c - \
-    && chmod 644 /opt/spark/jars/arrow-memory-unsafe-${ARROW_VERSION}.jar
+    && chmod 644 /opt/spark/jars/arrow-memory-unsafe-${ARROW_VERSION}.jar \
+    && ls /opt/spark/jars/*.jar | LC_ALL=C sort | paste -sd: > /opt/spark/aot/classpath \
+    && grep -q arrow-memory-unsafe /opt/spark/aot/classpath && chmod a+r /opt/spark/aot/classpath
+# (The executor's class path is the sorted jar list in /opt/spark/aot/classpath, not jars/*: the base image's
+# Dockerfile writes it for the AOT cache, so a jar added here must be added to that list too.)
 USER spark
