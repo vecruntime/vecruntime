@@ -13,7 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package io.vecruntime.kernels.parquet;
+package io.vecruntime.parquet.codec;
 
 import java.util.function.IntFunction;
 

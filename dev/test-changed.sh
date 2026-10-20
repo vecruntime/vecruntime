@@ -19,7 +19,7 @@
 #
 # What changed is `git diff --name-only REF...HEAD` (default origin/main) plus uncommitted and untracked files.
 #  - Modules: every changed module of the gate set and every module after it in build order (kernels, then
-#    parquet-writer when present, spark, shuffle, benchmarks) is built and tested. A change to the root pom,
+#    parquet when present, spark, shuffle, benchmarks) is built and tested. A change to the root pom,
 #    `.mvn/` or a directory this script does not know runs the whole gate set.
 #  - Inside spark (the slow module): only the suites tagged with the changed areas
 #    (`io.vecruntime.spark.test.tags.*`, -DtagsToInclude). Areas come from the paths of the changed main
@@ -51,7 +51,7 @@ TAGPKG=io.vecruntime.spark.test.tags
 ALL_TAGS="Scan Expr Agg Join SortWindow Nested Write Iceberg Comet Shuffle Core"
 MVN=(mvn -B -ntp -Pcomet,iceberg)
 ORDER=(kernels)
-[ -d parquet-writer ] && ORDER+=(parquet-writer)
+[ -d parquet ] && ORDER+=(parquet)
 ORDER+=(spark shuffle benchmarks)
 
 # --- Every concrete spark suite carries an area tag, or a tagged run would skip it silently.
@@ -115,7 +115,7 @@ while IFS= read -r p; do
       if printf '%s\n' "${ORDER[@]}" | grep -qx "$top"; then
         mods[$top]=1
         [ "$top" = kernels ] && spark_full=1
-        [ "$top" = parquet-writer ] && add_tags Write
+        [ "$top" = parquet ] && spark_full=1 # the scan's decoders and the writer (#900)
       else
         all=1
       fi ;;

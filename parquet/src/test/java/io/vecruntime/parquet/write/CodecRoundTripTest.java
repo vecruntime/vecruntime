@@ -23,9 +23,9 @@ import java.util.Random;
 import java.util.function.IntFunction;
 
 import io.vecruntime.kernels.Bitmap;
-import io.vecruntime.kernels.parquet.DeltaBinaryPackedReader;
-import io.vecruntime.kernels.parquet.GroupUnpacker;
-import io.vecruntime.kernels.parquet.RleBitPackingReader;
+import io.vecruntime.parquet.codec.DeltaBinaryPackedReader;
+import io.vecruntime.parquet.codec.GroupUnpacker;
+import io.vecruntime.parquet.codec.RleBitPackingReader;
 import org.apache.parquet.column.values.bitpacking.Packer;
 import org.junit.jupiter.api.Test;
 

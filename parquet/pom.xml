@@ -8,10 +8,12 @@
     <version>0.0.9</version>
   </parent>
 
-  <artifactId>vecruntime-parquet-writer_${spark.line}</artifactId>
-  <name>vecruntime-parquet-writer</name>
-  <description>Columnar Parquet writer: Arrow vectors to Parquet column chunks through parquet-java's file and page
-    writers (#64, #842). No Spark dependency, so it is tested against parquet-java's and Hardwood's readers and writers.</description>
+  <artifactId>vecruntime-parquet_${spark.line}</artifactId>
+  <name>vecruntime-parquet</name>
+  <description>Spark-free Parquet core (#900): the page decoders the native scan reads with (io.vecruntime.parquet.codec)
+    and the columnar writer (io.vecruntime.parquet.write: Arrow vectors to Parquet column chunks through parquet-java's
+    file and page writers, #64, #842), on one shared framing. No Spark dependency, so it is tested against parquet-java's
+    and Hardwood's readers and writers.</description>
 
   <dependencies>
     <!-- The engine's Arrow-layout columns (VectorBuffers); Spark-free, shaded into the plugin jar. -->

@@ -19,8 +19,8 @@ import java.util.Random;
 import java.util.concurrent.TimeUnit;
 import java.util.function.IntFunction;
 
-import io.vecruntime.kernels.parquet.DeltaBinaryPackedReader;
-import io.vecruntime.kernels.parquet.GroupUnpacker;
+import io.vecruntime.parquet.codec.DeltaBinaryPackedReader;
+import io.vecruntime.parquet.codec.GroupUnpacker;
 import org.apache.parquet.bytes.ByteBufferInputStream;
 import org.apache.parquet.bytes.HeapByteBufferAllocator;
 import org.apache.parquet.column.values.bitpacking.BytePacker;

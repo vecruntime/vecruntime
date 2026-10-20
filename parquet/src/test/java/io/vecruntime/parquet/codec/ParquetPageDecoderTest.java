@@ -13,7 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package io.vecruntime.kernels.parquet;
+package io.vecruntime.parquet.codec;
 
 import java.io.ByteArrayOutputStream;
 import java.lang.foreign.Arena;
@@ -24,8 +24,8 @@ import java.util.List;
 
 import io.vecruntime.kernels.VecType;
 import io.vecruntime.kernels.VectorBuffers;
-import io.vecruntime.kernels.parquet.ParquetPageDecoder.Encoding;
-import io.vecruntime.kernels.parquet.ParquetPageDecoder.Page;
+import io.vecruntime.parquet.codec.ParquetPageDecoder.Encoding;
+import io.vecruntime.parquet.codec.ParquetPageDecoder.Page;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
