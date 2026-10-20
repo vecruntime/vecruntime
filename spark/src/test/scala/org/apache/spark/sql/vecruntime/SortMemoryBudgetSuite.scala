@@ -147,6 +147,38 @@ class SortMemoryBudgetSuite extends AnyFunSuite {
     }
   }
 
+  test("#868: with off-heap runs, a heap too small for the merge's heap side makes the sort spill") {
+    // Off-heap pool large enough for every run; on-heap pool of 128 KiB, a third of the permutations and normalised
+    // keys of 32768 rows (4 + 9 bytes per row and key). The heap side's refusal must spill, not OOM the heap.
+    val conf = new SparkConf(false)
+      .set("spark.memory.offHeap.enabled", "true")
+      .set("spark.memory.offHeap.size", "1g")
+    val mm = new UnifiedMemoryManager(conf, 128L * 1024, 0L, 1)
+    val tmm = new TaskMemoryManager(mm, 0L)
+    val ctx = new PoolTaskContext(tmm)
+    VectorSortIterator.modeOverride = MemoryMode.OFF_HEAP
+    TaskContext.setTaskContext(ctx)
+    try {
+      val it = new VectorSortIterator(
+        input,
+        Array(ColumnRef(0, LongType)),
+        Array(true),
+        Array(true),
+        Array("k" -> LongType, "v" -> LongType),
+        metrics,
+        runRows = 4096
+      )
+      check(it)
+      assert(it.spilledRuns > 0, "the on-heap pool refused the heap side, so runs went to disk")
+      it.close()
+      ctx.complete()
+      assert(mm.executionMemoryUsed === 0L)
+    } finally {
+      VectorSortIterator.modeOverride = null
+      TaskContext.unset()
+    }
+  }
+
   // #868: the shuffled hash join's build side on the same pool.
   private val joinSpec = JoinSpec(
     joinType = org.apache.spark.sql.catalyst.plans.Inner,
@@ -180,6 +212,26 @@ class SortMemoryBudgetSuite extends AnyFunSuite {
   }
 
   private val joinExpected = (16384L, (0L until 32768L by 2).sum)
+
+  test("#868: a bucketed join's per-bucket tables are held in the pool while probed, and returned") {
+    withPool(1L << 30) { (tmm, _) =>
+      val schema = new StructType().add("k", LongType)
+      def batches(n: Int)(v: Long => Long) =
+        Iterator.tabulate(8)(b =>
+          VectorRowStages.toBatch(schema, Array.tabulate(n)(i => InternalRow(v(b.toLong * n + i))))
+        )
+      // A budget of 1 byte buckets at once; the pool is large, so each bucket's table is granted.
+      val it = GraceHashJoin.iterator(batches(4096)(identity), batches(4096)(_ * 2), joinSpec, metrics, 1L, 32)
+      var rows = 0L
+      var peak = 0L
+      while (it.hasNext) {
+        rows += it.next().numRows()
+        peak = math.max(peak, tmm.getMemoryConsumptionForThisTask())
+      }
+      assert(rows === joinExpected._1)
+      assert(peak > 0, "the bucket being probed was held")
+    }
+  }
 
   test("#868: a pool too small for the build side makes the hash join bucket, within a large budget") {
     withPool(64L * 1024) { (_, _) =>

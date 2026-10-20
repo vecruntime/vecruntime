@@ -42,8 +42,12 @@ import org.apache.spark.sql.vectorized.{ColumnarBatch, ColumnVector}
  */
 private[vecruntime] object VectorSortIterator {
 
+  /** For tests driving the operators without a SparkEnv: the memory mode to report instead of the conf's. */
+  @volatile private[vecruntime] var modeOverride: org.apache.spark.memory.MemoryMode = null
+
   /** #867: the pool the sort's memory comes from: off-heap execution memory when Spark has one. */
   def memoryMode(): org.apache.spark.memory.MemoryMode = {
+    if (modeOverride != null) return modeOverride
     val env = org.apache.spark.SparkEnv.get
     if (env != null && env.conf.getBoolean("spark.memory.offHeap.enabled", false))
       org.apache.spark.memory.MemoryMode.OFF_HEAP
@@ -98,6 +102,9 @@ private[vecruntime] class VectorSortIterator(
   ) extends Run {
     val permutation: Array[Int] = SortKernels.sortIndices(keys, ascending, nullsFirst, rows)
     val kept: Int = math.min(rows, limit)
+
+    /** #868: the run's heap side -- its permutation, and at the merge its normalised keys -- for the on-heap pool. */
+    def heapBytes: Long = rows.toLong * heapBytesPerRow
     def close(): Unit = { builders.foreach(_.close()); arena.close() }
   }
 
@@ -175,8 +182,45 @@ private[vecruntime] class VectorSortIterator(
   private final class SortMemoryConsumer(tmm: org.apache.spark.memory.TaskMemoryManager)
       extends org.apache.spark.memory.MemoryConsumer(tmm, tmm.pageSizeBytes(), VectorSortIterator.memoryMode()) {
     override def spill(size: Long, trigger: org.apache.spark.memory.MemoryConsumer): Long =
-      if ((trigger eq this) || !draining || hasNested) 0L else spillResident(size)
+      if ((trigger eq this) || !draining || hasNested) 0L else spillResident(size, 0L)._1
   }
+
+  /**
+   * #868: the runs' heap side in the on-heap pool when the runs themselves are off-heap. A resident run keeps an
+   * `int` permutation per row, and the merge normalises every key of every resident run into a `long` per row (and
+   * a null flag per row where the key has nulls) -- with a pool-sized off-heap budget that is gigabytes of heap per
+   * executor, which a small heap cannot hold (q14a at 10 TB with a 20g heap). A refusal spills like the native one.
+   * With an on-heap pool the native consumer is already on-heap, and the heap side rides on its cap.
+   */
+  private lazy val heapBytesPerRow: Long = 4L + 9L * keyExprs.length
+  private val heapConsumer: HeapSideConsumer =
+    if (VectorSortIterator.memoryMode() != org.apache.spark.memory.MemoryMode.OFF_HEAP) null
+    else Option(TaskContext.get()).map(tc => new HeapSideConsumer(tc.taskMemoryManager())).orNull
+  private var heapReserved = 0L
+  private var residentHeap = 0L
+
+  private final class HeapSideConsumer(tmm: org.apache.spark.memory.TaskMemoryManager)
+      extends org.apache.spark.memory.MemoryConsumer(
+        tmm,
+        tmm.pageSizeBytes(),
+        org.apache.spark.memory.MemoryMode.ON_HEAP
+      ) {
+    override def spill(size: Long, trigger: org.apache.spark.memory.MemoryConsumer): Long =
+      if ((trigger eq this) || !draining || hasNested) 0L else spillResident(0L, size)._2
+  }
+
+  private def holdHeap(bytes: Long): Boolean = {
+    if (heapConsumer == null || bytes <= heapReserved) return true
+    heapReserved += heapConsumer.acquireMemory(bytes - heapReserved)
+    heapReserved >= bytes
+  }
+
+  private def releaseHeapTo(bytes: Long): Unit =
+    if (heapConsumer != null && heapReserved > bytes) {
+      val give = heapReserved - math.max(bytes, 0L)
+      heapConsumer.freeMemory(give)
+      heapReserved -= give
+    }
 
   /** Holds `bytes` of the pool for the sort, acquiring what is missing; false when the pool grants less. */
   private def hold(bytes: Long): Boolean = {
@@ -193,21 +237,28 @@ private[vecruntime] class VectorSortIterator(
       reserved -= give
     }
 
-  /** Spills sealed in-memory runs, the largest first, until `size` bytes are freed; the bytes freed. */
-  private def spillResident(size: Long): Long = {
+  /**
+   * Spills sealed in-memory runs, the largest first, until `size` native bytes and `heapSize` heap bytes are freed;
+   * the native and heap bytes freed.
+   */
+  private def spillResident(size: Long, heapSize: Long): (Long, Long) = {
     var freed = 0L
+    var heapFreed = 0L
     val inMemory = runs.indices.collect { case i if runs(i).isInstanceOf[MemoryRun] => i }
       .sortBy(i => -runs(i).asInstanceOf[MemoryRun].bytes)
     val it = inMemory.iterator
-    while (freed < size && it.hasNext) {
+    while ((freed < size || heapFreed < heapSize) && it.hasNext) {
       val i = it.next()
       val r = runs(i).asInstanceOf[MemoryRun]
       runs(i) = spill(r)
       residentBytes -= r.bytes
+      residentHeap -= r.heapBytes
       freed += r.bytes
+      heapFreed += r.heapBytes
     }
     if (freed > 0) releaseTo(reserved - freed)
-    freed
+    if (heapFreed > 0) releaseHeapTo(heapReserved - heapFreed)
+    (freed, heapFreed)
   }
 
   /** Runs written to disk and their bytes, for the operator's description and the tests. */
@@ -342,14 +393,20 @@ private[vecruntime] class VectorSortIterator(
         val run = new MemoryRun(cols, keys, runTotal, bytes, runArena, builders)
         total += runTotal
         residentBytes += bytes
-        // Past the budget -- the cap, or what the pool grants this task (#867) -- the newest run goes to disk in
-        // sorted order and its memory is returned, then the largest resident runs until the rest fit.
-        if (!hasNested && (residentBytes > spillLimit || !hold(residentBytes))) {
+        residentHeap += run.heapBytes
+        // Past the budget -- the cap, or what the pool grants this task (#867), native or heap side (#868) -- the
+        // newest run goes to disk in sorted order and its memory is returned, then the largest resident runs until
+        // the rest fit.
+        if (!hasNested && (residentBytes > spillLimit || !hold(residentBytes) || !holdHeap(residentHeap))) {
           runs += spill(run)
           residentBytes -= bytes
+          residentHeap -= run.heapBytes
           val allowed = if (consumer == null) spillLimit else math.min(spillLimit, reserved)
-          if (residentBytes > allowed) spillResident(residentBytes - allowed)
+          val heapAllowed = if (heapConsumer == null) Long.MaxValue else heapReserved
+          if (residentBytes > allowed || residentHeap > heapAllowed)
+            spillResident(math.max(0L, residentBytes - allowed), math.max(0L, residentHeap - heapAllowed))
           releaseTo(residentBytes)
+          releaseHeapTo(residentHeap)
         } else {
           runs += run
         }
@@ -530,6 +587,7 @@ private[vecruntime] class VectorSortIterator(
       runs.foreach(_.close())
       runs.clear()
       releaseTo(0L)
+      releaseHeapTo(0L)
       allocator.close()
     }
   }
