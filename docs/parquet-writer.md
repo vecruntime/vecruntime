@@ -117,9 +117,16 @@ fallback list:
 - **Size:** the v2 files are 23% smaller on snappy and 5% smaller on zstd. Our snappy output is already as small as Spark's zstd output.
 - **Where the CPU goes** (executor JFR): mostly dictionary encoding of the fixed-width columns, then RLE / bit packing. Compression (1.7%) and the S3A upload (2.6%) take little.
 
-**Partitioned writes:** a partitioned 1 TB write (`DISTRIBUTE BY ss_sold_date_sk`, then `partitionBy`) does not complete under VecRuntime yet.
-- Executors are killed for exceeding their container memory in the stage after that shuffle.
-- This happens with this writer and with Spark's writer, so the cause is upstream of the writer.
+**Partitioned writes** (1 TB `store_sales`, snappy, `DISTRIBUTE BY ss_sold_date_sk`, then `partitionBy("ss_sold_date_sk")`; same cluster, one run each):
+
+| Source | This writer | Spark's writer under VecRuntime | Plain Spark |
+|---|---|---|---|
+| `WHERE ss_sold_date_sk IS NOT NULL` | **324 s**, 100.4 GB | -- | 542 s, 137.6 GB |
+| all rows | 1137 s, 104.1 GB | 1657 s, 135.2 GB | 985 s, 143.0 GB |
+| all rows, `spark.vecruntime.sort.spillBytes=64m`, `sort.runRows=131072` | 653 s | 1043 s | -- |
+
+- With all rows, the wall time is the one task that receives every null `ss_sold_date_sk` row. At the default sort budget, that task makes VecRuntime slower than plain Spark.
+- These writes used to fail with container OOMs, with this writer and with Spark's. The cause was the sort that `V1Writes` plans before the write: its native runs held about 4x their budget. #870 and #871 fixed that.
 
 JMH `ParquetWriteBenchmark`, 262,144 `store_sales`-shaped rows, uncompressed, output discarded (shared
 x86 host, indicative): ours 4,085 rows/ms before the per-lane write loops and about 4,700 after them, parquet-java v2 1,160,
