@@ -64,9 +64,4 @@ public final class NativeParquetColumnReader extends LeafColumnReader implements
         }
         return io.vecruntime.spark.arrow.ArrowOutput.wrap(v, sparkType);
     }
-
-    @Override
-    public void setRebase(ParquetRebase rebase) {
-        super.setRebase(rebase);
-    }
 }

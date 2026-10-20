@@ -638,7 +638,7 @@ public final class NativeParquetTreeReader implements NativeParquetColumn, RowLe
      * item 6).
      */
     @Override
-    public void setRebase(ParquetRebase rebase) {
+    public void setRebase(io.vecruntime.parquet.read.CalendarRebase rebase) {
         for (Leaf l : leaves) {
             l.reader.setRebase(rebase);
         }

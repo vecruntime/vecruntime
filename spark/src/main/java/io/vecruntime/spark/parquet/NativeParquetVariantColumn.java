@@ -173,7 +173,7 @@ public final class NativeParquetVariantColumn implements NativeParquetColumn {
     }
 
     @Override
-    public void setRebase(ParquetRebase rebase) {
+    public void setRebase(io.vecruntime.parquet.read.CalendarRebase rebase) {
         inner.setRebase(rebase);
     }
 

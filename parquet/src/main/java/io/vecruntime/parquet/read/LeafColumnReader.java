@@ -73,7 +73,7 @@ import org.apache.parquet.column.values.bitpacking.Packer;
  * <p>Not thread safe: one reader per column per task. Slice 1 supports {@code
  * PLAIN} and {@code RLE_DICTIONARY}/{@code PLAIN_DICTIONARY} value encodings.
  */
-public class LeafColumnReader implements RowLevels {
+public class LeafColumnReader implements ColumnReader, RowLevels {
 
     private final ColumnDescriptor column;
     private final VecType type;
@@ -361,6 +361,7 @@ public class LeafColumnReader implements RowLevels {
         return u;
     }
 
+    @Override
     public void startRowGroup(org.apache.parquet.column.page.PageReadStore store, int rows) {
         setRanges(store.getRowIndexes(), rows);
         startPages(store.getPageReader(column), rows);
@@ -497,6 +498,7 @@ public class LeafColumnReader implements RowLevels {
     }
 
     /** {@link #release(FieldVector)} for a batch handle. */
+    @Override
     public void release(Object batch) {
         release((FieldVector) batch);
     }
@@ -592,11 +594,13 @@ public class LeafColumnReader implements RowLevels {
 
     /**
      * Emit a string column's dictionary-encoded batches as dictionary ids over
-     * the row group's dictionary ({@link #dictionaryOf} names it; Spark wraps an id batch as a {@code
-     * VectorDictionaryColumnVector}), so the operators above compute on ids, as
-     * they do over Spark's scan. Only for a UTF8 string column read through the
-     * UTF8 path (not binary, not a fixed-length or byte-array decimal).
+     * the row group's dictionary ({@link #dictionaryOf} names it; Spark wraps
+     * an id batch as a {@code VectorDictionaryColumnVector}), so the operators
+     * above compute on ids, as they do over Spark's scan. Only for a UTF8
+     * string column read through the UTF8 path (not binary, not a fixed-length
+     * or byte-array decimal).
      */
+    @Override
     public void setDictionaryIds(boolean enabled) {
         boolean ok = enabled
                 && type == VecType.UTF8
@@ -655,6 +659,7 @@ public class LeafColumnReader implements RowLevels {
     }
 
     /** Rows still unemitted in the current row group. */
+    @Override
     public int rowsRemaining() {
         if (rangeStart != null) {
             return selectedRows - selectedDone;
@@ -680,6 +685,7 @@ public class LeafColumnReader implements RowLevels {
      * intermediate copies" requirement. UTF8 stays on the staging path (its two
      * passes already size one data buffer and bulk-copy offsets+bytes once).
      */
+    @Override
     public FieldVector readBatch(int n) {
         if (rangeStart != null) {
             return readFiltered(n);
@@ -1131,6 +1137,7 @@ public class LeafColumnReader implements RowLevels {
      * run of one or a few rows -- costs more than it saves (1 TB q44: twice the
      * executor time at ~0.1% scattered survivors).
      */
+    @Override
     public boolean decodesSelectedFaster() {
         return type == VecType.UTF8 && rangeStart == null;
     }
@@ -1139,6 +1146,7 @@ public class LeafColumnReader implements RowLevels {
      * Skips the next {@code n} rows of the row group without decoding them into
      * any vector.
      */
+    @Override
     public void skipRows(int n) {
         if (repeated) {
             skipEntries(n, entriesForRows(n));
@@ -1164,6 +1172,7 @@ public class LeafColumnReader implements RowLevels {
      * selection excludes them. Runs of unselected rows are skipped in the page
      * streams.
      */
+    @Override
     public FieldVector readBatchSelected(int n, java.lang.foreign.MemorySegment selection) {
         if (rangeStart != null) {
             return readBatch(n); // the batch's selection excludes the other rows
@@ -1327,6 +1336,7 @@ public class LeafColumnReader implements RowLevels {
      * This file's calendar rebase and INT96 conversion (#568 item 6); {@link
      * CalendarRebase#NONE} by default.
      */
+    @Override
     public void setRebase(CalendarRebase rebase) {
         this.rebase = rebase;
     }
@@ -1566,6 +1576,7 @@ public class LeafColumnReader implements RowLevels {
      * How many released vectors the pool keeps (decode-ahead keeps more batches
      * in flight).
      */
+    @Override
     public void setPoolLimit(int limit) {
         synchronized (pool) {
             maxPool = Math.max(1, limit);
@@ -1573,6 +1584,7 @@ public class LeafColumnReader implements RowLevels {
     }
 
     /** #735: see {@link #reuseDecompress} and {@link #ownedView}. */
+    @Override
     public void setReuseDecompress(boolean reuse) {
         this.reuseDecompress = reuse;
     }
@@ -1750,6 +1762,7 @@ public class LeafColumnReader implements RowLevels {
      * Releases the pool. The scratch arena is automatic: the GC frees it once
      * the reader is unreachable. A vector released after this is closed, not pooled.
      */
+    @Override
     public void close() {
         synchronized (pool) {
             closed = true;

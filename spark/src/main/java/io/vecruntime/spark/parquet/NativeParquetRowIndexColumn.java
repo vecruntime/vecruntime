@@ -123,7 +123,7 @@ public final class NativeParquetRowIndexColumn implements NativeParquetColumn {
     }
 
     @Override
-    public void setRebase(ParquetRebase rebase) {
+    public void setRebase(io.vecruntime.parquet.read.CalendarRebase rebase) {
         // Row indexes are not dates or timestamps.
     }
 

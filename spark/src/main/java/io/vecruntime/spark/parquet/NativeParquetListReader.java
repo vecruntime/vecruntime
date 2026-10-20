@@ -15,17 +15,14 @@
  */
 package io.vecruntime.spark.parquet;
 
-import java.lang.foreign.MemorySegment;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.function.BiConsumer;
 
-import io.vecruntime.parquet.read.RowLevels;
+import io.vecruntime.parquet.read.ListColumnReader;
 import io.vecruntime.spark.arrow.VectorNestedColumnVector;
 import org.apache.arrow.memory.BufferAllocator;
-import org.apache.arrow.vector.FieldVector;
 import org.apache.parquet.column.ColumnDescriptor;
-import org.apache.parquet.column.page.PageReadStore;
 import org.apache.parquet.schema.MessageType;
 import org.apache.parquet.schema.Type;
 import org.apache.spark.sql.types.ArrayType;
@@ -57,48 +54,30 @@ import org.apache.spark.sql.vectorized.ColumnVector;
  * lists and lists inside structs repeat more than once or mix repeated and
  * unrepeated leaves; they keep Spark's scan.
  */
-public final class NativeParquetListReader implements NativeParquetColumn, RowLevels {
+public final class NativeParquetListReader extends ListColumnReader implements NativeParquetColumn {
 
     private final DataType type;
+    // The base class's leaf readers, as Spark leaves: wrap() asks each for its column.
     private final NativeParquetColumnReader first; // the element, or the key
     private final NativeParquetColumnReader second; // the value, or null
-    private final int listDef; // the list is present at this level (0: never null)
-    private final int elementDef; // the entry is an element at this level
-    // An array of structs of leaves: one reader per field, in the struct's order (fields[0] is `first`), and the
-    // level at which an element's struct is present (elementDef when the repeated group is the struct itself).
-    // A map of structs (#568): fields[0] is the key, fields[1..] the value struct's fields, and structDef the level
-    // at which an entry's value struct is present.
-    private final NativeParquetColumnReader[] fields;
-    private final int structDef;
-    private int[] rowLevels = new int[0]; // each row's first-entry level, last batch
+    private final NativeParquetColumnReader[] fields; // an array or map of structs: each field's leaf
 
     private NativeParquetListReader(DataType type, NativeParquetColumnReader first, NativeParquetColumnReader second,
             int listDef, int elementDef) {
+        super(type instanceof MapType, first, second, listDef, elementDef);
         this.type = type;
         this.first = first;
         this.second = second;
-        this.listDef = listDef;
-        this.elementDef = elementDef;
         this.fields = null;
-        this.structDef = elementDef;
-        first.setDictionaryIds(false);
-        if (second != null) {
-            second.setDictionaryIds(false);
-        }
     }
 
     private NativeParquetListReader(DataType type, NativeParquetColumnReader[] fields, int listDef,
             int elementDef, int structDef) {
+        super(type instanceof MapType, fields, listDef, elementDef, structDef);
         this.type = type;
         this.first = fields[0];
         this.second = null;
-        this.listDef = listDef;
-        this.elementDef = elementDef;
         this.fields = fields;
-        this.structDef = structDef;
-        for (NativeParquetColumnReader f : fields) {
-            f.setDictionaryIds(false);
-        }
     }
 
     /**
@@ -382,179 +361,9 @@ public final class NativeParquetListReader implements NativeParquetColumn, RowLe
         return false;
     }
 
-    /**
-     * A list batch: its rows, null rows ({@code null}: none), offsets and each
-     * leaf's elements.
-     */
-    private static final class Batch {
-        final int rows;
-        final boolean[] nulls;
-        final int[] offsets;
-        final FieldVector a;
-        final FieldVector b;
-        final FieldVector[] fs; // an array of structs: each field's elements
-        final boolean[] elementNulls; // and its null structs (null: none)
-        final int elements;
-
-        Batch(int rows, boolean[] nulls, int[] offsets,
-              FieldVector a, FieldVector b) {
-            this.rows = rows;
-            this.nulls = nulls;
-            this.offsets = offsets;
-            this.a = a;
-            this.b = b;
-            this.fs = null;
-            this.elementNulls = null;
-            this.elements = 0;
-        }
-
-        Batch(int rows, boolean[] nulls, int[] offsets,
-              FieldVector[] fs, boolean[] elementNulls, int elements) {
-            this.rows = rows;
-            this.nulls = nulls;
-            this.offsets = offsets;
-            this.a = null;
-            this.b = null;
-            this.fs = fs;
-            this.elementNulls = elementNulls;
-            this.elements = elements;
-        }
-    }
-
-    @Override
-    public void startRowGroup(PageReadStore store, int rows) {
-        first.startRowGroup(store, rows);
-        if (second != null) {
-            second.startRowGroup(store, rows);
-        }
-        for (NativeParquetColumnReader f : others()) {
-            f.startRowGroup(store, rows);
-        }
-    }
-
-    @Override
-    public Object readBatch(int n) {
-        int entries = first.entriesForRows(n);
-        int[] r = first.repLevels();
-        int[] d = first.defLevels();
-        int off = first.levelOffset();
-        int[] offsets = new int[n + 1];
-        if (rowLevels.length < n) {
-            rowLevels = new int[n];
-        }
-        boolean[] nulls = null;
-        int row = -1;
-        int count = 0;
-        boolean[] elementNulls = null;
-        for (int k = 0; k < entries; k++) {
-            int def = d[off + k];
-            if (r[off + k] == 0) {
-                row++;
-                offsets[row] = count;
-                rowLevels[row] = def;
-                if (def < listDef) {
-                    if (nulls == null) {
-                        nulls = new boolean[n];
-                    }
-                    nulls[row] = true;
-                }
-            }
-            if (def >= elementDef) {
-                if (fields != null && !(type instanceof MapType) && def < structDef) {
-                    if (elementNulls == null) {
-                        elementNulls = new boolean[entries];
-                    }
-                    elementNulls[count] = true;
-                }
-                count++;
-            }
-        }
-        if (row != n - 1) {
-            throw new IllegalStateException("a list column ended at row " + (row + 1) + " of " + n);
-        }
-        offsets[n] = count;
-        if (fields != null) {
-            FieldVector[] fs = new FieldVector[fields.length];
-            try {
-                fs[0] = first.readElements(n, entries, elementDef);
-                for (int i = 1; i < fields.length; i++) {
-                    int e = fields[i].entriesForRows(n);
-                    if (i == 1 && type instanceof MapType) {
-                        // A map's value struct is null where its first field's level is below the struct's; the
-                        // key is required, so its own levels cannot tell.
-                        elementNulls = valueNulls(fields[1], e, count);
-                    }
-                    fs[i] = fields[i].readElements(n, e, elementDef);
-                }
-            } catch (RuntimeException | Error e) {
-                for (int i = 0; i < fs.length; i++) {
-                    fields[i].release(fs[i]);
-                }
-                throw e;
-            }
-            return new Batch(n, nulls, offsets, fs, elementNulls, count);
-        }
-        FieldVector a = first.readElements(n, entries, elementDef);
-        FieldVector b = null;
-        if (second != null) {
-            try {
-                b = second.readElements(n, second.entriesForRows(n), elementDef);
-            } catch (RuntimeException | Error e) {
-                first.release(a);
-                throw e;
-            }
-        }
-        return new Batch(n, nulls, offsets, a, b);
-    }
-
-    /**
-     * The null value structs among a map's next {@code entries} entries ({@code
-     * null}: none).
-     */
-    private boolean[] valueNulls(NativeParquetColumnReader valueField, int entries, int elements) {
-        int[] d = valueField.defLevels();
-        int off = valueField.levelOffset();
-        boolean[] out = null;
-        int at = 0;
-        for (int k = 0; k < entries; k++) {
-            int def = d[off + k];
-            if (def >= elementDef) {
-                if (def < structDef) {
-                    if (out == null) {
-                        out = new boolean[elements];
-                    }
-                    out[at] = true;
-                }
-                at++;
-            }
-        }
-        return out;
-    }
-
-    @Override
-    public Object readBatchSelected(int n, MemorySegment selection) {
-        return readBatch(n);
-    }
-
-    @Override
-    public boolean decodesSelectedFaster() {
-        return false;
-    }
-
-    @Override
-    public void skipRows(int n) {
-        first.skipRows(n);
-        if (second != null) {
-            second.skipRows(n);
-        }
-        for (NativeParquetColumnReader f : others()) {
-            f.skipRows(n);
-        }
-    }
-
     @Override
     public ColumnVector wrap(Object batch) {
-        Batch b = (Batch) batch;
+        ListColumnReader.Batch b = (ListColumnReader.Batch) batch;
         if (fields != null && type instanceof MapType mt) {
             StructType st = (StructType) mt.valueType();
             ColumnVector[] kids = new ColumnVector[fields.length - 1];
@@ -578,100 +387,4 @@ public final class NativeParquetListReader implements NativeParquetColumn, RowLe
         return VectorNestedColumnVector.map((MapType) type, b.rows, b.nulls, b.offsets,
                 first.wrap(b.a), second.wrap(b.b));
     }
-
-    @Override
-    public void release(Object batch) {
-        if (batch != null) {
-            Batch b = (Batch) batch;
-            if (fields != null) {
-                for (int i = 0; i < fields.length; i++) {
-                    fields[i].release(b.fs[i]);
-                }
-                return;
-            }
-            first.release(b.a);
-            if (second != null) {
-                second.release(b.b);
-            }
-        }
-    }
-
-    @Override
-    public void setPoolLimit(int limit) {
-        first.setPoolLimit(limit);
-        if (second != null) {
-            second.setPoolLimit(limit);
-        }
-        for (NativeParquetColumnReader f : others()) {
-            f.setPoolLimit(limit);
-        }
-    }
-
-    @Override
-    public void setReuseDecompress(boolean reuse) {
-        first.setReuseDecompress(reuse);
-        if (second != null) {
-            second.setReuseDecompress(reuse);
-        }
-        for (NativeParquetColumnReader f : others()) {
-            f.setReuseDecompress(reuse);
-        }
-    }
-
-    @Override
-    public void setRebase(ParquetRebase rebase) {
-        first.setRebase(rebase);
-        if (second != null) {
-            second.setRebase(rebase);
-        }
-        for (NativeParquetColumnReader f : others()) {
-            f.setRebase(rebase);
-        }
-    }
-
-    /**
-     * #568: a list's or map's strings are dictionary ids too (#612), where the
-     * leaf allows it: keys, values, elements and the fields of a list of
-     * structs. Spark's getters and the adapters both read a dictionary vector.
-     */
-    @Override
-    public void setDictionaryIds(boolean enabled) {
-        first.setDictionaryIds(enabled);
-        if (second != null) {
-            second.setDictionaryIds(enabled);
-        }
-        for (NativeParquetColumnReader f : others()) {
-            f.setDictionaryIds(enabled);
-        }
-    }
-
-    @Override
-    public int rowsRemaining() {
-        return first.rowsRemaining();
-    }
-
-    @Override
-    public void close() {
-        first.close();
-        if (second != null) {
-            second.close();
-        }
-        for (NativeParquetColumnReader f : others()) {
-            f.close();
-        }
-    }
-
-    /** An array of structs' readers after the first; none otherwise. */
-    private NativeParquetColumnReader[] others() {
-        return fields == null ? new NativeParquetColumnReader[0] : java.util.Arrays.copyOfRange(fields, 1, fields.length);
-    }
-
-    @Override
-    public int[] rowLevels() {
-        return rowLevels;
-    }
-
-    /** Always kept: one store per row while the offsets are built. */
-    @Override
-    public void recordRowLevels() {}
 }
