@@ -30,7 +30,7 @@ import org.apache.spark.sql.SparkSession
  *
  *  - `noop`: Spark's no-op sink. The scan, the source query and the columnar-to-row conversion, no encoding.
  *  - `parquet-<codec>`: Parquet through `FileFormatWriter` with that codec (`snappy`, `zstd`, `lz4_raw`,
- *    `uncompressed`, ...) to `<write-base>/<case>-<iteration>`, deleted after it is measured.
+ *    `uncompressed`, ...) to `<write-base>/<case>-<iteration>`, deleted after it is measured (kept with `--keep`, to make a source for a later run).
  *  - `parquet-<codec>@<col>[+<col>...]`: the same, partitioned by those columns (`partitionBy`).
  *
  * The difference between a Parquet case and `noop` is the write; between `parquet-uncompressed` and a codec,
@@ -61,7 +61,8 @@ object WriteBenchRunner {
       cases: Seq[String] = Seq("noop", "parquet-snappy"),
       iterations: Int = 1,
       label: String = "write",
-      holdSecs: Int = 0
+      holdSecs: Int = 0,
+      keep: Boolean = false
   )
 
   /** Task-level sums of one job group: what the stage metrics of the query runners do not carry for a write. */
@@ -135,7 +136,7 @@ object WriteBenchRunner {
         println(s"[write] $line")
         out.println(line)
         out.flush()
-        if (c != "noop") {
+        if (c != "noop" && !a.keep) {
           val fs = FileSystem.get(new URI(target), spark.sparkContext.hadoopConfiguration)
           fs.delete(new HPath(target), true)
         }
@@ -161,6 +162,7 @@ object WriteBenchRunner {
     case "--iterations" :: v :: rest => parse(rest, a.copy(iterations = v.toInt))
     case "--label" :: v :: rest => parse(rest, a.copy(label = v))
     case "--hold-secs" :: v :: rest => parse(rest, a.copy(holdSecs = v.toInt))
+    case "--keep" :: rest => parse(rest, a.copy(keep = true))
     case "--cluster" :: rest => parse(rest, a)
     case ("--warmup" | "--queries") :: _ :: rest => parse(rest, a)
     case other :: _ => throw new IllegalArgumentException(s"unknown argument $other")

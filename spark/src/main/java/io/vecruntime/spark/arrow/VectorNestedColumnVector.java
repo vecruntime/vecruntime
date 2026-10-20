@@ -84,6 +84,24 @@ public final class VectorNestedColumnVector extends ColumnVector {
     }
 
     /**
+     * Null flags per value ({@code null}: none is null), read in place by the
+     * columnar writer (#842).
+     */
+    public boolean[] nullFlags() {
+        return nulls;
+    }
+
+    /** A list's or map's offsets ({@code length + 1}), {@code null} for a struct. */
+    public int[] offsetArray() {
+        return offsets;
+    }
+
+    /** The element, key and value, or field columns. */
+    public ColumnVector[] childColumns() {
+        return children;
+    }
+
+    /**
      * The Spark column of the nested lane {@code in}, of Spark type {@code dt};
      * owns its children's memory.
      */

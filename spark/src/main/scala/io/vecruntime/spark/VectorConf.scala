@@ -213,6 +213,13 @@ object VectorConf {
   val WriteColumnar = "spark.vecruntime.write.columnar.enabled"
 
   /**
+   * #842: the columnar writer also takes a write whose input is rows (a local relation, a row operator), through
+   * Spark's RowToColumnarExec. Off by default; Spark's own write suites run with it on, so every Parquet write
+   * they make goes through our writer.
+   */
+  val WriteColumnarFromRows = "spark.vecruntime.write.columnar.fromRows"
+
+  /**
    * #735: Iceberg tables read with our native Parquet reader (VectorIcebergScanExec) over Iceberg's own planning:
    * each task group of data files without deletes is decoded by VectorParquetPartitionReader, any other group by
    * Iceberg's reader. Off by default until the TPC-DS Iceberg A/B.
@@ -345,10 +352,48 @@ object VectorConf {
   val DefaultSortSpillBytes: Long = 1L << 30
   def sortSpillBytes(conf: SQLConf, sparkConf: org.apache.spark.SparkConf): Long = {
     val explicit = conf.getConfString(SortSpillBytes, "").trim
+    // #877: with off-heap memory and no explicit setting there is no cap -- the pool's grant is the ceiling and the
+    // task's fair share is only where the sort starts preferring to spill (sortFairShareBytes).
     val v = if (explicit.nonEmpty) org.apache.spark.network.util.JavaUtils.byteStringAsBytes(explicit)
-    else offHeapTaskShare(sparkConf).getOrElse(DefaultSortSpillBytes)
+    else if (offHeapTaskShare(sparkConf).isDefined) Long.MaxValue
+    else overheadTaskShare(sparkConf).fold(DefaultSortSpillBytes)(math.min(DefaultSortSpillBytes, _))
     if (v <= 0) Long.MaxValue else v
   }
+
+  /**
+   * Without off-heap memory the sort's native runs are held against the on-heap pool, which is sized from the heap
+   * and does not bound native memory against `spark.executor.memoryOverhead`, where those runs actually live. At
+   * 1 TB, 30g heap / 20g overhead / 13 cores, the flat 1 GiB budget let the runs reach 17.5 GB native and an
+   * executor was lost in every run; 64 MiB kept it at 6.5 GB. So the default is also bounded by half the task's share
+   * of the overhead left after direct memory: `(memoryOverhead - direct) / (2 * executor.cores)` -- half, because the
+   * runs' malloc arenas hold more than their counted bytes and the overhead also carries the JVM's own native memory;
+   * `direct` is `-XX:MaxDirectMemorySize` from the executor's Java options, or half the overhead when it is not set
+   * (the JVM's default is the heap size, which would leave nothing). At least 64 MiB. None when the overhead is not
+   * set.
+   */
+  def overheadTaskShare(sparkConf: org.apache.spark.SparkConf): Option[Long] =
+    sparkConf.getOption("spark.executor.memoryOverhead").map { o =>
+      val overhead = org.apache.spark.network.util.JavaUtils.byteStringAsBytes(o.trim match {
+        case s if s.nonEmpty && s.forall(_.isDigit) => s + "m" // Spark reads a bare number as MiB
+        case s => s
+      })
+      val direct = "-XX:MaxDirectMemorySize=(\\S+)".r
+        .findFirstMatchIn(sparkConf.get("spark.executor.extraJavaOptions", ""))
+        .map(m => org.apache.spark.network.util.JavaUtils.byteStringAsBytes(m.group(1)))
+        .getOrElse(overhead / 2)
+      val cores = math.max(1, sparkConf.getInt("spark.executor.cores", 1))
+      math.max(64L << 20, (overhead - direct) / (2L * cores))
+    }
+
+  /**
+   * #877: the sort's soft spill trigger with off-heap memory and no explicit `spark.vecruntime.sort.spillBytes`: the
+   * task's fair share of the pool ([[offHeapTaskShare]]), past which resident runs spill unless the pool has room
+   * to spare -- the sort may grow by half of the pool's free bytes past it, so a task alone on an idle executor uses
+   * what is free while one among busy siblings stays near its share. 0 when not applicable (an explicit cap or no
+   * off-heap memory: the cap alone decides).
+   */
+  def sortFairShareBytes(conf: SQLConf, sparkConf: org.apache.spark.SparkConf): Long =
+    if (conf.getConfString(SortSpillBytes, "").trim.nonEmpty) 0L else offHeapTaskShare(sparkConf).getOrElse(0L)
 
   /**
    * #868: a task's fair share of the off-heap execution pool, `spark.memory.offHeap.size /
@@ -531,8 +576,30 @@ object VectorConf {
     else DefaultJoinSpillBytes
     if (v <= 0) Long.MaxValue else v
   }
+
+  /**
+   * #875: what a shuffled hash join's build side may hold in memory before it buckets to disk: `joinSpillBytes`, but
+   * never past the task's fair share of the off-heap pool (`offHeapTaskShare`), so a build that cannot be asked to
+   * give memory back does not win the race to the pool and pin more than its share.
+   */
+  def joinBuildAdmissionBytes(conf: SQLConf, sparkConf: org.apache.spark.SparkConf): Long =
+    offHeapTaskShare(sparkConf).fold(joinSpillBytes(conf, sparkConf))(math.min(joinSpillBytes(conf, sparkConf), _))
   def joinSpillBuckets(conf: SQLConf): Int =
     scala.util.Try(conf.getConfString(JoinSpillBuckets, "").trim.toInt).toOption.getOrElse(32)
+
+  /**
+   * #868: the executor's cap on Arrow memory (size string; `0`, the default, for none). Every Arrow buffer of the
+   * plugin -- the Flight shuffle's server and client, the shuffle readers, the operators' output vectors -- comes from
+   * one root allocator per executor, and past the cap an allocation fails (the task fails and is retried) instead of
+   * the container being OOM-killed. Not part of `spark.memory.offHeap.size`: size it inside the memory overhead
+   * (about 1 GB per executor was the Flight shuffle's share at 10 TB, #840). Read once, when the executor starts.
+   */
+  val ArrowMaxBytes = "spark.vecruntime.arrow.maxBytes"
+  def arrowMaxBytes(sparkConf: org.apache.spark.SparkConf): Long =
+    org.apache.spark.network.util.JavaUtils.byteStringAsBytes(sparkConf.get(ArrowMaxBytes, "0").trim match {
+      case "" => "0"
+      case s => s
+    })
 
   /**
    * The most a sort-merge join's build side may weigh per task, by statistics, for `mode=auto` to
@@ -585,6 +652,7 @@ object VectorConf {
 
   /** #64: the columnar Parquet writer, off by default. */
   def writeColumnar(conf: SQLConf): Boolean = bool(conf, WriteColumnar, default = false)
+  def writeColumnarFromRows(conf: SQLConf): Boolean = bool(conf, WriteColumnarFromRows, default = false)
 
   /** #735: VectorIcebergScanExec, behind the native Parquet scan's own switch too. */
   def scanNativeIceberg(conf: SQLConf): Boolean =

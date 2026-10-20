@@ -63,12 +63,18 @@ final class BinaryChunkWriter implements ChunkWriter {
     private final boolean dictionaryEnabled;
 
     private PageWriter pages;
+    private final ParquetProperties props;
+    // The chunk's Bloom filter and where it goes at the end of the chunk; null when the column has none.
+    private org.apache.parquet.column.values.bloomfilter.BloomFilterWriter bloomWriter;
+    private org.apache.parquet.column.values.bloomfilter.BloomFilter bloom;
 
     // The page being built.
     private long[] pageValidity = new long[64];
     private int[] ids = new int[4096];
     private int pageRows;
     private int pageValues;
+    // The page's value bytes before encoding, for its size statistics.
+    private long pageDataBytes;
     private final ByteSink plain = new ByteSink(64 * 1024);
     private byte[] min;
     private byte[] max;
@@ -100,6 +106,7 @@ final class BinaryChunkWriter implements ChunkWriter {
 
     BinaryChunkWriter(ColumnDescriptor column, ParquetProperties props) {
         this.column = column;
+        this.props = props;
         this.optional = column.getMaxDefinitionLevel() > 0;
         this.pageSize = props.getPageSizeThreshold();
         this.pageRowLimit = props.getPageRowCountLimit();
@@ -108,10 +115,13 @@ final class BinaryChunkWriter implements ChunkWriter {
     }
 
     @Override
-    public void startChunk(PageWriter pageWriter) {
+    public void startChunk(PageWriter pageWriter, org.apache.parquet.column.values.bloomfilter.BloomFilterWriter blooms) {
+        this.bloomWriter = blooms;
+        this.bloom = blooms == null ? null : ChunkBloom.newFilter(column, props);
         this.pages = pageWriter;
         pageRows = 0;
         pageValues = 0;
+        pageDataBytes = 0;
         plain.reset();
         min = null;
         max = null;
@@ -152,6 +162,11 @@ final class BinaryChunkWriter implements ChunkWriter {
             int src = inIds != null ? inIds.get(LE_INT, (long) i << 2) : i;
             int start = offsets.get(LE_INT, (long) src << 2);
             int len = offsets.get(LE_INT, (long) (src + 1) << 2) - start;
+            pageDataBytes += len;
+            if (bloom != null) {
+                bloom.insertHash(bloom.hash(org.apache.parquet.io.api.Binary.fromConstantByteBuffer(data.asSlice(start, len)
+                        .asByteBuffer())));
+            }
             if (dictionary) {
                 int id;
                 if (inIds != null) {
@@ -371,10 +386,16 @@ final class BinaryChunkWriter implements ChunkWriter {
                 BytesInput.from(levels.toByteArray()),
                 valuesEncoding,
                 BytesInput.from(body.toByteArray()),
-                s);
+                s,
+                // Size statistics (Parquet 2.10): the page's unencoded value bytes and,
+                // for a flat column, no level histograms -- as parquet-java writes them.
+                new org.apache.parquet.column.statistics.SizeStatistics(column.getPrimitiveType(), pageDataBytes, java.util.List.of(),
+                        java.util.List.of()),
+                null); // no geospatial statistics
         Arrays.fill(pageValidity, 0, (pageRows + 63) >>> 6, 0L);
         pageRows = 0;
         pageValues = 0;
+        pageDataBytes = 0;
         plain.reset();
         min = null;
         max = null;
@@ -438,6 +459,9 @@ final class BinaryChunkWriter implements ChunkWriter {
     @Override
     public void endChunk() throws IOException {
         flushPage();
+        if (bloom != null) {
+            bloomWriter.writeBloomFilter(bloom);
+        }
         if (dictionaryPagesWritten > 0) {
             ByteSink d = new ByteSink((int) dictionaryByteSize);
             MemorySegment entries = entryBytes.segment();

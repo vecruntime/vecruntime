@@ -134,7 +134,8 @@ case class VectorWriteFilesExec(
           sortMetric("sortTime")
         ),
         VectorConf.sortRunRows(conf),
-        VectorConf.sortSpillBytes(conf, sparkContext.getConf)
+        VectorConf.sortSpillBytes(conf, sparkContext.getConf),
+        VectorSortIterator.memoryMode(sparkContext.getConf) // #879: the runs' pool, resolved at plan time
       )
     }
     val committer = writeFilesSpec.committer
@@ -171,7 +172,6 @@ object VectorWritePlanner {
 
   /** Hadoop / Parquet options the prototype does not reproduce: the write keeps Spark's writer. */
   private val UnsupportedOptions = Seq(
-    "parquet.bloom.filter.enabled",
     "parquet.crypto.factory.class",
     "parquet.encryption.kms.client.class"
   )
@@ -184,14 +184,22 @@ object VectorWritePlanner {
       concurrentKeysReason(w, conf)
     } else if (w.options.contains(BucketingUtils.optionForHiveCompatibleBucketWrite)) {
       Some("columnar write: Hive-compatible bucketing is not supported yet (#842)")
-    } else if (!w.child.supportsColumnar) {
+    } else if (!w.child.supportsColumnar && !io.vecruntime.spark.VectorConf.writeColumnarFromRows(conf)) {
       Some(s"columnar write: child ${w.child.nodeName} is not columnar")
     } else {
       val hadoopConf = session.sessionState.newHadoopConfWithOptions(w.options)
       def option(k: String): Option[String] = w.options.get(k).orElse(Option(hadoopConf.get(k)))
       val options = UnsupportedOptions.find(k => option(k).exists(v => v != "false"))
+      // The per-column options the writer reads (#842); any other `parquet.*#<column>` key keeps Spark's writer.
+      val readPerColumn = Seq(
+        ParquetOutputFormat.ENABLE_DICTIONARY,
+        ParquetOutputFormat.BLOOM_FILTER_ENABLED,
+        ParquetOutputFormat.BLOOM_FILTER_EXPECTED_NDV,
+        ParquetOutputFormat.BLOOM_FILTER_FPP,
+        ParquetOutputFormat.BLOOM_FILTER_CANDIDATES_NUMBER
+      ).map(_ + "#")
       lazy val perColumn = (hadoopConf.iterator().asScala.map(_.getKey) ++ w.options.keys)
-        .find(k => k.startsWith("parquet.") && k.contains("#"))
+        .find(k => k.startsWith("parquet.") && k.contains("#") && !readPerColumn.exists(k.startsWith))
       // The columnar writer writes Parquet v2 only (data page v2, the v2 encodings); a write that asks for v1 by
       // name keeps Spark's writer.
       val v1 =
@@ -257,6 +265,15 @@ object VectorWritePlanner {
       case d: DecimalType if d.precision <= Decimal.MAX_LONG_DIGITS && conf.writeLegacyParquetFormat =>
         Some(s"columnar write: column $name is a decimal(${d.precision},${d.scale}) and writeLegacyFormat is on")
       case _: DecimalType => None
+      // Structs, arrays and maps (#842) in Spark's standard layout, of the types above.
+      case _: StructType | _: ArrayType | _: MapType if conf.writeLegacyParquetFormat =>
+        Some(s"columnar write: column $name is nested and writeLegacyFormat is on")
+      case s: StructType if s.isEmpty => Some(s"columnar write: column $name is an empty struct")
+      case s: StructType =>
+        s.fields.iterator.flatMap(f => typeReason(s"$name.${f.name}", f.dataType, conf)).nextOption()
+      case a: ArrayType => typeReason(s"$name.element", a.elementType, conf)
+      case m: MapType =>
+        typeReason(s"$name.key", m.keyType, conf).orElse(typeReason(s"$name.value", m.valueType, conf))
       case other => Some(s"columnar write: column $name has type ${other.simpleString}, not supported yet (#842)")
     }
   }
@@ -291,6 +308,19 @@ private[vecruntime] object VectorWriteTask {
     }
     committer.setupTask(taskAttemptContext)
     var dataWriter: FileFormatDataWriter with VectorBatchWriter = null
+    // As FileFormatDataWriter.enrichWriteError around its writes: a fetch failure as it is; a file that already
+    // exists as the fast-fail exception under spark.sql.execution.fastFailOnFileFormatOutput, else, as any other
+    // error of the writer, TASK_WRITE_FAILED. An error computing the input (the batches) propagates as it is.
+    def write(f: => Unit): Unit =
+      try f
+      catch {
+        case e: org.apache.spark.shuffle.FetchFailedException => throw e
+        case e: org.apache.hadoop.fs.FileAlreadyExistsException
+            if org.apache.spark.sql.internal.SQLConf.get.fastFailFileFormatOutput =>
+          throw new org.apache.spark.TaskOutputFileAlreadyExistException(e)
+        case t: Throwable =>
+          throw org.apache.spark.sql.errors.QueryExecutionErrors.taskFailedWhileWritingRowsError(description.path, t)
+      }
     Utils.tryWithSafeFinallyAndFailureCallbacks(block = {
       // As Spark: an empty partition other than the first writes no file (the first writes the schema).
       val writeFile = sparkPartitionId == 0 || batches.hasNext
@@ -303,16 +333,17 @@ private[vecruntime] object VectorWriteTask {
       dataWriter match {
         case d: VectorDynamicPartitionDataWriter if concurrent.isDefined =>
           // `sorted` first: a reader may reuse its vectors on `hasNext`, and the pending rows still borrow them.
-          while (!d.sorted && batches.hasNext) d.writeBatch(batches.next(), ordinals)
+          while (!d.sorted && batches.hasNext) { val b = batches.next(); write(d.writeBatch(b, ordinals)) }
           if (d.sorted) {
             // The limit was reached: the rest, sorted, through the same writer (the sort keeps the columns).
             val rest = d.sortedRest(batches)
-            try while (rest.hasNext) d.writeBatch(rest.next(), ordinals)
+            try while (rest.hasNext) { val b = rest.next(); write(d.writeBatch(b, ordinals)) }
             finally rest.close()
           }
         case _ =>
           while (batches.hasNext) {
-            dataWriter.writeBatch(batches.next(), ordinals)
+            val b = batches.next()
+            write(dataWriter.writeBatch(b, ordinals))
           }
       }
       dataWriter.commit()
@@ -402,7 +433,8 @@ private[vecruntime] final case class VectorConcurrentWriters(
     outputAttrs: Array[(String, DataType)],
     metrics: VectorMetrics,
     runRows: Int,
-    spillBytes: Long
+    spillBytes: Long,
+    memoryMode: org.apache.spark.memory.MemoryMode
 )
 
 /** A data writer fed batches: `ordinals` are the data columns' positions in the batch. */
@@ -626,7 +658,8 @@ private[vecruntime] class VectorDynamicPartitionDataWriter(
       c.outputAttrs,
       c.metrics,
       runRows = c.runRows,
-      spillBytes = c.spillBytes
+      spillBytes = c.spillBytes,
+      memoryMode = c.memoryMode
     )
   }
 
@@ -746,11 +779,33 @@ private[vecruntime] object VectorWriteTask2 {
   /** The data columns of `batch` as `VectorBuffers` (at `ordinals`), compacted to its selection; and their rows. */
   def columns(batch: ColumnarBatch, ordinals: Array[Int], arena: Arena): (Array[VectorBuffers], Int) = {
     val rows = batch.numRows()
-    val columns = ordinals.map(o => ColumnVectorAdapters.adapt(batch.column(o), rows, arena))
-    batch match {
-      case s: SelectedColumnarBatch if s.selectedCount() < rows =>
-        (columns.map(c => compact(c, s.selection(), s.selectedCount(), arena)), s.selectedCount())
-      case _ => (columns, rows)
+    val selection = batch match {
+      case s: SelectedColumnarBatch if s.selectedCount() < rows => Some(s)
+      case _ => None
+    }
+    // A struct, array or map column (#842) as its nested lane: read in place from our scan; built from Spark's
+    // getters (plain strings, which the gather below takes) when the batch has a selection to apply.
+    def adapt(o: Int): VectorBuffers = {
+      val cv = batch.column(o)
+      cv.dataType() match {
+        case dt @ (_: StructType | _: ArrayType | _: MapType) if selection.isEmpty =>
+          io.vecruntime.spark.adapter.NestedColumns.adaptForWrite(cv, dt, rows, arena)
+        case dt @ (_: StructType | _: ArrayType | _: MapType) =>
+          io.vecruntime.spark.adapter.NestedColumns.adapt(cv, dt, rows, arena)
+        case _ => ColumnVectorAdapters.adapt(cv, rows, arena)
+      }
+    }
+    val columns = ordinals.map(adapt)
+    selection match {
+      case Some(s) =>
+        lazy val selected = selectedRows(s.selection(), rows, s.selectedCount())
+        val compacted = columns.map { c =>
+          if (c.`type`().isNested())
+            io.vecruntime.spark.expr.ElementAccessExpr.gather(c, selected, s.selectedCount(), arena)
+          else compact(c, s.selection(), s.selectedCount(), arena)
+        }
+        (compacted, s.selectedCount())
+      case None => (columns, rows)
     }
   }
 
@@ -829,7 +884,7 @@ private[vecruntime] class VectorParquetOutputWriter(val filePath: String, dataSc
 
   private val writer: ColumnarParquetWriter = {
     val schema = new SparkToParquetSchemaConverter(conf).convert(dataSchema)
-    val props = ParquetProperties
+    val builder = ParquetProperties
       .builder()
       .withPageSize(ParquetOutputFormat.getPageSize(conf))
       .withDictionaryPageSize(ParquetOutputFormat.getDictionaryPageSize(conf))
@@ -845,7 +900,31 @@ private[vecruntime] class VectorParquetOutputWriter(val filePath: String, dataSc
         conf.getInt("parquet.statistics.truncate.length", ParquetProperties.DEFAULT_STATISTICS_TRUNCATE_LENGTH)
       )
       .withPageWriteChecksumEnabled(ParquetOutputFormat.getPageWriteChecksumEnabled(conf))
-      .build()
+    // Per-column dictionary switches (`parquet.enable.dictionary#<column path>`), as ParquetOutputFormat reads them.
+    val dictionaryPrefix = ParquetOutputFormat.ENABLE_DICTIONARY + "#"
+    conf.iterator().asScala.map(e => e.getKey -> e.getValue).filter(_._1.startsWith(dictionaryPrefix)).foreach {
+      case (k, v) => builder.withDictionaryEncoding(k.substring(dictionaryPrefix.length), v.trim.toBoolean)
+    }
+    // Bloom filters (#842), global and per column, as ParquetOutputFormat reads them.
+    builder
+      .withBloomFilterEnabled(ParquetOutputFormat.getBloomFilterEnabled(conf))
+      .withMaxBloomFilterBytes(ParquetOutputFormat.getBloomFilterMaxBytes(conf))
+      .withAdaptiveBloomFilterEnabled(ParquetOutputFormat.getAdaptiveBloomFilterEnabled(conf))
+    conf.iterator().asScala.map(e => e.getKey -> e.getValue.trim).foreach {
+      case (k, v) if k.startsWith(ParquetOutputFormat.BLOOM_FILTER_ENABLED + "#") =>
+        builder.withBloomFilterEnabled(k.substring(ParquetOutputFormat.BLOOM_FILTER_ENABLED.length + 1), v.toBoolean)
+      case (k, v) if k.startsWith(ParquetOutputFormat.BLOOM_FILTER_EXPECTED_NDV + "#") =>
+        builder.withBloomFilterNDV(k.substring(ParquetOutputFormat.BLOOM_FILTER_EXPECTED_NDV.length + 1), v.toLong)
+      case (k, v) if k.startsWith(ParquetOutputFormat.BLOOM_FILTER_FPP + "#") =>
+        builder.withBloomFilterFPP(k.substring(ParquetOutputFormat.BLOOM_FILTER_FPP.length + 1), v.toDouble)
+      case (k, v) if k.startsWith(ParquetOutputFormat.BLOOM_FILTER_CANDIDATES_NUMBER + "#") =>
+        builder.withBloomFilterCandidatesNumber(
+          k.substring(ParquetOutputFormat.BLOOM_FILTER_CANDIDATES_NUMBER.length + 1),
+          v.toInt
+        )
+      case _ =>
+    }
+    val props = builder.build()
     val footer = Map(
       org.apache.spark.sql.SPARK_VERSION_METADATA_KEY -> SPARK_VERSION_SHORT,
       ParquetReadSupport.SPARK_METADATA_KEY -> conf.get(ParquetWriteSupport.SPARK_ROW_SCHEMA, dataSchema.json)

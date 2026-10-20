@@ -25,7 +25,11 @@ ARG ICEBERG_VERSION=1.12.0
 # Amazon Corretto Crypto Provider (#566): native AES-GCM / SHA-2 / HMAC for the S3 TLS + SigV4 path. On the
 # class path only; a run opts in with -Djava.security.properties=/opt/spark/accp/accp.security.
 ARG ACCP_VERSION=2.5.0
-
+# Arrow's malloc-backed allocation manager (#894), at the Arrow version Spark bundles. Spark ships only the Netty
+# one, whose buffers count against -XX:MaxDirectMemorySize; render-run.sh selects this one on the executors
+# (-Darrow.allocation.manager.type=Unsafe). sha256 of arrow-memory-unsafe-18.3.0.jar on Maven Central.
+ARG ARROW_VERSION=18.3.0
+ARG ARROW_UNSAFE_SHA256=e9652f322d7be306c400ea0d775b3114a11b48d2afe23e8b8566f13c469d5483
 # ---- build: our jars from this repository, dsdgen from tpcds-kit ------------------------------------
 FROM eclipse-temurin:25-jdk AS build
 RUN apt-get update && apt-get install -y --no-install-recommends maven git make gcc libc6-dev bison flex ca-certificates \
@@ -101,6 +105,8 @@ ARG AAL_VERSION
 ARG COMET_VERSION
 ARG ICEBERG_VERSION
 ARG ACCP_VERSION
+ARG ARROW_VERSION
+ARG ARROW_UNSAFE_SHA256
 
 # The packages Spark's own Kubernetes Dockerfile installs (tini for PID 1, gosu for the entrypoint's
 # user switch, krb5/nss for the Hadoop client, procps/net-tools for diagnostics).
@@ -147,7 +153,10 @@ RUN cd /opt/spark/jars \
     && curl -fsSLO "https://repo1.maven.org/maven2/org/apache/spark/spark-sql_2.13/${SPARK_VERSION}/spark-sql_2.13-${SPARK_VERSION}-tests.jar" \
     && curl -fsSLO "https://repo1.maven.org/maven2/org/apache/spark/spark-hadoop-cloud_2.13/${SPARK_VERSION}/spark-hadoop-cloud_2.13-${SPARK_VERSION}.jar" \
     && case "$(uname -m)" in aarch64) ACCP_ARCH=linux-aarch_64 ;; *) ACCP_ARCH=linux-x86_64 ;; esac \
-    && curl -fsSLO "https://repo1.maven.org/maven2/software/amazon/cryptools/AmazonCorrettoCryptoProvider/${ACCP_VERSION}/AmazonCorrettoCryptoProvider-${ACCP_VERSION}-${ACCP_ARCH}.jar"
+    && curl -fsSLO "https://repo1.maven.org/maven2/software/amazon/cryptools/AmazonCorrettoCryptoProvider/${ACCP_VERSION}/AmazonCorrettoCryptoProvider-${ACCP_VERSION}-${ACCP_ARCH}.jar" \
+    && curl -fsSLO "https://repo1.maven.org/maven2/org/apache/arrow/arrow-memory-unsafe/${ARROW_VERSION}/arrow-memory-unsafe-${ARROW_VERSION}.jar" \
+    && echo "${ARROW_UNSAFE_SHA256}  arrow-memory-unsafe-${ARROW_VERSION}.jar" | sha256sum -c - \
+    && test -f "arrow-memory-core-${ARROW_VERSION}.jar"
 COPY benchmarks/k8s/accp.security /opt/spark/accp/accp.security
 
 COPY --from=build /src/benchmarks/target/benchmarks.jar /opt/spark/jars/benchmarks.jar
@@ -172,7 +181,8 @@ RUN chmod g+w /opt/spark/work-dir && chown -R spark:spark /opt/spark/work-dir /o
 COPY benchmarks/k8s/aot/aot-env.sh benchmarks/k8s/aot/train.sh benchmarks/k8s/aot/assemble.sh /opt/spark/aot/
 RUN ls /opt/spark/jars/*.jar | LC_ALL=C sort | paste -sd: > /opt/spark/aot/classpath \
     && chmod a+rx /opt/spark/aot/*.sh && /opt/spark/aot/train.sh aot-smoke/executor.aot --rounds 1 \
-    && rm -r aot-smoke && chmod a+r /opt/spark/aot/classpath
+    && rm -r aot-smoke && chmod a+r /opt/spark/aot/classpath \
+    && grep -q arrow-memory-unsafe /opt/spark/aot/classpath
 # The executor's class path from entrypoint.sh carries its conf directory (on Kubernetes a mounted
 # ConfigMap with spark.properties), its working directory (where the executor fetches the job's jars)
 # and empty entries (the working directory again), and the JDK's AOT cache / CDS refuses a non-empty

@@ -197,10 +197,15 @@ class ColumnarParquetWriterTest {
         return Binary.fromConstantByteArray(out);
     }
 
-    private static ParquetProperties props() {
+    // Bloom filters for the test that compares them: every column, an expected NDV for `l`.
+    private boolean blooms;
+
+    private ParquetProperties props() {
         return ParquetProperties.builder()
                 .withPageSize(64 * 1024)
                 .withDictionaryPageSize(64 * 1024)
+                .withBloomFilterEnabled(blooms)
+                .withBloomFilterNDV("l", 5_000)
                 .build();
     }
 
@@ -234,6 +239,8 @@ class ColumnarParquetWriterTest {
                 .withRowGroupSize(rowGroupSize)
                 .withPageSize(64 * 1024)
                 .withDictionaryPageSize(64 * 1024)
+                .withBloomFilterEnabled(blooms)
+                .withBloomFilterNDV("l", 5_000)
                 .build()) {
             for (Row r : rows) {
                 Group g = f.newGroup();
@@ -375,6 +382,14 @@ class ColumnarParquetWriterTest {
         return out;
     }
 
+    private static String d(org.apache.parquet.column.statistics.SizeStatistics s) {
+        return s == null ? "null" : s.getUnencodedByteArrayDataBytes()
+                + " rep="
+                + s.getRepetitionLevelHistogram()
+                + " def="
+                + s.getDefinitionLevelHistogram();
+    }
+
     @Test
     void sameChunkStatisticsAndEncodings() throws Exception {
         List<Row> rows = rows(20_000, 2);
@@ -396,11 +411,55 @@ class ColumnarParquetWriterTest {
             assertEquals(sy.getNumNulls(), sx.getNumNulls(), col);
             assertEquals(sy.genericGetMin(), sx.genericGetMin(), col);
             assertEquals(sy.genericGetMax(), sx.genericGetMax(), col);
+            assertEquals(d(y.getSizeStatistics()), d(x.getSizeStatistics()), col + ": size statistics");
         }
         assertEquals("vecruntime",
                 ours.getFileMetaData()
                     .getKeyValueMetaData()
                     .get("writer"));
+    }
+
+    /**
+     * Bloom filters on every column, sized from an expected NDV for {@code l}
+     * and from the maximum size for the rest: each chunk's filter is the bitset
+     * parquet-java writes, on the fast writers and on parquet-java's.
+     */
+    @Test
+    void sameBloomFiltersAsParquetJava() throws Exception {
+        blooms = true;
+        try {
+            List<Row> rows = rows(20_000, 3);
+            org.apache.hadoop.fs.Path ours = writeOurs(rows, 4096, 128L << 20);
+            org.apache.hadoop.fs.Path theirs = writeParquetJava(rows, 128L << 20);
+            try (ParquetFileReader a = ParquetFileReader.open(HadoopInputFile.fromPath(ours, conf));
+                 ParquetFileReader b = ParquetFileReader.open(HadoopInputFile.fromPath(theirs, conf))) {
+                BlockMetaData ba = a.getFooter()
+                                    .getBlocks()
+                                    .get(0);
+                BlockMetaData bb = b.getFooter()
+                                    .getBlocks()
+                                    .get(0);
+                var ra = a.getBloomFilterDataReader(ba);
+                var rb = b.getBloomFilterDataReader(bb);
+                int filters = 0;
+                for (int c = 0; c < bb.getColumns().size(); c++) {
+                    String col = bb.getColumns()
+                                   .get(c)
+                                   .getPath()
+                                   .toDotString();
+                    var fb = rb.readBloomFilter(bb.getColumns()
+                            .get(c));
+                    var fa = ra.readBloomFilter(ba.getColumns()
+                            .get(c));
+                    // parquet-java writes no filter for a chunk whose pages are all dictionary-encoded.
+                    filters += fb == null ? 0 : 1;
+                    assertEquals(fb, fa, col + ": bloom filter");
+                }
+                assertTrue(filters >= 3, "chunks with a filter: " + filters);
+            }
+        } finally {
+            blooms = false;
+        }
     }
 
     @Test

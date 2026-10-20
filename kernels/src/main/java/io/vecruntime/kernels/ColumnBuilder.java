@@ -96,10 +96,13 @@ public final class ColumnBuilder implements AutoCloseable {
 
     /**
      * The arena a new (or grown) buffer goes into: the caller's, or a fresh one
-     * of this builder's.
+     * of this builder's. #840: not a shared one -- closing a shared arena is a
+     * handshake with every thread of the JVM, and an owning builder closes one on
+     * every doubling. #869: from the {@link NativePool}, so the doubling's
+     * buffers are reused instead of a malloc each.
      */
     private Arena freshArena() {
-        return owned == null ? arena : Arena.ofShared();
+        return owned == null ? arena : NativePool.shared().newArena();
     }
 
     /**

@@ -414,6 +414,108 @@ class VectorWriteSuite extends VectorQuerySuite {
     }
   }
 
+  test("structs, arrays and maps (#842): columnar, the same Parquet schema and rows as Spark's") {
+    // Nulls at every level, empty arrays and maps, a list of structs holding a list, every leaf type the flat
+    // writer takes (INT96 timestamps, the three decimal widths, float, binary), and a filter (a selection).
+    val nested = (s: SparkSession) =>
+      wide(s).selectExpr(
+        "i",
+        "IF(i % 9 = 0, NULL, named_struct('a', i, 'b', s, 'ts', ts, 'dec7', dec7, 'dec30', dec30)) AS st",
+        "CASE WHEN i % 5 = 0 THEN NULL WHEN i % 5 = 1 THEN array() ELSE array(l, NULL, l + 1) END AS arr",
+        "CASE WHEN i % 7 = 0 THEN NULL WHEN i % 7 = 1 THEN map() ELSE map(coalesce(s, 'x'), dec15, 'k', NULL) END AS m",
+        "array(named_struct('x', by, 'ys', IF(i % 4 = 0, NULL, array(s, cast(b as string))), 'f', f), NULL) AS deep",
+        "array(array(sh), array(), NULL) AS aa",
+        "map(i, named_struct('d', dt, 'bin', cast(s as binary))) AS ms"
+      )
+    // Written once by Spark, then read by our scan (nested columns) and written by both writers.
+    val src = newTempPath("write/nested-src")
+    withPlugin(enabled = false)(nested(spark).write.mode("overwrite").parquet(src))
+    val (plan, footers) = compareWrites("nested", s => s.read.parquet(src).where("i % 11 <> 3"))
+    assert(hasVectorWrite(plan), s"${plan.treeString}\n${fallbackReasons(plan)}")
+    assert(footers.head.getFileMetaData.getSchema.getColumns.asScala.exists(_.getMaxRepetitionLevel == 2))
+    // Partitioned: the runs of a batch, cut at partition boundaries, slice the nested lanes too.
+    val (pp, _) = compareWrites(
+      "nested-part",
+      s => s.read.parquet(src).selectExpr("*", "i % 3 AS pk"),
+      partitionBy = Seq("pk")
+    )
+    assert(hasVectorWrite(pp), s"${pp.treeString}\n${fallbackReasons(pp)}")
+  }
+
+  test("parquet.enable.dictionary#<column>: the column named is written without a dictionary, as Spark writes it") {
+    val (plan, ours) =
+      compareWrites(
+        "dict-col",
+        s => s.table("t").selectExpr("i % 10 AS k", "s", "l"),
+        Map("parquet.enable.dictionary#s" -> "false")
+      )
+    assert(hasVectorWrite(plan), s"${plan.treeString}\n${fallbackReasons(plan)}")
+    // Spark's writer writes v1 by default, so the encodings differ; which columns use a dictionary does not.
+    def dictionary(f: ParquetMetadata): Map[String, Boolean] =
+      f.getBlocks.get(0).getColumns.asScala.map(c =>
+        c.getPath.toDotString -> c.getEncodings.asScala.exists(_.usesDictionary())
+      ).toMap
+    val theirs = dictionary(footers(newTempPath("write/dict-col-spark")).head)
+    assert(dictionary(ours.head) === theirs)
+    assert(!theirs("s") && theirs("k"), theirs)
+  }
+
+  test("Bloom filters (parquet.bloom.filter.*#<column>): the same filter per chunk as Spark's writer") {
+    val opts = Map(
+      "parquet.bloom.filter.enabled#l" -> "true",
+      "parquet.bloom.filter.expected.ndv#l" -> "5000",
+      "parquet.bloom.filter.enabled#i" -> "true"
+    )
+    val (plan, ours) = compareWrites("bloom", s => s.table("t").select("i", "s", "l"), opts)
+    assert(hasVectorWrite(plan), s"${plan.treeString}\n${fallbackReasons(plan)}")
+    def filters(dir: String): Seq[(String, org.apache.parquet.column.values.bloomfilter.BloomFilter)] =
+      parquetFiles(dir).sortBy(_.getName).flatMap { p =>
+        val r = org.apache.parquet.hadoop.ParquetFileReader
+          .open(org.apache.parquet.hadoop.util.HadoopInputFile.fromPath(p, spark.sparkContext.hadoopConfiguration))
+        try r.getFooter.getBlocks.asScala.flatMap { b =>
+            val bf = r.getBloomFilterDataReader(b)
+            b.getColumns.asScala.map(c => c.getPath.toDotString -> bf.readBloomFilter(c))
+          }.toSeq
+        finally r.close()
+      }
+    val a = filters(newTempPath("write/bloom-ours"))
+    val b = filters(newTempPath("write/bloom-spark"))
+    assert(a.map(_._1) === b.map(_._1))
+    a.zip(b).foreach { case ((c, x), (_, y)) => assert(x === y, c) }
+    assert(a.exists { case (c, f) => c == "l" && f != null } && a.forall { case (c, f) => c != "s" || f == null })
+    assert(ours.nonEmpty)
+  }
+
+  test("spark.vecruntime.write.columnar.fromRows: a write of rows goes through RowToColumnarExec to our writer") {
+
+    val rows =
+      (s: SparkSession) => s.createDataFrame((1 to 2000).map(i => (i, s"v${i % 7}", i.toLong * 3))).toDF("i", "s", "l")
+    withConf(VectorConf.WriteColumnarFromRows -> "true") {
+      val (plan, _) = compareWrites("from-rows", rows)
+      assert(hasVectorWrite(plan), s"${plan.treeString}\n${fallbackReasons(plan)}")
+    }
+    val (plain, _) = compareWrites("from-rows-off", rows)
+    assert(!hasVectorWrite(plain) && fallbackReasons(plain).exists(_.contains("is not columnar")))
+  }
+
+  test("field ids (spark.sql.parquet.fieldId.write.enabled): the same Parquet schema, ids included, as Spark's") {
+    def id(n: Int) = new org.apache.spark.sql.types.MetadataBuilder().putLong("parquet.field.id", n).build()
+    withConf("spark.sql.parquet.fieldId.write.enabled" -> "true") {
+      val (plan, footers) = compareWrites(
+        "field-ids",
+        s =>
+          s.table("t").select(
+            org.apache.spark.sql.functions.col("i").as("i", id(1)),
+            org.apache.spark.sql.functions.col("s").as("s", id(7)),
+            org.apache.spark.sql.functions.col("l")
+          )
+      )
+      assert(hasVectorWrite(plan), s"${plan.treeString}\n${fallbackReasons(plan)}")
+      val fields = footers.head.getFileMetaData.getSchema.getFields.asScala
+      assert(fields.map(f => Option(f.getId).map(_.intValue())) === Seq(Some(1), Some(7), None))
+    }
+  }
+
   test("writes the prototype does not take keep Spark's writer, with the reason") {
     def reasonsOf(f: String => Unit): Seq[String] = {
       lastWritePlan = null
@@ -427,8 +529,11 @@ class VectorWriteSuite extends VectorQuerySuite {
         .exists(_.contains("writes Parquet v2"))
     )
     assert(
-      reasonsOf(p => spark.table("t").selectExpr("i", "named_struct('a', i, 'b', s) AS st").write.parquet(p))
-        .exists(_.contains("not supported yet"))
+      reasonsOf { p =>
+        withConf("spark.sql.parquet.writeLegacyFormat" -> "true") {
+          spark.table("t").selectExpr("i", "named_struct('a', i, 'b', s) AS st").write.parquet(p)
+        }
+      }.exists(_.contains("is nested and writeLegacyFormat is on"))
     )
     assert(reasonsOf(p => spark.table("t").write.orc(p)).exists(_.contains("is not Parquet")))
   }

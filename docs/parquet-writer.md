@@ -67,18 +67,54 @@ index are written as parquet-java writes them; binary min/max compare unsigned.
 
 Taken: Parquet writes of flat types, unpartitioned, partitioned (dynamic partitions) and bucketed -- boolean, byte, short, int, long, float,
 double, decimal (every precision), date, timestamp (INT96, `TIMESTAMP_MICROS`, `TIMESTAMP_MILLIS`),
-string, binary -- over a columnar child. Other writes keep Spark's writer, with the reason in the plan's
+string, binary, and structs, arrays and maps of those types (#842) -- over a columnar child. Other writes keep Spark's writer, with the reason in the plan's
 fallback list:
 
 | Write | Reason |
 |---|---|
 | Concurrent output writers whose past-the-limit sort keys do not compile | `concurrent writers' sort key ...` |
 | Hive-compatible bucketing (Hive tables) | `Hive-compatible bucketing is not supported yet (#842)` |
-| Struct, array, map columns | `column <name> has type <type>, not supported yet (#842)` |
+| Struct, array, map columns under `spark.sql.parquet.writeLegacyFormat` | `column <name> is nested and writeLegacyFormat is on` |
+| Other types (intervals, variant, ...) | `column <name> has type <type>, not supported yet (#842)` |
 | `parquet.writer.version=v1` | `parquet.writer.version is v1, the columnar writer writes Parquet v2` |
-| Bloom filters, encryption, per-column `#` options | named in the reason |
+| Encryption; per-column `#` options other than `parquet.enable.dictionary#` and `parquet.bloom.filter.*#` | named in the reason |
 | A date or timestamp with a rebase mode in write other than `CORRECTED` (Spark 4 default) | `... is not CORRECTED` |
 | A decimal under `spark.sql.parquet.writeLegacyFormat` | `... writeLegacyFormat is on` |
+
+**Spark's own write suites** run with the writer on, from the spark-sql tests jar through the `spark-sql-tests`
+module, with the plugin, `spark.vecruntime.write.columnar.enabled=true`, `spark.vecruntime.write.columnar.fromRows=true`
+and off-heap on.
+- Suites: `ParquetIOSuite`, `ParquetEncodingSuite`, `ParquetCompressionCodecPrecedenceSuite`, `InsertSuite`,
+  `PartitionedWriteSuite`, `BucketedWriteWithoutHiveSupportSuite`, `FileFormatWriterSuite` and `V1WriteCommandSuite`.
+- `fromRows` takes a write of rows (a local relation, a row operator) through Spark's `RowToColumnarExec`, so that
+  323 of the 503 file-source writes the suites make went through this writer. The rest are ORC, JSON, CSV or text,
+  or other fallbacks.
+- 211 of 214 tests pass. The three failures fail the same way with the writer off, so they come from the rest of
+  VecRuntime, not the writer: the two `SPARK-41914` in-partition-sorted v1 writes, and `vectorized reader: missing
+  all struct fields`.
+- The runs found one difference, now fixed: like `FileFormatDataWriter`, an error from the writer is reported as
+  `TASK_WRITE_FAILED`, or as the fast-fail exception for a file that already exists.
+
+**Bloom filters** (#842): `parquet.bloom.filter.enabled`, globally or `#<column>`, with `expected.ndv#`, `fpp#`,
+`max.bytes`, `adaptive.enabled` and `candidates.number#`, read as parquet-java reads them.
+- Each chunk's filter is sized as parquet-java's column writers size it, and the fast writers hash every non-null
+  value with the filter's own hash.
+- A chunk whose pages are all dictionary-encoded gets no filter, as with parquet-java.
+- `ColumnarParquetWriterTest` checks that every chunk's filter is the bitset parquet-java writes, and
+  `VectorWriteSuite` checks it against Spark's writer.
+
+**Nested columns** (#842) use Spark's standard layout: a struct is a group, an array the 3-level `LIST`, a map
+the `MAP` with `key_value`.
+- `NestedFieldWriter` walks each row's nested lane (Arrow's layout) and works out the Dremel repetition and
+  definition levels for every leaf. A null at any level writes a null to each leaf under it; an empty array
+  or map writes one a level deeper.
+- The leaves are written through parquet-java's column writers, so they get its v2 encodings and statistics,
+  not the flat fast path.
+- On the Spark side the lane is built from Spark's getters, and a filtered batch is gathered by its
+  selection.
+- Tests: `NestedWriteTest` against parquet-java (nulls at every level, a list of structs holding a list,
+  several batch sizes and row groups), and `VectorWriteSuite` against Spark's writer, unpartitioned and
+  partitioned.
 | ORC, JSON, CSV | `... is not Parquet` |
 | A child that is not columnar | `child <op> is not columnar` |
 

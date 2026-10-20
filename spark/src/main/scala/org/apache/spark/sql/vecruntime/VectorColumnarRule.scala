@@ -239,7 +239,8 @@ case class VectorExecRule(session: SparkSession) extends Rule[SparkPlan] with Lo
             case Some(reason) => fallback(w, reason)
             case None =>
               VectorWriteFilesExec(
-                w.child,
+                // #842: a row input (spark.vecruntime.write.columnar.fromRows) through Spark's RowToColumnarExec.
+                if (w.child.supportsColumnar) w.child else org.apache.spark.sql.execution.RowToColumnarExec(w.child),
                 w.fileFormat,
                 w.partitionColumns,
                 w.bucketSpec,

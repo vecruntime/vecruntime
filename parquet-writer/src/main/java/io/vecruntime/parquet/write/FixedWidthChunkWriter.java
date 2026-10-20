@@ -84,6 +84,10 @@ final class FixedWidthChunkWriter implements ChunkWriter {
     private final boolean dictionaryEnabled;
 
     private PageWriter pages;
+    private final ParquetProperties props;
+    // The chunk's Bloom filter and where it goes at the end of the chunk; null when the column has none.
+    private org.apache.parquet.column.values.bloomfilter.BloomFilterWriter bloomWriter;
+    private org.apache.parquet.column.values.bloomfilter.BloomFilter bloom;
 
     // The page being built: its validity (bit set = value), its values as raw bits, and, while the chunk is
     // dictionary-encoded, their dictionary ids.
@@ -141,6 +145,7 @@ final class FixedWidthChunkWriter implements ChunkWriter {
     FixedWidthChunkWriter(Kind kind, ColumnDescriptor column, ParquetProperties props) {
         this.kind = kind;
         this.column = column;
+        this.props = props;
         this.optional = column.getMaxDefinitionLevel() > 0;
         this.pageSize = props.getPageSizeThreshold();
         this.pageRowLimit = props.getPageRowCountLimit();
@@ -150,7 +155,9 @@ final class FixedWidthChunkWriter implements ChunkWriter {
 
     /** Starts a column chunk (a row group) on {@code pages}. */
     @Override
-    public void startChunk(PageWriter pageWriter) {
+    public void startChunk(PageWriter pageWriter, org.apache.parquet.column.values.bloomfilter.BloomFilterWriter blooms) {
+        this.bloomWriter = blooms;
+        this.bloom = blooms == null ? null : ChunkBloom.newFilter(column, props);
         this.pages = pageWriter;
         pageRows = 0;
         pageValues = 0;
@@ -210,6 +217,16 @@ final class FixedWidthChunkWriter implements ChunkWriter {
                 pageValidity[pageRows >>> 6] |= 1L << pageRows;
                 pageRows++;
                 values[pageValues++] = raw;
+            }
+        }
+        if (bloom != null) {
+            for (int k = start; k < pageValues; k++) {
+                long raw = values[k];
+                bloom.insertHash(switch (kind) {
+                    case INT32, INT32_FROM_INT64 -> bloom.hash((int) raw);
+                    case INT64 -> bloom.hash(raw);
+                    case DOUBLE -> bloom.hash(Double.longBitsToDouble(raw));
+                });
             }
         }
         if (dictionary) {
@@ -361,7 +378,12 @@ final class FixedWidthChunkWriter implements ChunkWriter {
                 BytesInput.from(levels.toByteArray()),
                 valuesEncoding,
                 BytesInput.from(body.toByteArray()),
-                statistics());
+                statistics(),
+                // Size statistics (Parquet 2.10), as parquet-java writes them for a flat fixed-width column: no
+                // byte-array bytes and no level histograms.
+                new org.apache.parquet.column.statistics.SizeStatistics(column.getPrimitiveType(), 0L, java.util.List.of(),
+                        java.util.List.of()),
+                null); // no geospatial statistics
         Arrays.fill(pageValidity, 0, (pageRows + 63) >>> 6, 0L);
         pageRows = 0;
         pageValues = 0;
@@ -418,6 +440,9 @@ final class FixedWidthChunkWriter implements ChunkWriter {
     @Override
     public void endChunk() throws IOException {
         flushPage();
+        if (bloom != null) {
+            bloomWriter.writeBloomFilter(bloom);
+        }
         if (dictionaryPagesWritten > 0) {
             ByteSink d = new ByteSink(entryCount * kind.width);
             writePlain(entries, entryCount, d);
