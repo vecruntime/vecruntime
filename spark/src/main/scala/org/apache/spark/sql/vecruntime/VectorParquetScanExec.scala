@@ -986,10 +986,13 @@ private[vecruntime] final class VectorParquetPartitionReader(
         // ranges, and the store carries the selected row indexes; each leaf follows them (its pages carry their
         // first row index), so every column emits the same selected rows. A repeated leaf (a list or map, #626)
         // counts entries, not rows: it skips the entries of the rows before each range, and a batch then never
-        // crosses a range (`rangeBreaks`). Parquet's own switch (`parquet.filter.columnindex.enabled`) turns it
-        // off. The predicate is still applied above the scan.
+        // crosses a range (`rangeBreaks`). The predicate is still applied above the scan.
+        // Off unless `parquet.filter.columnindex.enabled` is set to true (#873): on the classic S3A stream every
+        // selected page is its own seek and GET, plus the column and offset index reads, and at 1 TB TPC-DS that
+        // cost 37% (q75, q95, q85, q80, q44: 100.2 s on, 73.2 s off). Back on by default once page ranges are
+        // merged into larger reads (#834).
         .useColumnIndexFilter(
-          hadoopConf.getBoolean(org.apache.parquet.hadoop.ParquetInputFormat.COLUMN_INDEX_FILTERING_ENABLED, true)
+          hadoopConf.getBoolean(org.apache.parquet.hadoop.ParquetInputFormat.COLUMN_INDEX_FILTERING_ENABLED, false)
         )
       // #735: a reused-buffer codec factory (zstd/snappy decompress through one growable byte[] per chunk,
       // read in place by #786) and/or a bounded heap pool for parquet-java's per-row-group chunk buffers.
