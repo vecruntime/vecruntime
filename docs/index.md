@@ -118,3 +118,5 @@ Version 0.0.9, a preview release under the Apache License 2.0. The plugin runs t
 - [Native Parquet reader](native-parquet-reader.html) -- design of `VectorParquetScanExec` (#559): data
   path, read-ahead, the support matrix (every flat type and v1/v2 encoding; INT96 and nested types go
   to Spark's reader), how it is tested, and the work list (nested types, late materialization).
+- [Columnar Parquet writer](parquet-writer.html) -- `VectorWriteFilesExec` (#64): writes Parquet v2 from our
+  batches; encodings, scope and fallbacks, tests against parquet-java and Spark, measurements.

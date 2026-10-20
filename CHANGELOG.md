@@ -6,6 +6,17 @@ version may change configuration keys or defaults, always noted here.
 
 ## Unreleased
 
+### Added
+
+- Columnar Parquet writer (#64), behind `spark.vecruntime.write.columnar.enabled` (default off):
+  `VectorWriteFilesExec` writes Parquet writes of flat types -- unpartitioned, partitioned and bucketed, with
+  concurrent output writers too --
+  straight from our batches. **It writes Parquet v2** (data page v2; `RLE_DICTIONARY`, falling back to
+  `DELTA_BINARY_PACKED`, `DELTA_BYTE_ARRAY` or `PLAIN`). The encoder lives in a new Spark-free
+  `parquet-writer` module, tested against parquet-java's v2 writer; `DELTA_BINARY_PACKED` blocks use the
+  Vector API. Nested types and Iceberg writes are #842. See `docs/parquet-writer.md`.
+- JMH `ParquetWriteBenchmark` and `DeltaEncodeBenchmark`.
+
 ### Changed
 
 - The native Parquet scan no longer filters pages by the column index by default (#873):

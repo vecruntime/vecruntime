@@ -57,6 +57,7 @@ const MD_PAGES = [
   ["iceberg.md", "/iceberg.html"],
   ["flight-shuffle.md", "/flight-shuffle.html"],
   ["native-parquet-reader.md", "/native-parquet-reader.html"],
+  ["parquet-writer.md", "/parquet-writer.html"],
 ];
 const BENCH_PAGES = [
   "tpcds-1tb.html",

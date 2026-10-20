@@ -1,0 +1,196 @@
+/*
+ * Copyright 2026-2027 Angel Conde and the vecruntime contributors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package io.vecruntime.parquet.write;
+
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
+import java.util.Arrays;
+
+/**
+ * A growable little-endian byte buffer: the page and dictionary bodies the page
+ * encoders build before handing them to parquet-java's page writer. Bulk
+ * appends copy whole {@link MemorySegment} ranges; nothing is written a byte at
+ * a time on the fixed-width paths.
+ */
+public final class ByteSink {
+
+    private static final ValueLayout.OfInt LE_INT = ValueLayout.JAVA_INT_UNALIGNED.withOrder(java.nio.ByteOrder.LITTLE_ENDIAN);
+    private static final ValueLayout.OfLong LE_LONG = ValueLayout.JAVA_LONG_UNALIGNED.withOrder(java.nio.ByteOrder.LITTLE_ENDIAN);
+
+    private byte[] buf;
+    private MemorySegment seg;
+    private int size;
+
+    public ByteSink(int capacity) {
+        buf = new byte[Math.max(16, capacity)];
+        seg = MemorySegment.ofArray(buf);
+    }
+
+    public int size() {
+        return size;
+    }
+
+    byte[] array() {
+        return buf;
+    }
+
+    /** The bytes as a segment, valid until the next append that grows the buffer. */
+    MemorySegment segment() {
+        return seg;
+    }
+
+    public void reset() {
+        size = 0;
+    }
+
+    void ensure(int extra) {
+        if (size + extra > buf.length) {
+            buf = Arrays.copyOf(buf,
+                    Math.max(buf.length * 2, size + extra));
+            seg = MemorySegment.ofArray(buf);
+        }
+    }
+
+    void writeByte(int b) {
+        ensure(1);
+        buf[size++] = (byte) b;
+    }
+
+    void writeIntLE(int v) {
+        ensure(4);
+        seg.set(LE_INT, size, v);
+        size += 4;
+    }
+
+    void writeLongLE(long v) {
+        ensure(8);
+        seg.set(LE_LONG, size, v);
+        size += 8;
+    }
+
+    /** Appends {@code n} longs, little-endian, in one copy. */
+    void writeLongsLE(long[] values, int n) {
+        ensure(n * 8);
+        MemorySegment.copy(values, 0, seg, LE_LONG, size, n);
+        size += n * 8;
+    }
+
+    /** {@link #packBits(long[], int, int, int, int)} over unsigned 32-bit values. */
+    void packBits(int[] values, int from, int to,
+                  int count, int width) {
+        int bytes = (count * width) >>> 3;
+        ensure(bytes + 8);
+        long pos = size;
+        long acc = 0;
+        int bits = 0;
+        for (int k = 0; k < count; k++) {
+            long v = from + k < to ? values[from + k] & 0xFFFFFFFFL : 0L;
+            acc |= v << bits;
+            int next = bits + width;
+            if (next >= 64) {
+                seg.set(LE_LONG, pos, acc);
+                pos += 8;
+                acc = bits == 0 ? 0L : v >>> (64 - bits);
+                next -= 64;
+            }
+            bits = next;
+        }
+        if (bits > 0) {
+            seg.set(LE_LONG, pos, acc);
+        }
+        size += bytes;
+    }
+
+    /**
+     * Bit-packs {@code count} values at {@code width} bits each, least
+     * significant bit first: {@code values[from, to)}, then zeros up to {@code
+     * count}. {@code count * width} must be a multiple of 8 (a miniblock of 32
+     * or a group of 8 values). Whole 64-bit words are stored at a time.
+     */
+    void packBits(long[] values, int from, int to,
+                  int count, int width) {
+        int bytes = (count * width) >>> 3;
+        ensure(bytes + 8);
+        long pos = size;
+        long acc = 0;
+        int bits = 0;
+        for (int k = 0; k < count; k++) {
+            long v = from + k < to ? values[from + k] : 0L;
+            acc |= v << bits;
+            int next = bits + width;
+            if (next >= 64) {
+                seg.set(LE_LONG, pos, acc);
+                pos += 8;
+                acc = bits == 0 ? 0L : v >>> (64 - bits);
+                next -= 64;
+            }
+            bits = next;
+        }
+        if (bits > 0) {
+            seg.set(LE_LONG, pos, acc); // within the slack ensured above; the size below cuts it to the exact bytes
+        }
+        size += bytes;
+    }
+
+    /** Appends the low 32 bits of {@code n} longs, little-endian. */
+    void writeIntsLE(long[] values, int n) {
+        ensure(n * 4);
+        long at = size;
+        for (int k = 0; k < n; k++) {
+            seg.set(LE_INT, at + 4L * k, (int) values[k]);
+        }
+        size += n * 4;
+    }
+
+    /**
+     * Overwrites four bytes at {@code at} (a length prefix written after its
+     * body).
+     */
+    void setIntLE(int at, int v) {
+        seg.set(LE_INT, at, v);
+    }
+
+    void writeUnsignedVarInt(int v) {
+        ensure(5);
+        while ((v & ~0x7F) != 0) {
+            buf[size++] = (byte) ((v & 0x7F) | 0x80);
+            v >>>= 7;
+        }
+        buf[size++] = (byte) v;
+    }
+
+    void write(byte[] b, int off, int len) {
+        ensure(len);
+        System.arraycopy(b, off, buf, size, len);
+        size += len;
+    }
+
+    /** Appends {@code len} bytes of {@code src} from {@code offset}. */
+    void write(MemorySegment src, long offset, int len) {
+        ensure(len);
+        MemorySegment.copy(src, offset, seg, size, len);
+        size += len;
+    }
+
+    void write(ByteSink other) {
+        write(other.buf, 0, other.size);
+    }
+
+    /** A copy of the bytes written, for a page that outlives this sink's reuse. */
+    byte[] toByteArray() {
+        return Arrays.copyOf(buf, size);
+    }
+}

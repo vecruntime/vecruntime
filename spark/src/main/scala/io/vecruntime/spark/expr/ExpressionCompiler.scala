@@ -430,6 +430,25 @@ object ExpressionCompiler {
     // hash keys): the bytes CollationFactory gives the value, a binary key the kernels compare as any (#705).
     case k @ CollationKey(a: AttributeReference) if CollationKeyExpr.collationOf(a.dataType) >= 0 =>
       compileMovedColumn(a, input).map(CollationKeyExpr(_, k.collationId))
+    // Spark 4's bucket hash, which V1Writes sorts a bucketed write on (#842): Murmur3 per key as `Murmur3Hash`,
+    // except that a collated string key is hashed as its collation key's bytes, as Spark hashes it.
+    case org.apache.spark.sql.catalyst.expressions.CollationAwareMurmur3Hash(children, seed) if children.nonEmpty =>
+      children.foldLeft[Either[String, Vector[(VectorExpr, DataType)]]](Right(Vector.empty)) { (acc, c) =>
+        acc.flatMap { done =>
+          val id = CollationKeyExpr.collationOf(c.dataType)
+          if (id >= 0) c match {
+            case a: AttributeReference =>
+              compileMovedColumn(a, input).map(v => done :+ ((CollationKeyExpr(v, id): VectorExpr, StringType)))
+            case other => Left(s"unsupported collation_aware_hash over a collated ")
+          }
+          else if (!XxHash64Expr.supports(c.dataType))
+            Left(s"unsupported collation_aware_hash key type ${c.dataType.simpleString}")
+          else compile(c, input).map(v => done :+ ((v, c.dataType)))
+        }
+      }.map(ks => Murmur3HashExpr(ks.map(_._1), ks.map(_._2), seed))
+    // V1Writes puts it on every string partition column: an empty string writes the default partition (#842).
+    case org.apache.spark.sql.catalyst.expressions.Empty2Null(child) =>
+      compile(child, input).map(Empty2NullExpr(_, child.dataType))
     case e
         if collatedOperand(e) && !(e.isInstanceOf[IsNull] || e.isInstanceOf[IsNotNull] || e.isInstanceOf[Alias]) &&
           !collatedComparison(e) =>

@@ -108,6 +108,10 @@ case class VectorColumnarRule(session: SparkSession) extends ColumnarRule {
       case c: org.apache.spark.sql.execution.ColumnarToRowExec
           if VectorBroadcastExchangeExec.unapply(c.child).isDefined =>
         c.child
+      // #64: the columnar writer reads batches; the transition Spark put under it (it is not a columnar node,
+      // its output is the write's commit messages) is taken out again.
+      case w @ VectorWriteFilesExec(c: org.apache.spark.sql.execution.ColumnarToRowExec, _, _, _, _, _) =>
+        w.copy(child = c.child)
     }
   }
 }
@@ -226,6 +230,23 @@ case class VectorExecRule(session: SparkSession) extends Rule[SparkPlan] with Lo
           VectorParquetScanPlanner.reason(s, conf) match {
             case Some(reason) => fallback(s, reason)
             case None => VectorParquetScanExec(s)
+          }
+
+        // #64: the columnar Parquet writer, behind spark.vecruntime.write.columnar.enabled (off by default). Spark
+        // keeps the write command and the job; the write task takes our batches straight to Parquet v2.
+        case w: org.apache.spark.sql.execution.datasources.WriteFilesExec if VectorConf.writeColumnar(conf) =>
+          VectorWritePlanner.reason(w, session) match {
+            case Some(reason) => fallback(w, reason)
+            case None =>
+              VectorWriteFilesExec(
+                // #842: a row input (spark.vecruntime.write.columnar.fromRows) through Spark's RowToColumnarExec.
+                if (w.child.supportsColumnar) w.child else org.apache.spark.sql.execution.RowToColumnarExec(w.child),
+                w.fileFormat,
+                w.partitionColumns,
+                w.bucketSpec,
+                w.options,
+                w.staticPartitions
+              )
           }
 
         // The range leaf: the same rows in the same partitions as Spark's, written as native INT64
