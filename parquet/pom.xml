@@ -21,6 +21,18 @@
       <groupId>io.github.vecruntime</groupId>
       <artifactId>vecruntime-kernels_${spark.line}</artifactId>
     </dependency>
+    <!-- #900: the readers fill Arrow vectors. Spark and Iceberg both bundle Arrow 18.3.0; compiled against,
+         never shipped, as in the spark module. -->
+    <dependency>
+      <groupId>org.apache.arrow</groupId>
+      <artifactId>arrow-memory-netty</artifactId>
+      <scope>provided</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.arrow</groupId>
+      <artifactId>arrow-vector</artifactId>
+      <scope>provided</scope>
+    </dependency>
     <!-- Spark ships parquet-java and Hadoop at these versions: compiled against, never shipped. -->
     <dependency>
       <groupId>org.apache.hadoop</groupId>

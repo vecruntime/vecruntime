@@ -16,6 +16,7 @@
 package io.vecruntime.spark.parquet;
 
 import io.vecruntime.kernels.VecType;
+import io.vecruntime.parquet.read.LeafReadSpec;
 import io.vecruntime.spark.adapter.TypeMapping;
 import org.apache.spark.sql.types.BinaryType;
 import org.apache.spark.sql.types.BooleanType;
@@ -196,6 +197,91 @@ public final class NativeParquetSupport {
             return VecType.INT64;
         }
         return TypeMapping.vecTypeOf(dt);
+    }
+
+    /**
+     * #900: how a leaf {@code column} is read as Spark type {@code dt} -- the
+     * lane and every conversion between the stored values and {@code dt}, the
+     * way Spark's {@code ParquetVectorUpdaterFactory} converts them. Decided
+     * once per column; the reader branches on the result as it did on these
+     * {@code DataType} checks.
+     */
+    public static LeafReadSpec leafSpec(org.apache.parquet.column.ColumnDescriptor column, DataType dt) {
+        return leafSpec(column, decodeLane(dt), dt);
+    }
+
+    /**
+     * {@link #leafSpec(org.apache.parquet.column.ColumnDescriptor, DataType)}
+     * onto a given {@code lane}.
+     */
+    public static LeafReadSpec leafSpec(org.apache.parquet.column.ColumnDescriptor column, VecType lane, DataType dt) {
+        org.apache.parquet.schema.PrimitiveType p = column.getPrimitiveType();
+        org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName stored = p.getPrimitiveTypeName();
+        org.apache.parquet.schema.LogicalTypeAnnotation a = p.getLogicalTypeAnnotation();
+        // x1000 at decode: TIMESTAMP / TIMESTAMP_NTZ stored as MILLIS onto the lane of micros, and TIME stored as
+        // MICROS onto Spark's nanoseconds of the day (#787: LongAsNanosUpdater's DateTimeUtils.microsToNanos).
+        boolean millis = ((dt instanceof TimestampType || dt instanceof TimestampNTZType)
+                        && a instanceof org.apache.parquet.schema.LogicalTypeAnnotation.TimestampLogicalTypeAnnotation t
+                        && t.getUnit() == org.apache.parquet.schema.LogicalTypeAnnotation.TimeUnit.MILLIS)
+                || dt instanceof org.apache.spark.sql.types.TimeType;
+        return LeafReadSpec.onLane(lane)
+                .widen(widenOf(stored, a, dt))
+                .rescale(rescaleOf(a, dt))
+                .narrowBits(dt instanceof ByteType
+                        ? 8
+                        : dt instanceof ShortType ? 16 : 0)
+                .millis(millis)
+                .dateLane(dt instanceof DateType)
+                .timestampLane(dt instanceof TimestampType)
+                .decimal(dt instanceof DecimalType)
+                .float32(dt instanceof FloatType)
+                // A collated string (#568) is carried to Spark's operators, which compare it by collation: values.
+                .dictionaryIdsAllowed(dt instanceof StringType st && st.isUTF8BinaryCollation())
+                .build();
+    }
+
+    /**
+     * The in-place conversion a stored type needs to become {@code dt} (Spark's
+     * widening updaters).
+     */
+    private static int widenOf(org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName stored, org.apache.parquet.schema.LogicalTypeAnnotation a, DataType dt) {
+        boolean unsigned = a instanceof org.apache.parquet.schema.LogicalTypeAnnotation.IntLogicalTypeAnnotation i && !i.isSigned();
+        if (dt instanceof LongType
+                && stored == org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.INT32
+                && unsigned
+                && ((org.apache.parquet.schema.LogicalTypeAnnotation.IntLogicalTypeAnnotation) a).getBitWidth() == 32) {
+            return LeafReadSpec.WIDEN_UINT32_TO_LONG;
+        }
+        if (dt instanceof DecimalType d
+                && d.precision() > 18
+                && (stored == org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.INT32 || stored == org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.INT64)) {
+            return unsigned ? LeafReadSpec.WIDEN_ULONG_TO_DEC128 : LeafReadSpec.WIDEN_LONG_TO_DEC128;
+        }
+        if (dt instanceof DoubleType) {
+            if (stored == org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.INT32) {
+                return LeafReadSpec.WIDEN_INT_TO_DOUBLE;
+            }
+            if (stored == org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.FLOAT) {
+                return LeafReadSpec.WIDEN_FLOAT_TO_DOUBLE;
+            }
+        }
+        if (dt instanceof TimestampNTZType && stored == org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.INT32) {
+            return LeafReadSpec.WIDEN_DAYS_TO_MICROS;
+        }
+        return LeafReadSpec.WIDEN_NONE;
+    }
+
+    /**
+     * How many digits a decimal's unscaled values move left: the requested
+     * scale less the file's (an integer without a decimal annotation has scale
+     * 0).
+     */
+    private static int rescaleOf(org.apache.parquet.schema.LogicalTypeAnnotation a, DataType dt) {
+        if (!(dt instanceof DecimalType d)) {
+            return 0;
+        }
+        int fileScale = a instanceof org.apache.parquet.schema.LogicalTypeAnnotation.DecimalLogicalTypeAnnotation da ? da.getScale() : 0;
+        return Math.max(0, d.scale() - fileScale);
     }
 
     /**
