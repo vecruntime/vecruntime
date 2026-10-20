@@ -43,7 +43,7 @@ Configuration keys (all default to `true` except the last; the complete referenc
 | `spark.vecruntime.exec.generate.enabled` | convert `GenerateExec` with `explode`/`posexplode` (and the `_outer` forms) over an array column: the other columns gathered through a repeat index built from the array lengths, the elements copied once per array from Spark's array vector |
 | `spark.vecruntime.exec.sample.enabled` | convert `SampleExec` without replacement over a columnar child: Spark's own Bernoulli sequence per partition as a selection bitmap, so a seed returns Spark's rows |
 | `spark.vecruntime.exec.localTableScan.enabled` | convert `LocalTableScanExec` (`VALUES`, local relations) into one batch per partition; **off by default** -- nothing to accelerate, it only lets small-table tests run our operators |
-| `spark.vecruntime.write.columnar.enabled` | write Parquet (unpartitioned, partitioned, bucketed) from our batches with the columnar writer, which writes Parquet v2 ([parquet-writer.md](parquet-writer.html), #64); **off by default** |
+| `spark.vecruntime.write.columnar.enabled` | write Parquet (unpartitioned, partitioned, bucketed) from our batches with the columnar writer, which writes Parquet v2 ([parquet-writer.md](parquet-writer.html), #64); **off by default**. Run partitioned and bucketed writes with `spark.memory.offHeap.enabled=true`: only the off-heap pool tracks the native memory of the sort before the write, so without it a large write needs manual tuning |
 | `spark.vecruntime.exec.range.enabled` | convert `RangeExec` (`spark.range`, the `range()` table function) into native INT64 batches -- Spark's rows in Spark's partitions, one reused vector per task -- so the chain above `range()` is ours from the leaf (over Spark's row leaf nothing of ours ran until the first exchange) |
 | `spark.vecruntime.exec.expand.enabled` | convert `ExpandExec` (`ROLLUP` / `CUBE` / `GROUPING SETS`, the `count(distinct)` rewrite) over a columnar child: one borrowed-column batch per grouping set, no data copy |
 | `spark.vecruntime.exec.broadcastHashJoin.enabled` | convert `BroadcastHashJoinExec` when the streamed side is columnar or an exchange (the build side stays Spark's broadcast) |
@@ -138,10 +138,14 @@ their footprint by the same factor -- strict mode is the cheapest in memory as w
 | `spark.sql.shuffle.partitions` | the size of a reduce task's input, hence of every table built from it: at 1 TB with 200 partitions a wide exchange hands a reducer several hundred MB of compressed input, and the final aggregate over it is the one that spills (#368 measures 1000 partitions with a 128 MB advisory size) With AQE on, the plugin starts it from 8 partitions per executor core and lets AQE coalesce (`spark.vecruntime.shuffle.initialPartitionsPerCore`, #689). |
 
 The sort holds runs of `spark.vecruntime.sort.runRows` rows and spills them as Arrow IPC once their bytes
-pass `spark.vecruntime.sort.spillBytes` (default 1 GiB, measured in #416; the runs are merged on the way
-out), and the shuffled hash join spills its build side into buckets past `spark.vecruntime.join.spillBytes`
-(default 256 MB, the grace join). The window still holds its whole partition (Arrow memory, plus an
-`int` permutation per row on the heap); a partition that cannot fit should keep Spark's window.
+pass `spark.vecruntime.sort.spillBytes` or what Spark's execution memory grants the task (default cap
+1 GiB, or `spark.memory.offHeap.size / spark.executor.cores` with off-heap memory enabled; #867, #868; the
+runs are merged on the way out), and the shuffled hash join spills its build side into buckets past
+`spark.vecruntime.join.spillBytes` (default 256 MB, the grace join) or when the pool refuses it. The window
+does not spill yet (#872): a whole-partition frame (`OVER (PARTITION BY ...)` without `ORDER BY`) holds every
+row of its partition until the partition ends, a running frame only its current peer group, and an offset
+frame its offset window -- Arrow memory, plus `int` arrays per row on the heap. A partition that cannot fit
+should keep Spark's window (`spark.vecruntime.exec.window.enabled=false`).
 
 **Disk.** Everything we write lands under `spark.local.dir`, through Spark's own block manager, so it
 is sized and cleaned like Spark's shuffle files -- and on Kubernetes that is the node's disk or the
@@ -230,8 +234,8 @@ measurements behind each item are in the linked docs and issues.
   or a struct included (#705) -- work.
 - Python UDFs (#65) and the Parquet write path, `DataWritingCommandExec` (#64).
 - Decimal window aggregates over sliding frames (#28), `IGNORE NULLS` (#58), `RANGE` window offsets over decimal or timestamp (interval) order keys.
-- The window operator holds its whole partition in memory (the sort and the joins spill; the window
-  does not yet).
+- The window operator does not spill (#872): a whole-partition frame holds its whole partition in memory, a
+  running frame its current peer group (the sort and the joins spill; the window does not yet).
 - Regular expressions, binary and Float columns as computed values or keys, and collated strings as
   computed values (they pass through untouched); the full lists are the "Falls back" column of
   [Supported today](how-it-works.html#supported-today) and `docs/expressions.md`.
@@ -256,6 +260,6 @@ measurements behind each item are in the linked docs and issues.
   Spark's reader instead, decided per file or per plan. FLOAT, BINARY and TIMESTAMP_NTZ are read natively
   but have no engine lane yet: operators carry them untouched, and an operator that computes on one stays
   Spark's. Comet's reader remains an option for the zero-copy case.
-- A spilling window, TLS for the Flight shuffle server,
+- A spilling window (#872), TLS for the Flight shuffle server,
   and a push-based shuffle service for disposable executors (the `VectorShuffleBackend` seam is
   where it plugs in).

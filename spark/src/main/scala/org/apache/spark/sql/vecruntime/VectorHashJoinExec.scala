@@ -507,6 +507,13 @@ final class BuildTable(
   /** A shared table (a broadcast relation's, used by every task of the executor) outlives its tasks. */
   override def close(): Unit = if (!shared) release()
 
+  /**
+   * #868: the native bytes the build columns hold -- their owning builders' capacity -- for the memory pool.
+   * 0 for a table over columns it does not own (the in-memory grace path counts its builders itself).
+   */
+  def nativeBytes: Long =
+    if (builders == null) 0L else builders.iterator.filter(_ != null).map(_.allocatedBytes()).sum
+
   /** Frees the table's memory: `close()` for a task's own table, the owner's cleaner for a shared one. */
   def release(): Unit = {
     arena.close()

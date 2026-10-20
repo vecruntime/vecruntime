@@ -104,7 +104,7 @@ import scala.collection.mutable
  * q98. Each partition is a group: the aggregate functions of the grouped hash aggregate run over the
  * batch with the partition ordinal as the group id, and the partition's value is the function's
  * `evaluateExpression` over its buffers, exactly as the Final aggregate computes it. Rows are held
- * (copied, in memory, no spill -- like the sort) until their partition ends, since the value is
+ * (copied, in memory; no spill yet, #872 -- the sort spills since #448) until their partition ends, since the value is
  * known only then, and are emitted batch by batch with the values gathered per row.
  *
  * Running frames (layer 2b): `ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` and `RANGE BETWEEN
@@ -1147,6 +1147,9 @@ private[vecruntime] class VectorWindowAggregateIterator(
   private final class Held(val columns: Array[ColumnVector], val numRows: Int, val groups: Array[Int])
 
   private val allocator: BufferAllocator = VectorAllocators.newChild("VectorWindowExec")
+  // #868: the held rows' Arrow bytes in Spark's execution memory (off-heap when Spark has an off-heap pool), kept in
+  // step with the allocator as batches are held and released. Counted, not spilled: the window does not spill yet (#872).
+  private val memory = new BuildMemory
   private val states: Array[GroupedAggState] = aggs.map(_.newGroupedState())
   private val partition = new KeyTracker(partitionKeys)
   private val order = new KeyTracker(orderKeys)
@@ -1212,6 +1215,7 @@ private[vecruntime] class VectorWindowAggregateIterator(
         c += 1
       }
       held.enqueue(new Held(columns, outRows, groups))
+      memory.track(allocator.getAllocatedMemory)
     }
   }
 
@@ -1325,6 +1329,7 @@ private[vecruntime] class VectorWindowAggregateIterator(
       held.foreach(_.columns.foreach(_.close()))
       held.clear()
       allocator.close()
+      memory.releaseTo(0L)
     }
   }
 }
@@ -1547,6 +1552,9 @@ private[vecruntime] class VectorWindowOffsetIterator(
   }
 
   private val allocator: BufferAllocator = VectorAllocators.newChild("VectorWindowExec")
+  // #868: the held rows' Arrow bytes in Spark's execution memory (off-heap when Spark has an off-heap pool), kept in
+  // step with the allocator as batches are held and released. Counted, not spilled: the window does not spill yet (#872).
+  private val memory = new BuildMemory
   // Only the adapter's fallback copy would use it, and the held columns are our own Arrow vectors.
   private val scratchArena = java.lang.foreign.Arena.ofConfined()
   private val partition = new KeyTracker(partitionKeys)
@@ -1651,6 +1659,7 @@ private[vecruntime] class VectorWindowOffsetIterator(
         keys,
         if (anyNullKey) keyValidity else null
       ))
+      memory.track(allocator.getAllocatedMemory)
       globalRows += outRows
     }
   }
@@ -2119,6 +2128,7 @@ private[vecruntime] class VectorWindowOffsetIterator(
       retired.foreach(_.close()); retired.clear()
       scratchArena.close()
       allocator.close()
+      memory.releaseTo(0L)
     }
   }
 }

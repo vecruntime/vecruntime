@@ -179,6 +179,10 @@ object GraceHashJoin extends Logging {
           val table =
             try BuildTable.fromBatches(buildRows, spec)
             finally buildRows.close()
+          // #868: the bucket's table in the pool while it is probed. It is built already (a bucket is the unit
+          // the join cannot split further), so a refusal is not acted on; holding it lets the pool make the
+          // task's other consumers spill.
+          memory.hold(table.nativeBytes)
           currentProbe = probeSpill.read(b)
           // Closed by this iterator (closeCurrent, and the one task listener above), never by a listener
           // of its own: one per bucket kept every bucket's table on the heap until the task ended.
@@ -192,6 +196,7 @@ object GraceHashJoin extends Logging {
       private def closeCurrent(): Unit = {
         if (current != null) { current.close(); current = null }
         if (currentProbe != null) { currentProbe.close(); currentProbe = null }
+        memory.releaseTo(0L)
       }
 
       override def hasNext: Boolean = {
@@ -273,4 +278,10 @@ private[vecruntime] final class BuildMemory {
       consumer.freeMemory(held - math.max(0L, bytes))
       held = math.max(0L, bytes)
     }
+
+  /**
+   * Holds exactly `bytes`: acquires what is missing or returns the excess. For an operator that measures what it
+   * holds (an Arrow allocator's `getAllocatedMemory`, say) and keeps the pool in step with it.
+   */
+  def track(bytes: Long): Unit = if (bytes > held) hold(bytes) else releaseTo(bytes)
 }
