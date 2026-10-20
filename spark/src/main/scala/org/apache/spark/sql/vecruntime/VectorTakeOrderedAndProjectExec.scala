@@ -73,7 +73,8 @@ case class VectorTakeOrderedAndProjectExec(
     "numInputBatches" -> SQLMetrics.createMetric(sparkContext, "number of input batches"),
     "numOutputBatches" -> SQLMetrics.createMetric(sparkContext, "number of output batches"),
     "numOutputRows" -> SQLMetrics.createMetric(sparkContext, "number of output rows"),
-    "time" -> SQLMetrics.createNanoTimingMetric(sparkContext, "time in spark-vector kernels")
+    "time" -> SQLMetrics.createNanoTimingMetric(sparkContext, "time in spark-vector kernels"),
+    "peakNativeBytes" -> SQLMetrics.createSizeMetric(sparkContext, "peak native memory (#874)")
   ) ++ readMetrics ++ writeMetrics
 
   @transient private lazy val compiledKeys: Array[VectorExpr] = sortOrder.map { o =>
@@ -94,9 +95,23 @@ case class VectorTakeOrderedAndProjectExec(
     val runRows = io.vecruntime.spark.VectorConf.sortRunRows(conf)
     val spillBytes = io.vecruntime.spark.VectorConf.sortSpillBytes(conf, sparkContext.getConf)
     val m = vectorMetrics
+    val mode = VectorSortIterator.memoryMode(sparkContext.getConf) // #879: resolved at plan time
+    val fairShare = io.vecruntime.spark.VectorConf.sortFairShareBytes(conf, sparkContext.getConf) // #877
     child.executeColumnar().mapPartitionsInternal { iter =>
       VectorRowStages.toUnsafeRows(
-        new VectorSortIterator(iter, keys, ascending, nullsFirst, childAttrs, m, n, runRows, spillBytes),
+        new VectorSortIterator(
+          iter,
+          keys,
+          ascending,
+          nullsFirst,
+          childAttrs,
+          m,
+          n,
+          runRows,
+          spillBytes,
+          mode,
+          fairShareBytes = fairShare
+        ),
         childOutput
       )
     }
