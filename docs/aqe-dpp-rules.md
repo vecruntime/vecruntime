@@ -29,6 +29,7 @@ Each rule here follows the same contract:
 | `FactBloomFilter` | `spark.vecruntime.optimizer.factBloomFilter.enabled` | q16, q50, q93, q94 |
 | `NarrowBelowJoin` | `spark.vecruntime.optimizer.narrowBelowJoin.enabled` | q23a, q23b |
 | `CountBelowJoin` | `spark.vecruntime.optimizer.countBelowJoin.enabled` | q6, q8, q10, q11, q12, q15, q19, q20, q24a, q24b, q30, q31, q33, q46, q48, q54, q56, q60, q61, q64, q68, q69, q74, q81, q91, q98 |
+| `DistinctBelowSemiJoin` | `spark.vecruntime.optimizer.distinctBelowSemiJoin.enabled` | q14a, q14b (measured at 10 TB; the full list follows the 99-query run) |
 
 The plugin changes no AQE setting. `DppThroughAggregate` and `TransitiveDpp` add dynamic partition pruning
 filters where Spark's DPP does not reach; Spark's own DPP settings are unchanged.
@@ -574,6 +575,27 @@ executors the same way in q78, q79 and q94. The rule changes 26 queries, which t
 q74 −10 %, q12 and q20 about −1 s. The other rewritten queries move by a few tenths of a second either way, and q64 is
 about 2.7 s (6 %) slower in both runs. Off with `spark.vecruntime.optimizer.countBelowJoin.enabled=false`.
 
+
+## `DistinctBelowSemiJoin`: a left semi join's right side as its distinct join columns (#840)
+
+`spark/src/main/scala/org/apache/spark/sql/vecruntime/DistinctBelowSemiJoin.scala`.
+
+A left semi join only asks whether a left row has a match, so duplicate right rows change nothing. Spark rewrites
+`INTERSECT` as `Distinct(LeftSemi(left, right))` and leaves the right side as it is. TPC-DS q14's `cross_items`
+joins `item` (400 K rows) to `catalog_sales x item` (8.6 G rows at 10 TB) on `(brand, class, category)`, and the
+result to `web_sales x item` (4.3 G rows) on the same keys, which have a few thousand values. At 10 TB the two
+sort-merge joins and their sorts took 5,900 of q14a's 17,300 task seconds and spilled about 230 GiB.
+
+Shape (logical, in the late optimizer batch): `Join(left, right, LeftSemi, condition)` whose `right` is
+deterministic, not already an aggregate, and too large to broadcast by its size estimate. Rewrite: `right`
+becomes `Aggregate(K, K, right)`, with `K` the columns of `right` the condition reads -- the equi-join keys and
+any column a non-equi conjunct compares, so the condition sees the same values.
+
+The aggregate is local ([[LocalPreAggregate]], as for `AggregateBelowJoin`): one per task, no exchange of its
+own. The join's exchange of the right side follows it and carries the reduced rows, and a task whose first rows
+do not repeat (a high-cardinality key) gives it up and passes its rows through.
+
+Off with `spark.vecruntime.optimizer.distinctBelowSemiJoin.enabled=false`.
 
 ## `RemoveRedundantGroupKeys`: grouping keys a unique broadcast key determines (#635)
 
