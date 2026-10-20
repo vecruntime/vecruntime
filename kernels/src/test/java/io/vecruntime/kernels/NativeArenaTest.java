@@ -15,12 +15,13 @@
  */
 package io.vecruntime.kernels;
 
-import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertThrows;
-
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
+
 import org.junit.jupiter.api.Test;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 /** #840: the calloc/free arena behind an owning {@link ColumnBuilder}. */
 class NativeArenaTest {

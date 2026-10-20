@@ -47,11 +47,13 @@ final class NativeArena implements Arena {
 
     static {
         Linker linker = Linker.nativeLinker();
-        CALLOC = linker.downcallHandle(
-                linker.defaultLookup().find("calloc").orElseThrow(),
+        CALLOC = linker.downcallHandle(linker.defaultLookup()
+                .find("calloc")
+                .orElseThrow(),
                 FunctionDescriptor.of(ValueLayout.ADDRESS, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG));
-        FREE = linker.downcallHandle(
-                linker.defaultLookup().find("free").orElseThrow(),
+        FREE = linker.downcallHandle(linker.defaultLookup()
+                .find("free")
+                .orElseThrow(),
                 FunctionDescriptor.ofVoid(ValueLayout.ADDRESS));
     }
 
