@@ -16,6 +16,7 @@
 #   EXECUTORS (8) EXEC_CORES (14) EXEC_MEM (40g) EXEC_OVERHEAD (10g) DRIVER_CORES (2) DRIVER_MEM (8g)
 #   DRIVER_OVERHEAD (1g) DRIVER_MALLOC_ARENA_MAX (2; empty = glibc's default) EXEC_MALLOC_ARENA_MAX (unset)
 #   NODE_SELECTOR (workload=spark-xl; empty for none) OFFHEAP (32g, the comet configurations)
+#   DRIVER_NODE_SELECTOR (default NODE_SELECTOR; e.g. workload=spark-driver for a driver node group of its own)
 #   EXEC_JAVA_OPTS (extra executor JVM options, e.g. a JFR recording: -XX:StartFlightRecording=duration=300s,filename=/tmp/exec.jfr,settings=profile)
 #   DRIVER_JAVA_OPTS (extra driver JVM options, appended to spark.driver.extraJavaOptions)
 #   KEEP_EXECUTORS (unset; set to 1 to keep dead executor pods for their logs)
@@ -194,8 +195,11 @@ cat <<EOF
     labels:
       app: vecruntime-bench
 EOF
-if [ -n "$NODE_SELECTOR" ]; then
-  echo "    nodeSelector:"; echo "      ${NODE_SELECTOR%%=*}: \"${NODE_SELECTOR#*=}\""
+# DRIVER_NODE_SELECTOR (default NODE_SELECTOR): the driver on its own node group, so the executors' nodes hold
+# one full-size executor each.
+DRIVER_SEL="${DRIVER_NODE_SELECTOR-$NODE_SELECTOR}"
+if [ -n "$DRIVER_SEL" ]; then
+  echo "    nodeSelector:"; echo "      ${DRIVER_SEL%%=*}: \"${DRIVER_SEL#*=}\""
 fi
 cat <<EOF
   executor:
