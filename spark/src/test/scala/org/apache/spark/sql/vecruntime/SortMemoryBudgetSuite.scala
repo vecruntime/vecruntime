@@ -114,6 +114,35 @@ class SortMemoryBudgetSuite extends AnyFunSuite {
     }
   }
 
+  test("#874: the sort's peak native memory is measured, and covers what it reserved from the pool") {
+    withPool(1L << 30) { (tmm, _) =>
+      val m = new VectorMetrics(
+        new SQLMetric("sum"),
+        new SQLMetric("sum"),
+        new SQLMetric("sum"),
+        new SQLMetric("sum"),
+        new SQLMetric("size")
+      )
+      val it = new VectorSortIterator(
+        input,
+        Array(ColumnRef(0, LongType)),
+        Array(true),
+        Array(true),
+        Array("k" -> LongType, "v" -> LongType),
+        m,
+        runRows = 1 << 20
+      )
+      var reservedPeak = 0L
+      while (it.hasNext) { it.next(); reservedPeak = math.max(reservedPeak, tmm.getMemoryConsumptionForThisTask()) }
+      it.close()
+      // Two long lanes of every row were resident at once; the reservation is checkable against the measure.
+      assert(m.peakNativeBytes.value >= 16L * Rows, s"peak ${m.peakNativeBytes.value}")
+      assert(reservedPeak > 0 && reservedPeak <= m.peakNativeBytes.value * 2, s"reserved $reservedPeak")
+      m.recordPeakNative(1L)
+      assert(m.peakNativeBytes.value >= 16L * Rows, "a high-water mark: a smaller value does not lower it")
+    }
+  }
+
   test("#867: another consumer of the task can make the sort spill its sealed runs") {
     // A pool the sort's runs nearly fill; after its first batches another consumer asks for most of it, and the
     // sort, still draining, gives back sealed runs by spilling them.

@@ -212,6 +212,9 @@ private[vecruntime] class VectorSortIterator(
   /** Bytes of the sealed runs held in memory: their builders' allocated capacity (#867). */
   private var residentBytes = 0L
 
+  /** #874: the most sorted-run bytes resident at once, for the operator's peak native memory. */
+  private var peakResidentBytes = 0L
+
   /**
    * #867: the sort's memory from Spark's execution memory, as the task's share of the executor's pool: OFF_HEAP
    * when `spark.memory.offHeap.enabled` (our runs are native), else ON_HEAP as the hash aggregate's (#367). The
@@ -437,6 +440,7 @@ private[vecruntime] class VectorSortIterator(
         val run = new MemoryRun(cols, keys, runTotal, bytes, runArena, builders)
         total += runTotal
         residentBytes += bytes
+        peakResidentBytes = math.max(peakResidentBytes, residentBytes)
         residentHeap += run.heapBytes
         // Past the budget -- the cap, or what the pool grants this task (#867), native or heap side (#868) -- the
         // newest run goes to disk in sorted order and its memory is returned, then the largest resident runs until
@@ -636,6 +640,8 @@ private[vecruntime] class VectorSortIterator(
       runs.clear()
       releaseTo(0L)
       releaseHeapTo(0L)
+      // #874: measured, not reserved -- the Arrow output's peak plus the most sorted-run bytes resident at once.
+      metrics.recordPeakNative(allocator.getPeakMemoryAllocation + peakResidentBytes)
       allocator.close()
     }
   }
