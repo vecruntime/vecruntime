@@ -81,6 +81,20 @@ fallback list:
 | A date or timestamp with a rebase mode in write other than `CORRECTED` (Spark 4 default) | `... is not CORRECTED` |
 | A decimal under `spark.sql.parquet.writeLegacyFormat` | `... writeLegacyFormat is on` |
 
+**Spark's own write suites** run with the writer on, from the spark-sql tests jar through the `spark-sql-tests`
+module, with the plugin, `spark.vecruntime.write.columnar.enabled=true`, `spark.vecruntime.write.columnar.fromRows=true`
+and off-heap on.
+- Suites: `ParquetIOSuite`, `ParquetEncodingSuite`, `ParquetCompressionCodecPrecedenceSuite`, `InsertSuite`,
+  `PartitionedWriteSuite`, `BucketedWriteWithoutHiveSupportSuite`, `FileFormatWriterSuite` and `V1WriteCommandSuite`.
+- `fromRows` takes a write of rows (a local relation, a row operator) through Spark's `RowToColumnarExec`, so that
+  323 of the 503 file-source writes the suites make went through this writer. The rest are ORC, JSON, CSV or text,
+  or other fallbacks.
+- 211 of 214 tests pass. The three failures fail the same way with the writer off, so they come from the rest of
+  VecRuntime, not the writer: the two `SPARK-41914` in-partition-sorted v1 writes, and `vectorized reader: missing
+  all struct fields`.
+- The runs found one difference, now fixed: like `FileFormatDataWriter`, an error from the writer is reported as
+  `TASK_WRITE_FAILED`, or as the fast-fail exception for a file that already exists.
+
 **Bloom filters** (#842): `parquet.bloom.filter.enabled`, globally or `#<column>`, with `expected.ndv#`, `fpp#`,
 `max.bytes`, `adaptive.enabled` and `candidates.number#`, read as parquet-java reads them.
 - Each chunk's filter is sized as parquet-java's column writers size it, and the fast writers hash every non-null

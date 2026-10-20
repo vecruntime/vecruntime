@@ -213,6 +213,13 @@ object VectorConf {
   val WriteColumnar = "spark.vecruntime.write.columnar.enabled"
 
   /**
+   * #842: the columnar writer also takes a write whose input is rows (a local relation, a row operator), through
+   * Spark's RowToColumnarExec. Off by default; Spark's own write suites run with it on, so every Parquet write
+   * they make goes through our writer.
+   */
+  val WriteColumnarFromRows = "spark.vecruntime.write.columnar.fromRows"
+
+  /**
    * #735: Iceberg tables read with our native Parquet reader (VectorIcebergScanExec) over Iceberg's own planning:
    * each task group of data files without deletes is decoded by VectorParquetPartitionReader, any other group by
    * Iceberg's reader. Off by default until the TPC-DS Iceberg A/B.
@@ -585,6 +592,7 @@ object VectorConf {
 
   /** #64: the columnar Parquet writer, off by default. */
   def writeColumnar(conf: SQLConf): Boolean = bool(conf, WriteColumnar, default = false)
+  def writeColumnarFromRows(conf: SQLConf): Boolean = bool(conf, WriteColumnarFromRows, default = false)
 
   /** #735: VectorIcebergScanExec, behind the native Parquet scan's own switch too. */
   def scanNativeIceberg(conf: SQLConf): Boolean =

@@ -486,6 +486,18 @@ class VectorWriteSuite extends VectorQuerySuite {
     assert(ours.nonEmpty)
   }
 
+  test("spark.vecruntime.write.columnar.fromRows: a write of rows goes through RowToColumnarExec to our writer") {
+
+    val rows =
+      (s: SparkSession) => s.createDataFrame((1 to 2000).map(i => (i, s"v${i % 7}", i.toLong * 3))).toDF("i", "s", "l")
+    withConf(VectorConf.WriteColumnarFromRows -> "true") {
+      val (plan, _) = compareWrites("from-rows", rows)
+      assert(hasVectorWrite(plan), s"${plan.treeString}\n${fallbackReasons(plan)}")
+    }
+    val (plain, _) = compareWrites("from-rows-off", rows)
+    assert(!hasVectorWrite(plain) && fallbackReasons(plain).exists(_.contains("is not columnar")))
+  }
+
   test("field ids (spark.sql.parquet.fieldId.write.enabled): the same Parquet schema, ids included, as Spark's") {
     def id(n: Int) = new org.apache.spark.sql.types.MetadataBuilder().putLong("parquet.field.id", n).build()
     withConf("spark.sql.parquet.fieldId.write.enabled" -> "true") {

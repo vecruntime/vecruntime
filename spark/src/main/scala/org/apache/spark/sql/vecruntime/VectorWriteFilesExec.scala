@@ -183,7 +183,7 @@ object VectorWritePlanner {
       concurrentKeysReason(w, conf)
     } else if (w.options.contains(BucketingUtils.optionForHiveCompatibleBucketWrite)) {
       Some("columnar write: Hive-compatible bucketing is not supported yet (#842)")
-    } else if (!w.child.supportsColumnar) {
+    } else if (!w.child.supportsColumnar && !io.vecruntime.spark.VectorConf.writeColumnarFromRows(conf)) {
       Some(s"columnar write: child ${w.child.nodeName} is not columnar")
     } else {
       val hadoopConf = session.sessionState.newHadoopConfWithOptions(w.options)
@@ -307,6 +307,19 @@ private[vecruntime] object VectorWriteTask {
     }
     committer.setupTask(taskAttemptContext)
     var dataWriter: FileFormatDataWriter with VectorBatchWriter = null
+    // As FileFormatDataWriter.enrichWriteError around its writes: a fetch failure as it is; a file that already
+    // exists as the fast-fail exception under spark.sql.execution.fastFailOnFileFormatOutput, else, as any other
+    // error of the writer, TASK_WRITE_FAILED. An error computing the input (the batches) propagates as it is.
+    def write(f: => Unit): Unit =
+      try f
+      catch {
+        case e: org.apache.spark.shuffle.FetchFailedException => throw e
+        case e: org.apache.hadoop.fs.FileAlreadyExistsException
+            if org.apache.spark.sql.internal.SQLConf.get.fastFailFileFormatOutput =>
+          throw new org.apache.spark.TaskOutputFileAlreadyExistException(e)
+        case t: Throwable =>
+          throw org.apache.spark.sql.errors.QueryExecutionErrors.taskFailedWhileWritingRowsError(description.path, t)
+      }
     Utils.tryWithSafeFinallyAndFailureCallbacks(block = {
       // As Spark: an empty partition other than the first writes no file (the first writes the schema).
       val writeFile = sparkPartitionId == 0 || batches.hasNext
@@ -319,16 +332,17 @@ private[vecruntime] object VectorWriteTask {
       dataWriter match {
         case d: VectorDynamicPartitionDataWriter if concurrent.isDefined =>
           // `sorted` first: a reader may reuse its vectors on `hasNext`, and the pending rows still borrow them.
-          while (!d.sorted && batches.hasNext) d.writeBatch(batches.next(), ordinals)
+          while (!d.sorted && batches.hasNext) { val b = batches.next(); write(d.writeBatch(b, ordinals)) }
           if (d.sorted) {
             // The limit was reached: the rest, sorted, through the same writer (the sort keeps the columns).
             val rest = d.sortedRest(batches)
-            try while (rest.hasNext) d.writeBatch(rest.next(), ordinals)
+            try while (rest.hasNext) { val b = rest.next(); write(d.writeBatch(b, ordinals)) }
             finally rest.close()
           }
         case _ =>
           while (batches.hasNext) {
-            dataWriter.writeBatch(batches.next(), ordinals)
+            val b = batches.next()
+            write(dataWriter.writeBatch(b, ordinals))
           }
       }
       dataWriter.commit()
