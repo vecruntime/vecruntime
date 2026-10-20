@@ -294,6 +294,32 @@ class SortMemoryBudgetSuite extends AnyFunSuite {
     }
   }
 
+  test("#875: the pool memory unspillable consumers hold is counted, current and peak, and returned") {
+    withPool(1L << 30) { (_, _) =>
+      val before = PinnedMemory.bytes
+      val m = new BuildMemory(MemoryMode.ON_HEAP)
+      assert(m.hold(1L << 20))
+      assert(PinnedMemory.bytes - before === (1L << 20))
+      assert(PinnedMemory.peakBytes >= PinnedMemory.bytes)
+      m.releaseTo(1L << 18)
+      assert(PinnedMemory.bytes - before === (1L << 18))
+      m.releaseTo(0L)
+      assert(PinnedMemory.bytes === before)
+    }
+  }
+
+  test("#875: a join build is admitted within its spill budget and the task's share of the off-heap pool") {
+    val sql = new org.apache.spark.sql.internal.SQLConf
+    val offHeap = new SparkConf(false)
+      .set("spark.memory.offHeap.enabled", "true")
+      .set("spark.memory.offHeap.size", "1g")
+      .set("spark.executor.cores", "8")
+    assert(io.vecruntime.spark.VectorConf.joinBuildAdmissionBytes(sql, new SparkConf(false)) === (256L << 20))
+    assert(io.vecruntime.spark.VectorConf.joinBuildAdmissionBytes(sql, offHeap) === (128L << 20), "the share")
+    sql.setConfString("spark.vecruntime.join.spillBytes", "64m")
+    assert(io.vecruntime.spark.VectorConf.joinBuildAdmissionBytes(sql, offHeap) === (64L << 20), "the budget")
+  }
+
   test("#868: a pool too small for the build side makes the hash join bucket, within a large budget") {
     withPool(64L * 1024) { (_, _) =>
       val before = GraceHashJoin.bucketedJoins.get()

@@ -530,14 +530,18 @@ private[vecruntime] class VectorGroupedAggregateIterator(
     val estimate = estimatedBytes
     if (estimate > budget) return true
     if (consumer != null && estimate > reserved) {
-      reserved += consumer.acquireMemory(estimate - reserved)
+      val got = consumer.acquireMemory(estimate - reserved)
+      reserved += got
+      PinnedMemory.add(got) // #875: never spilled on request
       if (reserved < estimate) return true
     }
     false
   }
 
   private def releaseMemory(): Unit =
-    if (consumer != null && reserved > 0) { consumer.freeMemory(reserved); reserved = 0L }
+    if (consumer != null && reserved > 0) {
+      consumer.freeMemory(reserved); PinnedMemory.add(-reserved); reserved = 0L
+    }
 
   Option(TaskContext.get()).foreach(_.addTaskCompletionListener[Unit](_ => close()))
 

@@ -261,6 +261,24 @@ object GraceHashJoin extends Logging {
  * consumer's request (a built table cannot give back part of itself); everything is returned when the task
  * ends. Without a task (a driver-side call, a unit test) it holds nothing and always grants.
  */
+/**
+ * #875: the execution memory this executor's tasks hold through consumers that never spill on another consumer's
+ * request -- the hash join's builds and heap mirrors ([[BuildMemory]]) and the hash aggregates' tables -- current and
+ * peak, published as the executor metrics `pinnedUnspillableBytes` and `pinnedUnspillablePeakBytes`. When it nears
+ * the pool, the sort (the one consumer that yields) is the one squeezed.
+ */
+object PinnedMemory {
+  private val current = new java.util.concurrent.atomic.AtomicLong()
+  private val peak = new java.util.concurrent.atomic.AtomicLong()
+
+  def add(delta: Long): Unit = if (delta != 0) {
+    val now = current.addAndGet(delta)
+    if (delta > 0) peak.accumulateAndGet(now, (a, b) => math.max(a, b))
+  }
+  def bytes: Long = current.get()
+  def peakBytes: Long = peak.get()
+}
+
 private[vecruntime] final class BuildMemory(
     mode: org.apache.spark.memory.MemoryMode = VectorSortIterator.memoryMode()
 ) {
@@ -278,13 +296,17 @@ private[vecruntime] final class BuildMemory(
 
   def hold(bytes: Long): Boolean = {
     if (consumer == null || bytes <= held) return true
-    held += consumer.acquireMemory(bytes - held)
+    val got = consumer.acquireMemory(bytes - held)
+    held += got
+    PinnedMemory.add(got)
     held >= bytes
   }
 
   def releaseTo(bytes: Long): Unit =
     if (consumer != null && held > bytes) {
-      consumer.freeMemory(held - math.max(0L, bytes))
+      val freed = held - math.max(0L, bytes)
+      consumer.freeMemory(freed)
+      PinnedMemory.add(-freed)
       held = math.max(0L, bytes)
     }
 
