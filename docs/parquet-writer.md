@@ -77,7 +77,7 @@ fallback list:
 | Struct, array, map columns under `spark.sql.parquet.writeLegacyFormat` | `column <name> is nested and writeLegacyFormat is on` |
 | Other types (intervals, variant, ...) | `column <name> has type <type>, not supported yet (#842)` |
 | `parquet.writer.version=v1` | `parquet.writer.version is v1, the columnar writer writes Parquet v2` |
-| Bloom filters, encryption, per-column `#` options other than `parquet.enable.dictionary#<column>` | named in the reason |
+| Encryption; per-column `#` options other than `parquet.enable.dictionary#` and `parquet.bloom.filter.*#` | named in the reason |
 | A date or timestamp with a rebase mode in write other than `CORRECTED` (Spark 4 default) | `... is not CORRECTED` |
 | A decimal under `spark.sql.parquet.writeLegacyFormat` | `... writeLegacyFormat is on` |
 
