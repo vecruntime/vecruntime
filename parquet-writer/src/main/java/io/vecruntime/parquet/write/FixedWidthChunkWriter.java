@@ -213,8 +213,23 @@ final class FixedWidthChunkWriter implements ChunkWriter {
             }
         }
         if (dictionary) {
-            for (int k = start; k < pageValues; k++) {
-                ids[k] = idOf(values[k]);
+            // Repeated neighbours (a ticket's rows share its date, customer, store...; a sorted or partitioned
+            // write repeats its keys) reuse the previous id without a probe.
+            int k = start;
+            if (k > 0) {
+                long prev = values[k - 1];
+                int prevId = ids[k - 1];
+                while (k < pageValues && values[k] == prev) {
+                    ids[k++] = prevId;
+                }
+            }
+            while (k < pageValues) {
+                long value = values[k];
+                int id = idOf(value);
+                ids[k++] = id;
+                while (k < pageValues && values[k] == value) {
+                    ids[k++] = id;
+                }
             }
         }
         if (dictionary && (long) entryCount * kind.width > dictionaryLimit) {

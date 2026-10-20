@@ -123,9 +123,10 @@ fallback list:
 |---|---|---|---|
 | `WHERE ss_sold_date_sk IS NOT NULL` | **324 s**, 100.4 GB | -- | 542 s, 137.6 GB |
 | all rows | 1137 s, 104.1 GB | 1657 s, 135.2 GB | 985 s, 143.0 GB |
-| all rows, `spark.vecruntime.sort.spillBytes=64m`, `sort.runRows=131072` | 653 s | 1043 s | -- |
+| all rows, `spark.vecruntime.sort.spillBytes=64m`, `sort.runRows=131072` | 653 s and 1156 s (two runs) | 1043 s | -- |
 
-- With all rows, the wall time is the one task that receives every null `ss_sold_date_sk` row. At the default sort budget, that task makes VecRuntime slower than plain Spark.
+- With all rows, one task receives every null `ss_sold_date_sk` row (about 4.5% of the table, written as one file). That task runs alone at the end, for more than 10 minutes in the slower 64 MiB run, so the wall time varies from run to run.
+- At the default sort settings, each all-rows run also lost one executor near its 53.7 GB container limit. The fetch failure that follows recomputes the map stage. With off-heap disabled, the sort's native runs are budgeted against the on-heap pool (#868). A 64 MiB budget lost none.
 - These writes used to fail with container OOMs, with this writer and with Spark's. The cause was the sort that `V1Writes` plans before the write: its native runs held about 4x their budget. #870 and #871 fixed that.
 
 JMH `ParquetWriteBenchmark`, 262,144 `store_sales`-shaped rows, uncompressed, output discarded (shared

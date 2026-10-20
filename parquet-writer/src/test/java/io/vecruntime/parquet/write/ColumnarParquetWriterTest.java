@@ -435,4 +435,31 @@ class ColumnarParquetWriterTest {
         assertEquals(a, c);
         assertEquals(rows.size(), a.size());
     }
+
+    /**
+     * Runs of repeated values (a ticket's rows, a sorted key), with nulls
+     * inside the runs and runs that span batch and page boundaries: the
+     * dictionary ids the writer reuses for a repeated neighbour give the values
+     * parquet-java writes.
+     */
+    @Test
+    void repeatedRunsAcrossBatchesMatchParquetJava() throws Exception {
+        List<Row> base = rows(3_000, 5);
+        Random r = new Random(6);
+        List<Row> rows = new ArrayList<>();
+        for (Row b : base) {
+            int run = 1 + r.nextInt(r.nextBoolean() ? 3 : 40);
+            for (int k = 0; k < run; k++) {
+                boolean hole = r.nextInt(6) == 0;
+                rows.add(hole ? new Row(null, null, null, null, null, null,
+                        null, null, null, null)
+                        : b);
+            }
+        }
+        org.apache.hadoop.fs.Path theirs = writeParquetJava(rows, 128L << 20);
+        List<String> expected = readAll(theirs);
+        for (int batch : new int[] {1, 7, 1000, rows.size()}) {
+            assertEquals(expected, readAll(writeOurs(rows, batch, 128L << 20)), "batch " + batch);
+        }
+    }
 }
