@@ -376,7 +376,11 @@ class ColumnarParquetWriterTest {
     }
 
     private static String d(org.apache.parquet.column.statistics.SizeStatistics s) {
-        return s == null ? "null" : s.getUnencodedByteArrayDataBytes() + " rep=" + s.getRepetitionLevelHistogram() + " def=" + s.getDefinitionLevelHistogram();
+        return s == null ? "null" : s.getUnencodedByteArrayDataBytes()
+                + " rep="
+                + s.getRepetitionLevelHistogram()
+                + " def="
+                + s.getDefinitionLevelHistogram();
     }
 
     @Test

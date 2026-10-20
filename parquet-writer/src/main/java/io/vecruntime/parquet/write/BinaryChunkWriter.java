@@ -378,8 +378,8 @@ final class BinaryChunkWriter implements ChunkWriter {
                 s,
                 // Size statistics (Parquet 2.10): the page's unencoded value bytes and,
                 // for a flat column, no level histograms -- as parquet-java writes them.
-                new org.apache.parquet.column.statistics.SizeStatistics(column.getPrimitiveType(),
-                        pageDataBytes, java.util.List.of(), java.util.List.of()),
+                new org.apache.parquet.column.statistics.SizeStatistics(column.getPrimitiveType(), pageDataBytes, java.util.List.of(),
+                        java.util.List.of()),
                 null); // no geospatial statistics
         Arrays.fill(pageValidity, 0, (pageRows + 63) >>> 6, 0L);
         pageRows = 0;
