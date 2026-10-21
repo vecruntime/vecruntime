@@ -50,7 +50,7 @@ mvn -B -q clean install                    # kernels + Spark suites, Comet suite
 mvn -B -q -Pcomet clean install            # also the Comet-backed suites (needs the Comet jar in ~/.m2)
 mvn -B -q -Pcomet,iceberg clean install    # plus the Iceberg suites (Iceberg 1.11 runtime from Maven Central)
 dev/test-changed.sh                         # the fast loop: changed modules + the spark suites of the changed areas (docs/testing.md section 5)
-mvn -B -Pcomet,iceberg -pl kernels,spark,shuffle,benchmarks install   # THE GATE every change runs before a PR
+mvn -B -Pcomet,iceberg -pl kernels,parquet,spark,shuffle,benchmarks install   # THE GATE every change runs before a PR
 mvn -pl kernels test -Dvector.jvm.args="--add-modules=jdk.incubator.vector --enable-native-access=ALL-UNNAMED --sun-misc-unsafe-memory-access=allow -Dvecruntime.vectorBits=512"
 mvn -pl spark install -Dsuites=io.vecruntime.spark.VectorAggregateSuite   # one suite
 benchmarks/scripts/run-spark-sql-tests.sh [regex]          # the SQL golden suite (section 7.2)
@@ -736,7 +736,7 @@ demand.
 A change is not done until all of the following that apply have run green, locally, on JDK 25, and
 the exit codes are reported.
 
-1. The gate: `mvn -B -Pcomet,iceberg -pl kernels,spark,shuffle,benchmarks install`, exit 0. Last full
+1. The gate: `mvn -B -Pcomet,iceberg -pl kernels,parquet,spark,shuffle,benchmarks install`, exit 0. Last full
    gate: kernels 204 tests, spark 431 (Comet and Iceberg profiles on), shuffle 54. If a change lowers
    a number, explain why in the commit.
 2. Kernel changes: the kernel suite at 128, 256 and 512 bits (`-Dvecruntime.vectorBits=...`).
