@@ -87,6 +87,13 @@ object TaskNativeMemory {
     else new ConsumerReservation(tc.taskMemoryManager(), mode, spill)
   }
 
+  /** A reservation of its own for bytes that are not pool blocks, whatever the accounting; null off a task thread. */
+  def ownReservation(mode: MemoryMode, spill: Long => Long): Reservation = {
+    val tc = TaskContext.get()
+    if (tc == null || tc.taskMemoryManager() == null) null
+    else new ConsumerReservation(tc.taskMemoryManager(), mode, spill)
+  }
+
   /** The account of the task running on this thread, opened on first use; null off a task thread. */
   def current(): NativePool.Account = {
     val tc = TaskContext.get()
