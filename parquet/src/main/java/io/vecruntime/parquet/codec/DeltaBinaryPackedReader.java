@@ -132,7 +132,7 @@ public final class DeltaBinaryPackedReader {
         }
         this.perMini = blockSize / miniblocks;
         this.remaining = readUleb32("value count");
-        long first = zigzag(readUleb64());
+        long first = ParquetFraming.zigzagDecode(readUleb64());
         this.last = int64 ? first : (int) first;
         this.widths = new int[miniblocks];
         this.miniIndex = miniblocks;
@@ -253,7 +253,7 @@ public final class DeltaBinaryPackedReader {
      */
     private void nextMiniblock() {
         if (miniIndex == miniblocks) {
-            minDelta = zigzag(readUleb64());
+            minDelta = ParquetFraming.zigzagDecode(readUleb64());
             if (pos + miniblocks > end) {
                 throw new IllegalStateException("DELTA_BINARY_PACKED: block header past the end of the page");
             }
@@ -440,9 +440,5 @@ public final class DeltaBinaryPackedReader {
             }
             shift += 7;
         }
-    }
-
-    private static long zigzag(long v) {
-        return ParquetFraming.zigzagDecode(v);
     }
 }

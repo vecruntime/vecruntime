@@ -74,7 +74,7 @@ public final class DeltaBinaryPackedEncoder {
             int count = Math.min(BLOCK, n - i);
             if (vector && count == BLOCK) {
                 long min = vectorBlock(values, i, true);
-                emit(count, zigzag(min), out);
+                emit(count, ParquetFraming.zigzagEncode(min), out);
                 i += count;
                 continue;
             }
@@ -87,7 +87,7 @@ public final class DeltaBinaryPackedEncoder {
             for (int k = 0; k < count; k++) {
                 deltas[k] = ((int) deltas[k] - min) & 0xFFFFFFFFL;
             }
-            block(count, zigzag(min), out);
+            block(count, ParquetFraming.zigzagEncode(min), out);
             i += count;
         }
     }
@@ -100,7 +100,7 @@ public final class DeltaBinaryPackedEncoder {
             int count = Math.min(BLOCK, n - i);
             if (vector && count == BLOCK) {
                 long min = vectorBlock(values, i, false);
-                emit(count, zigzag(min), out);
+                emit(count, ParquetFraming.zigzagEncode(min), out);
                 i += count;
                 continue;
             }
@@ -113,7 +113,7 @@ public final class DeltaBinaryPackedEncoder {
             for (int k = 0; k < count; k++) {
                 deltas[k] -= min;
             }
-            block(count, zigzag(min), out);
+            block(count, ParquetFraming.zigzagEncode(min), out);
             i += count;
         }
     }
@@ -133,7 +133,7 @@ public final class DeltaBinaryPackedEncoder {
             for (int k = 0; k < count; k++) {
                 deltas[k] = ((int) deltas[k] - min) & 0xFFFFFFFFL;
             }
-            block(count, zigzag(min), out);
+            block(count, ParquetFraming.zigzagEncode(min), out);
             i += count;
         }
     }
@@ -142,11 +142,7 @@ public final class DeltaBinaryPackedEncoder {
         writeVarLong(BLOCK, out);
         writeVarLong(MINIBLOCKS, out);
         writeVarLong(n, out);
-        writeVarLong(zigzag(first), out);
-    }
-
-    private static long zigzag(long v) {
-        return ParquetFraming.zigzagEncode(v);
+        writeVarLong(ParquetFraming.zigzagEncode(first), out);
     }
 
     private static void writeVarLong(long v, ByteSink out) {
