@@ -129,7 +129,7 @@ public final class NativeParquetNullColumn implements NativeParquetColumn {
     }
 
     @Override
-    public void setRebase(ParquetRebase rebase) {
+    public void setRebase(io.vecruntime.parquet.read.CalendarRebase rebase) {
         // No values to rebase.
     }
 

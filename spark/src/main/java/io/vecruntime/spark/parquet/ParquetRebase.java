@@ -46,7 +46,7 @@ import org.apache.spark.sql.execution.datasources.DataSourceUtils;
  * present values are all at or above it -- every batch of any modern data --
  * costs one pass of comparisons and is left as decoded.
  */
-public final class ParquetRebase {
+public final class ParquetRebase implements io.vecruntime.parquet.read.CalendarRebase {
 
     /** No rebase, no conversion: a CORRECTED file. */
     public static final ParquetRebase CORRECTED = new ParquetRebase("CORRECTED", null, "CORRECTED", null, null);
@@ -84,6 +84,7 @@ public final class ParquetRebase {
     }
 
     /** A batch of {@code n} dates (INT32 days) in {@code data}. */
+    @Override
     public void fixDays(MemorySegment data, MemorySegment validity, int n) {
         if (!dateLegacy && !dateFail) {
             return;
@@ -112,6 +113,7 @@ public final class ParquetRebase {
      * Math#multiplyExact} fails a day out of range, as Spark's {@code
      * daysToMicros} does.
      */
+    @Override
     public void daysToMicros(MemorySegment data, MemorySegment validity, int n) {
         int sw = RebaseDateTime.lastSwitchJulianDay();
         boolean rebase = dateLegacy || dateFail;
@@ -137,6 +139,7 @@ public final class ParquetRebase {
      * A batch of {@code n} timestamps (INT64 micros) in {@code data}; {@code
      * int96}: stored as INT96.
      */
+    @Override
     public void fixMicros(MemorySegment data, MemorySegment validity, int n,
                           boolean int96) {
         boolean legacy = int96 ? int96Legacy : dateLegacy;

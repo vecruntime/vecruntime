@@ -38,6 +38,12 @@ version may change configuration keys or defaults, always noted here.
   the writer's `io.vecruntime.parquet.write`. The encoders and decoders share their `DELTA_BINARY_PACKED` and
   RLE / bit-packed hybrid framing (`ParquetFraming`). The plugin jar shades `kernels` and `parquet`; code that
   imported the decoders from `kernels` imports them from the new package.
+- The native scan's structural readers are Spark-free too (#900): `io.vecruntime.parquet.read` holds the leaf
+  reader (`LeafColumnReader`, driven by a `LeafReadSpec` the adapter builds once per column instead of Spark type
+  checks), the struct, list / map, nested-list and tree readers, and the `ColumnReader` contract; they write Arrow
+  vectors through `ArrowWrite` and take the calendar rebase as a `CalendarRebase`. The Spark classes keep their
+  names as thin subclasses (the schema walk from the Spark type and the column wrappers). The leaf reader no longer
+  builds a Spark column wrapper it threw away on every batch.
 
 - The native Parquet scan no longer filters pages by the column index by default (#873):
   `parquet.filter.columnindex.enabled` now defaults to `false` in `VectorParquetScanExec`. On the classic S3A
