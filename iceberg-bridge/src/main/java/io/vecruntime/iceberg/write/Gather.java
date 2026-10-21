@@ -22,6 +22,7 @@ import java.util.List;
 
 import io.vecruntime.kernels.ArrowLayout;
 import io.vecruntime.kernels.GatherKernels;
+import io.vecruntime.kernels.NestedGatherKernels;
 import io.vecruntime.kernels.SegmentVectorBuffers;
 import io.vecruntime.kernels.VecType;
 import io.vecruntime.kernels.VectorBuffers;
@@ -29,9 +30,8 @@ import io.vecruntime.kernels.VectorBuffers;
 /**
  * Rows of a batch gathered into new columns, for the fanout writer (#842, W3):
  * the engine's gather kernels over fixed-width, boolean, decimal and string
- * lanes, a dictionary-encoded string keeping its dictionary. Nested lanes are
- * not gathered here; a fanout write of a schema with nested columns keeps
- * Iceberg's writer.
+ * lanes, a dictionary-encoded string keeping its dictionary, and lists, maps
+ * and structs gathered recursively ({@link NestedGatherKernels}).
  */
 final class Gather {
 
@@ -48,7 +48,8 @@ final class Gather {
     private static VectorBuffers column(VectorBuffers in, int[] idx, Arena arena) {
         int n = idx.length;
         if (in.type().isNested()) {
-            throw new UnsupportedOperationException("gathering a nested column: " + in.type());
+            // Lists, maps and structs: their rows' elements and fields, gathered recursively.
+            return NestedGatherKernels.gather(in, idx, n, arena);
         }
         MemorySegment validity = in.hasNulls() ? ArrowLayout.allocateBitmap(arena, n) : null;
         if (in.type() == VecType.UTF8 && !in.isDictionaryEncoded()) {

@@ -183,66 +183,7 @@ object ElementAccessExpr {
     case other => throw new IllegalStateException(s"no literal $other index or key")
   }
 
-  /** Rows `idx` of `child` (-1 = null) as a lane of `n` rows. */
+  /** Rows `idx` of `child` (-1 = null) as a lane of `n` rows, nested or not (NestedGatherKernels). */
   def gather(child: VectorBuffers, idx: Array[Int], n: Int, arena: Arena): VectorBuffers =
-    if (child.`type`().isNested()) gatherNested(child.asInstanceOf[NestedVectorBuffers], idx, n, arena)
-    else gatherLeaf(child, idx, n, arena)
-
-  /**
-   * Rows `idx` of a nested lane (-1 = null), as a nested lane of `n` rows (#705): a list's or map's
-   * rows become new offsets over their children gathered at the elements' positions, a struct's fields
-   * are gathered at the same rows -- recursively, down to the leaves.
-   */
-  def gatherNested(v: NestedVectorBuffers, idx: Array[Int], n: Int, arena: Arena): VectorBuffers = {
-    val validity = ArrowLayout.allocateBitmap(arena, math.max(n, 1))
-    var i = 0
-    while (i < n) { if (idx(i) >= 0 && !v.isNull(idx(i))) Bitmap.set(validity, i); i += 1 }
-    if (v.`type`() == VecType.STRUCT) {
-      val fields = new java.util.ArrayList[VectorBuffers](v.children().size())
-      v.children().forEach(c => fields.add(gather(c, idx, n, arena)))
-      new NestedVectorBuffers(VecType.STRUCT, n, validity, null, fields)
-    } else {
-      val offsets = ArrowLayout.allocateOffsets(arena, n)
-      var total = 0
-      i = 0
-      while (i < n) { if (Bitmap.isSet(validity, i)) total += v.size(idx(i)); i += 1 }
-      val elems = new Array[Int](math.max(total, 1))
-      var k = 0
-      i = 0
-      while (i < n) {
-        if (Bitmap.isSet(validity, i)) {
-          var j = v.start(idx(i))
-          val end = v.end(idx(i))
-          while (j < end) { elems(k) = j; k += 1; j += 1 }
-        }
-        offsets.set(VectorBuffers.LE_INT, (i + 1).toLong << 2, k)
-        i += 1
-      }
-      val kids = new java.util.ArrayList[VectorBuffers](v.children().size())
-      v.children().forEach(c => kids.add(gather(c, elems, k, arena)))
-      new NestedVectorBuffers(v.`type`(), n, validity, offsets, kids)
-    }
-  }
-
-  private def gatherLeaf(child: VectorBuffers, idx: Array[Int], n: Int, arena: Arena): VectorBuffers = {
-    val validity = ArrowLayout.allocateBitmap(arena, n)
-    child.`type`() match {
-      case VecType.UTF8 =>
-        val offsets = ArrowLayout.allocateOffsets(arena, n)
-        val data = ArrowLayout.allocateBytes(arena, math.max(GatherKernels.gatherUtf8Bytes(child, idx, 0, n), 1L))
-        GatherKernels.gatherUtf8(child, idx, 0, n, offsets, data, validity)
-        SegmentVectorBuffers.utf8(n, validity, offsets, data)
-      case t =>
-        val data =
-          if (t == VecType.BOOL) ArrowLayout.allocateBitmap(arena, n) else ArrowLayout.allocateData(arena, t, n)
-        if (child.length() == 0) {
-          // No element anywhere: every row is null (and no position to read).
-          Bitmap.fillRange(validity, 0, n, false)
-          SegmentVectorBuffers.fixedWidth(t, n, validity, data)
-        } else {
-          GatherKernels.gatherFixed(child, idx, 0, n, data, validity)
-          SegmentVectorBuffers.fixedWidth(t, n, validity, data)
-        }
-    }
-  }
+    io.vecruntime.kernels.NestedGatherKernels.gather(child, idx, n, arena)
 }

@@ -61,8 +61,7 @@ public final class IcebergDataCommitBridge {
      * Why the columnar writer cannot write {@code write}'s data files, or
      * {@code null} when it can: the file format must be Parquet; a partitioned
      * output spec's sources must be top-level columns of types the batches
-     * carry (and a fanout write must have no nested columns, which it cannot
-     * gather); the table must be unencrypted; and every write schema type must
+     * carry; the table must be unencrypted; and every write schema type must
      * be one the columnar Parquet writer encodes.
      */
     public static String declineReason(Write write) {
@@ -81,10 +80,6 @@ public final class IcebergDataCommitBridge {
             String partitions = io.vecruntime.iceberg.write.IcebergWriteSpec.unsupportedPartitioning(spec, schema);
             if (partitions != null) {
                 return partitions;
-            }
-            if (field(w, "useFanoutWriter", Boolean.class) && schema.columns().stream()
-                    .anyMatch(c -> c.type().isNestedType())) {
-                return "a fanout write of nested columns is not supported yet";
             }
         }
         if (table.properties().keySet().stream()

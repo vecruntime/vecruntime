@@ -306,7 +306,7 @@ class VectorIcebergWriteSuite extends AnyFunSuite with BeforeAndAfterAll {
     assert(rows(on) == rows(off))
   }
 
-  test("partitioned nested columns write columnar clustered, and keep Iceberg's writer with fanout") {
+  test("partitioned nested columns write columnar, clustered and fanout") {
     partitionedTwin(
       "p_nested_clustered",
       "bucket(4, id)",
@@ -319,8 +319,7 @@ class VectorIcebergWriteSuite extends AnyFunSuite with BeforeAndAfterAll {
       "bucket(4, id)",
       ", 'write.spark.fanout.enabled'='true'",
       Columns,
-      source(3000),
-      columnarExpected = false
+      source(3000)
     )
   }
 
