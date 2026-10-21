@@ -40,6 +40,18 @@ final class IcebergParquetInterop {
 
     private IcebergParquetInterop() {}
 
+    private static final org.apache.parquet.format.converter.ParquetMetadataConverter TO_THRIFT = new org.apache.parquet.format.converter.ParquetMetadataConverter();
+
+    /**
+     * Built once: the read options' default Thrift message-size limit is the
+     * one a file reader uses (the no-argument converter has none, -1, and
+     * refuses to read), and building them creates a Hadoop {@code
+     * Configuration}, which parses the default XML resources -- milliseconds a
+     * file must not pay.
+     */
+    private static final org.apache.iceberg.shaded.org.apache.parquet.format.converter.ParquetMetadataConverter FROM_THRIFT = new org.apache.iceberg.shaded.org.apache.parquet.format.converter.ParquetMetadataConverter(org.apache.iceberg.shaded.org.apache.parquet.ParquetReadOptions.builder()
+            .build());
+
     /**
      * The Parquet schema Iceberg writes for {@code schema}: Iceberg's own conversion
      * ({@code ParquetSchemaUtil.convert}), field ids included, re-parsed into
@@ -63,12 +75,8 @@ final class IcebergParquetInterop {
      */
     static org.apache.iceberg.shaded.org.apache.parquet.hadoop.metadata.ParquetMetadata shadedFooter(ParquetMetadata footer) throws IOException {
         ByteArrayOutputStream bytes = new ByteArrayOutputStream();
-        org.apache.parquet.format.Util.writeFileMetaData(new org.apache.parquet.format.converter.ParquetMetadataConverter().toParquetMetadata(ParquetFileWriter.CURRENT_VERSION, footer), bytes);
-        // The no-argument converter has no Thrift message-size limit set (-1) and refuses to read; the read
-        // options' default limit is the one a file reader uses.
-        return new org.apache.iceberg.shaded.org.apache.parquet.format.converter.ParquetMetadataConverter(org.apache.iceberg.shaded.org.apache.parquet.ParquetReadOptions.builder()
-                .build())
-                .readParquetMetadata(new ByteArrayInputStream(bytes.toByteArray()), org.apache.iceberg.shaded.org.apache.parquet.format.converter.ParquetMetadataConverter.NO_FILTER);
+        org.apache.parquet.format.Util.writeFileMetaData(TO_THRIFT.toParquetMetadata(ParquetFileWriter.CURRENT_VERSION, footer), bytes);
+        return FROM_THRIFT.readParquetMetadata(new ByteArrayInputStream(bytes.toByteArray()), org.apache.iceberg.shaded.org.apache.parquet.format.converter.ParquetMetadataConverter.NO_FILTER);
     }
 
     /**

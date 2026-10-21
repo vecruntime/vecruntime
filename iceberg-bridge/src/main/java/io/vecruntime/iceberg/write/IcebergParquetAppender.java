@@ -89,13 +89,15 @@ public final class IcebergParquetAppender implements FileAppender<IcebergParquet
     private final MetricsConfig metricsConfig;
     private final NameMapping nameMapping;
     private final FloatingMetrics floating;
+    private final CodecFactory codecs;
     private Metrics metrics;
     private List<Long> splitOffsets;
 
-    private IcebergParquetAppender(ColumnarParquetWriter writer, MetricsConfig metricsConfig, NameMapping nameMapping,
-            FloatingMetrics floating) {
+    private IcebergParquetAppender(ColumnarParquetWriter writer, CodecFactory codecs, MetricsConfig metricsConfig,
+            NameMapping nameMapping, FloatingMetrics floating) {
         this.writer = writer;
         this.floating = floating;
+        this.codecs = codecs;
         this.metricsConfig = metricsConfig;
         this.nameMapping = nameMapping;
     }
@@ -154,7 +156,7 @@ public final class IcebergParquetAppender implements FileAppender<IcebergParquet
         long rowGroupSize = longProp(properties, TableProperties.PARQUET_ROW_GROUP_SIZE_BYTES, TableProperties.PARQUET_ROW_GROUP_SIZE_BYTES_DEFAULT);
         ColumnarParquetWriter writer = new ColumnarParquetWriter(IcebergParquetInterop.parquetOutput(file), fileSchema, props.build(),
                 codecs.getCompressor(codec), rowGroupSize, Map.of("iceberg.schema", SchemaParser.toJson(schema)));
-        return new IcebergParquetAppender(writer, metricsConfig, nameMapping, new FloatingMetrics(schema));
+        return new IcebergParquetAppender(writer, codecs, metricsConfig, nameMapping, new FloatingMetrics(schema));
     }
 
     private static int intProp(Map<String, String> p, String key, int dflt) {
@@ -229,7 +231,11 @@ public final class IcebergParquetAppender implements FileAppender<IcebergParquet
         if (metrics != null) {
             return;
         }
-        writer.close();
+        try {
+            writer.close();
+        } finally {
+            codecs.release();
+        }
         ParquetMetadata footer = writer.footer();
         List<Long> offsets = new ArrayList<>(footer.getBlocks()
                 .size());
