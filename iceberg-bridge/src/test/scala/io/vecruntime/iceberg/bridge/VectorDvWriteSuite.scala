@@ -383,6 +383,58 @@ class VectorDvWriteSuite extends AnyFunSuite with BeforeAndAfterAll {
     }
   }
 
+  test("UPDATE and MERGE on a v3 table with struct, array and map columns match Spark's writer") {
+    val base = "ice.db.dv_nested"
+    for (t <- Seq(s"${base}_on", s"${base}_off")) {
+      spark.sql(s"DROP TABLE IF EXISTS $t")
+      spark.sql(
+        s"""CREATE TABLE $t (id BIGINT, p INT,
+           |  s STRUCT<a: INT, d: DECIMAL(10,2), t: STRING>, l ARRAY<STRING>, m MAP<STRING, BIGINT>)
+           |USING iceberg PARTITIONED BY (p)
+           |TBLPROPERTIES ('format-version'='3', 'write.delete.mode'='merge-on-read',
+           |  'write.update.mode'='merge-on-read', 'write.merge.mode'='merge-on-read',
+           |  'write.target-file-size-bytes'='4096')""".stripMargin
+      )
+      spark.sql(
+        s"""INSERT INTO $t
+           |SELECT id, cast(id % 4 as int),
+           |  if(id % 11 = 0, null, named_struct('a', cast(id as int), 'd', cast(id / 7 as decimal(10,2)),
+           |    't', if(id % 3 = 0, null, concat('t', id)))),
+           |  if(id % 13 = 0, null, array(concat('x', id), null, concat('y', id % 5))),
+           |  if(id % 17 = 0, null, map(concat('k', id), id, 'z', id * 2))
+           |FROM range(2000)""".stripMargin
+      )
+    }
+    assert(
+      onOff(
+        base,
+        "UPDATE %s SET s = named_struct('a', -1, 'd', cast(1.5 as decimal(10,2)), 't', 'u') WHERE id % 7 = 0"
+      ),
+      "nested UPDATE not columnar"
+    )
+    spark
+      .sql(
+        """SELECT id, cast(id % 4 as int) AS p, array(concat('n', id)) AS l, id % 3 AS op
+          |FROM range(1500, 2500)""".stripMargin
+      )
+      .createOrReplaceTempView("dv_src_nested")
+    val merge =
+      """MERGE INTO %s t USING dv_src_nested s ON t.id = s.id
+        |WHEN MATCHED AND s.op = 0 THEN DELETE
+        |WHEN MATCHED THEN UPDATE SET t.l = s.l
+        |WHEN NOT MATCHED THEN INSERT (id, p, s, l, m) VALUES (s.id, s.p, null, s.l, map('i', s.id))""".stripMargin
+    assert(onOff(base, merge), "nested MERGE not columnar")
+    // Inserted rows get their _row_id at commit, from the order of the new files: compared for the originals only.
+    def all(t: String): Array[Row] =
+      spark.sql(s"SELECT *, if(id < 2000, _row_id, null) FROM $t ORDER BY id").collect()
+    val (rOn, rOff) = (all(s"${base}_on"), all(s"${base}_off"))
+    val diff = rOn.zip(rOff).filter { case (a, b) => a != b }.take(3)
+    assert(
+      rOn.length == rOff.length && diff.isEmpty,
+      s"nested contents or _row_id differ: ${rOn.length} vs ${rOff.length} rows; ${diff.mkString("; ")}"
+    )
+  }
+
   test("MERGE with only a NOT MATCHED insert clause leaves no DVs and matches Spark's writer") {
     val base = "ice.db.dv_mrg_ins"
     createMor(s"${base}_on", partitioned = false)
