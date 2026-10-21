@@ -165,7 +165,19 @@ public final class NativePool {
     private static final class ThreadCache {
         final Block[][] blocks = new Block[CLASSES][MAX_CACHE_DEPTH];
         final int[] count = new int[CLASSES];
+        // Bytes in this thread's cache, and takes so far (the peak is sampled every PEAK_SAMPLE-th take).
+        long bytes;
+        int takes;
     }
+
+    /**
+     * The in-use peak is refreshed on one take in this many per thread, not on
+     * every one: reading a striped counter's total touches every stripe, which
+     * the other task threads keep writing, so a read per take would cost what
+     * striping saved. {@link #peakInUseBytes()} also folds in the current total
+     * when read.
+     */
+    private static final int PEAK_SAMPLE = 16;
 
     private final ThreadLocal<ThreadCache> cache = ThreadLocal.withInitial(ThreadCache::new);
 
@@ -247,7 +259,8 @@ public final class NativePool {
 
     /** The highest {@link #inUseBytes()} so far. */
     public long peakInUseBytes() {
-        return peakInUse.get();
+        long now = inUse.sum();
+        return now > peakInUse.get() ? peakInUse.accumulateAndGet(now, Math::max) : peakInUse.get();
     }
 
     /**
@@ -287,6 +300,7 @@ public final class NativePool {
                 freeRaw(b.raw);
             }
         }
+        tc.bytes = 0;
         for (ConcurrentLinkedQueue<Block> q : free) {
             Block b;
             while ((b = q.poll()) != null) {
@@ -323,11 +337,12 @@ public final class NativePool {
     Block take(long size, boolean zero) {
         int c = size < MIN_CLASS ? -1 : classOf(size);
         Block b = null;
+        ThreadCache tc = cache.get();
         if (c >= 0 && c < cachedClasses) {
-            ThreadCache tc = cache.get();
             if (tc.count[c] > 0) {
                 b = tc.blocks[c][--tc.count[c]];
                 tc.blocks[c][tc.count[c]] = null;
+                tc.bytes -= b.size;
                 cached.add(-b.size);
                 reuses.increment();
             }
@@ -348,9 +363,11 @@ public final class NativePool {
             b.segment.asSlice(0, size).fill((byte) 0);
         }
         inUse.add(b.size);
-        long now = inUse.sum();
-        if (now > peakInUse.get()) {
-            peakInUse.accumulateAndGet(now, Math::max);
+        if ((tc.takes++ % PEAK_SAMPLE) == 0) {
+            long now = inUse.sum();
+            if (now > peakInUse.get()) {
+                peakInUse.accumulateAndGet(now, Math::max);
+            }
         }
         return b;
     }
@@ -364,15 +381,18 @@ public final class NativePool {
         if (poison) {
             b.segment.fill(POISON);
         }
-        if (b.cls >= 0 && b.cls < cachedClasses && retainedBytes() + b.size <= retainLimit) {
-            ThreadCache tc = cache.get();
+        // The retain limit, checked without reading the striped cache total: the shared lists' bytes plus this
+        // thread's cache (other threads' caches are bounded by their depth and are not counted here).
+        ThreadCache tc = cache.get();
+        if (b.cls >= 0 && b.cls < cachedClasses && retained.get() + tc.bytes + b.size <= retainLimit) {
             if (tc.count[b.cls] < cacheDepth) {
                 tc.blocks[b.cls][tc.count[b.cls]++] = b;
+                tc.bytes += b.size;
                 cached.add(b.size);
                 return;
             }
         }
-        if (b.cls >= 0 && retained.addAndGet(b.size) + cached.sum() <= retainLimit) {
+        if (b.cls >= 0 && retained.addAndGet(b.size) + tc.bytes <= retainLimit) {
             free[b.cls].offer(b);
             return;
         }
