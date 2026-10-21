@@ -1031,6 +1031,12 @@ object ExpressionCompiler {
     case m @ Minute(child, _) => timeField(DateKernels.TimeField.MINUTE, child, m.timeZoneId, input)
     case s @ Second(child, _) => timeField(DateKernels.TimeField.SECOND, child, s.timeZoneId, input)
 
+    // Iceberg's partition transforms, as Spark binds Iceberg's functions: the keys of a hash- or
+    // range-distributed Iceberg write's exchange and sort (#842).
+    case s: org.apache.spark.sql.catalyst.expressions.objects.StaticInvoke
+        if IcebergTransformExprs.isIcebergFunction(s) =>
+      IcebergTransformExprs.compile(s, input, compile)
+
     case other => Left(s"unsupported expression ${other.getClass.getSimpleName}: ${other.sql}")
   }
 

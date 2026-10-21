@@ -44,6 +44,8 @@ class VectorIcebergWriteSuite extends AnyFunSuite with BeforeAndAfterAll {
       .config("spark.sql.shuffle.partitions", "4")
       .config("spark.driver.host", "localhost")
       .config("spark.sql.extensions", "io.vecruntime.spark.VectorSparkSessionExtensions")
+      .config("spark.shuffle.manager", "org.apache.spark.sql.vecruntime.shuffle.VectorShuffleManager")
+      .config("spark.vecruntime.shuffle.enabled", "true")
       .config("spark.sql.catalog.ice", "org.apache.iceberg.spark.SparkCatalog")
       .config("spark.sql.catalog.ice.type", "hadoop")
       .config("spark.sql.catalog.ice.warehouse", warehouse.toString)
@@ -77,6 +79,11 @@ class VectorIcebergWriteSuite extends AnyFunSuite with BeforeAndAfterAll {
         case "AdaptiveSparkPlanExec" =>
           p.getClass.getMethods
             .find(m => m.getName == "executedPlan" && m.getParameterCount == 0)
+            .map(_.invoke(p).asInstanceOf[SparkPlan])
+            .toSeq
+        case n if n.endsWith("QueryStageExec") =>
+          p.getClass.getMethods
+            .find(m => m.getName == "plan" && m.getParameterCount == 0)
             .map(_.invoke(p).asInstanceOf[SparkPlan])
             .toSeq
         case _ => Seq.empty
@@ -238,7 +245,8 @@ class VectorIcebergWriteSuite extends AnyFunSuite with BeforeAndAfterAll {
       props: String,
       columns: String,
       src: String,
-      columnarExpected: Boolean = true
+      columnarExpected: Boolean = true,
+      batchesIn: Boolean = true
   ): Unit = {
     val (off, on) = (s"ice.db.${name}_off", s"ice.db.${name}_on")
     Seq(off, on).foreach { t =>
@@ -252,6 +260,12 @@ class VectorIcebergWriteSuite extends AnyFunSuite with BeforeAndAfterAll {
     val df = withWriter(on = true)(spark.sql(s"INSERT INTO $on $src"))
     df.collect()
     assert(columnar(df) == columnarExpected, s"$name: columnar exec planned")
+    if (columnarExpected && batchesIn) {
+      // The distribution and ordering Iceberg requests (hash, range, the clustering by partition) run on
+      // batches: no Spark row sort or row exchange under the write.
+      val rowOps = nodes(df).map(_.getClass.getSimpleName).filter(Set("SortExec", "ShuffleExchangeExec"))
+      assert(rowOps.isEmpty, s"$name: row operators under the write: ${rowOps.mkString(", ")}")
+    }
     assert(rows(on) == rows(off), s"$name: the table differs from the one Iceberg's writer wrote")
     def parts(t: String) =
       spark.sql(s"SELECT cast(partition as string), record_count FROM $t.partitions ORDER BY 1").collect().toSeq
@@ -298,7 +312,9 @@ class VectorIcebergWriteSuite extends AnyFunSuite with BeforeAndAfterAll {
       "bucket(4, id)",
       ", 'write.spark.fanout.enabled'='false'",
       Columns,
-      source(3000)
+      source(3000),
+      // The source's struct projection is Spark's, so the exchange above it reads rows.
+      batchesIn = false
     )
     partitionedTwin(
       "p_nested_fanout",
