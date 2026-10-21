@@ -15,78 +15,27 @@
  */
 package io.vecruntime.spark.parquet;
 
-import java.lang.foreign.MemorySegment;
-
-import org.apache.parquet.column.page.PageReadStore;
+import io.vecruntime.parquet.read.ColumnReader;
 import org.apache.spark.sql.vectorized.ColumnVector;
 
 /**
- * One top-level column of the native Parquet scan: a leaf column chunk
- * ({@link NativeParquetColumnReader}) or a struct over leaf chunks ({@link
- * NativeParquetStructReader}, #568). A batch is an opaque handle the column
- * made: the scan wraps it as Spark's column ({@link #wrap}) and hands it back
- * ({@link #release}) when the batch is done.
+ * One top-level column of the native Parquet scan, for Spark: a Spark-free
+ * {@link ColumnReader} (#900) -- a leaf column chunk ({@link
+ * NativeParquetColumnReader}) or a nested reader over several ({@link
+ * NativeParquetStructReader}, #568) -- that can also wrap its batch handle as
+ * Spark's column ({@link #wrap}). The scan hands the batch back ({@link
+ * #release}) when it is done.
  */
-public interface NativeParquetColumn {
-
-    /**
-     * Begin a row group of {@code rows} rows: each leaf takes its page reader
-     * from {@code store}.
-     */
-    void startRowGroup(PageReadStore store, int rows);
-
-    /**
-     * The next {@code n} rows of the row group, as a batch handle the caller
-     * owns.
-     */
-    Object readBatch(int n);
-
-    /**
-     * {@link #readBatch} decoding only the rows set in {@code selection} (#611);
-     * the other rows are null or zero, and the batch's selection excludes them.
-     */
-    Object readBatchSelected(int n, MemorySegment selection);
-
-    /** Whether {@link #readBatchSelected} can beat decoding the batch whole. */
-    boolean decodesSelectedFaster();
-
-    /** Skips the next {@code n} rows of the row group without decoding them. */
-    void skipRows(int n);
+public interface NativeParquetColumn extends ColumnReader {
 
     /** The batch as Spark's column. */
     ColumnVector wrap(Object batch);
 
-    /** Returns a batch's memory to the column (pooled or closed). */
-    void release(Object batch);
-
-    /** How many released vectors each leaf keeps for reuse. */
-    void setPoolLimit(int limit);
-
     /**
-     * #735: whether the scan installed a {@link ReusingCodecFactory}, so a page
-     * the decompressor returns lives in a buffer reused by the next page. A
-     * repeated leaf (which pulls pages ahead and queues several) must then copy
-     * each page out; a flat leaf consumes one page at a time and reads it in
-     * place either way. Default off: with the default codec factory each page is
-     * its own fresh array and nothing copies (#786).
+     * This file's calendar rebase from Spark's settings and footer keys (#568
+     * item 6).
      */
-    void setReuseDecompress(boolean reuse);
-
-    /**
-     * This file's calendar rebase and INT96 conversion (#568 item 6), for every
-     * date and timestamp leaf below. Abstract on purpose: a reader that forgot
-     * to forward it would read a LEGACY file without its rebase.
-     */
-    void setRebase(ParquetRebase rebase);
-
-    /**
-     * Emit dictionary-encoded strings as dictionary ids (#612), where the
-     * column allows it.
-     */
-    void setDictionaryIds(boolean enabled);
-
-    /** Rows still unemitted in the current row group. */
-    int rowsRemaining();
-
-    void close();
+    default void setRebase(ParquetRebase rebase) {
+        setRebase((io.vecruntime.parquet.read.CalendarRebase) rebase);
+    }
 }

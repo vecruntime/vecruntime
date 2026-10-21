@@ -13,7 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package io.vecruntime.spark.parquet;
+package io.vecruntime.parquet.read;
 
 import java.io.OutputStream;
 

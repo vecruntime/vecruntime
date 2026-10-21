@@ -1,0 +1,13 @@
+{
+  "source": "https://quanton.dev/benchmarks/#tpc-ds",
+  "source_label": "quanton.dev/benchmarks (Onehouse), read 2026-10-21",
+  "hardware": "11 x m8gd.4xlarge",
+  "note": "Totals as published on quanton.dev: the Quanton v0.43.0 suite total, and the other engines from the Quanton storage-aware Spark benchmark deck. Comet and Gluten are tuned configurations (their out-of-the-box runs failed with out-of-memory errors on Q67 and Q93). Not re-run here; per-query times are not published.",
+  "engines": [
+    {"name": "OSS Apache Spark", "seconds": 12200},
+    {"name": "DataFusion Comet (tuned)", "seconds": 9122},
+    {"name": "Gluten + Velox (tuned)", "seconds": 8563},
+    {"name": "Databricks Photon 18.2", "seconds": 2550},
+    {"name": "Quanton v0.43.0", "seconds": 2034}
+  ]
+}

@@ -15,13 +15,12 @@
  */
 package io.vecruntime.spark.parquet;
 
-import java.lang.foreign.MemorySegment;
 import java.util.function.BiConsumer;
 
+import io.vecruntime.parquet.read.StructColumnReader;
 import io.vecruntime.spark.arrow.VectorNestedColumnVector;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.parquet.column.ColumnDescriptor;
-import org.apache.parquet.column.page.PageReadStore;
 import org.apache.parquet.schema.GroupType;
 import org.apache.parquet.schema.MessageType;
 import org.apache.parquet.schema.Type;
@@ -48,38 +47,17 @@ import org.apache.spark.sql.vectorized.ColumnVector;
  * map is not read here: those need repetition levels, and the planner keeps
  * Spark's scan for them.
  */
-public final class NativeParquetStructReader implements NativeParquetColumn, RowLevels {
+public final class NativeParquetStructReader extends StructColumnReader implements NativeParquetColumn {
 
     private final StructType type;
+    // The same readers the base class holds, as Spark columns: wrap() asks each for its own column.
     private final NativeParquetColumn[] fields;
-    // The field whose per-row levels give this struct's validity (its first: a leaf, a struct, a list or a map --
-    // each carries the same information about the struct), and the level at which the struct is present;
-    // null / 0 when no group from the root down to the struct is optional (never null).
-    private final RowLevels levelSource;
-    private final int defLevel;
-    // The first field the file holds: a struct's levels come from it (fields the file lacks are null columns).
-    private final RowLevels levelField;
 
     private NativeParquetStructReader(StructType type, NativeParquetColumn[] fields, int levelIndex,
             int defLevel) {
+        super(fields, levelIndex, defLevel);
         this.type = type;
         this.fields = fields;
-        this.levelField = (RowLevels) fields[levelIndex];
-        this.levelSource = defLevel > 0 ? levelField : null;
-        this.defLevel = defLevel;
-        if (this.levelSource != null) {
-            this.levelSource.recordRowLevels();
-        }
-    }
-
-    @Override
-    public int[] rowLevels() {
-        return levelField.rowLevels();
-    }
-
-    @Override
-    public void recordRowLevels() {
-        levelField.recordRowLevels();
     }
 
     /**
@@ -297,166 +275,13 @@ public final class NativeParquetStructReader implements NativeParquetColumn, Row
         return true;
     }
 
-    /**
-     * A struct batch: its rows, its null rows ({@code null}: none) and each
-     * field's batch.
-     */
-    private static final class Batch {
-        final int rows;
-        final boolean[] nulls;
-        final Object[] fields;
-
-        Batch(int rows, boolean[] nulls, Object[] fields) {
-            this.rows = rows;
-            this.nulls = nulls;
-            this.fields = fields;
-        }
-    }
-
-    @Override
-    public void startRowGroup(PageReadStore store, int rows) {
-        for (NativeParquetColumn f : fields) {
-            f.startRowGroup(store, rows);
-        }
-    }
-
-    @Override
-    public Object readBatch(int n) {
-        return read(n, null);
-    }
-
-    /**
-     * {@code n} rows of every field; {@code selection} null: all of them, else
-     * the set rows (others unread).
-     */
-    private Object read(int n, MemorySegment selection) {
-        Object[] kids = new Object[fields.length];
-        try {
-            for (int i = 0; i < fields.length; i++) {
-                kids[i] = selection == null ? fields[i].readBatch(n) : fields[i].readBatchSelected(n, selection);
-            }
-        } catch (RuntimeException | Error e) {
-            releaseFields(kids);
-            throw e;
-        }
-        // Read after every field: the level source may be under a nested field, and its levels stay valid until
-        // its next batch. Under a selection the unselected rows' levels are stale: those rows are excluded.
-        boolean[] nulls = null;
-        if (levelSource != null) {
-            int[] levels = levelSource.rowLevels();
-            int d = defLevel;
-            for (int r = 0; r < n; r++) {
-                if (levels[r] < d) {
-                    if (nulls == null) {
-                        nulls = new boolean[n];
-                    }
-                    nulls[r] = true;
-                }
-            }
-        }
-        return new Batch(n, nulls, kids);
-    }
-
-    /**
-     * #568: each field decodes only the rows set in {@code selection} (a flat
-     * string leaf skips the others in its pages; a nested field decodes whole);
-     * the batch's selection excludes the other rows.
-     */
-    @Override
-    public Object readBatchSelected(int n, MemorySegment selection) {
-        return read(n, selection);
-    }
-
-    /**
-     * Whether some field decodes its selected rows faster than the whole batch
-     * (a string leaf).
-     */
-    @Override
-    public boolean decodesSelectedFaster() {
-        for (NativeParquetColumn f : fields) {
-            if (f.decodesSelectedFaster()) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    @Override
-    public void skipRows(int n) {
-        for (NativeParquetColumn f : fields) {
-            f.skipRows(n);
-        }
-    }
-
     @Override
     public ColumnVector wrap(Object batch) {
-        Batch b = (Batch) batch;
+        StructColumnReader.Batch b = (StructColumnReader.Batch) batch;
         ColumnVector[] cols = new ColumnVector[type.fields().length];
         for (int i = 0; i < cols.length; i++) {
-            cols[i] = fields[i].wrap(b.fields[i]);
+            cols[i] = fields[i].wrap(b.field(i));
         }
-        return VectorNestedColumnVector.struct(type, b.rows, b.nulls, cols);
-    }
-
-    @Override
-    public void release(Object batch) {
-        if (batch != null) {
-            releaseFields(((Batch) batch).fields);
-        }
-    }
-
-    private void releaseFields(Object[] kids) {
-        for (int i = 0; i < kids.length; i++) {
-            if (kids[i] != null) {
-                fields[i].release(kids[i]);
-            }
-        }
-    }
-
-    @Override
-    public void setPoolLimit(int limit) {
-        for (NativeParquetColumn f : fields) {
-            f.setPoolLimit(limit);
-        }
-    }
-
-    @Override
-    public void setReuseDecompress(boolean reuse) {
-        for (NativeParquetColumn f : fields) {
-            f.setReuseDecompress(reuse);
-        }
-    }
-
-    @Override
-    public void setRebase(ParquetRebase rebase) {
-        for (NativeParquetColumn f : fields) {
-            f.setRebase(rebase);
-        }
-    }
-
-    /**
-     * #568: a struct's flat string fields are emitted as dictionary ids too
-     * (#612), the way a top-level string column is, where the leaf allows it.
-     * The consumers read a field through Spark's getters (nested lanes, Spark's
-     * operators) or adapt it as a column ({@code StructFieldExpr}), and both
-     * take a dictionary vector. A list or map field keeps its own choice (off).
-     */
-    @Override
-    public void setDictionaryIds(boolean enabled) {
-        for (NativeParquetColumn f : fields) {
-            f.setDictionaryIds(enabled);
-        }
-    }
-
-    @Override
-    public int rowsRemaining() {
-        return ((NativeParquetColumn) levelField).rowsRemaining();
-    }
-
-    @Override
-    public void close() {
-        for (NativeParquetColumn f : fields) {
-            f.close();
-        }
+        return VectorNestedColumnVector.struct(type, b.rows(), b.nulls(), cols);
     }
 }
