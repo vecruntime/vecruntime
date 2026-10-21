@@ -248,7 +248,10 @@ case class VectorIcebergScanExec(
         sqlConf.parquetFilterPushDownStringPredicate,
         sqlConf.parquetFilterPushDownInFilterThreshold
       ),
-      IcebergTasks.nameMapping(scan)
+      IcebergTasks.nameMapping(scan),
+      // #901 R1: Iceberg's own column resolution (iceberg-bridge), when on and the bridge is on the classpath.
+      if (!io.vecruntime.spark.VectorConf.icebergReadSpecsEnabled(sqlConf)) null
+      else ParquetFileResolver.iceberg(IcebergTasks.tableSchema(scan), IcebergTasks.nameMappingJson(scan)).orNull
     )
     val out: RDD[ColumnarBatch] =
       if (emitSelection) rdd else rdd.mapPartitionsInternal(_.map(VectorIcebergScanExec.compacted))
@@ -318,7 +321,8 @@ private[vecruntime] final class VectorIcebergRDD(
     pushedFilters: Seq[org.apache.spark.sql.sources.Filter],
     filterFieldIds: Map[String, Int], // null: nothing pushed
     pushDown: PushDownConf,
-    nameMapping: IcebergNameMapping // #849: null when the table has none
+    nameMapping: IcebergNameMapping, // #849: null when the table has none
+    fileResolver: ParquetFileResolver // #901 R1: null: Spark's clipParquetSchema
 ) extends RDD[ColumnarBatch](sc, Nil) {
 
   override protected def getPartitions: Array[Partition] = parts
@@ -465,7 +469,8 @@ private[vecruntime] final class VectorIcebergRDD(
       reuseDecompressBuffers = reuseDecompressBuffers,
       poolChunkBuffers = poolChunkBuffers,
       filterFieldIds = filterFieldIds,
-      nameMapping = nameMapping
+      nameMapping = nameMapping,
+      fileResolver = fileResolver
     )
     if (decodeAhead > 0) new DecodeAheadIterator(reader, decodeAhead, decodeAheadVirtual, context) else reader
   }
@@ -898,6 +903,11 @@ private[vecruntime] object IcebergTasks {
     val props = call(call(b.scan, "table"), "properties").asInstanceOf[java.util.Map[String, String]]
     Option(props.get("schema.name-mapping.default")).map(IcebergNameMapping.parse).orNull
   }
+
+  /** #901 R1: the table's `schema.name-mapping.default` JSON; null when it has none. */
+  def nameMappingJson(b: BatchScanExec): String =
+    call(call(b.scan, "table"), "properties").asInstanceOf[java.util.Map[String, String]]
+      .get("schema.name-mapping.default")
 
   def tableSchema(b: BatchScanExec): AnyRef = call(call(b.scan, "table"), "schema")
 

@@ -436,7 +436,9 @@ private[vecruntime] final class VectorParquetPartitionReader(
     filterFieldIds: Map[String, Int] = null,
     // #849: an Iceberg table's name mapping: a file written without field ids gets them from it before it is
     // clipped, so its columns are matched by id as every other file's; null: none.
-    nameMapping: IcebergNameMapping = null
+    nameMapping: IcebergNameMapping = null,
+    // #901 R1: the table format's own column resolution, in place of clipParquetSchema (null: Spark's).
+    fileResolver: ParquetFileResolver = null
 ) extends Iterator[ColumnarBatch]
     with AutoCloseable {
 
@@ -922,12 +924,24 @@ private[vecruntime] final class VectorParquetPartitionReader(
     try {
       stream = inputFile.newStream()
       val read0: ParquetMetadata = ParquetFileReader.readFooter(inputFile, rangeOpts, stream)
+      // #901 R1: the table format resolves the file's columns itself (by its field ids, its name mapping, its
+      // positional fallback): the footer carries the ids the columns were matched by, and the clipped schema is
+      // the resolver's. Left: the file goes to Spark's reader.
+      val resolved: Option[Either[String, ParquetFileResolver.Resolved]] =
+        Option(fileResolver).map(_.clip(read0.getFileMetaData.getSchema, readSchema))
       // #849: a file without field ids, of a table with a name mapping: its schema with the mapping's ids.
       val unmapped = read0.getFileMetaData.getSchema
       val mapped = nameMapping != null && !VectorParquetScanExec.hasFieldIds(unmapped)
-      val footer: ParquetMetadata =
-        if (!mapped) read0
-        else {
+      val footer: ParquetMetadata = resolved match {
+        case Some(Right(r)) if r.fileWithIds ne unmapped =>
+          val m = read0.getFileMetaData
+          new ParquetMetadata(
+            new org.apache.parquet.hadoop.metadata.FileMetaData(r.fileWithIds, m.getKeyValueMetaData, m.getCreatedBy),
+            read0.getBlocks
+          )
+        case Some(_) => read0
+        case None if !mapped => read0
+        case None =>
           val m = read0.getFileMetaData
           new ParquetMetadata(
             new org.apache.parquet.hadoop.metadata.FileMetaData(
@@ -937,31 +951,41 @@ private[vecruntime] final class VectorParquetPartitionReader(
             ),
             read0.getBlocks
           )
-        }
+      }
       val fileSchema = footer.getFileMetaData.getSchema
-      val read = fileReadSchema(fileSchema)
-      val clipped =
-        // #808: a file going to Spark's reader (read = None) is clipped against Spark's own schema, which is the
-        // only one some files clip against (a bare repeated VARIANT group).
-        ParquetReadSupport.clipParquetSchema(
-          fileSchema,
-          read.getOrElse(requiredSchema),
-          caseSensitive,
-          useFieldId,
-          false
-        )
+      val read = resolved match {
+        case Some(Left(_)) => None
+        case Some(Right(_)) => Some(readSchema)
+        case None => fileReadSchema(fileSchema)
+      }
+      val clipped = resolved match {
+        case Some(Right(r)) => r.clipped
+        case _ =>
+          // #808: a file going to Spark's reader (read = None) is clipped against Spark's own schema, which is the
+          // only one some files clip against (a bare repeated VARIANT group).
+          ParquetReadSupport.clipParquetSchema(
+            fileSchema,
+            read.getOrElse(requiredSchema),
+            caseSensitive,
+            useFieldId,
+            false
+          )
+      }
       val modes = fallbackModes(footer)
       // Encoding is only knowable at read time. If any required column chunk uses an encoding we do not
       // decode (BYTE_STREAM_SPLIT on FIXED_LEN_BYTE_ARRAY, ...) or a column's physical type is not its lane's,
       // fall the WHOLE FILE over to Spark's vectorized reader -- with this file's rebase modes -- for correct
       // results, no mid-decode crash. A date or timestamp file in any rebase mode is read natively (#568 item
       // 6): its readers apply the file's LEGACY rebase, EXCEPTION check and INT96 conversion (ParquetRebase).
+      // A file the resolver matched (#901 R1) is matched by id whatever its names, so neither field-id check
+      // below applies to it.
       if (
         read.isEmpty || hasUnsupportedEncodingInFooter(footer, clipped, read.get) ||
-        (useFieldId && !ignoreMissingFieldIds && requestedHasFieldIds && !VectorParquetScanExec.hasFieldIds(
-          fileSchema
-        )) ||
-        (useFieldId && requestedHasFieldIds && VectorParquetScanExec.idNameClash(read.get, clipped))
+        (resolved.isEmpty && useFieldId && !ignoreMissingFieldIds && requestedHasFieldIds && !VectorParquetScanExec
+          .hasFieldIds(
+            fileSchema
+          )) ||
+        (resolved.isEmpty && useFieldId && requestedHasFieldIds && VectorParquetScanExec.idNameClash(read.get, clipped))
       ) {
         stream.close()
         stream = null
@@ -975,6 +999,7 @@ private[vecruntime] final class VectorParquetPartitionReader(
             c.setBoolean(SQLConf.PARQUET_FIELD_ID_READ_ENABLED.key, false)
             c
           }
+        ParquetFileResolver.sparkReaderFiles.incrementAndGet()
         return new Prepared(file, null, clipped, false, null, needsFallback = true, modes, readSchema, conf)
       }
       // The reader owns the stream from here (closed by reader.close()); clear our handle.

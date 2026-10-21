@@ -47,6 +47,14 @@ object VectorConf {
   val IcebergDvWriterEnabled = "spark.vecruntime.iceberg.dvWriter.enabled"
 
   /**
+   * #901 R1: the native Iceberg scan resolves each data file's columns with Iceberg's own rules (iceberg-bridge's
+   * `IcebergReadSpecs`: field ids, the table's name mapping, Iceberg's positional fallback ids, promotions,
+   * initial defaults) instead of Spark's `clipParquetSchema` over field-id metadata. Without the bridge on the
+   * classpath the scan resolves as before. On by default; off is the previous resolution, for A/B runs.
+   */
+  val IcebergReadSpecsEnabled = "spark.vecruntime.iceberg.readSpecs.enabled"
+
+  /**
    * Logical rewrite (#632): `IsNotNull` on a grouping key that is the only difference between the
    * inputs of two aggregates (a CTE used twice) moves above the aggregates, so the input is shared.
    */
@@ -330,6 +338,7 @@ object VectorConf {
    * merge-on-read suite.
    */
   def icebergDvWriterEnabled(conf: SQLConf): Boolean = bool(conf, IcebergDvWriterEnabled, default = false)
+  def icebergReadSpecsEnabled(conf: SQLConf): Boolean = bool(conf, IcebergReadSpecsEnabled, default = true)
   def aggDictionaryKeys(conf: SQLConf): Boolean = bool(conf, AggDictionaryKeys, default = true)
 
   /** Pass selection bitmaps between spark-vector operators instead of compacting each batch. */

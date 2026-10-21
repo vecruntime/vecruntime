@@ -65,16 +65,16 @@ public final class IcebergReadSpecs {
     public record Leaf(Types.NestedField field, ColumnDescriptor column, LeafReadSpec spec) implements Node {}
 
     /**
-     * A struct present in the file (as {@code fileName}); its fields resolved
-     * in projection order.
+     * A struct present in the file (as {@code fileType}, field ids applied);
+     * its fields resolved in projection order.
      */
-    public record Struct(Types.NestedField field, String fileName, List<Node> fields) implements Node {}
+    public record Struct(Types.NestedField field, org.apache.parquet.schema.Type fileType, List<Node> fields) implements Node {}
 
-    /** A list present in the file (as {@code fileName}). */
-    public record ListNode(Types.NestedField field, String fileName, Node element) implements Node {}
+    /** A list present in the file (as {@code fileType}). */
+    public record ListNode(Types.NestedField field, org.apache.parquet.schema.Type fileType, Node element) implements Node {}
 
-    /** A map present in the file (as {@code fileName}). */
-    public record MapNode(Types.NestedField field, String fileName, Node key,
+    /** A map present in the file (as {@code fileType}). */
+    public record MapNode(Types.NestedField field, org.apache.parquet.schema.Type fileType, Node key,
                           Node value)
             implements Node {}
 
@@ -92,11 +92,14 @@ public final class IcebergReadSpecs {
     public record Metadata(Types.NestedField field) implements Node {}
 
     /**
-     * One file's resolution: the file's schema pruned to what is read, each
-     * projected top-level field resolved, and, when some field cannot be read
-     * natively, why (the file then keeps Iceberg's reader).
+     * One file's resolution: the file's schema with the field ids it was
+     * matched by ({@code fileWithIds}: the file's own, the name mapping's or
+     * the positional ones), that schema pruned to what is read, each projected
+     * top-level field resolved, and, when some field cannot be read natively,
+     * why (the file then keeps Iceberg's reader).
      */
-    public record FileProjection(MessageType requested, List<Node> columns, String unsupported) {}
+    public record FileProjection(MessageType fileWithIds, MessageType requested, List<Node> columns,
+            String unsupported) {}
 
     /**
      * Resolves {@code projection} against {@code file}, matching by field id
@@ -124,7 +127,7 @@ public final class IcebergReadSpecs {
                 kept.add(pruned);
             }
         }
-        return new FileProjection(new MessageType(file.getName(), kept), List.copyOf(columns), r.unsupported);
+        return new FileProjection(withIds, new MessageType(file.getName(), kept), List.copyOf(columns), r.unsupported);
     }
 
     // ------------------------------------------------------------------ resolution
@@ -173,9 +176,10 @@ public final class IcebergReadSpecs {
                     any |= !(n instanceof Missing);
                     fields.add(n);
                 }
-                // A struct none of whose projected fields the file holds is read as a missing struct (null), as a
-                // group with no column to read cannot be requested.
-                return any ? new Struct(f, t.getName(), List.copyOf(fields)) : new Missing(f, f.initialDefault());
+                // A struct the file holds but none of whose projected fields it does: Iceberg reads it as a present
+                // struct of nulls (null only where the group is), which needs the group's definition levels with no
+                // column of it requested -- not something the readers do yet, so such a file keeps another reader.
+                return any ? new Struct(f, t, List.copyOf(fields)) : unsupported(f, "struct " + f.name() + " holds none of its projected fields");
             }
             if (type.isListType()) {
                 org.apache.parquet.schema.Type element = listElement(g);
@@ -188,7 +192,7 @@ public final class IcebergReadSpecs {
                 String[] elementParent = elementIsRepeated(g) ? path : append(path, g.getType(0)
                         .getName());
                 Node n = node(e, idOrNull(element, e.fieldId()), elementParent);
-                return n instanceof Missing ? unsupported(f, "list " + f.name() + "'s element is not the file's") : new ListNode(f, t.getName(), n);
+                return n instanceof Missing ? unsupported(f, "list " + f.name() + "'s element is not the file's") : new ListNode(f, t, n);
             }
             if (type.isMapType()) {
                 if (g.getFieldCount() != 1 || g.getType(0).isPrimitive() || g.getType(0)
@@ -216,7 +220,7 @@ public final class IcebergReadSpecs {
                 if (key instanceof Missing || value instanceof Missing) {
                     return unsupported(f, "map " + f.name() + "'s key or value is not the file's");
                 }
-                return new MapNode(f, t.getName(), key, value);
+                return new MapNode(f, t, key, value);
             }
             return unsupported(f, "field " + f.name() + " of type " + type);
         }
