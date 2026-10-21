@@ -15,10 +15,12 @@
  */
 package io.vecruntime.iceberg.write;
 
+import java.lang.foreign.MemorySegment;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.stream.Stream;
 
+import io.vecruntime.kernels.Bitmap;
 import io.vecruntime.kernels.VectorBuffers;
 import org.apache.iceberg.DoubleFieldMetrics;
 import org.apache.iceberg.FieldMetrics;
@@ -139,13 +141,29 @@ final class FloatingMetrics {
                 anyParentNulls |= p.hasNulls();
             }
             leaf.values += end - first;
+            // The segments once per batch rather than through the per-element accessors.
+            MemorySegment data = v.data();
+            MemorySegment validity = v.validity();
+            if (validity == null && !anyParentNulls) {
+                if (leaf.isFloat) {
+                    for (int r = first; r < end; r++) {
+                        leaf.floats.addValue((float) data.get(VectorBuffers.LE_DOUBLE, (long) r << 3));
+                    }
+                } else {
+                    for (int r = first; r < end; r++) {
+                        leaf.doubles.addValue(data.get(VectorBuffers.LE_DOUBLE, (long) r << 3));
+                    }
+                }
+                continue;
+            }
             for (int r = first; r < end; r++) {
-                if (v.isNull(r) || (anyParentNulls && underNull(parents, r))) {
+                if ((validity != null && !Bitmap.isSet(validity, r))
+                        || (anyParentNulls && underNull(parents, r))) {
                     leaf.nulls++;
                 } else if (leaf.isFloat) {
-                    leaf.floats.addValue((float) v.getDouble(r));
+                    leaf.floats.addValue((float) data.get(VectorBuffers.LE_DOUBLE, (long) r << 3));
                 } else {
-                    leaf.doubles.addValue(v.getDouble(r));
+                    leaf.doubles.addValue(data.get(VectorBuffers.LE_DOUBLE, (long) r << 3));
                 }
             }
         }
