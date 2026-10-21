@@ -25,9 +25,43 @@ import org.apache.arrow.memory.RootAllocator;
  */
 public final class VectorAllocators {
 
-    private static final RootAllocator ROOT = new RootAllocator(Long.MAX_VALUE);
+    private static volatile RootAllocator rootAllocator;
+    private static volatile boolean nativePool;
 
     private VectorAllocators() {}
+
+    private static RootAllocator rootAllocator() {
+        RootAllocator r = rootAllocator;
+        if (r != null) {
+            return r;
+        }
+        synchronized (VectorAllocators.class) {
+            if (rootAllocator == null) {
+                rootAllocator = nativePool ? org.apache.arrow.memory.PooledRoot.create() : new RootAllocator(Long.MAX_VALUE);
+            }
+            return rootAllocator;
+        }
+    }
+
+    /**
+     * #869 step 4: Arrow's buffers from the native pool
+     * ({@link PoolAllocationManager}) instead of Arrow's allocation manager.
+     * Takes effect only before the root allocator exists -- the executor
+     * plugin calls it first thing -- and returns whether it did.
+     */
+    public static synchronized boolean useNativePool(boolean on) {
+        if (rootAllocator != null) {
+            return nativePool == on;
+        }
+        nativePool = on;
+        return true;
+    }
+
+    /** Whether the root allocator takes its buffers from the native pool. */
+    public static boolean nativePool() {
+        rootAllocator();
+        return nativePool;
+    }
 
     /**
      * #868: the executor's cap on Arrow memory -- the Flight shuffle's server
@@ -40,29 +74,29 @@ public final class VectorAllocators {
      * Long.MAX_VALUE} (the default) for no cap.
      */
     public static void setLimit(long bytes) {
-        ROOT.setLimit(bytes <= 0 ? Long.MAX_VALUE : bytes);
+        rootAllocator().setLimit(bytes <= 0 ? Long.MAX_VALUE : bytes);
     }
 
     /** Bytes currently allocated under the root, for the executor's metrics. */
     public static long allocatedBytes() {
-        return ROOT.getAllocatedMemory();
+        return rootAllocator().getAllocatedMemory();
     }
 
     /** The most ever allocated under the root at once, for the executor's metrics. */
     public static long peakBytes() {
-        return ROOT.getPeakMemoryAllocation();
+        return rootAllocator().getPeakMemoryAllocation();
     }
 
     /** The cap set by {@link #setLimit}. */
     public static long limit() {
-        return ROOT.getLimit();
+        return rootAllocator().getLimit();
     }
 
     public static BufferAllocator root() {
-        return ROOT;
+        return rootAllocator();
     }
 
     public static BufferAllocator newChild(String name) {
-        return ROOT.newChildAllocator(name, 0L, Long.MAX_VALUE);
+        return rootAllocator().newChildAllocator(name, 0L, Long.MAX_VALUE);
     }
 }

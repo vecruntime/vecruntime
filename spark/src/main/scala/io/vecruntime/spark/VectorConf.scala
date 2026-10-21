@@ -609,6 +609,16 @@ object VectorConf {
   def poolAccountingEnabled(sparkConf: org.apache.spark.SparkConf): Boolean =
     sparkConf.getBoolean(PoolAccountingEnabled, true)
 
+  /**
+   * #869 step 4: Arrow's buffers (the Flight shuffle's, the shuffle readers', the operators' output vectors) from
+   * the native pool instead of Arrow's allocation manager (`-Darrow.allocation.manager.type`), so they are reused
+   * blocks of the same pool. Arrow still accounts them and `spark.vecruntime.arrow.maxBytes` still caps them. Read
+   * once, when the executor starts.
+   */
+  val ArrowNativePoolEnabled = "spark.vecruntime.arrow.nativePool.enabled"
+  def arrowNativePoolEnabled(sparkConf: org.apache.spark.SparkConf): Boolean =
+    sparkConf.getBoolean(ArrowNativePoolEnabled, false)
+
   val ArrowMaxBytes = "spark.vecruntime.arrow.maxBytes"
   def arrowMaxBytes(sparkConf: org.apache.spark.SparkConf): Long =
     org.apache.spark.network.util.JavaUtils.byteStringAsBytes(sparkConf.get(ArrowMaxBytes, "0").trim match {

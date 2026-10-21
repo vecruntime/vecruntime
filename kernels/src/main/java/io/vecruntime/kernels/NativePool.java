@@ -149,6 +149,45 @@ public final class NativePool {
         return new PooledArena(this, accountSource.get());
     }
 
+    /**
+     * #869 step 4: one block for an owner outside any task -- an Arrow buffer
+     * (the Flight shuffle's, an operator's output vector) that may outlive the
+     * task that made it. Not zeroed (Arrow does not zero its buffers) and
+     * charged to no account: Arrow's own allocator and its cap count it.
+     */
+    public Lease lease(long size) {
+        return new Lease(this, take(size, false));
+    }
+
+    /** A block from {@link #lease}; {@link #close()} gives it back, once. */
+    public static final class Lease implements AutoCloseable {
+        private final NativePool pool;
+        private Block block;
+
+        Lease(NativePool pool, Block block) {
+            this.pool = pool;
+            this.block = block;
+        }
+
+        /** The block's address, 64-byte aligned. */
+        public long address() {
+            return block.segment.address();
+        }
+
+        /** The block's usable size: the request rounded up to its class. */
+        public long size() {
+            return block.size;
+        }
+
+        @Override
+        public synchronized void close() {
+            if (block != null) {
+                pool.release(block);
+                block = null;
+            }
+        }
+    }
+
     /** Bytes handed out and not yet released, rounded to their classes. */
     public long inUseBytes() {
         return inUse.get();
@@ -207,6 +246,14 @@ public final class NativePool {
      * {@code size}.
      */
     Block take(long size) {
+        return take(size, true);
+    }
+
+    /**
+     * A block of at least {@code size} bytes, zeroed over {@code size} when
+     * {@code zero}.
+     */
+    Block take(long size, boolean zero) {
         int c = size < MIN_CLASS ? -1 : classOf(size);
         Block b = c < 0 ? null : free[c].poll();
         if (b != null) {
@@ -217,7 +264,9 @@ public final class NativePool {
             b = new Block(mallocRaw(blockSize + ALIGN - 1), blockSize, c);
             mallocs.incrementAndGet();
         }
-        b.segment.asSlice(0, size).fill((byte) 0);
+        if (zero) {
+            b.segment.asSlice(0, size).fill((byte) 0);
+        }
         long now = inUse.addAndGet(b.size);
         peakInUse.accumulateAndGet(now, Math::max);
         return b;
