@@ -67,6 +67,8 @@ import org.apache.spark.sql.catalyst.expressions.{
   Chr,
   Coalesce,
   CollationKey,
+  CreateArray,
+  CreateMap,
   CreateNamedStruct,
   Concat,
   ConcatWs,
@@ -1271,10 +1273,47 @@ object ExpressionCompiler {
     case If(IsNull(guard), Literal(null, _), s: CreateNamedStruct)
         if TypeMapping.nestedTypeOf(guard.dataType) != null =>
       compileNested(guard, input).flatMap(g => namedStruct(s, Some(g), input))
+    // `if(p, null, x)` / `if(p, x, null)` over a nested `x` (#842): `x` with its validity narrowed.
+    case If(p, Literal(null, _), x) => nullWhen(p, x, nullWhenTrue = true, expr.dataType, input)
+    case If(p, x, Literal(null, _)) => nullWhen(p, x, nullWhenTrue = false, expr.dataType, input)
+    // `array(...)` and `map(...)` constructors over scalar lanes (#842).
+    case c: CreateArray if c.children.nonEmpty =>
+      scalarLanes(c.children, "array", input).map(CreateArrayExpr(_, c.dataType))
+    case m: CreateMap if m.keys.nonEmpty =>
+      // Spark resolves a duplicate key per its dedup policy: take only maps whose keys cannot repeat -- one
+      // entry, or distinct non-null literals. A null key fails as Spark's does (CreateMapExpr).
+      val literalKeys =
+        m.keys.forall(_.isInstanceOf[Literal]) && !m.keys.exists(k => k.asInstanceOf[Literal].value == null)
+      val distinct = m.keys.length == 1 ||
+        (literalKeys && m.keys.map(_.asInstanceOf[Literal].value).distinct.length == m.keys.length)
+      if (!distinct) Left("map(...) whose keys may repeat")
+      else for (k <- scalarLanes(m.keys, "map", input); v <- scalarLanes(m.values, "map", input))
+        yield CreateMapExpr(k, v, m.dataType)
     // Anything else keeps the reason the ordinary compiler gives it (element access with a nested
     // element, ...).
     case other => compile(other, input)
   }
+
+  /** `if(p, null, x)` (`nullWhenTrue`) or `if(p, x, null)` over a nested `x` (#842). */
+  private def nullWhen(
+      p: Expression,
+      x: Expression,
+      nullWhenTrue: Boolean,
+      dataType: DataType,
+      input: Seq[Attribute]
+  ): Result =
+    if (TypeMapping.nestedTypeOf(x.dataType) == null) Left(s"if over ${x.dataType.simpleString}")
+    else for (pe <- compilePredicate(p, input); xe <- compileNested(x, input))
+      yield NestedNullWhenExpr(pe, xe, nullWhenTrue, dataType)
+
+  /** The children of an `array(...)` / `map(...)` constructor as scalar lanes of one type (#842). */
+  private def scalarLanes(es: Seq[Expression], what: String, input: Seq[Attribute]): Either[String, Seq[VectorExpr]] =
+    if (es.exists(e => TypeMapping.nestedTypeOf(e.dataType) != null || !TypeMapping.isSupported(e.dataType)))
+      Left(s"$what(...) of ${es.map(_.dataType.simpleString).distinct.mkString(", ")}")
+    else if (es.map(_.dataType).distinct.length != 1) Left(s"$what(...) of mixed element types")
+    else es.foldRight[Either[String, List[VectorExpr]]](Right(Nil)) { (e, acc) =>
+      for (done <- acc; v <- compile(e, input)) yield v :: done
+    }
 
   /** `named_struct(...)`'s fields, each a lane or a nested value, as one struct lane (#705). */
   private def namedStruct(s: CreateNamedStruct, nullWhen: Option[VectorExpr], input: Seq[Attribute]): Result =

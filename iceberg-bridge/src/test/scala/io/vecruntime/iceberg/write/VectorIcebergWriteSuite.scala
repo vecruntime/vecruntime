@@ -312,9 +312,7 @@ class VectorIcebergWriteSuite extends AnyFunSuite with BeforeAndAfterAll {
       "bucket(4, id)",
       ", 'write.spark.fanout.enabled'='false'",
       Columns,
-      source(3000),
-      // The source's struct projection is Spark's, so the exchange above it reads rows.
-      batchesIn = false
+      source(3000)
     )
     partitionedTwin(
       "p_nested_fanout",
