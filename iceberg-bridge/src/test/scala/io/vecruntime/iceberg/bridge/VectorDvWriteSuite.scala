@@ -181,12 +181,17 @@ class VectorDvWriteSuite extends AnyFunSuite with BeforeAndAfterAll {
 
   test("v2 table falls back to Spark's WriteDeltaExec (our operator absent)") {
     createV3("ice.db.dv_v2", fmtVersion = 2)
-    val had = withFlag(on = true) {
-      val df = spark.sql("DELETE FROM ice.db.dv_v2 WHERE id % 3 = 0")
-      val h = planHasVectorWriteDelta(df)
-      df.collect()
-      h
-    }
+    // #901 M2 writes a v2 table's position deletes columnar; with that off, a v2 table keeps Spark's writer.
+    spark.conf.set("spark.vecruntime.iceberg.positionDeletes.enabled", "false")
+    val had =
+      try
+        withFlag(on = true) {
+          val df = spark.sql("DELETE FROM ice.db.dv_v2 WHERE id % 3 = 0")
+          val h = planHasVectorWriteDelta(df)
+          df.collect()
+          h
+        }
+      finally spark.conf.unset("spark.vecruntime.iceberg.positionDeletes.enabled")
     assert(!had, "v2 must fall back to Spark's writer; VectorWriteDeltaExec must be absent")
     assert(count("SELECT count(*) FROM ice.db.dv_v2 WHERE id % 3 = 0") == 0L)
   }

@@ -47,6 +47,12 @@ object VectorConf {
   val IcebergDvWriterEnabled = "spark.vecruntime.iceberg.dvWriter.enabled"
 
   /**
+   * #901 M2: under the merge-on-read writer (`dvWriter.enabled`), whether a v2 table's deletes are written as
+   * columnar Parquet position delete files (default true); off, a v2 table keeps Spark's own `WriteDeltaExec`.
+   */
+  val IcebergPositionDeletesEnabled = "spark.vecruntime.iceberg.positionDeletes.enabled"
+
+  /**
    * The columnar Iceberg data-file writer (#842, W2): `INSERT INTO`, `INSERT OVERWRITE` and copy-on-write
    * `DELETE` / `UPDATE` / `MERGE INTO` into an Iceberg table write their Parquet data files from our batches
    * through `IcebergParquetAppender` (the `iceberg-bridge` module) instead of Iceberg's row writer; the commit
@@ -339,6 +345,10 @@ object VectorConf {
    * merge-on-read suite.
    */
   def icebergDvWriterEnabled(conf: SQLConf): Boolean = bool(conf, IcebergDvWriterEnabled, default = false)
+
+  /** #901 M2: v2 position delete files under the merge-on-read writer. Default `true`. */
+  def icebergPositionDeletesEnabled(conf: SQLConf): Boolean =
+    bool(conf, IcebergPositionDeletesEnabled, default = true)
 
   /** The columnar Iceberg data-file writer (#842, W2). Default `false` while it lands. */
   def icebergWriterEnabled(conf: SQLConf): Boolean = bool(conf, IcebergWriterEnabled, default = false)

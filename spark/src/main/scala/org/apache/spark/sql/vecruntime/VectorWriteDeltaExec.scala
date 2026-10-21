@@ -77,7 +77,7 @@ case class VectorWriteDeltaExec(
     val proj = projections
     val tbl = table
     // Read on the driver before the job, as Iceberg's own writer does, and broadcast to the tasks.
-    val previous = session.sparkContext.broadcast(Option(IcebergDvBridge.rewritableDeletes(write)))
+    val previous = session.sparkContext.broadcast(IcebergDvBridge.deletePlan(write))
     val columnarData = VectorWriteDeltaExec.columnarDataSpec(write, proj, conf)
     if (columnarData.isDefined) return runColumnar(batchWrite, previous, columnarData.get)
     val rdd: RDD[InternalRow] = query.execute()
@@ -100,7 +100,7 @@ case class VectorWriteDeltaExec(
         rdd
           .mapPartitions { iter =>
             Iterator.single(
-              VectorWriteDeltaExec.writePartition(tbl, proj, previous.value.orNull, dataWriterFactory, iter)
+              VectorWriteDeltaExec.writePartition(tbl, proj, previous.value, dataWriterFactory, iter)
             )
           }
           .collect()
@@ -129,7 +129,7 @@ case class VectorWriteDeltaExec(
    */
   private def runColumnar(
       batchWrite: org.apache.spark.sql.connector.write.DeltaBatchWrite,
-      previous: org.apache.spark.broadcast.Broadcast[Option[AnyRef]],
+      previous: org.apache.spark.broadcast.Broadcast[IcebergDvBridge.DeletePlan],
       data: VectorWriteDeltaExec.ColumnarData
   ): Seq[InternalRow] = {
     val (batches, fromRows) = VectorIcebergWriteExec.columnar(query)
@@ -143,7 +143,7 @@ case class VectorWriteDeltaExec(
     try {
       val collected = batches.mapPartitions { iter =>
         Iterator.single(
-          VectorWriteDeltaExec.writeBatches(tbl, proj, previous.value.orNull, data, hadoopConf.value.value, iter)
+          VectorWriteDeltaExec.writeBatches(tbl, proj, previous.value, data, hadoopConf.value.value, iter)
         )
       }.collect()
       messages ++= collected.flatten.filter(_ != null)
@@ -279,7 +279,7 @@ object VectorWriteDeltaExec extends Logging {
   private def writeBatches(
       table: AnyRef,
       projections: WriteDeltaProjections,
-      rewritableDeletes: AnyRef,
+      rewritableDeletes: IcebergDvBridge.DeletePlan,
       plan: ColumnarData,
       conf: org.apache.hadoop.conf.Configuration,
       batches: Iterator[org.apache.spark.sql.vectorized.ColumnarBatch]
@@ -388,7 +388,7 @@ object VectorWriteDeltaExec extends Logging {
   private def writePartition(
       table: AnyRef,
       projections: WriteDeltaProjections,
-      rewritableDeletes: AnyRef,
+      rewritableDeletes: IcebergDvBridge.DeletePlan,
       dataWriterFactory: Option[DeltaWriterFactory],
       rows: Iterator[InternalRow]
   ): Seq[WriterCommitMessage] = {
