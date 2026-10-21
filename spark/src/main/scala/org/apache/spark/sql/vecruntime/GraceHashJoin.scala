@@ -85,7 +85,7 @@ object GraceHashJoin extends Logging {
     val canSpill =
       budgetBytes > 0 && budgetBytes < Long.MaxValue && buckets >= 2 && AggregateSpill.supportsKeys(keyTypes.toSeq)
 
-    val arena = Arena.ofShared() // the table's scratch; the columns live in the builders
+    val arena = io.vecruntime.kernels.NativePool.shared().newArena() // #869: the table's scratch, pooled; the columns live in the builders
     val builders = spec.buildTypes.map(dt => ColumnBuilder.owning(TypeMapping.vecTypeOf(dt), 4096))
     // #868: the build side's bytes come from Spark's execution memory (the sort's pool: off-heap when Spark
     // has one). Held before every append; a refusal starts the bucketing as the budget does. A build side
@@ -138,7 +138,7 @@ object GraceHashJoin extends Logging {
     var from = 0
     while (from < total) {
       val to = math.min(total, from + SpillChunkRows)
-      val scratch = Arena.ofConfined()
+      val scratch = io.vecruntime.kernels.NativePool.shared().newArena() // #869: per chunk, so its blocks are reused chunk to chunk
       try {
         val slice = views.map(v => plain(v.slice(from, to), scratch))
         val ctx = new EvalContext(scratch, to - from, c => slice(c))

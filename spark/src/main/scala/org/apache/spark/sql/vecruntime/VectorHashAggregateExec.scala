@@ -916,7 +916,7 @@ private[vecruntime] class VectorGroupedAggregateIterator(
         encoded(i) = if (bytesColumn.isNullAt(i)) null else bytesColumn.getUTF8String(i).getBytes; i += 1
       }
     } finally bytesColumn.close()
-    val arena = java.lang.foreign.Arena.ofConfined()
+    val arena = io.vecruntime.kernels.NativePool.shared().newArena() // #869
     try {
       val lane = io.vecruntime.kernels.NestedKeyCodec.decode(
         arena,

@@ -346,7 +346,7 @@ private[vecruntime] class VectorSortIterator(
       from: Int,
       to: Int
   ): ColumnVector = {
-    val arena = Arena.ofConfined()
+    val arena = io.vecruntime.kernels.NativePool.shared().newArena() // #869
     try {
       val rows = java.util.Arrays.copyOfRange(permutation, from, to)
       io.vecruntime.spark.arrow.VectorNestedColumnVector.of(
