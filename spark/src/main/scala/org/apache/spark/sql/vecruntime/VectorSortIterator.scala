@@ -497,7 +497,10 @@ private[vecruntime] class VectorSortIterator(
               }
               if (columnBuilders == null) {
                 val expected = math.max(math.min(runRowLimit, count), 1)
-                runArena = Arena.ofShared()
+                // #869: the run's arena (its nested lanes) from the pool, as its owning builders already are: a run is
+                // built and dropped thousands of times per executor, and a shared arena's close is a handshake with
+                // every JVM thread.
+                runArena = io.vecruntime.kernels.NativePool.shared().newArena()
                 // #867: owning builders -- a buffer the run outgrows is freed at once, where the run's shared arena
                 // kept every doubling's leftovers (a column of C bytes held 2C). Nested lanes stay in the arena.
                 def builder(t: VecType): ColumnBuilder =
