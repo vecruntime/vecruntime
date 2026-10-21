@@ -90,7 +90,7 @@ public final class IcebergDataCommitBridge {
         return type == null ? null : "write schema type " + type + " is not supported";
     }
 
-    private static String unsupportedType(Type type) {
+    static String unsupportedType(Type type) {
         switch (type.typeId()) {
             case BOOLEAN, INTEGER, LONG, FLOAT, DOUBLE, DATE, TIMESTAMP, STRING, BINARY, DECIMAL:
                 return null;

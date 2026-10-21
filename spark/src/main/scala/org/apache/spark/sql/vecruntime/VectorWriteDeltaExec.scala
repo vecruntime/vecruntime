@@ -74,11 +74,13 @@ case class VectorWriteDeltaExec(
 
   override protected def run(): Seq[InternalRow] = {
     val batchWrite = write.toBatch
-    val rdd: RDD[InternalRow] = query.execute()
     val proj = projections
     val tbl = table
     // Read on the driver before the job, as Iceberg's own writer does, and broadcast to the tasks.
     val previous = session.sparkContext.broadcast(Option(IcebergDvBridge.rewritableDeletes(write)))
+    val columnarData = VectorWriteDeltaExec.columnarDataSpec(write, proj, conf)
+    if (columnarData.isDefined) return runColumnar(batchWrite, previous, columnarData.get)
+    val rdd: RDD[InternalRow] = query.execute()
     // UPDATE and MERGE carry an insert half (a row projection). Those rows go through Iceberg's OWN
     // delta writer, created from Iceberg's own writer factory exactly as Spark's WriteDeltaExec
     // does, so the data files, their partitioning, file sizing and v3 row lineage are Iceberg's.
@@ -119,6 +121,48 @@ case class VectorWriteDeltaExec(
   }
 
   /**
+   * #901 M1: the whole write on the child's batches. A task walks each batch's operation lane: a DELETE's
+   * `_file` / `_pos` (and `_spec_id` / `_partition`) feed the same per-file deletion vectors as the row path; the
+   * INSERT and REINSERT rows of the batch go, picked out by row index, to the columnar data writer
+   * (`IcebergDeltaDataWriter`), with their v3 row lineage from the metadata columns. Each task returns our DV
+   * message and a data-files message; Iceberg's commit folds them into one `RowDelta`, as before.
+   */
+  private def runColumnar(
+      batchWrite: org.apache.spark.sql.connector.write.DeltaBatchWrite,
+      previous: org.apache.spark.broadcast.Broadcast[Option[AnyRef]],
+      data: VectorWriteDeltaExec.ColumnarData
+  ): Seq[InternalRow] = {
+    val (batches, fromRows) = VectorIcebergWriteExec.columnar(query)
+    if (fromRows) logInfo("vecruntime: the columnar delta write reads rows from its child (RowToColumnarExec)")
+    val hadoopConf = session.sparkContext.broadcast(
+      new org.apache.spark.util.SerializableConfiguration(session.sessionState.newHadoopConf())
+    )
+    val tbl = table
+    val proj = projections
+    val messages = new mutable.ArrayBuffer[WriterCommitMessage]()
+    try {
+      val collected = batches.mapPartitions { iter =>
+        Iterator.single(
+          VectorWriteDeltaExec.writeBatches(tbl, proj, previous.value.orNull, data, hadoopConf.value.value, iter)
+        )
+      }.collect()
+      messages ++= collected.flatten.filter(_ != null)
+      writeSummary(query) match {
+        case Some(summary) => batchWrite.commit(messages.toArray, summary)
+        case None => batchWrite.commit(messages.toArray)
+      }
+      logInfo(s"vecruntime: columnar delta write (deletion vectors + data files) committed ${messages.size} message(s)")
+    } catch {
+      case t: Throwable =>
+        try batchWrite.abort(messages.toArray)
+        catch { case a: Throwable => t.addSuppressed(a) }
+        throw t
+    }
+    refreshCache()
+    Nil
+  }
+
+  /**
    * The MERGE summary Spark's `WriteDeltaExec` hands to the commit, read from the MERGE's row
    * operator -- Spark's `MergeRowsExec` or our columnar one, which keeps the same metric names -- so
    * the snapshot summary carries the same `spark.merge.*`-style properties with the writer on or off.
@@ -141,7 +185,198 @@ case class VectorWriteDeltaExec(
     }
 }
 
-object VectorWriteDeltaExec {
+object VectorWriteDeltaExec extends Logging {
+
+  /** #901 M1: the tasks that wrote a data half columnar (read by tests). */
+  val columnarDataTasks = new java.util.concurrent.atomic.AtomicLong()
+
+  /**
+   * #901 M1: what the columnar task needs -- the data writer's spec (null for a delete-only write), whether the
+   * data files carry row lineage, and the ordinals, in the child's output, of the operation, `_file`, `_pos`,
+   * `_spec_id`, `_partition`, the data columns and the lineage columns.
+   */
+  final case class ColumnarData(
+      spec: AnyRef,
+      lineage: Boolean,
+      file: Int,
+      pos: Int,
+      specId: Int,
+      partition: Int,
+      partitionWidth: Int,
+      data: Array[Int],
+      lineageColumns: Array[Int]
+  ) extends Serializable
+
+  /**
+   * The columnar task's plan for `write`, or None to keep the row path: the bridge's delta data writer present,
+   * the columnar writer on (`spark.vecruntime.iceberg.writer.enabled`), and a data half (if any) it can write.
+   */
+  def columnarDataSpec(
+      write: DeltaWrite,
+      projections: WriteDeltaProjections,
+      conf: org.apache.spark.sql.internal.SQLConf
+  ): Option[ColumnarData] = {
+    if (!io.vecruntime.spark.VectorConf.icebergWriterEnabled(conf) || !IcebergDeltaWriteBridge.isAvailable) return None
+    if (!IcebergDeltaWriteBridge.isPositionDeltaWrite(write)) return None
+    def ordinals(p: Option[org.apache.spark.sql.catalyst.ProjectingInternalRow]): Map[String, Int] =
+      p.map(r => r.schema.fieldNames.zip(r.colOrdinals).toMap).getOrElse(Map.empty)
+    val rowId = ordinals(Some(projections.rowIdProjection))
+    val meta = ordinals(projections.metadataProjection)
+    val partitionWidth = projections.metadataProjection
+      .flatMap(m => m.schema.find(_.name == "_partition"))
+      .map(_.dataType.asInstanceOf[org.apache.spark.sql.types.StructType].size)
+      .getOrElse(0)
+    val (spec, lineage, data, lineageColumns) = projections.rowProjection match {
+      case None => (null, false, Array.emptyIntArray, Array.emptyIntArray)
+      case Some(rows) =>
+        IcebergDeltaWriteBridge.declineReason(write) match {
+          case Some(why) =>
+            if (io.vecruntime.spark.VectorConf.explainFallback(conf)) {
+              logInfo(s"spark-vector: columnar delta data writer declined -- $why")
+            }
+            return None
+          case None =>
+        }
+        val lineage = IcebergDeltaWriteBridge.rowLineage(write)
+        val lineageColumns =
+          if (!lineage) Array.emptyIntArray
+          else {
+            val l = Seq("_row_id", "_last_updated_sequence_number").map(meta.get)
+            if (l.exists(_.isEmpty)) return None
+            l.map(_.get).toArray
+          }
+        (IcebergDeltaWriteBridge.specOf(write), lineage, rows.colOrdinals.toArray, lineageColumns)
+    }
+    if (!rowId.contains("_file") || !rowId.contains("_pos")) return None
+    Some(
+      ColumnarData(
+        spec,
+        lineage,
+        rowId("_file"),
+        rowId("_pos"),
+        meta.getOrElse("_spec_id", -1),
+        meta.getOrElse("_partition", -1),
+        partitionWidth,
+        data,
+        lineageColumns
+      )
+    )
+  }
+
+  /** The column `o` of `batch` as a lane, nested columns through Spark's getters (any row picked by index). */
+  private def lane(batch: org.apache.spark.sql.vectorized.ColumnarBatch, o: Int, arena: java.lang.foreign.Arena)
+      : io.vecruntime.kernels.VectorBuffers = {
+    val cv = batch.column(o)
+    cv.dataType() match {
+      case dt @ (_: org.apache.spark.sql.types.StructType | _: org.apache.spark.sql.types.ArrayType |
+          _: org.apache.spark.sql.types.MapType) =>
+        io.vecruntime.spark.adapter.NestedColumns.adapt(cv, dt, batch.numRows(), arena)
+      case _ => io.vecruntime.spark.adapter.ColumnVectorAdapters.adapt(cv, batch.numRows(), arena)
+    }
+  }
+
+  /** #901 M1: one task of the columnar delta write. Returns our DV message and the data files' message. */
+  private def writeBatches(
+      table: AnyRef,
+      projections: WriteDeltaProjections,
+      rewritableDeletes: AnyRef,
+      plan: ColumnarData,
+      conf: org.apache.hadoop.conf.Configuration,
+      batches: Iterator[org.apache.spark.sql.vectorized.ColumnarBatch]
+  ): Seq[WriterCommitMessage] = {
+    val tc = TaskContext.get()
+    val partitionId = if (tc != null) tc.partitionId() else 0
+    val taskId = if (tc != null) tc.taskAttemptId() else 0L
+    val deleteOnly = projections.rowProjection.isEmpty
+    val writer = IcebergDvBridge.createTaskWriter(table, partitionId, taskId, rewritableDeletes)
+    val dataWriter =
+      if (deleteOnly) null
+      else IcebergDeltaWriteBridge.createWriter(plan.spec, partitionId, taskId, conf, plan.lineage)
+    val dataOrdinals = plan.data ++ plan.lineageColumns
+    try {
+      var currentFile: org.apache.spark.unsafe.types.UTF8String = null
+      var currentSpec = 0
+      var currentPartition: InternalRow = null
+      val positions = new mutable.ArrayBuilder.ofLong
+      var count = 0
+      def flush(): Unit = {
+        if (currentFile != null && count > 0) {
+          writer.deleteFile(currentFile.toString, positions.result(), count, currentSpec, currentPartition)
+        }
+        positions.clear()
+        count = 0
+      }
+      while (batches.hasNext) {
+        val batch = batches.next()
+        val n = batch.numRows()
+        val selection = batch match {
+          case s: io.vecruntime.spark.arrow.SelectedColumnarBatch if s.selectedCount() < n => s.selection()
+          case _ => null
+        }
+        val ops = if (deleteOnly) null else batch.column(0)
+        val fileCol = batch.column(plan.file)
+        val posCol = batch.column(plan.pos)
+        val specCol = if (plan.specId >= 0) batch.column(plan.specId) else null
+        val partCol = if (plan.partition >= 0) batch.column(plan.partition) else null
+        val rows = if (deleteOnly) null else new Array[Int](n)
+        val reinsert = if (deleteOnly) null else new Array[Boolean](n)
+        var k = 0
+        var i = 0
+        while (i < n) {
+          if (selection == null || io.vecruntime.kernels.Bitmap.isSet(selection, i)) {
+            val op = if (deleteOnly) RowDeltaUtils.DELETE_OPERATION else ops.getInt(i)
+            op match {
+              case RowDeltaUtils.DELETE_OPERATION =>
+                val file = fileCol.getUTF8String(i)
+                val spec = if (specCol == null) 0 else specCol.getInt(i)
+                // A run ends where the file changes; an interleaved insert does not end it (the bridge merges a
+                // file's runs into one DV).
+                if (currentFile == null || file != currentFile || spec != currentSpec) {
+                  flush()
+                  currentFile = file.clone()
+                  currentSpec = spec
+                  currentPartition =
+                    if (partCol == null || partCol.isNullAt(i)) null else partCol.getStruct(i).copy()
+                }
+                positions += posCol.getLong(i)
+                count += 1
+              case RowDeltaUtils.INSERT_OPERATION =>
+                rows(k) = i; reinsert(k) = false; k += 1
+              case RowDeltaUtils.REINSERT_OPERATION =>
+                rows(k) = i; reinsert(k) = true; k += 1
+              case RowDeltaUtils.UPDATE_OPERATION =>
+                throw new IllegalStateException("UPDATE must be represented as delete and reinsert")
+              case other => throw new IllegalStateException(s"unexpected row-level operation id $other")
+            }
+          }
+          i += 1
+        }
+        if (k > 0) {
+          val arena = java.lang.foreign.Arena.ofConfined()
+          try {
+            val columns = dataOrdinals.map(o => lane(batch, o, arena))
+            dataWriter.write(java.util.Arrays.asList(columns: _*), rows, k, reinsert)
+          } finally arena.close()
+        }
+      }
+      flush()
+      val ours = writer.commit()
+      val data =
+        if (dataWriter == null) null
+        else {
+          columnarDataTasks.incrementAndGet()
+          IcebergDeltaWriteBridge.dataCommit(dataWriter.dataFiles())
+        }
+      Seq(ours, data)
+    } catch {
+      case t: Throwable =>
+        if (dataWriter != null) {
+          try dataWriter.abort(t)
+          catch { case a: Throwable => t.addSuppressed(a) }
+        }
+        throw t
+    } finally writer.close()
+  }
 
   /**
    * One task: read the delta rows and dispatch on each row's operation, as Spark's

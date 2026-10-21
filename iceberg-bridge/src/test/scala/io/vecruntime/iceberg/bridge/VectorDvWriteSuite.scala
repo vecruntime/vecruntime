@@ -32,6 +32,9 @@ import org.scalatest.funsuite.AnyFunSuite
  */
 class VectorDvWriteSuite extends AnyFunSuite with BeforeAndAfterAll {
 
+  /** #901 M1: whether the "on" side also writes the data half columnar (the columnar Iceberg writer on). */
+  protected def columnarData: Boolean = false
+
   private var spark: SparkSession = _
   private lazy val warehouse: Path = Files.createTempDirectory("dvwrite")
 
@@ -57,12 +60,15 @@ class VectorDvWriteSuite extends AnyFunSuite with BeforeAndAfterAll {
     finally super.afterAll()
   }
 
-  private def withFlag[T](on: Boolean)(f: => T): T = {
-    val key = "spark.vecruntime.iceberg.dvWriter.enabled"
-    val prev = spark.conf.getOption(key)
-    spark.conf.set(key, on.toString)
+  protected def withFlag[T](on: Boolean)(f: => T): T = {
+    val keys = Seq("spark.vecruntime.iceberg.dvWriter.enabled" -> on) ++
+      (if (columnarData) Seq("spark.vecruntime.iceberg.writer.enabled" -> on) else Nil)
+    val prev = keys.map { case (k, _) => k -> spark.conf.getOption(k) }
+    keys.foreach { case (k, v) => spark.conf.set(k, v.toString) }
     try f
-    finally prev match { case Some(v) => spark.conf.set(key, v); case None => spark.conf.unset(key) }
+    finally prev.foreach { case (k, p) =>
+        p match { case Some(v) => spark.conf.set(k, v); case None => spark.conf.unset(k) }
+      }
   }
 
   private def rows(t: String): Array[Row] = spark.sql(s"SELECT * FROM $t ORDER BY id").collect()
