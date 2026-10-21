@@ -101,6 +101,20 @@ class VectorPlugin extends SparkPlugin {
           override def getValue: Long = org.apache.spark.sql.vecruntime.PinnedMemory.peakBytes
         }
       )
+      // #869: the native pool's totals as executor metrics, and (when on) every task's pooled blocks in its budget.
+      if (VectorConf.poolAccountingEnabled(ctx.conf())) org.apache.spark.sql.vecruntime.TaskNativeMemory.install()
+      Seq[(String, () => Long)](
+        "nativePoolInUseBytes" -> (() => io.vecruntime.kernels.NativePool.shared().inUseBytes()),
+        "nativePoolPeakBytes" -> (() => io.vecruntime.kernels.NativePool.shared().peakInUseBytes()),
+        "nativePoolRetainedBytes" -> (() => io.vecruntime.kernels.NativePool.shared().retainedBytes()),
+        "nativePoolOverdraftBytes" -> (() => org.apache.spark.sql.vecruntime.TaskNativeMemory.overdraftBytes),
+        "nativePoolLeakedBytes" -> (() => org.apache.spark.sql.vecruntime.TaskNativeMemory.leakedBytes)
+      ).foreach { case (name, read) =>
+        ctx.metricRegistry().register(
+          name,
+          new com.codahale.metrics.Gauge[Long] { override def getValue: Long = read() }
+        )
+      }
       // Starts the Flight shuffle server on this executor when the shuffle module is present, its
       // manager configured and the backend is Flight (#288).
       org.apache.spark.sql.vecruntime.VectorShuffle.executorInit(ctx)

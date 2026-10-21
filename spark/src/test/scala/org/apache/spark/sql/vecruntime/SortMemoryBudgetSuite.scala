@@ -89,12 +89,18 @@ class SortMemoryBudgetSuite extends AnyFunSuite {
     val tmm = new TaskMemoryManager(mm, 0L)
     val ctx = new PoolTaskContext(tmm)
     TaskContext.setTaskContext(ctx)
+    // #869: the pool's accounting off unless a test turns it on -- a session of an earlier suite may have installed it.
+    val wasInstalled = TaskNativeMemory.isInstalled
+    TaskNativeMemory.uninstall()
     try {
       val out = body(tmm, ctx)
       ctx.complete()
       assert(mm.executionMemoryUsed === 0L, "the sort returned everything it held")
       out
-    } finally TaskContext.unset()
+    } finally {
+      TaskContext.unset()
+      if (wasInstalled) TaskNativeMemory.install() else TaskNativeMemory.uninstall()
+    }
   }
 
   test("#867: a pool too small for the partition makes the sort spill, with no spillBytes cap") {
@@ -321,6 +327,101 @@ class SortMemoryBudgetSuite extends AnyFunSuite {
       }
       assert(rows === joinExpected._1)
       assert(peak > 0, "the bucket being probed was held")
+    }
+  }
+
+  test("#869: a pooled arena's blocks are held in the task's execution memory and given back") {
+    withPool(1L << 30) { (tmm, _) =>
+      TaskNativeMemory.install()
+      try {
+        val a = io.vecruntime.kernels.NativePool.shared().newArena()
+        a.allocate(3L << 20, 8)
+        a.allocate(1L << 20, 8)
+        assert(tmm.getMemoryConsumptionForThisTask() >= (5L << 20), "4 MiB class + 1 MiB class, charged")
+        a.close()
+        assert(tmm.getMemoryConsumptionForThisTask() <= 2 * TaskNativeMemory.Chunk, "given back to one chunk of slack")
+      } finally TaskNativeMemory.uninstall()
+    }
+  }
+
+  test("#869: a pooled allocation the memory manager cannot cover is counted as overdraft, not refused") {
+    val before = TaskNativeMemory.overdraftBytes
+    withPool(1L << 20) { (_, _) =>
+      TaskNativeMemory.install()
+      try {
+        val a = io.vecruntime.kernels.NativePool.shared().newArena()
+        a.allocate(8L << 20, 8) // larger than the whole pool: handed out anyway
+        a.close()
+      } finally TaskNativeMemory.uninstall()
+    }
+    assert(TaskNativeMemory.overdraftBytes - before >= (7L << 20))
+  }
+
+  test("#869: an arena still open when its task completes is counted as leaked, and the memory is returned") {
+    val before = TaskNativeMemory.leakedBytes
+    var open: java.lang.foreign.Arena = null
+    withPool(1L << 30) { (_, _) =>
+      TaskNativeMemory.install()
+      try {
+        open = io.vecruntime.kernels.NativePool.shared().newArena()
+        open.allocate(1L << 20, 8)
+      } finally TaskNativeMemory.uninstall()
+    }
+    assert(TaskNativeMemory.leakedBytes - before === (1L << 20))
+    open.close()
+  }
+
+  test("#869: no task, no account: an arena opened off a task thread charges nothing") {
+    TaskNativeMemory.install()
+    try assert(TaskNativeMemory.current() === null)
+    finally TaskNativeMemory.uninstall()
+  }
+
+  test("#869: with the pool's accounting on, a pool too small still makes the sort spill, and all is returned") {
+    withPool(256L * 1024) { (_, _) =>
+      TaskNativeMemory.install()
+      try {
+        val it = sorter(input)
+        check(it)
+        assert(it.spilledRuns > 0, "the account refused, so runs went to disk")
+        it.close()
+      } finally TaskNativeMemory.uninstall()
+    }
+  }
+
+  test("#869: with the pool's accounting on, the sort's reservation and its pooled blocks are one budget") {
+    withPool(1L << 30) { (tmm, _) =>
+      TaskNativeMemory.install()
+      try {
+        val it = sorter(input)
+        check(it)
+        assert(it.spilledRuns === 0)
+        val account = TaskNativeMemory.current().asInstanceOf[TaskNativeMemory.TaskAccount]
+        assert(
+          tmm.getMemoryConsumptionForThisTask() <=
+            math.max(account.reservedBytes, account.chargedBytes) + 2 * TaskNativeMemory.Chunk,
+          "held once, not reserved and charged side by side"
+        )
+        it.close()
+      } finally TaskNativeMemory.uninstall()
+    }
+  }
+
+  test("#869: a reservation of the account is asked to spill for another, never for its own hold") {
+    withPool(8L << 20) { (_, _) =>
+      TaskNativeMemory.install()
+      try {
+        var asked = 0
+        val first = TaskNativeMemory.reservation(MemoryMode.ON_HEAP, size => { asked += 1; 0L })
+        val second = TaskNativeMemory.reservation(MemoryMode.ON_HEAP, _ => 0L)
+        assert(first.hold(6L << 20))
+        assert(!first.hold(16L << 20), "its own hold past the pool is refused")
+        assert(asked === 0, "and does not ask itself to spill")
+        assert(!second.hold(4L << 20), "the other's hold does not fit")
+        assert(asked === 1, "and asks the first to spill")
+        first.releaseTo(0L)
+        second.releaseTo(0L)
+      } finally TaskNativeMemory.uninstall()
     }
   }
 

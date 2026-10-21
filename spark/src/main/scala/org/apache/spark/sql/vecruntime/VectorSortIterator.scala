@@ -219,18 +219,14 @@ private[vecruntime] class VectorSortIterator(
    * #867: the sort's memory from Spark's execution memory, as the task's share of the executor's pool: OFF_HEAP
    * when `spark.memory.offHeap.enabled` (our runs are native), else ON_HEAP as the hash aggregate's (#367). The
    * runs' allocated bytes are acquired as they grow, a refusal seals and spills, and another consumer of the task
-   * can ask the sort to spill its sealed runs while it drains. `spillBytes` stays a hard cap.
+   * can ask the sort to spill its sealed runs while it drains. `spillBytes` stays a hard cap. #869: with the native
+   * pool's accounting on, the reservation is part of the task's account, so the runs' pooled blocks are not counted
+   * a second time.
    */
-  private val consumer: SortMemoryConsumer =
-    Option(TaskContext.get()).map(tc => new SortMemoryConsumer(tc.taskMemoryManager())).orNull
-  private var reserved = 0L
+  private val reservation: TaskNativeMemory.Reservation =
+    TaskNativeMemory.reservation(memoryMode, size => if (!draining || hasNested) 0L else spillResident(size, 0L)._1)
+  private def reserved: Long = if (reservation == null) 0L else reservation.held
   private var draining = false
-
-  private final class SortMemoryConsumer(tmm: org.apache.spark.memory.TaskMemoryManager)
-      extends org.apache.spark.memory.MemoryConsumer(tmm, tmm.pageSizeBytes(), memoryMode) {
-    override def spill(size: Long, trigger: org.apache.spark.memory.MemoryConsumer): Long =
-      if ((trigger eq this) || !draining || hasNested) 0L else spillResident(size, 0L)._1
-  }
 
   /**
    * #868: the runs' heap side in the on-heap pool when the runs themselves are off-heap. A resident run keeps an
@@ -270,19 +266,10 @@ private[vecruntime] class VectorSortIterator(
     }
 
   /** Holds `bytes` of the pool for the sort, acquiring what is missing; false when the pool grants less. */
-  private def hold(bytes: Long): Boolean = {
-    if (consumer == null || bytes <= reserved) return true
-    reserved += consumer.acquireMemory(bytes - reserved)
-    reserved >= bytes
-  }
+  private def hold(bytes: Long): Boolean = reservation == null || reservation.hold(bytes)
 
   /** Returns what the sort holds past `bytes` to the pool. */
-  private def releaseTo(bytes: Long): Unit =
-    if (consumer != null && reserved > bytes) {
-      val give = reserved - math.max(bytes, 0L)
-      consumer.freeMemory(give)
-      reserved -= give
-    }
+  private def releaseTo(bytes: Long): Unit = if (reservation != null) reservation.releaseTo(bytes)
 
   /**
    * Spills sealed in-memory runs, the largest first, until `size` native bytes and `heapSize` heap bytes are freed;
@@ -450,7 +437,7 @@ private[vecruntime] class VectorSortIterator(
           residentBytes -= bytes
           residentHeap -= run.heapBytes
           val trigger = spillTrigger
-          val allowed = if (consumer == null) trigger else math.min(trigger, reserved)
+          val allowed = if (reservation == null) trigger else math.min(trigger, reserved)
           val heapAllowed = if (heapConsumer == null) Long.MaxValue else heapReserved
           if (residentBytes > allowed || residentHeap > heapAllowed)
             spillResident(math.max(0L, residentBytes - allowed), math.max(0L, residentHeap - heapAllowed))
