@@ -99,9 +99,13 @@ class IcebergReadSpecsSuite extends AnyFunSuite {
     assert(st.fields().get(0).asInstanceOf[Leaf].column().getPath.toSeq == Seq("st", "y"))
     assert(st.fields().get(1).isInstanceOf[Missing])
     assert(p.columns().get(1).isInstanceOf[Missing])
-    // The file holds `st` but none of the fields projected from it: not readable natively yet (see the resolver).
+    // The file holds `st` but none of the fields projected from it: a present struct of nulls, its nulls read from
+    // the group's narrowest leaf (x, int32), which the requested schema carries after the projected fields.
     val empty = resolve(struct(optional(4, "st", struct(optional(12, "z", Types.LongType.get())))), evolved, null)
-    assert(empty.unsupported() != null && empty.unsupported().contains("holds none of its projected fields"))
+    assert(empty.unsupported() == null)
+    val es = empty.columns().get(0).asInstanceOf[Struct]
+    assert(es.fields().get(0).isInstanceOf[Missing] && es.levelField().getName == "x")
+    assert(paths(empty) == Seq("st.x"))
   }
 
   test("initial defaults fill a missing field; a required field without one fails as Iceberg's reader does") {

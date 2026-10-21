@@ -66,9 +66,14 @@ public final class IcebergReadSpecs {
 
     /**
      * A struct present in the file (as {@code fileType}, field ids applied);
-     * its fields resolved in projection order.
+     * its fields resolved in projection order. {@code levelField}: when the
+     * file holds none of them, one of the group's own leaves, read only for
+     * the struct's nulls (a present struct of null fields where the group is
+     * defined, as Iceberg reads it); null otherwise.
      */
-    public record Struct(Types.NestedField field, org.apache.parquet.schema.Type fileType, List<Node> fields) implements Node {}
+    public record Struct(Types.NestedField field, org.apache.parquet.schema.Type fileType, List<Node> fields,
+                         org.apache.parquet.schema.Type levelField)
+            implements Node {}
 
     /** A list present in the file (as {@code fileType}). */
     public record ListNode(Types.NestedField field, org.apache.parquet.schema.Type fileType, Node element) implements Node {}
@@ -176,10 +181,14 @@ public final class IcebergReadSpecs {
                     any |= !(n instanceof Missing);
                     fields.add(n);
                 }
+                if (any) {
+                    return new Struct(f, t, List.copyOf(fields), null);
+                }
                 // A struct the file holds but none of whose projected fields it does: Iceberg reads it as a present
-                // struct of nulls (null only where the group is), which needs the group's definition levels with no
-                // column of it requested -- not something the readers do yet, so such a file keeps another reader.
-                return any ? new Struct(f, t, List.copyOf(fields)) : unsupported(f, "struct " + f.name() + " holds none of its projected fields");
+                // struct of nulls (null only where the group is). Its nulls come from one of the group's own leaves,
+                // read only for its definition levels -- the narrowest single non-repeated primitive child.
+                org.apache.parquet.schema.Type level = levelField(g);
+                return level == null ? unsupported(f, "struct " + f.name() + " holds none of its projected fields and no leaf to read its nulls from") : new Struct(f, t, List.copyOf(fields), level);
             }
             if (type.isListType()) {
                 org.apache.parquet.schema.Type element = listElement(g);
@@ -284,6 +293,9 @@ public final class IcebergReadSpecs {
                     fields.add(prune(c, ct));
                 }
             }
+            if (s.levelField() != null) {
+                fields.add(s.levelField());
+            }
             return g.withNewFields(fields);
         }
         if (n instanceof ListNode l) {
@@ -303,6 +315,32 @@ public final class IcebergReadSpecs {
                                 List.of(
                                         prune(m.key(), kv.getType(0)),
                                         prune(m.value(), kv.getType(1))))));
+    }
+
+    /**
+     * The narrowest single non-repeated primitive child of {@code g}, read only
+     * for a struct's nulls; null when it has none.
+     */
+    static org.apache.parquet.schema.Type levelField(GroupType g) {
+        org.apache.parquet.schema.Type best = null;
+        int bestWidth = Integer.MAX_VALUE;
+        for (org.apache.parquet.schema.Type c : g.getFields()) {
+            if (!c.isPrimitive() || c.isRepetition(org.apache.parquet.schema.Type.Repetition.REPEATED)) {
+                continue;
+            }
+            int width = switch (c.asPrimitiveType().getPrimitiveTypeName()) {
+                case BOOLEAN -> 1;
+                case INT32, FLOAT -> 4;
+                case INT64, DOUBLE -> 8;
+                case INT96 -> 12;
+                default -> 16;
+            };
+            if (width < bestWidth) {
+                best = c;
+                bestWidth = width;
+            }
+        }
+        return best;
     }
 
     // ------------------------------------------------------------------ field ids

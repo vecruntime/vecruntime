@@ -173,6 +173,8 @@ class IcebergReadSpecsScanSuite extends AnyFunSuite with BeforeAndAfterAll {
     )
     check(s"SELECT * FROM $t")
     check(s"SELECT k, st.y2, st.z FROM $t")
+    // The new nested fields alone: the old files hold `st` but neither of them.
+    check(s"SELECT k, st.z FROM $t")
   }
 
   test("v3 initial defaults fill the files written before their columns were added") {
@@ -230,9 +232,9 @@ class IcebergReadSpecsScanSuite extends AnyFunSuite with BeforeAndAfterAll {
     val t = "ice.db.unmapped"
     imported(t, mapping = false)
     // Iceberg numbers only the top-level columns by position, so `st.x` is missing in these files and `st` is a
-    // struct of nulls (IcebergReadSpecs does not read such a struct natively yet): the top-level columns. The
-    // previous resolution hands these files to Spark's reader, which fails on a file without the field ids the
-    // read schema expects; Iceberg's reads them.
+    // present struct of nulls. The previous resolution hands these files to Spark's reader, which fails on a file
+    // without the field ids the read schema expects; Iceberg's reads them.
+    check(s"SELECT * FROM $t", previousFails = true)
     check(s"SELECT a, s FROM $t", previousFails = true)
   }
 }

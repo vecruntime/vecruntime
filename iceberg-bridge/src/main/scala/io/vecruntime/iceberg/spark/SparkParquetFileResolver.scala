@@ -105,7 +105,10 @@ final class SparkParquetFileResolver(tableSchema: Object, nameMappingJson: Strin
     case (l: Leaf, _) => l.column().getPrimitiveType
     case (s: Struct, st: StructType) =>
       val g = s.fileType().asGroupType()
-      g.withNewFields(s.fields().asScala.zip(st.fields).map { case (c, sf) => shaped(c, sf.dataType) }.asJava)
+      val fields = s.fields().asScala.zip(st.fields).map { case (c, sf) => shaped(c, sf.dataType) }
+      // A struct holding none of its projected fields: the level field after them, as Spark's clipping appends it
+      // (the struct reader reads it for the struct's nulls only).
+      g.withNewFields((fields ++ Option(s.levelField())).asJava)
     case (l: ListNode, at: ArrayType) =>
       val g = l.fileType().asGroupType()
       val repeated = g.getType(0)
