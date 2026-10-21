@@ -75,6 +75,10 @@ class VectorPlugin extends SparkPlugin {
       VectorPlugin.requireVectorApi()
       io.vecruntime.spark.comet.CometVectorAdapter.tryRegister()
       // #869 step 4: before anything opens the Arrow root -- its buffers from the native pool when on.
+      io.vecruntime.kernels.NativePool.configureThreadCache(
+        VectorConf.nativePoolThreadCacheDepth(ctx.conf()),
+        VectorConf.nativePoolThreadCacheMaxBlockBytes(ctx.conf())
+      )
       io.vecruntime.spark.arrow.VectorAllocators.useNativePool(VectorConf.arrowNativePoolEnabled(ctx.conf()))
       // #868: the executor's Arrow budget, and its use as executor metrics (current and peak bytes) for sizing it.
       io.vecruntime.spark.arrow.VectorAllocators.setLimit(VectorConf.arrowMaxBytes(ctx.conf()))

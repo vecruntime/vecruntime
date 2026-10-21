@@ -617,7 +617,19 @@ object VectorConf {
    */
   val ArrowNativePoolEnabled = "spark.vecruntime.arrow.nativePool.enabled"
   def arrowNativePoolEnabled(sparkConf: org.apache.spark.SparkConf): Boolean =
-    sparkConf.getBoolean(ArrowNativePoolEnabled, false)
+    sparkConf.getBoolean(ArrowNativePoolEnabled, true)
+
+  /**
+   * #869 step 4: the native pool's per-thread cache -- blocks per size class (0 to 16) and the largest block cached
+   * (64 KiB to 64 MiB). A thread holds at most about `2 * depth * maxBlockBytes`: 8 MiB with the defaults (4, 1m).
+   * Read once, when the executor starts.
+   */
+  val NativePoolThreadCacheDepth = "spark.vecruntime.nativePool.threadCache.depth"
+  val NativePoolThreadCacheMaxBlockBytes = "spark.vecruntime.nativePool.threadCache.maxBlockBytes"
+  def nativePoolThreadCacheDepth(sparkConf: org.apache.spark.SparkConf): Int =
+    sparkConf.getInt(NativePoolThreadCacheDepth, 4)
+  def nativePoolThreadCacheMaxBlockBytes(sparkConf: org.apache.spark.SparkConf): Long =
+    org.apache.spark.network.util.JavaUtils.byteStringAsBytes(sparkConf.get(NativePoolThreadCacheMaxBlockBytes, "1m"))
 
   val ArrowMaxBytes = "spark.vecruntime.arrow.maxBytes"
   def arrowMaxBytes(sparkConf: org.apache.spark.SparkConf): Long =

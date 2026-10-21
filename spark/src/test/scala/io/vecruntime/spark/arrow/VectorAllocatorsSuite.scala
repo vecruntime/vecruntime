@@ -68,8 +68,15 @@ class VectorAllocatorsSuite extends AnyFunSuite {
     } finally root.close()
   }
 
-  test("#869: spark.vecruntime.arrow.nativePool.enabled is off by default") {
-    assert(!VectorConf.arrowNativePoolEnabled(new SparkConf(false)))
-    assert(VectorConf.arrowNativePoolEnabled(new SparkConf(false).set(VectorConf.ArrowNativePoolEnabled, "true")))
+  test("#869: Arrow on the native pool by default; the pool's per-thread cache shape from the conf") {
+    assert(VectorConf.arrowNativePoolEnabled(new SparkConf(false)))
+    assert(!VectorConf.arrowNativePoolEnabled(new SparkConf(false).set(VectorConf.ArrowNativePoolEnabled, "false")))
+    assert(VectorConf.nativePoolThreadCacheDepth(new SparkConf(false)) === 4)
+    assert(VectorConf.nativePoolThreadCacheMaxBlockBytes(new SparkConf(false)) === (1L << 20))
+    val big = new SparkConf(false)
+      .set(VectorConf.NativePoolThreadCacheDepth, "8")
+      .set(VectorConf.NativePoolThreadCacheMaxBlockBytes, "4m")
+    assert(VectorConf.nativePoolThreadCacheDepth(big) === 8)
+    assert(VectorConf.nativePoolThreadCacheMaxBlockBytes(big) === (4L << 20))
   }
 }

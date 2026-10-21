@@ -8,6 +8,10 @@ version may change configuration keys or defaults, always noted here.
 
 ### Added
 
+- Arrow buffers on the native pool (#869, `spark.vecruntime.arrow.nativePool.enabled`, on by default): the Flight
+  shuffle's buffers and the operators' output vectors are reused blocks of the same pool as the operators', not a
+  `malloc` and `free` each. The pool gains a per-thread cache for blocks up to 1 MiB and striped counters
+  (`spark.vecruntime.nativePool.threadCache.depth` / `.maxBlockBytes`), which also speeds up the operator arenas.
 - Native pool accounting (#869, `spark.vecruntime.memory.poolAccounting.enabled`, on by default): every block a
   task takes from `NativePool` is held in that task's Spark execution memory through one account, which the sort's
   and the grace hash join's reservations share, so a block is counted once and an allocation no operator reserved

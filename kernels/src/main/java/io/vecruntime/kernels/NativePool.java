@@ -120,19 +120,51 @@ public final class NativePool {
     private final ConcurrentLinkedQueue<Block>[] free = new ConcurrentLinkedQueue[CLASSES];
 
     /**
-     * #869 step 4: classes up to 1 MiB (0..4) also have a small per-thread
-     * cache in front of their shared free list, so the batch-sized buffers 15
-     * task threads take and release every few microseconds do not all meet on
-     * one queue head; counters are striped for the same reason. A cached block
-     * counts as retained.
+     * #869 step 4: the smaller classes also have a per-thread cache in front of
+     * their shared free list, so the batch-sized buffers 15 task threads take
+     * and release every few microseconds do not all meet on one queue head;
+     * counters are striped for the same reason. A cached block counts as
+     * retained. By default classes up to 1 MiB, 4 blocks each: at most about
+     * 8 MiB per thread ({@link #configureThreadCache}).
      */
-    static final int CACHED_CLASSES = 5;
+    static final int MAX_CACHE_DEPTH = 16;
 
-    static final int CACHE_DEPTH = 4;
+    private static volatile int cachedClasses = 5;
+
+    private static volatile int cacheDepth = 4;
+
+    /**
+     * The per-thread cache's shape for every pool: {@code depth} blocks (0 to
+     * 16) of each class up to {@code maxBlockBytes} (64 KiB to 64 MiB, rounded
+     * down to a class). A thread holds at most about {@code 2 * depth *
+     * maxBlockBytes}. Set once, before the pool is busy (the executor plugin
+     * does it first thing); blocks already cached past a smaller shape stay
+     * until they are taken.
+     */
+    public static void configureThreadCache(int depth, long maxBlockBytes) {
+        if (depth < 0
+                || depth > MAX_CACHE_DEPTH
+                || maxBlockBytes < MIN_CLASS
+                || maxBlockBytes > MAX_CLASS) {
+            throw new IllegalArgumentException("thread cache depth " + depth + ", max block " + maxBlockBytes);
+        }
+        cachedClasses = 63 - Long.numberOfLeadingZeros(maxBlockBytes) - MIN_SHIFT + 1;
+        cacheDepth = depth;
+    }
+
+    /** Blocks per class in each thread's cache. */
+    public static int threadCacheDepth() {
+        return cacheDepth;
+    }
+
+    /** The largest block a thread caches. */
+    public static long threadCacheMaxBlockBytes() {
+        return MIN_CLASS << (cachedClasses - 1);
+    }
 
     private static final class ThreadCache {
-        final Block[][] blocks = new Block[CACHED_CLASSES][CACHE_DEPTH];
-        final int[] count = new int[CACHED_CLASSES];
+        final Block[][] blocks = new Block[CLASSES][MAX_CACHE_DEPTH];
+        final int[] count = new int[CLASSES];
     }
 
     private final ThreadLocal<ThreadCache> cache = ThreadLocal.withInitial(ThreadCache::new);
@@ -247,7 +279,7 @@ public final class NativePool {
      */
     public void trim() {
         ThreadCache tc = cache.get();
-        for (int c = 0; c < CACHED_CLASSES; c++) {
+        for (int c = 0; c < CLASSES; c++) {
             while (tc.count[c] > 0) {
                 Block b = tc.blocks[c][--tc.count[c]];
                 tc.blocks[c][tc.count[c]] = null;
@@ -291,7 +323,7 @@ public final class NativePool {
     Block take(long size, boolean zero) {
         int c = size < MIN_CLASS ? -1 : classOf(size);
         Block b = null;
-        if (c >= 0 && c < CACHED_CLASSES) {
+        if (c >= 0 && c < cachedClasses) {
             ThreadCache tc = cache.get();
             if (tc.count[c] > 0) {
                 b = tc.blocks[c][--tc.count[c]];
@@ -332,9 +364,9 @@ public final class NativePool {
         if (poison) {
             b.segment.fill(POISON);
         }
-        if (b.cls >= 0 && b.cls < CACHED_CLASSES && retainedBytes() + b.size <= retainLimit) {
+        if (b.cls >= 0 && b.cls < cachedClasses && retainedBytes() + b.size <= retainLimit) {
             ThreadCache tc = cache.get();
-            if (tc.count[b.cls] < CACHE_DEPTH) {
+            if (tc.count[b.cls] < cacheDepth) {
                 tc.blocks[b.cls][tc.count[b.cls]++] = b;
                 cached.add(b.size);
                 return;

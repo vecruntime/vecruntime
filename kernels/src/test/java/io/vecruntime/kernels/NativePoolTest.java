@@ -119,6 +119,32 @@ class NativePoolTest {
     }
 
     @Test
+    void theThreadCacheShapeIsConfigurableAndBounded() {
+        int depth = NativePool.threadCacheDepth();
+        long max = NativePool.threadCacheMaxBlockBytes();
+        try {
+            NativePool.configureThreadCache(8, 4L << 20);
+            assertEquals(8, NativePool.threadCacheDepth());
+            assertEquals(4L << 20, NativePool.threadCacheMaxBlockBytes());
+            NativePool.configureThreadCache(2, 3L << 20); // rounded down to a class
+            assertEquals(2L << 20, NativePool.threadCacheMaxBlockBytes());
+            NativePool pool = new NativePool(1L << 30, false);
+            try (Arena a = pool.newArena()) {
+                a.allocate(1L << 20, 8);
+                a.allocate(1L << 20, 8);
+                a.allocate(1L << 20, 8);
+            }
+            assertEquals(3L << 20, pool.retainedBytes(), "two in the thread's cache, one on the shared list");
+            pool.trim();
+            assertEquals(0, pool.retainedBytes());
+            assertThrows(IllegalArgumentException.class, () -> NativePool.configureThreadCache(17, 1L << 20));
+            assertThrows(IllegalArgumentException.class, () -> NativePool.configureThreadCache(4, 1L << 10));
+        } finally {
+            NativePool.configureThreadCache(depth, max);
+        }
+    }
+
+    @Test
     void concurrentOwnersNeverShareABlock() throws Exception {
         NativePool pool = new NativePool(64L << 20, false);
         ExecutorService ex = Executors.newFixedThreadPool(8);
