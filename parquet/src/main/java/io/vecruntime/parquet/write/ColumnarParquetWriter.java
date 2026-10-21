@@ -275,6 +275,16 @@ public final class ColumnarParquetWriter implements AutoCloseable {
     }
 
     /**
+     * The file's length so far: the bytes already written plus the open row
+     * group's buffered estimate, and the exact file size once {@link #close}
+     * has returned. Like Iceberg's {@code FileAppender.length()}, it is what a
+     * caller rolls files on ({@code write.target-file-size-bytes}).
+     */
+    public long length() throws IOException {
+        return closed ? file.getPos() : file.getPos() + bufferedSize();
+    }
+
+    /**
      * The footer this writer wrote -- schema, row groups, and each column
      * chunk's statistics, encodings, sizes and value counts -- once {@link
      * #close} has returned (#900, #901). It is what a table format needs to
