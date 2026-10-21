@@ -99,6 +99,19 @@ object WriteBenchRunner {
     def of(group: String): TaskSums = synchronized(sums.getOrElse(group, TaskSums(0, 0, 0, 0, 0, 0)))
   }
 
+  /**
+   * `wb.db.<name>` in a Hadoop catalog `wb` whose warehouse is `<writeBase>/iceberg`, registered on first use
+   * (Spark loads catalogs lazily, so a runtime setting is enough).
+   */
+  private def icebergTable(spark: SparkSession, writeBase: String, name: String): String = {
+    if (spark.conf.getOption("spark.sql.catalog.wb").isEmpty) {
+      spark.conf.set("spark.sql.catalog.wb", "org.apache.iceberg.spark.SparkCatalog")
+      spark.conf.set("spark.sql.catalog.wb.type", "hadoop")
+      spark.conf.set("spark.sql.catalog.wb.warehouse", s"${writeBase.stripSuffix("/")}/iceberg")
+    }
+    s"wb.db.$name"
+  }
+
   def main(argv: Array[String]): Unit = {
     val a = parse(argv.toList, Args())
     require(a.tables.nonEmpty && a.out.nonEmpty, "--tables and --out are required")
@@ -115,6 +128,8 @@ object WriteBenchRunner {
         val target = s"${a.writeBase.stripSuffix("/")}/$c-$it"
         spark.sparkContext.setJobGroup(group, group, interruptOnCancel = false)
         val t0 = System.nanoTime()
+        var checksum = ""
+        var t1 = 0L
         try {
           val df = spark.sql(a.source)
           c match {
@@ -125,18 +140,36 @@ object WriteBenchRunner {
               val codec = spec.takeWhile(_ != '@')
               val cols = spec.drop(codec.length + 1).split("\\+").filter(_.nonEmpty).toSeq
               df.write.mode("overwrite").option("compression", codec).partitionBy(cols: _*).parquet(target)
+            case p if p.startsWith("iceberg-row-") || p.startsWith("iceberg-vector-") =>
+              // #842: `iceberg-<row|vector>-<codec>`: an append into a new unpartitioned Iceberg table (a Hadoop
+              // catalog under --write-base), written by Iceberg's own writer (`row`) or the columnar one (`vector`).
+              val vector = p.startsWith("iceberg-vector-")
+              val codec = p.stripPrefix(if (vector) "iceberg-vector-" else "iceberg-row-")
+              val table = icebergTable(spark, a.writeBase, s"${c.replace('-', '_')}_$it")
+              spark.sql(
+                s"CREATE TABLE $table (${df.schema.toDDL}) USING iceberg " +
+                  s"TBLPROPERTIES ('format-version'='2', 'write.parquet.compression-codec'='$codec')"
+              )
+              spark.conf.set("spark.vecruntime.iceberg.writer.enabled", vector.toString)
+              try df.writeTo(table).append()
+              finally spark.conf.unset("spark.vecruntime.iceberg.writer.enabled")
+              t1 = System.nanoTime()
+              checksum = spark.table(table).selectExpr("count(*)", "sum(xxhash64(*))").collect()(0).toString
             case other => throw new IllegalArgumentException(s"unknown case $other")
           }
         } finally spark.sparkContext.clearJobGroup()
-        val ms = (System.nanoTime() - t0) / 1e6
+        val ms = ((if (t1 > 0) t1 else System.nanoTime()) - t0) / 1e6
         org.apache.spark.sql.vecruntime.BenchmarkListenerSync.drain(spark)
         val s = listener.of(group)
         val line = s"""{"config":"${a.config}","dataset":"${a.dataset}","case":"$c","iteration":$it,""" +
-          f""""wallMs":$ms%.1f,${s.json}}"""
+          f""""wallMs":$ms%.1f,${s.json}""" +
+          (if (checksum.nonEmpty) s""","checksum":"$checksum"}""" else "}")
         println(s"[write] $line")
         out.println(line)
         out.flush()
-        if (c != "noop" && !a.keep) {
+        if (c.startsWith("iceberg-") && !a.keep) {
+          spark.sql(s"DROP TABLE IF EXISTS ${icebergTable(spark, a.writeBase, s"${c.replace('-', '_')}_$it")} PURGE")
+        } else if (c != "noop" && !a.keep) {
           val fs = FileSystem.get(new URI(target), spark.sparkContext.hadoopConfiguration)
           fs.delete(new HPath(target), true)
         }
