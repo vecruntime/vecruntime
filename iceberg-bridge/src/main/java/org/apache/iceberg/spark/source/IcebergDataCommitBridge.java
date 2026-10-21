@@ -155,6 +155,18 @@ public final class IcebergDataCommitBridge {
     }
 
     /**
+     * The top-level field names of the write's Iceberg write schema, in order:
+     * the data columns and, for a format v3 rewrite, the row lineage Iceberg
+     * appends ({@code MetadataColumns.schemaWithRowLineage}).
+     */
+    public static String[] writeSchemaNames(Write write) {
+        Schema schema = field((SparkWrite) write, "writeSchema", Schema.class);
+        return schema.columns().stream()
+                .map(Types.NestedField::name)
+                .toArray(String[]::new);
+    }
+
+    /**
      * One task's commit message for {@code files}, as Iceberg's own data writer
      * returns it.
      */

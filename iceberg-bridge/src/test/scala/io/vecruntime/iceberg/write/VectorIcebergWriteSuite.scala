@@ -227,11 +227,27 @@ class VectorIcebergWriteSuite extends AnyFunSuite with BeforeAndAfterAll {
     assert(ids.getLong(0) == 5000L && ids.getLong(1) == 0L)
   }
 
-  test("copy-on-write on a format v3 table keeps Iceberg's writer (row lineage), unchanged") {
-    val df = twin("cow_v3", CopyOnWrite, version = 3)(t => spark.sql(s"INSERT INTO $t ${source(3000)}").collect())(t =>
-      s"DELETE FROM $t WHERE id % 3 = 0"
+  private def lineage(t: String): Seq[Row] =
+    spark.sql(s"SELECT id, _row_id, _last_updated_sequence_number FROM $t ORDER BY id").collect().toSeq
+
+  for (
+    (op, sql) <- Seq(
+      "DELETE" -> ((t: String) => s"DELETE FROM $t WHERE id % 3 = 0"),
+      "UPDATE" -> ((t: String) => s"UPDATE $t SET s = 'updated' WHERE id % 4 = 1"),
+      "MERGE INTO" -> ((t: String) =>
+        s"""MERGE INTO $t t USING (${source(4000)}) src ON t.id = src.id AND src.id >= 1000
+           |WHEN MATCHED AND src.id % 2 = 0 THEN UPDATE SET t.s = 'merged'
+           |WHEN MATCHED AND src.id % 5 = 0 THEN DELETE
+           |WHEN NOT MATCHED THEN INSERT *""".stripMargin
+      )
     )
-    assert(!columnar(df))
+  ) {
+    test(s"copy-on-write $op on a format v3 table writes columnar and keeps the rows' lineage") {
+      val name = s"cow_v3_${op.replace(' ', '_').toLowerCase}"
+      val df = twin(name, CopyOnWrite, version = 3)(t => spark.sql(s"INSERT INTO $t ${source(3000)}").collect())(sql)
+      assert(columnar(df))
+      assert(lineage(s"ice.db.${name}_on") == lineage(s"ice.db.${name}_off"), "row lineage")
+    }
   }
 
   test("INSERT INTO from a Parquet table reads the scan's batches, not rows") {
