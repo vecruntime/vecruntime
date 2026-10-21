@@ -21,7 +21,7 @@ import java.lang.foreign.MemorySegment;
 import java.util.Random;
 import java.util.concurrent.TimeUnit;
 
-import io.vecruntime.kernels.parquet.RleBitPackingReader;
+import io.vecruntime.parquet.codec.RleBitPackingReader;
 import org.apache.parquet.bytes.ByteBufferInputStream;
 import org.apache.parquet.column.values.bitpacking.BytePacker;
 import org.apache.parquet.column.values.bitpacking.Packer;

@@ -22,7 +22,7 @@ import java.util.function.IntFunction
 import scala.util.Random
 
 import io.vecruntime.kernels.{ArrowLayout, SegmentVectorBuffers, VecType, VectorBuffers}
-import io.vecruntime.kernels.parquet.{ColumnChunkDecoder, DeltaBinaryPackedReader, GroupUnpacker, ParquetPageDecoder}
+import io.vecruntime.parquet.codec.{ColumnChunkDecoder, DeltaBinaryPackedReader, GroupUnpacker, ParquetPageDecoder}
 import org.apache.parquet.bytes.HeapByteBufferAllocator
 import org.apache.parquet.column.values.bitpacking.Packer
 import org.apache.parquet.column.values.bytestreamsplit.ByteStreamSplitValuesWriter
