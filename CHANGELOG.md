@@ -12,6 +12,8 @@ version may change configuration keys or defaults, always noted here.
   distinct join columns, one aggregate per task, before the join's exchange
   (`spark.vecruntime.optimizer.distinctBelowSemiJoin.enabled`, default on). TPC-DS q14's `INTERSECT`s
   semi-join 8.6 G and 4.3 G sales rows at 10 TB on three item columns with a few thousand values.
+- The same for left anti joins -- `NOT EXISTS`, `EXCEPT`, `NOT IN` (#904,
+  `spark.vecruntime.optimizer.distinctBelowAntiJoin.enabled`, default on).
 
 - Columnar Parquet writer (#64), behind `spark.vecruntime.write.columnar.enabled` (default off):
   `VectorWriteFilesExec` writes Parquet writes of flat types -- unpartitioned, partitioned and bucketed, with

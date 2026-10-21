@@ -597,6 +597,12 @@ do not repeat (a high-cardinality key) gives it up and passes its rows through.
 
 Off with `spark.vecruntime.optimizer.distinctBelowSemiJoin.enabled=false`.
 
+**Left anti joins (#904).** `NOT EXISTS`, `EXCEPT` (`Distinct(LeftAnti(...))`) and `NOT IN` get the same rewrite:
+an anti join keeps a left row when no right row satisfies the condition, and the condition reads only the right
+columns kept. `NOT IN`'s null-aware condition, `(a = b) OR isnull(a = b)`, is no exception: a right side with a
+null key keeps one null row, so `NOT IN` stays never-true for it, and an empty right side stays empty. Off with
+`spark.vecruntime.optimizer.distinctBelowAntiJoin.enabled=false`.
+
 ## `RemoveRedundantGroupKeys`: grouping keys a unique broadcast key determines (#635)
 
 An adaptive (runtime) optimizer rule. It runs when AQE
