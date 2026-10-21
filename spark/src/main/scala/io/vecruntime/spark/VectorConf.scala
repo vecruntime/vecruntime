@@ -55,6 +55,14 @@ object VectorConf {
   val IcebergReadSpecsEnabled = "spark.vecruntime.iceberg.readSpecs.enabled"
 
   /**
+   * #901 R2: the native Iceberg scan applies equality deletes on each batch's lanes (iceberg-bridge's
+   * `EqualityDeleteSet`: one hash probe per row over the key's canonical bytes) instead of wrapping every row for
+   * Iceberg's `StructLikeSet`. The delete rows are still loaded by Iceberg's own delete loader. Without the bridge,
+   * or for a key type it does not take, the row probe stays. On by default.
+   */
+  val IcebergNativeEqualityDeletesEnabled = "spark.vecruntime.iceberg.nativeEqualityDeletes.enabled"
+
+  /**
    * Logical rewrite (#632): `IsNotNull` on a grouping key that is the only difference between the
    * inputs of two aggregates (a CTE used twice) moves above the aggregates, so the input is shared.
    */
@@ -339,6 +347,8 @@ object VectorConf {
    */
   def icebergDvWriterEnabled(conf: SQLConf): Boolean = bool(conf, IcebergDvWriterEnabled, default = false)
   def icebergReadSpecsEnabled(conf: SQLConf): Boolean = bool(conf, IcebergReadSpecsEnabled, default = true)
+  def icebergNativeEqualityDeletesEnabled(conf: SQLConf): Boolean =
+    bool(conf, IcebergNativeEqualityDeletesEnabled, default = true)
   def aggDictionaryKeys(conf: SQLConf): Boolean = bool(conf, AggDictionaryKeys, default = true)
 
   /** Pass selection bitmaps between spark-vector operators instead of compacting each batch. */

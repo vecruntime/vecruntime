@@ -38,6 +38,9 @@ object ParquetFileResolver {
   /** The data files this executor's native Parquet readers handed to Spark's reader (read by tests). */
   val sparkReaderFiles = new java.util.concurrent.atomic.AtomicLong()
 
+  /** #901 R2: the batches whose equality deletes were probed on their lanes (read by tests). */
+  val nativeEqualityBatches = new java.util.concurrent.atomic.AtomicLong()
+
   private val IcebergResolver = "io.vecruntime.iceberg.spark.SparkParquetFileResolver"
 
   /**

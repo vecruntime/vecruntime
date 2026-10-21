@@ -251,7 +251,8 @@ case class VectorIcebergScanExec(
       IcebergTasks.nameMapping(scan),
       // #901 R1: Iceberg's own column resolution (iceberg-bridge), when on and the bridge is on the classpath.
       if (!io.vecruntime.spark.VectorConf.icebergReadSpecsEnabled(sqlConf)) null
-      else ParquetFileResolver.iceberg(IcebergTasks.tableSchema(scan), IcebergTasks.nameMappingJson(scan)).orNull
+      else ParquetFileResolver.iceberg(IcebergTasks.tableSchema(scan), IcebergTasks.nameMappingJson(scan)).orNull,
+      io.vecruntime.spark.VectorConf.icebergNativeEqualityDeletesEnabled(sqlConf)
     )
     val out: RDD[ColumnarBatch] =
       if (emitSelection) rdd else rdd.mapPartitionsInternal(_.map(VectorIcebergScanExec.compacted))
@@ -322,7 +323,8 @@ private[vecruntime] final class VectorIcebergRDD(
     filterFieldIds: Map[String, Int], // null: nothing pushed
     pushDown: PushDownConf,
     nameMapping: IcebergNameMapping, // #849: null when the table has none
-    fileResolver: ParquetFileResolver // #901 R1: null: Spark's clipParquetSchema
+    fileResolver: ParquetFileResolver, // #901 R1: null: Spark's clipParquetSchema
+    nativeEqualityDeletes: Boolean // #901 R2: probe equality deletes on the batch's lanes (iceberg-bridge)
 ) extends RDD[ColumnarBatch](sc, Nil) {
 
   override protected def getPartitions: Array[Partition] = parts
@@ -412,7 +414,8 @@ private[vecruntime] final class VectorIcebergRDD(
     } else {
       val schema = equalitySchema.get
       val out = layout(schema.length - attrs.length - 1, positions = true)
-      lazy val equality = IcebergTasks.equalityFilter(p, t.equalityDeletes, tableSchema, schema, equalitySets)
+      lazy val equality =
+        IcebergTasks.equalityFilter(p, t.equalityDeletes, tableSchema, schema, equalitySets, nativeEqualityDeletes)
       readerOf(index, Array(t.file), equalityConfBroadcast.get, schema, context)
         .map(b => IcebergTasks.withoutDeleted(b, out, schema.length - 1, deleted, equality(b)))
     }
@@ -972,7 +975,8 @@ private[vecruntime] object IcebergTasks {
       deletes: java.util.List[AnyRef],
       tableSchema: AnyRef,
       schema: StructType,
-      cache: scala.collection.mutable.HashMap[(Seq[String], Seq[Int]), AnyRef]
+      cache: scala.collection.mutable.HashMap[(Seq[String], Seq[Int]), AnyRef],
+      native: Boolean = false
   ): ColumnarBatch => (Int => Boolean) = {
     val cl = p.getClass.getClassLoader
     val (loaderClass, loader) = deleteLoader(p)
@@ -1001,17 +1005,67 @@ private[vecruntime] object IcebergTasks {
         .asScala
         .map(f => call(f, "fieldId").asInstanceOf[Integer].intValue())
         .toArray
-      val set = cache.getOrElseUpdate(
-        (files.map(d => call(d, "location").toString).sorted.toSeq, ids),
-        load.invoke(loader, files.asJava, deleteSchema)
-      )
+      val cacheKey = (files.map(d => call(d, "location").toString).sorted.toSeq, ids)
+      val set = cache.getOrElseUpdate(cacheKey, load.invoke(loader, files.asJava, deleteSchema))
       val ordinals = order.map(ordinalOf)
       val sparkType =
         StructType(ordinals.map(o => schema(o).copy(metadata = org.apache.spark.sql.types.Metadata.empty)))
-      (set, ordinals, sparkType, call(deleteSchema, "asStruct"))
+      (set, ordinals, sparkType, call(deleteSchema, "asStruct"), cacheKey)
+    }
+    // #901 R2: each group as the bridge's EqualityDeleteSet, probed with the batch's lanes; None without the
+    // bridge or for a key type it does not take, which keeps the row probe below.
+    val nativeGroups: Option[Seq[(AnyRef, java.lang.reflect.Method, Array[Int])]] =
+      if (!native) None
+      else
+        try {
+          val cls = Class.forName("io.vecruntime.iceberg.read.EqualityDeleteSet", true, cl)
+          val supports = cls.getMethod("supports", Class.forName("org.apache.iceberg.types.Type", false, cl))
+          val of = cls.getMethod("of", structTypeClass, classOf[java.lang.Iterable[_]])
+          val clear = cls.getMethod(
+            "clearDeleted",
+            classOf[Array[io.vecruntime.kernels.VectorBuffers]],
+            Integer.TYPE,
+            classOf[java.lang.foreign.MemorySegment]
+          )
+          val all = groups.map { case (set, ordinals, _, struct, cacheKey) =>
+            val types = call(struct, "fields").asInstanceOf[java.util.List[AnyRef]].asScala.map(call(_, "type"))
+            if (!types.forall(t => supports.invoke(null, t).asInstanceOf[java.lang.Boolean].booleanValue())) None
+            else {
+              // Built once per task and group, beside the loaded set (the key's "#native" marks it).
+              val built = cache.synchronized {
+                cache.getOrElseUpdate(
+                  (cacheKey._1 :+ "#native", cacheKey._2),
+                  of.invoke(null, struct, set.asInstanceOf[java.lang.Iterable[_]])
+                )
+              }
+              Some((built, clear, ordinals))
+            }
+          }
+          if (all.forall(_.isDefined)) Some(all.map(_.get)) else None
+        } catch {
+          case _: ClassNotFoundException | _: NoClassDefFoundError => None
+        }
+    if (nativeGroups.isDefined) {
+      val native = nativeGroups.get
+      return batch => {
+        val n = batch.numRows()
+        val words = new Array[Long](math.max(1, (n + 63) >>> 6))
+        java.util.Arrays.fill(words, -1L)
+        val live = java.lang.foreign.MemorySegment.ofArray(words)
+        val arena = java.lang.foreign.Arena.ofConfined()
+        try {
+          native.foreach { case (set, clear, ordinals) =>
+            val columns =
+              ordinals.map(o => io.vecruntime.spark.adapter.ColumnVectorAdapters.adapt(batch.column(o), n, arena))
+            clear.invoke(set, columns, Int.box(n), live)
+          }
+        } finally arena.close()
+        ParquetFileResolver.nativeEqualityBatches.incrementAndGet()
+        (i: Int) => (words(i >>> 6) & (1L << (i & 63))) == 0
+      }
     }
     batch => {
-      val probes = groups.map { case (set, ordinals, sparkType, icebergStruct) =>
+      val probes = groups.map { case (set, ordinals, sparkType, icebergStruct, _) =>
         val wrapper = wrapperCtor.newInstance(sparkType, icebergStruct)
         val row = new org.apache.spark.sql.catalyst.expressions.GenericInternalRow(ordinals.length)
         val types = sparkType.fields.map(_.dataType)
