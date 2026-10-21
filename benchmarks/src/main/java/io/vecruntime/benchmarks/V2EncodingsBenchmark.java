@@ -22,9 +22,9 @@ import java.util.concurrent.TimeUnit;
 
 import io.vecruntime.kernels.ArrowLayout;
 import io.vecruntime.kernels.VecType;
-import io.vecruntime.kernels.parquet.ColumnChunkDecoder;
-import io.vecruntime.kernels.parquet.GroupUnpacker;
-import io.vecruntime.kernels.parquet.ParquetPageDecoder;
+import io.vecruntime.parquet.codec.ColumnChunkDecoder;
+import io.vecruntime.parquet.codec.GroupUnpacker;
+import io.vecruntime.parquet.codec.ParquetPageDecoder;
 import org.apache.parquet.bytes.ByteBufferInputStream;
 import org.apache.parquet.bytes.HeapByteBufferAllocator;
 import org.apache.parquet.column.values.ValuesReader;

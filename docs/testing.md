@@ -191,7 +191,7 @@ intermittent dynamic-partition-pruning timing issue, also documented there.)
 - **The CI gate the crews run before a PR:**
 
   ```bash
-  mvn -B -Pcomet,iceberg -pl kernels,spark,shuffle,benchmarks install
+  mvn -B -Pcomet,iceberg -pl kernels,parquet,spark,shuffle,benchmarks install
   ```
 
 - **A single suite:**

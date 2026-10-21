@@ -20,8 +20,8 @@ import java.nio.ByteOrder
 import java.nio.charset.StandardCharsets
 
 import io.vecruntime.kernels.{VecType, VectorBuffers}
-import io.vecruntime.kernels.parquet.ParquetPageDecoder
-import io.vecruntime.kernels.parquet.ParquetPageDecoder.{Encoding, Page}
+import io.vecruntime.parquet.codec.ParquetPageDecoder
+import io.vecruntime.parquet.codec.ParquetPageDecoder.{Encoding, Page}
 import org.apache.parquet.bytes.HeapByteBufferAllocator
 import org.apache.parquet.column.values.plain.PlainValuesWriter
 import org.apache.parquet.column.values.rle.RunLengthBitPackingHybridEncoder

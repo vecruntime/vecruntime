@@ -18,7 +18,7 @@
 
   <modules>
     <module>kernels</module>
-    <module>parquet-writer</module>
+    <module>parquet</module>
     <module>spark</module>
     <module>shuffle</module>
     <module>benchmarks</module>
@@ -161,7 +161,7 @@
       </dependency>
       <dependency>
         <groupId>io.github.vecruntime</groupId>
-        <artifactId>vecruntime-parquet-writer_${spark.line}</artifactId>
+        <artifactId>vecruntime-parquet_${spark.line}</artifactId>
         <version>${project.version}</version>
       </dependency>
       <dependency>

@@ -24,9 +24,9 @@ import java.util.Deque;
 
 import io.vecruntime.kernels.VecType;
 import io.vecruntime.kernels.VectorBuffers;
-import io.vecruntime.kernels.parquet.ColumnChunkDecoder;
-import io.vecruntime.kernels.parquet.GroupUnpacker;
-import io.vecruntime.kernels.parquet.ParquetPageDecoder;
+import io.vecruntime.parquet.codec.ColumnChunkDecoder;
+import io.vecruntime.parquet.codec.GroupUnpacker;
+import io.vecruntime.parquet.codec.ParquetPageDecoder;
 import io.vecruntime.spark.arrow.ArrowOutput;
 import io.vecruntime.spark.arrow.ArrowVectorBuffers;
 import org.apache.arrow.memory.BufferAllocator;
@@ -1006,7 +1006,7 @@ public final class NativeParquetColumnReader implements NativeParquetColumn, Row
             java.util.Arrays.fill(dst, levelEnd, levelEnd + n, 0);
             return;
         }
-        io.vecruntime.kernels.parquet.RleBitPackingReader.overArray(src, offset, length, bitWidth, unpackerFor(bitWidth)).readInts(dst, levelEnd, n);
+        io.vecruntime.parquet.codec.RleBitPackingReader.overArray(src, offset, length, bitWidth, unpackerFor(bitWidth)).readInts(dst, levelEnd, n);
     }
 
     private static int readLeInt(byte[] b, int at) {

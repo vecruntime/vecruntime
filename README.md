@@ -129,7 +129,7 @@ Contributions are welcome: bug reports, failing queries, benchmarks on other har
 * **Issues.** Open one on [GitHub](https://github.com/vecruntime/vecruntime/issues) with the query, the
   Spark version and the plan or the fallback reason from the Vector Acceleration tab.
 * **Pull requests.** Branch from `main`, keep one change per PR and include tests. A change is ready when the
-  gate passes: `mvn -B -Pcomet,iceberg -pl kernels,spark,shuffle,benchmarks install` on JDK 25. Planner
+  gate passes: `mvn -B -Pcomet,iceberg -pl kernels,parquet,spark,shuffle,benchmarks install` on JDK 25. Planner
   or expression changes also need the SQL golden suite ([docs/testing.md](docs/testing.md)), and
   performance claims need a number (JMH or TPC-H / TPC-DS).
 * **Conventions.** [AGENTS.md](AGENTS.md) holds the design decisions, the coding rules and what "done" means

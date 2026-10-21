@@ -20,7 +20,7 @@ import java.nio.charset.StandardCharsets
 import scala.collection.mutable.ArrayBuffer
 
 import io.vecruntime.kernels.VecType
-import io.vecruntime.kernels.parquet.ParquetPageDecoder
+import io.vecruntime.parquet.codec.ParquetPageDecoder
 import io.vecruntime.spark.arrow.VectorAllocators
 import org.apache.parquet.bytes.{BytesInput, HeapByteBufferAllocator}
 import org.apache.parquet.column.{ColumnDescriptor, Encoding}

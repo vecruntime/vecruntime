@@ -26,10 +26,10 @@
       <groupId>io.github.vecruntime</groupId>
       <artifactId>vecruntime-kernels_${spark.line}</artifactId>
     </dependency>
-    <!-- #64: the columnar Parquet writer, shaded into the plugin jar like the kernels. -->
+    <!-- #64, #900: the Parquet codec and the columnar writer, shaded into the plugin jar like the kernels. -->
     <dependency>
       <groupId>io.github.vecruntime</groupId>
-      <artifactId>vecruntime-parquet-writer_${spark.line}</artifactId>
+      <artifactId>vecruntime-parquet_${spark.line}</artifactId>
     </dependency>
     <dependency>
       <groupId>org.apache.arrow</groupId>
@@ -103,7 +103,7 @@
               <artifactSet>
                 <includes>
                   <include>io.github.vecruntime:vecruntime-kernels_${spark.line}</include>
-                  <include>io.github.vecruntime:vecruntime-parquet-writer_${spark.line}</include>
+                  <include>io.github.vecruntime:vecruntime-parquet_${spark.line}</include>
                 </includes>
               </artifactSet>
             </configuration>
