@@ -186,7 +186,7 @@ it is correct but brings no measured wall-time gain yet (next section). See `doc
 
 ## Running the tests
 
-CI's gate builds `-pl kernels,spark,shuffle,benchmarks` and does **not** build the optional
+CI's gate builds `-pl kernels,parquet,spark,shuffle,benchmarks` and does **not** build the optional
 `iceberg-bridge` module, so the operator's correctness suite is run manually. The gate itself does
 cover the strategy's decline/fallback paths through `DvWriteStrategyFallbackSuite` in the spark
 module (the bridge is absent there by construction).
