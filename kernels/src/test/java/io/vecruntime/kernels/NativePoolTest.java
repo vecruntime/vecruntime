@@ -148,6 +148,43 @@ class NativePoolTest {
         pool.trim();
     }
 
+    @Test
+    void anArenaChargesItsAccountAndCreditsItOnClose() {
+        NativePool pool = new NativePool(1L << 30, false);
+        long[] held = {0};
+        NativePool.Account account = new NativePool.Account() {
+            @Override
+            public void charge(long bytes) {
+                held[0] += bytes;
+            }
+
+            @Override
+            public void credit(long bytes) {
+                held[0] -= bytes;
+            }
+        };
+        NativePool.setAccountSource(() -> account);
+        try {
+            Arena a = pool.newArena();
+            a.allocate(100_000, 8);
+            a.allocate(NativePool.MIN_CLASS, 8);
+            // Class sizes: 100,000 rounds to 128 KiB.
+            assertEquals((1L << 17) + NativePool.MIN_CLASS, held[0]);
+            assertEquals(held[0], pool.inUseBytes());
+            a.close();
+            assertEquals(0, held[0]);
+            a.close();
+            assertEquals(0, held[0]);
+        } finally {
+            NativePool.setAccountSource(null);
+        }
+        // No source: nothing is charged.
+        try (Arena b = pool.newArena()) {
+            b.allocate(1000, 8);
+        }
+        assertEquals(0, held[0]);
+    }
+
     private static void assertAllZero(MemorySegment s) {
         for (long i = 0; i < s.byteSize(); i += 8) {
             long left = Math.min(8, s.byteSize() - i);

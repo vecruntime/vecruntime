@@ -324,6 +324,53 @@ class SortMemoryBudgetSuite extends AnyFunSuite {
     }
   }
 
+  test("#869: a pooled arena's blocks are held in the task's execution memory and given back") {
+    withPool(1L << 30) { (tmm, _) =>
+      TaskNativeMemory.install()
+      try {
+        val a = io.vecruntime.kernels.NativePool.shared().newArena()
+        a.allocate(3L << 20, 8)
+        a.allocate(1L << 20, 8)
+        assert(tmm.getMemoryConsumptionForThisTask() >= (5L << 20), "4 MiB class + 1 MiB class, charged")
+        a.close()
+        assert(tmm.getMemoryConsumptionForThisTask() <= 2 * TaskNativeMemory.Chunk, "given back to one chunk of slack")
+      } finally TaskNativeMemory.uninstall()
+    }
+  }
+
+  test("#869: a pooled allocation the memory manager cannot cover is counted as overdraft, not refused") {
+    val before = TaskNativeMemory.overdraftBytes
+    withPool(1L << 20) { (_, _) =>
+      TaskNativeMemory.install()
+      try {
+        val a = io.vecruntime.kernels.NativePool.shared().newArena()
+        a.allocate(8L << 20, 8) // larger than the whole pool: handed out anyway
+        a.close()
+      } finally TaskNativeMemory.uninstall()
+    }
+    assert(TaskNativeMemory.overdraftBytes - before >= (7L << 20))
+  }
+
+  test("#869: an arena still open when its task completes is counted as leaked, and the memory is returned") {
+    val before = TaskNativeMemory.leakedBytes
+    var open: java.lang.foreign.Arena = null
+    withPool(1L << 30) { (_, _) =>
+      TaskNativeMemory.install()
+      try {
+        open = io.vecruntime.kernels.NativePool.shared().newArena()
+        open.allocate(1L << 20, 8)
+      } finally TaskNativeMemory.uninstall()
+    }
+    assert(TaskNativeMemory.leakedBytes - before === (1L << 20))
+    open.close()
+  }
+
+  test("#869: no task, no account: an arena opened off a task thread charges nothing") {
+    TaskNativeMemory.install()
+    try assert(TaskNativeMemory.current() === null)
+    finally TaskNativeMemory.uninstall()
+  }
+
   test("#875: the pool memory unspillable consumers hold is counted, current and peak, and returned") {
     withPool(1L << 30) { (_, _) =>
       val before = PinnedMemory.bytes

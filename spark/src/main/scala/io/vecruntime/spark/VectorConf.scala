@@ -600,6 +600,15 @@ object VectorConf {
    * the container being OOM-killed. Not part of `spark.memory.offHeap.size`: size it inside the memory overhead
    * (about 1 GB per executor was the Flight shuffle's share at 10 TB, #840). Read once, when the executor starts.
    */
+  /**
+   * #869 step 3b: count every block a task takes from the native pool in that task's Spark execution memory
+   * (`TaskNativeMemory`). Off by default: the operators still reserve their own estimates, so turning it on counts
+   * those bytes twice until they move onto it. Read once, when the executor starts.
+   */
+  val PoolAccountingEnabled = "spark.vecruntime.memory.poolAccounting.enabled"
+  def poolAccountingEnabled(sparkConf: org.apache.spark.SparkConf): Boolean =
+    sparkConf.getBoolean(PoolAccountingEnabled, false)
+
   val ArrowMaxBytes = "spark.vecruntime.arrow.maxBytes"
   def arrowMaxBytes(sparkConf: org.apache.spark.SparkConf): Long =
     org.apache.spark.network.util.JavaUtils.byteStringAsBytes(sparkConf.get(ArrowMaxBytes, "0").trim match {
