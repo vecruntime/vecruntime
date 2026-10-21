@@ -108,7 +108,11 @@ class VectorPlugin extends SparkPlugin {
         "nativePoolPeakBytes" -> (() => io.vecruntime.kernels.NativePool.shared().peakInUseBytes()),
         "nativePoolRetainedBytes" -> (() => io.vecruntime.kernels.NativePool.shared().retainedBytes()),
         "nativePoolOverdraftBytes" -> (() => org.apache.spark.sql.vecruntime.TaskNativeMemory.overdraftBytes),
-        "nativePoolLeakedBytes" -> (() => org.apache.spark.sql.vecruntime.TaskNativeMemory.leakedBytes)
+        "nativePoolLeakedBytes" -> (() => org.apache.spark.sql.vecruntime.TaskNativeMemory.leakedBytes),
+        // #915: the scan's read-ahead held in execution memory, its peak, and the grants the pool refused.
+        "scanReadAheadHeldBytes" -> (() => org.apache.spark.sql.vecruntime.VectorParquetScanExec.readAheadHeldBytes),
+        "scanReadAheadPeakBytes" -> (() => org.apache.spark.sql.vecruntime.VectorParquetScanExec.readAheadPeakBytes),
+        "scanReadAheadRefusals" -> (() => org.apache.spark.sql.vecruntime.VectorParquetScanExec.readAheadRefusals)
       ).foreach { case (name, read) =>
         ctx.metricRegistry().register(
           name,

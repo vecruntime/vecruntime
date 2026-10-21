@@ -50,6 +50,13 @@ private[vecruntime] final class DecodeAheadIterator(
   private final class Failure(val t: Throwable)
   private object End
 
+  /** A queued batch and the bytes held in execution memory for it (#915; 0 when it went in ungranted). */
+  private final class Held(val batch: OwnedBatch, val bytes: Long)
+
+  // #915: the decoded batches queued ahead held in the task's execution memory, in the mode Arrow memory is budgeted
+  // in, granted from free memory only. Refused, the producer waits for the queue to empty before it queues another.
+  private val memory = ReadAheadMemory(context, VectorSortIterator.memoryMode())
+
   private val queue = new ArrayBlockingQueue[AnyRef](math.max(1, depth))
   private val handBack = new Semaphore(0) // released when the consumer is done with a recycled batch
   @volatile private var stopping = false
@@ -105,8 +112,14 @@ private[vecruntime] final class DecodeAheadIterator(
       }
       first
     } else {
-      try queue.take()
-      catch {
+      try {
+        queue.take() match {
+          case h: Held =>
+            if (h.bytes > 0) memory.release(h.bytes)
+            h.batch
+          case other => other
+        }
+      } catch {
         case e: InterruptedException =>
           Thread.currentThread().interrupt()
           throw e
@@ -130,7 +143,8 @@ private[vecruntime] final class DecodeAheadIterator(
       if (waitFirst) handBack.acquire()
       while (!stopping && inner.hasNext) {
         val o = inner.nextOwned()
-        if (!offer(o)) { inner.releaseOwned(o); return }
+        val item = hold(o)
+        if (!offer(item)) { releaseItem(item); return }
         if (o.recycled) handBack.acquire()
       }
       if (!stopping) offer(End)
@@ -140,6 +154,23 @@ private[vecruntime] final class DecodeAheadIterator(
     } finally {
       if (context != null) TaskContext.unset()
     }
+  }
+
+  /**
+   * The batch as a queue item, its decoded bytes held in execution memory (#915). When the pool cannot grant them and
+   * batches are already queued, waits for the consumer to take them first: the window narrows to one batch ahead,
+   * which is always allowed (queued ungranted), never to none.
+   */
+  private def hold(o: OwnedBatch): AnyRef = {
+    if (memory == null || o.recycled) return o
+    val bytes = DecodeAheadIterator.decodedBytes(o)
+    if (bytes <= 0) return o
+    var granted = memory.tryHold(bytes)
+    while (!granted && !stopping && !queue.isEmpty) {
+      java.util.concurrent.locks.LockSupport.parkNanos(1000000L)
+      granted = memory.tryHold(bytes)
+    }
+    new Held(o, if (granted) bytes else 0L)
   }
 
   /** Puts `item` unless stopping; waits in short slices so a stop is noticed while the queue is full. */
@@ -162,6 +193,9 @@ private[vecruntime] final class DecodeAheadIterator(
   }
 
   private def releaseItem(item: AnyRef): Unit = item match {
+    case h: Held =>
+      if (h.bytes > 0) memory.release(h.bytes)
+      inner.releaseOwned(h.batch)
     case o: OwnedBatch => inner.releaseOwned(o)
     case _ =>
   }
@@ -199,4 +233,19 @@ object DecodeAheadIterator {
   /** Producers started in this JVM, and how many of them were virtual threads (read by tests). */
   val started = new java.util.concurrent.atomic.AtomicLong()
   val startedVirtual = new java.util.concurrent.atomic.AtomicLong()
+
+  /** A decoded batch's Arrow bytes, from its data vectors (a handle that is not an Arrow vector counts 0). */
+  private[vecruntime] def decodedBytes(o: VectorParquetPartitionReader.OwnedBatch): Long = {
+    if (o.vectors == null) return 0L
+    var sum = 0L
+    var c = 0
+    while (c < o.vectors.length) {
+      o.vectors(c) match {
+        case v: org.apache.arrow.vector.ValueVector => sum += v.getBufferSize
+        case _ =>
+      }
+      c += 1
+    }
+    sum
+  }
 }

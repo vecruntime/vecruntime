@@ -181,6 +181,7 @@ class DecodeAheadSuite extends VectorQuerySuite {
       ) ++ confs: _*
     )(withPlugin(enabled = true)(spark.sql(sql).collect().toSeq))
     assert(VectorParquetScanExec.prefetchInFlightBytes === 0, "read-ahead bytes were not given back")
+    assert(VectorParquetScanExec.readAheadHeldBytes === 0, "read-ahead execution memory was not given back (#915)")
     (rows, VectorParquetScanExec.prefetchPeakBytes)
   }
 

@@ -8,6 +8,11 @@ version may change configuration keys or defaults, always noted here.
 
 ### Added
 
+- The native Parquet scan's read-ahead in the task's memory budget (#915): the compressed pages read ahead and the
+  batches decode-ahead queues are held in Spark execution memory, granted only from free memory, so read-ahead
+  narrows its window when the operators above it need the pool instead of making them spill. The byte caps
+  (`prefetchMaxBytes`, `prefetchExecutorMaxBytes`) stay as the upper bound. Executor metrics
+  `scanReadAheadHeldBytes`, `scanReadAheadPeakBytes`, `scanReadAheadRefusals`.
 - Native pool accounting (#869, `spark.vecruntime.memory.poolAccounting.enabled`, on by default): every block a
   task takes from `NativePool` is held in that task's Spark execution memory through one account, which the sort's
   and the grace hash join's reservations share, so a block is counted once and an allocation no operator reserved
