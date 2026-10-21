@@ -73,7 +73,8 @@ final class AggregateSpill(
   def write(batch: ColumnarBatch): Unit = {
     val n = batch.numRows()
     if (n == 0) return
-    val arena = io.vecruntime.kernels.NativePool.shared().newArena() // #869: per batch written, so its blocks are reused
+    val arena =
+      io.vecruntime.kernels.NativePool.shared().newArena() // #869: per batch written, so its blocks are reused
     try {
       val buffers = Array.tabulate(batch.numCols()) { c =>
         val b = ColumnVectorAdapters.adapt(batch.column(c), n, arena)
