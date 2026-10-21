@@ -53,6 +53,9 @@ class VectorPositionDeleteWriteSuite extends AnyFunSuite with BeforeAndAfterAll 
       .config("spark.sql.catalog.ice.type", "hadoop")
       .config("spark.sql.catalog.ice.warehouse", warehouse.toString)
       .config("spark.sql.catalog.ice.cache-enabled", "false")
+      // The columnar exchange, so the clustering Iceberg asks of a delta write runs on batches.
+      .config("spark.shuffle.manager", "org.apache.spark.sql.vecruntime.shuffle.VectorShuffleManager")
+      .config("spark.vecruntime.shuffle.enabled", "true")
       .getOrCreate()
   }
 

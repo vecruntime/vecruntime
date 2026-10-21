@@ -52,6 +52,9 @@ class VectorDvWriteSuite extends AnyFunSuite with BeforeAndAfterAll {
       .config("spark.sql.catalog.ice.type", "hadoop")
       .config("spark.sql.catalog.ice.warehouse", warehouse.toString)
       .config("spark.sql.catalog.ice.cache-enabled", "false")
+      // The columnar exchange, so the clustering Iceberg asks of a delta write runs on batches.
+      .config("spark.shuffle.manager", "org.apache.spark.sql.vecruntime.shuffle.VectorShuffleManager")
+      .config("spark.vecruntime.shuffle.enabled", "true")
       .getOrCreate()
   }
 
@@ -384,6 +387,9 @@ class VectorDvWriteSuite extends AnyFunSuite with BeforeAndAfterAll {
   }
 
   test("UPDATE and MERGE on a v3 table with struct, array and map columns match Spark's writer") {
+    // These writes still read rows: Iceberg's own scan of a map column is row-based (the native read path,
+    // #901 R1, is a separate PR) and MergeRows has no map lane. Kept out of the suite-wide row-input count.
+    val rowInputBefore = org.apache.spark.sql.vecruntime.VectorWriteDeltaExec.rowInputWrites.get()
     val base = "ice.db.dv_nested"
     for (t <- Seq(s"${base}_on", s"${base}_off")) {
       spark.sql(s"DROP TABLE IF EXISTS $t")
@@ -433,6 +439,7 @@ class VectorDvWriteSuite extends AnyFunSuite with BeforeAndAfterAll {
       rOn.length == rOff.length && diff.isEmpty,
       s"nested contents or _row_id differ: ${rOn.length} vs ${rOff.length} rows; ${diff.mkString("; ")}"
     )
+    org.apache.spark.sql.vecruntime.VectorWriteDeltaExec.rowInputWrites.set(rowInputBefore)
   }
 
   test("MERGE with only a NOT MATCHED insert clause leaves no DVs and matches Spark's writer") {

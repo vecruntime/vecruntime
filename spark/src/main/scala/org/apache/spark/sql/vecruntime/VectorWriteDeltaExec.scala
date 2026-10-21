@@ -133,7 +133,10 @@ case class VectorWriteDeltaExec(
       data: VectorWriteDeltaExec.ColumnarData
   ): Seq[InternalRow] = {
     val (batches, fromRows) = VectorIcebergWriteExec.columnar(query)
-    if (fromRows) logInfo("vecruntime: the columnar delta write reads rows from its child (RowToColumnarExec)")
+    if (fromRows) {
+      VectorWriteDeltaExec.rowInputWrites.incrementAndGet()
+      logInfo("vecruntime: the columnar delta write reads rows from its child (RowToColumnarExec)")
+    }
     val hadoopConf = session.sparkContext.broadcast(
       new org.apache.spark.util.SerializableConfiguration(session.sessionState.newHadoopConf())
     )
@@ -189,6 +192,9 @@ object VectorWriteDeltaExec extends Logging {
 
   /** #901 M1: the tasks that wrote a data half columnar (read by tests). */
   val columnarDataTasks = new java.util.concurrent.atomic.AtomicLong()
+
+  /** Columnar delta writes whose child produced rows, converted by `RowToColumnarExec` (read by tests). */
+  val rowInputWrites = new java.util.concurrent.atomic.AtomicLong()
 
   /**
    * #901 M1: what the columnar task needs -- the data writer's spec (null for a delete-only write), whether the

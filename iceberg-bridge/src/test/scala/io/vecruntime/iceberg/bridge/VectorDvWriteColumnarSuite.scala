@@ -29,5 +29,8 @@ class VectorDvWriteColumnarSuite extends VectorDvWriteSuite {
 
   test("the data half of the UPDATEs and MERGEs above ran on the columnar data writer") {
     assert(VectorWriteDeltaExec.columnarDataTasks.get() > 0, "no task wrote its data half columnar")
+    info(s"delta writes whose child produced rows: ${VectorWriteDeltaExec.rowInputWrites.get()}")
+    // With the columnar exchange, the UPDATE's Expand (carrying `_partition`) and the MERGE's rows stay batches.
+    assert(VectorWriteDeltaExec.rowInputWrites.get() == 0, "a delta write read rows through RowToColumnarExec")
   }
 }
