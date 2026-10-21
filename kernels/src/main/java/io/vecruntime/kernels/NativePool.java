@@ -24,6 +24,7 @@ import java.lang.invoke.MethodHandle;
 import java.util.ArrayList;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.LongAdder;
 import java.util.function.Supplier;
 
 /**
@@ -118,11 +119,30 @@ public final class NativePool {
     @SuppressWarnings({"unchecked", "rawtypes"})
     private final ConcurrentLinkedQueue<Block>[] free = new ConcurrentLinkedQueue[CLASSES];
 
-    private final AtomicLong inUse = new AtomicLong();
+    /**
+     * #869 step 4: classes up to 1 MiB (0..4) also have a small per-thread
+     * cache in front of their shared free list, so the batch-sized buffers 15
+     * task threads take and release every few microseconds do not all meet on
+     * one queue head; counters are striped for the same reason. A cached block
+     * counts as retained.
+     */
+    static final int CACHED_CLASSES = 5;
+
+    static final int CACHE_DEPTH = 4;
+
+    private static final class ThreadCache {
+        final Block[][] blocks = new Block[CACHED_CLASSES][CACHE_DEPTH];
+        final int[] count = new int[CACHED_CLASSES];
+    }
+
+    private final ThreadLocal<ThreadCache> cache = ThreadLocal.withInitial(ThreadCache::new);
+
+    private final LongAdder inUse = new LongAdder();
     private final AtomicLong peakInUse = new AtomicLong();
     private final AtomicLong retained = new AtomicLong();
-    private final AtomicLong mallocs = new AtomicLong();
-    private final AtomicLong reuses = new AtomicLong();
+    private final LongAdder cached = new LongAdder();
+    private final LongAdder mallocs = new LongAdder();
+    private final LongAdder reuses = new LongAdder();
     private final long retainLimit;
     private final boolean poison;
 
@@ -190,7 +210,7 @@ public final class NativePool {
 
     /** Bytes handed out and not yet released, rounded to their classes. */
     public long inUseBytes() {
-        return inUse.get();
+        return inUse.sum();
     }
 
     /** The highest {@link #inUseBytes()} so far. */
@@ -198,9 +218,12 @@ public final class NativePool {
         return peakInUse.get();
     }
 
-    /** Bytes of released blocks the pool keeps for reuse. */
+    /**
+     * Bytes of released blocks the pool keeps for reuse, per-thread caches
+     * included.
+     */
     public long retainedBytes() {
-        return retained.get();
+        return retained.get() + cached.sum();
     }
 
     /** Most bytes of released blocks kept for reuse. */
@@ -210,16 +233,28 @@ public final class NativePool {
 
     /** Blocks that came from {@code malloc}. */
     public long mallocCount() {
-        return mallocs.get();
+        return mallocs.sum();
     }
 
     /** Blocks served from a free list. */
     public long reuseCount() {
-        return reuses.get();
+        return reuses.sum();
     }
 
-    /** Frees every retained block. */
+    /**
+     * Frees every retained block: the shared lists' and the calling thread's
+     * cache.
+     */
     public void trim() {
+        ThreadCache tc = cache.get();
+        for (int c = 0; c < CACHED_CLASSES; c++) {
+            while (tc.count[c] > 0) {
+                Block b = tc.blocks[c][--tc.count[c]];
+                tc.blocks[c][tc.count[c]] = null;
+                cached.add(-b.size);
+                freeRaw(b.raw);
+            }
+        }
         for (ConcurrentLinkedQueue<Block> q : free) {
             Block b;
             while ((b = q.poll()) != null) {
@@ -255,30 +290,57 @@ public final class NativePool {
      */
     Block take(long size, boolean zero) {
         int c = size < MIN_CLASS ? -1 : classOf(size);
-        Block b = c < 0 ? null : free[c].poll();
-        if (b != null) {
-            retained.addAndGet(-b.size);
-            reuses.incrementAndGet();
-        } else {
+        Block b = null;
+        if (c >= 0 && c < CACHED_CLASSES) {
+            ThreadCache tc = cache.get();
+            if (tc.count[c] > 0) {
+                b = tc.blocks[c][--tc.count[c]];
+                tc.blocks[c][tc.count[c]] = null;
+                cached.add(-b.size);
+                reuses.increment();
+            }
+        }
+        if (b == null && c >= 0) {
+            b = free[c].poll();
+            if (b != null) {
+                retained.addAndGet(-b.size);
+                reuses.increment();
+            }
+        }
+        if (b == null) {
             long blockSize = c < 0 ? Math.max(size, 1) : MIN_CLASS << c;
             b = new Block(mallocRaw(blockSize + ALIGN - 1), blockSize, c);
-            mallocs.incrementAndGet();
+            mallocs.increment();
         }
         if (zero) {
             b.segment.asSlice(0, size).fill((byte) 0);
         }
-        long now = inUse.addAndGet(b.size);
-        peakInUse.accumulateAndGet(now, Math::max);
+        inUse.add(b.size);
+        long now = inUse.sum();
+        if (now > peakInUse.get()) {
+            peakInUse.accumulateAndGet(now, Math::max);
+        }
         return b;
     }
 
-    /** Takes {@code b} back: onto its free list, or to {@code free}. */
+    /**
+     * Takes {@code b} back: into this thread's cache, onto its free list, or to
+     * {@code free}.
+     */
     void release(Block b) {
-        inUse.addAndGet(-b.size);
+        inUse.add(-b.size);
         if (poison) {
             b.segment.fill(POISON);
         }
-        if (b.cls >= 0 && retained.addAndGet(b.size) <= retainLimit) {
+        if (b.cls >= 0 && b.cls < CACHED_CLASSES && retainedBytes() + b.size <= retainLimit) {
+            ThreadCache tc = cache.get();
+            if (tc.count[b.cls] < CACHE_DEPTH) {
+                tc.blocks[b.cls][tc.count[b.cls]++] = b;
+                cached.add(b.size);
+                return;
+            }
+        }
+        if (b.cls >= 0 && retained.addAndGet(b.size) + cached.sum() <= retainLimit) {
             free[b.cls].offer(b);
             return;
         }
