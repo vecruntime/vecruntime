@@ -640,9 +640,18 @@ object BuildTable {
     c
   }
 
+  /**
+   * #869: a build table's scratch arena. A task's own table takes its blocks from the [[NativePool]]: no
+   * shared-arena close (a handshake with every JVM thread) per table, and the blocks are reused by the
+   * next one. A shared (broadcast) table keeps `Arena.ofShared()`: every task of the executor reads it and
+   * its cleaner frees it, so a read after release must fail rather than see a reused block.
+   */
+  private[vecruntime] def buildArena(shared: Boolean): Arena =
+    if (shared) Arena.ofShared() else io.vecruntime.kernels.NativePool.shared().newArena()
+
   /** The build side from columnar batches (shuffled hash join; a columnar broadcast, shared). */
   def fromBatches(batches: Iterator[ColumnarBatch], spec: JoinSpec, shared: Boolean = false): BuildTable = {
-    val arena = Arena.ofShared()
+    val arena = buildArena(shared)
     // Owning builders: a grown-out buffer is released at once, not with the arena (#416). A payload
     // column without a lane goes to a row store instead (#547), read through the batch's rows.
     val types = spec.buildTypes
@@ -699,7 +708,7 @@ object BuildTable {
    * `InternalRow` getters into typed arrays, then laid out as columns.
    */
   def fromRelation(rows: Iterator[InternalRow], spec: JoinSpec, shared: Boolean = false): BuildTable = {
-    val arena = Arena.ofShared()
+    val arena = buildArena(shared)
     val types = spec.buildTypes
     // A payload column without a lane (#547) is copied out of the row into a row store.
     val payload = payloadColumns(types)

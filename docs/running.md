@@ -127,6 +127,26 @@ where Arrow on Netty needed about 10 GB, at the same speed, and 4 GB was not. Th
 Arrow Java's FFM allocation manager ([apache/arrow-java#1334](https://github.com/apache/arrow-java/pull/1334))
 will replace it, with `-Darrow.allocation.manager.type=FFM`, once released.
 
+**Sizing an executor.** Spark's default `spark.executor.memoryOverhead` is 10 % of the heap (at least
+384 MB), about 2 GB for a 20 GB heap. That is far too little here: the overhead must hold the direct-memory
+cap plus what the JVM and the C allocator need outside the heap (metaspace, thread stacks, code cache, GC
+structures, glibc's arenas), about 4 GB on a 15-core executor. The off-heap pool, `spark.memory.offHeap.size`,
+is separate: Spark adds it to the container on top of the heap and the overhead. A 64 GB node
+(m8gd.4xlarge, 58.8 GiB allocatable) at 10 TB:
+
+| setting | value |
+|---|---|
+| `spark.executor.memory` (heap) | 20 GB |
+| `-XX:MaxDirectMemorySize` | 6 GB, with Arrow on `arrow-memory-unsafe` (10 GB on Netty) |
+| `spark.executor.memoryOverhead` | 10 GB: the direct cap plus about 4 GB |
+| `spark.memory.offHeap.size` | the rest of the node: allocatable less heap, overhead and ~512 MB for daemonsets |
+
+On 11 such executors this passes the 99 TPC-DS queries at 10 TB in 2,893 s, against 2,806 s for 14 GB
+overhead and a 10 GB direct cap with Arrow on Netty, with GC time down 45 % (#840). Below a 6 GB direct cap
+the Flight transport's own buffers run out; a fixed 4 MiB HTTP/2 window
+(`spark.vecruntime.shuffle.flight.clientWindow=4m`) fits 4 GB at about 10 % more time on the heaviest
+shuffles (#897).
+
 **On-heap: the tables.** The grouped aggregate's key table and accumulators, and a hash join's build
 table and its heap mirrors, are Java arrays on the heap. The aggregate registers with Spark's task
 memory manager and asks for its real footprint as its table grows (#367), so it lives inside the

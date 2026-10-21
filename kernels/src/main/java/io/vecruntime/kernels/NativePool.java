@@ -24,6 +24,7 @@ import java.lang.invoke.MethodHandle;
 import java.util.ArrayList;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Supplier;
 
 /**
  * #869: a process-wide pool of native blocks in power-of-two size classes, and
@@ -89,6 +90,31 @@ public final class NativePool {
         return SHARED;
     }
 
+    /**
+     * #869 step 3b: where an owner's blocks are counted besides the pool's own
+     * totals -- in Spark, the task's execution memory. {@link #charge} is called
+     * after a block is handed out and {@link #credit} after it comes back, with
+     * the block's class size, on whichever thread allocates or closes.
+     */
+    public interface Account {
+        /** {@code bytes} more held by this account's owners. */
+        void charge(long bytes);
+
+        /** {@code bytes} given back. */
+        void credit(long bytes);
+    }
+
+    private static volatile Supplier<Account> accountSource = () -> null;
+
+    /**
+     * The account a new {@link #newArena() arena} charges, looked up on the
+     * thread that opens it (null for none). One process-wide source; the
+     * default charges nothing.
+     */
+    public static void setAccountSource(Supplier<Account> source) {
+        accountSource = source == null ? () -> null : source;
+    }
+
     @SuppressWarnings({"unchecked", "rawtypes"})
     private final ConcurrentLinkedQueue<Block>[] free = new ConcurrentLinkedQueue[CLASSES];
 
@@ -120,7 +146,7 @@ public final class NativePool {
      * close.
      */
     public Arena newArena() {
-        return new PooledArena(this);
+        return new PooledArena(this, accountSource.get());
     }
 
     /** Bytes handed out and not yet released, rounded to their classes. */
@@ -256,11 +282,22 @@ public final class NativePool {
     /** An owner of pool blocks; {@link #close()} gives them back. Not thread-safe. */
     static final class PooledArena implements Arena {
         private final NativePool pool;
+        private final Account account;
         private final ArrayList<Block> blocks = new ArrayList<>(2);
         private boolean closed;
 
-        PooledArena(NativePool pool) {
+        PooledArena(NativePool pool, Account account) {
             this.pool = pool;
+            this.account = account;
+        }
+
+        private Block takeCounted(long size) {
+            Block b = pool.take(size);
+            blocks.add(b);
+            if (account != null) {
+                account.charge(b.size);
+            }
+            return b;
         }
 
         @Override
@@ -273,13 +310,11 @@ public final class NativePool {
             }
             if (byteAlignment > ALIGN) {
                 // Rare (no Arrow buffer asks for more than 64): over-allocate inside one block.
-                Block b = pool.take(byteSize + byteAlignment - 1);
-                blocks.add(b);
+                Block b = takeCounted(byteSize + byteAlignment - 1);
                 long start = (b.segment.address() + byteAlignment - 1) & -byteAlignment;
                 return b.segment.asSlice(start - b.segment.address(), byteSize);
             }
-            Block b = pool.take(byteSize);
-            blocks.add(b);
+            Block b = takeCounted(byteSize);
             return b.segment.asSlice(0, byteSize);
         }
 
@@ -294,10 +329,15 @@ public final class NativePool {
                 return;
             }
             closed = true;
+            long bytes = 0;
             for (Block b : blocks) {
+                bytes += b.size;
                 pool.release(b);
             }
             blocks.clear();
+            if (account != null && bytes > 0) {
+                account.credit(bytes);
+            }
         }
     }
 }

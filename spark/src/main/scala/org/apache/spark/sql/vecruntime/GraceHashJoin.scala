@@ -78,19 +78,20 @@ object GraceHashJoin extends Logging {
     // other consumers can be made to spill around it.
     if (!spec.buildTypes.forall(TypeMapping.hasLane)) {
       val table = BuildTable.fromBatches(buildIter, spec)
-      new BuildMemory(memoryMode).hold(table.nativeBytes)
+      new BuildMemory(memoryMode, pooled = true).hold(table.nativeBytes)
       return new VectorHashJoinIterator(streamIter, table, spec, metrics)
     }
     // A key type the bucket hash has no lane for (float, binary...): the build side stays in memory.
     val canSpill =
       budgetBytes > 0 && budgetBytes < Long.MaxValue && buckets >= 2 && AggregateSpill.supportsKeys(keyTypes.toSeq)
 
-    val arena = Arena.ofShared() // the table's scratch; the columns live in the builders
+    val arena =
+      io.vecruntime.kernels.NativePool.shared().newArena() // #869: the table's scratch, pooled; the columns live in the builders
     val builders = spec.buildTypes.map(dt => ColumnBuilder.owning(TypeMapping.vecTypeOf(dt), 4096))
     // #868: the build side's bytes come from Spark's execution memory (the sort's pool: off-heap when Spark
     // has one). Held before every append; a refusal starts the bucketing as the budget does. A build side
     // that cannot bucket is still counted, so the pool can make the task's other consumers spill.
-    val memory = new BuildMemory(memoryMode)
+    val memory = new BuildMemory(memoryMode, pooled = true)
     var total = 0
     // The batch that would have grown the builders past the budget: not appended, bucketed first below.
     var overflowBatch: ColumnarBatch = null
@@ -138,7 +139,8 @@ object GraceHashJoin extends Logging {
     var from = 0
     while (from < total) {
       val to = math.min(total, from + SpillChunkRows)
-      val scratch = Arena.ofConfined()
+      val scratch =
+        io.vecruntime.kernels.NativePool.shared().newArena() // #869: per chunk, so its blocks are reused chunk to chunk
       try {
         val slice = views.map(v => plain(v.slice(from, to), scratch))
         val ctx = new EvalContext(scratch, to - from, c => slice(c))
@@ -280,34 +282,35 @@ object PinnedMemory {
 }
 
 private[vecruntime] final class BuildMemory(
-    mode: org.apache.spark.memory.MemoryMode = VectorSortIterator.memoryMode()
+    mode: org.apache.spark.memory.MemoryMode = VectorSortIterator.memoryMode(),
+    pooled: Boolean = false
 ) {
-  private val consumer: org.apache.spark.memory.MemoryConsumer =
-    Option(org.apache.spark.TaskContext.get()).flatMap(tc => Option(tc.taskMemoryManager())).map { tmm =>
-      new org.apache.spark.memory.MemoryConsumer(tmm, tmm.pageSizeBytes(), mode) {
-        override def spill(size: Long, trigger: org.apache.spark.memory.MemoryConsumer): Long = 0L
-      }
-    }.orNull
+  // #869: bytes that are the task's own NativePool blocks (a join build's owning builders) reserve through the task's
+  // account when the pool's accounting is on, so the blocks they then take are not counted again. Anything else (Arrow
+  // vectors, heap mirrors) keeps a consumer of its own: those bytes are not the pool's.
+  private val reservation: TaskNativeMemory.Reservation =
+    if (pooled) TaskNativeMemory.reservation(mode, _ => 0L)
+    else TaskNativeMemory.ownReservation(mode, _ => 0L)
   private var held = 0L
-  if (consumer != null) org.apache.spark.TaskContext.get().addTaskCompletionListener[Unit](_ => releaseTo(0L))
+  if (reservation != null) org.apache.spark.TaskContext.get().addTaskCompletionListener[Unit](_ => releaseTo(0L))
 
   /** The bytes currently held. */
   def bytes: Long = held
 
   def hold(bytes: Long): Boolean = {
-    if (consumer == null || bytes <= held) return true
-    val got = consumer.acquireMemory(bytes - held)
-    held += got
+    if (reservation == null || bytes <= held) return true
+    reservation.hold(bytes)
+    val got = reservation.held - held
+    held = reservation.held
     PinnedMemory.add(got)
     held >= bytes
   }
 
   def releaseTo(bytes: Long): Unit =
-    if (consumer != null && held > bytes) {
-      val freed = held - math.max(0L, bytes)
-      consumer.freeMemory(freed)
-      PinnedMemory.add(-freed)
-      held = math.max(0L, bytes)
+    if (reservation != null && held > bytes) {
+      reservation.releaseTo(bytes)
+      PinnedMemory.add(reservation.held - held)
+      held = reservation.held
     }
 
   /**
