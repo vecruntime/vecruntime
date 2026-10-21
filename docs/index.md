@@ -100,6 +100,9 @@ Version 0.0.9, a preview release under the Apache License 2.0. The plugin runs t
   the same run on arm64 nodes (Neoverse V2, SVE2), set against the x86 run.
 - [VecRuntime vs Gluten + Velox vs DataFusion Comet on TPC-DS 3 TB, AWS Graviton4](benchmarks/tpcds-3tb-graviton.html) --
   the awslabs data-on-eks 3 TB benchmark's data, nodes and executor layout, against its published Gluten and Comet results.
+- [VecRuntime on TPC-DS 10 TB, AWS Graviton4](benchmarks/tpcds-10tb-graviton.html) --
+  the 99 queries on 11 x m8gd.4xlarge, two passes, per-query charts, set against the totals other engines publish for the
+  same instance type and count.
 - [Iceberg merge-on-read: VecRuntime vs Apache Spark](benchmarks/iceberg-mor.html) -- the v2
   delete-file and v3 deletion-vector merge cost at TPC-H SF1, against OSS Spark.
 

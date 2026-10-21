@@ -1,0 +1,103 @@
+---
+layout: default
+title: "VecRuntime on TPC-DS 10 TB, AWS Graviton4 (11 x m8gd.4xlarge)"
+---
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+/* Benchmark-page components. Scoped under .bench so they never restyle the site
+   shell; colours come from the site theme variables (light/dark toggle works). */
+.doc:has(.bench) { max-width: none; }
+.bench .lede { color: var(--muted); }
+.bench .cards { display:grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 14px; margin: 1em 0; }
+.bench .card { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; }
+.bench .card .n { font-size: 1.7rem; font-weight: 700; } .bench .card .l { color: var(--muted); font-size: .9rem; }
+.bench table td:nth-child(n+2) { font-variant-numeric: tabular-nums; }
+.bench table.kv td:first-child { font-weight: 600; white-space: nowrap; }
+.bench .chart { position: relative; height: 340px; margin: 1em 0 2em; } .bench .chart.tall { height: 420px; }
+.bench .two { display:grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 24px; } .bench .two > * { min-width: 0; } @media (max-width: 860px) { .bench .two { grid-template-columns: minmax(0, 1fr); } }
+.bench details summary { cursor: pointer; font-weight: 600; margin: 1em 0; }
+.bench .foot { color: var(--muted); font-size: .85rem; margin-top: 3em; }
+</style>
+<div class="bench">
+<h1>VecRuntime on TPC-DS 10 TB, AWS Graviton4 (11 x m8gd.4xlarge)</h1>
+<p class="lede"><a href="https://github.com/vecruntime/vecruntime">VecRuntime</a> runs Spark SQL's filters, projections, aggregates, sorts and joins on Arrow-layout
+batches with the Java Vector API -- on the JVM, no native code -- and moves batches between executors over its own Arrow Flight shuffle.
+This page is its TPC-DS 10 TB run on eleven Graviton4 nodes, set against the totals <a href="https://quanton.dev/benchmarks/#tpc-ds">quanton.dev/benchmarks (Onehouse), read 2026-10-21</a>
+publishes for other engines on the same instance type and count.</p>
+
+<div class="cards">
+<div class="card"><div class="l">VecRuntime, 99 queries</div><div class="n">2,430 s</div><div class="l">10 TB · 11 x m8gd.4xlarge</div></div>
+<div class="card"><div class="l">vs OSS Apache Spark (published)</div><div class="n">5.0x</div><div class="l">12,200 s against 2,430 s</div></div>
+<div class="card"><div class="l">Second pass / first pass</div><div class="n">2,430 / 2,449 s</div><div class="l">0.8% apart</div></div>
+</div>
+
+<h2 id="summary">Total runtime</h2>
+<p>Lower is better. The grey bars are published totals, not re-run here (see the notes); VecRuntime's is this page's run.</p>
+<div class="chart"><canvas id="totals"></canvas></div>
+<table class=""><thead><tr><th>Engine</th><th>Total (s)</th><th>Its time / VecRuntime&#x27;s</th><th>Source</th></tr></thead><tbody><tr><td>OSS Apache Spark</td><td>12,200</td><td>5.02x</td><td>published</td></tr><tr><td>DataFusion Comet (tuned)</td><td>9,122</td><td>3.75x</td><td>published</td></tr><tr><td>Gluten + Velox (tuned)</td><td>8,563</td><td>3.52x</td><td>published</td></tr><tr><td>Databricks Photon 18.2</td><td>2,550</td><td>1.05x</td><td>published</td></tr><tr><td><b>VecRuntime</b></td><td><b>2,430</b></td><td></td><td>this page</td></tr><tr><td>Quanton v0.43.0</td><td>2,034</td><td>0.84x</td><td>published</td></tr></tbody></table>
+<p class="lede">Totals as published on quanton.dev: the Quanton v0.43.0 suite total, and the other engines from the Quanton storage-aware Spark benchmark deck. Comet and Gluten are tuned configurations (their out-of-the-box runs failed with out-of-memory errors on Q67 and Q93). Not re-run here; per-query times are not published.</p>
+
+<h2 id="where">Where the time goes</h2>
+<div class="two">
+<div><p>The ten longest queries:</p><table class=""><thead><tr><th>Query</th><th>Seconds</th><th>Share of total</th></tr></thead><tbody><tr><td>q23</td><td>207.3</td><td>8.5%</td></tr><tr><td>q24</td><td>196.0</td><td>8.1%</td></tr><tr><td>q14</td><td>156.5</td><td>6.4%</td></tr><tr><td>q78</td><td>154.9</td><td>6.4%</td></tr><tr><td>q67</td><td>151.2</td><td>6.2%</td></tr><tr><td>q28</td><td>109.1</td><td>4.5%</td></tr><tr><td>q93</td><td>93.8</td><td>3.9%</td></tr><tr><td>q64</td><td>77.8</td><td>3.2%</td></tr><tr><td>q4</td><td>73.5</td><td>3.0%</td></tr><tr><td>q50</td><td>62.9</td><td>2.6%</td></tr></tbody></table></div>
+<div><p>Across the 99 queries:</p><table class="kv"><thead><tr><th>Measure</th><th>Value</th></tr></thead><tbody><tr><td>Executor time</td><td>101.9 h</td></tr><tr><td>GC time</td><td>0.81 h</td></tr><tr><td>Spill</td><td>942 GiB</td></tr><tr><td>Shuffle written</td><td>2.23 TiB</td></tr></tbody></table></div>
+</div>
+
+<h2 id="results">Per query</h2>
+<p>Seconds per query, both passes (hover for values).</p>
+<div class="chart tall"><canvas id="perquery1"></canvas></div>
+<div class="chart tall"><canvas id="perquery2"></canvas></div>
+<div class="chart tall"><canvas id="perquery3"></canvas></div>
+
+<h2 id="infrastructure">Benchmark infrastructure</h2>
+<p><b>Methodology.</b> Two full passes of the 99 queries, one after the other, each with the cluster to itself and all 11 executors up (checked before the first query). Each query ran once after its plan was compiled; its time is the wall-clock of its execution as the runner measures it, and the total is the sum over the queries. The page shows pass 2 and, per query, pass 1 next to it.</p>
+<h3>Test environment</h3>
+<table class="kv"><thead><tr><th>Component</th><th>Configuration</th></tr></thead><tbody><tr><td>Dataset</td><td>TPC-DS scale factor 10000 (10 TB), Parquet on Amazon S3; the 99 queries (q14, q23, q24 and q39 as the sums of their a and b parts)</td></tr><tr><td>Cluster</td><td>Amazon EKS; 11 x m8gd.4xlarge executor nodes (16 vCPU AWS Graviton4, 64 GB, local NVMe for shuffle and spill), one executor per node; the driver on a separate c8g.xlarge node</td></tr><tr><td>Executors</td><td>11 executors x 15 cores; 20 GB heap + 10 GB overhead + 28,928 MB off-heap (spark.memory.offHeap.size), 6 GB direct memory; G1; driver 3 cores x 4 GB</td></tr><tr><td>Storage</td><td>Amazon S3 through Hadoop S3A; VecRuntime&#x27;s native Parquet scan (VectorParquetScanExec)</td></tr></tbody></table>
+<h3>Versions</h3>
+<table class="kv"><thead><tr><th>Component</th><th>Version</th></tr></thead><tbody><tr><td>VecRuntime</td><td>PR #911&#x27;s head 60c645c2, merged as main e74d0be5 (2026-10-21): DistinctBelowSemiJoin for semi and anti joins (#906, #907), operator arenas on the native pool (#909), pool accounting (#911); arm64 image</td></tr><tr><td>Spark (VecRuntime)</td><td>4.1.3, Scala 2.13, Amazon Corretto 25.0.4.1</td></tr></tbody></table>
+<h3>VecRuntime configuration</h3>
+<pre>spark.plugins=io.vecruntime.spark.VectorPlugin
+spark.shuffle.manager=org.apache.spark.sql.vecruntime.shuffle.VectorShuffleManager
+spark.sql.shuffle.partitions=1500, spark.sql.adaptive.enabled=true (coalescing on)
+spark.memory.offHeap.enabled=true, spark.memory.offHeap.size=28928m
+spark.vecruntime.exec.strictFloatingPoint=false, spark.vecruntime.exec.sortMergeJoin.enabled=true
+spark.vecruntime.memory.poolAccounting.enabled=true (the default)
+Executors: G1, -XX:MaxDirectMemorySize=6g, Arrow on its Unsafe allocation manager; glibc malloc defaults (no MALLOC_ARENA_MAX, no MALLOC_MMAP_THRESHOLD_)
+--add-modules=jdk.incubator.vector --enable-native-access=ALL-UNNAMED (driver and executors)</pre>
+<h3>Notes</h3>
+<ul><li>The other engines&#x27; totals are the ones quanton.dev publishes for TPC-DS 10 TB on 11 x m8gd.4xlarge; they were not re-run here, and only their totals are published, so the comparison is of totals only.</li><li>Their setups are not documented to the level of this page (dataset generation and table format, Spark versions, executor layout, whether the driver is one of the 11 nodes). Treat the cross-engine bars as indicative, not as a controlled comparison.</li><li>VecRuntime needs Spark 4.1+ and JDK 25.</li><li>A third pass at 600 shuffle partitions took 2,520 s (1,500 partitions stays the setting); the same configuration before #909 and #911, with MALLOC_ARENA_MAX=2 and MALLOC_MMAP_THRESHOLD_=131072, took 2,618 s. See issue #869.</li><li>q18 and q68 end in LIMIT 100 over rows with tied sort keys, so their checksums can differ between runs and engines; every other query&#x27;s result is the same in both passes.</li></ul>
+
+<h2 id="table">All queries</h2>
+<details><summary>Seconds per query</summary>
+<table class="all"><thead><tr><th>Query</th><th>Pass 2 (s)</th><th>Pass 1 (s)</th><th>Difference</th></tr></thead><tbody><tr><td>q1</td><td>8.1</td><td>8.1</td><td>-0.0</td></tr><tr><td>q2</td><td>12.9</td><td>12.8</td><td>-0.1</td></tr><tr><td>q3</td><td>5.9</td><td>6.0</td><td>+0.1</td></tr><tr><td>q4</td><td>73.5</td><td>73.0</td><td>-0.5</td></tr><tr><td>q5</td><td>17.9</td><td>18.0</td><td>+0.1</td></tr><tr><td>q6</td><td>3.0</td><td>2.9</td><td>-0.0</td></tr><tr><td>q7</td><td>11.9</td><td>11.6</td><td>-0.3</td></tr><tr><td>q8</td><td>4.2</td><td>3.5</td><td>-0.7</td></tr><tr><td>q9</td><td>53.2</td><td>52.3</td><td>-0.9</td></tr><tr><td>q10</td><td>4.2</td><td>4.3</td><td>+0.1</td></tr><tr><td>q11</td><td>30.3</td><td>30.3</td><td>+0.0</td></tr><tr><td>q12</td><td>2.8</td><td>2.7</td><td>-0.0</td></tr><tr><td>q13</td><td>14.7</td><td>13.6</td><td>-1.1</td></tr><tr><td>q14</td><td>156.5</td><td>153.5</td><td>-3.1</td></tr><tr><td>q15</td><td>3.7</td><td>4.0</td><td>+0.3</td></tr><tr><td>q16</td><td>51.1</td><td>49.8</td><td>-1.4</td></tr><tr><td>q17</td><td>10.3</td><td>9.5</td><td>-0.8</td></tr><tr><td>q18</td><td>12.9</td><td>13.1</td><td>+0.1</td></tr><tr><td>q19</td><td>4.0</td><td>3.8</td><td>-0.1</td></tr><tr><td>q20</td><td>2.5</td><td>2.4</td><td>-0.1</td></tr><tr><td>q21</td><td>1.6</td><td>1.6</td><td>-0.0</td></tr><tr><td>q22</td><td>4.3</td><td>4.4</td><td>+0.1</td></tr><tr><td>q23</td><td>207.3</td><td>201.0</td><td>-6.4</td></tr><tr><td>q24</td><td>196.0</td><td>196.0</td><td>+0.0</td></tr><tr><td>q25</td><td>8.1</td><td>8.1</td><td>+0.0</td></tr><tr><td>q26</td><td>7.1</td><td>6.5</td><td>-0.6</td></tr><tr><td>q27</td><td>10.7</td><td>9.9</td><td>-0.8</td></tr><tr><td>q28</td><td>109.1</td><td>112.7</td><td>+3.6</td></tr><tr><td>q29</td><td>22.1</td><td>22.5</td><td>+0.3</td></tr><tr><td>q30</td><td>6.7</td><td>7.3</td><td>+0.7</td></tr><tr><td>q31</td><td>6.8</td><td>6.7</td><td>-0.1</td></tr><tr><td>q32</td><td>1.6</td><td>1.9</td><td>+0.3</td></tr><tr><td>q33</td><td>3.6</td><td>3.2</td><td>-0.4</td></tr><tr><td>q34</td><td>5.4</td><td>5.3</td><td>-0.1</td></tr><tr><td>q35</td><td>9.6</td><td>9.5</td><td>-0.1</td></tr><tr><td>q36</td><td>8.2</td><td>7.7</td><td>-0.5</td></tr><tr><td>q37</td><td>16.5</td><td>16.1</td><td>-0.4</td></tr><tr><td>q38</td><td>34.0</td><td>34.3</td><td>+0.3</td></tr><tr><td>q39</td><td>8.1</td><td>8.3</td><td>+0.1</td></tr><tr><td>q40</td><td>5.6</td><td>5.7</td><td>+0.1</td></tr><tr><td>q41</td><td>0.6</td><td>0.6</td><td>+0.0</td></tr><tr><td>q42</td><td>1.6</td><td>1.9</td><td>+0.3</td></tr><tr><td>q43</td><td>6.5</td><td>6.6</td><td>+0.1</td></tr><tr><td>q44</td><td>59.0</td><td>59.2</td><td>+0.2</td></tr><tr><td>q45</td><td>3.2</td><td>3.2</td><td>+0.0</td></tr><tr><td>q46</td><td>7.4</td><td>7.2</td><td>-0.2</td></tr><tr><td>q47</td><td>23.8</td><td>23.7</td><td>-0.0</td></tr><tr><td>q48</td><td>10.6</td><td>11.0</td><td>+0.4</td></tr><tr><td>q49</td><td>15.4</td><td>15.8</td><td>+0.4</td></tr><tr><td>q50</td><td>62.9</td><td>64.2</td><td>+1.3</td></tr><tr><td>q51</td><td>12.7</td><td>12.8</td><td>+0.1</td></tr><tr><td>q52</td><td>1.8</td><td>1.8</td><td>+0.0</td></tr><tr><td>q53</td><td>6.6</td><td>6.6</td><td>+0.1</td></tr><tr><td>q54</td><td>5.2</td><td>5.5</td><td>+0.3</td></tr><tr><td>q55</td><td>1.8</td><td>2.0</td><td>+0.2</td></tr><tr><td>q56</td><td>2.7</td><td>2.6</td><td>-0.1</td></tr><tr><td>q57</td><td>15.7</td><td>15.8</td><td>+0.0</td></tr><tr><td>q58</td><td>3.3</td><td>3.1</td><td>-0.3</td></tr><tr><td>q59</td><td>13.7</td><td>13.9</td><td>+0.2</td></tr><tr><td>q60</td><td>3.9</td><td>3.9</td><td>-0.0</td></tr><tr><td>q61</td><td>3.3</td><td>3.6</td><td>+0.3</td></tr><tr><td>q62</td><td>9.1</td><td>25.2</td><td>+16.2</td></tr><tr><td>q63</td><td>6.7</td><td>6.8</td><td>+0.1</td></tr><tr><td>q64</td><td>77.8</td><td>76.6</td><td>-1.2</td></tr><tr><td>q65</td><td>32.5</td><td>32.5</td><td>+0.0</td></tr><tr><td>q66</td><td>9.1</td><td>8.9</td><td>-0.2</td></tr><tr><td>q67</td><td>151.2</td><td>157.3</td><td>+6.1</td></tr><tr><td>q68</td><td>3.4</td><td>3.7</td><td>+0.3</td></tr><tr><td>q69</td><td>3.4</td><td>3.4</td><td>-0.1</td></tr><tr><td>q70</td><td>10.5</td><td>10.5</td><td>-0.1</td></tr><tr><td>q71</td><td>4.2</td><td>4.7</td><td>+0.5</td></tr><tr><td>q72</td><td>24.2</td><td>24.1</td><td>-0.0</td></tr><tr><td>q73</td><td>2.6</td><td>2.6</td><td>+0.0</td></tr><tr><td>q74</td><td>24.3</td><td>24.7</td><td>+0.3</td></tr><tr><td>q75</td><td>60.9</td><td>62.1</td><td>+1.1</td></tr><tr><td>q76</td><td>51.0</td><td>52.2</td><td>+1.2</td></tr><tr><td>q77</td><td>3.0</td><td>3.1</td><td>+0.0</td></tr><tr><td>q78</td><td>154.9</td><td>159.5</td><td>+4.6</td></tr><tr><td>q79</td><td>7.0</td><td>7.0</td><td>+0.0</td></tr><tr><td>q80</td><td>22.3</td><td>22.5</td><td>+0.2</td></tr><tr><td>q81</td><td>6.3</td><td>6.6</td><td>+0.3</td></tr><tr><td>q82</td><td>24.6</td><td>23.7</td><td>-0.9</td></tr><tr><td>q83</td><td>1.7</td><td>1.8</td><td>+0.1</td></tr><tr><td>q84</td><td>7.2</td><td>7.1</td><td>-0.1</td></tr><tr><td>q85</td><td>9.4</td><td>9.3</td><td>-0.1</td></tr><tr><td>q86</td><td>2.9</td><td>2.7</td><td>-0.2</td></tr><tr><td>q87</td><td>35.6</td><td>34.3</td><td>-1.3</td></tr><tr><td>q88</td><td>24.2</td><td>23.4</td><td>-0.8</td></tr><tr><td>q89</td><td>6.9</td><td>6.9</td><td>+0.0</td></tr><tr><td>q90</td><td>7.8</td><td>7.4</td><td>-0.4</td></tr><tr><td>q91</td><td>1.8</td><td>1.8</td><td>+0.0</td></tr><tr><td>q92</td><td>1.5</td><td>1.3</td><td>-0.2</td></tr><tr><td>q93</td><td>93.8</td><td>97.8</td><td>+4.0</td></tr><tr><td>q94</td><td>28.7</td><td>27.6</td><td>-1.2</td></tr><tr><td>q95</td><td>25.0</td><td>23.7</td><td>-1.3</td></tr><tr><td>q96</td><td>22.6</td><td>22.4</td><td>-0.2</td></tr><tr><td>q97</td><td>37.4</td><td>38.0</td><td>+0.7</td></tr><tr><td>q98</td><td>3.3</td><td>3.1</td><td>-0.2</td></tr><tr><td>q99</td><td>13.5</td><td>14.0</td><td>+0.5</td></tr></tbody></table>
+</details>
+
+<h2 id="running">Running the benchmark</h2>
+<p>The cluster runner, the Spark-on-Kubernetes manifests and the image are in <a href="https://github.com/vecruntime/vecruntime/blob/main/benchmarks/k8s/README.md">the benchmark runner's README</a>.
+<code>run-matrix.sh</code> writes one JSON-lines result file per run; this page is rendered from them by
+<code>benchmarks/scripts/render-10tb-page.py</code>. The runs and their memory measurements are discussed in <a href="https://github.com/vecruntime/vecruntime/issues/869">#869</a>.</p>
+
+<p class="foot">TPC-DS is a benchmark of the Transaction Processing Performance Council; these results are not audited TPC results and are not comparable to
+published TPC-DS results. VecRuntime's times are one measured iteration per query. The other engines' totals are their publishers' figures.</p>
+</div>
+<script>
+const D = {"bars": [{"name": "OSS Apache Spark", "seconds": 12200.0, "color": "#9ca3af"}, {"name": "DataFusion Comet (tuned)", "seconds": 9122.0, "color": "#9ca3af"}, {"name": "Gluten + Velox (tuned)", "seconds": 8563.0, "color": "#9ca3af"}, {"name": "Databricks Photon 18.2", "seconds": 2550.0, "color": "#9ca3af"}, {"name": "VecRuntime", "seconds": 2429.8, "color": "#2563eb"}, {"name": "Quanton v0.43.0", "seconds": 2034.0, "color": "#9ca3af"}], "queries": ["q1", "q2", "q3", "q4", "q5", "q6", "q7", "q8", "q9", "q10", "q11", "q12", "q13", "q14", "q15", "q16", "q17", "q18", "q19", "q20", "q21", "q22", "q23", "q24", "q25", "q26", "q27", "q28", "q29", "q30", "q31", "q32", "q33", "q34", "q35", "q36", "q37", "q38", "q39", "q40", "q41", "q42", "q43", "q44", "q45", "q46", "q47", "q48", "q49", "q50", "q51", "q52", "q53", "q54", "q55", "q56", "q57", "q58", "q59", "q60", "q61", "q62", "q63", "q64", "q65", "q66", "q67", "q68", "q69", "q70", "q71", "q72", "q73", "q74", "q75", "q76", "q77", "q78", "q79", "q80", "q81", "q82", "q83", "q84", "q85", "q86", "q87", "q88", "q89", "q90", "q91", "q92", "q93", "q94", "q95", "q96", "q97", "q98", "q99"], "pass2": [8.07, 12.92, 5.92, 73.51, 17.87, 2.97, 11.91, 4.17, 53.24, 4.21, 30.3, 2.76, 14.65, 156.51, 3.68, 51.13, 10.34, 12.92, 3.97, 2.51, 1.57, 4.29, 207.3, 196.0, 8.07, 7.11, 10.72, 109.12, 22.15, 6.68, 6.81, 1.62, 3.55, 5.42, 9.59, 8.23, 16.47, 34.05, 8.14, 5.56, 0.62, 1.61, 6.46, 58.98, 3.21, 7.43, 23.77, 10.61, 15.38, 62.9, 12.69, 1.78, 6.57, 5.22, 1.78, 2.73, 15.73, 3.35, 13.69, 3.87, 3.27, 9.06, 6.73, 77.76, 32.53, 9.08, 151.15, 3.43, 3.41, 10.53, 4.22, 24.16, 2.57, 24.33, 60.95, 51.03, 3.03, 154.9, 7.01, 22.26, 6.33, 24.62, 1.7, 7.19, 9.36, 2.87, 35.55, 24.18, 6.94, 7.77, 1.8, 1.52, 93.79, 28.72, 24.99, 22.61, 37.36, 3.28, 13.48], "pass1": [8.06, 12.79, 5.97, 73.03, 17.98, 2.93, 11.62, 3.47, 52.31, 4.34, 30.33, 2.73, 13.55, 153.45, 4.0, 49.78, 9.53, 13.06, 3.83, 2.39, 1.56, 4.4, 200.95, 196.02, 8.07, 6.53, 9.93, 112.73, 22.49, 7.35, 6.73, 1.95, 3.18, 5.3, 9.49, 7.7, 16.09, 34.3, 8.25, 5.67, 0.64, 1.89, 6.57, 59.18, 3.24, 7.21, 23.74, 11.0, 15.8, 64.18, 12.79, 1.78, 6.65, 5.48, 2.03, 2.64, 15.75, 3.07, 13.94, 3.86, 3.57, 25.24, 6.78, 76.55, 32.54, 8.86, 157.3, 3.7, 3.35, 10.47, 4.73, 24.11, 2.59, 24.68, 62.1, 52.22, 3.06, 159.45, 7.03, 22.48, 6.58, 23.68, 1.79, 7.1, 9.25, 2.71, 34.25, 23.37, 6.95, 7.41, 1.83, 1.33, 97.83, 27.56, 23.69, 22.39, 38.02, 3.07, 13.98]};
+const opts = (title, yTitle, extra={}) => Object.assign({
+  responsive: true, maintainAspectRatio: false, interaction: { mode: 'index', intersect: false },
+  plugins: { title: { display: !!title, text: title }, legend: { position: 'top' } },
+  scales: { y: { title: { display: true, text: yTitle } } }
+}, extra);
+new Chart(document.getElementById('totals'), { type: 'bar',
+  data: { labels: D.bars.map(b => b.name), datasets: [{ label: 'Total runtime', data: D.bars.map(b => b.seconds),
+    backgroundColor: D.bars.map(b => b.color) }] },
+  options: { indexAxis: 'y', responsive: true, maintainAspectRatio: false,
+    plugins: { legend: { display: false }, title: { display: true, text: 'Total runtime, 99 queries, 10 TB (seconds, lower is better)' } },
+    scales: { x: { title: { display: true, text: 'seconds' } } } } });
+const runs = [{ label: 'VecRuntime, pass 2', color: '#2563eb', data: D.pass2 }]
+  .concat(D.pass1 ? [{ label: 'VecRuntime, pass 1', color: '#93c5fd', data: D.pass1 }] : []);
+const chunks = [[0, 33], [33, 66], [66, 99]];
+chunks.forEach(([lo, hi], i) => new Chart(document.getElementById('perquery' + (i + 1)), { type: 'bar',
+  data: { labels: D.queries.slice(lo, hi), datasets: runs.map(r => ({ label: r.label, backgroundColor: r.color, borderColor: r.color,
+    data: r.data.slice(lo, hi) })) },
+  options: opts(i === 0 ? 'Seconds per query' : '', 'seconds') }));
+</script>
