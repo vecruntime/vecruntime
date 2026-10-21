@@ -154,7 +154,10 @@ object WriteBenchRunner {
               try df.writeTo(table).append()
               finally spark.conf.unset("spark.vecruntime.iceberg.writer.enabled")
               t1 = System.nanoTime()
-              checksum = spark.table(table).selectExpr("count(*)", "sum(xxhash64(*))").collect()(0).toString
+              checksum = spark.table(table).selectExpr(
+                "count(*)",
+                "sum(cast(xxhash64(*) as decimal(38,0)))"
+              ).collect()(0).toString
             case other => throw new IllegalArgumentException(s"unknown case $other")
           }
         } finally spark.sparkContext.clearJobGroup()
