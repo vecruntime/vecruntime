@@ -29,7 +29,7 @@ Each rule here follows the same contract:
 | `FactBloomFilter` | `spark.vecruntime.optimizer.factBloomFilter.enabled` | q16, q50, q93, q94 |
 | `NarrowBelowJoin` | `spark.vecruntime.optimizer.narrowBelowJoin.enabled` | q23a, q23b |
 | `CountBelowJoin` | `spark.vecruntime.optimizer.countBelowJoin.enabled` | q6, q8, q10, q11, q12, q15, q19, q20, q24a, q24b, q30, q31, q33, q46, q48, q54, q56, q60, q61, q64, q68, q69, q74, q81, q91, q98 |
-| `DistinctBelowSemiJoin` | `spark.vecruntime.optimizer.distinctBelowSemiJoin.enabled` | q14a, q14b (measured at 10 TB; the full list follows the 99-query run) |
+| `DistinctBelowSemiJoin` | `spark.vecruntime.optimizer.distinctBelowSemiJoin.enabled`, `...distinctBelowAntiJoin.enabled` | q8, q10, q14a, q14b, q16, q23a, q23b, q35, q69, q70, q94, q95 |
 
 The plugin changes no AQE setting. `DppThroughAggregate` and `TransitiveDpp` add dynamic partition pruning
 filters where Spark's DPP does not reach; Spark's own DPP settings are unchanged.
@@ -602,6 +602,28 @@ an anti join keeps a left row when no right row satisfies the condition, and the
 columns kept. `NOT IN`'s null-aware condition, `(a = b) OR isnull(a = b)`, is no exception: a right side with a
 null key keeps one null row, so `NOT IN` stays never-true for it, and an empty right side stays empty. Off with
 `spark.vecruntime.optimizer.distinctBelowAntiJoin.enabled=false`.
+
+**At 10 TB (#840).** All 99 queries ran with both rules on and again without them, same sizing and 11 executors.
+The rewrite fired in the twelve queries below, each with one or more extra local aggregates in the physical plan.
+q38 and q87 are not rewritten: their `INTERSECT` / `EXCEPT` right side is already a `Distinct`. Wall time, one
+run each:
+
+| query | without | with | plan change |
+|---|---|---|---|
+| q14a | 147.4 s | 80.7 s | two sort-merge joins become shuffled hash joins, no sorts |
+| q14b | 145.6 s | 75.1 s | two of three sort-merge joins become shuffled hash joins |
+| q94 | 52.1 s | 31.1 s | |
+| q95 | 32.2 s | 25.0 s | |
+| q35 | 15.0 s | 9.6 s | the sort-merge join becomes a shuffled hash join |
+| q10 | 6.0 s | 4.1 s | the same |
+| q69 | 4.7 s | 3.5 s | the same |
+| q23a | 100.8 s | 97.0 s | |
+| q70 | 12.1 s | 10.8 s | |
+| q16 | 53.7 s | 51.7 s | |
+| q23b | 115.1 s | 115.9 s | |
+| q8 | 3.5 s | 4.0 s | |
+
+Over the 99 queries: 2,893 s without the rules, 2,618 s with them (-9.5%); spill 1,400 GiB without, 935 GiB with.
 
 ## `RemoveRedundantGroupKeys`: grouping keys a unique broadcast key determines (#635)
 
