@@ -1,0 +1,32 @@
+{
+  "title": "VecRuntime on TPC-DS 10 TB, AWS Graviton4 (11 x m8gd.4xlarge)",
+  "dataset": "TPC-DS scale factor 10000 (10 TB), Parquet on Amazon S3; the 99 queries (q14, q23, q24 and q39 as the sums of their a and b parts)",
+  "cluster": "Amazon EKS; 11 x m8gd.4xlarge executor nodes (16 vCPU AWS Graviton4, 64 GB, local NVMe for shuffle and spill), one executor per node; the driver on a separate c8g.xlarge node",
+  "executors": "11 executors x 15 cores; 20 GB heap + 10 GB overhead + 28,928 MB off-heap (spark.memory.offHeap.size), 6 GB direct memory; G1; driver 3 cores x 4 GB",
+  "storage": "Amazon S3 through Hadoop S3A; VecRuntime's native Parquet scan (VectorParquetScanExec)",
+  "versions": {
+    "VecRuntime": "PR #911's head 60c645c2, merged as main e74d0be5 (2026-10-21): DistinctBelowSemiJoin for semi and anti joins (#906, #907), operator arenas on the native pool (#909), pool accounting (#911); arm64 image",
+    "Spark (VecRuntime)": "4.1.3, Scala 2.13, Amazon Corretto 25.0.4.1"
+  },
+  "vector_conf": [
+    "spark.plugins=io.vecruntime.spark.VectorPlugin",
+    "spark.shuffle.manager=org.apache.spark.sql.vecruntime.shuffle.VectorShuffleManager",
+    "spark.sql.shuffle.partitions=1500, spark.sql.adaptive.enabled=true (coalescing on)",
+    "spark.memory.offHeap.enabled=true, spark.memory.offHeap.size=28928m",
+    "spark.vecruntime.exec.strictFloatingPoint=false, spark.vecruntime.exec.sortMergeJoin.enabled=true",
+    "spark.vecruntime.memory.poolAccounting.enabled=true (the default)",
+    "Executors: G1, -XX:MaxDirectMemorySize=6g, Arrow on its Unsafe allocation manager; glibc malloc defaults (no MALLOC_ARENA_MAX, no MALLOC_MMAP_THRESHOLD_)",
+    "--add-modules=jdk.incubator.vector --enable-native-access=ALL-UNNAMED (driver and executors)"
+  ],
+  "methodology": "Two full passes of the 99 queries, one after the other, each with the cluster to itself and all 11 executors up (checked before the first query). Each query ran once after its plan was compiled; its time is the wall-clock of its execution as the runner measures it, and the total is the sum over the queries. The page shows pass 2 and, per query, pass 1 next to it.",
+  "notes": [
+    "The other engines' totals are the ones quanton.dev publishes for TPC-DS 10 TB on 11 x m8gd.4xlarge; they were not re-run here, and only their totals are published, so the comparison is of totals only.",
+    "Their setups are not documented to the level of this page (dataset generation and table format, Spark versions, executor layout, whether the driver is one of the 11 nodes). Treat the cross-engine bars as indicative, not as a controlled comparison.",
+    "VecRuntime needs Spark 4.1+ and JDK 25.",
+    "A third pass at 600 shuffle partitions took 2,520 s (1,500 partitions stays the setting); the same configuration before #909 and #911, with MALLOC_ARENA_MAX=2 and MALLOC_MMAP_THRESHOLD_=131072, took 2,618 s. See issue #869.",
+    "q18 and q68 end in LIMIT 100 over rows with tied sort keys, so their checksums can differ between runs and engines; every other query's result is the same in both passes."
+  ],
+  "repo": "https://github.com/vecruntime/vecruntime",
+  "run_doc": "https://github.com/vecruntime/vecruntime/blob/main/benchmarks/k8s/README.md",
+  "issue": "https://github.com/vecruntime/vecruntime/issues/869"
+}
