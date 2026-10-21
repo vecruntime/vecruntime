@@ -602,12 +602,12 @@ object VectorConf {
    */
   /**
    * #869 step 3b: count every block a task takes from the native pool in that task's Spark execution memory
-   * (`TaskNativeMemory`). Off by default: the operators still reserve their own estimates, so turning it on counts
-   * those bytes twice until they move onto it. Read once, when the executor starts.
+   * (`TaskNativeMemory`), with the sort's and the grace hash join's reservations in the same account. `false` gives
+   * each operator a consumer of its own again. Read once, when the executor starts.
    */
   val PoolAccountingEnabled = "spark.vecruntime.memory.poolAccounting.enabled"
   def poolAccountingEnabled(sparkConf: org.apache.spark.SparkConf): Boolean =
-    sparkConf.getBoolean(PoolAccountingEnabled, false)
+    sparkConf.getBoolean(PoolAccountingEnabled, true)
 
   val ArrowMaxBytes = "spark.vecruntime.arrow.maxBytes"
   def arrowMaxBytes(sparkConf: org.apache.spark.SparkConf): Long =

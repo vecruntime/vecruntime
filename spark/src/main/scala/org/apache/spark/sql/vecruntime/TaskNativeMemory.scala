@@ -34,8 +34,10 @@ import org.apache.spark.memory.{MemoryConsumer, MemoryMode, TaskMemoryManager}
  * memory manager does not grant is recorded as overdraft (an executor metric), and the operators' own reservations,
  * made before they allocate, stay the place where a refusal turns into a spill.
  *
- * Off by default (`spark.vecruntime.memory.poolAccounting.enabled`): until the operators' own estimates move onto
- * it, turning it on counts their bytes twice.
+ * On by default (`spark.vecruntime.memory.poolAccounting.enabled`). The sort and the grace hash join reserve through
+ * [[TaskNativeMemory.reservation]], so the bytes they reserve before allocating and the blocks they then take are one
+ * budget; reservations for bytes that are not pool blocks (Arrow vectors, heap mirrors) use
+ * [[TaskNativeMemory.ownReservation]].
  */
 object TaskNativeMemory {
 

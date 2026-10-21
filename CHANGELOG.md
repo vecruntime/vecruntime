@@ -8,6 +8,12 @@ version may change configuration keys or defaults, always noted here.
 
 ### Added
 
+- Native pool accounting (#869, `spark.vecruntime.memory.poolAccounting.enabled`, on by default): every block a
+  task takes from `NativePool` is held in that task's Spark execution memory through one account, which the sort's
+  and the grace hash join's reservations share, so a block is counted once and an allocation no operator reserved
+  for is still in the budget. Executor metrics `nativePoolInUseBytes`, `nativePoolPeakBytes`,
+  `nativePoolRetainedBytes`, `nativePoolOverdraftBytes` (charged past what the memory manager granted) and
+  `nativePoolLeakedBytes` (still open when the task ended).
 - `DistinctBelowSemiJoin` (#840): a left semi join's right side too large to broadcast is reduced to its
   distinct join columns, one aggregate per task, before the join's exchange
   (`spark.vecruntime.optimizer.distinctBelowSemiJoin.enabled`, default on). TPC-DS q14's `INTERSECT`s
