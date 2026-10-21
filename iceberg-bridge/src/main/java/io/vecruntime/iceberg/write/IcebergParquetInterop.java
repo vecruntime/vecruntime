@@ -27,13 +27,14 @@ import org.apache.parquet.schema.MessageType;
 import org.apache.parquet.schema.MessageTypeParser;
 
 /**
- * The two places where the Iceberg runtime and our writer meet across parquet-java's
- * relocation (#842). {@code iceberg-spark-runtime} shades parquet-java to {@code
- * org.apache.iceberg.shaded.org.apache.parquet}, while {@code ColumnarParquetWriter} is
- * built on the parquet-java Spark ships. The two are converted through their stable,
- * serialized forms -- the schema's text and the footer's Thrift bytes -- so the field
- * ids, logical types and statistics are Iceberg's own on both sides and nothing about
- * them is re-derived here.
+ * The two places where the Iceberg runtime and our writer meet across
+ * parquet-java's relocation (#842). {@code iceberg-spark-runtime} shades
+ * parquet-java to {@code org.apache.iceberg.shaded.org.apache.parquet}, while
+ * {@code ColumnarParquetWriter} is built on the parquet-java Spark ships. The
+ * two are converted through their stable, serialized forms -- the schema's text
+ * and the footer's Thrift bytes -- so the field ids, logical types and
+ * statistics are Iceberg's own on both sides and nothing about them is
+ * re-derived here.
  */
 final class IcebergParquetInterop {
 
@@ -45,38 +46,35 @@ final class IcebergParquetInterop {
      * parquet-java's unshaded {@link MessageType}.
      */
     static MessageType fileSchema(Schema schema, String name) {
-        org.apache.iceberg.shaded.org.apache.parquet.schema.MessageType shaded = ParquetSchemaUtil.convert(schema,
-                name);
+        org.apache.iceberg.shaded.org.apache.parquet.schema.MessageType shaded = ParquetSchemaUtil.convert(schema, name);
         MessageType unshaded = MessageTypeParser.parseMessageType(shaded.toString());
         if (!unshaded.toString().equals(shaded.toString())) {
             // The text form is the contract between the two copies; a difference means one of
             // them prints or parses an annotation the other does not know.
-            throw new IllegalStateException("Parquet schema did not survive conversion: " + shaded + " vs "
-                    + unshaded);
+            throw new IllegalStateException("Parquet schema did not survive conversion: " + shaded + " vs " + unshaded);
         }
         return unshaded;
     }
 
     /**
-     * {@code footer} as the Iceberg runtime's (shaded) {@code ParquetMetadata}, by writing
-     * it to its Thrift form and reading that back, as both copies do for a file's footer.
+     * {@code footer} as the Iceberg runtime's (shaded) {@code ParquetMetadata},
+     * by writing it to its Thrift form and reading that back, as both copies do
+     * for a file's footer.
      */
-    static org.apache.iceberg.shaded.org.apache.parquet.hadoop.metadata.ParquetMetadata shadedFooter(
-            ParquetMetadata footer) throws IOException {
+    static org.apache.iceberg.shaded.org.apache.parquet.hadoop.metadata.ParquetMetadata shadedFooter(ParquetMetadata footer) throws IOException {
         ByteArrayOutputStream bytes = new ByteArrayOutputStream();
-        org.apache.parquet.format.Util.writeFileMetaData(
-                new org.apache.parquet.format.converter.ParquetMetadataConverter()
-                        .toParquetMetadata(ParquetFileWriter.CURRENT_VERSION, footer),
-                bytes);
+        org.apache.parquet.format.Util.writeFileMetaData(new org.apache.parquet.format.converter.ParquetMetadataConverter().toParquetMetadata(ParquetFileWriter.CURRENT_VERSION, footer), bytes);
         // The no-argument converter has no Thrift message-size limit set (-1) and refuses to read; the read
         // options' default limit is the one a file reader uses.
-        return new org.apache.iceberg.shaded.org.apache.parquet.format.converter.ParquetMetadataConverter(
-                        org.apache.iceberg.shaded.org.apache.parquet.ParquetReadOptions.builder().build())
-                .readParquetMetadata(new ByteArrayInputStream(bytes.toByteArray()),
-                        org.apache.iceberg.shaded.org.apache.parquet.format.converter.ParquetMetadataConverter.NO_FILTER);
+        return new org.apache.iceberg.shaded.org.apache.parquet.format.converter.ParquetMetadataConverter(org.apache.iceberg.shaded.org.apache.parquet.ParquetReadOptions.builder()
+                .build())
+                .readParquetMetadata(new ByteArrayInputStream(bytes.toByteArray()), org.apache.iceberg.shaded.org.apache.parquet.format.converter.ParquetMetadataConverter.NO_FILTER);
     }
 
-    /** An Iceberg {@code OutputFile} as the {@code OutputFile} parquet-java writes to. */
+    /**
+     * An Iceberg {@code OutputFile} as the {@code OutputFile} parquet-java
+     * writes to.
+     */
     static org.apache.parquet.io.OutputFile parquetOutput(org.apache.iceberg.io.OutputFile file) {
         return new org.apache.parquet.io.OutputFile() {
             @Override

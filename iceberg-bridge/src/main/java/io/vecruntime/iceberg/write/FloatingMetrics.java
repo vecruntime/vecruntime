@@ -28,23 +28,25 @@ import org.apache.iceberg.types.Type;
 import org.apache.iceberg.types.Types;
 
 /**
- * The metrics a Parquet footer cannot give Iceberg: per float and double field, the NaN
- * count and bounds that skip NaN (#842). Iceberg's own Parquet writers collect them while
- * writing (its {@code FloatFieldMetrics} / {@code DoubleFieldMetrics}) and hand them to
- * {@code ParquetUtil.footerMetrics}, which takes everything else from the footer; this
- * collects the same from the batches, with Iceberg's own builders, so the merged metrics
- * are the ones Iceberg's writer reports.
+ * The metrics a Parquet footer cannot give Iceberg: per float and double field,
+ * the NaN count and bounds that skip NaN (#842). Iceberg's own Parquet writers
+ * collect them while writing (its {@code FloatFieldMetrics} / {@code
+ * DoubleFieldMetrics}) and hand them to {@code ParquetUtil.footerMetrics},
+ * which takes everything else from the footer; this collects the same from the
+ * batches, with Iceberg's own builders, so the merged metrics are the ones
+ * Iceberg's writer reports.
  *
- * <p>Covers float and double fields at the top level and inside structs. A float or
- * double inside a list or a map is refused by {@link #check}: its values are not
- * row-aligned, and a file whose bounds could include a NaN must not be committed.
+ * <p>Covers float and double fields at the top level and inside structs. A
+ * float or double inside a list or a map is refused by {@link #check}: its
+ * values are not row-aligned, and a file whose bounds could include a NaN must
+ * not be committed.
  */
 final class FloatingMetrics {
 
     /**
-     * One float or double field: its position as a path of struct child indexes, its rows
-     * and nulls so far (a null parent struct counts as a null), and the builder of its NaN
-     * count and bounds.
+     * One float or double field: its position as a path of struct child
+     * indexes, its rows and nulls so far (a null parent struct counts as a
+     * null), and the builder of its NaN count and bounds.
      */
     private static final class Leaf {
         final int id;
@@ -88,10 +90,16 @@ final class FloatingMetrics {
                 }
                 return false;
             case LIST:
-                return repeatedFloating(type.asListType().elementType(), true);
+                return repeatedFloating(type.asListType()
+                        .elementType(),
+                        true);
             case MAP:
-                return repeatedFloating(type.asMapType().keyType(), true)
-                        || repeatedFloating(type.asMapType().valueType(), true);
+                return repeatedFloating(type.asMapType()
+                        .keyType(),
+                        true)
+                        || repeatedFloating(type.asMapType()
+                        .valueType(),
+                        true);
             default:
                 return false;
         }
@@ -106,13 +114,18 @@ final class FloatingMetrics {
             switch (f.type().typeId()) {
                 case FLOAT -> leaves.add(new Leaf(f.fieldId(), List.copyOf(path), true));
                 case DOUBLE -> leaves.add(new Leaf(f.fieldId(), List.copyOf(path), false));
-                case STRUCT -> collect(f.type().asStructType(), path);
+                case STRUCT -> collect(f.type()
+                                        .asStructType(),
+                        path);
                 default -> {}
             }
         }
     }
 
-    /** Adds rows {@code [first, end)} of {@code columns} (one per top-level field). */
+    /**
+     * Adds rows {@code [first, end)} of {@code columns} (one per top-level
+     * field).
+     */
     void add(List<? extends VectorBuffers> columns, int first, int end) {
         for (Leaf leaf : leaves) {
             VectorBuffers v = columns.get(leaf.path.get(0));
@@ -148,18 +161,20 @@ final class FloatingMetrics {
     }
 
     /**
-     * Per field: the builders' NaN count and bounds, with the value count (nulls included)
-     * and null count of every row, as Iceberg's metrics count them.
+     * Per field: the builders' NaN count and bounds, with the value count
+     * (nulls included) and null count of every row, as Iceberg's metrics count
+     * them.
      */
     Stream<FieldMetrics<?>> metrics() {
         return leaves.stream().map(l -> {
             if (l.isFloat) {
                 FieldMetrics<Float> m = l.floats.build();
-                return new FieldMetrics<>(l.id, l.values, l.nulls, m.nanValueCount(), m.lowerBound(),
-                        m.upperBound());
+                return new FieldMetrics<>(l.id, l.values, l.nulls, m.nanValueCount(),
+                        m.lowerBound(), m.upperBound());
             }
             FieldMetrics<Double> m = l.doubles.build();
-            return new FieldMetrics<>(l.id, l.values, l.nulls, m.nanValueCount(), m.lowerBound(), m.upperBound());
+            return new FieldMetrics<>(l.id, l.values, l.nulls, m.nanValueCount(),
+                    m.lowerBound(), m.upperBound());
         });
     }
 }

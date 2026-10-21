@@ -106,8 +106,10 @@ class IcebergParquetAppenderSuite extends AnyFunSuite {
     rec.setField(
       "ts",
       row.ts.map { us =>
-        OffsetDateTime.ofInstant(Instant.ofEpochSecond(Math.floorDiv(us, 1000000L), Math.floorMod(us, 1000000L) * 1000L),
-          ZoneOffset.UTC)
+        OffsetDateTime.ofInstant(
+          Instant.ofEpochSecond(Math.floorDiv(us, 1000000L), Math.floorMod(us, 1000000L) * 1000L),
+          ZoneOffset.UTC
+        )
       }.orNull
     )
     rec
@@ -125,8 +127,14 @@ class IcebergParquetAppenderSuite extends AnyFunSuite {
   /** Writes `rs` with the appender in batches of `batch` rows. */
   private def writeNative(path: Path, rs: IndexedSeq[Row], batch: Int, props: Map[String, String] = Map.empty)
       : IcebergParquetAppender = {
-    val appender = IcebergParquetAppender.create(Files.localOutput(path.toFile), schema, props.asJava,
-      MetricsConfig.getDefault, null, new Configuration())
+    val appender = IcebergParquetAppender.create(
+      Files.localOutput(path.toFile),
+      schema,
+      props.asJava,
+      MetricsConfig.getDefault,
+      null,
+      new Configuration()
+    )
     val arena = Arena.ofConfined()
     try {
       rs.grouped(batch).foreach { part =>
@@ -142,7 +150,8 @@ class IcebergParquetAppenderSuite extends AnyFunSuite {
       .write(Files.localOutput(path.toFile))
       .schema(schema)
       .createWriterFunc((s: Schema, t: org.apache.iceberg.shaded.org.apache.parquet.schema.MessageType) =>
-        GenericParquetWriter.create(s, t))
+        GenericParquetWriter.create(s, t)
+      )
       .build()
     rs.foreach(r => appender.add(record(r)))
     appender.close()
@@ -183,7 +192,11 @@ class IcebergParquetAppenderSuite extends AnyFunSuite {
       val path = dir.resolve("native.parquet")
       writeNative(path, rows(100, 2L), 100)
       val reader = org.apache.parquet.hadoop.ParquetFileReader.open(
-        org.apache.parquet.hadoop.util.HadoopInputFile.fromPath(new org.apache.hadoop.fs.Path(path.toUri), new Configuration()))
+        org.apache.parquet.hadoop.util.HadoopInputFile.fromPath(
+          new org.apache.hadoop.fs.Path(path.toUri),
+          new Configuration()
+        )
+      )
       try {
         val footer = reader.getFooter
         val fileSchema = footer.getFileMetaData.getSchema
@@ -207,7 +220,8 @@ class IcebergParquetAppenderSuite extends AnyFunSuite {
       val rs = rows(20000, 5L).map { row =>
         row.copy(
           d = if (r.nextInt(50) == 0) Some(Double.NaN) else row.d,
-          f = if (r.nextInt(40) == 0) Some(Float.NaN) else row.f)
+          f = if (r.nextInt(40) == 0) Some(Float.NaN) else row.f
+        )
       }
       assertSameMetrics(dir, rs)
     }
@@ -238,9 +252,14 @@ class IcebergParquetAppenderSuite extends AnyFunSuite {
   test("structs, lists and maps read back and report Iceberg's metrics") {
     val nested = new Schema(
       optional(1, "id", Types.IntegerType.get()),
-      optional(2, "s", Types.StructType.of(
-        optional(3, "x", Types.DoubleType.get()),
-        optional(4, "y", Types.StringType.get()))),
+      optional(
+        2,
+        "s",
+        Types.StructType.of(
+          optional(3, "x", Types.DoubleType.get()),
+          optional(4, "y", Types.StringType.get())
+        )
+      ),
       optional(5, "tags", Types.ListType.ofOptional(6, Types.IntegerType.get())),
       optional(7, "m", Types.MapType.ofOptional(8, 9, Types.StringType.get(), Types.LongType.get()))
     )
@@ -250,8 +269,10 @@ class IcebergParquetAppenderSuite extends AnyFunSuite {
     val ids = Array.tabulate(n)(k => if (r.nextInt(10) == 0) None else Some(k))
     val ss = Array.fill(n) {
       if (r.nextInt(8) == 0) None
-      else Some((if (r.nextInt(6) == 0) None else Some(if (r.nextInt(30) == 0) Double.NaN else r.nextGaussian()),
-        if (r.nextInt(7) == 0) None else Some("y" + r.nextInt(100))))
+      else Some((
+        if (r.nextInt(6) == 0) None else Some(if (r.nextInt(30) == 0) Double.NaN else r.nextGaussian()),
+        if (r.nextInt(7) == 0) None else Some("y" + r.nextInt(100))
+      ))
     }
     val tags = Array.fill(n) {
       if (r.nextInt(9) == 0) None
@@ -273,42 +294,64 @@ class IcebergParquetAppenderSuite extends AnyFunSuite {
     }
     def vectors(a: Arena): java.util.List[VectorBuffers] = {
       val x = ss.map(_.flatMap(_._1))
-      val struct = NestedVectorBuffers.struct(n, ArrowLayout.validityFrom(a, ss.map(_.isEmpty), n),
+      val struct = NestedVectorBuffers.struct(
+        n,
+        ArrowLayout.validityFrom(a, ss.map(_.isEmpty), n),
         java.util.List.of(
           ArrowLayout.ofDoubles(a, x.map(_.getOrElse(0.0)), x.map(_.isEmpty)),
-          ArrowLayout.ofStrings(a, ss.map(_.flatMap(_._2).orNull))))
+          ArrowLayout.ofStrings(a, ss.map(_.flatMap(_._2).orNull))
+        )
+      )
       val elems = tags.flatMap(_.getOrElse(Nil))
-      val list = NestedVectorBuffers.list(n, ArrowLayout.validityFrom(a, tags.map(_.isEmpty), n),
+      val list = NestedVectorBuffers.list(
+        n,
+        ArrowLayout.validityFrom(a, tags.map(_.isEmpty), n),
         offsets(a, tags.map(_.map(_.length).getOrElse(0))),
-        ArrowLayout.ofInts(a, elems.map(_.getOrElse(0)), elems.map(_.isEmpty)))
+        ArrowLayout.ofInts(a, elems.map(_.getOrElse(0)), elems.map(_.isEmpty))
+      )
       val entries = maps.flatMap(_.getOrElse(Nil))
-      val map = NestedVectorBuffers.map(n, ArrowLayout.validityFrom(a, maps.map(_.isEmpty), n),
+      val map = NestedVectorBuffers.map(
+        n,
+        ArrowLayout.validityFrom(a, maps.map(_.isEmpty), n),
         offsets(a, maps.map(_.map(_.length).getOrElse(0))),
         ArrowLayout.ofStrings(a, entries.map(_._1)),
-        ArrowLayout.ofLongs(a, entries.map(_._2.getOrElse(0L)), entries.map(_._2.isEmpty)))
+        ArrowLayout.ofLongs(a, entries.map(_._2.getOrElse(0L)), entries.map(_._2.isEmpty))
+      )
       java.util.List.of(ArrowLayout.ofInts(a, ids.map(_.getOrElse(0)), ids.map(_.isEmpty)), struct, list, map)
     }
     def record(k: Int): Record = {
       val rec = GenericRecord.create(nested)
       rec.setField("id", ids(k).map(Int.box).orNull)
-      rec.setField("s", ss(k).map { case (x, y) =>
-        val s = GenericRecord.create(nested.findType("s").asStructType())
-        s.setField("x", x.map(Double.box).orNull)
-        s.setField("y", y.orNull)
-        s
-      }.orNull)
+      rec.setField(
+        "s",
+        ss(k).map { case (x, y) =>
+          val s = GenericRecord.create(nested.findType("s").asStructType())
+          s.setField("x", x.map(Double.box).orNull)
+          s.setField("y", y.orNull)
+          s
+        }.orNull
+      )
       rec.setField("tags", tags(k).map(_.map(_.map(Int.box).orNull).asJava).orNull)
-      rec.setField("m", maps(k).map { es =>
-        val m = new java.util.LinkedHashMap[String, java.lang.Long]()
-        es.foreach { case (key, v) => m.put(key, v.map(Long.box).orNull) }
-        m
-      }.orNull)
+      rec.setField(
+        "m",
+        maps(k).map { es =>
+          val m = new java.util.LinkedHashMap[String, java.lang.Long]()
+          es.foreach { case (key, v) => m.put(key, v.map(Long.box).orNull) }
+          m
+        }.orNull
+      )
       rec
     }
     withDir { dir =>
       val path = dir.resolve("native.parquet")
-      val appender = IcebergParquetAppender.create(Files.localOutput(path.toFile), nested,
-        java.util.Map.of(), MetricsConfig.getDefault, null, new Configuration())
+      val appender = IcebergParquetAppender.create(
+        Files.localOutput(path.toFile),
+        nested,
+        java.util.Map.of(),
+        MetricsConfig.getDefault,
+        null,
+        new Configuration()
+      )
       val arena = Arena.ofConfined()
       try {
         appender.add(new IcebergParquetAppender.Batch(vectors(arena), n))
@@ -316,7 +359,9 @@ class IcebergParquetAppenderSuite extends AnyFunSuite {
       } finally arena.close()
       val in = Parquet.read(Files.localInput(path.toFile)).project(nested)
         .createReaderFunc(t => GenericParquetReaders.buildReader(nested, t)).build[Record]()
-      val back = try in.asScala.map(_.copy()).toIndexedSeq finally in.close()
+      val back =
+        try in.asScala.map(_.copy()).toIndexedSeq
+        finally in.close()
       assert(back.length == n)
       back.zipWithIndex.foreach { case (got, k) =>
         val want = record(k)
@@ -329,7 +374,8 @@ class IcebergParquetAppenderSuite extends AnyFunSuite {
       val iceberg: FileAppender[Record] = Parquet.write(Files.localOutput(dir.resolve("iceberg.parquet").toFile))
         .schema(nested)
         .createWriterFunc((s: Schema, t: org.apache.iceberg.shaded.org.apache.parquet.schema.MessageType) =>
-          GenericParquetWriter.create(s, t))
+          GenericParquetWriter.create(s, t)
+        )
         .build()
       (0 until n).foreach(k => iceberg.add(record(k)))
       iceberg.close()
@@ -346,8 +392,14 @@ class IcebergParquetAppenderSuite extends AnyFunSuite {
     val listOfDoubles = new Schema(optional(1, "xs", Types.ListType.ofOptional(2, Types.DoubleType.get())))
     withDir { dir =>
       intercept[UnsupportedOperationException] {
-        IcebergParquetAppender.create(Files.localOutput(dir.resolve("x.parquet").toFile), listOfDoubles,
-          java.util.Map.of(), MetricsConfig.getDefault, null, new Configuration())
+        IcebergParquetAppender.create(
+          Files.localOutput(dir.resolve("x.parquet").toFile),
+          listOfDoubles,
+          java.util.Map.of(),
+          MetricsConfig.getDefault,
+          null,
+          new Configuration()
+        )
       }
     }
   }
@@ -355,10 +407,18 @@ class IcebergParquetAppenderSuite extends AnyFunSuite {
   test("table properties pick the codec and the row-group size") {
     withDir { dir =>
       val path = dir.resolve("native.parquet")
-      val appender = writeNative(path, rows(20000, 4L), 2048,
-        Map("write.parquet.compression-codec" -> "snappy", "write.parquet.row-group-size-bytes" -> "65536"))
+      val appender = writeNative(
+        path,
+        rows(20000, 4L),
+        2048,
+        Map("write.parquet.compression-codec" -> "snappy", "write.parquet.row-group-size-bytes" -> "65536")
+      )
       val reader = org.apache.parquet.hadoop.ParquetFileReader.open(
-        org.apache.parquet.hadoop.util.HadoopInputFile.fromPath(new org.apache.hadoop.fs.Path(path.toUri), new Configuration()))
+        org.apache.parquet.hadoop.util.HadoopInputFile.fromPath(
+          new org.apache.hadoop.fs.Path(path.toUri),
+          new Configuration()
+        )
+      )
       try {
         val blocks = reader.getFooter.getBlocks.asScala
         assert(blocks.length > 1)
@@ -381,5 +441,6 @@ object IcebergParquetAppenderSuite {
       day: Option[Int],
       dec: Option[Long],
       wide: Option[BigInteger],
-      ts: Option[Long])
+      ts: Option[Long]
+  )
 }
