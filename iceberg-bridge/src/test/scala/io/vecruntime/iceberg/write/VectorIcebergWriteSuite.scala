@@ -95,6 +95,35 @@ class VectorIcebergWriteSuite extends AnyFunSuite with BeforeAndAfterAll {
 
   private def columnar(df: DataFrame): Boolean = nodes(df).exists(_.getClass.getSimpleName == "VectorIcebergWriteExec")
 
+  /**
+   * Whether `f` ran the columnar exec in any query it executed. CTAS and RTAS write through an `AppendData`
+   * Spark plans and runs in a query execution of its own, which the statement's plan does not show.
+   */
+  private def ranColumnar(f: => Unit): Boolean = {
+    val seen = new java.util.concurrent.atomic.AtomicBoolean(false)
+    val listener = new org.apache.spark.sql.util.QueryExecutionListener {
+      override def onSuccess(name: String, qe: org.apache.spark.sql.execution.QueryExecution, ns: Long): Unit = {
+        def walk(p: SparkPlan): Boolean =
+          p.getClass.getSimpleName == "VectorIcebergWriteExec" || p.children.exists(walk) ||
+            (p match {
+              case a: org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanExec => walk(a.executedPlan)
+              case c: org.apache.spark.sql.execution.CommandResultExec => walk(c.commandPhysicalPlan)
+              case _ => false
+            })
+        if (walk(qe.executedPlan)) seen.set(true)
+      }
+      override def onFailure(name: String, qe: org.apache.spark.sql.execution.QueryExecution, e: Exception): Unit = ()
+    }
+    spark.listenerManager.register(listener)
+    try {
+      f
+      // The listeners run on Spark's listener bus, after the query: wait for them, up to a bound.
+      val deadline = System.nanoTime() + 20L * 1000 * 1000 * 1000
+      while (!seen.get && System.nanoTime() < deadline) Thread.sleep(100)
+    } finally spark.listenerManager.unregister(listener)
+    seen.get
+  }
+
   private def rows(t: String): Seq[Row] = spark.sql(s"SELECT * FROM $t ORDER BY id").collect().toSeq
 
   private def summary(t: String, key: String): String =
@@ -205,11 +234,27 @@ class VectorIcebergWriteSuite extends AnyFunSuite with BeforeAndAfterAll {
     assert(ids.getLong(0) == 5000L && ids.getLong(1) == 0L)
   }
 
-  test("copy-on-write on a format v3 table keeps Iceberg's writer (row lineage), unchanged") {
-    val df = twin("cow_v3", CopyOnWrite, version = 3)(t => spark.sql(s"INSERT INTO $t ${source(3000)}").collect())(t =>
-      s"DELETE FROM $t WHERE id % 3 = 0"
+  private def lineage(t: String): Seq[Row] =
+    spark.sql(s"SELECT id, _row_id, _last_updated_sequence_number FROM $t ORDER BY id").collect().toSeq
+
+  for (
+    (op, sql) <- Seq(
+      "DELETE" -> ((t: String) => s"DELETE FROM $t WHERE id % 3 = 0"),
+      "UPDATE" -> ((t: String) => s"UPDATE $t SET s = 'updated' WHERE id % 4 = 1"),
+      "MERGE INTO" -> ((t: String) =>
+        s"""MERGE INTO $t t USING (${source(4000)}) src ON t.id = src.id AND src.id >= 1000
+           |WHEN MATCHED AND src.id % 2 = 0 THEN UPDATE SET t.s = 'merged'
+           |WHEN MATCHED AND src.id % 5 = 0 THEN DELETE
+           |WHEN NOT MATCHED THEN INSERT *""".stripMargin
+      )
     )
-    assert(!columnar(df))
+  ) {
+    test(s"copy-on-write $op on a format v3 table writes columnar and keeps the rows' lineage") {
+      val name = s"cow_v3_${op.replace(' ', '_').toLowerCase}"
+      val df = twin(name, CopyOnWrite, version = 3)(t => spark.sql(s"INSERT INTO $t ${source(3000)}").collect())(sql)
+      assert(columnar(df))
+      assert(lineage(s"ice.db.${name}_on") == lineage(s"ice.db.${name}_off"), "row lineage")
+    }
   }
 
   test("INSERT INTO from a Parquet table reads the scan's batches, not rows") {
@@ -337,6 +382,27 @@ class VectorIcebergWriteSuite extends AnyFunSuite with BeforeAndAfterAll {
     val df = withWriter(on = true)(spark.sql(s"DELETE FROM $on WHERE id % 3 = 0"))
     df.collect()
     assert(columnar(df))
+    assert(rows(on) == rows(off))
+  }
+
+  test("CTAS and RTAS write columnar, through the append Spark runs for them") {
+    val (off, on) = ("ice.db.ctas_off", "ice.db.ctas_on")
+    Seq(off, on).foreach(t => spark.sql(s"DROP TABLE IF EXISTS $t"))
+    withWriter(on = false)(
+      spark.sql(s"CREATE TABLE $off USING iceberg TBLPROPERTIES ('format-version'='2') AS ${source(4000)}").collect()
+    )
+    val ctas = ranColumnar(withWriter(on = true)(
+      spark.sql(s"CREATE TABLE $on USING iceberg TBLPROPERTIES ('format-version'='2') AS ${source(4000)}").collect()
+    ))
+    assert(ctas, "CTAS")
+    assert(rows(on) == rows(off))
+    withWriter(on = false)(
+      spark.sql(s"REPLACE TABLE $off USING iceberg TBLPROPERTIES ('format-version'='2') AS ${source(2500)}").collect()
+    )
+    val rtas = ranColumnar(withWriter(on = true)(
+      spark.sql(s"REPLACE TABLE $on USING iceberg TBLPROPERTIES ('format-version'='2') AS ${source(2500)}").collect()
+    ))
+    assert(rtas, "RTAS")
     assert(rows(on) == rows(off))
   }
 

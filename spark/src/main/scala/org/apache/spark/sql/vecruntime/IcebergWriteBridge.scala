@@ -53,6 +53,9 @@ object IcebergWriteBridge {
   /** Why the columnar writer cannot write `write`'s data files (None when it can). */
   def declineReason(write: Write): Option[String] = Option(static("declineReason", write).asInstanceOf[String])
 
+  /** The top-level field names of the write's Iceberg write schema, in order. */
+  def writeSchemaNames(write: Write): Array[String] = static("writeSchemaNames", write).asInstanceOf[Array[String]]
+
   /** What the tasks need (a serializable `IcebergWriteSpec`), read from Iceberg's `SparkWrite` on the driver. */
   def specOf(write: Write): AnyRef = static("specOf", write)
 
