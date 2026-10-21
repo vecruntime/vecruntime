@@ -313,8 +313,8 @@ private[vecruntime] class VectorSortMergeJoinIterator(
       haveRun = true
       return true
     }
-    val arena =
-      Arena.ofConfined() // consumed on the task thread; a shared arena's close is a handshake with every thread, ruinous per run
+    // #869: per run, from the pool -- no shared-arena handshake on close, and blocks reused run to run.
+    val arena = io.vecruntime.kernels.NativePool.shared().newArena()
     if (existenceOnly) {
       // Only the run's key is read (compareRuns, keyIsNull): keep its first row and pass over the
       // rest of the run, batch after batch, without copying it.
@@ -404,8 +404,8 @@ private[vecruntime] class VectorSortMergeJoinIterator(
    * batch with a selection is compacted first so rows are dense.
    */
   private def sortedRows(batch: ColumnarBatch, keyExprs: Array[VectorExpr]): SortedRows = {
-    val arena =
-      Arena.ofConfined() // consumed on the task thread; a shared arena's close is a handshake with every thread, ruinous per run
+    // #869: per batch, from the pool -- no shared-arena handshake on close, and blocks reused batch to batch.
+    val arena = io.vecruntime.kernels.NativePool.shared().newArena()
     EvalContexts.withBatch(batch) { ctx =>
       val count = ctx.selectedCount
       val width = batch.numCols()
@@ -878,7 +878,7 @@ private[vecruntime] class VectorSortMergeJoinIterator(
   private def gatherColumn(name: String, dt: DataType, src: VectorBuffers, idx: Array[Int], count: Int): ColumnVector =
     if (TypeMapping.nestedTypeOf(dt) == null) ArrowOutput.gather(name, dt, src, idx, 0, count, allocator)
     else {
-      val arena = Arena.ofConfined()
+      val arena = io.vecruntime.kernels.NativePool.shared().newArena() // #869
       try {
         val rows = if (idx.length == count) idx else java.util.Arrays.copyOf(idx, count)
         io.vecruntime.spark.arrow.VectorNestedColumnVector.of(

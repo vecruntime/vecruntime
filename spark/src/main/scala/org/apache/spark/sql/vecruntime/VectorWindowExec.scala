@@ -1556,7 +1556,7 @@ private[vecruntime] class VectorWindowOffsetIterator(
   // step with the allocator as batches are held and released. Counted, not spilled: the window does not spill yet (#872).
   private val memory = new BuildMemory
   // Only the adapter's fallback copy would use it, and the held columns are our own Arrow vectors.
-  private val scratchArena = java.lang.foreign.Arena.ofConfined()
+  private val scratchArena = io.vecruntime.kernels.NativePool.shared().newArena() // #869
   private val partition = new KeyTracker(partitionKeys)
   private val order = new KeyTracker(orderKeys)
   // A `RANGE` frame with value offsets: the single order key is captured per row for the frame kernels.
