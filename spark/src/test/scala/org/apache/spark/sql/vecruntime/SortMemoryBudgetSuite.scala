@@ -89,12 +89,18 @@ class SortMemoryBudgetSuite extends AnyFunSuite {
     val tmm = new TaskMemoryManager(mm, 0L)
     val ctx = new PoolTaskContext(tmm)
     TaskContext.setTaskContext(ctx)
+    // #869: the pool's accounting off unless a test turns it on -- a session of an earlier suite may have installed it.
+    val wasInstalled = TaskNativeMemory.isInstalled
+    TaskNativeMemory.uninstall()
     try {
       val out = body(tmm, ctx)
       ctx.complete()
       assert(mm.executionMemoryUsed === 0L, "the sort returned everything it held")
       out
-    } finally TaskContext.unset()
+    } finally {
+      TaskContext.unset()
+      if (wasInstalled) TaskNativeMemory.install() else TaskNativeMemory.uninstall()
+    }
   }
 
   test("#867: a pool too small for the partition makes the sort spill, with no spillBytes cap") {

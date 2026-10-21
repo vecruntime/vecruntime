@@ -85,7 +85,10 @@ object TaskNativeMemory {
   def reservation(mode: MemoryMode, spill: Long => Long): Reservation = {
     val tc = TaskContext.get()
     if (tc == null || tc.taskMemoryManager() == null) return null
-    if (installed) current().asInstanceOf[TaskAccount].newReservation(spill)
+    val account = if (installed) accountOf(tc, mode) else null
+    // An account in another mode than the operator's (an operator told its mode at plan time, say) cannot hold its
+    // bytes: such an operator keeps a consumer of its own.
+    if (account != null && account.mode == mode) account.newReservation(spill)
     else new ConsumerReservation(tc.taskMemoryManager(), mode, spill)
   }
 
@@ -99,15 +102,22 @@ object TaskNativeMemory {
   /** The account of the task running on this thread, opened on first use; null off a task thread. */
   def current(): NativePool.Account = {
     val tc = TaskContext.get()
-    if (tc == null || tc.taskMemoryManager() == null) return null
+    if (tc == null || tc.taskMemoryManager() == null) null else accountOf(tc, VectorSortIterator.memoryMode())
+  }
+
+  /**
+   * The task's account, opened in `mode` on first use. Keyed by attempt id and checked against the task's memory
+   * manager: an entry left by another context with the same id (tests reuse ids) is replaced, not shared.
+   */
+  private def accountOf(tc: TaskContext, mode: MemoryMode): TaskAccount = {
     val id = java.lang.Long.valueOf(tc.taskAttemptId())
+    val tmm = tc.taskMemoryManager()
     val existing = accounts.get(id)
-    if (existing != null) return existing
-    val created = new TaskAccount(tc.taskMemoryManager(), VectorSortIterator.memoryMode())
-    val prior = accounts.putIfAbsent(id, created)
-    if (prior != null) return prior
+    if (existing != null && (existing.tmm eq tmm)) return existing
+    val created = new TaskAccount(tmm, mode)
+    accounts.put(id, created)
     tc.addTaskCompletionListener[Unit] { _ =>
-      accounts.remove(id)
+      accounts.remove(id, created)
       created.complete()
     }
     created
@@ -142,7 +152,8 @@ object TaskNativeMemory {
    * may be from inside an operator). Calls come from the task's thread; `charge` and `credit` may also come from
    * another (an arena closed elsewhere) and are serialised with them.
    */
-  private[vecruntime] final class TaskAccount(tmm: TaskMemoryManager, mode: MemoryMode) extends NativePool.Account {
+  private[vecruntime] final class TaskAccount(val tmm: TaskMemoryManager, val mode: MemoryMode)
+      extends NativePool.Account {
     private val consumer = new MemoryConsumer(tmm, tmm.pageSizeBytes(), mode) {
       override def spill(size: Long, trigger: MemoryConsumer): Long = spillFor(size)
     }
