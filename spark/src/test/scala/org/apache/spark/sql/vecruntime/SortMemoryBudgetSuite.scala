@@ -371,6 +371,54 @@ class SortMemoryBudgetSuite extends AnyFunSuite {
     finally TaskNativeMemory.uninstall()
   }
 
+  test("#869: with the pool's accounting on, a pool too small still makes the sort spill, and all is returned") {
+    withPool(256L * 1024) { (_, _) =>
+      TaskNativeMemory.install()
+      try {
+        val it = sorter(input)
+        check(it)
+        assert(it.spilledRuns > 0, "the account refused, so runs went to disk")
+        it.close()
+      } finally TaskNativeMemory.uninstall()
+    }
+  }
+
+  test("#869: with the pool's accounting on, the sort's reservation and its pooled blocks are one budget") {
+    withPool(1L << 30) { (tmm, _) =>
+      TaskNativeMemory.install()
+      try {
+        val it = sorter(input)
+        check(it)
+        assert(it.spilledRuns === 0)
+        val account = TaskNativeMemory.current().asInstanceOf[TaskNativeMemory.TaskAccount]
+        assert(
+          tmm.getMemoryConsumptionForThisTask() <=
+            math.max(account.reservedBytes, account.chargedBytes) + 2 * TaskNativeMemory.Chunk,
+          "held once, not reserved and charged side by side"
+        )
+        it.close()
+      } finally TaskNativeMemory.uninstall()
+    }
+  }
+
+  test("#869: a reservation of the account is asked to spill for another, never for its own hold") {
+    withPool(8L << 20) { (_, _) =>
+      TaskNativeMemory.install()
+      try {
+        var asked = 0
+        val first = TaskNativeMemory.reservation(MemoryMode.ON_HEAP, size => { asked += 1; 0L })
+        val second = TaskNativeMemory.reservation(MemoryMode.ON_HEAP, _ => 0L)
+        assert(first.hold(6L << 20))
+        assert(!first.hold(16L << 20), "its own hold past the pool is refused")
+        assert(asked === 0, "and does not ask itself to spill")
+        assert(!second.hold(4L << 20), "the other's hold does not fit")
+        assert(asked === 1, "and asks the first to spill")
+        first.releaseTo(0L)
+        second.releaseTo(0L)
+      } finally TaskNativeMemory.uninstall()
+    }
+  }
+
   test("#875: the pool memory unspillable consumers hold is counted, current and peak, and returned") {
     withPool(1L << 30) { (_, _) =>
       val before = PinnedMemory.bytes
