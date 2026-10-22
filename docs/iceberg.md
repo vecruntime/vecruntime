@@ -226,7 +226,6 @@ Per step:
 
 | Case | Why |
 |---|---|
-| A float or double inside a list or map | Its NaN-aware metrics are not computed natively yet |
 | `time`, `uuid`, `timestamp_ns`, `fixed`, `variant`, geometry types | Not encoded by the columnar writer yet |
 | ORC or Avro data or delete files | The columnar writer writes Parquet only |
 | Encrypted tables | Key metadata is not written |
