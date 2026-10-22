@@ -497,8 +497,8 @@ private[vecruntime] class VectorDynamicPartitionDataWriter(
   /**
    * The bucket-id expression compiled onto the data lanes (#842), used when the Murmur3 kernel fast path above
    * does not match -- most importantly a Hive-compatible write's
-   * `pmod(bitwise_and(hive-hash(keys), Int.MaxValue), n)`, now that `HiveHashExpr`, `BitwiseAndIntExpr` and
-   * `PmodIntExpr` compile. The whole expression is handed to `ExpressionCompiler` (not pattern-matched to one
+   * `pmod(bitwise_and(hive-hash(keys), Int.MaxValue), n)`, now that `HiveHashExpr` compiles (the bitwise and
+   * pmod already did). The whole expression is handed to `ExpressionCompiler` (not pattern-matched to one
    * shape), so any bucket-id expression it can compile is evaluated on lanes; only an expression it rejects
    * falls to the row-by-row `getBucketId` below.
    */
