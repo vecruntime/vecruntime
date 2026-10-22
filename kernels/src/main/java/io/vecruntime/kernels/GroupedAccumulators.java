@@ -45,6 +45,37 @@ public final class GroupedAccumulators {
      */
     static final int COLLAPSE_GROUPS = Integer.getInteger("vecruntime.agg.collapseGroups", 1 << 14);
 
+    /**
+     * #941: whether an accumulator past {@link #COLLAPSE_GROUPS} groups -- one
+     * copy, millions of groups at 10 TB -- moves its state from heap arrays
+     * into {@link NativePool} blocks ({@link NativeLongs}), which a task
+     * thread's arena charges to the task in the operators' memory mode. Below
+     * the threshold the state stays on the heap: it is small there, and the
+     * interleaved copies and the masked path are tuned on arrays (on AVX-512 a
+     * segment scatter at a few groups measured slower). Off by default for the
+     * A/B; the executor plugin sets it from {@code
+     * spark.vecruntime.agg.nativeState}, {@code
+     * -Dvecruntime.agg.nativeState=true} sets it outside Spark. Read when a
+     * table grows, so a change applies to tables that grow afterwards.
+     */
+    private static volatile boolean nativeState = Boolean.getBoolean("vecruntime.agg.nativeState");
+
+    public static void setNativeState(boolean on) {
+        nativeState = on;
+    }
+
+    public static boolean nativeState() {
+        return nativeState;
+    }
+
+    /**
+     * Whether a table growing to {@code capacity} groups with {@code copies}
+     * copies goes native.
+     */
+    private static boolean goNative(int copies, int capacity) {
+        return copies == 1 && capacity > COLLAPSE_GROUPS && nativeState;
+    }
+
     /** The copies an accumulator keeps at {@code capacity} groups. */
     private static int copiesFor(int copies, int capacity) {
         return capacity > COLLAPSE_GROUPS ? 1 : copies;
@@ -329,11 +360,13 @@ public final class GroupedAccumulators {
      * (the masked path) and throws {@link ArithmeticException}, which is what
      * Spark's ANSI {@code sum(bigint)} needs.
      */
-    public static final class LongSum {
+    public static final class LongSum implements AutoCloseable {
         private int capacity = 64;
         private int copies = INTERLEAVE; // 1 once past COLLAPSE_GROUPS groups
         private long[] sum = new long[64 * INTERLEAVE];
         private long[] count = new long[64 * INTERLEAVE];
+        private NativeLongs nSum; // #941: the state once native; sum and count are then null
+        private NativeLongs nCount;
         private final Scratch scratch = new Scratch();
         private final boolean checked;
 
@@ -359,8 +392,17 @@ public final class GroupedAccumulators {
                         long s = ints
                                 ? AggKernels.sumInt(sub)
                                 : (checked ? AggKernels.sumLongExact(sub) : AggKernels.sumLong(sub));
-                        sum[g] = checked ? Math.addExact(sum[g], s) : sum[g] + s;
-                        count[g] += c;
+                        if (nSum != null) {
+                            MemorySegment ns = nSum.segment();
+                            MemorySegment nc = nCount.segment();
+                            long old = ns.getAtIndex(NativeLongs.LONG, g);
+                            ns.setAtIndex(NativeLongs.LONG, g,
+                                    checked ? Math.addExact(old, s) : old + s);
+                            nc.setAtIndex(NativeLongs.LONG, g, nc.getAtIndex(NativeLongs.LONG, g) + c);
+                        } else {
+                            sum[g] = checked ? Math.addExact(sum[g], s) : sum[g] + s;
+                            count[g] += c;
+                        }
                     }
                 }
                 return;
@@ -370,6 +412,10 @@ public final class GroupedAccumulators {
             // Ints are widened into the long scratch so one loop serves both types.
             long[] x = ints ? scratch.longsFromInts(v.data(), n) : scratch.longs(v.data(), n);
             MemorySegment validity = a.effectiveValidity(v);
+            if (nSum != null) {
+                updateNative(x, ids, n, validity);
+                return;
+            }
             long[] sum = this.sum;
             long[] count = this.count;
             int cap = capacity;
@@ -432,6 +478,12 @@ public final class GroupedAccumulators {
         private void ensure(int groups) {
             if (groups > capacity) {
                 int cap = grow(capacity, groups);
+                if (nSum != null) {
+                    nSum.grow(cap);
+                    nCount.grow(cap);
+                    capacity = cap;
+                    return;
+                }
                 int c = copiesFor(copies, cap);
                 if (c == copies) {
                     sum = regroup(sum, capacity, cap, copies);
@@ -442,6 +494,66 @@ public final class GroupedAccumulators {
                     copies = c;
                 }
                 capacity = cap;
+                if (goNative(copies, cap)) {
+                    nSum = new NativeLongs(sum, cap, cap);
+                    nCount = new NativeLongs(count, cap, cap);
+                    sum = null;
+                    count = null;
+                }
+            }
+        }
+
+        /** The one-copy scatter over the native state (#941). */
+        private void updateNative(long[] x, int[] ids, int n,
+                MemorySegment validity) {
+            MemorySegment sum = nSum.segment();
+            MemorySegment count = nCount.segment();
+            if (validity == null && !checked) {
+                for (int i = 0; i < n; i++) {
+                    long g = ids[i];
+                    sum.setAtIndex(NativeLongs.LONG, g, sum.getAtIndex(NativeLongs.LONG, g) + x[i]);
+                    count.setAtIndex(NativeLongs.LONG, g, count.getAtIndex(NativeLongs.LONG, g) + 1);
+                }
+                return;
+            }
+            if (validity == null) {
+                for (int i = 0; i < n; i++) {
+                    long g = ids[i];
+                    sum.setAtIndex(NativeLongs.LONG, g, Math.addExact(sum.getAtIndex(NativeLongs.LONG, g), x[i]));
+                    count.setAtIndex(NativeLongs.LONG, g, count.getAtIndex(NativeLongs.LONG, g) + 1);
+                }
+                return;
+            }
+            for (int w = 0, words = Bitmap.wordsFor(n);
+                 w < words;
+                 w++) {
+                long bits = Bitmap.wordAt(validity, w, n);
+                while (bits != 0L) {
+                    int i = (w << 6) + Long.numberOfTrailingZeros(bits);
+                    bits &= bits - 1;
+                    long g = ids[i];
+                    long s = sum.getAtIndex(NativeLongs.LONG, g);
+                    sum.setAtIndex(NativeLongs.LONG, g,
+                            checked ? Math.addExact(s, x[i]) : s + x[i]);
+                    count.setAtIndex(NativeLongs.LONG, g, count.getAtIndex(NativeLongs.LONG, g) + 1);
+                }
+            }
+        }
+
+        /** Bytes of state outside the heap: 0 until the table goes native. */
+        public long nativeBytes() {
+            return nSum == null ? 0L : nSum.bytes() + nCount.bytes();
+        }
+
+        /**
+         * Gives the native state back to the pool; the accumulator is not used
+         * afterwards.
+         */
+        @Override
+        public void close() {
+            if (nSum != null) {
+                nSum.close();
+                nCount.close();
             }
         }
 
@@ -490,6 +602,9 @@ public final class GroupedAccumulators {
         }
 
         public long sum(int g) {
+            if (nSum != null) {
+                return nSum.get(g);
+            }
             long s = 0;
             for (int k = 0; k < copies; k++) {
                 s = checked ? Math.addExact(s, sum[k * capacity + g]) : s + sum[k * capacity + g];
@@ -498,6 +613,9 @@ public final class GroupedAccumulators {
         }
 
         public long count(int g) {
+            if (nCount != null) {
+                return nCount.get(g);
+            }
             long c = 0;
             for (int k = 0; k < copies; k++) {
                 c += count[k * capacity + g];
