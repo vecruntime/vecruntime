@@ -60,7 +60,7 @@ Format version 1 reads as version 2 does, without delete files.
 | Storage-partitioned joins | yes | A scan that reports a partitioning keeps Iceberg's groups, unpacked. A scan that reports an ordering is read by Iceberg's reader (scan) |
 | Metadata columns `_file`, `_pos`, `_spec_id` | yes | `_file` and `_spec_id` are per-split constants; `_pos` is the reader's row index |
 | Metadata columns `_partition`, `_row_id`, `_last_updated_sequence_number` | yes (#20 M3a) | `_partition` is the per-file struct of the table's unified partition type (empty on an unpartitioned table, where Iceberg returns it null); `_row_id` and `_last_updated_sequence_number` are the file's own column where it materialises them (copy-on-write, compaction), else `firstRowId + _pos` / `dataSequenceNumber`. All three come from `PartitionUtil.constantsMap` and the data file, per batch |
-| Metadata column `_deleted` | scan | |
+| Metadata column `_deleted` | yes (#901 item 3) | Computed by the scan: `false` for a live row, `true` for a row a position delete, deletion vector or equality delete marks. When `_deleted` is projected the scan keeps the marked rows instead of dropping them, exactly as Iceberg's reader does, so a changelog or `SELECT _deleted` read sees them |
 | Types: boolean, int, long, float, double, date, timestamp (with zone and without), string, binary, decimal | yes | `decimal(p > 18)` becomes a DECIMAL128 lane |
 | Types: uuid, fixed, time | scan | Iceberg's reader reads them as Spark types our reader does not produce from these files |
 | Types: struct, list, map | yes | At any depth, when every leaf is one of the flat types above. Nested struct fields are matched by their Iceberg field ids, so a renamed nested field reads as Iceberg reads it, and a field added to a struct later reads as nulls from older files. Iceberg's reader does not vectorize nested columns, so such a scan is taken only when every task group reads natively; otherwise it stays Spark's row path |
@@ -107,8 +107,8 @@ At plan time the node declines, and Spark's `BatchScanExec` stays:
 - a scan that reports an ordering;
 - a scan Iceberg does not vectorize (nested columns) with a task group our reader cannot read: an ORC or Avro
   file, an encrypted file, or equality deletes on a column it does not read;
-- a metadata column other than `_file`, `_pos`, `_spec_id`, `_partition`, `_row_id` and
-  `_last_updated_sequence_number` (for example `_deleted`);
+- a metadata column other than `_file`, `_pos`, `_spec_id`, `_partition`, `_row_id`,
+  `_last_updated_sequence_number` and `_deleted`;
 - a nested or top-level default our reader cannot fill as a constant;
 - a column type outside the flat types in the table above, or a nested type with such a leaf.
 

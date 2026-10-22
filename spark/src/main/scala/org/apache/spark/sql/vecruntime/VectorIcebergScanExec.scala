@@ -357,6 +357,9 @@ private[vecruntime] final class VectorIcebergRDD(
     kinds.exists(k =>
       k == IcebergTasks.PartitionColumn || k == IcebergTasks.RowIdColumn || k == IcebergTasks.SeqNumColumn
     )
+  // #901 item 3: when _deleted is projected the scan keeps deleted rows and marks them, instead of dropping them.
+  private val markDeleted = kinds.contains(IcebergTasks.DeletedColumn)
+  private val deletedOrdinal = kinds.indexOf(IcebergTasks.DeletedColumn)
   private val needsPositions =
     kinds.contains(IcebergTasks.PosColumn) || kinds.contains(IcebergTasks.RowIdColumn)
   private val constants =
@@ -426,6 +429,7 @@ private[vecruntime] final class VectorIcebergRDD(
       case IcebergTasks.FileColumn => constBase
       case IcebergTasks.SpecIdColumn => constBase + 1
       case IcebergTasks.PartitionColumn => -1
+      case IcebergTasks.DeletedColumn => -1
     }
   }
 
@@ -507,7 +511,10 @@ private[vecruntime] final class VectorIcebergRDD(
       val out = layout(0, positions = true)
       val rebuild = metaRebuild(fileMeta, posOrdinalOf(0), fileOrdinalOf(0, positions = true))
       readerOf(index, Array(t.file), positionsConfBroadcast, VectorIcebergRDD.withPositions(requiredSchema), context)
-        .map(b => IcebergTasks.withoutDeleted(b, out, attrs.length, deleted, null, rebuild))
+        .map(b =>
+          if (markDeleted) IcebergTasks.withDeletedMarked(b, out, deletedOrdinal, attrs.length, deleted, null, rebuild)
+          else IcebergTasks.withoutDeleted(b, out, attrs.length, deleted, null, rebuild)
+        )
     } else {
       val schema = equalitySchema.get
       val extra = schema.length - attrs.length - 1
@@ -516,7 +523,11 @@ private[vecruntime] final class VectorIcebergRDD(
       lazy val equality =
         IcebergTasks.equalityFilter(p, t.equalityDeletes, tableSchema, schema, equalitySets, nativeEqualityDeletes)
       readerOf(index, Array(t.file), equalityConfBroadcast.get, schema, context)
-        .map(b => IcebergTasks.withoutDeleted(b, out, schema.length - 1, deleted, equality(b), rebuild))
+        .map(b =>
+          if (markDeleted)
+            IcebergTasks.withDeletedMarked(b, out, deletedOrdinal, schema.length - 1, deleted, equality(b), rebuild)
+          else IcebergTasks.withoutDeleted(b, out, schema.length - 1, deleted, equality(b), rebuild)
+        )
     }
   }
 
@@ -531,11 +542,22 @@ private[vecruntime] final class VectorIcebergRDD(
       val out = layout(0, positions = true)
       val rebuild = metaRebuild(fileMeta, posOrdinalOf(0), fileOrdinalOf(0, positions = true))
       readerOf(index, files, positionsConfBroadcast, VectorIcebergRDD.withPositions(requiredSchema), context)
-        .map(b => IcebergTasks.withoutDeleted(b, out, attrs.length, Array.emptyLongArray, null, rebuild))
+        .map(b =>
+          if (markDeleted)
+            IcebergTasks.withDeletedMarked(b, out, deletedOrdinal, attrs.length, Array.emptyLongArray, null, rebuild)
+          else IcebergTasks.withoutDeleted(b, out, attrs.length, Array.emptyLongArray, null, rebuild)
+        )
     } else {
       val out = layout(0, positions = false)
       val rebuild = metaRebuild(fileMeta, -1, fileOrdinalOf(0, positions = false))
-      readerOf(index, files, confBroadcast, requiredSchema, context).map(b => IcebergTasks.reordered(b, out, rebuild))
+      // #901 item 3: a file with no delete files has `_deleted` false in every row.
+      if (markDeleted)
+        readerOf(index, files, confBroadcast, requiredSchema, context)
+          .map(b => IcebergTasks.withDeletedMarked(b, out, deletedOrdinal, -1, Array.emptyLongArray, null, rebuild))
+      else
+        readerOf(index, files, confBroadcast, requiredSchema, context).map(b =>
+          IcebergTasks.reordered(b, out, rebuild)
+        )
     }
 
   private def readerOf(
@@ -761,6 +783,9 @@ private[vecruntime] object IcebergTasks {
   // _last_updated_sequence_number: the file's own column where it materialises it, else the data file's
   // `dataSequenceNumber`.
   case object SeqNumColumn extends ColumnKind
+  // #901 item 3: _deleted (MetadataColumns.IS_DELETED), a boolean the scan computes -- false for a live row, true
+  // for a row a position delete, deletion vector or equality delete marks, which is kept instead of dropped.
+  case object DeletedColumn extends ColumnKind
 
   // Iceberg's reserved metadata column ids (MetadataColumns): every metadata column sits near Int.MaxValue.
   private val FileId = Int.MaxValue - 1
@@ -771,6 +796,8 @@ private[vecruntime] object IcebergTasks {
   private val PartitionId = Int.MaxValue - 5 // 2147483642
   private val RowIdId = Int.MaxValue - 107 // 2147483540
   private val SeqNumId = Int.MaxValue - 108 // 2147483539
+  // #901 item 3: _deleted (MetadataColumns.IS_DELETED), a boolean computed by the scan.
+  private val DeletedId = Int.MaxValue - 3 // 2147483644
   private val MetadataIdFloor = Int.MaxValue - 10000
 
   def columnKind(name: String, id: Int): ColumnKind =
@@ -780,6 +807,7 @@ private[vecruntime] object IcebergTasks {
     else if (id == PartitionId && name == "_partition") PartitionColumn
     else if (id == RowIdId && name == "_row_id") RowIdColumn
     else if (id == SeqNumId && name == "_last_updated_sequence_number") SeqNumColumn
+    else if (id == DeletedId && name == "_deleted") DeletedColumn
     else DataColumn
 
   /** The per-file constants a split carries as its partition values, in this order: `_file`, `_spec_id`. */
@@ -807,11 +835,13 @@ private[vecruntime] object IcebergTasks {
           case "_partition" => PartitionId
           case "_row_id" => RowIdId
           case "_last_updated_sequence_number" => SeqNumId
+          // #901 item 3: _deleted is computed by the scan (false for live rows, true for marked rows).
+          case "_deleted" => DeletedId
           case _ =>
             val field =
               byName.getOrElse(a.name.toLowerCase, return Left(s"column ${a.name} not in the Iceberg projection"))
             val id = call(field, "fieldId").asInstanceOf[Integer].intValue()
-            // Other metadata columns (_deleted, _partition, row lineage) keep Iceberg's reader.
+            // Other metadata columns (row lineage aside, handled above) keep Iceberg's reader.
             if (id >= MetadataIdFloor) return Left(s"Iceberg metadata column ${a.name}")
             // A v3 initial default fills the column for files written before it was added; our reader reads nulls.
             // A v3 initial default fills the column for files written before it was added: read as an existence
@@ -1431,6 +1461,55 @@ private[vecruntime] object IcebergTasks {
         while (i < n) { child.putDecimal(i, v, d.precision); i += 1 }
       case other =>
         throw new UnsupportedOperationException(s"unsupported _partition field type ${other.simpleString}")
+    }
+  }
+
+  /**
+   * #901 item 3: `batch` with its columns in output order (`out`), keeping EVERY row and filling the `_deleted`
+   * boolean at `deletedOut` -- true for a row a position/DV delete (`deleted` positions, matched against the file
+   * positions at `posOrdinal`) or an equality delete (`equalityDeleted`) marks, false otherwise -- as Iceberg's
+   * reader does when `_deleted` is projected (it keeps deleted rows instead of dropping them). The batch's own
+   * selection (from the reader) is preserved; deletes do not deselect here. `rebuild`, when set, fills the v3
+   * metadata columns first. The data columns stay the reader's (borrowed).
+   */
+  def withDeletedMarked(
+      batch: ColumnarBatch,
+      out: Array[Int],
+      deletedOut: Int,
+      posOrdinal: Int,
+      deleted: Array[Long],
+      equalityDeleted: Int => Boolean,
+      rebuild: (ColumnarBatch, Array[org.apache.spark.sql.vectorized.ColumnVector]) => Unit = null
+  ): ColumnarBatch = {
+    val n = batch.numRows()
+    val columns = out.map(o => if (o < 0) null else batch.column(o))
+    if (rebuild != null) rebuild(batch, columns)
+    val flags =
+      new org.apache.spark.sql.execution.vectorized.OnHeapColumnVector(
+        math.max(1, n),
+        org.apache.spark.sql.types.BooleanType
+      )
+    flags.putBooleans(0, n, false)
+    if (deleted.nonEmpty && n > 0) {
+      val pos = batch.column(posOrdinal)
+      var i = 0
+      var j = lowerBound(deleted, pos.getLong(0))
+      while (i < n && j < deleted.length) {
+        val p = pos.getLong(i)
+        while (j < deleted.length && deleted(j) < p) j += 1
+        if (j < deleted.length && deleted(j) == p) flags.putBoolean(i, true)
+        i += 1
+      }
+    }
+    if (equalityDeleted != null) {
+      var i = 0
+      while (i < n) { if (equalityDeleted(i)) flags.putBoolean(i, true); i += 1 }
+    }
+    columns(deletedOut) = flags
+    batch match {
+      case s: io.vecruntime.spark.arrow.SelectedColumnarBatch =>
+        io.vecruntime.spark.arrow.SelectedColumnarBatch.ofHeap(columns, n, s.selection(), s.selectedCount(), false)
+      case _ => new ColumnarBatch(columns, n)
     }
   }
 

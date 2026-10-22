@@ -683,6 +683,40 @@ class IcebergNativeScanSuite extends IcebergMorSuiteBase {
     assert(rowIds.exists(r => !r.isNullAt(0)), "the copy-on-write UPDATE should have materialised some _row_id")
   }
 
+  icebergTest("the _deleted metadata column is produced natively (#901 item 3)") {
+    // Position deletes, deletion vectors and equality deletes: _deleted must agree with Iceberg's reader row for
+    // row (checkVectorized compares plugin-off vs plugin-on), and the native path must be used.
+    Seq("t_pos", "t_dv", "t_eq").foreach { table =>
+      val t = s"$Db.$table"
+      val df = checkVectorized(s"SELECT _deleted, i, s FROM $t WHERE i % 37 = 3", Nil)
+      val (native, iceberg) = groups(df)
+      assert(native > 0 && iceberg == 0, s"$table: native $native, Iceberg $iceberg")
+      // _deleted alone, and grouped, each matched against Iceberg's reader.
+      checkVectorized(s"SELECT _deleted, count(*) FROM $t GROUP BY _deleted", Nil)
+      checkVectorized(s"SELECT i, _deleted, _pos FROM $t WHERE i % 53 = 1", Nil)
+    }
+    // A table with no delete files: _deleted is false in every row.
+    spark.sql(s"CREATE OR REPLACE TABLE $Db.t_del_none USING iceberg AS SELECT * FROM $Db.t_pos")
+    val none = checkVectorized(s"SELECT count(*) FROM $Db.t_del_none WHERE _deleted", Nil)
+    val (n2, i2) = groups(none)
+    assert(n2 > 0 && i2 == 0, s"no-delete native $n2, Iceberg $i2")
+    assert(count(s"SELECT count(*) FROM $Db.t_del_none WHERE _deleted") === 0)
+    // Independent control on t_pos: the rows i % 5 = 0 were deleted. If Iceberg keeps deleted rows under a plain
+    // _deleted projection, every such row is marked; either way the native scan equals Iceberg's reader above.
+    val kept =
+      withPlugin(enabled = false)(spark.sql(s"SELECT i, _deleted FROM $Db.t_pos").collect())
+    val keptNative =
+      withPlugin(enabled = true)(spark.sql(s"SELECT i, _deleted FROM $Db.t_pos").collect())
+    assertRowsEqual(kept, keptNative, 0.0, "_deleted on t_pos: native equals Iceberg's reader")
+    // Whichever rows Iceberg reports as _deleted=true, each must be an originally-deleted position -- i % 5 = 0
+    // (the DELETE) or i % 17 = 1 (the old image the UPDATE removed) -- an independent check of the mark, not only
+    // equality with Iceberg. A live row (neither) must never be marked.
+    kept.filter(r => r.getBoolean(1)).foreach { r =>
+      val i = r.getInt(0)
+      assert(i % 5 == 0 || i % 17 == 1, s"marked a live row: $i")
+    }
+  }
+
   icebergTest("switched off, Spark's BatchScanExec stays") {
     withConf(VectorConf.ScanNativeIceberg -> "false") {
       useTable("t_pos")
