@@ -247,7 +247,14 @@ class IcebergEqualityDeletesSuite extends AnyFunSuite with BeforeAndAfterAll {
     assertRemaining("ice.db.equ", uRemaining)
     info(s"uuid: deleted ${N - uRemaining.size}, remaining ${uRemaining.size}")
 
-    // --- fixed key: the native scan deletes exactly the rows Iceberg's own reader deletes ---
+    // --- fixed key ---
+    // Iceberg 1.12's own reader does NOT apply a fixed (byte-array) equality delete correctly: its delete-load
+    // path (BaseDeleteLoader.readEqDeletes -> GenericParquetReaders$FixedReader, which REUSES one byte[] buffer
+    // per column) feeds that reused array into the StructLikeSet, so every distinct fixed key collapses to the
+    // last value read -- the loaded set ends up with ONE element for a delete file of many keys (verified: a
+    // 143-key fixed delete loads as StructLikeSet.size == 1). The native scan loads the same set from the same
+    // loader, so it mirrors Iceberg exactly. We therefore assert native == Iceberg's own reader rather than an
+    // independent expected count, which only Iceberg could satisfy once it fixes the FixedReader buffer reuse.
     create("eqf")
     addDeletes("ice.db.eqf", Seq("f"), (0 until N by 17).filter(_ % 9 != 0).map(i => Seq[Any](fx(i))))
     val (fGot, fProbed) = nativeIds("ice.db.eqf")
@@ -255,7 +262,12 @@ class IcebergEqualityDeletesSuite extends AnyFunSuite with BeforeAndAfterAll {
     assert(fGot == icebergIds("ice.db.eqf"), "eqf: native scan differs from Iceberg's reader on a fixed key")
     info(s"fixed: native removed ${N - fGot.size}")
 
-    // --- composite (uuid, int) key: the native scan deletes exactly the rows Iceberg's own reader deletes ---
+    // --- composite (uuid, int) key ---
+    // The loaded delete set is correct here (verified: 143 distinct keys, and set.contains of a known key is
+    // true), but Iceberg 1.12's own Spark reader still applies zero of them -- its DeleteFilter projects the data
+    // row to the delete schema (StructProjection over the InternalRowWrapper) and the projected multi-field key
+    // does not match the set (single-field uuid and single-field int both apply; the two-field combination does
+    // not). The native scan mirrors Iceberg, so we assert native == Iceberg's own reader.
     create("eqc")
     addDeletes(
       "ice.db.eqc",
