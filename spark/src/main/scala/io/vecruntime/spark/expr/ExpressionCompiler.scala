@@ -1287,15 +1287,9 @@ object ExpressionCompiler {
     case c: CreateArray if c.children.nonEmpty =>
       constructorLanes(c.children, "array", input).map(CreateArrayExpr(_, c.dataType))
     case m: CreateMap if m.keys.nonEmpty =>
-      // Spark resolves a duplicate key per its dedup policy: take only maps whose keys cannot repeat -- one
-      // entry, or distinct non-null literals. A null key fails as Spark's does (CreateMapExpr). The values
-      // may be nested (a map of struct values); a nested key is accepted on the same single/distinct rule.
-      val literalKeys =
-        m.keys.forall(_.isInstanceOf[Literal]) && !m.keys.exists(k => k.asInstanceOf[Literal].value == null)
-      val distinct = m.keys.length == 1 ||
-        (literalKeys && m.keys.map(_.asInstanceOf[Literal].value).distinct.length == m.keys.length)
-      if (!distinct) Left("map(...) whose keys may repeat")
-      else for (k <- constructorLanes(m.keys, "map", input); v <- constructorLanes(m.values, "map", input))
+      // Keys may repeat: resolved at runtime by Spark's spark.sql.mapKeyDedupPolicy, per row
+      // (CreateMapExpr). A null key fails as Spark's does. Keys and values may be nested to any depth.
+      for (k <- constructorLanes(m.keys, "map", input); v <- constructorLanes(m.values, "map", input))
         yield CreateMapExpr(k, v, m.dataType)
     // Anything else keeps the reason the ordinary compiler gives it (element access with a nested
     // element, ...).

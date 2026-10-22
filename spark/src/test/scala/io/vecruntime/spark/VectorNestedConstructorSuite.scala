@@ -94,11 +94,70 @@ class VectorNestedConstructorSuite extends VectorQuerySuite {
     )
   }
 
-  test("a map whose keys may repeat keeps Spark's projection") {
-    // The keys never repeat here, but the compiler cannot know it.
-    val df = spark.sql("SELECT map(concat('a', id % 2), id, concat('b', id % 3), id) m FROM ctor")
-    df.collect()
-    assert(!df.queryExecution.executedPlan.exists(_.isInstanceOf[VectorProjectExec]))
+  test("map keys that may repeat no longer decline: LAST_WIN keeps the last value, per Spark, plugin on vs off") {
+    withConf("spark.sql.mapKeyDedupPolicy" -> "LAST_WIN") {
+      // Duplicate keys across rows (literal) and within one row; a key that is a column.
+      checkVectorized(
+        "SELECT id, map(concat('a', id % 2), id, concat('b', id % 3), id, concat('a', id % 2), id * 10) dup, " +
+          "map('k', id, 'k', id + 1, 'k', id + 2) same, " +
+          "map(cast(id % 3 as int), id, cast(id % 3 as int), id * 7) colkey FROM ctor",
+        Seq(Project)
+      )
+    }
+  }
+
+  test("map key equality is Spark's: -0.0 == 0.0, under LAST_WIN, plugin on vs off") {
+    withConf("spark.sql.mapKeyDedupPolicy" -> "LAST_WIN") {
+      // -0.0 and 0.0 collide; last value wins at the first position. (NaN-key equality is covered by the
+      // EXCEPTION test below -- two NaN keys collide and raise -- since a NaN-keyed Map does not compare
+      // equal with Scala's `==` here even when the two sides are identical.)
+      checkVectorized(
+        "SELECT id, map(cast(-0.0 as double), id, cast(0.0 as double), id + 1) zero, " +
+          "map(cast(id % 2 as double), id, cast(id % 2 as double), id + 5) colkey FROM ctor",
+        Seq(Project)
+      )
+    }
+  }
+
+  test("nested map keys compare structurally, under LAST_WIN, plugin on vs off") {
+    withConf("spark.sql.mapKeyDedupPolicy" -> "LAST_WIN") {
+      checkVectorized(
+        "SELECT id, map(named_struct('a', cast(id % 3 as int)), id, named_struct('a', cast(id % 3 as int)), id + 1) sk, " +
+          "map(array(cast(id % 2 as int), 1), id, array(cast(id % 2 as int), 1), id + 2) ak FROM ctor",
+        Seq(Project)
+      )
+    }
+  }
+
+  test("under EXCEPTION (the default), a duplicate map key raises Spark's DUPLICATED_MAP_KEY") {
+    // A row whose two keys collide (id % 2 repeats for even/odd pairs is avoided; force a guaranteed dup).
+    def duplicatedMapKey(sql: String): Boolean = {
+      val e = intercept[Exception](withPlugin(enabled = true)(spark.sql(sql).collect()))
+      Iterator.iterate[Throwable](e)(_.getCause).takeWhile(_ != null).exists { t =>
+        t match {
+          case st: org.apache.spark.SparkThrowable => st.getCondition == "DUPLICATED_MAP_KEY"
+          case _ => false
+        }
+      }
+    }
+    // Literal duplicate within a row, a column duplicate, and a NaN/-0.0 collision all raise under EXCEPTION.
+    assert(duplicatedMapKey("SELECT map('k', id, 'k', id + 1) m FROM ctor"), "literal dup did not raise")
+    assert(duplicatedMapKey("SELECT map(cast(id % 1 as int), id, cast(id % 1 as int), id) m FROM ctor"), "column dup")
+    assert(
+      duplicatedMapKey("SELECT map(cast('NaN' as double), id, sqrt(cast(-1 as double)), id) m FROM ctor"),
+      "NaN collision did not raise"
+    )
+    // Spark itself raises the same class for the same query (plugin off).
+    val sparkErr = intercept[Exception](
+      withPlugin(enabled = false)(spark.sql("SELECT map('k', id, 'k', id + 1) m FROM ctor").collect())
+    )
+    assert(
+      Iterator.iterate[Throwable](sparkErr)(_.getCause).takeWhile(_ != null).exists {
+        case st: org.apache.spark.SparkThrowable => st.getCondition == "DUPLICATED_MAP_KEY"
+        case _ => false
+      },
+      "Spark did not raise DUPLICATED_MAP_KEY for the same query"
+    )
   }
 
   test("named_struct(...) over scalar lanes, with null fields and a null-guarded struct") {
@@ -149,7 +208,8 @@ class VectorNestedConstructorSuite extends VectorQuerySuite {
   test("a struct of an array of maps, built by constructors to three levels") {
     checkVectorized(
       "SELECT id, named_struct('aom', array(map('a', i), map('b', cast(id % 7 as int))), 'tag', s) soam, " +
-        "named_struct('deep', array(named_struct('m', map(concat('k', id % 3), id)))) deep FROM ctor",
+        "named_struct('deep', array(named_struct('m', map(concat('k', id % 3), id)))) deep, " +
+        "map(concat('k', id), id, 'z', id * 2) insert_shape FROM ctor",
       Seq(Project)
     )
   }

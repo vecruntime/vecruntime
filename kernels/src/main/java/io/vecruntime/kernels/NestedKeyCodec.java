@@ -61,7 +61,7 @@ public final class NestedKeyCodec {
             if (v.isNull(i)) {
                 nulls[i] = true;
             } else {
-                value(v, i, out);
+                value(v, i, out, false);
             }
             offsets[i + 1] = out.size;
         }
@@ -71,25 +71,49 @@ public final class NestedKeyCodec {
     /** One non-null value's encoding (exposed for tests). */
     public static byte[] encodeValue(VectorBuffers v, int i) {
         Out out = new Out(64);
-        value(v, i, out);
+        value(v, i, out, false);
         return Arrays.copyOf(out.buf, out.size);
     }
 
-    private static void child(VectorBuffers v, int i, Out out) {
+    /**
+     * One non-null value's encoding with float leaves normalised the way
+     * Spark's map-key dedup compares them ({@code NaN == NaN}, {@code -0.0 ==
+     * 0.0}): used only to detect duplicate map keys, never to store the key, so
+     * the stored key keeps its original bits. Two keys Spark considers equal
+     * encode to the same bytes here.
+     */
+    public static byte[] encodeKeyForDedup(VectorBuffers v, int i) {
+        Out out = new Out(64);
+        value(v, i, out, true);
+        return Arrays.copyOf(out.buf, out.size);
+    }
+
+    private static void child(VectorBuffers v, int i, Out out,
+            boolean normalizeFloats) {
         if (v.isNull(i)) {
             out.b(0);
         } else {
             out.b(1);
-            value(v, i, out);
+            value(v, i, out, normalizeFloats);
         }
     }
 
-    private static void value(VectorBuffers v, int i, Out out) {
+    private static void value(VectorBuffers v, int i, Out out,
+            boolean normalizeFloats) {
         switch (v.type()) {
             case BOOL -> out.b(v.getBoolean(i) ? 1 : 0);
             case INT32 -> out.i32(v.getInt(i));
             case INT64 -> out.i64(v.getLong(i));
-            case FLOAT64 -> out.i64(Double.doubleToRawLongBits(v.getDouble(i)));
+            case FLOAT64 -> {
+                double d = v.getDouble(i);
+                // Spark's map-key dedup normalises NaN and -0.0 so equal values encode alike.
+                if (normalizeFloats) {
+                    d = Double.isNaN(d)
+                            ? Double.NaN
+                            : (d == 0.0 ? 0.0 : d);
+                }
+                out.i64(Double.doubleToRawLongBits(d));
+            }
             case DECIMAL128 -> out.dec(v.getDecimal128(i));
             case FIXED_BINARY -> throw new IllegalStateException("no FIXED_BINARY keys: the lane does not reach operators");
             case UTF8 -> {
@@ -104,7 +128,7 @@ public final class NestedKeyCodec {
                 for (int j = nv.start(i);
                      j < nv.end(i);
                      j++) {
-                    child(e, j, out);
+                    child(e, j, out, normalizeFloats);
                 }
             }
             case MAP -> {
@@ -115,13 +139,13 @@ public final class NestedKeyCodec {
                 for (int j = nv.start(i);
                      j < nv.end(i);
                      j++) {
-                    child(k, j, out);
-                    child(val, j, out);
+                    child(k, j, out, normalizeFloats);
+                    child(val, j, out, normalizeFloats);
                 }
             }
             case STRUCT -> {
                 for (VectorBuffers f : v.children()) {
-                    child(f, i, out);
+                    child(f, i, out, normalizeFloats);
                 }
             }
         }

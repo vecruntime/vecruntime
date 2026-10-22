@@ -85,4 +85,7 @@ object VectorErrors {
 
   /** `map(...)` with a null key (#842): Spark's `NULL_MAP_KEY`. */
   def nullMapKey(): RuntimeException = QueryExecutionErrors.nullAsMapKeyNotAllowedError()
+
+  /** `map(...)` with a duplicate key under the EXCEPTION dedup policy (#901 R3): Spark's `DUPLICATED_MAP_KEY`. */
+  def duplicateMapKey(key: Any): RuntimeException = QueryExecutionErrors.duplicateMapKeyFoundError(key)
 }
