@@ -112,6 +112,9 @@ case class VectorColumnarRule(session: SparkSession) extends ColumnarRule {
       // its output is the write's commit messages) is taken out again.
       case w @ VectorWriteFilesExec(c: org.apache.spark.sql.execution.ColumnarToRowExec, _, _, _, _, _) =>
         w.copy(child = c.child)
+      // #842: likewise for the columnar Iceberg writer, a command that reads its child's batches.
+      case w: VectorIcebergWriteExec if w.query.isInstanceOf[org.apache.spark.sql.execution.ColumnarToRowExec] =>
+        w.copy(query = w.query.asInstanceOf[org.apache.spark.sql.execution.ColumnarToRowExec].child)
     }
   }
 }
