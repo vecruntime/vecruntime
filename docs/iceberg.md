@@ -226,7 +226,7 @@ Per step:
 
 | Case | Why |
 |---|---|
-| `variant`, geometry types | Not encoded by the columnar writer yet. `time` and `timestamp_ns` columns cannot be read or written from Spark with Iceberg 1.12 at all |
+| Geometry types; a shredded `variant` (`write.parquet.shred-variants`) | Not encoded by the columnar writer yet. `time` and `timestamp_ns` columns cannot be read or written from Spark with Iceberg 1.12 at all |
 | ORC or Avro data or delete files | The columnar writer writes Parquet only |
 | Encrypted tables | Key metadata is not written |
 | A partition source that is not a top-level column of a supported type | The transform is computed on the batch's top-level lanes |
