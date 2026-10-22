@@ -276,7 +276,13 @@ object VectorIcebergWriteExec extends Logging {
           writer.write(java.util.Arrays.asList(cols: _*), 0, n)
         } finally arena.close()
       }
-      IcebergWriteBridge.taskCommit(writer.dataFiles())
+      val files = writer.dataFiles()
+      // Spark's output metrics (UI, listeners), as its DataWritingSparkTask reports them for a v2 write.
+      val (records, bytes) = IcebergWriteBridge.fileTotals(files)
+      val out = ctx.taskMetrics().outputMetrics
+      out.setRecordsWritten(out.recordsWritten + records)
+      out.setBytesWritten(out.bytesWritten + bytes)
+      IcebergWriteBridge.taskCommit(files)
     } catch {
       case t: Throwable =>
         writer.abort(t)

@@ -174,6 +174,32 @@ class VectorIcebergWriteSuite extends AnyFunSuite with BeforeAndAfterAll {
     assert(files.getLong(1) == 20000L)
   }
 
+  test("the columnar append reports Spark's output metrics: records and bytes written") {
+    val t = "ice.db.outmetrics"
+    create(t)
+    val records = new java.util.concurrent.atomic.AtomicLong()
+    val bytes = new java.util.concurrent.atomic.AtomicLong()
+    val listener = new org.apache.spark.scheduler.SparkListener {
+      override def onTaskEnd(e: org.apache.spark.scheduler.SparkListenerTaskEnd): Unit =
+        Option(e.taskMetrics).foreach { m =>
+          records.addAndGet(m.outputMetrics.recordsWritten)
+          bytes.addAndGet(m.outputMetrics.bytesWritten)
+        }
+    }
+    spark.sparkContext.addSparkListener(listener)
+    try {
+      val df = withWriter(on = true)(spark.sql(s"INSERT INTO $t ${source(20000)}"))
+      df.collect()
+      // The listener bus is asynchronous: wait (bounded) for the write's task-end events.
+      val deadline = System.nanoTime() + 20L * 1000 * 1000 * 1000
+      while (records.get() < 20000L && System.nanoTime() < deadline) Thread.sleep(50)
+      assert(columnar(df))
+    } finally spark.sparkContext.removeSparkListener(listener)
+    val files = spark.sql(s"SELECT sum(record_count), sum(file_size_in_bytes) FROM $t.files").collect()(0)
+    assert(records.get() == 20000L, "recordsWritten")
+    assert(bytes.get() == files.getLong(1), "bytesWritten must be the data files' size")
+  }
+
   test("the files' metrics let Iceberg prune on them") {
     val t = "ice.db.prune_on"
     create(t)
