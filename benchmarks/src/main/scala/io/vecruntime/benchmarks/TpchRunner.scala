@@ -411,6 +411,7 @@ object TpchRunner {
                 println(s"[${args.suite.name}]   memory (MiB, max over ${result.memory.getOrElse("executors", 0L)} executors): " +
                   s"rssPeak=${mb("rssPeakMax")} poolPeak=${mb("nativePoolPeakMax")} pinnedPeak=${mb("pinnedPeakMax")} " +
                   s"heapOldPeak=${mb("heapOldPeakMax")} prefetchPeak=${mb("prefetchPeakMax")} " +
+                  s"readAheadPeak=${mb("readAheadPeakMax")} readAheadRefusals=${result.memory.getOrElse("readAheadRefusalsSum", 0L)} " +
                   s"overdraft=${mb("nativePoolOverdraftMax")} leaked=${mb("nativePoolLeakedMax")}")
               }
               result.fallbacks.foreach(f => println(s"[${args.suite.name}]   fallback: $f"))

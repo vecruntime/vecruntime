@@ -78,7 +78,8 @@ For every value it gives `<name>Max` and `<name>Sum` over the executors, plus `e
   `nativePoolOverdraft` and `nativePoolLeaked` during the run;
 - the pinned bytes: `pinned` and `pinnedPeak`;
 - Arrow: `arrow`, and `arrowPeakSinceStart`, which can't be reset;
-- the scan's read-ahead: `prefetchPeak`;
+- the scan's read-ahead: `prefetchPeak`, `readAheadHeld`, `readAheadPeak`, and the growth of `readAheadRefusals`
+  during the run;
 - the heap's old generation: `heapOldPeak` and `heapOldAfterGc`;
 - the process: `rss` and `rssPeak` (VmHWM).
 

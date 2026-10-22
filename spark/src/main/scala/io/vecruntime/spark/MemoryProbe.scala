@@ -46,6 +46,9 @@ object MemoryProbe {
       "arrow" -> io.vecruntime.spark.arrow.VectorAllocators.allocatedBytes(),
       "arrowPeakSinceStart" -> io.vecruntime.spark.arrow.VectorAllocators.peakBytes(),
       "prefetchPeak" -> org.apache.spark.sql.vecruntime.VectorParquetScanExec.prefetchPeakBytes,
+      "readAheadHeld" -> org.apache.spark.sql.vecruntime.VectorParquetScanExec.readAheadHeldBytes,
+      "readAheadPeak" -> org.apache.spark.sql.vecruntime.VectorParquetScanExec.readAheadPeakBytes,
+      "readAheadRefusals" -> org.apache.spark.sql.vecruntime.VectorParquetScanExec.readAheadRefusals,
       "heapOldPeak" -> oldGen.map(_.getPeakUsage.getUsed).sum,
       "heapOldAfterGc" -> oldGen.flatMap(p => Option(p.getCollectionUsage)).map(_.getUsed).sum,
       "rss" -> rss,
@@ -58,6 +61,7 @@ object MemoryProbe {
     io.vecruntime.kernels.NativePool.shared().resetPeak()
     org.apache.spark.sql.vecruntime.PinnedMemory.resetPeak()
     org.apache.spark.sql.vecruntime.VectorParquetScanExec.resetPrefetchPeak()
+    org.apache.spark.sql.vecruntime.VectorParquetScanExec.resetReadAheadPeak()
     heapPools.foreach(_.resetPeakUsage())
     // Writing 5 to clear_refs restarts the process's VmHWM (Linux 4.0+); where it is refused the peak is since start.
     try java.nio.file.Files.writeString(java.nio.file.Path.of("/proc/self/clear_refs"), "5")
@@ -95,7 +99,7 @@ object MemoryProbe {
   def summarize(before: Map[String, Map[String, Long]], after: Map[String, Map[String, Long]]): Map[String, Long] = {
     if (after.isEmpty) return Map.empty
     val keys = after.values.head.keySet
-    val cumulative = Set("nativePoolOverdraft", "nativePoolLeaked")
+    val cumulative = Set("nativePoolOverdraft", "nativePoolLeaked", "readAheadRefusals")
     keys.toSeq.flatMap { k =>
       val values = after.toSeq.map { case (id, s) =>
         val v = s.getOrElse(k, 0L)
