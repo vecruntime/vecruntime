@@ -371,7 +371,14 @@ object VectorWriteDeltaExec extends Logging {
         if (dataWriter == null) null
         else {
           columnarDataTasks.incrementAndGet()
-          IcebergDeltaWriteBridge.dataCommit(dataWriter.dataFiles())
+          val files = dataWriter.dataFiles()
+          if (tc != null) {
+            val (records, bytes) = IcebergWriteBridge.fileTotals(files)
+            val out = tc.taskMetrics().outputMetrics
+            out.setRecordsWritten(out.recordsWritten + records)
+            out.setBytesWritten(out.bytesWritten + bytes)
+          }
+          IcebergDeltaWriteBridge.dataCommit(files)
         }
       Seq(ours, data)
     } catch {
