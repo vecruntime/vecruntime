@@ -13,6 +13,8 @@ version may change configuration keys or defaults, always noted here.
   narrows its window when the operators above it need the pool instead of making them spill. The byte caps
   (`prefetchMaxBytes`, `prefetchExecutorMaxBytes`) stay as the upper bound. Executor metrics
   `scanReadAheadHeldBytes`, `scanReadAheadPeakBytes`, `scanReadAheadRefusals`.
+- Deeper read-ahead by default (#915): `prefetchFiles` 6 -> 12, `prefetchRowGroups` 2 -> 4, `decodeAhead` 0 -> 2.
+  At 10 TB the full TPC-DS run went from 2,404 s to 2,329 s (-3.1%), with the byte caps kept as the upper bound.
 - Native pool accounting (#869, `spark.vecruntime.memory.poolAccounting.enabled`, on by default): every block a
   task takes from `NativePool` is held in that task's Spark execution memory through one account, which the sort's
   and the grace hash join's reservations share, so a block is counted once and an allocation no operator reserved
