@@ -142,6 +142,7 @@ public final class IcebergDataTaskWriter implements AutoCloseable {
     private final NameMapping nameMapping;
     private final Configuration conf;
     private final PartitionKeys keys;
+    private final boolean arrowLanes;
     private final List<DataFile> done = new ArrayList<>();
     private final List<String> written = new ArrayList<>();
     // Unpartitioned, or clustered: the one open partition.
@@ -167,6 +168,7 @@ public final class IcebergDataTaskWriter implements AutoCloseable {
         this.nameMapping = mapping == null ? null : NameMappingParser.fromJson(mapping);
         this.conf = conf;
         this.keys = spec.spec().isUnpartitioned() ? null : new PartitionKeys(spec.spec(), spec.writeSchema());
+        this.arrowLanes = SparkLanes.needed(spec.writeSchema());
     }
 
     /**
@@ -177,6 +179,18 @@ public final class IcebergDataTaskWriter implements AutoCloseable {
         if (end <= first) {
             return;
         }
+        if (arrowLanes) {
+            // Spark's lanes as the Arrow lanes of the Iceberg types (SparkLanes), for the length of this call: the
+            // encoders copy every value into their pages before it returns.
+            try (java.lang.foreign.Arena arena = java.lang.foreign.Arena.ofConfined()) {
+                writeArrow(SparkLanes.toArrow(spec.writeSchema(), columns, arena), first, end);
+            }
+            return;
+        }
+        writeArrow(columns, first, end);
+    }
+
+    private void writeArrow(List<? extends VectorBuffers> columns, int first, int end) {
         if (keys == null) {
             if (current == null) {
                 current = new Rolling(null);

@@ -92,7 +92,7 @@ public final class IcebergDataCommitBridge {
 
     private static String unsupportedType(Type type) {
         switch (type.typeId()) {
-            case BOOLEAN, INTEGER, LONG, FLOAT, DOUBLE, DATE, TIMESTAMP, STRING, BINARY, DECIMAL:
+            case BOOLEAN, INTEGER, LONG, FLOAT, DOUBLE, DATE, TIMESTAMP, STRING, BINARY, DECIMAL, FIXED:
                 return null;
             case STRUCT:
                 for (Types.NestedField f : type.asStructType().fields()) {
@@ -111,7 +111,7 @@ public final class IcebergDataCommitBridge {
                 return k != null ? k : unsupportedType(type.asMapType()
                         .valueType());
             default:
-                // TIME, TIMESTAMP_NANO, UUID, FIXED, VARIANT, GEOMETRY, GEOGRAPHY, UNKNOWN: not encoded natively yet.
+                // TIME, TIMESTAMP_NANO, UUID, VARIANT, GEOMETRY, GEOGRAPHY, UNKNOWN: not encoded natively yet.
                 return type.toString();
         }
     }

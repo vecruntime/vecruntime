@@ -91,6 +91,7 @@ public final class NestedKeyCodec {
             case INT64 -> out.i64(v.getLong(i));
             case FLOAT64 -> out.i64(Double.doubleToRawLongBits(v.getDouble(i)));
             case DECIMAL128 -> out.dec(v.getDecimal128(i));
+            case FIXED_BINARY -> throw new IllegalStateException("no FIXED_BINARY keys: the lane does not reach operators");
             case UTF8 -> {
                 byte[] b = v.getUtf8Bytes(i);
                 out.i32(b.length);
