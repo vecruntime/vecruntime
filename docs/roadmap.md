@@ -14,16 +14,18 @@ is for the themes big enough to shape the engine.
 ## Deeper integration with Project Panama
 
 VecRuntime is already built on the JDK's Foreign Function & Memory API: our
-columnar vectors are off-heap `MemorySegment`s, and the native boundary is
-crossed through the Panama FFM machinery rather than legacy JNI. The roadmap is
-to lean further into [OpenJDK Project Panama](https://openjdk.org/projects/panama/)
-as it matures:
+columnar vectors are off-heap `MemorySegment`s, the native boundary is crossed
+through the Panama FFM machinery rather than legacy JNI, and the hot per-batch
+kernels already use the **Vector API** (Panama's SIMD layer) for explicit
+vectorization. The roadmap is to lean further into
+[OpenJDK Project Panama](https://openjdk.org/projects/panama/) as it matures:
 
 - Track the FFM API as it stabilizes across JDK releases and adopt the
   improvements that reduce the cost of the native boundary.
-- Evaluate the **Vector API** (Panama's SIMD incubator) for the hot
-  per-row/per-batch kernels where explicit vectorization beats what the JIT
-  autovectorizes today.
+- Deepen our **Vector API** use and tune it as newer JDK releases ship —
+  widen the set of kernels that run on explicit SIMD, and re-tune lane widths,
+  masks and shapes against each release's codegen so the engine keeps pace with
+  the Vector API as it moves toward a stable (non-incubator) form.
 - Keep allocation, arena lifecycle and the segment accessors aligned with where
   Panama is going, so the engine benefits from the platform's work rather than
   working around it.
