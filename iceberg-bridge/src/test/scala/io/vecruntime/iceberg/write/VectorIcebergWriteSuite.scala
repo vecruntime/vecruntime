@@ -228,7 +228,7 @@ class VectorIcebergWriteSuite extends AnyFunSuite with BeforeAndAfterAll {
   }
 
   private def lineage(t: String): Seq[Row] =
-    spark.sql(s"SELECT id, _row_id, _last_updated_sequence_number FROM $t ORDER BY id").collect().toSeq
+    spark.sql(s"SELECT id, _row_id, _last_updated_sequence_number FROM $t ORDER BY id, _row_id").collect().toSeq
 
   for (
     (op, sql) <- Seq(
