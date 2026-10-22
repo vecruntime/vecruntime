@@ -508,6 +508,7 @@ public final class ScalarReference {
             case BOOL -> v.getBoolean(i);
             case UTF8 -> v.getString(i);
             case DECIMAL128 -> v.getDecimal128(i);
+            case FIXED_BINARY -> java.util.HexFormat.of().formatHex(((io.vecruntime.kernels.FixedBinaryVectorBuffers) v).bytes(i));
             case LIST -> {
                 NestedVectorBuffers n = (NestedVectorBuffers) v;
                 VectorBuffers elements = n.children().get(0);
