@@ -47,6 +47,22 @@ object VectorConf {
   val IcebergDvWriterEnabled = "spark.vecruntime.iceberg.dvWriter.enabled"
 
   /**
+   * #901 R1: the native Iceberg scan resolves each data file's columns with Iceberg's own rules (iceberg-bridge's
+   * `IcebergReadSpecs`: field ids, the table's name mapping, Iceberg's positional fallback ids, promotions,
+   * initial defaults) instead of Spark's `clipParquetSchema` over field-id metadata. Without the bridge on the
+   * classpath the scan resolves as before. On by default; off is the previous resolution, for A/B runs.
+   */
+  val IcebergReadSpecsEnabled = "spark.vecruntime.iceberg.readSpecs.enabled"
+
+  /**
+   * #901 R2: the native Iceberg scan applies equality deletes on each batch's lanes (iceberg-bridge's
+   * `EqualityDeleteSet`: one hash probe per row over the key's canonical bytes) instead of wrapping every row for
+   * Iceberg's `StructLikeSet`. The delete rows are still loaded by Iceberg's own delete loader. Without the bridge,
+   * or for a key type it does not take, the row probe stays. On by default.
+   */
+  val IcebergNativeEqualityDeletesEnabled = "spark.vecruntime.iceberg.nativeEqualityDeletes.enabled"
+
+  /**
    * The columnar Iceberg data-file writer (#842, W2): `INSERT INTO`, `INSERT OVERWRITE` and copy-on-write
    * `DELETE` / `UPDATE` / `MERGE INTO` into an Iceberg table write their Parquet data files from our batches
    * through `IcebergParquetAppender` (the `iceberg-bridge` module) instead of Iceberg's row writer; the commit
@@ -339,6 +355,9 @@ object VectorConf {
    * merge-on-read suite.
    */
   def icebergDvWriterEnabled(conf: SQLConf): Boolean = bool(conf, IcebergDvWriterEnabled, default = false)
+  def icebergReadSpecsEnabled(conf: SQLConf): Boolean = bool(conf, IcebergReadSpecsEnabled, default = true)
+  def icebergNativeEqualityDeletesEnabled(conf: SQLConf): Boolean =
+    bool(conf, IcebergNativeEqualityDeletesEnabled, default = true)
 
   /** The columnar Iceberg data-file writer (#842, W2). Default `false` while it lands. */
   def icebergWriterEnabled(conf: SQLConf): Boolean = bool(conf, IcebergWriterEnabled, default = false)
