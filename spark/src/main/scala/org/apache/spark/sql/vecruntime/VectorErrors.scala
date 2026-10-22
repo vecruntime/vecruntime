@@ -82,4 +82,7 @@ object VectorErrors {
   /** An ANSI cast whose value is outside the target type's range. */
   def castOverflow(value: Any, from: DataType, to: DataType): ArithmeticException =
     QueryExecutionErrors.castingCauseOverflowError(value, from, to)
+
+  /** `map(...)` with a null key (#842): Spark's `NULL_MAP_KEY`. */
+  def nullMapKey(): RuntimeException = QueryExecutionErrors.nullAsMapKeyNotAllowedError()
 }

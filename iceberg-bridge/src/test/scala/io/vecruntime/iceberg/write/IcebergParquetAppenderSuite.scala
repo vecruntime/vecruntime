@@ -388,18 +388,135 @@ class IcebergParquetAppenderSuite extends AnyFunSuite {
     }
   }
 
-  test("a float or double inside a list or a map is refused") {
-    val listOfDoubles = new Schema(optional(1, "xs", Types.ListType.ofOptional(2, Types.DoubleType.get())))
-    withDir { dir =>
-      intercept[UnsupportedOperationException] {
-        IcebergParquetAppender.create(
-          Files.localOutput(dir.resolve("x.parquet").toFile),
-          listOfDoubles,
+  test("floats and doubles inside lists, maps and structs of lists report Iceberg's metrics") {
+    val schema = new Schema(
+      optional(1, "xs", Types.ListType.ofOptional(2, Types.DoubleType.get())),
+      optional(3, "m", Types.MapType.ofOptional(4, 5, Types.StringType.get(), Types.FloatType.get())),
+      optional(6, "s", Types.StructType.of(optional(7, "ys", Types.ListType.ofOptional(8, Types.FloatType.get()))))
+    )
+    val r = new Random(11L)
+    val n = 2500
+    def value(): Option[Double] = r.nextInt(12) match {
+      case 0 => None
+      case 1 => Some(Double.NaN)
+      case 2 => Some(-0.0)
+      case 3 => Some(0.0)
+      case _ => Some(r.nextGaussian() * 100)
+    }
+    val xs = Array.fill(n)(if (r.nextInt(8) == 0) None else Some(Seq.fill(r.nextInt(5))(value())))
+    val ms = Array.fill(n)(if (r.nextInt(8) == 0) None
+    else Some((0 until r.nextInt(3)).map(e => ("k" + e, value().map(_.toFloat.toDouble)))))
+    // s: null struct, struct with a null list, or struct with elements.
+    val ss = Array.fill(n)(r.nextInt(7) match {
+      case 0 => None
+      case 1 => Some(None)
+      case _ => Some(Some(Seq.fill(r.nextInt(4))(value().map(_.toFloat.toDouble))))
+    })
+    def offsets(a: Arena, sizes: Array[Int]) = {
+      val seg = ArrowLayout.allocateOffsets(a, sizes.length)
+      var at = 0
+      sizes.indices.foreach { k =>
+        seg.set(VectorBuffers.LE_INT, k.toLong << 2, at)
+        at += sizes(k)
+      }
+      seg.set(VectorBuffers.LE_INT, sizes.length.toLong << 2, at)
+      seg
+    }
+    def doubles(a: Arena, vs: Array[Option[Double]]) =
+      ArrowLayout.ofDoubles(a, vs.map(_.getOrElse(0.0)), vs.map(_.isEmpty))
+    def vectors(a: Arena): java.util.List[VectorBuffers] = {
+      val xsList = NestedVectorBuffers.list(
+        n,
+        ArrowLayout.validityFrom(a, xs.map(_.isEmpty), n),
+        offsets(a, xs.map(_.map(_.length).getOrElse(0))),
+        doubles(a, xs.flatMap(_.getOrElse(Nil)))
+      )
+      val entries = ms.flatMap(_.getOrElse(Nil))
+      val mMap = NestedVectorBuffers.map(
+        n,
+        ArrowLayout.validityFrom(a, ms.map(_.isEmpty), n),
+        offsets(a, ms.map(_.map(_.length).getOrElse(0))),
+        ArrowLayout.ofStrings(a, entries.map(_._1)),
+        doubles(a, entries.map(_._2))
+      )
+      val lists = ss.map(_.flatten)
+      val ysList = NestedVectorBuffers.list(
+        n,
+        ArrowLayout.validityFrom(a, lists.map(_.isEmpty), n),
+        offsets(a, lists.map(_.map(_.length).getOrElse(0))),
+        doubles(a, lists.flatMap(_.getOrElse(Nil)))
+      )
+      val sStruct =
+        NestedVectorBuffers.struct(n, ArrowLayout.validityFrom(a, ss.map(_.isEmpty), n), java.util.List.of(ysList))
+      java.util.List.of(xsList, mMap, sStruct)
+    }
+    def record(k: Int): Record = {
+      val rec = GenericRecord.create(schema)
+      rec.setField("xs", xs(k).map(_.map(_.map(Double.box).orNull).asJava).orNull)
+      rec.setField(
+        "m",
+        ms(k).map { es =>
+          val m = new java.util.LinkedHashMap[String, java.lang.Float]()
+          es.foreach { case (key, v) => m.put(key, v.map(d => Float.box(d.toFloat)).orNull) }
+          m
+        }.orNull
+      )
+      rec.setField(
+        "s",
+        ss(k).map { ys =>
+          val s = GenericRecord.create(schema.findType("s").asStructType())
+          s.setField("ys", ys.map(_.map(_.map(d => Float.box(d.toFloat)).orNull).asJava).orNull)
+          s
+        }.orNull
+      )
+      rec
+    }
+    for (batch <- Seq(n, 97)) {
+      withDir { dir =>
+        val appender = IcebergParquetAppender.create(
+          Files.localOutput(dir.resolve("native.parquet").toFile),
+          schema,
           java.util.Map.of(),
           MetricsConfig.getDefault,
           null,
           new Configuration()
         )
+        val arena = Arena.ofConfined()
+        try {
+          val cols = vectors(arena)
+          var at = 0
+          while (at < n) {
+            appender.write(cols, at, math.min(n, at + batch))
+            at += batch
+          }
+          appender.close()
+        } finally arena.close()
+        val iceberg: FileAppender[Record] = Parquet.write(Files.localOutput(dir.resolve("iceberg.parquet").toFile))
+          .schema(schema)
+          .createWriterFunc((s: Schema, t: org.apache.iceberg.shaded.org.apache.parquet.schema.MessageType) =>
+            GenericParquetWriter.create(s, t)
+          )
+          .build()
+        (0 until n).foreach(k => iceberg.add(record(k)))
+        iceberg.close()
+        val (a, b) = (appender.metrics(), iceberg.metrics())
+        assert(a.valueCounts() == b.valueCounts(), s"batch $batch value counts")
+        assert(a.nullValueCounts() == b.nullValueCounts(), s"batch $batch null counts")
+        assert(a.nanValueCounts() == b.nanValueCounts(), s"batch $batch NaN counts")
+        assert(a.lowerBounds() == b.lowerBounds(), s"batch $batch lower bounds")
+        assert(a.upperBounds() == b.upperBounds(), s"batch $batch upper bounds")
+        // Iceberg's writer keeps no metrics for fields under a list or map; ours match it exactly.
+        info(s"Iceberg's metrics cover ${b.valueCounts().keySet()}")
+        // The values themselves read back through Iceberg's reader (compared as text: NaN != NaN).
+        val in = Parquet.read(Files.localInput(dir.resolve("native.parquet").toFile)).project(schema)
+          .createReaderFunc(t => GenericParquetReaders.buildReader(schema, t)).build[Record]()
+        val back =
+          try in.asScala.map(_.copy()).toIndexedSeq
+          finally in.close()
+        assert(back.length == n)
+        back.zipWithIndex.foreach { case (got, k) =>
+          assert(String.valueOf(got) == String.valueOf(record(k)), s"batch $batch row $k")
+        }
       }
     }
   }

@@ -47,6 +47,15 @@ object VectorConf {
   val IcebergDvWriterEnabled = "spark.vecruntime.iceberg.dvWriter.enabled"
 
   /**
+   * The columnar Iceberg data-file writer (#842, W2): `INSERT INTO`, `INSERT OVERWRITE` and copy-on-write
+   * `DELETE` / `UPDATE` / `MERGE INTO` into an Iceberg table write their Parquet data files from our batches
+   * through `IcebergParquetAppender` (the `iceberg-bridge` module) instead of Iceberg's row writer; the commit
+   * stays Iceberg's own (`write.toBatch()`). Unpartitioned output specs only for now; anything else declines to
+   * Spark's writer with a printed reason. Default OFF while it lands.
+   */
+  val IcebergWriterEnabled = "spark.vecruntime.iceberg.writer.enabled"
+
+  /**
    * Logical rewrite (#632): `IsNotNull` on a grouping key that is the only difference between the
    * inputs of two aggregates (a CTE used twice) moves above the aggregates, so the input is shared.
    */
@@ -330,6 +339,9 @@ object VectorConf {
    * merge-on-read suite.
    */
   def icebergDvWriterEnabled(conf: SQLConf): Boolean = bool(conf, IcebergDvWriterEnabled, default = false)
+
+  /** The columnar Iceberg data-file writer (#842, W2). Default `false` while it lands. */
+  def icebergWriterEnabled(conf: SQLConf): Boolean = bool(conf, IcebergWriterEnabled, default = false)
   def aggDictionaryKeys(conf: SQLConf): Boolean = bool(conf, AggDictionaryKeys, default = true)
 
   /** Pass selection bitmaps between spark-vector operators instead of compacting each batch. */
