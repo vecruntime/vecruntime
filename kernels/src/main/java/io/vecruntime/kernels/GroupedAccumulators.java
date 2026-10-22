@@ -635,12 +635,19 @@ public final class GroupedAccumulators {
      * Exact, so the interleaving question of the double sums does not arise and
      * none is done.
      */
-    public static final class WideLongSum {
+    public static final class WideLongSum implements AutoCloseable {
         private int capacity = 64;
         private long[] hi = new long[64];
         private long[] lo = new long[64];
         private long[] count = new long[64];
-        private boolean[] overflowed = new boolean[64];
+        private boolean[] overflowed = new boolean[64]; // on the heap even when native: one byte a group
+        // #941: hi, lo and count once native (the arrays are then null); the segments are cached per growth.
+        private NativeLongs nHi;
+        private NativeLongs nLo;
+        private NativeLongs nCount;
+        private MemorySegment sHi;
+        private MemorySegment sLo;
+        private MemorySegment sCount;
         private final Scratch scratch = new Scratch();
 
         /**
@@ -757,6 +764,10 @@ public final class GroupedAccumulators {
          * as a value.
          */
         private void addWide(int g, long xh, long xl) {
+            if (sHi != null) {
+                addWideNative(g, xh, xl);
+                return;
+            }
             long l = lo[g];
             long sum = l + xl;
             long carry = ((l & xl) | ((l | xl) & ~sum)) >>> 63;
@@ -806,6 +817,10 @@ public final class GroupedAccumulators {
          * then the sign word.
          */
         private void add(int g, long x) {
+            if (sHi != null) {
+                addNative(g, x);
+                return;
+            }
             long l = lo[g];
             long sum = l + x;
             long carry = ((l & x) | ((l | x) & ~sum)) >>> 63;
@@ -814,34 +829,98 @@ public final class GroupedAccumulators {
             count[g]++;
         }
 
+        /** {@link #add} on the native state (#941). */
+        private void addNative(int g, long x) {
+            long l = sLo.getAtIndex(NativeLongs.LONG, g);
+            long sum = l + x;
+            long carry = ((l & x) | ((l | x) & ~sum)) >>> 63;
+            sLo.setAtIndex(NativeLongs.LONG, g, sum);
+            sHi.setAtIndex(NativeLongs.LONG, g, sHi.getAtIndex(NativeLongs.LONG, g) + (x >> 63) + carry);
+            sCount.setAtIndex(NativeLongs.LONG, g, sCount.getAtIndex(NativeLongs.LONG, g) + 1);
+        }
+
+        /** {@link #addWide} on the native state (#941). */
+        private void addWideNative(int g, long xh, long xl) {
+            long l = sLo.getAtIndex(NativeLongs.LONG, g);
+            long sum = l + xl;
+            long carry = ((l & xl) | ((l | xl) & ~sum)) >>> 63;
+            long h = sHi.getAtIndex(NativeLongs.LONG, g);
+            long hsum = h + xh + carry;
+            if (((h ^ hsum) & (xh ^ hsum)) < 0) {
+                overflowed[g] = true;
+            }
+            sLo.setAtIndex(NativeLongs.LONG, g, sum);
+            sHi.setAtIndex(NativeLongs.LONG, g, hsum);
+            sCount.setAtIndex(NativeLongs.LONG, g, sCount.getAtIndex(NativeLongs.LONG, g) + 1);
+        }
+
         private void ensure(int groups) {
             if (groups > capacity) {
                 int cap = grow(capacity, groups);
-                hi = Arrays.copyOf(hi, cap);
-                lo = Arrays.copyOf(lo, cap);
-                count = Arrays.copyOf(count, cap);
                 overflowed = Arrays.copyOf(overflowed, cap);
+                if (nHi != null) {
+                    nHi.grow(cap);
+                    nLo.grow(cap);
+                    nCount.grow(cap);
+                } else if (goNative(1, cap)) {
+                    nHi = new NativeLongs(hi, capacity, cap);
+                    nLo = new NativeLongs(lo, capacity, cap);
+                    nCount = new NativeLongs(count, capacity, cap);
+                    hi = null;
+                    lo = null;
+                    count = null;
+                } else {
+                    hi = Arrays.copyOf(hi, cap);
+                    lo = Arrays.copyOf(lo, cap);
+                    count = Arrays.copyOf(count, cap);
+                }
+                if (nHi != null) {
+                    sHi = nHi.segment();
+                    sLo = nLo.segment();
+                    sCount = nCount.segment();
+                }
                 capacity = cap;
+            }
+        }
+
+        /** Bytes of state outside the heap: 0 until the table goes native. */
+        public long nativeBytes() {
+            return nHi == null ? 0L : nHi.bytes() + nLo.bytes() + nCount.bytes();
+        }
+
+        /**
+         * Gives the native state back to the pool; the accumulator is not used
+         * afterwards.
+         */
+        @Override
+        public void close() {
+            if (nHi != null) {
+                nHi.close();
+                nLo.close();
+                nCount.close();
+                sHi = null;
+                sLo = null;
+                sCount = null;
             }
         }
 
         /** High word of the group's signed 128-bit sum. */
         public long hi(int g) {
-            return hi[g];
+            return sHi != null ? sHi.getAtIndex(NativeLongs.LONG, g) : hi[g];
         }
 
         /** Low word (unsigned) of the group's signed 128-bit sum. */
         public long lo(int g) {
-            return lo[g];
+            return sLo != null ? sLo.getAtIndex(NativeLongs.LONG, g) : lo[g];
         }
 
         public long count(int g) {
-            return count[g];
+            return sCount != null ? sCount.getAtIndex(NativeLongs.LONG, g) : count[g];
         }
 
         /** The group's sum as a {@link java.math.BigInteger}. */
         public java.math.BigInteger sum(int g) {
-            return toBigInteger(hi[g], lo[g]);
+            return toBigInteger(hi(g), lo(g));
         }
 
         /**
@@ -857,14 +936,19 @@ public final class GroupedAccumulators {
     }
 
     /** COUNT(*) or COUNT(expr). */
-    public static final class Count {
+    public static final class Count implements AutoCloseable {
         private int capacity = 64;
         private int copies = INTERLEAVE; // 1 once past COLLAPSE_GROUPS groups
         private long[] count = new long[64 * INTERLEAVE];
+        private NativeLongs nCount; // #941: the state once native; count is then null
 
         /** Counts every row of each group. */
         public void updateAll(GroupAssignment a) {
             ensure(a.numGroups());
+            if (nCount != null) {
+                updateNative(a, a.useMasks() ? null : a.selection());
+                return;
+            }
             if (a.useMasks()) {
                 for (int g = 0; g < a.numGroups(); g++) {
                     count[g] += a.maskCount(g);
@@ -922,10 +1006,20 @@ public final class GroupedAccumulators {
                 updateAll(a);
                 return;
             }
+            if (nCount != null && !a.useMasks()) {
+                updateNative(a, validity);
+                return;
+            }
             if (a.useMasks()) {
                 for (int g = 0; g < a.numGroups(); g++) {
                     if (a.maskCount(g) > 0) {
-                        count[g] += AggKernels.countValid(a.restrict(v, g));
+                        long c = AggKernels.countValid(a.restrict(v, g));
+                        if (nCount != null) {
+                            MemorySegment s = nCount.segment();
+                            s.setAtIndex(NativeLongs.LONG, g, s.getAtIndex(NativeLongs.LONG, g) + c);
+                        } else {
+                            count[g] += c;
+                        }
                     }
                 }
                 return;
@@ -954,14 +1048,77 @@ public final class GroupedAccumulators {
         private void ensure(int groups) {
             if (groups > capacity) {
                 int cap = grow(capacity, groups);
+                if (nCount != null) {
+                    nCount.grow(cap);
+                    capacity = cap;
+                    return;
+                }
                 int c = copiesFor(copies, cap);
                 count = c == copies ? regroup(count, capacity, cap, copies) : collapse(count, capacity, cap, copies, false);
                 copies = c;
                 capacity = cap;
+                if (goNative(copies, cap)) {
+                    nCount = new NativeLongs(count, cap, cap);
+                    count = null;
+                }
+            }
+        }
+
+        /**
+         * The one-copy count over the native state (#941): every row of the
+         * batch, or only those whose bit is set in {@code bits} (a selection or
+         * a validity) when it is not null. A masked assignment (few groups) is
+         * counted from its per-group counts.
+         */
+        private void updateNative(GroupAssignment a, MemorySegment bits) {
+            MemorySegment s = nCount.segment();
+            if (a.useMasks()) {
+                for (int g = 0; g < a.numGroups(); g++) {
+                    s.setAtIndex(NativeLongs.LONG, g, s.getAtIndex(NativeLongs.LONG, g) + a.maskCount(g));
+                }
+                return;
+            }
+            int[] ids = a.ids();
+            int n = a.numRows();
+            if (bits == null) {
+                for (int i = 0; i < n; i++) {
+                    long g = ids[i];
+                    s.setAtIndex(NativeLongs.LONG, g, s.getAtIndex(NativeLongs.LONG, g) + 1);
+                }
+                return;
+            }
+            for (int w = 0, words = Bitmap.wordsFor(n);
+                 w < words;
+                 w++) {
+                long word = Bitmap.wordAt(bits, w, n);
+                while (word != 0L) {
+                    long g = ids[(w << 6) + Long.numberOfTrailingZeros(word)];
+                    word &= word - 1;
+                    s.setAtIndex(NativeLongs.LONG, g, s.getAtIndex(NativeLongs.LONG, g) + 1);
+                }
+            }
+        }
+
+        /** Bytes of state outside the heap: 0 until the table goes native. */
+        public long nativeBytes() {
+            return nCount == null ? 0L : nCount.bytes();
+        }
+
+        /**
+         * Gives the native state back to the pool; the accumulator is not used
+         * afterwards.
+         */
+        @Override
+        public void close() {
+            if (nCount != null) {
+                nCount.close();
             }
         }
 
         public long count(int g) {
+            if (nCount != null) {
+                return nCount.get(g);
+            }
             long c = 0;
             for (int k = 0; k < copies; k++) {
                 c += count[k * capacity + g];

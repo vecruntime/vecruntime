@@ -362,6 +362,8 @@ final case class WideDecimalSumAgg(
   }
   override def newGroupedState(): GroupedAggState = new GroupedAggState {
     private val acc = new GroupedAccumulators.WideLongSum
+    override def close(): Unit = acc.close()
+    override def nativeBytes: Long = acc.nativeBytes()
     private val extra = new Escalation
     override def update(ctx: EvalContext, groups: GroupAssignment): Unit = {
       val ids = groups.ids()
@@ -480,6 +482,8 @@ final case class WideDecimalAvgAgg(
   }
   override def newGroupedState(): GroupedAggState = new GroupedAggState {
     private val acc = new GroupedAccumulators.WideLongSum
+    override def close(): Unit = acc.close()
+    override def nativeBytes: Long = acc.nativeBytes()
     private val extra = new Escalation
     override def update(ctx: EvalContext, groups: GroupAssignment): Unit = {
       val ids = groups.ids()
@@ -911,6 +915,8 @@ final case class CountAgg(input: Option[VectorExpr]) extends VectorAggFunction {
   }
   override def newGroupedState(): GroupedAggState = new GroupedAggState {
     private val acc = new GroupedAccumulators.Count
+    override def close(): Unit = acc.close()
+    override def nativeBytes: Long = acc.nativeBytes()
     override def update(ctx: EvalContext, groups: GroupAssignment): Unit = input match {
       case None => acc.updateAll(groups)
       case Some(e) => acc.updateNonNull(e.eval(ctx), groups)

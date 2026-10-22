@@ -108,6 +108,66 @@ class GroupedAccumulatorsNativeStateTest extends GroupedAccumulatorsCollapseTest
     }
 
     @Test
+    void wideSumAndCountGoNativeWithTheSameAnswers() {
+        int groups = GroupedAccumulators.COLLAPSE_GROUPS * 3;
+        Random rnd = new Random(9410);
+        java.math.BigInteger[] ref = new java.math.BigInteger[groups];
+        java.util.Arrays.fill(ref, java.math.BigInteger.ZERO);
+        long[] refCount = new long[groups];
+        long[] refNonNull = new long[groups];
+        long inUse = NativePool.shared().inUseBytes();
+        GroupedAccumulators.WideLongSum wide = new GroupedAccumulators.WideLongSum();
+        GroupedAccumulators.WideLongSum wideLongs = new GroupedAccumulators.WideLongSum();
+        GroupedAccumulators.Count all = new GroupedAccumulators.Count();
+        GroupedAccumulators.Count nonNull = new GroupedAccumulators.Count();
+        java.math.BigInteger[] refLongs = new java.math.BigInteger[groups];
+        java.util.Arrays.fill(refLongs, java.math.BigInteger.ZERO);
+        try (Arena arena = Arena.ofConfined()) {
+            for (int b = 0; b < 6; b++) {
+                int n = 4096;
+                int[] ids = new int[n];
+                java.math.BigInteger[] d = new java.math.BigInteger[n];
+                long[] v = new long[n];
+                boolean[] nul = new boolean[n];
+                for (int i = 0; i < n; i++) {
+                    // Groups reach the threshold in the second batch, so the state moves mid-stream.
+                    ids[i] = rnd.nextInt(b == 0 ? 1024 : groups);
+                    d[i] = new java.math.BigInteger(100, rnd).subtract(java.math.BigInteger.ONE.shiftLeft(99));
+                    v[i] = rnd.nextLong();
+                    nul[i] = rnd.nextInt(7) == 0;
+                    refCount[ids[i]]++;
+                    if (!nul[i]) {
+                        ref[ids[i]] = ref[ids[i]].add(d[i]);
+                        refLongs[ids[i]] = refLongs[ids[i]].add(java.math.BigInteger.valueOf(v[i]));
+                        refNonNull[ids[i]]++;
+                    }
+                }
+                int seen = b == 0 ? 1024 : groups;
+                GroupAssignment a = assign(ids, seen, arena);
+                wide.update(ArrowLayout.ofDecimal128(arena, d, nul), a);
+                wideLongs.update(ArrowLayout.ofLongs(arena, v, nul), a);
+                all.updateAll(a);
+                nonNull.updateNonNull(ArrowLayout.ofLongs(arena, v, nul), a);
+            }
+        }
+        assertTrue(wide.nativeBytes() >= 24L * groups);
+        assertTrue(all.nativeBytes() >= 8L * groups);
+        for (int g = 0; g < groups; g++) {
+            assertEquals(ref[g], wide.sum(g), "wide decimal sum of group " + g);
+            assertEquals(refLongs[g], wideLongs.sum(g), "wide long sum of group " + g);
+            assertEquals(refNonNull[g], wide.count(g), "wide count of group " + g);
+            assertEquals(refCount[g], all.count(g), "count(*) of group " + g);
+            assertEquals(refNonNull[g], nonNull.count(g), "count(x) of group " + g);
+        }
+        wide.close();
+        wideLongs.close();
+        all.close();
+        nonNull.close();
+        assertEquals(inUse, NativePool.shared().inUseBytes(),
+                "blocks back in the pool");
+    }
+
+    @Test
     void stateStaysOnTheHeapBelowTheThresholdAndWhenOff() {
         try (Arena arena = Arena.ofConfined()) {
             GroupedAccumulators.LongSum small = new GroupedAccumulators.LongSum();
