@@ -45,7 +45,8 @@ class StructFlatteningSuite extends AnyFunSuite {
     (0 until n).foreach(i => k.putInt(i, i))
     val part = new ConstantColumnVector(n, schema.fields(1).dataType)
     part.setNull()
-    assert(part.getChild(0) == null, "Spark's null struct constant is expected to leave its children unset")
+    // Spark 4.1's null struct constant leaves its children unset (the case this covers); Spark 4.2 sets them.
+    // Either way the struct must flatten to all-null lanes.
     val layout = StructFlattening.plan(schema).get
     val arena = Arena.ofConfined()
     try {
