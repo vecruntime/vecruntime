@@ -81,6 +81,7 @@ For every value it gives `<name>Max` and `<name>Sum` over the executors, plus `e
 - the scan's read-ahead: `prefetchPeak`, `readAheadHeld`, `readAheadPeak`, and the growth of `readAheadRefusals`
   during the run;
 - the heap's old generation: `heapOldPeak` and `heapOldAfterGc`;
+- Spark's own execution pools: `offHeapExecutionPeak` and `onHeapExecutionPeak`, sampled every 100 ms;
 - the process: `rss` and `rssPeak` (VmHWM).
 
 The run log has the same summary as one `memory (MiB, ...)` line per query.

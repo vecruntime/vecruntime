@@ -171,6 +171,21 @@ final class NestedFieldWriter {
         }
         expect(v, VecType.STRUCT, g);
         List<VectorBuffers> children = v.children();
+        if (a instanceof LogicalTypeAnnotation.VariantLogicalTypeAnnotation) {
+            // The engine carries a variant as the struct (value, metadata), the order of Spark's variant vectors
+            // (NativeParquetSupport.VARIANT_READ_TYPE); the file's group is matched by name, in its own order.
+            for (int f = 0; f < g.getFieldCount(); f++) {
+                String name = g.getType(f).getName();
+                int k = switch (name) {
+                    case "value" -> 0;
+                    case "metadata" -> 1;
+                    default -> throw new IllegalArgumentException("variant group field '" + name + "' (a shredded variant) is not written natively: " + g);
+                };
+                node(g.getType(f), children.get(k), i, rep,
+                        def, depth);
+            }
+            return;
+        }
         for (int f = 0; f < g.getFieldCount(); f++) {
             node(g.getType(f), children.get(f), i, rep,
                     def, depth);

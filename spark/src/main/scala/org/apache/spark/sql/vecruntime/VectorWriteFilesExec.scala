@@ -788,9 +788,10 @@ private[vecruntime] object VectorWriteTask2 {
     def adapt(o: Int): VectorBuffers = {
       val cv = batch.column(o)
       cv.dataType() match {
-        case dt @ (_: StructType | _: ArrayType | _: MapType) if selection.isEmpty =>
+        case dt @ (_: StructType | _: ArrayType | _: MapType | _: org.apache.spark.sql.types.VariantType)
+            if selection.isEmpty =>
           io.vecruntime.spark.adapter.NestedColumns.adaptForWrite(cv, dt, rows, arena)
-        case dt @ (_: StructType | _: ArrayType | _: MapType) =>
+        case dt @ (_: StructType | _: ArrayType | _: MapType | _: org.apache.spark.sql.types.VariantType) =>
           io.vecruntime.spark.adapter.NestedColumns.adapt(cv, dt, rows, arena)
         case _ => ColumnVectorAdapters.adapt(cv, rows, arena)
       }

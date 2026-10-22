@@ -69,6 +69,10 @@ public final class NestedColumns {
      */
     public static VectorBuffers adaptForWrite(ColumnVector cv, DataType dt, int numRows,
             Arena arena) {
+        if (dt instanceof org.apache.spark.sql.types.VariantType) {
+            // A variant (#842): the struct of its value and metadata binaries, from Spark's getters.
+            return adapt(cv, dt, numRows, arena);
+        }
         boolean nested = dt instanceof StructType || dt instanceof ArrayType || dt instanceof MapType;
         if (!nested) {
             return ColumnVectorAdapters.adapt(cv, numRows, arena);
@@ -131,6 +135,9 @@ public final class NestedColumns {
     }
 
     private static Node node(DataType dt, int expected) {
+        if (dt instanceof org.apache.spark.sql.types.VariantType) {
+            return new VariantNode(expected);
+        }
         if (dt instanceof ArrayType a) {
             return new ListNode(node(a.elementType(), expected), expected);
         }
@@ -522,6 +529,46 @@ public final class NestedColumns {
                     rows + 1);
             return NestedVectorBuffers.map(rows, validity(arena), off, keys.build(arena),
                     values.build(arena));
+        }
+    }
+
+    /**
+     * A variant, as the struct of its two binaries {@code (value, metadata)} the
+     * engine carries it in ({@code NativeParquetSupport.VARIANT_READ_TYPE}, the
+     * order of Spark's own variant vectors); a null variant's binaries are
+     * null.
+     */
+    private static final class VariantNode extends Node {
+        private final BytesNode value;
+        private final BytesNode metadata;
+
+        VariantNode(int expected) {
+            super(expected);
+            this.value = new BytesNode(true, expected);
+            this.metadata = new BytesNode(true, expected);
+        }
+
+        @Override
+        void growValues(int capacity) {}
+
+        @Override
+        void appendDefault() {
+            value.appendNull();
+            metadata.appendNull();
+        }
+
+        @Override
+        void appendValue(SpecializedGetters g, int ordinal) {
+            org.apache.spark.unsafe.types.VariantVal v = g.getVariant(ordinal);
+            org.apache.spark.sql.catalyst.expressions.GenericInternalRow both = new org.apache.spark.sql.catalyst.expressions.GenericInternalRow(new Object[] {v.getValue(), v.getMetadata()});
+            value.append(both, 0);
+            metadata.append(both, 1);
+        }
+
+        @Override
+        VectorBuffers build(Arena arena) {
+            return NestedVectorBuffers.struct(rows, validity(arena),
+                    List.of(value.build(arena), metadata.build(arena)));
         }
     }
 
