@@ -223,6 +223,49 @@ class VectorIcebergWriteSuite extends AnyFunSuite with BeforeAndAfterAll {
     assert(on == off)
   }
 
+  test("variant columns write columnar as the variant group, equal to Iceberg's writer") {
+    for (t <- Seq("ice.db.var_on", "ice.db.var_off")) {
+      spark.sql(s"DROP TABLE IF EXISTS $t")
+      spark.sql(
+        s"""CREATE TABLE $t (id BIGINT, v VARIANT, s STRUCT<w: VARIANT>, l ARRAY<VARIANT>)
+           |USING iceberg TBLPROPERTIES ('format-version'='3')""".stripMargin
+      )
+    }
+    val src =
+      """SELECT id,
+        |  if(id % 7 = 0, null, parse_json(concat('{"a":', id, ',"b":"s', id % 13, '","c":[1,2,{"d":null}]}'))),
+        |  if(id % 11 = 0, null, named_struct('w', if(id % 3 = 0, null, parse_json(cast(id * 1.5 as string))))),
+        |  if(id % 5 = 0, null, array(parse_json('"x"'), null, parse_json('true')))
+        |FROM range(3000)""".stripMargin
+    withWriter(on = false)(spark.sql(s"INSERT INTO ice.db.var_off $src").collect())
+    val df = withWriter(on = true)(spark.sql(s"INSERT INTO ice.db.var_on $src"))
+    df.collect()
+    assert(columnar(df), "a variant column no longer falls back")
+    def text(t: String) =
+      spark.sql(s"SELECT id, to_json(v), to_json(s.w), transform(l, x -> to_json(x)) FROM $t ORDER BY id")
+        .collect().map(_.toString).toSeq
+    assert(text("ice.db.var_on") == text("ice.db.var_off"))
+    def metrics(t: String) =
+      spark.sql(
+        s"SELECT record_count, value_counts, null_value_counts, transform_values(lower_bounds, (k, v) -> hex(v)), transform_values(upper_bounds, (k, v) -> hex(v)) FROM $t.files"
+      ).collect().map(_.toString).sorted.toSeq
+    assert(metrics("ice.db.var_on") == metrics("ice.db.var_off"), "file metrics differ from Iceberg's writer")
+  }
+
+  test("a table that shreds variants keeps Iceberg's writer") {
+    val t = "ice.db.var_shred"
+    spark.sql(s"DROP TABLE IF EXISTS $t")
+    spark.sql(
+      s"""CREATE TABLE $t (id BIGINT, v VARIANT) USING iceberg
+         |TBLPROPERTIES ('format-version'='3', 'write.parquet.shred-variants'='true')""".stripMargin
+    )
+    val df =
+      withWriter(on = true)(spark.sql(s"INSERT INTO $t SELECT id, parse_json(cast(id as string)) FROM range(10)"))
+    df.collect()
+    assert(!columnar(df), "a shredded variant must stay on Iceberg's writer")
+    assert(spark.sql(s"SELECT count(*) FROM $t").collect()(0).getLong(0) == 10L)
+  }
+
   test("floats and doubles inside lists and maps write columnar, equal to Iceberg's writer") {
     for (t <- Seq("ice.db.fl_on", "ice.db.fl_off")) {
       spark.sql(s"DROP TABLE IF EXISTS $t")
