@@ -16,8 +16,14 @@
 package io.vecruntime.spark
 
 import io.vecruntime.spark.test.{TestTables, VectorQuerySuite}
-import org.apache.spark.sql.execution.ExpandExec
-import org.apache.spark.sql.vecruntime.{VectorExpandExec, VectorFilterExec, VectorHashAggregateExec, VectorRollupExec}
+import org.apache.spark.sql.execution.{ExpandExec, SparkPlan}
+import org.apache.spark.sql.vecruntime.{
+  VectorExpandExec,
+  VectorExpandPlanner,
+  VectorFilterExec,
+  VectorHashAggregateExec,
+  VectorRollupExec
+}
 
 /** ExpandExec: grouping sets and the distinct-aggregate rewrite, row for row against Spark. */
 @io.vecruntime.spark.test.tags.Agg
@@ -141,4 +147,105 @@ class VectorExpandSuite extends VectorQuerySuite {
       assert(nodesOf[ExpandExec](df).nonEmpty)
     }
   }
+
+  test("#901 R2: an expand projection that BUILDS a struct, array and map agrees with Spark's ExpandExec") {
+    import org.apache.spark.sql.catalyst.expressions.{
+      Attribute,
+      AttributeReference,
+      CreateArray,
+      CreateMap,
+      CreateNamedStruct,
+      Expression,
+      Literal
+    }
+    import org.apache.spark.sql.execution.ColumnarToRowExec
+    import org.apache.spark.sql.types._
+    import org.apache.spark.sql.vecruntime.PlanUtils
+
+    // A columnar child: the scan of `t`.
+    val df = spark.sql("SELECT i, s FROM t")
+    df.collect()
+    val child = PlanUtils.allNodes(finalPlan(df)).find(_.supportsColumnar)
+      .getOrElse(fail("no columnar scan: " + finalPlan(df).treeString))
+    val ci = child.output.find(_.name == "i").get
+    val cs = child.output.find(_.name == "s").get
+
+    val output: Seq[Attribute] = Seq(
+      AttributeReference("i", IntegerType)(),
+      AttributeReference("st", StructType(Seq(StructField("a", IntegerType), StructField("t", StringType))))(),
+      AttributeReference("arr", ArrayType(StringType))(),
+      AttributeReference("m", MapType(StringType, IntegerType))(),
+      AttributeReference("aom", ArrayType(MapType(StringType, IntegerType)))()
+    )
+    def st(a: Expression, t: Expression) = CreateNamedStruct(Seq(Literal("a"), a, Literal("t"), t))
+    // Two projections (a grouping-set-like expand): one builds from the columns, one from literals/nulls.
+    val projections: Seq[Seq[Expression]] = Seq(
+      Seq(
+        ci,
+        st(ci, cs),
+        CreateArray(Seq(cs, Literal(null, StringType), cs)),
+        CreateMap(Seq(
+          org.apache.spark.sql.catalyst.expressions.Concat(Seq(
+            Literal("k"),
+            org.apache.spark.sql.catalyst.expressions.Coalesce(Seq(cs, Literal("z")))
+          )),
+          ci
+        )),
+        CreateArray(Seq(CreateMap(Seq(Literal("a"), ci)), CreateMap(Seq(Literal("b"), ci))))
+      ),
+      Seq(
+        ci,
+        st(Literal(-1), Literal("u")),
+        CreateArray(Seq(Literal("x"), cs)),
+        CreateMap(Seq(Literal("z"), Literal(7))),
+        CreateArray(Seq(CreateMap(Seq(Literal("c"), Literal(9)))))
+      )
+    )
+    val ours = VectorExpandExec(projections, output, child)
+    assert(VectorExpandPlanner.plan(ExpandExec(projections, output, ColumnarToRowExec(child))).isRight)
+    val theirs = ExpandExec(projections, output, ColumnarToRowExec(child))
+
+    val schema = StructType(output.map(a => StructField(a.name, a.dataType, a.nullable)))
+    def rowsOf(plan: SparkPlan): Seq[String] = {
+      val rows = if (plan.supportsColumnar) ColumnarToRowExec(plan).executeCollect() else plan.executeCollect()
+      rows.map(ir => ExpandNestedRender.row(ir.copy(), schema)).toSeq.sorted
+    }
+    val e = rowsOf(theirs)
+    val a = rowsOf(ours)
+    assert(a.length === e.length, s"row counts: ours ${a.length}, Spark ${e.length}")
+    assert(a === e)
+  }
+}
+
+/** Renders an InternalRow and its nested values to a stable string (the expand test's comparator). */
+private object ExpandNestedRender {
+  import org.apache.spark.sql.catalyst.InternalRow
+  import org.apache.spark.sql.catalyst.util.{ArrayData, MapData}
+  import org.apache.spark.sql.types._
+
+  def row(r: InternalRow, schema: StructType): String =
+    schema.fields.zipWithIndex.map { case (f, i) =>
+      s"${f.name}=" + (if (r.isNullAt(i)) "null" else value(r.get(i, f.dataType), f.dataType))
+    }.mkString("{", ", ", "}")
+
+  private def value(v: Any, dt: DataType): String = dt match {
+    case s: StructType => row(v.asInstanceOf[InternalRow], s)
+    case a: ArrayType => array(v.asInstanceOf[ArrayData], a.elementType)
+    case m: MapType =>
+      val md = v.asInstanceOf[MapData]
+      val ks = md.keyArray(); val vs = md.valueArray()
+      (0 until md.numElements()).map { i =>
+        value(if (ks.isNullAt(i)) null else ks.get(i, m.keyType), m.keyType) + "->" +
+          (if (vs.isNullAt(i)) "null" else value(vs.get(i, m.valueType), m.valueType))
+      }.sorted.mkString("map(", ", ", ")")
+    case _: StringType => if (v == null) "null" else v.toString
+    case _ => String.valueOf(v)
+  }
+
+  private def array(ad: ArrayData, et: DataType): String =
+    (0 until ad.numElements()).map(i => if (ad.isNullAt(i)) "null" else value(ad.get(i, et), et)).mkString(
+      "[",
+      ", ",
+      "]"
+    )
 }

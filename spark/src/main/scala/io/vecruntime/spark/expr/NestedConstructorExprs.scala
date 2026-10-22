@@ -17,7 +17,15 @@ package io.vecruntime.spark.expr
 
 import java.lang.foreign.MemorySegment
 
-import io.vecruntime.kernels.{ArrowLayout, Bitmap, NestedVectorBuffers, SegmentVectorBuffers, VecType, VectorBuffers}
+import io.vecruntime.kernels.{
+  ArrowLayout,
+  Bitmap,
+  NestedGatherKernels,
+  NestedVectorBuffers,
+  SegmentVectorBuffers,
+  VecType,
+  VectorBuffers
+}
 import io.vecruntime.spark.arrow.ArrowOutput
 import org.apache.spark.sql.types.DataType
 
@@ -63,7 +71,7 @@ final case class CreateArrayExpr(elements: Seq[VectorExpr], dataType: DataType) 
       n,
       null,
       NestedConstructors.offsets(ctx, n, k),
-      NestedConstructors.interleave(
+      NestedConstructors.elements(
         elements.map(NestedConstructors.lane(_, ctx)),
         n,
         ctx
@@ -73,9 +81,10 @@ final case class CreateArrayExpr(elements: Seq[VectorExpr], dataType: DataType) 
 }
 
 /**
- * `map(k1, v1, ..., kk, vk)` over scalar lanes (#842): `k` entries per row, keys and values interleaved
- * row by row. The compiler takes it only when the keys cannot repeat within a row (one entry, or distinct
- * literal keys), so Spark's duplicate-key handling never applies; a null key fails as Spark's does.
+ * `map(k1, v1, ..., kk, vk)` (#842, #901 R2): `k` entries per row, keys and values interleaved row by
+ * row; the keys and the values may themselves be nested (a map of struct values, Spark allows a nested
+ * value type). The compiler takes it only when the keys cannot repeat within a row (one entry, or
+ * distinct literal keys), so Spark's duplicate-key handling never applies; a null key fails as Spark's.
  */
 final case class CreateMapExpr(keys: Seq[VectorExpr], values: Seq[VectorExpr], dataType: DataType)
     extends VectorExpr {
@@ -85,16 +94,26 @@ final case class CreateMapExpr(keys: Seq[VectorExpr], values: Seq[VectorExpr], d
     val n = ctx.numRows
     val offsets = NestedConstructors.offsets(ctx, n, keys.length)
     val keyLanes = keys.map(NestedConstructors.lane(_, ctx))
+    // Spark builds a row's map only when the operator keeps that row, so a null key raises only for an
+    // ACTIVE row (a selection or a merge-clause mask narrows which rows the batch-wide eval emits).
+    val active = ctx.active
     keyLanes.foreach { k =>
-      if (k.validity() != null && !Bitmap.allSet(k.validity(), n))
-        throw org.apache.spark.sql.vecruntime.VectorErrors.nullMapKey()
+      val v = k.validity()
+      if (v != null) {
+        var i = 0
+        while (i < n) {
+          if ((active == null || Bitmap.isSet(active, i)) && !Bitmap.isSet(v, i))
+            throw org.apache.spark.sql.vecruntime.VectorErrors.nullMapKey()
+          i += 1
+        }
+      }
     }
     NestedVectorBuffers.map(
       n,
       null,
       offsets,
-      NestedConstructors.interleave(keyLanes, n, ctx),
-      NestedConstructors.interleave(values.map(NestedConstructors.lane(_, ctx)), n, ctx)
+      NestedConstructors.elements(keyLanes, n, ctx),
+      NestedConstructors.elements(values.map(NestedConstructors.lane(_, ctx)), n, ctx)
     )
   }
 }
@@ -116,6 +135,36 @@ private[expr] object NestedConstructors {
       i += 1
     }
     off
+  }
+
+  /**
+   * The child of `array(...)` / `map(...)`: element `i * k + j` is row `i` of lane `j`. A flat lane
+   * (fixed width, BOOL, UTF8) is interleaved directly; a nested lane (a struct, array or map element or
+   * value, #901 R2) is built by concatenating the `k` lanes and gathering them into interleaved order,
+   * which reuses the tested nested concat and gather and composes to any depth.
+   */
+  def elements(lanes: Seq[VectorBuffers], n: Int, ctx: EvalContext): VectorBuffers =
+    if (lanes.head.`type`().isNested) interleaveNested(lanes, n, ctx) else interleave(lanes, n, ctx)
+
+  /**
+   * Nested elements interleaved: the `k` lanes concatenated into one lane of `n * k` rows (lane `j`
+   * occupying rows `[j * n, (j + 1) * n)`), then gathered by the permutation that puts row `i` of lane
+   * `j` at position `i * k + j`.
+   */
+  private def interleaveNested(lanes: Seq[VectorBuffers], n: Int, ctx: EvalContext): VectorBuffers = {
+    val k = lanes.length
+    val m = n * k
+    val builder = new io.vecruntime.kernels.ColumnBuilder(ctx.arena, lanes.head.`type`(), math.max(m, 1))
+    lanes.foreach(builder.append)
+    val combined = builder.view()
+    val idx = new Array[Int](math.max(m, 1))
+    var j = 0
+    while (j < k) {
+      var i = 0
+      while (i < n) { idx(i * k + j) = j * n + i; i += 1 }
+      j += 1
+    }
+    NestedGatherKernels.gather(combined, idx, m, ctx.arena)
   }
 
   /** Element `i * k + j` is row `i` of lane `j`; the lanes share one type (fixed width, BOOL or UTF8). */
