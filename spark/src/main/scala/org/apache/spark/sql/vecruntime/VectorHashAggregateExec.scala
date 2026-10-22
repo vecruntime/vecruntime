@@ -650,6 +650,7 @@ private[vecruntime] class VectorGroupedAggregateIterator(
     // #886: the reservation stays -- the next table regrows into it; close returns it.
     releaseDictionaries()
     table = new GroupKeyTable(keyExprs.map(_.vecType), dictionaryStrings)
+    closeStates()
     states = aggs.map(_.newGroupedState())
     representatives = newRepresentatives()
     emittedGroups = 0
@@ -999,8 +1000,21 @@ private[vecruntime] class VectorGroupedAggregateIterator(
       }
       releaseMemory()
       releaseDictionaries()
+      closeStates()
       metrics.recordPeakNative(allocator.getPeakMemoryAllocation) // #874: measured, not reserved
       allocator.close()
+    }
+  }
+
+  /** #941: the states' off-heap accumulators back to the pool; each state is closed exactly once. */
+  private def closeStates(): Unit = {
+    val old = states
+    states = Array.empty
+    var i = 0
+    while (i < old.length) {
+      try old(i).close()
+      catch { case _: Exception => }
+      i += 1
     }
   }
 }

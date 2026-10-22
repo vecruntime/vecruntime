@@ -81,6 +81,13 @@ trait GroupedAggState {
    * the lane accumulators spill the same buffer they emit, so the default forwards to [[bufferValue]].
    */
   def spillValue(g: Int, slot: Int): Any = bufferValue(g, slot)
+
+  /**
+   * Gives back what this state holds outside the heap (#941: accumulators in pool segments). The
+   * operator calls it once, when it drops the state -- a reset after a spill or emit, and close --
+   * and never touches the state afterwards. The heap accumulators hold nothing to give back.
+   */
+  def close(): Unit = ()
 }
 
 /** Serializable description of a supported aggregate function; states are created per task. */
