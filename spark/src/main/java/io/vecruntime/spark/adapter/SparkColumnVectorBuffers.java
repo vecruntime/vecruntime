@@ -152,6 +152,14 @@ public final class SparkColumnVectorBuffers {
                 }
             }
         }
+        if (validity != null && !(cv instanceof WritableColumnVector)) {
+            // A foreign vector with nulls (Iceberg's ConstantColumnVector of a null partition value, for one)
+            // may throw when a null row's value is read, which the bulk getters below do: read the valid rows only.
+            VectorBuffers guarded = copyValidRows(cv, type, numRows, arena, validity);
+            if (guarded != null) {
+                return guarded;
+            }
+        }
         switch (type) {
             case INT32 -> {
                 MemorySegment data = ArrowLayout.allocateData(arena, type, numRows);
@@ -192,6 +200,56 @@ public final class SparkColumnVectorBuffers {
                 return copyUtf8(cv, numRows, arena, validity);
             }
             default -> throw new IllegalStateException(type.toString());
+        }
+    }
+
+    /**
+     * The fixed-width lane of {@code cv} reading only the rows {@code validity}
+     * marks valid, or null for a type this does not cover (UTF8 and decimals
+     * read through their own null-checking paths).
+     */
+    private static VectorBuffers copyValidRows(ColumnVector cv, VecType type, int numRows,
+            Arena arena, MemorySegment validity) {
+        switch (type) {
+            case INT32 -> {
+                MemorySegment data = ArrowLayout.allocateData(arena, type, numRows);
+                for (int i = 0; i < numRows; i++) {
+                    if (Bitmap.isSet(validity, i)) {
+                        data.setAtIndex(VectorBuffers.LE_INT, i, cv.getInt(i));
+                    }
+                }
+                return SegmentVectorBuffers.fixedWidth(type, numRows, validity, data);
+            }
+            case INT64 -> {
+                MemorySegment data = ArrowLayout.allocateData(arena, type, numRows);
+                for (int i = 0; i < numRows; i++) {
+                    if (Bitmap.isSet(validity, i)) {
+                        data.setAtIndex(VectorBuffers.LE_LONG, i, cv.getLong(i));
+                    }
+                }
+                return SegmentVectorBuffers.fixedWidth(type, numRows, validity, data);
+            }
+            case FLOAT64 -> {
+                MemorySegment data = ArrowLayout.allocateData(arena, type, numRows);
+                for (int i = 0; i < numRows; i++) {
+                    if (Bitmap.isSet(validity, i)) {
+                        data.setAtIndex(VectorBuffers.LE_DOUBLE, i, cv.getDouble(i));
+                    }
+                }
+                return SegmentVectorBuffers.fixedWidth(type, numRows, validity, data);
+            }
+            case BOOL -> {
+                MemorySegment data = ArrowLayout.allocateBitmap(arena, numRows);
+                for (int i = 0; i < numRows; i++) {
+                    if (Bitmap.isSet(validity, i) && cv.getBoolean(i)) {
+                        Bitmap.set(data, i);
+                    }
+                }
+                return SegmentVectorBuffers.fixedWidth(type, numRows, validity, data);
+            }
+            default -> {
+                return null;
+            }
         }
     }
 
