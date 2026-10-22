@@ -406,6 +406,14 @@ object TpchRunner {
                 println(s"[${args.suite.name}]   stages=${m.stages} executorRunTime=${m.executorRunTimeMs}ms gc=${m.jvmGcTimeMs}ms " +
                   s"shuffleRead=${m.shuffleReadBytes} shuffleWrite=${m.shuffleWriteBytes} spill=${m.spillBytes} peakMemory=${m.peakExecutionMemory}")
               )
+              if (result.memory.nonEmpty) {
+                def mb(k: String) = result.memory.getOrElse(k, 0L) >> 20
+                println(s"[${args.suite.name}]   memory (MiB, max over ${result.memory.getOrElse("executors", 0L)} executors): " +
+                  s"rssPeak=${mb("rssPeakMax")} poolPeak=${mb("nativePoolPeakMax")} pinnedPeak=${mb("pinnedPeakMax")} " +
+                  s"heapOldPeak=${mb("heapOldPeakMax")} prefetchPeak=${mb("prefetchPeakMax")} " +
+                  s"readAheadPeak=${mb("readAheadPeakMax")} readAheadRefusals=${result.memory.getOrElse("readAheadRefusalsSum", 0L)} " +
+                  s"overdraft=${mb("nativePoolOverdraftMax")} leaked=${mb("nativePoolLeakedMax")}")
+              }
               result.fallbacks.foreach(f => println(s"[${args.suite.name}]   fallback: $f"))
             } catch {
               case e: Exception =>
@@ -468,7 +476,12 @@ object TpchRunner {
       morPhysicalRows: Long = 0,
       morLiveRows: Long = 0,
       /** Per-operator attribution of the last measured run (#279): ours and Comet's native operators, one entry per plan node. */
-      operatorTimes: Seq[OperatorTime] = Nil
+      operatorTimes: Seq[OperatorTime] = Nil,
+      /**
+       * #925: the executors' memory gauges over the last measured run (`MemoryProbe.summarize`: each value's max and
+       * sum over executors), empty without our plugin.
+       */
+      memory: Map[String, Long] = Map.empty
   ) {
     private val sorted = timesMs.sorted
     def medianMs: Double = percentile(50)
@@ -498,6 +511,8 @@ object TpchRunner {
           )}",""" +
         s""""scan":"${esc(scan)}","morPhysicalRows":$morPhysicalRows,"morLiveRows":$morLiveRows,""" +
         s""""operatorTimes":"${esc(OperatorTime.encode(operatorTimes))}",""" +
+        (if (memory.isEmpty) ""
+         else memory.toSeq.sortBy(_._1).map { case (k, v) => s""""$k":$v""" }.mkString(""""memory":{""", ",", "},")) +
         s""""fallbacks":"${esc(fallbacks.mkString("; "))}","operators":"${esc(operators)}","plan":"${esc(plan)}"}"""
     }
   }
@@ -586,7 +601,14 @@ object TpchRunner {
     val runs = (1 to args.iterations - 1).map(once)
     val (physicalBefore, liveBefore) =
       (IcebergVectorAdapter.normalizedPhysicalRows(), IcebergVectorAdapter.normalizedLiveRows())
+    // #925: the executors' memory gauges around the last measured run, when our plugin is loaded (it is what the
+    // probe job reads); peaks restarted just before it, so they are this run's.
+    val probing = spark.sparkContext.getConf.get("spark.plugins", "").contains("io.vecruntime.spark.VectorPlugin")
+    val memoryBefore = if (probing) probe(spark, reset = true) else Map.empty[String, Map[String, Long]]
     val last = once(args.iterations)
+    val memory =
+      if (probing) io.vecruntime.spark.MemoryProbe.summarize(memoryBefore, probe(spark, reset = false))
+      else Map.empty[String, Long]
     val morPhysical = IcebergVectorAdapter.normalizedPhysicalRows() - physicalBefore
     val morLive = IcebergVectorAdapter.normalizedLiveRows() - liveBefore
     val (_, rows, plan, metrics) = last
@@ -636,9 +658,19 @@ object TpchRunner {
       scan,
       morPhysical,
       morLive,
-      operatorTimes
+      operatorTimes,
+      memory
     )
   }
+
+  /** The executors' memory snapshots (#925), outside any measured job group; empty when the probe job fails. */
+  private def probe(spark: SparkSession, reset: Boolean): Map[String, Map[String, Long]] =
+    try io.vecruntime.spark.MemoryProbe.collect(spark.sparkContext, reset)
+    catch {
+      case e: Exception =>
+        println(s"[memory] probe failed: ${e.getClass.getSimpleName}: ${e.getMessage}")
+        Map.empty
+    }
 
   /**
    * Comet's own fallback reasons for the plan (#279), `Comet: <reason>` each, read through its
