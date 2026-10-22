@@ -71,7 +71,8 @@ class RunMergeGatherTest {
                 }
                 yield ArrowLayout.ofStrings(arena, v);
             }
-            case LIST, MAP, STRUCT -> throw new IllegalStateException("no nested lane here (#705)");
+            case LIST, MAP, STRUCT, FIXED_BINARY ->
+                    throw new IllegalStateException("no nested or FIXED_BINARY lane here (#705)");
         };
     }
 
@@ -83,7 +84,8 @@ class RunMergeGatherTest {
             case BOOL -> c.getBoolean(i);
             case DECIMAL128 -> c.getDecimal128(i);
             case UTF8 -> c.getString(i);
-            case LIST, MAP, STRUCT -> throw new IllegalStateException("no nested lane here (#705)");
+            case LIST, MAP, STRUCT, FIXED_BINARY ->
+                    throw new IllegalStateException("no nested or FIXED_BINARY lane here (#705)");
         };
     }
 
