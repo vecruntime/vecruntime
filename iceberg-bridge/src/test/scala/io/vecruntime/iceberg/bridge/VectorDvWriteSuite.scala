@@ -117,6 +117,27 @@ class VectorDvWriteSuite extends AnyFunSuite with BeforeAndAfterAll {
     unwrap(df.queryExecution.executedPlan).exists(_.getClass.getSimpleName == "VectorWriteDeltaExec")
   }
 
+  /** The simple class names of every node in the executed plan, unwrapping command and AQE wrappers. */
+  private def planNodeNames(df: org.apache.spark.sql.DataFrame): Seq[String] = {
+    import org.apache.spark.sql.execution.SparkPlan
+    def unwrap(p: SparkPlan): Seq[SparkPlan] = {
+      val nested = p.getClass.getSimpleName match {
+        case "CommandResultExec" =>
+          p.getClass.getMethods.find(m => m.getName == "commandPhysicalPlan" && m.getParameterCount == 0)
+            .map(_.invoke(p).asInstanceOf[SparkPlan]).toSeq
+        case "AdaptiveSparkPlanExec" =>
+          p.getClass.getMethods.find(m => m.getName == "executedPlan" && m.getParameterCount == 0)
+            .map(_.invoke(p).asInstanceOf[SparkPlan]).toSeq
+        case n if n.endsWith("QueryStageExec") =>
+          p.getClass.getMethods.find(m => m.getName == "plan" && m.getParameterCount == 0)
+            .map(_.invoke(p).asInstanceOf[SparkPlan]).toSeq
+        case _ => Seq.empty
+      }
+      p +: (p.children ++ nested).flatMap(unwrap)
+    }
+    unwrap(df.queryExecution.executedPlan).map(_.getClass.getSimpleName)
+  }
+
   test("bridge + eligibility preconditions hold on a v3 table") {
     createV3("ice.db.dv_pre")
     assert(
@@ -387,10 +408,10 @@ class VectorDvWriteSuite extends AnyFunSuite with BeforeAndAfterAll {
   }
 
   test("UPDATE and MERGE on a v3 table with struct, array and map columns match Spark's writer") {
-    // #20 M3a: the UPDATE's delete side now reads columnar -- the native Iceberg scan supports the metadata
-    // columns an UPDATE projects (_partition, _row_id, _last_updated_sequence_number). The MERGE still reads rows:
-    // MergeRowsExec has no map lane yet, so its scan falls back. Kept out of the suite-wide row-input count.
-    val rowInputBefore = org.apache.spark.sql.vecruntime.VectorWriteDeltaExec.rowInputWrites.get()
+    // #901 R2 + #949: the struct-literal UPDATE and the `map('i', s.id)` MERGE build their nested column in
+    // our Expand and MergeRows, and the native Iceberg scan (opt-in) now reads the metadata columns a
+    // row-level write projects (_partition, _row_id, _last_updated_sequence_number). With the native scan on
+    // the whole write is columnar and reads no rows.
     val base = "ice.db.dv_nested"
     for (t <- Seq(s"${base}_on", s"${base}_off")) {
       spark.sql(s"DROP TABLE IF EXISTS $t")
@@ -412,31 +433,42 @@ class VectorDvWriteSuite extends AnyFunSuite with BeforeAndAfterAll {
            |FROM range(2000)""".stripMargin
       )
     }
-    // A struct literal is not a column, so the Expand of this UPDATE reads rows (`SET s = named_struct(...)`).
-    assert(
-      onOff(
-        base,
-        "UPDATE %s SET s = named_struct('a', -1, 'd', cast(1.5 as decimal(10,2)), 't', 'u') WHERE id % 7 = 0"
-      ),
-      "nested UPDATE not columnar"
-    )
-    // #20 M3a: an UPDATE of a top-level column reads columnar end to end on the native Iceberg scan (opt-in): it
-    // projects _partition, _row_id and _last_updated_sequence_number over the map column, and the files that
-    // the UPDATE above rewrote carry their own _row_id. No delta write may read rows through RowToColumnarExec.
+
+    // Runs `sql` off then on with the native Iceberg scan enabled, returns the plan node names of the on run.
+    def onOffNative(sql: String): Seq[String] = {
+      withFlag(on = false)(spark.sql(sql.replace("%s", s"${base}_off")).collect())
+      val prevScan = spark.conf.getOption("spark.vecruntime.scan.nativeIceberg.enabled")
+      spark.conf.set("spark.vecruntime.scan.nativeIceberg.enabled", "true")
+      try withFlag(on = true) {
+          val df = spark.sql(sql.replace("%s", s"${base}_on"))
+          df.collect()
+          planNodeNames(df)
+        }
+      finally prevScan match {
+          case Some(v) => spark.conf.set("spark.vecruntime.scan.nativeIceberg.enabled", v)
+          case None => spark.conf.unset("spark.vecruntime.scan.nativeIceberg.enabled")
+        }
+    }
+
+    // The struct-literal UPDATE: its row projection is an Expand carrying the built struct; the native scan
+    // reads the metadata columns it projects, so the whole write is columnar and reads no rows.
+    val updBefore = org.apache.spark.sql.vecruntime.VectorWriteDeltaExec.rowInputWrites.get()
+    val updNames =
+      onOffNative("UPDATE %s SET s = named_struct('a', -1, 'd', cast(1.5 as decimal(10,2)), 't', 'u') WHERE id % 7 = 0")
+    val updRowInput = org.apache.spark.sql.vecruntime.VectorWriteDeltaExec.rowInputWrites.get() - updBefore
+    assert(updNames.contains("VectorExpandExec"), s"nested UPDATE: Expand fell back. Plan: ${updNames.mkString(", ")}")
+    assert(updRowInput == 0L, s"the struct-literal UPDATE's delta write read $updRowInput row batches")
+
+    // #20 M3a: an UPDATE of a top-level long reads columnar end to end on the native scan; the files the
+    // struct UPDATE above rewrote carry their own _row_id.
     val beforeScalar = org.apache.spark.sql.vecruntime.VectorWriteDeltaExec.rowInputWrites.get()
-    spark.conf.set("spark.vecruntime.scan.nativeIceberg.enabled", "true")
-    try {
-      assert(
-        onOff(base, "UPDATE %s SET id = id + 100000 WHERE id % 5 = 0 AND id < 1500"),
-        "UPDATE of a long not columnar"
-      )
-    } finally spark.conf.unset("spark.vecruntime.scan.nativeIceberg.enabled")
+    val scalarNames = onOffNative("UPDATE %s SET id = id + 100000 WHERE id % 5 = 0 AND id < 1500")
     assert(
       org.apache.spark.sql.vecruntime.VectorWriteDeltaExec.rowInputWrites.get() == beforeScalar,
-      "an UPDATE on a map-column table read rows: the native Iceberg scan supports its metadata columns"
+      s"an UPDATE on a map-column table read rows. Plan: ${scalarNames.mkString(", ")}"
     )
     assertSame(base)
-    // The MERGE still reads rows (MergeRowsExec has no map lane), so rowInputWrites may grow across it below.
+
     spark
       .sql(
         """SELECT id, cast(id % 4 as int) AS p, array(concat('n', id)) AS l, id % 3 AS op
@@ -448,7 +480,15 @@ class VectorDvWriteSuite extends AnyFunSuite with BeforeAndAfterAll {
         |WHEN MATCHED AND s.op = 0 THEN DELETE
         |WHEN MATCHED THEN UPDATE SET t.l = s.l
         |WHEN NOT MATCHED THEN INSERT (id, p, s, l, m) VALUES (s.id, s.p, null, s.l, map('i', s.id))""".stripMargin
-    assert(onOff(base, merge), "nested MERGE not columnar")
+    val mrgBefore = org.apache.spark.sql.vecruntime.VectorWriteDeltaExec.rowInputWrites.get()
+    val mrgNames = onOffNative(merge)
+    val mrgRowInput = org.apache.spark.sql.vecruntime.VectorWriteDeltaExec.rowInputWrites.get() - mrgBefore
+    assert(
+      mrgNames.contains("VectorMergeRowsExec"),
+      s"nested MERGE: MergeRows fell back. Plan: ${mrgNames.mkString(", ")}"
+    )
+    assert(mrgRowInput == 0L, s"the map('i', s.id) MERGE's delta write read $mrgRowInput row batches")
+
     // Inserted rows get their _row_id at commit, from the order of the new files: compared for the originals only.
     def all(t: String): Array[Row] =
       spark.sql(s"SELECT *, if(id < 2000, _row_id, null) FROM $t ORDER BY id").collect()
@@ -458,7 +498,6 @@ class VectorDvWriteSuite extends AnyFunSuite with BeforeAndAfterAll {
       rOn.length == rOff.length && diff.isEmpty,
       s"nested contents or _row_id differ: ${rOn.length} vs ${rOff.length} rows; ${diff.mkString("; ")}"
     )
-    org.apache.spark.sql.vecruntime.VectorWriteDeltaExec.rowInputWrites.set(rowInputBefore)
   }
 
   test("MERGE with only a NOT MATCHED insert clause leaves no DVs and matches Spark's writer") {

@@ -48,10 +48,21 @@ case class VectorExpandExec(projections: Seq[Seq[Expression]], output: Seq[Attri
 
   override def outputPartitioning: Partitioning = child.outputPartitioning
 
-  /** Compiled on the driver; the rule already checked every slot. A carried nested column's slot is null here. */
+  /**
+   * Compiled on the driver; the rule already checked every slot. A lane column or a built nested value
+   * (`named_struct`, `array`, `map`, #901 R2) compiles to a [[VectorExpr]]; a carried (moved or NULL)
+   * nested column's slot is null here and is handled by [[nested]].
+   */
   @transient private lazy val compiled: Array[Array[VectorExpr]] = projections.map { p =>
     p.zipWithIndex.map {
-      case (_, c) if !TypeMapping.hasLane(output(c).dataType) => null
+      // A nested OUTPUT whose slot only moves a column or is NULL is carried (null slot, see `nested`);
+      // a nested output built by an expression is compiled as a projection, like the project operator.
+      case (e, c) if !TypeMapping.hasLane(output(c).dataType) =>
+        if (VectorExpandPlanner.carriedNestedSlot(e, child.output)) null
+        else ExpressionCompiler.compileProjection(e, child.output) match {
+          case Right(c) => c
+          case Left(reason) => throw new IllegalStateException(s"cannot vectorize expand slot ${e.sql}: $reason")
+        }
       // Literals go straight to LiteralExpr: the compiler refuses NULL and boolean literals as
       // operands, but here they are whole constant columns.
       case (Literal(v, dt), _) => LiteralExpr(v, dt)
@@ -65,13 +76,15 @@ case class VectorExpandExec(projections: Seq[Seq[Expression]], output: Seq[Attri
 
   /**
    * Per projection and column, a carried nested column's source: the child ordinal it borrows, -1 for NULL,
-   * -2 for a lane column (compiled above).
+   * -2 for a lane column (compiled above), -3 for a built nested value (compiled above too).
    */
   @transient private lazy val nested: Array[Array[Int]] = projections.map { p =>
     p.zipWithIndex.map {
       case (_, c) if TypeMapping.hasLane(output(c).dataType) => -2
       case (a: Attribute, _) => child.output.indexWhere(_.exprId == a.exprId)
-      case _ => -1
+      case (Literal(null, _), _) => -1
+      // A built nested value: compiled above, evaluated and wrapped at emit time.
+      case _ => -3
     }.toArray
   }.toArray
 
@@ -168,6 +181,11 @@ private[vecruntime] class VectorExpandIterator(
                   ArrowOutput.compact(name, dt, ctx.input(ordinal), ctx.selection, n, allocator)
                 case lit: LiteralExpr if lit.value == null => ArrowOutput.nulls(name, dt, n, allocator)
                 case lit: LiteralExpr => ArrowOutput.constant(name, dt, lit.value, n, allocator)
+                // A built nested value (#901 R2): evaluated over the batch, handed to Spark as the
+                // nested lane and viewed through the selection, like the project operator does.
+                case e if TypeMapping.nestedTypeOf(dt) != null =>
+                  val col = io.vecruntime.spark.arrow.VectorNestedColumnVector.of(name, dt, e.eval(ctx), allocator)
+                  io.vecruntime.spark.arrow.RemappedColumnVector.owning(col, rows)
                 case e => ArrowOutput.compact(name, dt, e.eval(ctx), ctx.selection, n, allocator)
               }
               c += 1
@@ -188,6 +206,9 @@ private[vecruntime] class VectorExpandIterator(
                 case ColumnRef(ordinal, _) => BorrowedColumnVector.of(batch.column(ordinal))
                 case lit: LiteralExpr if lit.value == null => ArrowOutput.nulls(name, dt, n, allocator)
                 case lit: LiteralExpr => ArrowOutput.constant(name, dt, lit.value, n, allocator)
+                // A built nested value (#901 R2): the lane handed to Spark, like the project operator.
+                case e if TypeMapping.nestedTypeOf(dt) != null =>
+                  io.vecruntime.spark.arrow.VectorNestedColumnVector.of(name, dt, e.eval(ctx), allocator)
                 case e => ArrowOutput.copy(name, dt, e.eval(ctx), allocator)
               }
               c += 1
@@ -256,10 +277,15 @@ object VectorExpandPlanner {
       if (!TypeMapping.carriesNested(a.dataType))
         Some(s"unsupported output type ${a.dataType.simpleString} for ${a.name}")
       else
+        // A nested slot is carried (a column reference or NULL), or built by an expression we compile
+        // (`named_struct`, `array`, `map`, #901 R2); anything else keeps the compiler's reason.
         e.projections.zipWithIndex.collectFirst {
-          case (p, j) if !passedThrough(p(i), e.child.output) =>
-            s"projection $j: nested ${a.name} is ${p(i).sql}, not a column or NULL"
-        }
+          case (p, j) if !carriedNestedSlot(p(i), e.child.output) =>
+            ExpressionCompiler.compileProjection(p(i), e.child.output) match {
+              case Right(_) => null
+              case Left(reason) => s"projection $j: nested ${a.name} is ${p(i).sql}: $reason"
+            }
+        }.flatMap(Option(_))
     }
     val slotFailures = e.projections.zipWithIndex.flatMap { case (p, i) =>
       p.zipWithIndex.filterNot { case (_, c) => nestedColumns.contains(c) }.map(_._1).flatMap {
@@ -279,8 +305,8 @@ object VectorExpandPlanner {
     else Right(VectorExpandExec(e.projections, e.output, e.child))
   }
 
-  /** A nested slot carried through: a reference to a child column, or a NULL. */
-  private def passedThrough(slot: Expression, input: Seq[Attribute]): Boolean = slot match {
+  /** A nested slot carried through, borrowing rather than being built: a reference to a child column, or NULL. */
+  def carriedNestedSlot(slot: Expression, input: Seq[Attribute]): Boolean = slot match {
     case Literal(null, _) => true
     case a: Attribute => input.exists(_.exprId == a.exprId)
     case _ => false
