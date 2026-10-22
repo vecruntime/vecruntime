@@ -55,17 +55,29 @@ case class VectorIcebergWriteStrategy(session: SparkSession) extends SparkStrate
     case o: OverwriteByExpression => take(plan, o.table, o.query, o.write, None)
     case o: OverwritePartitionsDynamic => take(plan, o.table, o.query, o.write, None)
     case r: ReplaceData =>
-      // A copy-on-write rewrite always carries the operation's metadata columns (the row's _file, ...), which
-      // Iceberg's own writer uses only for format v3 row lineage: there the copied rows keep their _row_id and
-      // _last_updated_sequence_number, which the columnar writer does not write yet.
-      val lineage = r.projections.metadataProjection.toSeq
-        .flatMap(_.schema.fieldNames)
-        .filter(n => n == "_row_id" || n == "_last_updated_sequence_number")
-      if (lineage.nonEmpty) {
-        declined(s"copy-on-write keeping row lineage (${lineage.mkString(", ")}) is not supported yet")
-      } else {
-        val ordinals = r.projections.rowProjection.colOrdinals.map(_.asInstanceOf[Int]).toArray
-        take(plan, r.table, r.query, r.write, Some(ordinals), r.originalTable)
+      // The write's columns, in the order of Iceberg's write schema: the row's data columns from the row
+      // projection and, on a format v3 table, the row lineage the copied rows keep (_row_id and
+      // _last_updated_sequence_number, which Iceberg appends to the write schema) from the metadata projection.
+      val row = r.projections.rowProjection
+      val meta = r.projections.metadataProjection
+      def ordinal(name: String): Option[Int] = {
+        val inRow = row.schema.fieldNames.indexOf(name)
+        if (inRow >= 0) Some(row.colOrdinals(inRow).asInstanceOf[Int])
+        else meta.flatMap { m =>
+          val k = m.schema.fieldNames.indexOf(name)
+          if (k >= 0) Some(m.colOrdinals(k).asInstanceOf[Int]) else None
+        }
+      }
+      r.write match {
+        case Some(w) if IcebergWriteBridge.isAvailable && IcebergWriteBridge.isSparkWrite(w) =>
+          val names = IcebergWriteBridge.writeSchemaNames(w)
+          val ordinals = names.map(ordinal)
+          if (ordinals.exists(_.isEmpty)) {
+            declined(s"write column ${names(ordinals.indexWhere(_.isEmpty))} is in neither projection")
+          } else {
+            take(plan, r.table, r.query, r.write, Some(ordinals.map(_.get)), r.originalTable)
+          }
+        case _ => take(plan, r.table, r.query, r.write, None, r.originalTable)
       }
     case _ => Nil
   }
@@ -264,7 +276,13 @@ object VectorIcebergWriteExec extends Logging {
           writer.write(java.util.Arrays.asList(cols: _*), 0, n)
         } finally arena.close()
       }
-      IcebergWriteBridge.taskCommit(writer.dataFiles())
+      val files = writer.dataFiles()
+      // Spark's output metrics (UI, listeners), as its DataWritingSparkTask reports them for a v2 write.
+      val (records, bytes) = IcebergWriteBridge.fileTotals(files)
+      val out = ctx.taskMetrics().outputMetrics
+      out.setRecordsWritten(out.recordsWritten + records)
+      out.setBytesWritten(out.bytesWritten + bytes)
+      IcebergWriteBridge.taskCommit(files)
     } catch {
       case t: Throwable =>
         writer.abort(t)
