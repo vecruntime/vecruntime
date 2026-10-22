@@ -216,6 +216,31 @@ class IcebergReadSpecsSuite extends AnyFunSuite {
     assert(paths(p) == Seq("a"))
   }
 
+  test("the row-lineage columns are read from a file that materialises them, else missing") {
+    val lineage = struct(
+      optional(1, "a", Types.IntegerType.get()),
+      org.apache.iceberg.MetadataColumns.ROW_ID,
+      org.apache.iceberg.MetadataColumns.LAST_UPDATED_SEQUENCE_NUMBER
+    )
+    val (rowId, seq) = (
+      org.apache.iceberg.MetadataColumns.ROW_ID.fieldId(),
+      org.apache.iceberg.MetadataColumns.LAST_UPDATED_SEQUENCE_NUMBER.fieldId()
+    )
+    val rewritten = file(
+      s"""message table {
+         |  optional int32 a = 1;
+         |  optional int64 _row_id = $rowId;
+         |  optional int64 _last_updated_sequence_number = $seq;
+         |}""".stripMargin
+    )
+    val read = resolve(lineage, rewritten, null)
+    assert(read.columns().asScala.forall(_.isInstanceOf[Leaf]))
+    assert(paths(read) == Seq("a", "_row_id", "_last_updated_sequence_number"))
+    val original = resolve(lineage, file("message table { optional int32 a = 1; }"), null)
+    assert(original.columns().get(1).isInstanceOf[Missing] && original.columns().get(2).isInstanceOf[Missing])
+    assert(paths(original) == Seq("a"))
+  }
+
   // ------------------------------------------------------------- the Spark adapter's specs, type by type
 
   private val pairings: Seq[(Type.PrimitiveType, String)] = Seq(

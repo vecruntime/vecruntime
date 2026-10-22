@@ -412,6 +412,7 @@ class VectorDvWriteSuite extends AnyFunSuite with BeforeAndAfterAll {
            |FROM range(2000)""".stripMargin
       )
     }
+    // A struct literal is not a column, so the Expand of this UPDATE reads rows (`SET s = named_struct(...)`).
     assert(
       onOff(
         base,
@@ -419,13 +420,22 @@ class VectorDvWriteSuite extends AnyFunSuite with BeforeAndAfterAll {
       ),
       "nested UPDATE not columnar"
     )
-    // #20 M3a: the UPDATE's delete side reads columnar now -- its scan projects _partition / _row_id /
-    // _last_updated_sequence_number over a map column, which the native Iceberg scan supports. So the columnar
-    // delta write must not have had to read rows from a RowToColumnarExec for the UPDATE (on both partitions).
+    // #20 M3a: an UPDATE of a top-level column reads columnar end to end on the native Iceberg scan (opt-in): it
+    // projects _partition, _row_id and _last_updated_sequence_number over the map column, and the files that
+    // the UPDATE above rewrote carry their own _row_id. No delta write may read rows through RowToColumnarExec.
+    val beforeScalar = org.apache.spark.sql.vecruntime.VectorWriteDeltaExec.rowInputWrites.get()
+    spark.conf.set("spark.vecruntime.scan.nativeIceberg.enabled", "true")
+    try {
+      assert(
+        onOff(base, "UPDATE %s SET id = id + 100000 WHERE id % 5 = 0 AND id < 1500"),
+        "UPDATE of a long not columnar"
+      )
+    } finally spark.conf.unset("spark.vecruntime.scan.nativeIceberg.enabled")
     assert(
-      org.apache.spark.sql.vecruntime.VectorWriteDeltaExec.rowInputWrites.get() == rowInputBefore,
-      "the UPDATE on a map column must not read rows: the native Iceberg scan now supports its metadata columns"
+      org.apache.spark.sql.vecruntime.VectorWriteDeltaExec.rowInputWrites.get() == beforeScalar,
+      "an UPDATE on a map-column table read rows: the native Iceberg scan supports its metadata columns"
     )
+    assertSame(base)
     // The MERGE still reads rows (MergeRowsExec has no map lane), so rowInputWrites may grow across it below.
     spark
       .sql(
