@@ -271,8 +271,18 @@ class IcebergEqualityDeletesSuite extends AnyFunSuite with BeforeAndAfterAll {
     // id % 9 != 0. fx is injective, so no other row collides.
     val fDeleted = (0 until N by 17).filter(_ % 9 != 0).toSet
     val fExpected = (0 until N).toSet -- fDeleted
+    // The native probe reads the delete files itself (EqualityDeleteSet.ofDeleteFiles); it must NOT also trigger
+    // Iceberg's BaseDeleteLoader.loadEqualityDeletes, which would read every delete file a second time. Measure
+    // across a plugin-on scan whose equality delete is fully handled natively.
+    val loadsBefore = ParquetFileResolver.icebergEqualityLoads.get()
     val (fGot, fProbed) = nativeIds("ice.db.eqf")
+    val loadsDuringNative = ParquetFileResolver.icebergEqualityLoads.get() - loadsBefore
     assert(fProbed, "eqf: the native equality probe did not run")
+    assert(
+      loadsDuringNative == 0,
+      s"eqf: a native-probed equality delete must not load Iceberg's StructLikeSet, but " +
+        s"BaseDeleteLoader.loadEqualityDeletes ran $loadsDuringNative time(s)"
+    )
     assert(
       fGot == fExpected,
       s"eqf: native scan removed ${N - fGot.size} rows, expected ${fDeleted.size}; " +

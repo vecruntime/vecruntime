@@ -1227,7 +1227,17 @@ private[vecruntime] object IcebergTasks {
         .map(f => call(f, "fieldId").asInstanceOf[Integer].intValue())
         .toArray
       val cacheKey = (files.map(d => call(d, "location").toString).sorted.toSeq, ids)
-      val set = cache.getOrElseUpdate(cacheKey, load.invoke(loader, files.asJava, deleteSchema))
+      // Iceberg's own set, loaded only when the row probe below needs it: the native path reads the delete files
+      // itself (EqualityDeleteSet.ofDeleteFiles), so an eager load here would read every delete file twice.
+      val set = () =>
+        cache.synchronized(
+          cache.getOrElseUpdate(
+            cacheKey, {
+              ParquetFileResolver.icebergEqualityLoads.incrementAndGet()
+              load.invoke(loader, files.asJava, deleteSchema)
+            }
+          )
+        )
       val ordinals = order.map(ordinalOf)
       val sparkType =
         StructType(ordinals.map(o => schema(o).copy(metadata = org.apache.spark.sql.types.Metadata.empty)))
@@ -1293,7 +1303,8 @@ private[vecruntime] object IcebergTasks {
       }
     }
     batch => {
-      val probes = groups.map { case (set, ordinals, sparkType, icebergStruct, _, _, _) =>
+      val probes = groups.map { case (loadSet, ordinals, sparkType, icebergStruct, _, _, _) =>
+        val set = loadSet()
         val wrapper = wrapperCtor.newInstance(sparkType, icebergStruct)
         val row = new org.apache.spark.sql.catalyst.expressions.GenericInternalRow(ordinals.length)
         val types = sparkType.fields.map(_.dataType)
