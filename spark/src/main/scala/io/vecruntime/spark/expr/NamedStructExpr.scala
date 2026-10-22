@@ -31,7 +31,9 @@ final case class NamedStructExpr(fields: Seq[VectorExpr], nullWhen: Option[Vecto
   override def children: Seq[VectorExpr] = fields ++ nullWhen.toSeq
 
   override def eval(ctx: EvalContext): VectorBuffers = {
-    val lanes = fields.map(_.eval(ctx))
+    // A field may be a literal (a folded `named_struct('a', 1)`, #901 R2): materialised to a constant
+    // lane, not evaluated as a column.
+    val lanes = fields.map(CaseWhenExpr.materialise(_, ctx))
     val validity = nullWhen.map(_.eval(ctx).validity()).orNull
     NestedVectorBuffers.struct(ctx.numRows, validity, lanes.asJava)
   }
