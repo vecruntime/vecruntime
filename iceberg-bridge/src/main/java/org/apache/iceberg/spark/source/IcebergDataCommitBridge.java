@@ -59,9 +59,11 @@ public final class IcebergDataCommitBridge {
 
     /**
      * Why the columnar writer cannot write {@code write}'s data files, or
-     * {@code null} when it can: the file format must be Parquet, the output
-     * spec unpartitioned (until W3), the table unencrypted, and every write
-     * schema type one the columnar Parquet writer encodes.
+     * {@code null} when it can: the file format must be Parquet; a partitioned
+     * output spec's sources must be top-level columns of types the batches
+     * carry (and a fanout write must have no nested columns, which it cannot
+     * gather); the table must be unencrypted; and every write schema type must
+     * be one the columnar Parquet writer encodes.
      */
     public static String declineReason(Write write) {
         if (!(write instanceof SparkWrite w)) {
@@ -73,16 +75,22 @@ public final class IcebergDataCommitBridge {
         }
         Table table = field(w, "table", Table.class);
         int specId = field(w, "outputSpecId", Integer.class);
-        if (!table.specs()
-                  .get(specId)
-                  .isUnpartitioned()) {
-            return "partitioned output spec (" + table.specs().get(specId) + ") is not supported yet";
+        Schema schema = field(w, "writeSchema", Schema.class);
+        org.apache.iceberg.PartitionSpec spec = table.specs().get(specId);
+        if (!spec.isUnpartitioned()) {
+            String partitions = io.vecruntime.iceberg.write.IcebergWriteSpec.unsupportedPartitioning(spec, schema);
+            if (partitions != null) {
+                return partitions;
+            }
+            if (field(w, "useFanoutWriter", Boolean.class) && schema.columns().stream()
+                    .anyMatch(c -> c.type().isNestedType())) {
+                return "a fanout write of nested columns is not supported yet";
+            }
         }
         if (table.properties().keySet().stream()
                 .anyMatch(k -> k.startsWith("encryption."))) {
             return "the table is encrypted";
         }
-        Schema schema = field(w, "writeSchema", Schema.class);
         String type = unsupportedType(schema.asStruct());
         return type == null ? null : "write schema type " + type + " is not supported";
     }
@@ -150,8 +158,14 @@ public final class IcebergDataCommitBridge {
         for (Map.Entry<?, ?> e : writeProps.entrySet()) {
             props.put(String.valueOf(e.getKey()), String.valueOf(e.getValue()));
         }
-        return new IcebergWriteSpec(SerializableTable.copyOf(table), field(w, "writeSchema", Schema.class), field(w, "outputSpecId", Integer.class),
-                field(w, "targetFileSize", Long.class), props, field(w, "queryId", String.class));
+        return new IcebergWriteSpec(
+                SerializableTable.copyOf(table),
+                field(w, "writeSchema", Schema.class),
+                field(w, "outputSpecId", Integer.class),
+                field(w, "targetFileSize", Long.class),
+                props,
+                field(w, "queryId", String.class),
+                field(w, "useFanoutWriter", Boolean.class));
     }
 
     /**

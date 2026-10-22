@@ -294,16 +294,107 @@ class VectorIcebergWriteSuite extends AnyFunSuite with BeforeAndAfterAll {
       spark.sql("SELECT * FROM pq_src ORDER BY id").collect().toSeq)
   }
 
-  test("a partitioned table falls back to Iceberg's writer, unchanged") {
-    val (off, on) = ("ice.db.part_off", "ice.db.part_on")
+  private val FlatColumns = "id BIGINT, p INT, i INT, d DOUBLE, s STRING, day DATE, ts TIMESTAMP, dec DECIMAL(9,2)"
+
+  private def flat(rows: Int): String =
+    s"SELECT id, cast(id % 8 as int) as p, i, d, s, day, ts, dec FROM (${source(rows)})"
+
+  /**
+   * An append into a partitioned table, on a writer-off twin and a writer-on table: the same rows, the same
+   * partitions with the same record counts, and the columnar exec planned when `columnarExpected`.
+   */
+  private def partitionedTwin(
+      name: String,
+      partitioning: String,
+      props: String,
+      columns: String,
+      src: String,
+      columnarExpected: Boolean = true
+  ): Unit = {
+    val (off, on) = (s"ice.db.${name}_off", s"ice.db.${name}_on")
     Seq(off, on).foreach { t =>
       spark.sql(s"DROP TABLE IF EXISTS $t")
-      spark.sql(s"CREATE TABLE $t ($Columns) USING iceberg PARTITIONED BY (bucket(4, id))")
+      spark.sql(
+        s"CREATE TABLE $t ($columns) USING iceberg PARTITIONED BY ($partitioning) " +
+          s"TBLPROPERTIES ('format-version'='2', 'write.target-file-size-bytes'='65536'$props)"
+      )
     }
-    withWriter(on = false)(spark.sql(s"INSERT INTO $off ${source(3000)}").collect())
-    val df = withWriter(on = true)(spark.sql(s"INSERT INTO $on ${source(3000)}"))
+    withWriter(on = false)(spark.sql(s"INSERT INTO $off $src").collect())
+    val df = withWriter(on = true)(spark.sql(s"INSERT INTO $on $src"))
     df.collect()
-    assert(!columnar(df))
+    assert(columnar(df) == columnarExpected, s"$name: columnar exec planned")
+    assert(rows(on) == rows(off), s"$name: the table differs from the one Iceberg's writer wrote")
+    def parts(t: String) =
+      spark.sql(s"SELECT cast(partition as string), record_count FROM $t.partitions ORDER BY 1").collect().toSeq
+    assert(parts(on) == parts(off), s"$name: partitions")
+  }
+
+  private val Partitionings = Seq(
+    "identity" -> "p",
+    "day" -> "days(ts)",
+    "month_bucket" -> "months(day), bucket(4, id)",
+    "hour_truncate" -> "hours(ts), truncate(3, s)",
+    "year_truncate_dec" -> "years(day), truncate(100000, dec)"
+  )
+
+  for ((spec, partitioning) <- Partitionings; mode <- Seq("none", "hash", "range"); fanout <- Seq(false, true)) {
+    test(s"partitioned ($partitioning), distribution mode $mode, fanout $fanout writes columnar") {
+      partitionedTwin(
+        s"p_${spec}_${mode}_$fanout",
+        partitioning,
+        s", 'write.distribution-mode'='$mode', 'write.spark.fanout.enabled'='$fanout'",
+        FlatColumns,
+        flat(6000)
+      )
+    }
+  }
+
+  test("a partitioned table with a sort order writes columnar") {
+    val (off, on) = ("ice.db.sorted_off", "ice.db.sorted_on")
+    Seq(off, on).foreach { t =>
+      spark.sql(s"DROP TABLE IF EXISTS $t")
+      spark.sql(s"CREATE TABLE $t ($FlatColumns) USING iceberg PARTITIONED BY (bucket(3, i))")
+      org.apache.iceberg.spark.Spark3Util.loadIcebergTable(spark, t).replaceSortOrder().asc("s").asc("id").commit()
+    }
+    withWriter(on = false)(spark.sql(s"INSERT INTO $off ${flat(4000)}").collect())
+    val df = withWriter(on = true)(spark.sql(s"INSERT INTO $on ${flat(4000)}"))
+    df.collect()
+    assert(columnar(df))
+    assert(rows(on) == rows(off))
+  }
+
+  test("partitioned nested columns write columnar clustered, and keep Iceberg's writer with fanout") {
+    partitionedTwin(
+      "p_nested_clustered",
+      "bucket(4, id)",
+      ", 'write.spark.fanout.enabled'='false'",
+      Columns,
+      source(3000)
+    )
+    partitionedTwin(
+      "p_nested_fanout",
+      "bucket(4, id)",
+      ", 'write.spark.fanout.enabled'='true'",
+      Columns,
+      source(3000),
+      columnarExpected = false
+    )
+  }
+
+  test("copy-on-write DELETE on a partitioned table writes columnar") {
+    val (off, on) = ("ice.db.p_cow_off", "ice.db.p_cow_on")
+    Seq(off, on).foreach { t =>
+      spark.sql(s"DROP TABLE IF EXISTS $t")
+      spark.sql(
+        s"CREATE TABLE $t ($FlatColumns) USING iceberg PARTITIONED BY (days(ts)) TBLPROPERTIES " +
+          s"('format-version'='2'$CopyOnWrite)"
+      )
+      withWriter(on = false)(spark.sql(s"INSERT INTO $t ${flat(6000)}").collect())
+    }
+    withWriter(on = false)(spark.sql(s"DELETE FROM $off WHERE id % 3 = 0").collect())
+    val df = withWriter(on = true)(spark.sql(s"DELETE FROM $on WHERE id % 3 = 0"))
+    df.collect()
+    assert(columnar(df))
     assert(rows(on) == rows(off))
   }
 

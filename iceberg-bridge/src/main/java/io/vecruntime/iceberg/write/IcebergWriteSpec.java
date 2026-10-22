@@ -47,15 +47,23 @@ public final class IcebergWriteSpec implements Serializable {
     private final Map<String, String> properties;
 
     private final String operationId;
+    private final boolean fanout;
 
-    public IcebergWriteSpec(Table table, Schema writeSchema, int specId,
-                            long targetFileSize, Map<String, String> properties, String operationId) {
+    public IcebergWriteSpec(
+            Table table,
+            Schema writeSchema,
+            int specId,
+            long targetFileSize,
+            Map<String, String> properties,
+            String operationId,
+            boolean fanout) {
         this.table = table;
         this.writeSchema = writeSchema;
         this.specId = specId;
         this.targetFileSize = targetFileSize;
         this.properties = Map.copyOf(properties);
         this.operationId = operationId;
+        this.fanout = fanout;
     }
 
     public Table table() {
@@ -84,5 +92,22 @@ public final class IcebergWriteSpec implements Serializable {
 
     public String operationId() {
         return operationId;
+    }
+
+    /**
+     * Whether the write uses one open file per partition (rows in any order)
+     * rather than one at a time (rows clustered by partition): Iceberg's own
+     * choice for the write ({@code SparkWrite.useFanoutWriter}).
+     */
+    public boolean fanout() {
+        return fanout;
+    }
+
+    /**
+     * Why a partition spec cannot be written from the batches (null when it
+     * can), see {@link PartitionKeys}.
+     */
+    public static String unsupportedPartitioning(org.apache.iceberg.PartitionSpec spec, Schema schema) {
+        return PartitionKeys.unsupported(spec, schema);
     }
 }
