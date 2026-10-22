@@ -26,6 +26,16 @@
       <scope>provided</scope>
     </dependency>
     <dependency>
+      <!-- Provided: the Spark adapter of the Iceberg read resolution (io.vecruntime.iceberg.spark,
+           #901 R1) implements the plugin's ParquetFileResolver; the plugin is on the classpath
+           wherever the bridge runs, and the plugin reaches the bridge only reflectively. The tests
+           also load the plugin's operators, planner strategies and session extensions. -->
+      <groupId>io.github.vecruntime</groupId>
+      <artifactId>vecruntime-spark_${spark.line}_${scala.binary.version}</artifactId>
+      <version>${project.version}</version>
+      <scope>provided</scope>
+    </dependency>
+    <dependency>
       <!-- Compiled against here to reach the package-private DeltaTaskCommit constructors and the
            public DV writer API; at run time the classes come from the Iceberg runtime already on
            the Spark classpath, so provided keeps them out of this artifact. -->
@@ -49,15 +59,6 @@
            batches in the write suites, as it does in a vecruntime deployment. -->
       <groupId>io.github.vecruntime</groupId>
       <artifactId>vecruntime-shuffle_${spark.line}_${scala.binary.version}</artifactId>
-      <version>${project.version}</version>
-      <scope>test</scope>
-    </dependency>
-    <dependency>
-      <!-- Test-only: loads the plugin's operator, planner strategy and session extensions so the DV
-           writer's integration tests can run the columnar path end to end. The gate's -pl list does
-           not include this module, so these tests are run manually (see docs/iceberg-dv-writer.md). -->
-      <groupId>io.github.vecruntime</groupId>
-      <artifactId>vecruntime-spark_${spark.line}_${scala.binary.version}</artifactId>
       <version>${project.version}</version>
       <scope>test</scope>
     </dependency>

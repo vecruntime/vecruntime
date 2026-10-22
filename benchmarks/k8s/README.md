@@ -70,6 +70,21 @@ stages from `SparkListenerStageCompleted`, attributed through a job group per ru
 each run writes `<config>[-label]-<timestamp>.jsonl`; the report reads every file of the directory
 and takes the latest row per (configuration, query).
 
+With our plugin loaded, each row also has a `memory` object (#925): the executors' memory gauges over the last
+measured run, read by a small probe job (`io.vecruntime.spark.MemoryProbe`) with the peaks restarted just before it.
+For every value it gives `<name>Max` and `<name>Sum` over the executors, plus `executors`. The values are:
+
+- the native pool: `nativePoolInUse`, `nativePoolPeak`, `nativePoolRetained`, and the growth of
+  `nativePoolOverdraft` and `nativePoolLeaked` during the run;
+- the pinned bytes: `pinned` and `pinnedPeak`;
+- Arrow: `arrow`, and `arrowPeakSinceStart`, which can't be reset;
+- the scan's read-ahead: `prefetchPeak`, `readAheadHeld`, `readAheadPeak`, and the growth of `readAheadRefusals`
+  during the run;
+- the heap's old generation: `heapOldPeak` and `heapOldAfterGc`;
+- the process: `rss` and `rssPeak` (VmHWM).
+
+The run log has the same summary as one `memory (MiB, ...)` line per query.
+
 ## Report
 
 `run-tpcds.sh --cluster-report s3://bucket/results/sf1000-parquet` (or `TpcdsRunner --cluster-report
