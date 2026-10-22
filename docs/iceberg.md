@@ -16,8 +16,8 @@ Spark's and Iceberg's, apart from an opt-in columnar deletion-vector writer for 
   deletion vectors and equality deletes itself, and reads `_file`, `_pos` and `_spec_id`.
 - **When it is declined:** the whole scan or a single task group is read by Iceberg's vectorized reader, and our
   operators adapt its batches. That reader is also the path when the switch is off. Declined are some v3 and
-  other column types, other metadata columns, nested initial defaults, and ORC, Avro or
-  encrypted files.
+  other column types, other metadata columns, a nested default our reader cannot fill as a constant, and ORC,
+  Avro or encrypted files.
 - **No Comet:** Comet is not needed for any of this.
 - **Writes (#913-#921, #936):** a columnar Iceberg writer covers `INSERT`, `INSERT OVERWRITE`, CTAS/RTAS,
   copy-on-write and merge-on-read `DELETE` / `UPDATE` / `MERGE INTO`, partitioned tables and hash and range
@@ -76,7 +76,7 @@ Everything in the version 2 table applies. The version 3 additions:
 |---|---|---|
 | Deletion vectors (Puffin) | yes | Read once per data file, and the deleted rows are deselected as for position deletes |
 | Writing deletion vectors | opt-in | `spark.vecruntime.iceberg.dvWriter.enabled` (off by default) builds each data file's `PositionDeleteIndex` from our batches and hands it to Iceberg's DV writer, for `DELETE`, `UPDATE` and `MERGE INTO`. The commit stays Iceberg's `RowDelta`. See [the write side](#the-write-side-columnar-v3-deletion-vectors-20) |
-| Default values: `initial-default` | yes, or scan | A top-level column's default is filled into the files written before the column existed, as a constant (Spark's existence default), for boolean, int, long, float, double, decimal, string, binary, date and timestamp columns. A default on a nested field, or of another type, keeps Iceberg's reader for the scan |
+| Default values: `initial-default` | yes, or scan | A column's default is filled into the files written before the column existed, as a constant (Spark's existence default), for boolean, int, long, float, double, decimal, string, binary, date and timestamp columns -- at the top level and (#901 item 4) for a field added inside a struct, which returns the default from older files, not null. A default of another type keeps Iceberg's reader for the scan |
 | Default values: `write-default` | n/a | Applied by Iceberg's writer |
 | Row lineage (`_row_id`, `_last_updated_sequence_number`) | yes (#20 M3a) | The file's own column where it materialises them, else `firstRowId + _pos` / `dataSequenceNumber`, exactly as Iceberg derives them from the manifests and the files' first row ids |
 | `variant`, shredded or not | yes | Iceberg writes the spec's Parquet variant group, with `typed_value` when `write.parquet.shred-variants` is on. Our Parquet reader reads it as it reads Spark's variants (#787, #812), at the top level and inside structs, under deletes. Iceberg's own vectorized reader cannot read a shredded variant ("Unsupported variant: shredded typed_value primitive"); our scan reads it either way |
@@ -109,7 +109,7 @@ At plan time the node declines, and Spark's `BatchScanExec` stays:
   file, an encrypted file, or equality deletes on a column it does not read;
 - a metadata column other than `_file`, `_pos`, `_spec_id`, `_partition`, `_row_id` and
   `_last_updated_sequence_number` (for example `_deleted`);
-- a nested field with an initial default, or a top-level default our reader cannot fill as a constant;
+- a nested or top-level default our reader cannot fill as a constant;
 - a column type outside the flat types in the table above, or a nested type with such a leaf.
 
 The switch is off by default until the TPC-DS Iceberg A/B is in.

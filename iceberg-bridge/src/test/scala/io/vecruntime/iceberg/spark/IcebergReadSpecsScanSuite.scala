@@ -237,4 +237,44 @@ class IcebergReadSpecsScanSuite extends AnyFunSuite with BeforeAndAfterAll {
     check(s"SELECT * FROM $t", previousFails = true)
     check(s"SELECT a, s FROM $t", previousFails = true)
   }
+
+  test("#901 item 4: a nested field added with an initial default returns the default from old files") {
+    import org.apache.iceberg.expressions.Literal
+    import org.apache.iceberg.types.Types
+    val t = "ice.db.nested_defaults"
+    spark.sql(s"DROP TABLE IF EXISTS $t")
+    // A struct with a field present from the start, so the old files hold the struct (its nulls come from `a`).
+    spark.sql(
+      s"CREATE TABLE $t (k INT, st STRUCT<a: INT>) USING iceberg TBLPROPERTIES ('format-version' = '3')"
+    )
+    spark.sql(s"INSERT INTO $t SELECT cast(id AS INT), named_struct('a', cast(id % 9 AS INT)) FROM range(0, 2000)")
+    val table = org.apache.iceberg.spark.Spark3Util.loadIcebergTable(spark, t)
+    // Add fields inside the struct, each with an initial default -- the nested-default shape item 4 names.
+    table.updateSchema()
+      .addColumn("st", "ci", Types.IntegerType.get(), "", Literal.of(7))
+      .addColumn("st", "cs", Types.StringType.get(), "", Literal.of("it's"))
+      .addColumn("st", "cd", Types.DecimalType.of(9, 2), "", Literal.of(new java.math.BigDecimal("12.34")))
+      .commit()
+    spark.sql(s"REFRESH TABLE $t")
+    spark.sql(
+      s"""INSERT INTO $t SELECT cast(id AS INT),
+         |  named_struct('a', cast(id % 9 AS INT), 'ci', cast(id AS INT), 'cs', 'x', 'cd', CAST(id / 100.0 AS DECIMAL(9,2)))
+         |FROM range(2000, 2500)""".stripMargin
+    )
+    // Native read equals Iceberg's reader, no file to Spark's reader, no group to Iceberg's.
+    check(s"SELECT k, st.a, st.ci, st.cs, st.cd FROM $t")
+    check(s"SELECT k, st.ci, st.cs FROM $t WHERE k % 7 = 0")
+    // The new nested fields alone: the old files hold the struct but none of these three.
+    check(s"SELECT k, st.ci FROM $t")
+
+    // An independently computed expected set (not only Iceberg's reader): old rows take the defaults, new ones
+    // their inserted values. Iceberg 1.12's own reader agrees here, but the assertion stands on its own.
+    val rows = spark.sql(s"SELECT k, st.ci, st.cs, st.cd FROM $t").collect()
+      .map(r => (r.getInt(0), r.getInt(1), r.getString(2), r.getDecimal(3))).toSet
+    val expected = ((0 until 2000).map(k => (k, 7, "it's", new java.math.BigDecimal("12.34"))) ++
+      (2000 until 2500).map { k =>
+        (k, k, "x", new java.math.BigDecimal(k).divide(new java.math.BigDecimal(100)).setScale(2))
+      }).toSet
+    assert(rows == expected, s"nested defaults differ:\n${rows.diff(expected).take(5)}\n${expected.diff(rows).take(5)}")
+  }
 }

@@ -873,16 +873,39 @@ private[vecruntime] object IcebergTasks {
   }
 
   /**
+   * #901 item 4: a nested Iceberg field's initial default as an existence default (the SQL text our reader fills
+   * into a file written before the field was added), or None when the field has no default or one of a type our
+   * reader cannot fill as a constant. Only an atomic field carries a fillable default; a default on a struct, list
+   * or map itself is not filled here (and Iceberg does not allow one).
+   */
+  private def nestedDefaultSql(field: AnyRef): Option[String] = {
+    if (call(field, "initialDefault") == null) return None
+    val icebergType = call(field, "type")
+    if (!NativeTypes.contains(call(icebergType, "typeId").toString)) return None
+    val cl = icebergType.getClass.getClassLoader
+    val typeClass = Class.forName("org.apache.iceberg.types.Type", false, cl)
+    val dt = Class
+      .forName("org.apache.iceberg.spark.SparkSchemaUtil", false, cl)
+      .getMethod("convert", typeClass)
+      .invoke(null, icebergType)
+      .asInstanceOf[org.apache.spark.sql.types.DataType]
+    existenceDefaultSql(field, dt)
+  }
+
+  /**
    * Why an Iceberg column type is not read natively, or None: a flat type of [[NativeTypes]], or (#nested) a struct,
-   * list or map whose every leaf is one, at any depth. A nested field with an initial default is not: Iceberg fills
-   * it for files written before it was added, our reader reads nulls.
+   * list or map whose every leaf is one, at any depth. A nested field with an initial default (#901 item 4) is read
+   * natively when our reader can fill that default as a constant -- as it fills a top-level default (see
+   * [[existenceDefaultSql]]) -- and a file missing the field returns the default, not null, as Iceberg's reader
+   * does; a default of a type our reader cannot fill as a constant still keeps Iceberg's reader.
    */
   private def unsupportedType(icebergType: AnyRef, path: String): Option[String] =
     call(icebergType, "typeId").toString match {
       case "STRUCT" =>
         call(icebergType, "fields").asInstanceOf[java.util.List[AnyRef]].asScala.iterator.map { f =>
           val name = s"$path.${call(f, "name")}"
-          if (call(f, "initialDefault") != null) Some(s"Iceberg field $name has an initial default")
+          if (call(f, "initialDefault") != null && nestedDefaultSql(f).isEmpty)
+            Some(s"Iceberg field $name has an initial default our reader cannot fill as a constant")
           else unsupportedType(call(f, "type"), name)
         }.collectFirst { case Some(r) => r }
       case "LIST" => unsupportedType(call(icebergType, "elementType"), s"$path.element")
@@ -911,11 +934,17 @@ private[vecruntime] object IcebergTasks {
           byName.get(f.name.toLowerCase) match {
             case Some(nf) =>
               val id = call(nf, "fieldId").asInstanceOf[Integer].longValue()
-              f.copy(
-                dataType = withFieldIds(f.dataType, call(nf, "type")),
-                metadata = new MetadataBuilder().withMetadata(f.metadata)
-                  .putLong(ParquetUtils.FIELD_ID_METADATA_KEY, id).build()
-              )
+              val md = new MetadataBuilder().withMetadata(f.metadata)
+                .putLong(ParquetUtils.FIELD_ID_METADATA_KEY, id)
+              // #901 item 4: a nested field with a fillable initial default carries it as an existence default, so
+              // the struct reader fills a file missing the field with the default rather than null.
+              nestedDefaultSql(nf).foreach { sql =>
+                md.putString(
+                  org.apache.spark.sql.catalyst.util.ResolveDefaultColumns.EXISTS_DEFAULT_COLUMN_METADATA_KEY,
+                  sql
+                )
+              }
+              f.copy(dataType = withFieldIds(f.dataType, call(nf, "type")), metadata = md.build())
             case None => f
           }
         })
