@@ -88,6 +88,12 @@ trait GroupedAggState {
    * and never touches the state afterwards. The heap accumulators hold nothing to give back.
    */
   def close(): Unit = ()
+
+  /**
+   * Bytes this state holds in pool blocks (#941): charged to the task's account by the pool, so the
+   * operator leaves them out of its on-heap estimate. 0 for state on the heap.
+   */
+  def nativeBytes: Long = 0L
 }
 
 /** Serializable description of a supported aggregate function; states are created per task. */
@@ -157,6 +163,8 @@ final case class SumLongAgg(input: VectorExpr, checked: Boolean, queryContext: o
   }
   override def newGroupedState(): GroupedAggState = new GroupedAggState {
     private val acc = new GroupedAccumulators.LongSum(checked)
+    override def close(): Unit = acc.close()
+    override def nativeBytes: Long = acc.nativeBytes()
     override def update(ctx: EvalContext, groups: GroupAssignment): Unit =
       try acc.update(input.eval(ctx), groups)
       catch { case _: ArithmeticException => overflow() }
@@ -1037,6 +1045,8 @@ final case class CountMergeAgg(count: VectorExpr) extends VectorAggFunction {
   }
   override def newGroupedState(): GroupedAggState = new GroupedAggState {
     private val acc = new GroupedAccumulators.LongSum
+    override def close(): Unit = acc.close()
+    override def nativeBytes: Long = acc.nativeBytes()
     override def update(ctx: EvalContext, groups: GroupAssignment): Unit = acc.update(count.eval(ctx), groups)
     override def bufferValue(g: Int, slot: Int): Any = java.lang.Long.valueOf(acc.sum(g))
   }
@@ -1062,6 +1072,8 @@ final case class AverageMergeAgg(sum: VectorExpr, count: VectorExpr, strict: Boo
   override def newGroupedState(): GroupedAggState = new GroupedAggState {
     private val sums = new GroupedAccumulators.DoubleSum(strict)
     private val counts = new GroupedAccumulators.LongSum
+    override def close(): Unit = counts.close()
+    override def nativeBytes: Long = counts.nativeBytes()
     override def update(ctx: EvalContext, groups: GroupAssignment): Unit = {
       sums.update(sum.eval(ctx), groups)
       counts.update(count.eval(ctx), groups)

@@ -539,8 +539,18 @@ private[vecruntime] class VectorGroupedAggregateIterator(
     var capacity = 64L
     while (capacity < groups) capacity <<= 1
     val accumulators = capacity * accumulatorBytesPerGroup
-    val growth = if (groups * 8L >= capacity * 7L) 2L * accumulators else 0L
-    table.memoryBytes() + accumulators + growth + objectBytes
+    // #941: state in pool blocks is charged to the task by the pool, in the operators' memory mode; this
+    // on-heap estimate keeps only what is still on the heap.
+    val heapAccumulators = math.max(0L, accumulators - nativeStateBytes)
+    val growth = if (groups * 8L >= capacity * 7L) 2L * heapAccumulators else 0L
+    table.memoryBytes() + heapAccumulators + growth + objectBytes
+  }
+
+  private def nativeStateBytes: Long = {
+    var total = 0L
+    var s = 0
+    while (s < states.length) { total += states(s).nativeBytes; s += 1 }
+    total
   }
 
   // The heap held by object-aggregate buffers (#57), summed over the live groups: 0 unless a state
