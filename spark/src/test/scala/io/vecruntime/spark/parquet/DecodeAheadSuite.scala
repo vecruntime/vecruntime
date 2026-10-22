@@ -101,11 +101,13 @@ class DecodeAheadSuite extends VectorQuerySuite {
     }
   }
 
-  test("decodeAhead=0 (the default) starts no producer") {
+  test("decodeAhead=0 starts no producer; the default (2, #915) does") {
     val before = DecodeAheadIterator.started.get()
-    spark.conf.unset(VectorConf.ScanNativeParquetDecodeAhead)
-    checkVectorized("SELECT i, s FROM da_t WHERE i % 3 = 0", Seq(node))
+    withDecodeAhead(0, "virtual") {
+      checkVectorized("SELECT i, s FROM da_t WHERE i % 3 = 0", Seq(node))
+    }
     assert(DecodeAheadIterator.started.get() === before)
+    assert(VectorConf.scanNativeParquetDecodeAhead(new org.apache.spark.sql.internal.SQLConf) === 2)
   }
 
   test("a LIMIT that ends the task early leaks no vectors") {
@@ -181,6 +183,7 @@ class DecodeAheadSuite extends VectorQuerySuite {
       ) ++ confs: _*
     )(withPlugin(enabled = true)(spark.sql(sql).collect().toSeq))
     assert(VectorParquetScanExec.prefetchInFlightBytes === 0, "read-ahead bytes were not given back")
+    assert(VectorParquetScanExec.readAheadHeldBytes === 0, "read-ahead execution memory was not given back (#915)")
     (rows, VectorParquetScanExec.prefetchPeakBytes)
   }
 
