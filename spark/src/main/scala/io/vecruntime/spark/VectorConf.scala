@@ -78,6 +78,15 @@ object VectorConf {
   val IcebergWriterEnabled = "spark.vecruntime.iceberg.writer.enabled"
 
   /**
+   * Partial columnar merge (#901 M4a): a copy-on-write `DELETE` handled by the columnar writer copies the
+   * byte-for-byte row groups of a rewritten file that have no deleted rows, instead of decoding and re-encoding
+   * them. Needs the write's `_file` / `_pos` on the batches (Iceberg's copy-on-write scan projects both).
+   * Unpartitioned tables only for now; a file whose schema differs from the write schema, or whose tracked
+   * float/double NaN counts a copy cannot supply, falls back to the full rewrite. Default OFF while it lands.
+   */
+  val IcebergCopyUnchangedEnabled = "spark.vecruntime.iceberg.copyUnchanged.enabled"
+
+  /**
    * Logical rewrite (#632): `IsNotNull` on a grouping key that is the only difference between the
    * inputs of two aggregates (a CTE used twice) moves above the aggregates, so the input is shared.
    */
@@ -371,6 +380,9 @@ object VectorConf {
 
   /** The columnar Iceberg data-file writer (#842, W2). Default `false` while it lands. */
   def icebergWriterEnabled(conf: SQLConf): Boolean = bool(conf, IcebergWriterEnabled, default = false)
+
+  /** Copy delete-free row groups in a copy-on-write DELETE (#901 M4a). Default `false` while it lands. */
+  def icebergCopyUnchangedEnabled(conf: SQLConf): Boolean = bool(conf, IcebergCopyUnchangedEnabled, default = false)
   def aggDictionaryKeys(conf: SQLConf): Boolean = bool(conf, AggDictionaryKeys, default = true)
 
   /** Pass selection bitmaps between spark-vector operators instead of compacting each batch. */

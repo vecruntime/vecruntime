@@ -190,6 +190,29 @@ public final class IcebergParquetAppender implements FileAppender<IcebergParquet
     }
 
     /**
+     * Copies one row group {@code block} of {@code source} byte for byte into
+     * this file (#901 M4a), through {@link ColumnarParquetWriter#copyRowGroup}.
+     * The copied group's statistics reach the footer, so {@link #metrics}
+     * combines them with the re-encoded rows'.
+     */
+    public void copyRowGroup(org.apache.parquet.io.SeekableInputStream source, org.apache.parquet.hadoop.metadata.BlockMetaData block) {
+        try {
+            writer.copyRowGroup(source, block);
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+
+    /** Cuts a row-group boundary (see {@link ColumnarParquetWriter#endRowGroup}). */
+    public void endRowGroup() {
+        try {
+            writer.endRowGroup();
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+
+    /**
      * The file's metrics, from its footer; available once {@link #close} has
      * returned.
      */

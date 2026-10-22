@@ -334,10 +334,26 @@ A DELETE touching one row group of eight (2000 rows each) rewrote in 7.7 ms with
 rewrite in a local smoke run -- the shape the cluster A/B (a copy-on-write `DELETE` of 0.1% / 1% / 10% of the
 rows) will measure at 1 TB. The primitive and its guards are covered by `RowGroupCopyTest` in the `parquet`
 module (0, some and all groups copied; rows and order equal; copied statistics, encodings and byte sizes equal
-the source; schema-evolved files reported not copyable; the full-rewrite-vs-copy smoke). The operator that counts
-deleted positions per row group from the `_file` / `_pos` lanes and drives the per-file rewrite is the next step
-(M4a wiring), followed by column-chunk copying for `UPDATE` / matched-only `MERGE` (M4b) and `rewrite_data_files`
-(M4c).
+the source; schema-evolved files reported not copyable; the full-rewrite-vs-copy smoke).
+
+The per-file rewrite operator is wired behind `spark.vecruntime.iceberg.copyUnchanged.enabled` (default off). For
+a copy-on-write `DELETE` on an unpartitioned table, `VectorIcebergWriteStrategy` recognises the `ReplaceData`
+(its `RowLevelOperation.Command` is `DELETE`, so every output row is an unchanged copy of a surviving row -- an
+`UPDATE` or `MERGE` rewrites values and is not eligible), passes the `_file` / `_pos` ordinals Iceberg's
+copy-on-write scan already projects, and the executor runs `IcebergRewriteFileTaskWriter`: it buffers the
+surviving rows per source file, reads each source footer, asks `RowGroupCopyPlanner` which groups to copy /
+re-encode / skip, and emits the new file through `IcebergParquetAppender` so the metrics are the combined
+footer's. `RowGroupCopyPlanner` is covered by `RowGroupCopyPlannerSuite` (0 / some / all groups, group ranges,
+schema-evolution and NaN-metrics fallback).
+
+**Known gap (why the flag stays off):** the operator assumes each source file's surviving rows all land in one
+write task. Iceberg's copy-on-write distribution clusters the write input by `_file` with
+`REBALANCE_PARTITIONS_BY_COL`, which may *skew-split* one file across tasks; a task then sees only part of a file
+and cannot tell a deleted row from one that went to another task, so the copy is unsafe. Enabling copy-unchanged
+needs the write input clustered by `_file` without skew-splitting (a plain `hashpartitioning(_file)`), a
+distribution override not yet in place. Until then the flag is off and the streaming full-rewrite path runs, so
+nothing regresses. Column-chunk copying for `UPDATE` / matched-only `MERGE` (M4b) and `rewrite_data_files` (M4c)
+follow.
 
 ## The write side: columnar v3 deletion vectors (#20)
 
