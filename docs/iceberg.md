@@ -300,6 +300,45 @@ The partitioned (hash) append, the read A/B for #920, and a CDC `MERGE` A/B for 
   when a null row is read, and the copy path's bulk getters read every row. The 1 TB partitioned run hit it on
   `ss_store_sk`. Fixed on #919, and separately for `main`.
 
+## The write side: partial columnar merge -- copy unchanged row groups (#901 M4)
+
+A copy-on-write `DELETE` / `UPDATE` / `MERGE` rewrites a whole data file today: every row group is decoded,
+filtered and re-encoded through the columnar writer, even the groups the change never touches. M4 copies the
+bytes that do not change and encodes only the rest. **M4a** is the first step: in a copy-on-write `DELETE`, a row
+group with no deleted rows is copied byte for byte into the new file; only a group with at least one deleted row
+is decoded, filtered and re-encoded.
+
+The primitive is on the writer. `ColumnarParquetWriter` sits on parquet-java's `ParquetFileWriter`, whose
+`appendRowGroup(SeekableInputStream, BlockMetaData, dropColumnIndexes=false)` (parquet-java 1.16) copies a
+group's compressed pages without decoding them, each chunk keeping its codec, statistics, column index, offset
+index and Bloom filter:
+
+- `copyRowGroup(source, block)` flushes the open (re-encoded) group, then appends the source group's bytes, so
+  copied and re-encoded groups keep their order and stay separate;
+- `endRowGroup()` cuts a boundary so a run of re-encoded surviving rows is closed before a copied group follows;
+- `copyableFrom(fileSchema)` is the schema guard: a group is copyable only when the source file's Parquet schema
+  equals the write schema exactly -- same columns, order, physical and logical types, repetition and field ids.
+  A file that differs (a renamed, added, dropped, reordered or promoted column, or a different field id, after
+  schema evolution) is not copyable, and the file is rewritten the normal way.
+
+Because a copied group's chunk statistics reach the writer's `footer()` unchanged, the file's Iceberg metrics are
+combined from the copied groups' footer statistics and the re-encoded groups' metrics by the same
+`ParquetUtil.footerMetrics` path the full rewrite uses, honouring `write.metadata.metrics.*` and bound
+truncation. NaN counts a footer does not carry are the one metric a copy cannot supply: when the table tracks NaN
+counts for a float or double column, a file that would need them derived from copied groups must fall back to the
+full rewrite rather than report wrong metrics. v3 row lineage (`_row_id` /
+`_last_updated_sequence_number`) is always materialised explicitly, so those two chunks are encoded even in an
+otherwise-copied group.
+
+A DELETE touching one row group of eight (2000 rows each) rewrote in 7.7 ms with M4a against 14.5 ms for the full
+rewrite in a local smoke run -- the shape the cluster A/B (a copy-on-write `DELETE` of 0.1% / 1% / 10% of the
+rows) will measure at 1 TB. The primitive and its guards are covered by `RowGroupCopyTest` in the `parquet`
+module (0, some and all groups copied; rows and order equal; copied statistics, encodings and byte sizes equal
+the source; schema-evolved files reported not copyable; the full-rewrite-vs-copy smoke). The operator that counts
+deleted positions per row group from the `_file` / `_pos` lanes and drives the per-file rewrite is the next step
+(M4a wiring), followed by column-chunk copying for `UPDATE` / matched-only `MERGE` (M4b) and `rewrite_data_files`
+(M4c).
+
 ## The write side: columnar v3 deletion vectors (#20)
 
 On the **write** side, the DELETE half of a merge-on-read `DELETE` / `UPDATE` / `MERGE INTO` is Spark's
