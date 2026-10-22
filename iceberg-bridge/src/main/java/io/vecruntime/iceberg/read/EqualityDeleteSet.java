@@ -123,6 +123,66 @@ public final class EqualityDeleteSet {
         return new EqualityDeleteSet(kinds, encoded);
     }
 
+    /**
+     * The set of an equality delete group's keys, read STRAIGHT from the delete
+     * files rather than from Iceberg's loaded {@code StructLikeSet} (#rtypes).
+     *
+     * <p>Iceberg's {@code BaseDeleteLoader} loads a fixed/binary equality delete
+     * into a {@code StructLikeSet} that collapses to one element: {@code
+     * GenericParquetReaders$FixedReader.read(byte[])} reuses the caller's buffer
+     * (returns the same array every row), and {@code StructLikeSet.add} keeps
+     * only the {@code StructLike} reference, so every row ends up aliasing one
+     * mutated array and they dedup to one key. Reading the records here and
+     * encoding each into its own byte key BEFORE the next record is read (the
+     * reused buffer is copied by {@link #encodeInternal}) keeps every distinct
+     * key, so a 143-key fixed delete deletes the spec-correct rows.
+     *
+     * <p>{@code deleteSchema} is the equality fields in the delete type's order;
+     * {@code files} are those fields' values as {@link InputFile}s to read with
+     * Iceberg's generic Parquet reader. Applicability (which delete files reach
+     * this data file, by sequence number) is decided by the caller exactly as
+     * before -- only the load of the already-selected files changes.
+     */
+    public static EqualityDeleteSet ofDeleteFiles(org.apache.iceberg.Schema deleteSchema, Iterable<org.apache.iceberg.io.InputFile> files) {
+        Types.StructType deleteType = deleteSchema.asStruct();
+        List<Types.NestedField> fields = deleteType.fields();
+        Kind[] kinds = new Kind[fields.size()];
+        int[] scales = new int[fields.size()];
+        for (int i = 0; i < kinds.length; i++) {
+            Type t = fields.get(i).type();
+            kinds[i] = kindOf(t);
+            if (kinds[i] == null) {
+                throw new IllegalArgumentException("equality field " + fields.get(i).name() + " of type " + t + " is not supported");
+            }
+            scales[i] = t instanceof Types.DecimalType d ? d.scale() : 0;
+        }
+        // One InternalRecordWrapper reused across rows: it hands encodeInternal the SAME Iceberg-internal values
+        // the loaded StructLikeSet would (e.g. a uuid as java.util.UUID). We encode each row into its own byte key
+        // immediately, BEFORE reading the next -- so FixedReader's reused byte[] is already copied into the key and
+        // the collapse that sinks Iceberg's StructLikeSet (one shared mutated array) never happens here.
+        org.apache.iceberg.data.InternalRecordWrapper wrapper = new org.apache.iceberg.data.InternalRecordWrapper(deleteType);
+        List<byte[]> encoded = new java.util.ArrayList<>();
+        KeyBuffer buf = new KeyBuffer();
+        for (org.apache.iceberg.io.InputFile file : files) {
+            try (org.apache.iceberg.io.CloseableIterable<org.apache.iceberg.data.Record> reader = org.apache.iceberg.parquet.Parquet.read(file)
+                    .project(deleteSchema)
+                    .createReaderFunc(fileSchema -> org.apache.iceberg.data.parquet.GenericParquetReaders.buildReader(deleteSchema, fileSchema))
+                    .build()) {
+                for (org.apache.iceberg.data.Record record : reader) {
+                    StructLike row = wrapper.wrap(record);
+                    buf.reset();
+                    for (int i = 0; i < kinds.length; i++) {
+                        encodeInternal(buf, kinds[i], scales[i], row.get(i, Object.class));
+                    }
+                    encoded.add(buf.copy());
+                }
+            } catch (java.io.IOException e) {
+                throw new java.io.UncheckedIOException(e);
+            }
+        }
+        return new EqualityDeleteSet(kinds, encoded);
+    }
+
     /** The number of distinct keys. */
     public int size() {
         return size;

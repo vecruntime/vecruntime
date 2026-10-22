@@ -252,23 +252,40 @@ class IcebergEqualityDeletesSuite extends AnyFunSuite with BeforeAndAfterAll {
     info(s"uuid: deleted ${N - uRemaining.size}, remaining ${uRemaining.size}")
 
     // --- fixed key ---
-    // Iceberg 1.12's own reader does NOT apply a fixed (byte-array) equality delete correctly, and the native
-    // scan mirrors it. Root cause, verified against Iceberg's own classes (iceberg-spark-runtime 1.12.0):
+    // A fixed (byte-array) equality delete: the native scan now deletes the SPEC-CORRECT rows, because it reads
+    // the delete keys straight from the delete files (EqualityDeleteSet.ofDeleteFiles), encoding each record's key
+    // before the next record is read. Iceberg 1.12's OWN reader, by contrast, deletes only ONE row -- a genuine
+    // Iceberg bug we do NOT mirror. Root cause of the Iceberg bug, verified against iceberg-spark-runtime 1.12.0:
     //   * org.apache.iceberg.data.parquet.GenericParquetReaders$FixedReader.read(byte[]) REUSES the caller's
     //     byte[] buffer (it copies into aload_1 and returns that same array), so every row's fixed value is the
     //     SAME array instance, mutated in place as the file is read.
     //   * org.apache.iceberg.data.BaseDeleteLoader.readEqDeletes feeds those records through a flyweight
     //     InternalRecordWrapper into StructLikeSet; StructLikeSet.add -> StructLikeWrapper.copyFor -> set() only
     //     stores the StructLike REFERENCE (no deep copy of field values).
-    // The two combine so a many-key fixed delete file collapses to ONE set element (verified: a 143-key fixed
-    // delete loads as StructLikeSet.size == 1). Both Iceberg's own reader and the native scan (same loader) then
-    // remove only the degenerate match. We assert native == Iceberg's own reader.
+    // The two combine so a 143-key fixed delete file collapses to ONE StructLikeSet element (verified: size == 1),
+    // and Iceberg's reader removes only the degenerate match. Our reader avoids BaseDeleteLoader entirely for the
+    // native set, so it keeps all 143 keys and deletes the spec-correct rows.
     create("eqf")
     addDeletes("ice.db.eqf", Seq("f"), (0 until N by 17).filter(_ % 9 != 0).map(i => Seq[Any](fx(i))))
+    // Deleted (spec): a row whose f is non-null (id % 9 != 0) and whose fx(id) is a delete key, i.e. id by 17 and
+    // id % 9 != 0. fx is injective, so no other row collides.
+    val fDeleted = (0 until N by 17).filter(_ % 9 != 0).toSet
+    val fExpected = (0 until N).toSet -- fDeleted
     val (fGot, fProbed) = nativeIds("ice.db.eqf")
     assert(fProbed, "eqf: the native equality probe did not run")
-    assert(fGot == icebergIds("ice.db.eqf"), "eqf: native scan differs from Iceberg's reader on a fixed key")
-    info(s"fixed: native removed ${N - fGot.size}")
+    assert(
+      fGot == fExpected,
+      s"eqf: native scan removed ${N - fGot.size} rows, expected ${fDeleted.size}; " +
+        s"missing=${(fExpected -- fGot).take(5)} extra=${(fGot -- fExpected).take(5)}"
+    )
+    // Iceberg's OWN reader keeps rows the spec deletes: its collapsed StructLikeSet (size 1, per the bug above)
+    // removes at most one row, so it keeps almost all of fDeleted that the native scan correctly removes.
+    val fIceberg = icebergIds("ice.db.eqf")
+    assert(
+      fIceberg != fExpected && (fDeleted -- fIceberg).size <= 1,
+      s"eqf: expected Iceberg's own reader to keep the fixed-delete rows (bug); it removed ${N - fIceberg.size}"
+    )
+    info(s"fixed: native removed ${N - fGot.size} (spec-correct), Iceberg removed ${N - fIceberg.size}")
 
     // --- composite controls: multi-column equality keys with no uuid component delete exactly as expected,
     // proving the harness (writer field ids, delete-file equality ids, delete-row schema) is correct. ---

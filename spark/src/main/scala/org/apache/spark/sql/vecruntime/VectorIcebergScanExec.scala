@@ -1108,8 +1108,8 @@ private[vecruntime] object IcebergTasks {
     val deleteFileClass = Class.forName("org.apache.iceberg.DeleteFile", false, cl)
     val newInputFile =
       Class.forName("org.apache.iceberg.io.FileIO", false, cl).getMethod("newInputFile", deleteFileClass)
-    val io = call(p, "io")
-    val open: java.util.function.Function[AnyRef, AnyRef] = d => newInputFile.invoke(io, d)
+    val fileIo = call(p, "io")
+    val open: java.util.function.Function[AnyRef, AnyRef] = d => newInputFile.invoke(fileIo, d)
     val loaderClass = Class.forName("org.apache.iceberg.data.BaseDeleteLoader", false, cl)
     (loaderClass, loaderClass.getConstructor(classOf[java.util.function.Function[_, _]]).newInstance(open))
   }
@@ -1211,6 +1211,13 @@ private[vecruntime] object IcebergTasks {
       case (f, i) if f.metadata.contains(ParquetUtils.FIELD_ID_METADATA_KEY) =>
         f.metadata.getLong(ParquetUtils.FIELD_ID_METADATA_KEY).toInt -> i
     }.toMap
+    // #rtypes: the native set reads the delete files directly (below), through the partition's own FileIO -- the
+    // same handle Iceberg's loader opens them with. `newInputFile(DeleteFile)` turns each selected delete file
+    // into an InputFile for the bridge's copying reader.
+    val deleteFileClass = Class.forName("org.apache.iceberg.DeleteFile", false, cl)
+    val fileIo = call(p, "io")
+    val newInputFile =
+      Class.forName("org.apache.iceberg.io.FileIO", false, cl).getMethod("newInputFile", deleteFileClass)
     // Per group: the set, the batch ordinals of its fields (in the delete schema's order) and their Spark types.
     val groups = deletes.asScala.groupBy(equalityFieldIds).toSeq.map { case (ids, files) =>
       val deleteSchema = select.invoke(null, tableSchema, ids.map(Int.box).toSet.asJava)
@@ -1224,7 +1231,7 @@ private[vecruntime] object IcebergTasks {
       val ordinals = order.map(ordinalOf)
       val sparkType =
         StructType(ordinals.map(o => schema(o).copy(metadata = org.apache.spark.sql.types.Metadata.empty)))
-      (set, ordinals, sparkType, call(deleteSchema, "asStruct"), cacheKey)
+      (set, ordinals, sparkType, call(deleteSchema, "asStruct"), cacheKey, deleteSchema, files)
     }
     // #901 R2: each group as the bridge's EqualityDeleteSet, probed with the batch's lanes; None without the
     // bridge or for a key type it does not take, which keeps the row probe below.
@@ -1234,22 +1241,29 @@ private[vecruntime] object IcebergTasks {
         try {
           val cls = Class.forName("io.vecruntime.iceberg.read.EqualityDeleteSet", true, cl)
           val supports = cls.getMethod("supports", Class.forName("org.apache.iceberg.types.Type", false, cl))
-          val of = cls.getMethod("of", structTypeClass, classOf[java.lang.Iterable[_]])
+          val schemaCls = Class.forName("org.apache.iceberg.Schema", false, cl)
+          val ofDeleteFiles = cls.getMethod("ofDeleteFiles", schemaCls, classOf[java.lang.Iterable[_]])
           val clear = cls.getMethod(
             "clearDeleted",
             classOf[Array[io.vecruntime.kernels.VectorBuffers]],
             Integer.TYPE,
             classOf[java.lang.foreign.MemorySegment]
           )
-          val all = groups.map { case (set, ordinals, _, struct, cacheKey) =>
+          val all = groups.map { case (_, ordinals, _, struct, cacheKey, deleteSchema, files) =>
             val types = call(struct, "fields").asInstanceOf[java.util.List[AnyRef]].asScala.map(call(_, "type"))
             if (!types.forall(t => supports.invoke(null, t).asInstanceOf[java.lang.Boolean].booleanValue())) None
             else {
-              // Built once per task and group, beside the loaded set (the key's "#native" marks it).
+              // #rtypes: the native set is read STRAIGHT from the delete files, encoding each record's key before
+              // the next is read, so a fixed/binary equality delete is not collapsed to one key the way Iceberg's
+              // BaseDeleteLoader StructLikeSet collapses it (FixedReader buffer reuse + reference-only set copy).
+              // Built once per task and group (the key's "#native" marks it); applicability is already decided --
+              // `files` are only the delete files selected for this data file.
               val built = cache.synchronized {
                 cache.getOrElseUpdate(
-                  (cacheKey._1 :+ "#native", cacheKey._2),
-                  of.invoke(null, struct, set.asInstanceOf[java.lang.Iterable[_]])
+                  (cacheKey._1 :+ "#native", cacheKey._2), {
+                    val inputs: java.lang.Iterable[AnyRef] = files.map(d => newInputFile.invoke(fileIo, d)).asJava
+                    ofDeleteFiles.invoke(null, deleteSchema, inputs)
+                  }
                 )
               }
               Some((built, clear, ordinals))
@@ -1279,7 +1293,7 @@ private[vecruntime] object IcebergTasks {
       }
     }
     batch => {
-      val probes = groups.map { case (set, ordinals, sparkType, icebergStruct, _) =>
+      val probes = groups.map { case (set, ordinals, sparkType, icebergStruct, _, _, _) =>
         val wrapper = wrapperCtor.newInstance(sparkType, icebergStruct)
         val row = new org.apache.spark.sql.catalyst.expressions.GenericInternalRow(ordinals.length)
         val types = sparkType.fields.map(_.dataType)
