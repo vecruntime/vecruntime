@@ -43,7 +43,7 @@ Turn it on with `spark.vecruntime.scan.nativeIceberg.enabled=true`.
 | Distribution modes none / hash / range, without Spark's row exchange | **✓** |
 | Nested columns (struct, list, map) | **✓** |
 | Row lineage on v3 | **✓** |
-| Merge-on-read on tables with map columns | **◐** the write is columnar, its input is not yet |
+| Merge-on-read on tables with map columns | **◐** `DELETE` and `UPDATE` are columnar end to end; a `MERGE` still reads its input as rows |
 | float / double inside a list or map | **✓** |
 | `fixed`, `uuid` columns | **✓** |
 | `variant` columns (not shredded) | **✓** |

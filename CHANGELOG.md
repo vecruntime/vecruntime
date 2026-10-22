@@ -8,6 +8,14 @@ version may change configuration keys or defaults, always noted here.
 
 ### Added
 
+- The native Iceberg scan reads the v3 merge-on-read metadata columns `_partition`, `_row_id` and
+  `_last_updated_sequence_number` (#20 M3a), so a scan projecting them stays on our operators instead of falling
+  back to Iceberg's reader (and, for an UPDATE's delete side over a map column, to rows). `_partition` is the
+  per-file struct of the table's unified partition type (null on an unpartitioned table, as Iceberg returns it),
+  from `PartitionUtil.constantsMap`; `_row_id` and `_last_updated_sequence_number` are the file's own column where
+  it materialises them (copy-on-write, compaction), else `firstRowId + _pos` / `dataSequenceNumber`. Other metadata
+  columns (e.g. `_deleted`) still keep Iceberg's reader.
+
 - The native Parquet scan's read-ahead in the task's memory budget (#915): the compressed pages read ahead and the
   batches decode-ahead queues are held in Spark execution memory, granted only from free memory, so read-ahead
   narrows its window when the operators above it need the pool instead of making them spill. The byte caps
