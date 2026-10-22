@@ -50,6 +50,7 @@
     {
       "section": "About",
       "items": [
+        { "title": "Roadmap", "url": "/roadmap.html" },
         { "title": "Acknowledgments", "url": "/acknowledgments.html" }
       ]
     }
