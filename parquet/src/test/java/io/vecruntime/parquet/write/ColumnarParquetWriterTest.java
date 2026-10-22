@@ -542,6 +542,52 @@ class ColumnarParquetWriterTest {
         }
     }
 
+    /**
+     * An open writer that has written little holds little: a fanout write keeps
+     * one per partition open, so thousands may be live at once. Measured as the
+     * bytes allocated to open a writer and write one row (the column buffers
+     * start small and grow with what is written).
+     */
+    @Test
+    void anOpenWriterIsSmall() throws Exception {
+        com.sun.management.ThreadMXBean threads = (com.sun.management.ThreadMXBean) java.lang.management.ManagementFactory.getThreadMXBean();
+        List<Row> one = rows(1, 7);
+        CodecFactory codecs = new CodecFactory(conf, 64 * 1024);
+        List<ColumnarParquetWriter> open = new ArrayList<>();
+        int n = 64;
+        long perWriter;
+        try {
+            // Warm the code paths, so class loading and first-use caches are not counted.
+            for (int k = 0; k < 2; k++) {
+                open.add(openAndWrite(codecs, one, "warm-" + k));
+            }
+            long before = threads.getCurrentThreadAllocatedBytes();
+            for (int k = 0; k < n; k++) {
+                open.add(openAndWrite(codecs, one, "open-" + k));
+            }
+            perWriter = (threads.getCurrentThreadAllocatedBytes() - before) / n;
+        } finally {
+            for (ColumnarParquetWriter w : open) {
+                w.close();
+            }
+            codecs.release();
+        }
+        long perColumn = perWriter / SCHEMA.getColumns().size();
+        System.out.println("allocated per open writer: " + perWriter + " B, per column: " + perColumn + " B");
+        assertTrue(perColumn < 64 * 1024, "allocated per column of an open writer: " + perColumn + " B");
+    }
+
+    private ColumnarParquetWriter openAndWrite(CodecFactory codecs, List<Row> rows, String name) throws Exception {
+        org.apache.hadoop.fs.Path p = new org.apache.hadoop.fs.Path(dir.resolve(name + ".parquet")
+                .toString());
+        ColumnarParquetWriter w = new ColumnarParquetWriter(HadoopOutputFile.fromPath(p, conf), SCHEMA, props(),
+                codecs.getCompressor(CompressionCodecName.SNAPPY), 128L << 20, Map.of());
+        try (Arena a = Arena.ofConfined()) {
+            w.write(columns(a, rows), rows.size());
+        }
+        return w;
+    }
+
     @Test
     void emptyFileHasSchemaOnly() throws Exception {
         ParquetMetadata ours = footer(writeOurs(List.of(), 1024, 128L << 20));

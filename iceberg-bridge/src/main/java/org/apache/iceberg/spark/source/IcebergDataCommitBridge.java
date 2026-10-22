@@ -103,17 +103,9 @@ public final class IcebergDataCommitBridge {
                 }
                 return null;
             case LIST:
-                return floating(type.asListType()
-                                    .elementType())
-                        ? type.toString() : unsupportedType(type.asListType()
+                return unsupportedType(type.asListType()
                         .elementType());
             case MAP:
-                if (floating(type.asMapType()
-                                 .keyType())
-                        || floating(type.asMapType()
-                                        .valueType())) {
-                    return type.toString();
-                }
                 String k = unsupportedType(type.asMapType()
                         .keyType());
                 return k != null ? k : unsupportedType(type.asMapType()
@@ -122,21 +114,6 @@ public final class IcebergDataCommitBridge {
                 // TIME, TIMESTAMP_NANO, UUID, FIXED, VARIANT, GEOMETRY, GEOGRAPHY, UNKNOWN: not encoded natively yet.
                 return type.toString();
         }
-    }
-
-    /**
-     * A float or double anywhere under {@code type} (refused inside lists and
-     * maps, see FloatingMetrics).
-     */
-    private static boolean floating(Type type) {
-        if (type.typeId() == Type.TypeID.FLOAT || type.typeId() == Type.TypeID.DOUBLE) {
-            return true;
-        }
-        if (type.isNestedType()) {
-            return type.asNestedType().fields().stream()
-                    .anyMatch(f -> floating(f.type()));
-        }
-        return false;
     }
 
     /**

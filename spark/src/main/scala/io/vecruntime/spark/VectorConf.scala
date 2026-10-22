@@ -631,6 +631,28 @@ object VectorConf {
   def poolAccountingEnabled(sparkConf: org.apache.spark.SparkConf): Boolean =
     sparkConf.getBoolean(PoolAccountingEnabled, true)
 
+  /**
+   * #869 step 4: Arrow's buffers (the Flight shuffle's, the shuffle readers', the operators' output vectors) from
+   * the native pool instead of Arrow's allocation manager (`-Darrow.allocation.manager.type`), so they are reused
+   * blocks of the same pool. Arrow still accounts them and `spark.vecruntime.arrow.maxBytes` still caps them. Read
+   * once, when the executor starts.
+   */
+  val ArrowNativePoolEnabled = "spark.vecruntime.arrow.nativePool.enabled"
+  def arrowNativePoolEnabled(sparkConf: org.apache.spark.SparkConf): Boolean =
+    sparkConf.getBoolean(ArrowNativePoolEnabled, true)
+
+  /**
+   * #869 step 4: the native pool's per-thread cache -- blocks per size class (0 to 16) and the largest block cached
+   * (64 KiB to 64 MiB). A thread holds at most about `2 * depth * maxBlockBytes`. Off by default (depth 0): at 10 TB
+   * the shared free lists alone were as fast as main and the cache slower. Read once, when the executor starts.
+   */
+  val NativePoolThreadCacheDepth = "spark.vecruntime.nativePool.threadCache.depth"
+  val NativePoolThreadCacheMaxBlockBytes = "spark.vecruntime.nativePool.threadCache.maxBlockBytes"
+  def nativePoolThreadCacheDepth(sparkConf: org.apache.spark.SparkConf): Int =
+    sparkConf.getInt(NativePoolThreadCacheDepth, 0)
+  def nativePoolThreadCacheMaxBlockBytes(sparkConf: org.apache.spark.SparkConf): Long =
+    org.apache.spark.network.util.JavaUtils.byteStringAsBytes(sparkConf.get(NativePoolThreadCacheMaxBlockBytes, "1m"))
+
   val ArrowMaxBytes = "spark.vecruntime.arrow.maxBytes"
   def arrowMaxBytes(sparkConf: org.apache.spark.SparkConf): Long =
     org.apache.spark.network.util.JavaUtils.byteStringAsBytes(sparkConf.get(ArrowMaxBytes, "0").trim match {

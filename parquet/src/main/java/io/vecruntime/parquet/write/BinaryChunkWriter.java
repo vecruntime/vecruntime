@@ -68,14 +68,18 @@ final class BinaryChunkWriter implements ChunkWriter {
     private org.apache.parquet.column.values.bloomfilter.BloomFilterWriter bloomWriter;
     private org.apache.parquet.column.values.bloomfilter.BloomFilter bloom;
 
+    // Every buffer below starts small and doubles on demand: a fanout write keeps one writer per column open
+    // per partition, so thousands may be live at once, while a busy one reaches its working size in a few
+    // doublings on its first pages.
+    //
     // The page being built.
     private long[] pageValidity = new long[64];
-    private int[] ids = new int[4096];
+    private int[] ids = new int[256];
     private int pageRows;
     private int pageValues;
     // The page's value bytes before encoding, for its size statistics.
     private long pageDataBytes;
-    private final ByteSink plain = new ByteSink(64 * 1024);
+    private final ByteSink plain = new ByteSink(4 * 1024);
     private byte[] min;
     private byte[] max;
     private MemorySegment minSeg;
@@ -86,23 +90,23 @@ final class BinaryChunkWriter implements ChunkWriter {
     private boolean dictionary;
     private boolean firstPageDone;
     private int dictionaryPagesWritten;
-    private final ByteSink entryBytes = new ByteSink(64 * 1024);
-    private int[] entryStart = new int[1025];
-    private int[] entryHash = new int[1024];
+    private final ByteSink entryBytes = new ByteSink(4 * 1024);
+    private int[] entryStart = new int[65];
+    private int[] entryHash = new int[64];
     private int entryCount;
-    private int[] table = new int[2048];
+    private int[] table = new int[128];
     private long dictionaryByteSize;
 
     // Input-dictionary id -> chunk id (+1; 0 = not mapped yet), for the input dictionary last seen.
     private VectorBuffers inputDictionary;
     private int[] inputMap = new int[0];
 
-    private final ByteSink body = new ByteSink(64 * 1024);
+    private final ByteSink body = new ByteSink(4 * 1024);
     private final ByteSink levels = new ByteSink(1024);
-    private final ByteSink suffixes = new ByteSink(64 * 1024);
+    private final ByteSink suffixes = new ByteSink(4 * 1024);
     private final DeltaBinaryPackedEncoder delta = new DeltaBinaryPackedEncoder();
-    private int[] prefixLengths = new int[4096];
-    private int[] suffixLengths = new int[4096];
+    private int[] prefixLengths = new int[256];
+    private int[] suffixLengths = new int[256];
 
     BinaryChunkWriter(ColumnDescriptor column, ParquetProperties props) {
         this.column = column;
