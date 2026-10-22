@@ -62,7 +62,18 @@ class PartitionKeysSuite extends AnyFunSuite {
       if (r.nextInt(10) == 0) v - Math.floorMod(v, 3600000000L) else v
     })
     val s: Array[Option[String]] =
-      Array.fill(n)(maybe(("é" * r.nextInt(3)) + "s" + r.nextInt(1000) + ("x" * r.nextInt(6))))
+      Array.fill(n)(maybe {
+        // A mix of ASCII, 2-byte (é), 3-byte (CJK), 4-byte (emoji, a surrogate pair) code points and the
+        // empty string, so truncate-by-code-point and identity are exercised on every UTF-8 width.
+        val parts = Seq(
+          "é" * r.nextInt(3),
+          "日" * r.nextInt(3),
+          "\uD83D\uDE00" * r.nextInt(3), // U+1F600
+          "s" + r.nextInt(1000),
+          "x" * r.nextInt(6)
+        )
+        if (r.nextInt(20) == 0) "" else parts.mkString
+      })
     val dec: Array[Option[Long]] = Array.fill(n)(maybe(r.nextInt(2000000000).toLong - 1000000000L))
     val wide: Array[Option[BigInteger]] =
       Array.fill(n)(maybe(new BigInteger(90, r.self).subtract(BigInteger.ONE.shiftLeft(89))))
@@ -161,6 +172,14 @@ class PartitionKeysSuite extends AnyFunSuite {
     spec(_.truncate("i", 100).truncate("l", 1000).truncate("s", 2)
       .truncate("dec", 50).truncate("wide", 1000))
   )
+  // The object-valued transforms now group on lanes (#901 follow-up); each must still equal Iceberg's key.
+  check("identity of a string (grouped on the lane)", spec(_.identity("s")))
+  check("identity of binary (grouped on the lane)", spec(_.identity("bin")))
+  check("identity of a decimal and a wide decimal", spec(_.identity("dec").identity("wide")))
+  check("truncate of a string to 1 code point", spec(_.truncate("s", 1)))
+  check("truncate of a string to 3 code points", spec(_.truncate("s", 3)))
+  check("truncate of binary", spec(_.truncate("bin", 3)))
+  check("truncate of a narrow and a wide decimal", spec(_.truncate("dec", 100).truncate("wide", 100000)))
   check("void", spec(_.alwaysNull("i").identity("s")))
 
   // ---- Nested partition sources (#901 item 7): a source inside (possibly nested) structs.

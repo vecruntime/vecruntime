@@ -151,6 +151,85 @@ public final class IcebergTransformKernels {
         }
     }
 
+    /**
+     * The byte length of the first {@code codePoints} Unicode code points of a
+     * valid UTF-8 byte string of {@code len} bytes starting at {@code start}:
+     * Iceberg's {@code UnicodeUtil.truncateString}, which truncates by code
+     * point, not byte or {@code char}. A 4-byte sequence (a code point above
+     * the BMP, a surrogate pair in UTF-16) counts as one. A code point starts
+     * at every byte that is not a UTF-8 continuation byte ({@code (b & 0xC0) !=
+     * 0x80}); the result is {@code len} when the string has at most {@code
+     * codePoints} of them.
+     */
+    public static int truncateUtf8ByteLength(MemorySegment s, long start, int len,
+            int codePoints) {
+        int seen = 0;
+        int i = 0;
+        while (i < len) {
+            int b = s.get(java.lang.foreign.ValueLayout.JAVA_BYTE, start + i) & 0xff;
+            if ((b & 0xC0) != 0x80) {
+                // A lead byte: the start of a new code point.
+                if (seen == codePoints) {
+                    return i;
+                }
+                seen++;
+            }
+            i++;
+        }
+        return len;
+    }
+
+    /**
+     * {@code value - floorMod(value, w)} on a 128-bit two's complement unscaled
+     * decimal {@code (hi, lo)}, as Iceberg's {@code TruncateUtil} truncates a
+     * {@code BigInteger} unscaled value: the result into {@code out[2]} as
+     * {@code {hi, lo}}. {@code w} is a positive int (Iceberg's truncate width).
+     */
+    public static void truncateDecimal128(long hi, long lo, int w,
+            long[] out) {
+        // r = value mod w, in [0, w); result = value - r. 128-bit value, small positive w: compute value % w
+        // by processing the two's-complement magnitude, then adjust sign to a non-negative remainder.
+        long rem = mod128(hi, lo, w); // in [0, w)
+        // result = value - rem (128-bit subtract)
+        long newLo = lo - rem;
+        long borrow = Long.compareUnsigned(lo, rem) < 0 ? 1L : 0L;
+        long newHi = hi - borrow;
+        out[0] = newHi;
+        out[1] = newLo;
+    }
+
+    /**
+     * {@code floorMod(value, w)} for a 128-bit two's complement {@code (hi,
+     * lo)} and a positive {@code w}, result in {@code [0, w)}.
+     */
+    private static long mod128(long hi, long lo, int w) {
+        boolean negative = hi < 0;
+        long uhi = hi;
+        long ulo = lo;
+        if (negative) {
+            // magnitude = -(value): two's complement negate
+            ulo = ~lo + 1;
+            uhi = ~hi + (ulo == 0 ? 1 : 0);
+        }
+        // Unsigned 128-bit mod small w: fold the high limb's remainder into the low, limb by limb in base 2^32.
+        long wl = w & 0xffffffffL;
+        long r = 0;
+        for (int limb = 3; limb >= 0; limb--) {
+            long part = switch (limb) {
+                case 3 -> uhi >>> 32;
+                case 2 -> uhi & 0xffffffffL;
+                case 1 -> ulo >>> 32;
+                default -> ulo & 0xffffffffL;
+            };
+            r = ((r << 32) | part) % wl;
+        }
+        long rmag = r; // magnitude mod w, in [0, w)
+        if (negative && rmag != 0) {
+            rmag = wl - rmag; // floorMod of a negative value
+        }
+        return rmag;
+    }
+
     // ---------------------------------------------------------------- bucket
 
     /**

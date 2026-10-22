@@ -15,6 +15,7 @@
  */
 package io.vecruntime.iceberg.write;
 
+import java.lang.foreign.MemorySegment;
 import java.math.BigDecimal;
 import java.nio.ByteBuffer;
 import java.util.List;
@@ -280,16 +281,23 @@ final class PartitionKeys {
     final class Values {
         private final int first;
         private final int n;
-        // [field][row]
+        // The resolved leaf lane of each field, and the per-field enclosing-struct-null flags (null for a
+        // top-level source). Kept so an OBJECT field groups and materialises straight off the lane.
+        private final VectorBuffers[] leaves;
+        private final boolean[][] parentNulls;
+        // [field][row]: primitive (int widened / long) results; objects materialised lazily, once per group.
         private final long[][] longs;
         private final Object[][] objects;
         private final boolean[][] nulls;
         private final long[] hash;
 
+        @SuppressWarnings("unchecked")
         Values(List<? extends VectorBuffers> columns, int first, int end) {
             this.first = first;
             this.n = end - first;
             int f = fields.length;
+            this.leaves = new VectorBuffers[f];
+            this.parentNulls = new boolean[f][];
             this.longs = new long[f][];
             this.objects = new Object[f][];
             this.nulls = new boolean[f][n];
@@ -310,8 +318,8 @@ final class PartitionKeys {
             if (nulls[k][r]) {
                 return 0;
             }
-            if (objects[k] != null) {
-                return objects[k][r] == null ? 0 : objects[k][r].hashCode();
+            if (fields[k].kind() == Kind.OBJECT) {
+                return objectHash(k, r); // computed on the lane, no Java object
             }
             return longs[k][r];
         }
@@ -319,12 +327,14 @@ final class PartitionKeys {
         private void computeField(int k, List<? extends VectorBuffers> columns) {
             Field field = fields[k];
             VectorBuffers leaf = resolveLeaf(field, columns);
+            leaves[k] = leaf;
             boolean[] parentNull = parentNulls(field, columns);
+            parentNulls[k] = parentNull;
             boolean[] fieldNull = nulls[k];
-            if (field.kind() == Kind.OBJECT) {
-                objects[k] = new Object[n];
-            } else {
+            if (field.kind() != Kind.OBJECT) {
                 longs[k] = new long[n];
+            } else {
+                objects[k] = new Object[n]; // slots filled lazily in partitionValue
             }
             if (field.transform().equals("void")) {
                 java.util.Arrays.fill(fieldNull, true);
@@ -336,10 +346,10 @@ final class PartitionKeys {
                     fieldNull[r] = true;
                     continue;
                 }
-                switch (field.kind()) {
-                    case INT, LONG -> longs[k][r] = primitiveResult(field, leaf, row);
-                    case OBJECT -> objects[k][r] = objectResult(field, leaf, row);
+                if (field.kind() != Kind.OBJECT) {
+                    longs[k][r] = primitiveResult(field, leaf, row);
                 }
+                // OBJECT fields need nothing per row here: they group on the lane and materialise on demand.
             }
         }
 
@@ -376,19 +386,128 @@ final class PartitionKeys {
         }
 
         /**
-         * An object-valued result (identity, or a string / binary / decimal
-         * truncate) at {@code row}.
+         * A grouping hash for an OBJECT field (identity, or truncate of a
+         * string / binary / decimal) at {@code row}, computed on the leaf lane
+         * without materialising the value. Equal transformed values hash equal;
+         * {@link #objectsEqual} confirms a hash collision.
          */
-        private Object objectResult(Field field, VectorBuffers v, int row) {
-            Object value = sourceValue(field, v, row);
-            // Iceberg's own bound transform (identity passes the value through, truncate applies its width),
-            // so the value stored is byte-for-byte what Iceberg's PartitionKey would store.
-            return field.fn().apply(value);
+        private long objectHash(int k, int r) {
+            Field field = fields[k];
+            VectorBuffers v = leaves[k];
+            int row = first + r;
+            boolean truncate = field.transform().equals("truncate");
+            return switch (field.source()) {
+                case STRING, BINARY -> {
+                    byte[] b = v.getUtf8Bytes(row);
+                    int len = truncate && field.source() == Type.TypeID.STRING
+                            ? IcebergTransformKernels.truncateUtf8ByteLength(MemorySegment.ofArray(b), 0, b.length, field.param())
+                            : truncate ? Math.min(field.param(), b.length) : b.length;
+                    yield IcebergTransformKernels.hashBytes(MemorySegment.ofArray(b), 0, len);
+                }
+                case FIXED, UUID -> {
+                    byte[] b = ((FixedBinaryVectorBuffers) v).bytes(row);
+                    yield IcebergTransformKernels.hashBytes(b);
+                }
+                case DECIMAL -> {
+                    long hi;
+                    long lo;
+                    if (v.type() == VecType.DECIMAL128) {
+                        hi = Decimal128.hi(v.data(), row);
+                        lo = Decimal128.lo(v.data(), row);
+                    } else {
+                        long u = v.type() == VecType.INT32 ? v.getInt(row) : v.getLong(row);
+                        hi = u < 0 ? -1L : 0L;
+                        lo = u;
+                    }
+                    if (truncate) {
+                        long[] t = new long[2];
+                        IcebergTransformKernels.truncateDecimal128(hi, lo, field.param(), t);
+                        hi = t[0];
+                        lo = t[1];
+                    }
+                    yield Decimal128.hash(hi, lo);
+                }
+                case BOOLEAN -> v.getBoolean(row) ? 1L : 0L;
+                case FLOAT -> Float.floatToIntBits((float) v.getDouble(row));
+                case DOUBLE -> Double.doubleToLongBits(v.getDouble(row));
+                default -> throw new IllegalStateException("object group over " + field.source());
+            };
+        }
+
+        /**
+         * Whether the OBJECT field {@code k} has the same transformed value at
+         * rows {@code a} and {@code b}, compared on the lane with no Java
+         * object (both already known non-null).
+         */
+        private boolean objectsEqual(int k, int a, int b) {
+            Field field = fields[k];
+            VectorBuffers v = leaves[k];
+            int ra = first + a;
+            int rb = first + b;
+            boolean truncate = field.transform().equals("truncate");
+            switch (field.source()) {
+                case STRING, BINARY:
+                    {
+                        byte[] x = v.getUtf8Bytes(ra);
+                        byte[] y = v.getUtf8Bytes(rb);
+                        int lx = truncate && field.source() == Type.TypeID.STRING
+                                ? IcebergTransformKernels.truncateUtf8ByteLength(MemorySegment.ofArray(x), 0, x.length, field.param())
+                                : truncate ? Math.min(field.param(), x.length) : x.length;
+                        int ly = truncate && field.source() == Type.TypeID.STRING
+                                ? IcebergTransformKernels.truncateUtf8ByteLength(MemorySegment.ofArray(y), 0, y.length, field.param())
+                                : truncate ? Math.min(field.param(), y.length) : y.length;
+                        return java.util.Arrays.equals(x, 0, lx, y, 0, ly);
+                    }
+                case FIXED, UUID:
+                    {
+                        return java.util.Arrays.equals(((FixedBinaryVectorBuffers) v).bytes(ra), ((FixedBinaryVectorBuffers) v).bytes(rb));
+                    }
+                case DECIMAL:
+                    {
+                        long[] da = decimalLimbs(field, v, ra, truncate);
+                        long[] db = decimalLimbs(field, v, rb, truncate);
+                        return da[0] == db[0] && da[1] == db[1];
+                    }
+                case BOOLEAN:
+                    return v.getBoolean(ra) == v.getBoolean(rb);
+                case FLOAT:
+                    // Identity of a float: the stored lane value (NaN groups with NaN, as a bit compare).
+                    return Float.floatToIntBits((float) v.getDouble(ra)) == Float.floatToIntBits((float) v.getDouble(rb));
+                case DOUBLE:
+                    return Double.doubleToLongBits(v.getDouble(ra)) == Double.doubleToLongBits(v.getDouble(rb));
+                default:
+                    throw new IllegalStateException("object compare over " + field.source());
+            }
+        }
+
+        /**
+         * The (possibly truncated) unscaled 128-bit value of a decimal at
+         * {@code row} as {@code {hi, lo}}.
+         */
+        private long[] decimalLimbs(Field field, VectorBuffers v, int row,
+                boolean truncate) {
+            long hi;
+            long lo;
+            if (v.type() == VecType.DECIMAL128) {
+                hi = Decimal128.hi(v.data(), row);
+                lo = Decimal128.lo(v.data(), row);
+            } else {
+                long u = v.type() == VecType.INT32 ? v.getInt(row) : v.getLong(row);
+                hi = u < 0 ? -1L : 0L;
+                lo = u;
+            }
+            if (truncate) {
+                long[] t = new long[2];
+                IcebergTransformKernels.truncateDecimal128(hi, lo, field.param(), t);
+                return t;
+            }
+            return new long[] {hi, lo};
         }
 
         /**
          * Element {@code row} of {@code v} in Iceberg's internal representation
-         * for the field's source type.
+         * for the field's source type, used only to materialise the Java
+         * partition value once per distinct group.
          */
         private Object sourceValue(Field field, VectorBuffers v, int row) {
             return switch (field.source()) {
@@ -436,8 +555,8 @@ final class PartitionKeys {
                 if (nulls[k][a]) {
                     continue;
                 }
-                if (objects[k] != null) {
-                    if (!Objects.equals(objects[k][a], objects[k][b])) {
+                if (fields[k].kind() == Kind.OBJECT) {
+                    if (!objectsEqual(k, a, b)) {
                         return false;
                     }
                 } else if (longs[k][a] != longs[k][b]) {
@@ -481,12 +600,21 @@ final class PartitionKeys {
             if (nulls[k][r]) {
                 return null;
             }
-            if (objects[k] != null) {
-                return objects[k][r];
+            Field field = fields[k];
+            if (field.kind() == Kind.OBJECT) {
+                // Materialise the Java value (String / ByteBuffer / BigDecimal / ...) once per distinct group:
+                // grouping ran on the lane, so this is called about once per partition, not per row. Iceberg's
+                // own bound transform gives the exact value its PartitionKey would hold, and it is cached.
+                Object cached = objects[k][r];
+                if (cached == null) {
+                    cached = field.fn().apply(sourceValue(field, leaves[k], first + r));
+                    objects[k][r] = cached;
+                }
+                return cached;
             }
             // Box as Iceberg's result type: an Integer for an INT result, a Long for a LONG result. (A mixed
             // int/long ternary would promote both arms to long and wrongly box every INT result as a Long.)
-            if (fields[k].kind() == Kind.INT) {
+            if (field.kind() == Kind.INT) {
                 return Integer.valueOf((int) longs[k][r]);
             }
             return Long.valueOf(longs[k][r]);
