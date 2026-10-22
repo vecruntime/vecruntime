@@ -59,7 +59,8 @@ Format version 1 reads as version 2 does, without delete files.
 | Task-group packing | yes | Task groups are packed into Spark tasks as Spark packs a Parquet scan's splits (`...nativeIceberg.packSplits`) |
 | Storage-partitioned joins | yes | A scan that reports a partitioning keeps Iceberg's groups, unpacked. A scan that reports an ordering is read by Iceberg's reader (scan) |
 | Metadata columns `_file`, `_pos`, `_spec_id` | yes | `_file` and `_spec_id` are per-split constants; `_pos` is the reader's row index |
-| Metadata columns `_partition`, `_deleted` | scan | |
+| Metadata columns `_partition`, `_row_id`, `_last_updated_sequence_number` | yes (#20 M3a) | `_partition` is the per-file struct of the table's unified partition type (empty on an unpartitioned table, where Iceberg returns it null); `_row_id` and `_last_updated_sequence_number` are the file's own column where it materialises them (copy-on-write, compaction), else `firstRowId + _pos` / `dataSequenceNumber`. All three come from `PartitionUtil.constantsMap` and the data file, per batch |
+| Metadata column `_deleted` | scan | |
 | Types: boolean, int, long, float, double, date, timestamp (with zone and without), string, binary, decimal | yes | `decimal(p > 18)` becomes a DECIMAL128 lane |
 | Types: uuid, fixed, time | scan | Iceberg's reader reads them as Spark types our reader does not produce from these files |
 | Types: struct, list, map | yes | At any depth, when every leaf is one of the flat types above. Nested struct fields are matched by their Iceberg field ids, so a renamed nested field reads as Iceberg reads it, and a field added to a struct later reads as nulls from older files. Iceberg's reader does not vectorize nested columns, so such a scan is taken only when every task group reads natively; otherwise it stays Spark's row path |
@@ -77,7 +78,7 @@ Everything in the version 2 table applies. The version 3 additions:
 | Writing deletion vectors | opt-in | `spark.vecruntime.iceberg.dvWriter.enabled` (off by default) builds each data file's `PositionDeleteIndex` from our batches and hands it to Iceberg's DV writer, for `DELETE`, `UPDATE` and `MERGE INTO`. The commit stays Iceberg's `RowDelta`. See [the write side](#the-write-side-columnar-v3-deletion-vectors-20) |
 | Default values: `initial-default` | yes, or scan | A top-level column's default is filled into the files written before the column existed, as a constant (Spark's existence default), for boolean, int, long, float, double, decimal, string, binary, date and timestamp columns. A default on a nested field, or of another type, keeps Iceberg's reader for the scan |
 | Default values: `write-default` | n/a | Applied by Iceberg's writer |
-| Row lineage (`_row_id`, `_last_updated_sequence_number`) | scan | Iceberg derives them from the manifests and the files' first row ids |
+| Row lineage (`_row_id`, `_last_updated_sequence_number`) | yes (#20 M3a) | The file's own column where it materialises them, else `firstRowId + _pos` / `dataSequenceNumber`, exactly as Iceberg derives them from the manifests and the files' first row ids |
 | `variant`, shredded or not | yes | Iceberg writes the spec's Parquet variant group, with `typed_value` when `write.parquet.shred-variants` is on. Our Parquet reader reads it as it reads Spark's variants (#787, #812), at the top level and inside structs, under deletes. Iceberg's own vectorized reader cannot read a shredded variant ("Unsupported variant: shredded typed_value primitive"); our scan reads it either way |
 | `timestamp_ns`, `timestamptz_ns` | scan | |
 | `geometry`, `geography` | scan or row | |
@@ -106,7 +107,8 @@ At plan time the node declines, and Spark's `BatchScanExec` stays:
 - a scan that reports an ordering;
 - a scan Iceberg does not vectorize (nested columns) with a task group our reader cannot read: an ORC or Avro
   file, an encrypted file, or equality deletes on a column it does not read;
-- a metadata column other than `_file`, `_pos` and `_spec_id`;
+- a metadata column other than `_file`, `_pos`, `_spec_id`, `_partition`, `_row_id` and
+  `_last_updated_sequence_number` (for example `_deleted`);
 - a nested field with an initial default, or a top-level default our reader cannot fill as a constant;
 - a column type outside the flat types in the table above, or a nested type with such a leaf.
 

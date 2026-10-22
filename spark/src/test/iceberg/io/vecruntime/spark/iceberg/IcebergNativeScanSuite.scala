@@ -595,6 +595,94 @@ class IcebergNativeScanSuite extends IcebergMorSuiteBase {
     checkVectorized(s"SELECT _pos, i FROM $Db.t_push_part WHERE i < 50 AND _pos > 3", Seq(Filter))
   }
 
+  /**
+   * #20 M3a: the three v3 merge-on-read metadata columns `_partition`, `_row_id` and
+   * `_last_updated_sequence_number` read natively (the per-file partition struct and the v3 lineage constants, or
+   * the file's own column where it materialises it), beside `_file` and `_pos`. A map column keeps Iceberg's
+   * reader non-vectorized, so every task group is read natively.
+   */
+  private def createV3Map(name: String, extra: String): Unit = {
+    spark.sql(
+      s"""CREATE OR REPLACE TABLE $Db.$name (id INT, part INT, m MAP<STRING, BIGINT>, s STRING) USING iceberg $extra
+         |TBLPROPERTIES ('format-version'='3', 'write.delete.mode'='merge-on-read',
+         |  'write.target-file-size-bytes'='4096')""".stripMargin
+    )
+    spark.sql(
+      s"""INSERT INTO $Db.$name SELECT CAST(id AS INT), CAST(id % 4 AS INT),
+         |  IF(id % 9 = 0, NULL, map(concat('k', id % 3), id, 'z', id * 2)), concat('s', id % 7)
+         |FROM range(0, 3000)""".stripMargin
+    )
+    // Merge-on-read position deletes over several files.
+    spark.sql(s"DELETE FROM $Db.$name WHERE id % 5 = 0")
+  }
+
+  private val MetaQuery =
+    "SELECT id, _partition, _row_id, _last_updated_sequence_number, _file, _pos FROM TBL WHERE id % 97 = 3"
+
+  private def checkMetaColumns(table: String): Unit = {
+    val t = s"$Db.$table"
+    val df = checkVectorized(MetaQuery.replace("TBL", t), Nil)
+    assert(df.collect().nonEmpty, s"$table: the query should return rows")
+    val (native, iceberg) = groups(df)
+    assert(native > 0 && iceberg == 0, s"$table: native $native, Iceberg $iceberg")
+    // Each metadata column on its own. `_partition` is a struct (lane-less): projected through a filter it is
+    // forwarded, not grouped on. `count(_row_id)` cannot be pushed to Iceberg (a metadata column is not in the
+    // data struct), so the longs are checked through a projection, not a scan-level aggregate.
+    checkVectorized(s"SELECT id, _partition FROM $t WHERE id % 53 = 4", Seq(Filter))
+    checkVectorized(s"SELECT _row_id, _last_updated_sequence_number, id FROM $t WHERE id % 89 = 1", Seq(Filter))
+    checkVectorized(s"SELECT id, _file, _pos FROM $t WHERE id % 71 = 5", Seq(Filter))
+  }
+
+  icebergTest("v3 metadata columns _partition, _row_id, _last_updated_sequence_number: identity partition") {
+    createV3Map("t_meta_ipart", "PARTITIONED BY (part)")
+    useTable("t_meta_ipart")
+    checkMetaColumns("t_meta_ipart")
+  }
+
+  icebergTest("v3 metadata columns _partition, _row_id, _last_updated_sequence_number: unpartitioned") {
+    createV3Map("t_meta_unp", "")
+    useTable("t_meta_unp")
+    checkMetaColumns("t_meta_unp")
+  }
+
+  icebergTest("v3 metadata columns _partition, _row_id, _last_updated_sequence_number: partition-spec evolution") {
+    createV3Map("t_meta_evol", "PARTITIONED BY (part)")
+    // A second spec: files written under each spec carry a different partition, unified in `_partition`.
+    spark.sql(s"ALTER TABLE $Db.t_meta_evol ADD PARTITION FIELD truncate(s, 1)")
+    spark.sql(
+      s"""INSERT INTO $Db.t_meta_evol SELECT CAST(id AS INT), CAST(id % 4 AS INT),
+         |  map('k', id), concat('n', id % 3)
+         |FROM range(3000, 4000)""".stripMargin
+    )
+    spark.sql(s"DELETE FROM $Db.t_meta_evol WHERE id % 7 = 0")
+    useTable("t_meta_evol")
+    checkMetaColumns("t_meta_evol")
+  }
+
+  icebergTest("a copy-on-write UPDATE materialises _row_id, so some files carry it, read natively") {
+    spark.sql(
+      s"""CREATE OR REPLACE TABLE $Db.t_meta_cow (id INT, part INT, m MAP<STRING, BIGINT>, s STRING) USING iceberg
+         |PARTITIONED BY (part)
+         |TBLPROPERTIES ('format-version'='3', 'write.delete.mode'='merge-on-read',
+         |  'write.update.mode'='copy-on-write', 'write.target-file-size-bytes'='4096')""".stripMargin
+    )
+    spark.sql(
+      s"""INSERT INTO $Db.t_meta_cow SELECT CAST(id AS INT), CAST(id % 4 AS INT),
+         |  IF(id % 9 = 0, NULL, map('k', id)), concat('s', id % 7)
+         |FROM range(0, 3000)""".stripMargin
+    )
+    // The copy-on-write UPDATE rewrites whole files, materialising `_row_id` on the rewritten rows.
+    spark.sql(s"UPDATE $Db.t_meta_cow SET s = concat(s, '-u') WHERE id % 3 = 0")
+    // A merge-on-read delete too, so a deleted file is read with its materialised _row_id and the fallback alike.
+    spark.sql(s"DELETE FROM $Db.t_meta_cow WHERE id % 11 = 2")
+    useTable("t_meta_cow")
+    checkMetaColumns("t_meta_cow")
+    // Some files carry a materialised `_row_id` (the copy-on-write UPDATE rewrote them). Count in Spark rather
+    // than pushing `_row_id IS NOT NULL` to Iceberg, which cannot bind a metadata column in a data filter.
+    val rowIds = spark.sql(s"SELECT _row_id FROM $Db.t_meta_cow").collect()
+    assert(rowIds.exists(r => !r.isNullAt(0)), "the copy-on-write UPDATE should have materialised some _row_id")
+  }
+
   icebergTest("switched off, Spark's BatchScanExec stays") {
     withConf(VectorConf.ScanNativeIceberg -> "false") {
       useTable("t_pos")

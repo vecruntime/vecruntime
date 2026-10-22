@@ -387,8 +387,9 @@ class VectorDvWriteSuite extends AnyFunSuite with BeforeAndAfterAll {
   }
 
   test("UPDATE and MERGE on a v3 table with struct, array and map columns match Spark's writer") {
-    // These writes still read rows: Iceberg's own scan of a map column is row-based (the native read path,
-    // #901 R1, is a separate PR) and MergeRows has no map lane. Kept out of the suite-wide row-input count.
+    // #20 M3a: the UPDATE's delete side now reads columnar -- the native Iceberg scan supports the metadata
+    // columns an UPDATE projects (_partition, _row_id, _last_updated_sequence_number). The MERGE still reads rows:
+    // MergeRowsExec has no map lane yet, so its scan falls back. Kept out of the suite-wide row-input count.
     val rowInputBefore = org.apache.spark.sql.vecruntime.VectorWriteDeltaExec.rowInputWrites.get()
     val base = "ice.db.dv_nested"
     for (t <- Seq(s"${base}_on", s"${base}_off")) {
@@ -418,6 +419,14 @@ class VectorDvWriteSuite extends AnyFunSuite with BeforeAndAfterAll {
       ),
       "nested UPDATE not columnar"
     )
+    // #20 M3a: the UPDATE's delete side reads columnar now -- its scan projects _partition / _row_id /
+    // _last_updated_sequence_number over a map column, which the native Iceberg scan supports. So the columnar
+    // delta write must not have had to read rows from a RowToColumnarExec for the UPDATE (on both partitions).
+    assert(
+      org.apache.spark.sql.vecruntime.VectorWriteDeltaExec.rowInputWrites.get() == rowInputBefore,
+      "the UPDATE on a map column must not read rows: the native Iceberg scan now supports its metadata columns"
+    )
+    // The MERGE still reads rows (MergeRowsExec has no map lane), so rowInputWrites may grow across it below.
     spark
       .sql(
         """SELECT id, cast(id % 4 as int) AS p, array(concat('n', id)) AS l, id % 3 AS op
