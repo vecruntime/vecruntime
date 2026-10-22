@@ -116,9 +116,6 @@ public final class IcebergParquetAppender implements FileAppender<IcebergParquet
     public static IcebergParquetAppender create(OutputFile file, Schema schema, Map<String, String> properties,
             MetricsConfig metricsConfig, NameMapping nameMapping, Configuration conf)
             throws IOException {
-        if (!FloatingMetrics.check(schema)) {
-            throw new UnsupportedOperationException("a float or double inside a list or a map is not supported: " + schema);
-        }
         MessageType fileSchema = IcebergParquetInterop.fileSchema(schema, "table");
         int pageSize = intProp(properties, TableProperties.PARQUET_PAGE_SIZE_BYTES, TableProperties.PARQUET_PAGE_SIZE_BYTES_DEFAULT);
         ParquetProperties.Builder props = ParquetProperties.builder()
