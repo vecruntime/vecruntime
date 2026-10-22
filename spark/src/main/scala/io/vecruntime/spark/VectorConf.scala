@@ -621,13 +621,13 @@ object VectorConf {
 
   /**
    * #869 step 4: the native pool's per-thread cache -- blocks per size class (0 to 16) and the largest block cached
-   * (64 KiB to 64 MiB). A thread holds at most about `2 * depth * maxBlockBytes`: 8 MiB with the defaults (4, 1m).
-   * Read once, when the executor starts.
+   * (64 KiB to 64 MiB). A thread holds at most about `2 * depth * maxBlockBytes`. Off by default (depth 0): at 10 TB
+   * the shared free lists alone were as fast as main and the cache slower. Read once, when the executor starts.
    */
   val NativePoolThreadCacheDepth = "spark.vecruntime.nativePool.threadCache.depth"
   val NativePoolThreadCacheMaxBlockBytes = "spark.vecruntime.nativePool.threadCache.maxBlockBytes"
   def nativePoolThreadCacheDepth(sparkConf: org.apache.spark.SparkConf): Int =
-    sparkConf.getInt(NativePoolThreadCacheDepth, 4)
+    sparkConf.getInt(NativePoolThreadCacheDepth, 0)
   def nativePoolThreadCacheMaxBlockBytes(sparkConf: org.apache.spark.SparkConf): Long =
     org.apache.spark.network.util.JavaUtils.byteStringAsBytes(sparkConf.get(NativePoolThreadCacheMaxBlockBytes, "1m"))
 

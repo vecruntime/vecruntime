@@ -120,18 +120,17 @@ public final class NativePool {
     private final ConcurrentLinkedQueue<Block>[] free = new ConcurrentLinkedQueue[CLASSES];
 
     /**
-     * #869 step 4: the smaller classes also have a per-thread cache in front of
-     * their shared free list, so the batch-sized buffers 15 task threads take
-     * and release every few microseconds do not all meet on one queue head;
-     * counters are striped for the same reason. A cached block counts as
-     * retained. By default classes up to 1 MiB, 4 blocks each: at most about
-     * 8 MiB per thread ({@link #configureThreadCache}).
+     * #869 step 4: the smaller classes can also have a per-thread cache in front
+     * of their shared free list ({@link #configureThreadCache}); counters are
+     * striped. A cached block counts as retained. Off by default (depth 0): at
+     * 10 TB the cache at depth 4 cost the operator arenas 3-9% of a full
+     * TPC-DS run against the shared lists alone, Arrow buffers included.
      */
     static final int MAX_CACHE_DEPTH = 16;
 
     private static volatile int cachedClasses = 5;
 
-    private static volatile int cacheDepth = 4;
+    private static volatile int cacheDepth = 0;
 
     /**
      * The per-thread cache's shape for every pool: {@code depth} blocks (0 to
