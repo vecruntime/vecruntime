@@ -243,7 +243,8 @@ class GatherSortKernelsTest {
                         case BOOL -> ArrowLayout.ofBooleans(arena, booleans(rnd, n), nulls);
                         case UTF8 -> batch % 2 == 0 ? strings(arena, rnd, n, 0.2) : dictionary(arena, strings(arena, rnd, n, 0.2));
                         case DECIMAL128 -> TestData.decimal128s(arena, rnd, n, nulls);
-                        case LIST, MAP, STRUCT -> throw new IllegalStateException("no nested lane here (#705)");
+                        case LIST, MAP, STRUCT, FIXED_BINARY ->
+                                throw new IllegalStateException("no nested or FIXED_BINARY lane here (#705)");
                     };
                     MemorySegment selection = batch % 4 == 1 ? null : TestData.randomBitmap(arena, rnd, n);
                     int count = selection == null ? n : Bitmap.popcount(selection, n);
@@ -275,7 +276,8 @@ class GatherSortKernelsTest {
             case BOOL -> v.getBoolean(i);
             case UTF8 -> v.getString(i);
             case DECIMAL128 -> v.getDecimal128(i);
-            case LIST, MAP, STRUCT -> throw new IllegalStateException("no nested lane here (#705)");
+            case LIST, MAP, STRUCT, FIXED_BINARY ->
+                    throw new IllegalStateException("no nested or FIXED_BINARY lane here (#705)");
         };
     }
 
