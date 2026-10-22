@@ -201,10 +201,18 @@ case class VectorIcebergScanExec(
       .map(extra => VectorIcebergRDD.withPositions(StructType(requiredSchema.fields ++ extra)))
     val equalityConfBroadcast = equalitySchema.map(confFor)
 
-    // Pushed filters by field id: the data columns' quoted names, as the translated filters name them.
+    // Pushed filters by field id: the data columns' quoted names, as the translated filters name them. A uuid
+    // column is excluded (#rtypes): it reads as Spark's StringType (canonical text) but is stored as the raw
+    // 16 bytes, so a string predicate against the file's byte statistics would skip the wrong row groups/pages.
     val filterFieldIds =
       if (filters.isEmpty || !sqlConf.parquetFilterPushDown) null
-      else dataColumns.map { case (a, id) => org.apache.spark.sql.catalyst.util.quoteIfNeeded(a.name) -> id }.toMap
+      else
+        dataColumns.collect {
+          case (a, id)
+              if IcebergTasks.columnKind(a.name, id) != IcebergTasks.DataColumn ||
+                !IcebergTasks.isUuid(scan, id) =>
+            org.apache.spark.sql.catalyst.util.quoteIfNeeded(a.name) -> id
+        }.toMap
     val m = ScanMetrics(
       longMetric("numFiles"),
       longMetric("numOutputRows"),
@@ -700,6 +708,12 @@ object VectorIcebergScanPlanner {
         return Left(s"unsupported column type ${a.name}:${a.dataType.simpleString}")
       }
     }
+    // #rtypes: a uuid or fixed equality key cannot be applied by the native equality probe, and declining those
+    // files to Iceberg's columnar reader inside the node fails (the node cannot adapt an Iceberg uuid/fixed
+    // vector). Hand the whole scan to Spark's own reader instead, which applies the deletes correctly.
+    if (IcebergTasks.hasUuidOrFixedEqualityKey(b.inputPartitions, IcebergTasks.tableSchema(b))) {
+      return Left("Iceberg scan has an equality delete keyed on a uuid or fixed column")
+    }
     // Iceberg's reader is not vectorized for some scans (nested columns): every task group must then be read
     // natively, since the node cannot fall back to Iceberg's columnar reader for one of them.
     if (!b.supportsColumnar) {
@@ -725,11 +739,26 @@ object VectorIcebergScanPlanner {
  */
 private[vecruntime] object IcebergTasks {
 
-  // Iceberg types whose Spark type and Parquet encoding our reader decodes as Iceberg's reader does. Not: uuid
-  // (16 bytes in the file, a string in Spark), fixed, time, timestamp_ns, geometry, unknown. A variant column is
-  // read natively too (see unsupportedType), but is never an equality column.
+  // Iceberg types whose Spark type and Parquet encoding our reader decodes as Iceberg's reader does. uuid (16
+  // bytes in the file, a string in Spark) and fixed (a FIXED_LEN_BYTE_ARRAY, binary in Spark) are read natively
+  // too (#rtypes); the v3 unknown type (NullType in Spark) is produced as a null column, see unsupportedType. Not:
+  // time, timestamp_ns, geometry. A variant column is read natively too (see unsupportedType), but is never an
+  // equality column.
   private val NativeTypes =
-    Set("BOOLEAN", "INTEGER", "LONG", "FLOAT", "DOUBLE", "DATE", "TIMESTAMP", "STRING", "BINARY", "DECIMAL")
+    Set(
+      "BOOLEAN",
+      "INTEGER",
+      "LONG",
+      "FLOAT",
+      "DOUBLE",
+      "DATE",
+      "TIMESTAMP",
+      "STRING",
+      "BINARY",
+      "DECIMAL",
+      "FIXED",
+      "UUID"
+    )
 
   private def call(target: AnyRef, name: String): AnyRef = {
     var c: Class[_] = target.getClass
@@ -890,6 +919,8 @@ private[vecruntime] object IcebergTasks {
         unsupportedType(call(icebergType, "keyType"), s"$path.key")
           .orElse(unsupportedType(call(icebergType, "valueType"), s"$path.value"))
       case t if NativeTypes.contains(t) => None
+      // #rtypes: the v3 unknown type is always null, never stored in a file; produced as a null column.
+      case "UNKNOWN" => None
       // A v3 variant, shredded or not: Iceberg writes the spec's Parquet variant group (metadata, value and the
       // shredded typed_value), which our reader reads as it reads Spark's (#787, #812).
       case "VARIANT" => None
@@ -940,6 +971,9 @@ private[vecruntime] object IcebergTasks {
 
   /** The Iceberg type of the projected field `id` of `b`'s scan. */
   def projectedType(b: BatchScanExec, id: Int): AnyRef = call(projectedField(b, id), "type")
+
+  /** #rtypes: whether the projected field `id` of `b`'s scan is a uuid column (kept out of pushdown). */
+  def isUuid(b: BatchScanExec, id: Int): Boolean = call(projectedType(b, id), "typeId").toString == "UUID"
 
   /**
    * One file scan task read natively: its split, the data file's location, its position delete files (and deletion
@@ -1104,6 +1138,33 @@ private[vecruntime] object IcebergTasks {
     call(d, "equalityFieldIds").asInstanceOf[java.util.List[Integer]].asScala.map(_.intValue()).toSeq
 
   /**
+   * #rtypes: whether any planned equality delete of `inputs` is keyed on a uuid or fixed field of `schema`. Such a
+   * scan is handed to Spark's own reader whole: the native equality probe does not take these key types, and the
+   * node cannot adapt an Iceberg uuid/fixed vector when a group falls to Iceberg's columnar reader.
+   */
+  def hasUuidOrFixedEqualityKey(inputs: Seq[InputPartition], schema: AnyRef): Boolean = {
+    val ids = scala.collection.mutable.LinkedHashSet.empty[Int]
+    inputs.foreach { p =>
+      if (p.getClass.getName == "org.apache.iceberg.spark.source.SparkInputPartition") {
+        call(call(p, "taskGroup"), "tasks").asInstanceOf[java.util.Collection[AnyRef]].asScala.foreach { task =>
+          if (task.getClass.getName.contains("FileScanTask")) {
+            val deletes = call(task, "deletes").asInstanceOf[java.util.List[AnyRef]]
+            if (deletes != null) deletes.asScala.foreach { d =>
+              if (call(d, "content").toString == "EQUALITY_DELETES") ids ++= equalityFieldIds(d)
+            }
+          }
+        }
+      }
+    }
+    if (ids.isEmpty) return false
+    val struct = call(schema, "asStruct")
+    ids.exists { id =>
+      val field = struct.getClass.getMethod("field", classOf[Int]).invoke(struct, Int.box(id))
+      field != null && { val t = call(call(field, "type"), "typeId").toString; t == "UUID" || t == "FIXED" }
+    }
+  }
+
+  /**
    * The columns to read besides the projected ones (`projected`, field ids) to apply the equality deletes of the
    * planned task groups `parts`: one per equality field the query does not project, named after its id and
    * carrying it as its Parquet field id. None when one of them is not a top-level column of a type our reader
@@ -1131,6 +1192,16 @@ private[vecruntime] object IcebergTasks {
     val struct = call(schema, "asStruct")
     val typeClass = Class.forName("org.apache.iceberg.types.Type", false, cl)
     val convert = Class.forName("org.apache.iceberg.spark.SparkSchemaUtil", false, cl).getMethod("convert", typeClass)
+    // #rtypes: a uuid or fixed equality key (projected or not) declines the file to Iceberg's reader. A uuid reads
+    // as Spark's StringType (the canonical text) but the equality set holds Iceberg's uuid bytes; a fixed reads as
+    // Spark's BinaryType on the UTF8 lane, and Iceberg compares a fixed key as a ByteBuffer, not those bytes --
+    // so neither the native probe (EqualityDeleteSet does not take uuid) nor the row probe matches reliably. These
+    // are rare keys; declining the file to Iceberg's reader keeps the result correct.
+    val declineEq = ids.exists { id =>
+      val field = struct.getClass.getMethod("field", classOf[Int]).invoke(struct, Int.box(id))
+      field != null && { val t = call(call(field, "type"), "typeId").toString; t == "UUID" || t == "FIXED" }
+    }
+    if (declineEq) return None
     val extra = ids.toSeq.filterNot(projected).sorted.map { id =>
       // Top-level fields only: a nested equality field is not a column our reader reads on its own.
       val field = struct.getClass.getMethod("field", classOf[Int]).invoke(struct, Int.box(id))

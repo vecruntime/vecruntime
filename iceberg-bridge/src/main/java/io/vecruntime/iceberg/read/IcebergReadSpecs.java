@@ -158,6 +158,11 @@ public final class IcebergReadSpecs {
         }
 
         Node node(Types.NestedField f, org.apache.parquet.schema.Type t, String[] parentPath) {
+            if (f.type().typeId() == Type.TypeID.UNKNOWN) {
+                // The v3 unknown type (#rtypes): always null, never stored in a file. Null in every row, as
+                // Iceberg's reader produces it (Spark sees it as NullType).
+                return new Missing(f, null);
+            }
             if (t == null) {
                 if (f.isRequired() && f.initialDefault() == null) {
                     throw new IllegalArgumentException("Missing required field: " + f.name());

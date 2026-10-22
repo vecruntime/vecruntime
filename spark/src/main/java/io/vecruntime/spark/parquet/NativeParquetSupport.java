@@ -143,6 +143,11 @@ public final class NativeParquetSupport {
         if (dt instanceof DoubleType) {
             return true; // DOUBLE physical, FLOAT64 lane
         }
+        if (dt instanceof org.apache.spark.sql.types.NullType) {
+            // The v3 unknown type (Iceberg TypeToSparkType maps it to NullType): always null, never stored in a
+            // file, so it is produced as an all-null column (NativeParquetNullColumn), not decoded.
+            return true;
+        }
         if (dt instanceof StringType) {
             // UTF8; a collated string (#568) has no engine lane but the same bytes: decoded on the UTF8 lane and
             // emitted as an Arrow string vector, which operators carry as a column without a lane (decodeLane).
@@ -224,6 +229,12 @@ public final class NativeParquetSupport {
                         && a instanceof org.apache.parquet.schema.LogicalTypeAnnotation.TimestampLogicalTypeAnnotation t
                         && t.getUnit() == org.apache.parquet.schema.LogicalTypeAnnotation.TimeUnit.MILLIS)
                 || dt instanceof org.apache.spark.sql.types.TimeType;
+        // A uuid: Iceberg maps it to StringType, stored as FIXED_LEN_BYTE_ARRAY(16) with the UUID logical type.
+        // The 16 big-endian bytes are formatted into the canonical lowercase text at the Spark boundary (#rtypes).
+        boolean uuid = dt instanceof StringType
+                && stored == org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.FIXED_LEN_BYTE_ARRAY
+                && p.getTypeLength() == 16
+                && a instanceof org.apache.parquet.schema.LogicalTypeAnnotation.UUIDLogicalTypeAnnotation;
         return LeafReadSpec.onLane(lane)
                 .widen(widenOf(stored, a, dt))
                 .rescale(rescaleOf(a, dt))
@@ -235,8 +246,10 @@ public final class NativeParquetSupport {
                 .timestampLane(dt instanceof TimestampType)
                 .decimal(dt instanceof DecimalType)
                 .float32(dt instanceof FloatType)
+                .uuid(uuid)
                 // A collated string (#568) is carried to Spark's operators, which compare it by collation: values.
-                .dictionaryIdsAllowed(dt instanceof StringType st && st.isUTF8BinaryCollation())
+                // A uuid is never dictionary ids: the stored 16 bytes are not the text the operators read.
+                .dictionaryIdsAllowed(dt instanceof StringType st && st.isUTF8BinaryCollation() && !uuid)
                 .arrowType(arrowTypeOf(dt))
                 .build();
     }
