@@ -573,6 +573,34 @@ class VectorIcebergWriteSuite extends AnyFunSuite with BeforeAndAfterAll {
     )
   }
 
+  test("partitioned by sources inside a struct (bucket and truncate over st.x / st.y) writes columnar") {
+    // Partition sources inside a struct (#901 item 7): the transform is computed on the nested leaf lanes
+    // through the struct, with the same rows, partition values and record counts as Iceberg's writer, and
+    // no fallback. The struct is null for some rows (source: id % 7 = 0), so a null partition value occurs.
+    partitionedTwin(
+      "p_struct_src_clustered",
+      "bucket(4, st.x), truncate(2, st.y)",
+      ", 'write.spark.fanout.enabled'='false'",
+      Columns,
+      source(4000)
+    )
+    partitionedTwin(
+      "p_struct_src_fanout",
+      "bucket(4, st.x), truncate(2, st.y)",
+      ", 'write.spark.fanout.enabled'='true'",
+      Columns,
+      source(4000)
+    )
+    // A temporal transform over a nested source too, under hash distribution.
+    partitionedTwin(
+      "p_struct_src_identity",
+      "identity(st.x)",
+      ", 'write.distribution-mode'='hash'",
+      Columns,
+      source(4000)
+    )
+  }
+
   test("copy-on-write DELETE on a partitioned table writes columnar") {
     val (off, on) = ("ice.db.p_cow_off", "ice.db.p_cow_on")
     Seq(off, on).foreach { t =>

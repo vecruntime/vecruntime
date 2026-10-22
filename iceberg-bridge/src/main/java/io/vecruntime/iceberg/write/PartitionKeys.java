@@ -20,6 +20,9 @@ import java.nio.ByteBuffer;
 import java.util.List;
 import java.util.Objects;
 
+import io.vecruntime.kernels.Decimal128;
+import io.vecruntime.kernels.FixedBinaryVectorBuffers;
+import io.vecruntime.kernels.IcebergTransformKernels;
 import io.vecruntime.kernels.VecType;
 import io.vecruntime.kernels.VectorBuffers;
 import org.apache.iceberg.PartitionField;
@@ -28,31 +31,60 @@ import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.types.Type;
 import org.apache.iceberg.types.Types;
-import org.apache.iceberg.util.DateTimeUtil;
-import org.apache.iceberg.util.SerializableFunction;
 
 /**
  * The partition values of a batch's rows for an Iceberg partition spec (#842,
- * W3): per spec field, the source column's value in Iceberg's internal
- * representation (an int for a date, micros for a timestamp, a {@code
- * CharSequence} for a string, ...) put through the field's transform as Iceberg
- * binds it ({@code Transform.bind(sourceType)}), so identity, bucket, truncate,
- * year, month, day, hour and void are Iceberg's own functions. The time
- * transforms over dates and timestamps -- the common partitioning -- take
- * Iceberg's {@link DateTimeUtil} directly on the primitive value instead of
- * boxing it first.
+ * W3; #901 item 11): per spec field, the source column's value put through the
+ * field's transform, computed on whole lanes with {@link
+ * IcebergTransformKernels} -- the same Murmur3 bucket, truncate and time
+ * transforms Iceberg's own {@code Transforms} compute, never boxing a value per
+ * row. bucket and the time transforms reduce to an {@code int}; truncate of an
+ * integral or decimal reduces to an {@code int}/{@code long}; identity and the
+ * object-valued truncates (string, binary, decimal) keep the value itself.
  *
- * <p>Source columns must be top-level fields of the write schema; {@link
- * #unsupported} names the first one that is not.
+ * <p>Rows are grouped by their partition without a {@link PartitionKey} per row:
+ * each row carries a hash of its field results, rows that hash and compare equal
+ * share a group, and one {@code PartitionKey} is materialised per distinct
+ * group when the writer needs one. Nulls are kept exactly as Iceberg keeps them
+ * -- a null source (or a null enclosing struct) gives a null partition value,
+ * and the values and paths are Iceberg's own.
+ *
+ * <p>A source may be a top-level write-schema field or a field nested inside
+ * (possibly nested) structs (#901 item 7): the leaf lane is read through the
+ * struct children, and a row is null when the leaf or any enclosing struct is
+ * null, as Iceberg's accessor reads it. {@link #unsupported} names the first
+ * source a batch cannot supply.
  */
 final class PartitionKeys {
 
+    /** How a field's transform result is represented. */
+    private enum Kind {
+        /**
+         * An {@code int} result (bucket, truncate-int, year/month/day/hour,
+         * identity int/date, void).
+         */
+        INT,
+        /** A {@code long} result (truncate-long, identity long/timestamp). */
+        LONG,
+        /** The value itself (identity, or truncate of a string / binary / decimal). */
+        OBJECT
+    }
+
     /**
-     * One spec field: the write-schema position of its source, its source type
-     * and its bound transform.
+     * One spec field: the write-schema position of its top-level source, the
+     * chain of struct child indices down to the leaf (empty for a top-level
+     * source), the leaf source type, the transform and how its result is held.
      */
-    private record Field(int column, Type.TypeID source, Type sourceType,
-                         String transform, SerializableFunction<Object, Object> fn) {}
+    private record Field(
+            int column,
+            List<Integer> structPath,
+            Type.TypeID source,
+            Type sourceType,
+            Types.NestedField leaf,
+            String transform,
+            int param,
+            Kind kind,
+            org.apache.iceberg.util.SerializableFunction<Object, Object> fn) {}
 
     private final PartitionSpec spec;
     private final Schema schema;
@@ -68,49 +100,156 @@ final class PartitionKeys {
         this.schema = schema;
         List<PartitionField> specFields = spec.fields();
         this.fields = new Field[specFields.size()];
-        List<Types.NestedField> columns = schema.columns();
         for (int k = 0; k < fields.length; k++) {
             PartitionField pf = specFields.get(k);
-            int column = -1;
-            for (int c = 0; c < columns.size(); c++) {
-                if (columns.get(c).fieldId() == pf.sourceId()) {
-                    column = c;
-                }
-            }
-            Type sourceType = columns.get(column).type();
+            Located located = locate(schema, pf.sourceId());
+            Type sourceType = located.leaf().type();
+            String transform = pf.transform().toString();
+            String name = transformName(transform);
+            Kind kind = kindOf(name, sourceType);
+            // Object-valued results (identity, and truncate of a string / binary / decimal) go through
+            // Iceberg's own bound transform, so they are byte-for-byte Iceberg's; the primitive results
+            // (bucket, truncate int/long, year/month/day/hour) are the allocation-free kernel path.
+            org.apache.iceberg.util.SerializableFunction<Object, Object> fn = kind == Kind.OBJECT ? (org.apache.iceberg.util.SerializableFunction<Object, Object>) pf.transform().bind(sourceType) : null;
             fields[k] = new Field(
-                    column,
+                    located.column(),
+                    located.structPath(),
                     sourceType.typeId(),
                     sourceType,
-                    pf.transform().toString(),
-                    (SerializableFunction<Object, Object>) pf.transform().bind(sourceType));
+                    located.leaf(),
+                    name,
+                    transformParam(transform),
+                    kind,
+                    fn);
         }
     }
 
     /**
+     * The transform name without its parameter: {@code bucket}, {@code
+     * truncate}, {@code identity}, ...
+     */
+    private static String transformName(String transform) {
+        int b = transform.indexOf('[');
+        return b < 0 ? transform : transform.substring(0, b);
+    }
+
+    /**
+     * The {@code N} of a {@code bucket[N]} or {@code truncate[N]} transform; 0
+     * otherwise.
+     */
+    private static int transformParam(String transform) {
+        int b = transform.indexOf('[');
+        if (b < 0) {
+            return 0;
+        }
+        return Integer.parseInt(transform.substring(b + 1, transform.indexOf(']')));
+    }
+
+    private static Kind kindOf(String name, Type sourceType) {
+        return switch (name) {
+            case "void" -> Kind.INT; // always null; INT lane carries the null flag
+            case "bucket" -> Kind.INT;
+            case "year", "month", "day", "hour" -> Kind.INT;
+            case "truncate" -> switch (sourceType.typeId()) {
+                        case INTEGER -> Kind.INT;
+                        case LONG -> Kind.LONG;
+                        case DECIMAL -> Kind.OBJECT; // a BigDecimal, like Iceberg's TruncateDecimal
+                        default -> Kind.OBJECT; // string / binary
+                    };
+            default -> switch (sourceType.typeId()) { // identity
+                        case INTEGER, DATE -> Kind.INT;
+                        case LONG, TIMESTAMP -> Kind.LONG;
+                        default -> Kind.OBJECT;
+                    };
+        };
+    }
+
+    /**
+     * A located source: its top-level column, the struct path to the leaf, and
+     * the leaf field.
+     */
+    private record Located(int column, List<Integer> structPath, Types.NestedField leaf) {}
+
+    /**
+     * Finds the source field {@code sourceId} in {@code schema}: its top-level
+     * column index and, when it is nested, the chain of struct child indices
+     * down to it.
+     */
+    private static Located locate(Schema schema, int sourceId) {
+        List<Types.NestedField> columns = schema.columns();
+        for (int c = 0; c < columns.size(); c++) {
+            Types.NestedField top = columns.get(c);
+            if (top.fieldId() == sourceId) {
+                return new Located(c, List.of(), top);
+            }
+            List<Integer> path = pathTo(top.type(), sourceId);
+            if (path != null) {
+                return new Located(c, path, leafAt(top, path));
+            }
+        }
+        throw new IllegalStateException("partition source " + sourceId + " is not in the write schema");
+    }
+
+    /**
+     * The struct-child path from {@code type} to field {@code id}, or null when
+     * not a struct descendant.
+     */
+    private static List<Integer> pathTo(Type type, int id) {
+        if (!type.isStructType()) {
+            return null;
+        }
+        List<Types.NestedField> fs = type.asStructType().fields();
+        for (int i = 0; i < fs.size(); i++) {
+            Types.NestedField f = fs.get(i);
+            if (f.fieldId() == id) {
+                return List.of(i);
+            }
+            List<Integer> rest = pathTo(f.type(), id);
+            if (rest != null) {
+                List<Integer> p = new java.util.ArrayList<>(rest.size() + 1);
+                p.add(i);
+                p.addAll(rest);
+                return List.copyOf(p);
+            }
+        }
+        return null;
+    }
+
+    private static Types.NestedField leafAt(Types.NestedField top, List<Integer> path) {
+        Types.NestedField f = top;
+        for (int idx : path) {
+            f = f.type()
+                 .asStructType()
+                 .fields()
+                 .get(idx);
+        }
+        return f;
+    }
+
+    /**
      * Why a spec's partition values cannot be computed from the batches (null
-     * when they can): every source must be a top-level write-schema column of a
-     * type whose values the columns carry.
+     * when they can): every source must be a write-schema field -- top-level or
+     * nested inside structs -- whose leaf is one of the supported types.
      */
     static String unsupported(PartitionSpec spec, Schema schema) {
         for (PartitionField pf : spec.fields()) {
-            Types.NestedField top = null;
-            for (Types.NestedField c : schema.columns()) {
-                if (c.fieldId() == pf.sourceId()) {
-                    top = c;
-                }
-            }
-            if (top == null) {
+            Located located;
+            try {
+                located = locate(schema, pf.sourceId());
+            } catch (IllegalStateException e) {
                 return "partition source "
                         + pf.sourceId()
                         + " ("
                         + pf.name()
-                        + ") is not a top-level column";
+                        + ") is not in the write schema";
             }
-            switch (top.type().typeId()) {
-                case BOOLEAN, INTEGER, LONG, FLOAT, DOUBLE, DATE, TIMESTAMP, STRING, BINARY, DECIMAL -> {}
+            // locate only descends through structs, so a located leaf is always reachable as a single lane.
+            switch (located.leaf()
+                           .type()
+                           .typeId()) {
+                case BOOLEAN, INTEGER, LONG, FLOAT, DOUBLE, DATE, TIMESTAMP, STRING, BINARY, DECIMAL, FIXED, UUID -> {}
                 default -> {
-                    return "partition source type " + top.type() + " is not supported";
+                    return "partition source type " + located.leaf().type() + " is not supported";
                 }
             }
         }
@@ -122,110 +261,301 @@ final class PartitionKeys {
     }
 
     /**
-     * The partition values of rows {@code [first, end)}: {@code
-     * values[field][row - first]}, each as Iceberg's transform returns it
-     * ({@code null} for a null source or a void transform).
+     * The partition values of rows {@code [first, end)}: one {@link Values} that
+     * holds, per field, an {@code int}/{@code long} result lane or the object
+     * values, plus a per-row group hash, so the writer can group rows without a
+     * {@link PartitionKey} each.
      */
-    Object[][] compute(List<? extends VectorBuffers> columns, int first, int end) {
-        int n = end - first;
-        Object[][] out = new Object[fields.length][n];
-        for (int k = 0; k < fields.length; k++) {
-            Field f = fields[k];
-            VectorBuffers v = columns.get(f.column());
-            Object[] dst = out[k];
-            if (f.transform().equals("void")) {
-                continue;
+    Values compute(List<? extends VectorBuffers> columns, int first, int end) {
+        return new Values(columns, first, end);
+    }
+
+    /**
+     * The computed partition values of one call's rows {@code [first, end)},
+     * indexed by {@code row - first}. Primitive results live in {@code longs}
+     * (an {@code int} widened), object results in {@code objects}; {@code
+     * nulls} marks a null partition value. {@code hash[r]} folds the row's
+     * fields so grouping can bucket first and compare only within a bucket.
+     */
+    final class Values {
+        private final int first;
+        private final int n;
+        // [field][row]
+        private final long[][] longs;
+        private final Object[][] objects;
+        private final boolean[][] nulls;
+        private final long[] hash;
+
+        Values(List<? extends VectorBuffers> columns, int first, int end) {
+            this.first = first;
+            this.n = end - first;
+            int f = fields.length;
+            this.longs = new long[f][];
+            this.objects = new Object[f][];
+            this.nulls = new boolean[f][n];
+            this.hash = new long[n];
+            for (int k = 0; k < f; k++) {
+                computeField(k, columns);
             }
-            boolean time = f.transform().equals("year")
-                    || f.transform().equals("month")
-                    || f.transform().equals("day")
-                    || f.transform().equals("hour");
+            for (int r = 0; r < n; r++) {
+                long h = 1;
+                for (int k = 0; k < f; k++) {
+                    h = h * 31 + fieldHash(k, r);
+                }
+                hash[r] = h;
+            }
+        }
+
+        private long fieldHash(int k, int r) {
+            if (nulls[k][r]) {
+                return 0;
+            }
+            if (objects[k] != null) {
+                return objects[k][r] == null ? 0 : objects[k][r].hashCode();
+            }
+            return longs[k][r];
+        }
+
+        private void computeField(int k, List<? extends VectorBuffers> columns) {
+            Field field = fields[k];
+            VectorBuffers leaf = resolveLeaf(field, columns);
+            boolean[] parentNull = parentNulls(field, columns);
+            boolean[] fieldNull = nulls[k];
+            if (field.kind() == Kind.OBJECT) {
+                objects[k] = new Object[n];
+            } else {
+                longs[k] = new long[n];
+            }
+            if (field.transform().equals("void")) {
+                java.util.Arrays.fill(fieldNull, true);
+                return;
+            }
             for (int r = 0; r < n; r++) {
                 int row = first + r;
-                if (v.isNull(row)) {
+                if ((parentNull != null && parentNull[r]) || leaf.isNull(row)) {
+                    fieldNull[r] = true;
                     continue;
                 }
-                if (time && f.source() == Type.TypeID.DATE) {
-                    int days = v.getInt(row);
-                    dst[r] = switch (f.transform()) {
-                                case "year" -> DateTimeUtil.daysToYears(days);
-                                case "month" -> DateTimeUtil.daysToMonths(days);
-                                default -> days;
-                            };
-                } else if (time && f.source() == Type.TypeID.TIMESTAMP) {
-                    long micros = v.getLong(row);
-                    dst[r] = switch (f.transform()) {
-                                case "year" -> DateTimeUtil.microsToYears(micros);
-                                case "month" -> DateTimeUtil.microsToMonths(micros);
-                                case "day" -> DateTimeUtil.microsToDays(micros);
-                                default -> DateTimeUtil.microsToHours(micros);
-                            };
-                } else {
-                    dst[r] = f.fn().apply(sourceValue(v, row, f));
+                switch (field.kind()) {
+                    case INT, LONG -> longs[k][r] = primitiveResult(field, leaf, row);
+                    case OBJECT -> objects[k][r] = objectResult(field, leaf, row);
                 }
             }
         }
-        return out;
-    }
 
-    /**
-     * Element {@code row} of {@code v} in Iceberg's internal representation for
-     * the field's source type.
-     */
-    private static Object sourceValue(VectorBuffers v, int row, Field f) {
-        return switch (f.source()) {
-            case BOOLEAN -> v.getBoolean(row);
-            case INTEGER, DATE -> v.getInt(row);
-            case LONG, TIMESTAMP -> v.getLong(row);
-            // A float column arrives in a FLOAT64 lane.
-            case FLOAT -> (float) v.getDouble(row);
-            case DOUBLE -> v.getDouble(row);
-            case STRING -> v.getString(row);
-            case BINARY -> ByteBuffer.wrap(v.getUtf8Bytes(row));
-            case DECIMAL -> {
-                int scale = ((Types.DecimalType) f.sourceType()).scale();
-                if (v.type() == VecType.DECIMAL128) {
-                    yield new BigDecimal(v.getDecimal128(row), scale);
+        /**
+         * The {@code int}/{@code long} result of a primitive-valued transform
+         * at {@code row}.
+         */
+        private long primitiveResult(Field field, VectorBuffers v, int row) {
+            String t = field.transform();
+            return switch (t) {
+                case "bucket" -> bucketHash(field, v, row);
+                case "year" -> field.source() == Type.TypeID.DATE ? IcebergTransformKernels.daysToYears(v.getInt(row)) : IcebergTransformKernels.daysToYears(IcebergTransformKernels.microsToDays(v.getLong(row)));
+                case "month" -> field.source() == Type.TypeID.DATE ? IcebergTransformKernels.daysToMonths(v.getInt(row)) : IcebergTransformKernels.daysToMonths(IcebergTransformKernels.microsToDays(v.getLong(row)));
+                case "day" -> field.source() == Type.TypeID.DATE ? v.getInt(row) : IcebergTransformKernels.microsToDays(v.getLong(row));
+                case "hour" -> IcebergTransformKernels.microsToHours(v.getLong(row));
+                case "truncate" -> field.kind() == Kind.INT ? IcebergTransformKernels.truncate(v.getInt(row), field.param()) : IcebergTransformKernels.truncate(v.getLong(row), field.param());
+                default -> // identity of an int, date, long or timestamp
+                        field.kind() == Kind.INT ? v.getInt(row) : v.getLong(row);
+            };
+        }
+
+        /** Iceberg's bucket of the value at {@code row}. */
+        private int bucketHash(Field field, VectorBuffers v, int row) {
+            int h = switch (field.source()) {
+                case INTEGER, LONG, DATE, TIMESTAMP ->
+                        IcebergTransformKernels.hashLong(v.type() == VecType.INT32 ? v.getInt(row) : v.getLong(row));
+                case STRING, BINARY -> IcebergTransformKernels.hashBytes(v.getUtf8Bytes(row));
+                case FIXED, UUID -> IcebergTransformKernels.hashBytes(((FixedBinaryVectorBuffers) v).bytes(row));
+                case DECIMAL ->
+                        v.type() == VecType.DECIMAL128 ? IcebergTransformKernels.hashDecimal128(Decimal128.hi(v.data(), row), Decimal128.lo(v.data(), row)) : IcebergTransformKernels.hashDecimal(v.type() == VecType.INT32 ? v.getInt(row) : v.getLong(row));
+                default -> throw new IllegalStateException("bucket over " + field.source());
+            };
+            return IcebergTransformKernels.bucket(h, field.param());
+        }
+
+        /**
+         * An object-valued result (identity, or a string / binary / decimal
+         * truncate) at {@code row}.
+         */
+        private Object objectResult(Field field, VectorBuffers v, int row) {
+            Object value = sourceValue(field, v, row);
+            // Iceberg's own bound transform (identity passes the value through, truncate applies its width),
+            // so the value stored is byte-for-byte what Iceberg's PartitionKey would store.
+            return field.fn().apply(value);
+        }
+
+        /**
+         * Element {@code row} of {@code v} in Iceberg's internal representation
+         * for the field's source type.
+         */
+        private Object sourceValue(Field field, VectorBuffers v, int row) {
+            return switch (field.source()) {
+                case BOOLEAN -> v.getBoolean(row);
+                case INTEGER, DATE -> v.getInt(row);
+                case LONG, TIMESTAMP -> v.getLong(row);
+                case FLOAT -> (float) v.getDouble(row);
+                case DOUBLE -> v.getDouble(row);
+                case STRING -> v.getString(row);
+                case BINARY -> ByteBuffer.wrap(v.getUtf8Bytes(row));
+                case FIXED -> ByteBuffer.wrap(((FixedBinaryVectorBuffers) v).bytes(row));
+                case UUID -> uuidOf(((FixedBinaryVectorBuffers) v).bytes(row));
+                case DECIMAL -> {
+                    int scale = ((Types.DecimalType) field.sourceType()).scale();
+                    if (v.type() == VecType.DECIMAL128) {
+                        yield new BigDecimal(v.getDecimal128(row), scale);
+                    }
+                    yield BigDecimal.valueOf(v.type() == VecType.INT32 ? v.getInt(row) : v.getLong(row),
+                            scale);
                 }
-                yield BigDecimal.valueOf(v.type() == VecType.INT32 ? v.getInt(row) : v.getLong(row),
-                        scale);
+                default -> throw new IllegalStateException("unsupported partition source " + field.source());
+            };
+        }
+
+        int size() {
+            return n;
+        }
+
+        boolean fieldIsNull(int field, int r) {
+            return nulls[field][r];
+        }
+
+        /**
+         * Whether rows {@code a} and {@code b} (0-based into this call) have
+         * the same partition.
+         */
+        boolean samePartition(int a, int b) {
+            if (hash[a] != hash[b]) {
+                return false;
             }
-            default -> throw new IllegalStateException("unsupported partition source " + f.source());
-        };
+            for (int k = 0; k < fields.length; k++) {
+                if (nulls[k][a] != nulls[k][b]) {
+                    return false;
+                }
+                if (nulls[k][a]) {
+                    continue;
+                }
+                if (objects[k] != null) {
+                    if (!Objects.equals(objects[k][a], objects[k][b])) {
+                        return false;
+                    }
+                } else if (longs[k][a] != longs[k][b]) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        long hashOf(int r) {
+            return hash[r];
+        }
+
+        /** The partition of row {@code r} of this call, as a new {@link PartitionKey}. */
+        PartitionKey key(int r) {
+            PartitionKey key = new PartitionKey(spec, schema);
+            for (int k = 0; k < fields.length; k++) {
+                key.set(k, partitionValue(k, r));
+            }
+            return key;
+        }
+
+        /**
+         * Whether row {@code r} is in partition {@code key} (its already-set
+         * field values).
+         */
+        boolean inPartition(int r, PartitionKey key) {
+            for (int k = 0; k < fields.length; k++) {
+                if (!Objects.equals(partitionValue(k, r), key.get(k, Object.class))) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        /**
+         * The transform result of field {@code k} at row {@code r}, boxed as
+         * Iceberg's PartitionKey holds it.
+         */
+        private Object partitionValue(int k, int r) {
+            if (nulls[k][r]) {
+                return null;
+            }
+            if (objects[k] != null) {
+                return objects[k][r];
+            }
+            // Box as Iceberg's result type: an Integer for an INT result, a Long for a LONG result. (A mixed
+            // int/long ternary would promote both arms to long and wrongly box every INT result as a Long.)
+            if (fields[k].kind() == Kind.INT) {
+                return Integer.valueOf((int) longs[k][r]);
+            }
+            return Long.valueOf(longs[k][r]);
+        }
     }
 
     /**
-     * Whether rows {@code a} and {@code b} (indexes into {@code values}' rows)
-     * have the same partition.
+     * The leaf lane of a field: the top column, then the struct children down
+     * the path.
      */
-    static boolean samePartition(Object[][] values, int a, int b) {
-        for (Object[] field : values) {
-            if (!Objects.equals(field[a], field[b])) {
-                return false;
-            }
+    private static VectorBuffers resolveLeaf(Field field, List<? extends VectorBuffers> columns) {
+        VectorBuffers v = columns.get(field.column());
+        for (int idx : field.structPath()) {
+            v = v.children().get(idx);
         }
-        return true;
+        return v;
     }
 
     /**
-     * The partition of row {@code r} of {@code values}, as a new {@link
-     * PartitionKey}.
+     * For a nested source, a per-row flag that any enclosing struct is null
+     * (null when the source is top-level, so nothing encloses it). A struct's
+     * child lane is full length, so a child slot under a null struct still
+     * exists; this is what makes its partition value null, as Iceberg's
+     * accessor returns null through a null struct.
      */
-    PartitionKey key(Object[][] values, int r) {
-        PartitionKey key = new PartitionKey(spec, schema);
-        for (int k = 0; k < values.length; k++) {
-            key.set(k, values[k][r]);
+    private static boolean[] parentNulls(Field field, List<? extends VectorBuffers> columns) {
+        List<Integer> path = field.structPath();
+        if (path.isEmpty()) {
+            return null;
         }
-        return key;
+        VectorBuffers v = columns.get(field.column());
+        boolean[] any = null;
+        VectorBuffers node = v;
+        for (int depth = 0; depth < path.size(); depth++) {
+            // `node` is the struct whose field path[depth] we descend into; a null struct nulls the leaf.
+            if (node.hasNulls()) {
+                if (any == null) {
+                    any = new boolean[node.length()];
+                }
+                for (int i = 0; i < node.length(); i++) {
+                    if (node.isNull(i)) {
+                        any[i] = true;
+                    }
+                }
+            }
+            node = node.children().get(path.get(depth));
+        }
+        return any;
     }
 
-    /** Whether row {@code r} of {@code values} is in partition {@code key}. */
-    static boolean inPartition(Object[][] values, int r, PartitionKey key) {
-        for (int k = 0; k < values.length; k++) {
-            if (!Objects.equals(values[k][r], key.get(k, Object.class))) {
-                return false;
-            }
+    private static java.util.UUID uuidOf(byte[] bytes) {
+        long hi = 0;
+        long lo = 0;
+        for (int i = 0; i < 8; i++) {
+            hi = (hi << 8) | (bytes[i] & 0xffL);
         }
-        return true;
+        for (int i = 8; i < 16; i++) {
+            lo = (lo << 8) | (bytes[i] & 0xffL);
+        }
+        return new java.util.UUID(hi, lo);
+    }
+
+    // Static helpers kept so the writer's call sites read naturally.
+
+    static boolean samePartition(Values values, int a, int b) {
+        return values.samePartition(a, b);
+    }
+
+    static boolean inPartition(Values values, int r, PartitionKey key) {
+        return values.inPartition(r, key);
     }
 }

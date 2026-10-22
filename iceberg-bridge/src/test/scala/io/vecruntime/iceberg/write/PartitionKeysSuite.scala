@@ -21,7 +21,7 @@ import java.nio.ByteBuffer
 
 import scala.util.Random
 
-import io.vecruntime.kernels.{ArrowLayout, VectorBuffers}
+import io.vecruntime.kernels.{ArrowLayout, NestedVectorBuffers, VectorBuffers}
 import org.apache.iceberg.{PartitionKey, PartitionSpec, Schema}
 import org.apache.iceberg.data.GenericRecord
 import org.apache.iceberg.types.Types
@@ -113,12 +113,25 @@ class PartitionKeysSuite extends AnyFunSuite {
     try {
       val columns = data.columns(arena)
       val keys = new PartitionKeys(spec, schema)
+      // Several batches: the writer calls compute on slices, so compute must give the same keys per slice.
+      for ((from, until) <- Seq((0, n), (0, 1), (1, 1000), (1000, n))) {
+        val values = keys.compute(columns, from, until)
+        val expected = new PartitionKey(spec, schema)
+        (from until until).foreach { k =>
+          expected.partition(data.record(k))
+          val got = values.key(k - from)
+          assert(got == expected, s"row $k: ${got.toPath} vs ${expected.toPath}")
+        }
+      }
+      // Grouping: rows the engine calls same-partition must have equal Iceberg keys, and vice versa.
       val values = keys.compute(columns, 0, n)
-      val expected = new PartitionKey(spec, schema)
-      (0 until n).foreach { k =>
-        expected.partition(data.record(k))
-        val got = keys.key(values, k)
-        assert(got == expected, s"row $k: ${got.toPath} vs ${expected.toPath}")
+      val expected = Array.tabulate(n) { k =>
+        val e = new PartitionKey(spec, schema)
+        e.partition(data.record(k))
+        e.copy()
+      }
+      for (a <- Seq(0, 1, 2, 17, 500, 2500, n - 1); b <- Seq(0, 3, 42, 777, 2500, n - 1)) {
+        assert(values.samePartition(a, b) == (expected(a) == expected(b)), s"samePartition($a,$b)")
       }
     } finally arena.close()
   }
@@ -149,4 +162,115 @@ class PartitionKeysSuite extends AnyFunSuite {
       .truncate("dec", 50).truncate("wide", 1000))
   )
   check("void", spec(_.alwaysNull("i").identity("s")))
+
+  // ---- Nested partition sources (#901 item 7): a source inside (possibly nested) structs.
+
+  // schema: id, st STRUCT<a INT, s STRING, inner STRUCT<d DECIMAL(15,2), day DATE>>
+  private val nestedSchema = new Schema(
+    optional(20, "id", Types.LongType.get()),
+    optional(
+      21,
+      "st",
+      Types.StructType.of(
+        optional(22, "a", Types.IntegerType.get()),
+        optional(23, "s", Types.StringType.get()),
+        optional(
+          24,
+          "inner",
+          Types.StructType.of(
+            optional(25, "d", Types.DecimalType.of(15, 2)),
+            optional(26, "day", Types.DateType.get())
+          )
+        )
+      )
+    )
+  )
+
+  private final class Nested(seed: Long) {
+    private val r = new Random(seed)
+    private def maybe[T](v: => T): Option[T] = if (r.nextInt(7) == 0) None else Some(v)
+    val id: Array[Long] = Array.tabulate(n)(_.toLong)
+    // A null struct, a null inner struct, and null leaves all occur.
+    val stNull: Array[Boolean] = Array.fill(n)(r.nextInt(6) == 0)
+    val a: Array[Option[Int]] = Array.fill(n)(maybe(r.nextInt(400) - 200))
+    val s: Array[Option[String]] = Array.fill(n)(maybe("p" + r.nextInt(50)))
+    val innerNull: Array[Boolean] = Array.fill(n)(r.nextInt(5) == 0)
+    val d: Array[Option[Long]] = Array.fill(n)(maybe(r.nextInt(1000000).toLong - 500000L))
+    val day: Array[Option[Int]] = Array.fill(n)(maybe(r.nextInt(30000) - 15000))
+
+    def columns(arena: Arena): java.util.List[VectorBuffers] = {
+      val idCol = ArrowLayout.ofLongs(arena, id, null)
+      val aCol = ArrowLayout.ofInts(arena, a.map(_.getOrElse(0)), a.map(_.isEmpty))
+      val sCol = ArrowLayout.ofStrings(arena, s.map(_.orNull))
+      val dCol = ArrowLayout.ofLongs(arena, d.map(_.getOrElse(0L)), d.map(_.isEmpty))
+      val dayCol = ArrowLayout.ofInts(arena, day.map(_.getOrElse(0)), day.map(_.isEmpty))
+      val inner = NestedVectorBuffers.struct(
+        n,
+        ArrowLayout.validityFrom(arena, innerNull, n),
+        java.util.List.of[VectorBuffers](dCol, dayCol)
+      )
+      val st = NestedVectorBuffers.struct(
+        n,
+        ArrowLayout.validityFrom(arena, stNull, n),
+        java.util.List.of[VectorBuffers](aCol, sCol, inner)
+      )
+      java.util.List.of[VectorBuffers](idCol, st)
+    }
+
+    def record(k: Int): GenericRecord = {
+      val rec = GenericRecord.create(nestedSchema)
+      rec.set(0, Long.box(id(k)))
+      if (stNull(k)) {
+        rec.set(1, null)
+      } else {
+        val stType = nestedSchema.findField(21).`type`().asStructType()
+        val st = GenericRecord.create(stType)
+        st.set(0, a(k).map(Int.box).orNull)
+        st.set(1, s(k).orNull)
+        if (innerNull(k)) {
+          st.set(2, null)
+        } else {
+          val innerType = stType.fields().get(2).`type`().asStructType()
+          val inner = GenericRecord.create(innerType)
+          inner.set(0, d(k).map(v => JBigDecimal.valueOf(v, 2)).orNull)
+          inner.set(1, day(k).map(Int.box).orNull)
+          st.set(2, inner)
+        }
+        rec.set(1, st)
+      }
+      rec
+    }
+  }
+
+  private def nestedSpec(f: PartitionSpec.Builder => PartitionSpec.Builder): PartitionSpec =
+    f(PartitionSpec.builderFor(nestedSchema)).build()
+
+  private def checkNested(name: String, spec: PartitionSpec): Unit =
+    test(s"nested: $name equals Iceberg's partition key") {
+      val data = new Nested(name.hashCode.toLong)
+      val arena = Arena.ofConfined()
+      try {
+        val columns = data.columns(arena)
+        val keys = new PartitionKeys(spec, nestedSchema)
+        val values = keys.compute(columns, 0, n)
+        val expected = new PartitionKey(spec, nestedSchema)
+        (0 until n).foreach { k =>
+          expected.partition(data.record(k))
+          val got = values.key(k)
+          assert(got == expected, s"row $k: ${got.toPath} vs ${expected.toPath}")
+        }
+      } finally arena.close()
+    }
+
+  checkNested("identity of a nested int", nestedSpec(_.identity("st.a")))
+  checkNested("bucket of a nested string", nestedSpec(_.bucket("st.s", 8)))
+  checkNested("truncate of a nested string", nestedSpec(_.truncate("st.s", 2)))
+  checkNested("bucket of a doubly-nested decimal", nestedSpec(_.bucket("st.inner.d", 5)))
+  checkNested("truncate of a doubly-nested decimal", nestedSpec(_.truncate("st.inner.d", 100)))
+  checkNested("day of a doubly-nested date", nestedSpec(_.day("st.inner.day")))
+  checkNested("month of a doubly-nested date", nestedSpec(_.month("st.inner.day")))
+  checkNested(
+    "several nested sources at once",
+    nestedSpec(_.identity("st.a").bucket("st.s", 4).truncate("st.inner.d", 50).year("st.inner.day"))
+  )
 }
