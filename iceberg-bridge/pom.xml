@@ -11,6 +11,21 @@
   <description>Optional Iceberg-compiled bridge for the columnar v3 deletion-vector writer (#20); kept apart from the plugin core so the core keeps its zero Iceberg compile-time dependency and reaches this module reflectively when Iceberg is on the classpath</description>
   <dependencies>
     <dependency>
+      <!-- The columnar Parquet writer the Iceberg appender drives (#842, #901), and the engine's
+           Arrow-layout vectors it takes. Both are inside the plugin jar (which shades kernels and
+           parquet), next to which this module runs, so provided keeps them out of this artifact. -->
+      <groupId>io.github.vecruntime</groupId>
+      <artifactId>vecruntime-kernels_${spark.line}</artifactId>
+      <version>${project.version}</version>
+      <scope>provided</scope>
+    </dependency>
+    <dependency>
+      <groupId>io.github.vecruntime</groupId>
+      <artifactId>vecruntime-parquet_${spark.line}</artifactId>
+      <version>${project.version}</version>
+      <scope>provided</scope>
+    </dependency>
+    <dependency>
       <!-- Compiled against here to reach the package-private DeltaTaskCommit constructors and the
            public DV writer API; at run time the classes come from the Iceberg runtime already on
            the Spark classpath, so provided keeps them out of this artifact. -->
