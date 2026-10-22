@@ -537,12 +537,22 @@ private[vecruntime] final class VectorParquetPartitionReader(
   }
   private var currentFile: PartitionedFile = _ // the file being read (its batches carry it, #568)
 
-  /** Whether one more read-ahead of `bytes` fits; one queued item is always allowed (`queued` = 0). */
+  // #915: the read-ahead's compressed pages held in the task's execution memory, granted from free memory only.
+  // parquet-mr reads column chunks into heap buffers (its default allocator, and #735's pooled chunks), so ON_HEAP.
+  private val readAheadMemory = ReadAheadMemory(context, org.apache.spark.memory.MemoryMode.ON_HEAP)
+
+  /**
+   * Whether one more read-ahead of `bytes` fits: within the byte caps and granted by the task's memory (#915). One
+   * queued item is always allowed (`queued` = 0), held in memory if the pool can grant it.
+   */
   private def mayReadAhead(bytes: Long, queued: Int): Boolean =
-    queued == 0 || (
+    if (queued == 0) {
+      if (readAheadMemory != null) readAheadMemory.tryHoldTo(aheadBytes + bytes)
+      true
+    } else
       aheadBytes + bytes <= prefetchMaxBytes &&
-        VectorParquetPartitionReader.prefetchInFlight.get() + bytes <= prefetchExecutorMaxBytes
-    )
+      VectorParquetPartitionReader.prefetchInFlight.get() + bytes <= prefetchExecutorMaxBytes &&
+      (readAheadMemory == null || readAheadMemory.tryHoldTo(aheadBytes + bytes))
 
   private def reserve(bytes: Long): Unit = {
     aheadBytes += bytes
@@ -553,6 +563,7 @@ private[vecruntime] final class VectorParquetPartitionReader(
   private def unreserve(bytes: java.lang.Long): Unit = if (bytes != null) {
     aheadBytes -= bytes
     VectorParquetPartitionReader.prefetchInFlight.addAndGet(-bytes)
+    if (readAheadMemory != null) readAheadMemory.releaseTo(aheadBytes)
   }
 
   /** Row group `i` (of the current file's, after statistics pruning) at its requested column chunks' size. */
@@ -1752,6 +1763,7 @@ private[vecruntime] final class VectorParquetPartitionReader(
           VectorParquetPartitionReader.prefetchInFlight.addAndGet(-aheadBytes)
           aheadBytes = 0
         }
+        if (readAheadMemory != null) readAheadMemory.releaseTo(0L)
       }
     }
     org.apache.spark.rdd.InputFileBlockHolder.unset()
@@ -1933,6 +1945,15 @@ object VectorParquetScanExec {
   def prefetchInFlightBytes: Long = VectorParquetPartitionReader.prefetchInFlight.get()
   def prefetchPeakBytes: Long = VectorParquetPartitionReader.prefetchPeak.get()
   def resetPrefetchPeak(): Unit = VectorParquetPartitionReader.prefetchPeak.set(0)
+
+  /**
+   * #915: the read-ahead bytes held in execution memory (compressed pages ahead and decoded batches queued ahead), the
+   * most at once, and how many grants the pool refused, so far in this JVM.
+   */
+  def readAheadHeldBytes: Long = ReadAheadMemory.heldBytes
+  def readAheadPeakBytes: Long = ReadAheadMemory.peakBytes
+  def readAheadRefusals: Long = ReadAheadMemory.refusals
+  def resetReadAheadPeak(): Unit = ReadAheadMemory.resetPeak()
 
   /** The Parquet value/level encodings the native decoder handles; any other encoding falls the file over. */
   val SupportedEncodings: Set[String] = Set("PLAIN", "PLAIN_DICTIONARY", "RLE_DICTIONARY", "RLE", "BIT_PACKED")

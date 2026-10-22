@@ -46,6 +46,13 @@
         { "title": "Iceberg merge-on-read", "url": "/benchmarks/iceberg-mor.html" },
         { "title": "Flight shuffle transport (Graviton4)", "url": "/benchmarks/flight-shuffle-transport.html" }
       ]
+    },
+    {
+      "section": "About",
+      "items": [
+        { "title": "Roadmap", "url": "/roadmap.html" },
+        { "title": "Acknowledgments", "url": "/acknowledgments.html" }
+      ]
     }
   ]
 }
