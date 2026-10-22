@@ -12,8 +12,8 @@ Everything below is something this project actually uses, learns from, or
 validates itself with; none of it is ours, and we are grateful for all of it.
 
 The authoritative license and attribution record for distributed dependencies is
-in the repository's [`NOTICE`]({{ site.repo_url }}/blob/main/NOTICE) and
-[`LICENSE`]({{ site.repo_url }}/blob/main/LICENSE) files. This page is the human
+in the repository's [`NOTICE`](https://github.com/vecruntime/vecruntime/blob/main/NOTICE) and
+[`LICENSE`](https://github.com/vecruntime/vecruntime/blob/main/LICENSE) files. This page is the human
 version: who we learned from, and why.
 
 ## Projects we learned from
@@ -42,7 +42,7 @@ borrowed their good ideas, and in several cases ported their work directly.
 ## Libraries we depend on
 
 VecRuntime depends on, but does not bundle, the following software, each under
-its own license (see [`NOTICE`]({{ site.repo_url }}/blob/main/NOTICE) for the
+its own license (see [`NOTICE`](https://github.com/vecruntime/vecruntime/blob/main/NOTICE) for the
 canonical list). Versions are those the project currently builds against.
 
 | Project | What we use it for | License |
@@ -98,4 +98,4 @@ explained how. Any mistakes in applying those ideas are entirely our own.
 
 *If your project or work belongs on this page and isn't here, that's an
 oversight we'd like to fix — please
-[open an issue]({{ site.repo_url }}/issues).*
+[open an issue](https://github.com/vecruntime/vecruntime/issues).*
