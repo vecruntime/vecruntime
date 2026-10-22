@@ -256,10 +256,18 @@ public final class NativePool {
         return inUse.sum();
     }
 
-    /** The highest {@link #inUseBytes()} so far. */
+    /** The highest {@link #inUseBytes()} so far, or since {@link #resetPeak}. */
     public long peakInUseBytes() {
         long now = inUse.sum();
         return now > peakInUse.get() ? peakInUse.accumulateAndGet(now, Math::max) : peakInUse.get();
+    }
+
+    /**
+     * Restarts the peak from the current in-use bytes (#925: a benchmark reads
+     * the peak per query).
+     */
+    public void resetPeak() {
+        peakInUse.set(inUse.sum());
     }
 
     /**
