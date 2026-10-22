@@ -207,6 +207,22 @@ class VectorIcebergWriteSuite extends AnyFunSuite with BeforeAndAfterAll {
     assert(bytes.get() == files.getLong(1), "bytesWritten must be the data files' size")
   }
 
+  test("a partitioned table with a null identity partition reads back through the engine") {
+    // The 1 TB partitioned append's checksum (`ss_store_sk` has nulls) failed reading Iceberg's constant
+    // partition vector of the null partition; the read must match Spark's.
+    val t = "ice.db.nullpart"
+    spark.sql(s"DROP TABLE IF EXISTS $t")
+    spark.sql(s"CREATE TABLE $t (id BIGINT, k INT, s STRING) USING iceberg PARTITIONED BY (k)")
+    spark.sql(s"INSERT INTO $t SELECT id, if(id % 5 = 0, null, cast(id % 3 as int)), concat('s', id) FROM range(3000)")
+    val q = s"SELECT count(*), sum(cast(xxhash64(*) as decimal(38,0))), count(k), sum(k) FROM $t"
+    val on = spark.sql(q).collect().toSeq
+    spark.conf.set("spark.vecruntime.enabled", "false")
+    val off =
+      try spark.sql(q).collect().toSeq
+      finally spark.conf.unset("spark.vecruntime.enabled")
+    assert(on == off)
+  }
+
   test("the files' metrics let Iceberg prune on them") {
     val t = "ice.db.prune_on"
     create(t)

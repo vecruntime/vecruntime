@@ -16,7 +16,7 @@
 package io.vecruntime.spark.adapter
 
 import java.lang.foreign.Arena
-import io.vecruntime.kernels.{Bitmap, VecType}
+import io.vecruntime.kernels.{Bitmap, VecType, VectorBuffers}
 import io.vecruntime.spark.test.SparkVectorFunSuite
 import org.apache.spark.sql.execution.FileSourceScanExec
 import org.apache.spark.sql.execution.vectorized.{OffHeapColumnVector, OnHeapColumnVector, WritableColumnVector}
@@ -415,5 +415,52 @@ class SparkColumnVectorBuffersSuite extends SparkVectorFunSuite {
     info(summaries.sortBy(s => (s._1, -s._3)).take(6).map { case (c, t, len, valid, bytes, _) =>
       s"col $c $t rows=$len valid=$valid dataBytes=$bytes"
     }.mkString("\n"))
+  }
+
+  /**
+   * A foreign vector that, like Iceberg's ConstantColumnVector of a null partition value, throws when a null
+   * row's value is read: the copy reads only the valid rows (the 1 TB partitioned append's checksum read hit
+   * this on `ss_store_sk`'s null partition).
+   */
+  private final class NullThrowing(dt: DataType, nulls: Set[Int])
+      extends org.apache.spark.sql.vectorized.ColumnVector(dt) {
+    private def check(i: Int): Unit = if (nulls(i)) throw new NullPointerException(s"value of null row $i")
+    override def close(): Unit = ()
+    override def hasNull(): Boolean = nulls.nonEmpty
+    override def numNulls(): Int = nulls.size
+    override def isNullAt(i: Int): Boolean = nulls(i)
+    override def getBoolean(i: Int): Boolean = { check(i); i % 2 == 0 }
+    override def getByte(i: Int): Byte = { check(i); i.toByte }
+    override def getShort(i: Int): Short = { check(i); i.toShort }
+    override def getInt(i: Int): Int = { check(i); i * 3 }
+    override def getLong(i: Int): Long = { check(i); i * 5L }
+    override def getFloat(i: Int): Float = { check(i); i.toFloat }
+    override def getDouble(i: Int): Double = { check(i); i * 0.5 }
+    override def getArray(i: Int): org.apache.spark.sql.vectorized.ColumnarArray =
+      throw new UnsupportedOperationException
+    override def getMap(i: Int): org.apache.spark.sql.vectorized.ColumnarMap = throw new UnsupportedOperationException
+    override def getDecimal(i: Int, p: Int, s: Int): Decimal = { check(i); Decimal(i.toLong, p, s) }
+    override def getUTF8String(i: Int): UTF8String = { check(i); UTF8String.fromString(s"v$i") }
+    override def getBinary(i: Int): Array[Byte] = { check(i); Array(i.toByte) }
+    override def getChild(o: Int): org.apache.spark.sql.vectorized.ColumnVector = null
+  }
+
+  test("a foreign vector that throws on null rows copies through its valid rows only, every lane type") {
+    val n = 100
+    for (nulls <- Seq((0 until n).toSet, Set(0, 7, 99))) {
+      for (dt <- Seq(IntegerType, LongType, DoubleType, BooleanType, StringType, DecimalType(9, 2), DateType)) {
+        val arena = Arena.ofConfined()
+        try {
+          val vb = SparkColumnVectorBuffers.copy(new NullThrowing(dt, nulls), n, arena)
+          for (i <- 0 until n) {
+            val valid = vb.validity() == null || Bitmap.isSet(vb.validity(), i)
+            assert(valid == !nulls(i), s"$dt row $i validity")
+          }
+          if (dt == LongType) {
+            assert((0 until n).filterNot(nulls).forall(i => vb.data().getAtIndex(VectorBuffers.LE_LONG, i) == i * 5L))
+          }
+        } finally arena.close()
+      }
+    }
   }
 }
