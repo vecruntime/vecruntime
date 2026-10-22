@@ -494,6 +494,23 @@ private[vecruntime] class VectorDynamicPartitionDataWriter(
     }
   }
 
+  /**
+   * The bucket-id expression compiled onto the data lanes (#842), used when the Murmur3 kernel fast path above
+   * does not match -- most importantly a Hive-compatible write's
+   * `pmod(bitwise_and(hive-hash(keys), Int.MaxValue), n)`, now that `HiveHashExpr`, `BitwiseAndIntExpr` and
+   * `PmodIntExpr` compile. The whole expression is handed to `ExpressionCompiler` (not pattern-matched to one
+   * shape), so any bucket-id expression it can compile is evaluated on lanes; only an expression it rejects
+   * falls to the row-by-row `getBucketId` below.
+   */
+  private val bucketIdExpr: Option[io.vecruntime.spark.expr.VectorExpr] =
+    if (vectorBuckets.isDefined) None
+    else
+      description.bucketSpec.flatMap { spec =>
+        io.vecruntime.spark.expr.ExpressionCompiler
+          .compile(spec.bucketIdExpression, description.dataColumns)
+          .toOption
+      }
+
   override def write(record: InternalRow): Unit =
     throw new UnsupportedOperationException("VectorWriteFilesExec writes batches")
 
@@ -511,7 +528,7 @@ private[vecruntime] class VectorDynamicPartitionDataWriter(
         case _ => null
       }
       def rowOf(k: Int): Int = if (physical == null) k else physical(k)
-      val bucketIds: Array[Int] = if (!isBucketed) null else bucketIdsOf(cols, n, all, rowOf)
+      val bucketIds: Array[Int] = if (!isBucketed) null else bucketIdsOf(cols, n, all, rowOf, arena)
 
       var from = 0
       while (from < n) {
@@ -693,16 +710,41 @@ private[vecruntime] class VectorDynamicPartitionDataWriter(
     }
   }
 
-  private def bucketIdsOf(cols: Array[VectorBuffers], n: Int, all: ColumnarBatch, rowOf: Int => Int): Array[Int] = {
+  private def bucketIdsOf(
+      cols: Array[VectorBuffers],
+      n: Int,
+      all: ColumnarBatch,
+      rowOf: Int => Int,
+      arena: Arena
+  ): Array[Int] = {
     val ids = new Array[Int](n)
     vectorBuckets match {
       case Some((keys, kinds, num)) =>
         PartitionKernels.hashPartitionIds(keys.map(cols), kinds, n, num, new Array[Int](n), ids)
       case None =>
-        var k = 0
-        while (k < n) {
-          ids(k) = getBucketId(all.getRow(rowOf(k)))
-          k += 1
+        bucketIdExpr match {
+          case Some(expr) =>
+            // On lanes: evaluate the compiled bucket-id expression over the data columns (already compacted to
+            // the batch's selection), reading its INT32 result into ids. No per-row Spark projection.
+            val child = Arena.ofConfined()
+            try {
+              val ctx = new io.vecruntime.spark.expr.EvalContext(child, n, ordinal => cols(ordinal))
+              val out = expr.eval(ctx)
+              val data = out.data()
+              var k = 0
+              while (k < n) {
+                ids(k) = data.get(io.vecruntime.kernels.VectorBuffers.LE_INT, (k.toLong) << 2)
+                k += 1
+              }
+            } finally child.close()
+          case None =>
+            // Last resort: a bucket-id expression the compiler cannot take, evaluated per row by Spark's projection.
+            VectorDynamicPartitionDataWriter.rowBucketIdRows.addAndGet(n.toLong)
+            var k = 0
+            while (k < n) {
+              ids(k) = getBucketId(all.getRow(rowOf(k)))
+              k += 1
+            }
         }
     }
     ids
@@ -742,6 +784,14 @@ private[vecruntime] class VectorDynamicPartitionDataWriter(
 private[vecruntime] object VectorDynamicPartitionDataWriter {
 
   /**
+   * Rows whose bucket id was evaluated per row by Spark's projection (the last-resort fallback), summed over
+   * this JVM. A bucketed write handled on lanes -- Spark's Murmur3 kernel path or the compiled bucket-id
+   * expression (#842, Hive-compatible writes included) -- never increments it, so a test can assert the lane
+   * path was taken by reading it stays unchanged (through `VectorWriteTestHooks`).
+   */
+  val rowBucketIdRows = new java.util.concurrent.atomic.AtomicLong()
+
+  /**
    * The kernels' hash kind for a bucket key of type `dt` when it equals Spark's `Murmur3Hash` of that type over
    * our lane; null otherwise (the bucket ids are then evaluated by Spark's projection).
    */
@@ -759,6 +809,13 @@ private[vecruntime] object VectorDynamicPartitionDataWriter {
       case _ => null
     }
   }
+}
+
+/** Public test hooks for the writer's internal, package-private counters (#842). */
+object VectorWriteTestHooks {
+
+  /** Rows whose bucket id was evaluated per row by Spark's projection, summed over this JVM (0 on the lane path). */
+  def rowBucketIdRows: Long = VectorDynamicPartitionDataWriter.rowBucketIdRows.get()
 }
 
 private[vecruntime] object VectorWriteTask2 {

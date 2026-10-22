@@ -353,8 +353,14 @@ class VectorWriteSuite extends VectorQuerySuite {
     // int, string and multi-column bucket keys, each unpartitioned and bucketed+partitioned.
     for (keys <- Seq(Seq("i"), Seq("s"), Seq("s", "i")); partitioned <- Seq(false, true)) {
       val label = s"keys=${keys.mkString(",")} partitioned=$partitioned"
+      // The bucket id must be computed on lanes (the compiled hive-hash/pmod expression), never row by row.
+      val rowBucketsBefore = org.apache.spark.sql.vecruntime.VectorWriteTestHooks.rowBucketIdRows
       val plan = write("hbk_ours", columnar = true, keys, partitioned)
       assert(hasVectorWrite(plan), s"$label: ${plan.treeString}\n${fallbackReasons(plan)}")
+      assert(
+        org.apache.spark.sql.vecruntime.VectorWriteTestHooks.rowBucketIdRows == rowBucketsBefore,
+        s"$label: bucket ids were evaluated row by row, not on lanes"
+      )
       write("hbk_spark", columnar = false, keys, partitioned)
       val ours = byBucket("hbk_ours")
       val theirs = byBucket("hbk_spark")
