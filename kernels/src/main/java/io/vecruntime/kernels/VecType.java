@@ -52,7 +52,16 @@ public enum VecType {
      * Arrow Struct: one child column per field, each of the struct's length;
      * validity only (#705).
      */
-    STRUCT(-2);
+    STRUCT(-2),
+    /**
+     * Arrow FixedSizeBinary: {@link FixedBinaryVectorBuffers#width()} bytes per
+     * value, packed, no offsets. The Arrow form of Iceberg's {@code fixed(L)} and
+     * {@code uuid} (16 bytes, big-endian) and of Parquet's
+     * {@code FIXED_LEN_BYTE_ARRAY}. Spark has no such type (its binary is
+     * {@link #UTF8}-shaped and a uuid is a string), so the lane exists only
+     * between a table format and the Spark boundary, which converts.
+     */
+    FIXED_BINARY(-3);
 
     private final int byteWidth;
 

@@ -92,6 +92,7 @@ public final class NestedSortKey {
             case INT64 -> out.be64(v.getLong(i) ^ Long.MIN_VALUE);
             case FLOAT64 -> out.be64(SortKernels.doubleKey(v.getDouble(i)));
             case DECIMAL128 -> out.dec(v.getDecimal128(i));
+            case FIXED_BINARY -> throw new IllegalStateException("no FIXED_BINARY sort keys: the lane does not reach operators");
             case UTF8 -> {
                 for (byte x : v.getUtf8Bytes(i)) {
                     out.b(x);

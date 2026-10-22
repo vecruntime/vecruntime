@@ -163,7 +163,8 @@ public final class NestedColumns {
             case BOOL -> new BoolNode(expected);
             case UTF8 -> new BytesNode(dt instanceof BinaryType, expected);
             case DECIMAL128 -> new Decimal128Node((DecimalType) dt, expected);
-            case LIST, MAP, STRUCT -> throw new IllegalStateException("vecTypeOf is never nested");
+            case LIST, MAP, STRUCT, FIXED_BINARY ->
+                    throw new IllegalStateException("vecTypeOf is never nested or FIXED_BINARY");
         };
     }
 
