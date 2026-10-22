@@ -318,6 +318,53 @@ class VectorWriteSuite extends VectorQuerySuite {
     spark.sql("DROP TABLE bk_spark")
   }
 
+  test("Hive-compatible bucketed writes: HiveHash bucket id, Hive file names and rows as Spark's writer") {
+    import org.apache.spark.sql.execution.datasources.BucketingUtils
+    val hiveOption = BucketingUtils.optionForHiveCompatibleBucketWrite
+    // Hive names a bucket file `<bucketId %05d>_0_<uuid>...`, so the id is a PREFIX, not Spark's `_NNNNN` suffix.
+    val hivePrefix = """^(\d{5})_0_.*""".r
+    def hiveBucketId(name: String): Option[Int] = name match {
+      case hivePrefix(id) => Some(id.toInt)
+      case _ => None
+    }
+    def write(table: String, columnar: Boolean, keys: Seq[String], partitioned: Boolean): SparkPlan = {
+      lastWritePlan = null
+      withConf(VectorConf.WriteColumnar -> columnar.toString) {
+        spark.sql(s"DROP TABLE IF EXISTS $table")
+        val w = spark.table("t").selectExpr("i", "l", "s", "d2", "b").write
+          .option(hiveOption, "true")
+          .bucketBy(5, keys.head, keys.tail: _*)
+        (if (partitioned) w.partitionBy("b") else w).format("parquet").saveAsTable(table)
+      }
+      org.apache.spark.sql.vecruntime.TestListenerSync.drain(spark)
+      lastWritePlan
+    }
+    def byBucket(table: String): Map[(String, Int), Seq[String]] = {
+      val location =
+        spark.sessionState.catalog.getTableMetadata(spark.sessionState.sqlParser.parseTableIdentifier(table)).location
+      val root = new Path(location.toString).toString
+      val files = parquetFiles(location.toString)
+      // Every file must carry a Hive bucket-id prefix (so the naming matches Spark's, not the `_NNNNN` suffix).
+      files.foreach(f => assert(hiveBucketId(f.getName).isDefined, s"not a Hive bucket file name: ${f.getName}"))
+      files.groupBy(f => (f.getParent.toString.stripPrefix(root), hiveBucketId(f.getName).get)).map { case (k, fs) =>
+        k -> withPlugin(enabled = false)(spark.read.parquet(fs.map(_.toString): _*).collect()).map(_.toString).sorted
+      }
+    }
+    // int, string and multi-column bucket keys, each unpartitioned and bucketed+partitioned.
+    for (keys <- Seq(Seq("i"), Seq("s"), Seq("s", "i")); partitioned <- Seq(false, true)) {
+      val label = s"keys=${keys.mkString(",")} partitioned=$partitioned"
+      val plan = write("hbk_ours", columnar = true, keys, partitioned)
+      assert(hasVectorWrite(plan), s"$label: ${plan.treeString}\n${fallbackReasons(plan)}")
+      write("hbk_spark", columnar = false, keys, partitioned)
+      val ours = byBucket("hbk_ours")
+      val theirs = byBucket("hbk_spark")
+      assert(ours.keySet === theirs.keySet, s"$label: bucket files / ids")
+      ours.foreach { case (k, rows) => assert(rows === theirs(k), s"$label: bucket $k rows") }
+      spark.sql("DROP TABLE hbk_ours")
+      spark.sql("DROP TABLE hbk_spark")
+    }
+  }
+
   test("empty2null and collation_aware_hash run in our projection, as Spark computes them") {
     import org.apache.spark.sql.catalyst.analysis.UnresolvedAttribute
     import org.apache.spark.sql.catalyst.expressions.{CollationAwareMurmur3Hash, Empty2Null}

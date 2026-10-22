@@ -226,3 +226,83 @@ final case class NanvlExpr(left: VectorExpr, right: VectorExpr) extends VectorEx
     SegmentVectorBuffers.fixedWidth(VecType.FLOAT64, n, validity, data)
   }
 }
+
+/**
+ * `a & b` over INT32 lanes (#842): the bucket-id expression of a Hive-compatible write is
+ * `BitwiseAnd(hive-hash(keys), Int.MaxValue)`, which masks off the sign bit so a negative hash does not
+ * produce a negative bucket id (as Hive's `getBucketNumber` does). A null in either operand is a null result.
+ */
+final case class BitwiseAndIntExpr(left: VectorExpr, right: VectorExpr) extends VectorExpr {
+  override def dataType: DataType = org.apache.spark.sql.types.IntegerType
+  override def children: Seq[VectorExpr] = Seq(left, right)
+  override def eval(ctx: EvalContext): VectorBuffers = {
+    val n = ctx.numRows
+    val a = CaseWhenExpr.materialise(left, ctx)
+    val b = CaseWhenExpr.materialise(right, ctx)
+    val data = ArrowLayout.allocateData(ctx.arena, VecType.INT32, n)
+    val validity = BitwiseAndIntExpr.combineValidity(a.validity(), b.validity(), n, ctx)
+    var i = 0
+    while (i < n) {
+      data.setAtIndex(
+        VectorBuffers.LE_INT,
+        i,
+        a.data().getAtIndex(VectorBuffers.LE_INT, i) & b.data().getAtIndex(VectorBuffers.LE_INT, i)
+      )
+      i += 1
+    }
+    SegmentVectorBuffers.fixedWidth(VecType.INT32, n, validity, data)
+  }
+}
+
+object BitwiseAndIntExpr {
+
+  /** The AND of two operands' validity bitmaps (null when neither has nulls), into a fresh bitmap. */
+  def combineValidity(a: MemorySegment, b: MemorySegment, n: Int, ctx: EvalContext): MemorySegment = {
+    if (a == null && b == null) return null
+    val out = ctx.bitmap()
+    var i = 0
+    while (i < n) {
+      val present = (a == null || Bitmap.isSet(a, i)) && (b == null || Bitmap.isSet(b, i))
+      Bitmap.setTo(out, i, present)
+      i += 1
+    }
+    out
+  }
+}
+
+/**
+ * `pmod(a, b)` over INT32 lanes (#842), Spark's `Pmod`: `((a % b) + b) % b`, the bucket-id expression of a
+ * bucketed write (`pmod(hash, numBuckets)`). `b` is the positive bucket count, so the result is in `[0, b)`.
+ * A null in either operand, or `b == 0`, is a null result (Spark returns null for pmod by zero).
+ */
+final case class PmodIntExpr(left: VectorExpr, right: VectorExpr) extends VectorExpr {
+  override def dataType: DataType = org.apache.spark.sql.types.IntegerType
+  override def children: Seq[VectorExpr] = Seq(left, right)
+  override def eval(ctx: EvalContext): VectorBuffers = {
+    val n = ctx.numRows
+    val a = CaseWhenExpr.materialise(left, ctx)
+    val b = CaseWhenExpr.materialise(right, ctx)
+    val data = ArrowLayout.allocateData(ctx.arena, VecType.INT32, n)
+    // A fresh validity bitmap: the operands' AND, plus a null wherever pmod divides by zero.
+    val validity = ctx.bitmap()
+    var i = 0
+    while (i < n) {
+      val present = (a.validity() == null || Bitmap.isSet(a.validity(), i)) &&
+        (b.validity() == null || Bitmap.isSet(b.validity(), i))
+      var ok = present
+      if (present) {
+        val x = a.data().getAtIndex(VectorBuffers.LE_INT, i)
+        val m = b.data().getAtIndex(VectorBuffers.LE_INT, i)
+        if (m == 0) {
+          ok = false
+        } else {
+          val r = x % m
+          data.setAtIndex(VectorBuffers.LE_INT, i, if (r < 0) (r + m) % m else r)
+        }
+      }
+      Bitmap.setTo(validity, i, ok)
+      i += 1
+    }
+    SegmentVectorBuffers.fixedWidth(VecType.INT32, n, validity, data)
+  }
+}

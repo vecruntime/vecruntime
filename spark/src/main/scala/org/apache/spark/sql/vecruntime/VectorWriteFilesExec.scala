@@ -42,7 +42,6 @@ import org.apache.spark.sql.connector.write.WriterCommitMessage
 import org.apache.spark.sql.execution.SparkPlan
 import org.apache.spark.sql.execution.datasources.{
   BaseDynamicPartitionDataWriter,
-  BucketingUtils,
   FileFormatDataWriter,
   OutputWriter,
   OutputWriterFactory,
@@ -182,8 +181,6 @@ object VectorWritePlanner {
       Some(s"columnar write: format ${w.fileFormat.getClass.getSimpleName} is not Parquet")
     } else if (concurrentKeysReason(w, conf).isDefined) {
       concurrentKeysReason(w, conf)
-    } else if (w.options.contains(BucketingUtils.optionForHiveCompatibleBucketWrite)) {
-      Some("columnar write: Hive-compatible bucketing is not supported yet (#842)")
     } else if (!w.child.supportsColumnar && !io.vecruntime.spark.VectorConf.writeColumnarFromRows(conf)) {
       Some(s"columnar write: child ${w.child.nodeName} is not columnar")
     } else {

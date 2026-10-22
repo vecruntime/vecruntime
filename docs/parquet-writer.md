@@ -59,9 +59,14 @@ index are written as parquet-java writes them; binary min/max compare unsigned.
   is cut into runs of equal partition values and bucket id -- adjacent rows compared lane by lane, partition
   values projected once per run -- and each run is one range of the batch's columns written into the current
   file. Opening a file goes through Spark's own `renewCurrentWriter`, so the partition directories (escaping,
-  `__HIVE_DEFAULT_PARTITION__`, custom locations), the bucket file names and the stats trackers are Spark's.
+  `__HIVE_DEFAULT_PARTITION__`, custom locations), the bucket file names (Spark's `_NNNNN` suffix, or Hive's
+  `NNNNN_0_` prefix for a Hive-compatible bucketed write) and the stats trackers are Spark's.
   Bucket ids are `pmod(murmur3hash(keys, 42), n)` from the shuffle's hash kernels over the data lanes;
-  another bucket expression or key type is evaluated row by row by Spark's projection.
+  a Hive-compatible bucketed write (`__hive_compatible_bucketed_table_insertion__`) sorts on
+  `pmod(bitwise_and(hive-hash(keys), Int.MaxValue), n)`, which compiles on lanes too -- `hive-hash` steps per key
+  with Spark's own `HiveHasher` and combines them as `31 * h + childHash`, so our bucket id equals Spark's, and
+  the file keeps Spark's Hive file-name prefix. Another bucket expression or key type is evaluated row by row by
+  Spark's projection.
 - **Concurrent output writers** (`spark.sql.maxConcurrentOutputFileWriters` > 0, Spark's
   `DynamicPartitionDataConcurrentWriter` for batches): the input is not sorted; up to that many files stay open
   per task, one per partition and bucket, each run of a batch written to its own. Opening the last one switches
@@ -81,7 +86,6 @@ Spark's writer, with the reason in the plan's fallback list:
 | Write | Reason |
 |---|---|
 | Concurrent output writers whose past-the-limit sort keys do not compile | `concurrent writers' sort key ...` |
-| Hive-compatible bucketing (Hive tables) | `Hive-compatible bucketing is not supported yet (#842)` |
 | Other types (intervals, variant, ...) | `column <name> has type <type>, not supported yet (#842)` |
 | `parquet.writer.version=v1` | `parquet.writer.version is v1, the columnar writer writes Parquet v2` |
 | Encryption; per-column `#` options other than `parquet.enable.dictionary#` and `parquet.bloom.filter.*#` | named in the reason |
