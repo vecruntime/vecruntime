@@ -27,6 +27,22 @@ import org.apache.spark.sql.connector.write.{Write, WriterCommitMessage}
  * engine types; without the bridge or Iceberg the hooks report unavailable and Spark's writer stays.
  */
 object IcebergWriteBridge {
+
+  /** The rows and bytes of a task's data files (an `org.apache.iceberg.ContentFile[]`), read reflectively. */
+  def fileTotals(files: AnyRef): (Long, Long) = files match {
+    case a: Array[_] if a.nonEmpty =>
+      // Through the public interface: the implementations (GenericDataFile, ...) are not public classes.
+      val cf = Class.forName("org.apache.iceberg.ContentFile", false, a.head.getClass.getClassLoader)
+      val recordCount = cf.getMethod("recordCount")
+      val size = cf.getMethod("fileSizeInBytes")
+      a.foldLeft((0L, 0L)) { case ((r, b), f) =>
+        (
+          r + recordCount.invoke(f).asInstanceOf[Long],
+          b + size.invoke(f).asInstanceOf[Long]
+        )
+      }
+    case _ => (0L, 0L)
+  }
   private val CommitBridge = "org.apache.iceberg.spark.source.IcebergDataCommitBridge"
   private val TaskWriter = "io.vecruntime.iceberg.write.IcebergDataTaskWriter"
   private val Spec = "io.vecruntime.iceberg.write.IcebergWriteSpec"
