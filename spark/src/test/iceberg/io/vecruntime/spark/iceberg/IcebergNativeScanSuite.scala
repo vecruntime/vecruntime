@@ -823,58 +823,96 @@ class IcebergNativeScanSuite extends IcebergMorSuiteBase {
     }
   }
 
-  icebergTest("a uuid or fixed column that is also an equality-delete key still returns Spark's rows") {
+  icebergTest("equality deletes keyed on uuid, fixed, or a composite (uuid, int) key are probed on the native scan") {
     import org.apache.iceberg.types.Types
     import org.apache.iceberg.types.Types.NestedField.{optional, required}
     registerUuidOf()
-    // A uuid or fixed equality key cannot be applied by the native equality probe, and the node cannot adapt an
-    // Iceberg uuid/fixed vector, so the whole scan is handed to Spark's own reader (no VectorIcebergScanExec).
-    // The deletes still apply and the rows still match Spark.
-    def eqDeclines(name: String, keyType: org.apache.iceberg.types.Type, insertKey: String, addDeletes: () => Unit)
-        : Unit = {
-      val schema = new org.apache.iceberg.Schema(
-        required(1, "id", Types.LongType.get()),
-        optional(2, "k", keyType),
-        optional(3, "s", Types.StringType.get())
-      )
+    // Every table is a v2 merge-on-read table with an equality delete file (Iceberg Java API) keyed on a uuid, a
+    // fixed, or the composite (uuid, int). The native equality probe reads and matches the key -- a uuid as its
+    // canonical text, a fixed as its bytes, with a null key matching the null rows -- so the scan stays native and
+    // the rows match Iceberg's own reader (the plugin off) exactly, whatever Iceberg's own deletion verdict is.
+    def check(
+        name: String,
+        extraCols: Seq[(Int, String, org.apache.iceberg.types.Type)],
+        insert: String,
+        eqFields: Seq[String],
+        addDeletes: () => Unit,
+        projectKey: String
+    ): Unit = {
+      val fields = Seq(required(1, "id", Types.LongType.get())) ++
+        extraCols.map { case (fid, n, t) => optional(fid, n, t) } ++
+        Seq(optional(50, "s", Types.StringType.get()))
+      val schema = new org.apache.iceberg.Schema(fields: _*)
       createIcebergTable(name, schema, Map("format-version" -> "2", "write.delete.mode" -> "merge-on-read"))
-      withConf(VectorConf.Enabled -> "false")(spark.sql(
-        s"INSERT INTO $Db.$name SELECT id, $insertKey, concat('s', id % 7) FROM range(3000)"
-      ).collect())
+      withConf(VectorConf.Enabled -> "false")(spark.sql(s"INSERT INTO $Db.$name $insert").collect())
       addDeletes()
-      val expected =
-        withConf(VectorConf.Enabled -> "false")(spark.sql(s"SELECT id, s FROM $Db.$name ORDER BY id").collect().toSeq)
-      val got = spark.sql(s"SELECT id, s FROM $Db.$name ORDER BY id").collect().toSeq
-      assert(got == expected, s"$name: rows differ from Spark's reader")
-      // A key column projected beside a data column: still Spark's rows, uuid as canonical text / fixed as bytes.
-      // The uuid/fixed equality key is never probed on the native lanes (equalityColumnsOf returns None for those
-      // key types, and the plan declines the scan to Spark's reader when such a delete is attached), so the
-      // result can never be wrong, however the delete is applied.
-      val keyExpr = if (keyType == Types.UUIDType.get()) "k" else "hex(k)"
-      val exp2 = withConf(VectorConf.Enabled -> "false")(
-        spark.sql(s"SELECT id, $keyExpr, s FROM $Db.$name ORDER BY id").collect().map(_.toString).toSeq
-      )
-      val got2 = spark.sql(s"SELECT id, $keyExpr, s FROM $Db.$name ORDER BY id").collect().map(_.toString).toSeq
-      assert(got2 == exp2, s"$name: projected key rows differ from Spark's reader")
+      useTable(name)
+      // The native scan's rows equal Iceberg's own reader (plugin off), and no task group falls to Iceberg's
+      // reader -- the equality key is read and probed natively.
+      val q1 = s"SELECT id, $projectKey, s FROM t ORDER BY id"
+      val exp1 = withConf(VectorConf.Enabled -> "false")(spark.sql(q1).collect().map(_.toString).toSeq)
+      val df1 = spark.sql(q1)
+      assert(df1.collect().map(_.toString).toSeq == exp1, s"$name: rows differ from Iceberg's reader")
+      assert(scans(df1).nonEmpty, s"$name: expected the native scan:\n${finalPlan(df1).treeString}")
+      assert(groups(df1)._2 == 0, s"$name: a task group fell to Iceberg's reader, got ${groups(df1)}")
+      // The key not projected at all: it is read only for the deletes, then dropped. Still native, still correct.
+      val q2 = "SELECT s, count(*) FROM t GROUP BY s"
+      val exp2 = withConf(VectorConf.Enabled -> "false")(spark.sql(q2).collect().map(_.toString).sorted.toSeq)
+      val df2 = spark.sql(q2)
+      assert(df2.collect().map(_.toString).sorted.toSeq == exp2, s"$name: unprojected-key rows differ")
+      assert(groups(df2)._2 == 0, s"$name: unprojected key fell to Iceberg's reader, got ${groups(df2)}")
+      val expCount = withConf(VectorConf.Enabled -> "false")(count("SELECT count(*) FROM t"))
+      assert(count("SELECT count(*) FROM t") === expCount, s"$name: count differs from Iceberg's reader")
     }
-    eqDeclines(
-      "t_rt_equ",
-      Types.UUIDType.get(),
-      "uuid_of(id)",
+
+    // uuid key, including a null key value that deletes the null-uuid rows (id % 7 = 0).
+    check(
+      "t_eq_uuid",
+      Seq((2, "k", Types.UUIDType.get())),
+      "SELECT id, if(id % 7 = 0, null, uuid_of(id)), concat('s', id % 7) FROM range(3000)",
+      Seq("k"),
       () =>
-        addUuidEqualityDeletes(
-          s"$Db.t_rt_equ",
-          "k",
-          (0 until 3000 by 11).map(i =>
-            new java.util.UUID(i.toLong * 0x9e3779b97f4a7c15L, ~i.toLong * 0xbf58476d1ce4e5b9L)
-          )
-        )
+        addEqualityDeletes(
+          "t_eq_uuid",
+          Seq("k"),
+          ((0 until 3000 by 11).map(i =>
+            Seq(new java.util.UUID(i.toLong * 0x9e3779b97f4a7c15L, ~i.toLong * 0xbf58476d1ce4e5b9L))
+          ) :+ Seq[Any](null)) // a null key matches the null-uuid rows
+        ),
+      "k"
     )
-    eqDeclines(
-      "t_rt_eqf",
-      Types.FixedType.ofLength(4),
-      "unhex(lpad(hex(id), 8, '0'))",
-      () => addFixedEqualityDeletes(s"$Db.t_rt_eqf", "k", (0 until 3000 by 11).map(i => f"$i%08X"))
+    // fixed[4] key.
+    check(
+      "t_eq_fixed",
+      Seq((2, "k", Types.FixedType.ofLength(4))),
+      "SELECT id, if(id % 9 = 0, null, unhex(lpad(hex(id), 8, '0'))), concat('s', id % 7) FROM range(3000)",
+      Seq("k"),
+      () =>
+        addEqualityDeletes(
+          "t_eq_fixed",
+          Seq("k"),
+          (0 until 3000 by 11).map(i => Seq(f"$i%08X".sliding(2, 2).map(Integer.parseInt(_, 16).toByte).toArray))
+        ),
+      "hex(k)"
+    )
+    // composite (uuid, int) key: a row is deleted only when BOTH match.
+    check(
+      "t_eq_comp",
+      Seq((2, "u", Types.UUIDType.get()), (3, "n", Types.IntegerType.get())),
+      "SELECT id, uuid_of(id), CAST(id % 5 AS INT), concat('s', id % 7) FROM range(3000)",
+      Seq("u", "n"),
+      () =>
+        addEqualityDeletes(
+          "t_eq_comp",
+          Seq("u", "n"),
+          (0 until 3000 by 11).map(i =>
+            Seq(
+              new java.util.UUID(i.toLong * 0x9e3779b97f4a7c15L, ~i.toLong * 0xbf58476d1ce4e5b9L),
+              Integer.valueOf(i % 5)
+            )
+          )
+        ),
+      "u, n"
     )
   }
 
@@ -916,43 +954,35 @@ class IcebergNativeScanSuite extends IcebergMorSuiteBase {
     }
   }
 
-  /** Writes one Parquet equality delete file on a fixed column with the Iceberg Java API (hex key values). */
-  private def addFixedEqualityDeletes(name: String, column: String, hexValues: Seq[String]): Unit =
-    addEqualityDeletesRaw(
-      name,
-      column,
-      hexValues.map { h =>
-        h.sliding(2, 2).map(Integer.parseInt(_, 16).toByte).toArray
-      }
-    )
-
-  /** Writes one Parquet equality delete file on a uuid column with the Iceberg Java API. */
-  private def addUuidEqualityDeletes(name: String, column: String, uuids: Seq[java.util.UUID]): Unit =
-    addEqualityDeletesRaw(name, column, uuids)
-
-  private def addEqualityDeletesRaw(name: String, column: String, values: Seq[Any]): Unit = {
+  /**
+   * Writes one Parquet equality delete file on `columns` (one or more key fields) with the Iceberg Java API: each
+   * row of `rows` is the key values in `columns` order (a uuid as java.util.UUID, a fixed as byte[], an int as
+   * Integer; null allowed). The delete gets a sequence number above every data file, so it applies to all of them.
+   */
+  private def addEqualityDeletes(name: String, columns: Seq[String], rows: Seq[Seq[Any]]): Unit = {
     import org.apache.iceberg.{FileFormat, Table}
     import org.apache.iceberg.data.{GenericFileWriterFactory, GenericRecord}
     import org.apache.iceberg.io.OutputFileFactory
-    val table: Table = org.apache.iceberg.spark.Spark3Util.loadIcebergTable(spark, name)
+    val t = s"$Db.$name"
+    val table: Table = org.apache.iceberg.spark.Spark3Util.loadIcebergTable(spark, t)
     val schema = table.schema()
-    val keyField = schema.findField(column)
-    val deleteSchema = schema.select(column)
+    val ids = columns.map(c => schema.findField(c).fieldId())
+    val deleteSchema = schema.select(columns: _*)
     val factory = new GenericFileWriterFactory.Builder(table)
       .deleteFileFormat(FileFormat.PARQUET)
-      .equalityFieldIds(Array(keyField.fieldId()))
+      .equalityFieldIds(ids.toArray)
       .equalityDeleteRowSchema(deleteSchema)
       .build()
     val outputFile = OutputFileFactory.builderFor(table, 1, 1).format(FileFormat.PARQUET).build().newOutputFile()
     val writer = factory.newEqualityDeleteWriter(outputFile, table.spec(), null)
-    try values.foreach { v =>
+    try rows.foreach { values =>
         val record = GenericRecord.create(deleteSchema)
-        record.setField(column, v)
+        columns.zip(values).foreach { case (c, v) => record.setField(c, v) }
         writer.write(record)
       }
     finally writer.close()
     table.newRowDelta().addDeletes(writer.toDeleteFile()).commit()
-    spark.sql(s"REFRESH TABLE $name")
+    spark.sql(s"REFRESH TABLE $t")
   }
 
   icebergTest("switched off, Spark's BatchScanExec stays") {

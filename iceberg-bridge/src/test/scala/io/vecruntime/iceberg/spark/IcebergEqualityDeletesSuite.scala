@@ -167,4 +167,58 @@ class IcebergEqualityDeletesSuite extends AnyFunSuite with BeforeAndAfterAll {
     spark.sql(s"DELETE FROM $T WHERE l % 7 = 0")
     assert(check(s"SELECT * FROM $T") > 0)
   }
+
+  test("equality deletes keyed on uuid, fixed, and a composite (uuid, int) key") {
+    import org.apache.iceberg.types.Types
+    import org.apache.iceberg.types.Types.NestedField.{optional, required}
+    def uuidOf(n: Long) = new java.util.UUID(n * 0x9e3779b97f4a7c15L, ~n * 0xbf58476d1ce4e5b9L)
+    val iceCatalog = spark.sessionState.catalogManager
+      .catalog("ice")
+      .asInstanceOf[org.apache.iceberg.spark.SparkCatalog]
+      .icebergCatalog()
+    val schema = new org.apache.iceberg.Schema(
+      required(1, "id", Types.LongType.get()),
+      optional(2, "u", Types.UUIDType.get()),
+      optional(3, "f", Types.FixedType.ofLength(4)),
+      optional(4, "n", Types.IntegerType.get())
+    )
+    val tid = org.apache.iceberg.catalog.TableIdentifier.of("db", "eqrt")
+    iceCatalog.dropTable(tid, false)
+    iceCatalog.createTable(
+      tid,
+      schema,
+      org.apache.iceberg.PartitionSpec.unpartitioned(),
+      java.util.Map.of("format-version", "2", "write.delete.mode", "merge-on-read")
+    )
+    spark.sql("REFRESH TABLE ice.db.eqrt")
+    spark.udf.register("uuid_of", (n: Long) => uuidOf(n).toString)
+    withConf("spark.vecruntime.enabled" -> "false")(spark.sql(
+      """INSERT INTO ice.db.eqrt SELECT id,
+        |  if(id % 7 = 0, null, uuid_of(id)),
+        |  if(id % 9 = 0, null, unhex(lpad(hex(id), 8, '0'))),
+        |  cast(id % 5 AS INT)
+        |FROM range(0, 4000)""".stripMargin
+    ).collect())
+    // uuid key, including a null key that deletes the null-uuid rows.
+    addDeletes(
+      "ice.db.eqrt",
+      Seq("u"),
+      ((0 until 4000 by 13).map(i => Seq[Any](uuidOf(i.toLong))) :+ Seq[Any](null))
+    )
+    // fixed key.
+    addDeletes(
+      "ice.db.eqrt",
+      Seq("f"),
+      (0 until 4000 by 17).map(i => Seq[Any](f"$i%08X".sliding(2, 2).map(Integer.parseInt(_, 16).toByte).toArray))
+    )
+    // composite (uuid, int) key: a row is deleted only when both match.
+    addDeletes(
+      "ice.db.eqrt",
+      Seq("u", "n"),
+      (0 until 4000 by 11).map(i => Seq[Any](uuidOf(i.toLong), Integer.valueOf(i % 5)))
+    )
+    assert(check("SELECT id, u, hex(f), n FROM ice.db.eqrt") > 0, "no batch was probed natively")
+    check("SELECT n, count(*), count(u), count(f) FROM ice.db.eqrt GROUP BY n")
+    check("SELECT count(*) FROM ice.db.eqrt")
+  }
 }

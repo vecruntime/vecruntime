@@ -42,7 +42,9 @@ import org.apache.iceberg.types.Types;
  * equal: null equals null; ints, longs, dates, times and timestamps by value;
  * floats and doubles by their bits with NaN canonical ({@code Float.compare}
  * order: {@code -0.0} differs from {@code 0.0}, NaN equals NaN); strings by
- * their UTF-8 bytes; binaries by their bytes; decimals by their unscaled value
+ * their UTF-8 bytes; binaries and fixed by their bytes; a uuid by its canonical
+ * lowercase 8-4-4-4-12 text (the form the scan reads it as, so both sides
+ * compare text to text); decimals by their unscaled value
  * at the column's scale.
  */
 public final class EqualityDeleteSet {
@@ -56,7 +58,8 @@ public final class EqualityDeleteSet {
         BOOLEAN,
         STRING,
         BINARY,
-        DECIMAL
+        DECIMAL,
+        UUID
     }
 
     private final Kind[] kinds;
@@ -172,6 +175,8 @@ public final class EqualityDeleteSet {
             case BINARY:
             case FIXED:
                 return Kind.BINARY;
+            case UUID:
+                return Kind.UUID;
             case DECIMAL:
                 return Kind.DECIMAL;
             default:
@@ -205,6 +210,22 @@ public final class EqualityDeleteSet {
                 byte[] a = new byte[bb.remaining()];
                 bb.get(a);
                 b.putBytes(a);
+            }
+            case UUID -> {
+                // The native scan reads a uuid as its canonical lowercase 8-4-4-4-12 text (NativeParquetSupport),
+                // so the delete value is encoded the same way and the data lane (below) is compared text to text.
+                // Iceberg's internal uuid value is a java.util.UUID; a loader handing out the 16 raw bytes is read
+                // the same way.
+                String text;
+                if (v instanceof java.util.UUID u) {
+                    text = u.toString();
+                } else {
+                    ByteBuffer bb = ((ByteBuffer) v).duplicate();
+                    byte[] a = new byte[bb.remaining()];
+                    bb.get(a);
+                    text = org.apache.iceberg.util.UUIDUtil.convert(a).toString();
+                }
+                b.putBytes(text.getBytes(StandardCharsets.UTF_8));
             }
             case DECIMAL -> b.putBytes(((BigDecimal) v).setScale(scale)
                     .unscaledValue()
@@ -241,7 +262,8 @@ public final class EqualityDeleteSet {
                     : Float.intBitsToFloat(c.getInt(i))));
             case DOUBLE -> b.putLong(Double.doubleToLongBits(c.getDouble(i)));
             case BOOLEAN -> b.put((byte) (c.getBoolean(i) ? 1 : 0));
-            case STRING, BINARY -> b.putBytes(c.getUtf8Bytes(i));
+            // A uuid rides the UTF8 lane as its canonical text (the same bytes the delete side encodes).
+            case STRING, BINARY, UUID -> b.putBytes(c.getUtf8Bytes(i));
             case DECIMAL -> {
                 BigInteger unscaled = c.type() == VecType.DECIMAL128 ? c.getDecimal128(i) : BigInteger.valueOf(c.getLong(i));
                 b.putBytes(unscaled.toByteArray());
