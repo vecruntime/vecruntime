@@ -32,7 +32,7 @@ Iceberg 1.12 · Spark 4.1 · format versions 1, 2 and 3
 
 Turn it on with `spark.vecruntime.scan.nativeIceberg.enabled=true`.
 
-## Writing *(review)*
+## Writing
 
 | | |
 |---|---|

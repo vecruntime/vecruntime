@@ -19,7 +19,7 @@ Spark's and Iceberg's, apart from an opt-in columnar deletion-vector writer for 
   other column types, other metadata columns, nested initial defaults, and ORC, Avro or
   encrypted files.
 - **No Comet:** Comet is not needed for any of this.
-- **Writes (in review, #913-#921):** a columnar Iceberg writer covers `INSERT`, `INSERT OVERWRITE`, CTAS/RTAS,
+- **Writes (#913-#921, #936):** a columnar Iceberg writer covers `INSERT`, `INSERT OVERWRITE`, CTAS/RTAS,
   copy-on-write and merge-on-read `DELETE` / `UPDATE` / `MERGE INTO`, partitioned tables and hash and range
   distribution. Merge-on-read writes deletion vectors on v3 and position delete files on v2. It is behind
   `spark.vecruntime.iceberg.writer.enabled`. See [the columnar writer](#the-write-side-the-columnar-iceberg-writer-842-901).
@@ -65,8 +65,8 @@ Format version 1 reads as version 2 does, without delete files.
 | Types: uuid, fixed, time | scan | Iceberg's reader reads them as Spark types our reader does not produce from these files |
 | Types: struct, list, map | yes | At any depth, when every leaf is one of the flat types above. Nested struct fields are matched by their Iceberg field ids, so a renamed nested field reads as Iceberg reads it, and a field added to a struct later reads as nulls from older files. Iceberg's reader does not vectorize nested columns, so such a scan is taken only when every task group reads natively; otherwise it stays Spark's row path |
 | Encrypted files | group | Iceberg's `FileIO` decrypts them |
-| `DELETE`, `UPDATE`, `MERGE INTO` (merge-on-read) | partly; columnar in review (#921) | Their reads run on our operators, and the `MERGE INTO` join and `MergeRows` are columnar (#21, #273). Today Spark's `WriteDeltaExec` and Iceberg's writers write the delete and data files. #921 writes both columnar: position delete files on v2, deletion vectors on v3, and the inserted and updated rows through the columnar data writer |
-| Copy-on-write rewrites, `INSERT`, CTAS | reads only; columnar in review (#913-#919) | Today the write is Spark's row path into Iceberg's Parquet writer. #913-#919 add a columnar writer, see [the columnar writer](#the-write-side-the-columnar-iceberg-writer-842-901) |
+| `DELETE`, `UPDATE`, `MERGE INTO` (merge-on-read) | yes, with `spark.vecruntime.iceberg.writer.enabled` (#921) | Their reads run on our operators, and the `MERGE INTO` join and `MergeRows` are columnar (#21, #273). The writes are columnar too: position delete files on v2, deletion vectors on v3, and the inserted and updated rows through the columnar data writer. Off, Spark's `WriteDeltaExec` and Iceberg's writers write them |
+| Copy-on-write rewrites, `INSERT`, CTAS | yes, with `spark.vecruntime.iceberg.writer.enabled` (#913-#919) | Written by the columnar writer, see [the columnar writer](#the-write-side-the-columnar-iceberg-writer-842-901). Off, the write is Spark's row path into Iceberg's Parquet writer |
 
 ### Format version 3
 
@@ -174,9 +174,6 @@ from 86.4 s to 79.3 s, against 62.1 s for the Parquet copy; q21, q10 and q27 cam
 Parquet. They are catalog properties, so the plugin cannot set them for you.
 
 ## The write side: the columnar Iceberg writer (#842, #901)
-
-*In review: #913, #914, #918, #919 and #921, stacked in that order, and #920 for the read side. The rows below
-describe those branches, not `main` yet.*
 
 ### Design
 
