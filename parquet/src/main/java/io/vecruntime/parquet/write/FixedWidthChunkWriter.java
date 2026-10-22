@@ -89,11 +89,15 @@ final class FixedWidthChunkWriter implements ChunkWriter {
     private org.apache.parquet.column.values.bloomfilter.BloomFilterWriter bloomWriter;
     private org.apache.parquet.column.values.bloomfilter.BloomFilter bloom;
 
+    // Every buffer below starts small and doubles on demand: a fanout write keeps one writer per column open
+    // per partition, so thousands may be live at once, while a busy one reaches its working size in a few
+    // doublings on its first pages.
+    //
     // The page being built: its validity (bit set = value), its values as raw bits, and, while the chunk is
     // dictionary-encoded, their dictionary ids.
     private long[] pageValidity = new long[64];
-    private long[] values = new long[4096];
-    private int[] ids = new int[4096];
+    private long[] values = new long[256];
+    private int[] ids = new int[256];
     private int pageRows;
     private int pageValues;
 
@@ -101,13 +105,13 @@ final class FixedWidthChunkWriter implements ChunkWriter {
     private boolean dictionary;
     private boolean firstPageDone;
     private int dictionaryPagesWritten;
-    private long[] entries = new long[1024];
+    private long[] entries = new long[64];
     private int entryCount;
-    private int[] table = new int[2048];
+    private int[] table = new int[128];
     // The key of each table slot, inline, so a probe reads one array.
-    private long[] tableKeys = new long[2048];
+    private long[] tableKeys = new long[128];
 
-    private final ByteSink body = new ByteSink(64 * 1024);
+    private final ByteSink body = new ByteSink(4 * 1024);
     private final ByteSink levels = new ByteSink(1024);
     private final DeltaBinaryPackedEncoder delta = new DeltaBinaryPackedEncoder();
 
