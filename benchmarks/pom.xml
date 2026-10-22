@@ -138,4 +138,42 @@
       </plugin>
     </plugins>
   </build>
+
+  <profiles>
+    <profile>
+      <!-- The Iceberg write benchmarks (#842) compile against the Iceberg bridge, which is built only under
+           -Piceberg, so only this profile adds them (src/iceberg/java). The Iceberg runtime stays provided:
+           run them with it on the classpath (see IcebergAppendBenchmark). -->
+      <id>iceberg</id>
+      <dependencies>
+        <dependency>
+          <groupId>io.github.vecruntime</groupId>
+          <artifactId>vecruntime-iceberg-bridge_${spark.line}_${scala.binary.version}</artifactId>
+          <version>${project.version}</version>
+        </dependency>
+      </dependencies>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.codehaus.mojo</groupId>
+            <artifactId>build-helper-maven-plugin</artifactId>
+            <executions>
+              <execution>
+                <id>iceberg-sources</id>
+                <goals>
+                  <goal>add-source</goal>
+                </goals>
+                <phase>generate-sources</phase>
+                <configuration>
+                  <sources>
+                    <source>src/iceberg/java</source>
+                  </sources>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+  </profiles>
 </project>
