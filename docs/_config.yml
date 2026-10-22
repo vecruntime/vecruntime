@@ -42,6 +42,8 @@ nav:
         url: /how-it-works.html
       - title: Comet as the scan
         url: /comet.html
+      - title: Iceberg support at a glance
+        url: /iceberg-support.html
       - title: Apache Iceberg
         url: /iceberg.html
       - title: Flight shuffle

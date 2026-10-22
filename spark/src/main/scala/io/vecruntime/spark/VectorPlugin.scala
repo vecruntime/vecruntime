@@ -74,6 +74,12 @@ class VectorPlugin extends SparkPlugin {
     override def init(ctx: PluginContext, extraConf: java.util.Map[String, String]): Unit = {
       VectorPlugin.requireVectorApi()
       io.vecruntime.spark.comet.CometVectorAdapter.tryRegister()
+      // #869 step 4: before anything opens the Arrow root -- its buffers from the native pool when on.
+      io.vecruntime.kernels.NativePool.configureThreadCache(
+        VectorConf.nativePoolThreadCacheDepth(ctx.conf()),
+        VectorConf.nativePoolThreadCacheMaxBlockBytes(ctx.conf())
+      )
+      io.vecruntime.spark.arrow.VectorAllocators.useNativePool(VectorConf.arrowNativePoolEnabled(ctx.conf()))
       // #868: the executor's Arrow budget, and its use as executor metrics (current and peak bytes) for sizing it.
       io.vecruntime.spark.arrow.VectorAllocators.setLimit(VectorConf.arrowMaxBytes(ctx.conf()))
       ctx.metricRegistry().register(
@@ -108,7 +114,11 @@ class VectorPlugin extends SparkPlugin {
         "nativePoolPeakBytes" -> (() => io.vecruntime.kernels.NativePool.shared().peakInUseBytes()),
         "nativePoolRetainedBytes" -> (() => io.vecruntime.kernels.NativePool.shared().retainedBytes()),
         "nativePoolOverdraftBytes" -> (() => org.apache.spark.sql.vecruntime.TaskNativeMemory.overdraftBytes),
-        "nativePoolLeakedBytes" -> (() => org.apache.spark.sql.vecruntime.TaskNativeMemory.leakedBytes)
+        "nativePoolLeakedBytes" -> (() => org.apache.spark.sql.vecruntime.TaskNativeMemory.leakedBytes),
+        // #915: the scan's read-ahead held in execution memory, its peak, and the grants the pool refused.
+        "scanReadAheadHeldBytes" -> (() => org.apache.spark.sql.vecruntime.VectorParquetScanExec.readAheadHeldBytes),
+        "scanReadAheadPeakBytes" -> (() => org.apache.spark.sql.vecruntime.VectorParquetScanExec.readAheadPeakBytes),
+        "scanReadAheadRefusals" -> (() => org.apache.spark.sql.vecruntime.VectorParquetScanExec.readAheadRefusals)
       ).foreach { case (name, read) =>
         ctx.metricRegistry().register(
           name,

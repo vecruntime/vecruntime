@@ -19,6 +19,11 @@ Spark's and Iceberg's, apart from an opt-in columnar deletion-vector writer for 
   other column types, other metadata columns, nested initial defaults, and ORC, Avro or
   encrypted files.
 - **No Comet:** Comet is not needed for any of this.
+- **Writes (in review, #913-#921):** a columnar Iceberg writer covers `INSERT`, `INSERT OVERWRITE`, CTAS/RTAS,
+  copy-on-write and merge-on-read `DELETE` / `UPDATE` / `MERGE INTO`, partitioned tables and hash and range
+  distribution. Merge-on-read writes deletion vectors on v3 and position delete files on v2. It is behind
+  `spark.vecruntime.iceberg.writer.enabled`. See [the columnar writer](#the-write-side-the-columnar-iceberg-writer-842-901).
+  A one-page summary is in [Iceberg support at a glance](iceberg-support.html).
 
 The tables below give the state of each feature, by format version.
 
@@ -59,8 +64,8 @@ Format version 1 reads as version 2 does, without delete files.
 | Types: uuid, fixed, time | scan | Iceberg's reader reads them as Spark types our reader does not produce from these files |
 | Types: struct, list, map | yes | At any depth, when every leaf is one of the flat types above. Nested struct fields are matched by their Iceberg field ids, so a renamed nested field reads as Iceberg reads it, and a field added to a struct later reads as nulls from older files. Iceberg's reader does not vectorize nested columns, so such a scan is taken only when every task group reads natively; otherwise it stays Spark's row path |
 | Encrypted files | group | Iceberg's `FileIO` decrypts them |
-| `DELETE`, `UPDATE`, `MERGE INTO` (merge-on-read) | partly | Their reads run on our operators, and the `MERGE INTO` join and `MergeRows` are columnar (#21, #273). The delete and data files are written by Spark's `WriteDeltaExec` and Iceberg's writers |
-| Copy-on-write rewrites, `INSERT`, CTAS | reads only | The write is Spark's row path into Iceberg's Parquet writer. A columnar writer is #64 |
+| `DELETE`, `UPDATE`, `MERGE INTO` (merge-on-read) | partly; columnar in review (#921) | Their reads run on our operators, and the `MERGE INTO` join and `MergeRows` are columnar (#21, #273). Today Spark's `WriteDeltaExec` and Iceberg's writers write the delete and data files. #921 writes both columnar: position delete files on v2, deletion vectors on v3, and the inserted and updated rows through the columnar data writer |
+| Copy-on-write rewrites, `INSERT`, CTAS | reads only; columnar in review (#913-#919) | Today the write is Spark's row path into Iceberg's Parquet writer. #913-#919 add a columnar writer, see [the columnar writer](#the-write-side-the-columnar-iceberg-writer-842-901) |
 
 ### Format version 3
 
@@ -165,6 +170,137 @@ of about 1 MB).
 On 15 short 3 TB TPC-DS queries (10 nodes, two passes each) the two settings took Iceberg's total
 from 86.4 s to 79.3 s, against 62.1 s for the Parquet copy; q21, q10 and q27 came level with
 Parquet. They are catalog properties, so the plugin cannot set them for you.
+
+## The write side: the columnar Iceberg writer (#842, #901)
+
+*In review: #913, #914, #918, #919 and #921, stacked in that order, and #920 for the read side. The rows below
+describe those branches, not `main` yet.*
+
+### Design
+
+The columnar Iceberg writer reuses Iceberg for everything except encoding rows:
+
+- **Iceberg's own pieces, unchanged:** the Spark `Write` Iceberg builds (its `SparkWriteConf`: target size,
+  fanout, distribution, write properties, session settings), its `OutputFileFactory` (file names and the table's
+  location provider), `MetricsConfig`, and its commit: `AppendFiles`, `OverwriteFiles` or `ReplacePartitions`
+  for an append, overwrite or copy-on-write write, and `RowDelta` for merge-on-read.
+- **Ours:** the Parquet encoding. `IcebergParquetAppender` (#913) is a `FileAppender` over the Spark-free
+  columnar Parquet writer of the `parquet` module (#900). It writes Iceberg's field ids and schema into the
+  footer, and fills `Metrics` from the footer and Iceberg's own field-metrics builders.
+- **How the plan is taken:** `VectorIcebergWriteStrategy` plans after Spark's `V2Writes`, so the distribution
+  and ordering Iceberg asks for are already in the child plan. The write consumes the child's batches;
+  `RowToColumnarExec` is used only when the child produces rows.
+- **Package-private Iceberg classes:** `SparkWrite`, `SparkPositionDeltaWrite`, their `Context` and the
+  `DeltaTaskCommit` constructors are package-private. The bridge classes that touch them live in
+  `org.apache.iceberg.spark.source` in the optional `iceberg-bridge` module, and the `spark` module loads them
+  reflectively, so the plugin keeps no compile-time Iceberg dependency.
+
+Per step:
+
+- **#913, appender.** `IcebergParquetAppender`, with a JMH against Iceberg's `Parquet.write`.
+- **#914, write node.** `VectorIcebergWriteExec` for append, dynamic and static overwrite, CTAS/RTAS (Spark
+  plans them as an inner append) and copy-on-write `DELETE` / `UPDATE` / `MERGE`.
+  - On v3, copy-on-write maps each write-schema field to its ordinal in the row or the metadata projection, so
+    `_row_id` and `_last_updated_sequence_number` are kept as Iceberg's writer keeps them.
+  - Tasks report Spark's output metrics (records and bytes written) from their data files.
+- **#918, partitioned writes.** Clustered (one open file; each partition's run is a slice of the batch) and
+  fanout (one open file per partition; rows gathered per partition with the engine's gather kernels).
+- **#919, native distribution.** Iceberg's transform functions (`years`, `months`, `days`, `hours`, `bucket`,
+  `truncate`, which reach the plan as `StaticInvoke`) compile into columnar kernels (`IcebergTransformKernels`).
+  Hash and range distribution therefore run on batches, through the columnar shuffle manager, with no `SortExec`
+  or `ShuffleExchangeExec` left. It also adds nested constructors (`array`, `map`, `if(p, null, nested)`) and
+  fanout writes of nested columns (`NestedGatherKernels`).
+- **#921, merge-on-read.** `VectorWriteDeltaExec` runs on batches.
+  - A task walks each batch's operation lane. DELETE rows feed per-file deletion vectors on v3, or position
+    delete files on v2 (`ColumnarPositionDeleteWriter`); both sit behind one `DeleteSink`.
+  - INSERT and REINSERT rows are picked out by row index and written by the columnar data writer. A REINSERT
+    keeps its row lineage; an INSERT leaves it to the commit (`ExtractRowLineage`).
+  - An UPDATE's `Expand` carries the struct `_partition`, so the whole UPDATE plan stays columnar.
+  - v2 position delete files follow Iceberg's `FanoutPositionOnlyDeleteWriter` / `SortingPositionOnlyDeleteWriter`:
+    - files in path order and positions ascending;
+    - `file` granularity merges and replaces a data file's previous file-scoped deletes;
+    - files roll at the delete target size;
+    - a file referencing several data files drops the `file_path` / `pos` bounds.
+
+### What falls back to Iceberg's writer, and why
+
+| Case | Why |
+|---|---|
+| A float or double inside a list or map | Its NaN-aware metrics are not computed natively yet |
+| `time`, `uuid`, `timestamp_ns`, `fixed`, `variant`, geometry types | Not encoded by the columnar writer yet |
+| ORC or Avro data or delete files | The columnar writer writes Parquet only |
+| Encrypted tables | Key metadata is not written |
+| A partition source that is not a top-level column of a supported type | The transform is computed on the batch's top-level lanes |
+
+`spark.vecruntime.explainFallback.enabled=true` logs the reason for each declined write.
+
+### Table properties
+
+| Property | Honoured |
+|---|---|
+| `write.target-file-size-bytes`, `write.delete.target-file-size-bytes` | yes |
+| `write.parquet.row-group-size-bytes`, `page-size-bytes`, `page-row-limit`, `dict-size-bytes` | yes |
+| `write.parquet.compression-codec`, `compression-level` | yes |
+| `write.parquet.bloom-filter-*` | yes |
+| `write.delete.parquet.*` | yes; for delete files they override `write.parquet.*` |
+| `write.metadata.metrics.default`, `write.metadata.metrics.column.*` | yes, through `MetricsConfig` |
+| `write.distribution-mode`, `write.spark.fanout.enabled`, `write.delete.granularity` | yes |
+| Write options and session settings (`compression-codec`, `target-file-size-bytes`, ...) | yes; read from the write's resolved `SparkWriteConf`, so they override table properties as in Iceberg's writer |
+| `write.data.path`, `write.object-storage.enabled` | yes, through `OutputFileFactory` and the location provider |
+| `write.parquet.row-group-check-*` | not applicable: the open row group's size is tracked after every batch |
+
+### Tests
+
+Every case compares the result with a twin table written by Iceberg's own writer: the same rows, the same
+partitions with the same record counts, and the snapshot summary.
+
+- **`VectorIcebergWriteSuite`:**
+  - append, overwrite, CTAS/RTAS, copy-on-write `DELETE` / `UPDATE` / `MERGE`, and v3 lineage;
+  - five partitionings (identity; days; months with bucket; hours with truncate; years with decimal truncate)
+    under none, hash and range distribution, with fanout off and on, asserting no Spark `SortExec` or
+    `ShuffleExchangeExec` under the write;
+  - nested columns, clustered and fanout;
+  - output metrics, checked through a listener;
+  - reading a table with a null identity partition through the engine.
+- **`VectorDvWriteSuite` and `VectorDvWriteColumnarSuite`:**
+  - v3 `DELETE`: plain, empty, repeated and partitioned;
+  - an aborted task;
+  - `UPDATE` and `MERGE` on unpartitioned and partitioned tables, and with struct, array and map columns;
+  - an insert-only `MERGE`.
+
+  Each is compared on DV cardinality, one live DV per data file, `_row_id` of the original rows, and snapshot
+  counts. The columnar suite also asserts that no flat delta write reads rows.
+- **`VectorPositionDeleteWriteSuite` and its columnar variant:** v2 tables, unpartitioned and partitioned, with
+  `file` and `partition` granularity. Each runs `DELETE`, a second `DELETE`, `UPDATE` and `MERGE`, compared
+  statement by statement on delete-file kind and format, and on referenced data files. A roll test is included.
+- **`IcebergTransformExprsSuite`:** every transform over every source type, equal to Iceberg's own `invoke` row
+  by row.
+- **`StructFlatteningSuite`:** the columnar exchange's handling of a null struct constant (#922).
+
+### Measured
+
+**1 TB append, #914.** TPC-DS `store_sales` at sf1000: 2.88 billion rows, about 104 GB of zstd Parquet. An
+`INSERT INTO` an unpartitioned v2 table, 8 executors × 13 cores, two iterations:
+
+| writer | wall (s) | executor CPU (s) | GC (s) |
+|---|---:|---:|---:|
+| Iceberg's | 181.2 / 166.8 | 18,246 / 17,399 | 388 / 283 |
+| columnar | 60.8 / 59.7 | 6,937 / 6,841 | 56 / 58 |
+
+- **Speed:** 2.89x faster on the mean wall time, with 2.6x less CPU.
+- **Correctness:** the row count and `sum(cast(xxhash64(*) as decimal(38,0)))` of the written table are
+  identical in every run.
+
+The partitioned (hash) append, the read A/B for #920, and a CDC `MERGE` A/B for #921 follow on their PRs.
+
+### Bugs found on the way
+
+- **The columnar exchange and a null struct constant (#922).** Spark's `ConstantColumnVector` of a null struct
+  leaves its children unset. A partitioned `MERGE` carries one as the `_partition` of its inserted rows, and the
+  exchange failed on it.
+- **Copying a foreign vector with nulls.** Iceberg's `ConstantColumnVector` of a null partition value throws
+  when a null row is read, and the copy path's bulk getters read every row. The 1 TB partitioned run hit it on
+  `ss_store_sk`. Fixed on #919, and separately for `main`.
 
 ## The write side: columnar v3 deletion vectors (#20)
 

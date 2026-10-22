@@ -628,6 +628,28 @@ object VectorConf {
   def poolAccountingEnabled(sparkConf: org.apache.spark.SparkConf): Boolean =
     sparkConf.getBoolean(PoolAccountingEnabled, true)
 
+  /**
+   * #869 step 4: Arrow's buffers (the Flight shuffle's, the shuffle readers', the operators' output vectors) from
+   * the native pool instead of Arrow's allocation manager (`-Darrow.allocation.manager.type`), so they are reused
+   * blocks of the same pool. Arrow still accounts them and `spark.vecruntime.arrow.maxBytes` still caps them. Read
+   * once, when the executor starts.
+   */
+  val ArrowNativePoolEnabled = "spark.vecruntime.arrow.nativePool.enabled"
+  def arrowNativePoolEnabled(sparkConf: org.apache.spark.SparkConf): Boolean =
+    sparkConf.getBoolean(ArrowNativePoolEnabled, true)
+
+  /**
+   * #869 step 4: the native pool's per-thread cache -- blocks per size class (0 to 16) and the largest block cached
+   * (64 KiB to 64 MiB). A thread holds at most about `2 * depth * maxBlockBytes`. Off by default (depth 0): at 10 TB
+   * the shared free lists alone were as fast as main and the cache slower. Read once, when the executor starts.
+   */
+  val NativePoolThreadCacheDepth = "spark.vecruntime.nativePool.threadCache.depth"
+  val NativePoolThreadCacheMaxBlockBytes = "spark.vecruntime.nativePool.threadCache.maxBlockBytes"
+  def nativePoolThreadCacheDepth(sparkConf: org.apache.spark.SparkConf): Int =
+    sparkConf.getInt(NativePoolThreadCacheDepth, 0)
+  def nativePoolThreadCacheMaxBlockBytes(sparkConf: org.apache.spark.SparkConf): Long =
+    org.apache.spark.network.util.JavaUtils.byteStringAsBytes(sparkConf.get(NativePoolThreadCacheMaxBlockBytes, "1m"))
+
   val ArrowMaxBytes = "spark.vecruntime.arrow.maxBytes"
   def arrowMaxBytes(sparkConf: org.apache.spark.SparkConf): Long =
     org.apache.spark.network.util.JavaUtils.byteStringAsBytes(sparkConf.get(ArrowMaxBytes, "0").trim match {
@@ -709,7 +731,7 @@ object VectorConf {
    * (1 TB TPC-DS store_sales is ~14.6k files of ~7 MB). `0` opens each file on the task thread. Memory per
    * task grows by up to N opened files and their first row groups (compressed pages). Capped at 16.
    */
-  def scanNativeParquetPrefetchFiles(conf: SQLConf): Int = intIn(conf, ScanNativeParquetPrefetchFiles, 6, 16)
+  def scanNativeParquetPrefetchFiles(conf: SQLConf): Int = intIn(conf, ScanNativeParquetPrefetchFiles, 12, 16)
 
   /**
    * How many row groups of the current file `VectorParquetScanExec` reads ahead (#559/#566), on platform
@@ -718,7 +740,7 @@ object VectorConf {
    * groups (compressed pages), so it scales with the row-group size. Capped at 16.
    */
   def scanNativeParquetPrefetchRowGroups(conf: SQLConf): Int =
-    intIn(conf, ScanNativeParquetPrefetchRowGroups, 2, 16)
+    intIn(conf, ScanNativeParquetPrefetchRowGroups, 4, 16)
 
   /**
    * #568: the most compressed bytes one task's read-ahead (files opened ahead and row groups read ahead)
@@ -748,7 +770,7 @@ object VectorConf {
    * producer thread of each task's own, so decoding overlaps the operators above the scan. `0` (the default
    * until measured) decodes on the task thread. Memory per task grows by up to N batches. Capped at 16.
    */
-  def scanNativeParquetDecodeAhead(conf: SQLConf): Int = intIn(conf, ScanNativeParquetDecodeAhead, 0, 16)
+  def scanNativeParquetDecodeAhead(conf: SQLConf): Int = intIn(conf, ScanNativeParquetDecodeAhead, 2, 16)
 
   /** The decode-ahead producer's thread kind: `virtual` (the default) or `platform`. */
   def scanNativeParquetDecodeAheadVirtual(conf: SQLConf): Boolean =

@@ -8,6 +8,17 @@ version may change configuration keys or defaults, always noted here.
 
 ### Added
 
+- The native Parquet scan's read-ahead in the task's memory budget (#915): the compressed pages read ahead and the
+  batches decode-ahead queues are held in Spark execution memory, granted only from free memory, so read-ahead
+  narrows its window when the operators above it need the pool instead of making them spill. The byte caps
+  (`prefetchMaxBytes`, `prefetchExecutorMaxBytes`) stay as the upper bound. Executor metrics
+  `scanReadAheadHeldBytes`, `scanReadAheadPeakBytes`, `scanReadAheadRefusals`.
+- Deeper read-ahead by default (#915): `prefetchFiles` 6 -> 12, `prefetchRowGroups` 2 -> 4, `decodeAhead` 0 -> 2.
+  At 10 TB the full TPC-DS run went from 2,404 s to 2,329 s (-3.1%), with the byte caps kept as the upper bound.
+- Arrow buffers on the native pool (#869, `spark.vecruntime.arrow.nativePool.enabled`, on by default): the Flight
+  shuffle's buffers and the operators' output vectors are reused blocks of the same pool as the operators', not a
+  `malloc` and `free` each. The pool's counters are striped, and an optional per-thread cache
+  (`spark.vecruntime.nativePool.threadCache.depth` / `.maxBlockBytes`) is off by default.
 - Native pool accounting (#869, `spark.vecruntime.memory.poolAccounting.enabled`, on by default): every block a
   task takes from `NativePool` is held in that task's Spark execution memory through one account, which the sort's
   and the grace hash join's reservations share, so a block is counted once and an allocation no operator reserved
