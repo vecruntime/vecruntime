@@ -162,7 +162,13 @@ public final class IcebergDvCommitBridge {
         if (!(scan instanceof SparkRuntimeFilterableScan filterableScan)) {
             return null;
         }
-        java.util.Map<String, org.apache.iceberg.util.DeleteFileSet> byFile = filterableScan.rewritableDeletes(true);
+        // As Iceberg's PositionDeltaBatchWrite: previous deletes are rewritten for deletion vectors and for
+        // file-granularity position deletes (#901 M2), never for partition-granularity ones.
+        boolean dvs = context(deltaWrite, "useDVs", Boolean.class);
+        if (!dvs && context(deltaWrite, "deleteGranularity", Object.class) != org.apache.iceberg.deletes.DeleteGranularity.FILE) {
+            return null;
+        }
+        java.util.Map<String, org.apache.iceberg.util.DeleteFileSet> byFile = filterableScan.rewritableDeletes(dvs);
         if (byFile == null || byFile.isEmpty()) {
             return null;
         }
@@ -173,6 +179,80 @@ public final class IcebergDvCommitBridge {
             out.put(path, files);
         });
         return out;
+    }
+
+    /**
+     * Why the columnar writer cannot write {@code deltaWrite}'s deletes, or
+     * {@code null} when it can: deletion vectors always; position delete files
+     * (#901 M2) when they are Parquet and the table is unencrypted.
+     */
+    public static String deleteDeclineReason(Object deltaWrite) {
+        if (!(deltaWrite instanceof SparkPositionDeltaWrite w)) {
+            return "the write is not Iceberg's SparkPositionDeltaWrite";
+        }
+        if (context(w, "useDVs", Boolean.class)) {
+            return null;
+        }
+        org.apache.iceberg.FileFormat format = context(w, "deleteFileFormat", org.apache.iceberg.FileFormat.class);
+        if (format != org.apache.iceberg.FileFormat.PARQUET) {
+            return "delete file format " + format + " is not Parquet";
+        }
+        org.apache.iceberg.Table table = writeField(w, "table", org.apache.iceberg.Table.class);
+        if (table.properties().keySet().stream()
+                .anyMatch(k -> k.startsWith("encryption."))) {
+            return "the table is encrypted";
+        }
+        return null;
+    }
+
+    /**
+     * What the tasks need to write {@code deltaWrite}'s position delete files
+     * (#901 M2), or {@code null} when it writes deletion vectors: granularity,
+     * target size, the delete files' Parquet properties (the table's and the
+     * write's, {@code write.delete.parquet.*} over {@code write.parquet.*}, as
+     * Iceberg's delete writer reads them) and the query id that names the
+     * files.
+     */
+    public static io.vecruntime.iceberg.bridge.PositionDeleteSpec positionDeleteSpec(Object deltaWrite) {
+        if (!(deltaWrite instanceof SparkPositionDeltaWrite w) || context(w, "useDVs", Boolean.class)) {
+            return null;
+        }
+        org.apache.iceberg.Table table = writeField(w, "table", org.apache.iceberg.Table.class);
+        java.util.Map<String, String> props = new java.util.HashMap<>(table.properties());
+        java.util.Map<?, ?> writeProps = writeField(w, "writeProperties", java.util.Map.class);
+        writeProps.forEach((k, v) -> props.put(String.valueOf(k), String.valueOf(v)));
+        String deletePrefix = "write.delete.parquet.";
+        java.util.Map<String, String> resolved = new java.util.HashMap<>(props);
+        props.forEach((k, v) -> {
+            if (k.startsWith(deletePrefix)) {
+                resolved.put("write.parquet." + k.substring(deletePrefix.length()), v);
+            }
+        });
+        boolean file = context(w, "deleteGranularity", Object.class) == org.apache.iceberg.deletes.DeleteGranularity.FILE;
+        return new io.vecruntime.iceberg.bridge.PositionDeleteSpec(file, context(w, "targetDeleteFileSize", Long.class),
+                resolved, context(w, "queryId", String.class));
+    }
+
+    private static <T> T writeField(Object w, String name, Class<T> type) {
+        try {
+            java.lang.reflect.Field f = SparkPositionDeltaWrite.class.getDeclaredField(name);
+            f.setAccessible(true);
+            return type.cast(f.get(w));
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("SparkPositionDeltaWrite." + name + " is not readable", e);
+        }
+    }
+
+    /** A value of the write's private {@code Context}, by its accessor's name. */
+    private static <T> T context(Object w, String name, Class<T> type) {
+        Object context = writeField(w, "context", Object.class);
+        try {
+            java.lang.reflect.Method m = context.getClass().getDeclaredMethod(name);
+            m.setAccessible(true);
+            return type.cast(m.invoke(context));
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("SparkPositionDeltaWrite.Context." + name + " is not readable", e);
+        }
     }
 
     /**

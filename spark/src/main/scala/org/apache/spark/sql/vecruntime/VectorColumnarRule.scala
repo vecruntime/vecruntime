@@ -192,7 +192,8 @@ case class VectorExecRule(session: SparkSession) extends Rule[SparkPlan] with Lo
           }
 
         case e: ExpandExec if VectorConf.expandEnabled(conf) =>
-          laneInputReason(e.child) match {
+          // Nested columns may only be carried through (the planner checks each of their slots).
+          laneInputReason(e.child, nested = true) match {
             case Some(reason) => fallback(e, reason)
             case None => VectorExpandPlanner.plan(e).fold(reason => fallback(e, reason), v => v)
           }

@@ -88,8 +88,12 @@ case class VectorWriteDeltaStrategy(session: SparkSession) extends SparkStrategy
       return Some("write has no metadata projection (spec id / partition)")
     val table = VectorWriteDeltaStrategy.icebergTableOf(wd.table)
     if (table.isEmpty) return Some("target is not an Iceberg table")
-    if (!IcebergDvBridge.isDvEligible(table.get))
-      return Some("target is not a format-version-3 (deletion-vector) table")
+    if (!IcebergDvBridge.isDvEligible(table.get) && !VectorConf.icebergPositionDeletesEnabled(conf))
+      return Some("target is a v2 table and spark.vecruntime.iceberg.positionDeletes.enabled is off")
+    IcebergDvBridge.deleteDeclineReason(wd.write.get) match {
+      case Some(why) => return Some(why)
+      case None =>
+    }
     // Partitioned tables and tables that already carry deletes are both supported: the spec id and
     // partition tuple come from the metadata projection, and each data file's previously committed
     // DV is merged into its new one and replaced in the commit (Iceberg's rewritableDeletes), exactly

@@ -74,23 +74,54 @@ object IcebergDvBridge {
   }.orNull
 
   /**
+   * #901 M2: what the tasks need for a write's deletes, read on the driver -- the previously committed deletes
+   * to merge (`rewritableDeletes`, or null), and the position delete files' spec (null: deletion vectors).
+   */
+  final case class DeletePlan(rewritable: AnyRef, positionDeletes: AnyRef) extends Serializable
+
+  def deletePlan(write: AnyRef): DeletePlan = DeletePlan(rewritableDeletes(write), positionDeleteSpec(write))
+
+  private def bridgeStatic(name: String, arg: AnyRef): AnyRef = commitBridgeClass.map { c =>
+    val m = c.getMethods.find(x => x.getName == name && x.getParameterCount == 1).get
+    try m.invoke(null, arg)
+    catch { case e: java.lang.reflect.InvocationTargetException => throw e.getCause }
+  }.orNull
+
+  /** The position delete files' spec of a v2 write, or null when it writes deletion vectors. */
+  def positionDeleteSpec(write: AnyRef): AnyRef = bridgeStatic("positionDeleteSpec", write)
+
+  /** Why the columnar writer cannot write the write's deletes (DVs or position delete files), or None. */
+  def deleteDeclineReason(write: AnyRef): Option[String] =
+    Option(bridgeStatic("deleteDeclineReason", write).asInstanceOf[String])
+
+  /**
    * Creates a per-task DV writer handle (reflective wrapper over the bridge's DvDeltaTaskWriter).
    * `rewritableDeletes` is the map from [[rewritableDeletes]]: Iceberg's `BaseDVFileWriter.close`
    * merges each file's previous DV into the new one and reports it as rewritten, so the commit
-   * replaces it (a v3 table allows one DV per data file).
+   * replaces it (a v3 table allows one DV per data file). With a position delete spec (a v2 table,
+   * #901 M2) the task writes Parquet position delete files instead.
    */
   def createTaskWriter(
       table: AnyRef,
       partitionId: Int,
       taskId: Long,
-      rewritableDeletes: AnyRef
+      deletes: DeletePlan
   ): IcebergDvTaskWriterHandle = {
     val c = taskWriterClass.getOrElse(
       throw new IllegalStateException("vecruntime: iceberg-bridge module not on the classpath")
     )
-    val create = c.getMethods.find(m => m.getName == "create" && m.getParameterCount == 4).get
+    val create = c.getMethods.find(m => m.getName == "create" && m.getParameterCount == 5).get
     val instance =
-      create.invoke(null, table, Integer.valueOf(partitionId), java.lang.Long.valueOf(taskId), rewritableDeletes)
+      try
+        create.invoke(
+          null,
+          table,
+          Integer.valueOf(partitionId),
+          java.lang.Long.valueOf(taskId),
+          deletes.rewritable,
+          deletes.positionDeletes
+        )
+      catch { case e: java.lang.reflect.InvocationTargetException => throw e.getCause }
     new IcebergDvTaskWriterHandle(instance)
   }
 }

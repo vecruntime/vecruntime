@@ -112,3 +112,71 @@ final class IcebergDataTaskWriterHandle(instance: AnyRef) {
 
   def abort(cause: Throwable): Unit = abortM.invoke(instance, cause)
 }
+
+/**
+ * #901 M1: the data half of a merge-on-read write through the bridge (`IcebergDeltaDataBridge`,
+ * `IcebergDeltaDataWriter`), reached reflectively like the rest of the Iceberg write path.
+ */
+object IcebergDeltaWriteBridge {
+  private val Bridge = "org.apache.iceberg.spark.source.IcebergDeltaDataBridge"
+  private val Writer = "io.vecruntime.iceberg.write.IcebergDeltaDataWriter"
+
+  private def load(name: String): Option[Class[_]] =
+    try Some(Class.forName(name, true, getClass.getClassLoader))
+    catch { case _: ClassNotFoundException | _: NoClassDefFoundError => None }
+
+  private lazy val bridge: Option[Class[_]] = load(Bridge)
+  private lazy val writer: Option[Class[_]] = load(Writer)
+
+  def isAvailable: Boolean = bridge.isDefined && writer.isDefined
+
+  private def static(name: String, args: AnyRef*): AnyRef = {
+    val c = bridge.getOrElse(throw new IllegalStateException("vecruntime: iceberg-bridge not on the classpath"))
+    try c.getMethods.find(m => m.getName == name && m.getParameterCount == args.length).get.invoke(null, args: _*)
+    catch { case e: java.lang.reflect.InvocationTargetException => throw e.getCause }
+  }
+
+  def isPositionDeltaWrite(write: AnyRef): Boolean = static("isPositionDeltaWrite", write).asInstanceOf[Boolean]
+  def declineReason(write: AnyRef): Option[String] = Option(static("declineReason", write).asInstanceOf[String])
+  def rowLineage(write: AnyRef): Boolean = static("rowLineage", write).asInstanceOf[Boolean]
+  def specOf(write: AnyRef): AnyRef = static("specOf", write)
+  def dataCommit(files: AnyRef): org.apache.spark.sql.connector.write.WriterCommitMessage =
+    static("dataCommit", files).asInstanceOf[org.apache.spark.sql.connector.write.WriterCommitMessage]
+
+  def createWriter(
+      spec: AnyRef,
+      partitionId: Int,
+      taskId: Long,
+      conf: Configuration,
+      lineage: Boolean
+  ): IcebergDeltaDataWriterHandle = {
+    val c = writer.getOrElse(throw new IllegalStateException("vecruntime: iceberg-bridge not on the classpath"))
+    val ctor = c.getConstructors.find(_.getParameterCount == 5).get
+    new IcebergDeltaDataWriterHandle(
+      ctor.newInstance(
+        spec,
+        Integer.valueOf(partitionId),
+        java.lang.Long.valueOf(taskId),
+        conf,
+        java.lang.Boolean.valueOf(lineage)
+      ).asInstanceOf[AnyRef]
+    )
+  }
+}
+
+final class IcebergDeltaDataWriterHandle(instance: AnyRef) {
+  private val cls = instance.getClass
+  private val writeM = cls.getMethods.find(m => m.getName == "write" && m.getParameterCount == 4).get
+  private val dataFilesM = cls.getMethod("dataFiles")
+  private val abortM = cls.getMethod("abort", classOf[Throwable])
+
+  def write(columns: java.util.List[VectorBuffers], rows: Array[Int], count: Int, reinsert: Array[Boolean]): Unit =
+    try writeM.invoke(instance, columns, rows, Integer.valueOf(count), reinsert)
+    catch { case e: java.lang.reflect.InvocationTargetException => throw e.getCause }
+
+  def dataFiles(): AnyRef =
+    try dataFilesM.invoke(instance)
+    catch { case e: java.lang.reflect.InvocationTargetException => throw e.getCause }
+
+  def abort(cause: Throwable): Unit = abortM.invoke(instance, cause)
+}

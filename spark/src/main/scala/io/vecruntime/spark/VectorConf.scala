@@ -47,6 +47,12 @@ object VectorConf {
   val IcebergDvWriterEnabled = "spark.vecruntime.iceberg.dvWriter.enabled"
 
   /**
+   * #901 M2: under the merge-on-read writer (`dvWriter.enabled`), whether a v2 table's deletes are written as
+   * columnar Parquet position delete files (default true); off, a v2 table keeps Spark's own `WriteDeltaExec`.
+   */
+  val IcebergPositionDeletesEnabled = "spark.vecruntime.iceberg.positionDeletes.enabled"
+
+  /**
    * #901 R1: the native Iceberg scan resolves each data file's columns with Iceberg's own rules (iceberg-bridge's
    * `IcebergReadSpecs`: field ids, the table's name mapping, Iceberg's positional fallback ids, promotions,
    * initial defaults) instead of Spark's `clipParquetSchema` over field-id metadata. Without the bridge on the
@@ -358,6 +364,10 @@ object VectorConf {
   def icebergReadSpecsEnabled(conf: SQLConf): Boolean = bool(conf, IcebergReadSpecsEnabled, default = true)
   def icebergNativeEqualityDeletesEnabled(conf: SQLConf): Boolean =
     bool(conf, IcebergNativeEqualityDeletesEnabled, default = true)
+
+  /** #901 M2: v2 position delete files under the merge-on-read writer. Default `true`. */
+  def icebergPositionDeletesEnabled(conf: SQLConf): Boolean =
+    bool(conf, IcebergPositionDeletesEnabled, default = true)
 
   /** The columnar Iceberg data-file writer (#842, W2). Default `false` while it lands. */
   def icebergWriterEnabled(conf: SQLConf): Boolean = bool(conf, IcebergWriterEnabled, default = false)

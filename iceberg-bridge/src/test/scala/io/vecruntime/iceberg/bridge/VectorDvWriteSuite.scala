@@ -32,6 +32,9 @@ import org.scalatest.funsuite.AnyFunSuite
  */
 class VectorDvWriteSuite extends AnyFunSuite with BeforeAndAfterAll {
 
+  /** #901 M1: whether the "on" side also writes the data half columnar (the columnar Iceberg writer on). */
+  protected def columnarData: Boolean = false
+
   private var spark: SparkSession = _
   private lazy val warehouse: Path = Files.createTempDirectory("dvwrite")
 
@@ -49,6 +52,9 @@ class VectorDvWriteSuite extends AnyFunSuite with BeforeAndAfterAll {
       .config("spark.sql.catalog.ice.type", "hadoop")
       .config("spark.sql.catalog.ice.warehouse", warehouse.toString)
       .config("spark.sql.catalog.ice.cache-enabled", "false")
+      // The columnar exchange, so the clustering Iceberg asks of a delta write runs on batches.
+      .config("spark.shuffle.manager", "org.apache.spark.sql.vecruntime.shuffle.VectorShuffleManager")
+      .config("spark.vecruntime.shuffle.enabled", "true")
       .getOrCreate()
   }
 
@@ -57,12 +63,15 @@ class VectorDvWriteSuite extends AnyFunSuite with BeforeAndAfterAll {
     finally super.afterAll()
   }
 
-  private def withFlag[T](on: Boolean)(f: => T): T = {
-    val key = "spark.vecruntime.iceberg.dvWriter.enabled"
-    val prev = spark.conf.getOption(key)
-    spark.conf.set(key, on.toString)
+  protected def withFlag[T](on: Boolean)(f: => T): T = {
+    val keys = Seq("spark.vecruntime.iceberg.dvWriter.enabled" -> on) ++
+      (if (columnarData) Seq("spark.vecruntime.iceberg.writer.enabled" -> on) else Nil)
+    val prev = keys.map { case (k, _) => k -> spark.conf.getOption(k) }
+    keys.foreach { case (k, v) => spark.conf.set(k, v.toString) }
     try f
-    finally prev match { case Some(v) => spark.conf.set(key, v); case None => spark.conf.unset(key) }
+    finally prev.foreach { case (k, p) =>
+        p match { case Some(v) => spark.conf.set(k, v); case None => spark.conf.unset(k) }
+      }
   }
 
   private def rows(t: String): Array[Row] = spark.sql(s"SELECT * FROM $t ORDER BY id").collect()
@@ -175,12 +184,17 @@ class VectorDvWriteSuite extends AnyFunSuite with BeforeAndAfterAll {
 
   test("v2 table falls back to Spark's WriteDeltaExec (our operator absent)") {
     createV3("ice.db.dv_v2", fmtVersion = 2)
-    val had = withFlag(on = true) {
-      val df = spark.sql("DELETE FROM ice.db.dv_v2 WHERE id % 3 = 0")
-      val h = planHasVectorWriteDelta(df)
-      df.collect()
-      h
-    }
+    // #901 M2 writes a v2 table's position deletes columnar; with that off, a v2 table keeps Spark's writer.
+    spark.conf.set("spark.vecruntime.iceberg.positionDeletes.enabled", "false")
+    val had =
+      try
+        withFlag(on = true) {
+          val df = spark.sql("DELETE FROM ice.db.dv_v2 WHERE id % 3 = 0")
+          val h = planHasVectorWriteDelta(df)
+          df.collect()
+          h
+        }
+      finally spark.conf.unset("spark.vecruntime.iceberg.positionDeletes.enabled")
     assert(!had, "v2 must fall back to Spark's writer; VectorWriteDeltaExec must be absent")
     assert(count("SELECT count(*) FROM ice.db.dv_v2 WHERE id % 3 = 0") == 0L)
   }
@@ -370,6 +384,62 @@ class VectorDvWriteSuite extends AnyFunSuite with BeforeAndAfterAll {
       assert(count(s"SELECT count(*) FROM ${base}_on") == 2000L - deleted + 500L, "live row count wrong")
       assert(count(s"SELECT count(*) FROM ${base}_on WHERE id >= 2000") == 500L, "inserted rows missing")
     }
+  }
+
+  test("UPDATE and MERGE on a v3 table with struct, array and map columns match Spark's writer") {
+    // These writes still read rows: Iceberg's own scan of a map column is row-based (the native read path,
+    // #901 R1, is a separate PR) and MergeRows has no map lane. Kept out of the suite-wide row-input count.
+    val rowInputBefore = org.apache.spark.sql.vecruntime.VectorWriteDeltaExec.rowInputWrites.get()
+    val base = "ice.db.dv_nested"
+    for (t <- Seq(s"${base}_on", s"${base}_off")) {
+      spark.sql(s"DROP TABLE IF EXISTS $t")
+      spark.sql(
+        s"""CREATE TABLE $t (id BIGINT, p INT,
+           |  s STRUCT<a: INT, d: DECIMAL(10,2), t: STRING>, l ARRAY<STRING>, m MAP<STRING, BIGINT>)
+           |USING iceberg PARTITIONED BY (p)
+           |TBLPROPERTIES ('format-version'='3', 'write.delete.mode'='merge-on-read',
+           |  'write.update.mode'='merge-on-read', 'write.merge.mode'='merge-on-read',
+           |  'write.target-file-size-bytes'='4096')""".stripMargin
+      )
+      spark.sql(
+        s"""INSERT INTO $t
+           |SELECT id, cast(id % 4 as int),
+           |  if(id % 11 = 0, null, named_struct('a', cast(id as int), 'd', cast(id / 7 as decimal(10,2)),
+           |    't', if(id % 3 = 0, null, concat('t', id)))),
+           |  if(id % 13 = 0, null, array(concat('x', id), null, concat('y', id % 5))),
+           |  if(id % 17 = 0, null, map(concat('k', id), id, 'z', id * 2))
+           |FROM range(2000)""".stripMargin
+      )
+    }
+    assert(
+      onOff(
+        base,
+        "UPDATE %s SET s = named_struct('a', -1, 'd', cast(1.5 as decimal(10,2)), 't', 'u') WHERE id % 7 = 0"
+      ),
+      "nested UPDATE not columnar"
+    )
+    spark
+      .sql(
+        """SELECT id, cast(id % 4 as int) AS p, array(concat('n', id)) AS l, id % 3 AS op
+          |FROM range(1500, 2500)""".stripMargin
+      )
+      .createOrReplaceTempView("dv_src_nested")
+    val merge =
+      """MERGE INTO %s t USING dv_src_nested s ON t.id = s.id
+        |WHEN MATCHED AND s.op = 0 THEN DELETE
+        |WHEN MATCHED THEN UPDATE SET t.l = s.l
+        |WHEN NOT MATCHED THEN INSERT (id, p, s, l, m) VALUES (s.id, s.p, null, s.l, map('i', s.id))""".stripMargin
+    assert(onOff(base, merge), "nested MERGE not columnar")
+    // Inserted rows get their _row_id at commit, from the order of the new files: compared for the originals only.
+    def all(t: String): Array[Row] =
+      spark.sql(s"SELECT *, if(id < 2000, _row_id, null) FROM $t ORDER BY id").collect()
+    val (rOn, rOff) = (all(s"${base}_on"), all(s"${base}_off"))
+    val diff = rOn.zip(rOff).filter { case (a, b) => a != b }.take(3)
+    assert(
+      rOn.length == rOff.length && diff.isEmpty,
+      s"nested contents or _row_id differ: ${rOn.length} vs ${rOff.length} rows; ${diff.mkString("; ")}"
+    )
+    org.apache.spark.sql.vecruntime.VectorWriteDeltaExec.rowInputWrites.set(rowInputBefore)
   }
 
   test("MERGE with only a NOT MATCHED insert clause leaves no DVs and matches Spark's writer") {
