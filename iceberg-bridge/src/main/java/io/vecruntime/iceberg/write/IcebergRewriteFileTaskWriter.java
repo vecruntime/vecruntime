@@ -106,6 +106,7 @@ public final class IcebergRewriteFileTaskWriter implements AutoCloseable {
     private final int fileOrdinal;
     private final int posOrdinal;
     private final int[] dataOrdinals;
+    private final PartitionKeys keys;
     private final Arena arena = Arena.ofShared();
     private final Map<String, FileBuffer> buffers = new LinkedHashMap<>();
     private final List<DataFile> done = new ArrayList<>();
@@ -143,6 +144,7 @@ public final class IcebergRewriteFileTaskWriter implements AutoCloseable {
         this.fileOrdinal = fileOrdinal;
         this.posOrdinal = posOrdinal;
         this.dataOrdinals = dataOrdinals;
+        this.keys = spec.spec().isUnpartitioned() ? null : new PartitionKeys(spec.spec(), spec.writeSchema());
     }
 
     /**
@@ -243,24 +245,43 @@ public final class IcebergRewriteFileTaskWriter implements AutoCloseable {
         long sourceRows = footer.getBlocks().stream()
                 .mapToLong(b -> b.getRowCount())
                 .sum();
+        // Runtime safety guard: a copy is only valid if this task holds the file's rows exactly once, within
+        // range. If a position repeats or is out of range (a split file routed part elsewhere, or a corrupt
+        // _pos), the survivor set is not this file's true survivor set, so we must not copy -- force a full
+        // rewrite of whatever rows this task does hold (correct data; just no byte copy).
         boolean[] survives = new boolean[(int) sourceRows];
+        boolean safe = total <= sourceRows;
         for (long p : pos) {
-            if (p >= 0 && p < sourceRows) {
-                survives[(int) p] = true;
+            if (p < 0 || p >= sourceRows || survives[(int) p]) {
+                safe = false;
+                break;
             }
+            survives[(int) p] = true;
         }
-        long deletedCount = sourceRows - total;
-        long[] deleted = new long[(int) deletedCount];
-        int di = 0;
-        for (int p = 0; p < sourceRows; p++) {
-            if (!survives[p]) {
-                deleted[di++] = p;
+        long[] deleted;
+        if (safe) {
+            long deletedCount = sourceRows - total;
+            deleted = new long[(int) deletedCount];
+            int di = 0;
+            for (int p = 0; p < sourceRows; p++) {
+                if (!survives[p]) {
+                    deleted[di++] = p;
+                }
             }
+        } else {
+            // Treat every row this task holds as surviving and re-encode them all (no copy): mark all deleted
+            // so the planner yields REENCODE/SKIP only, and copyable() still gates the copy off below.
+            deleted = new long[0];
         }
 
-        RowGroupCopyPlanner plan = RowGroupCopyPlanner.plan(footer, writeSchema, deleted, spec.writeSchema(), metricsConfig);
+        RowGroupCopyPlanner plan = safe ? RowGroupCopyPlanner.plan(footer, writeSchema, deleted, spec.writeSchema(), metricsConfig) : null;
+        boolean copyable = safe && plan.copyable();
 
-        EncryptedOutputFile out = files.newOutputFile();
+        // The partition of this file's rows (all share one partition), from the first buffered row. Null for an
+        // unpartitioned spec; used so a rewritten file keeps its source file's partition.
+        org.apache.iceberg.PartitionKey partition = partitionOf(buffer);
+
+        EncryptedOutputFile out = partition == null ? files.newOutputFile() : files.newOutputFile(spec.spec(), partition);
         String location = out.encryptingOutputFile().location();
         written.add(location);
         IcebergParquetAppender appender;
@@ -275,27 +296,35 @@ public final class IcebergRewriteFileTaskWriter implements AutoCloseable {
         long[] posToPacked = new long[(int) sourceRows];
         Arrays.fill(posToPacked, -1L);
         for (int i = 0; i < total; i++) {
-            posToPacked[(int) pos[i]] = ((long) chunkOf[i] << 32) | (rowInChunk[i] & 0xffffffffL);
+            if (pos[i] >= 0 && pos[i] < sourceRows) {
+                posToPacked[(int) pos[i]] = ((long) chunkOf[i] << 32) | (rowInChunk[i] & 0xffffffffL);
+            }
         }
 
-        try (SeekableInputStream stream = plan.copyable() ? in.newStream() : null) {
-            for (RowGroupCopyPlanner.Group g : plan.groups()) {
-                RowGroupCopyPlanner.Action action = plan.copyable() ? g.action() : RowGroupCopyPlanner.Action.REENCODE;
-                if (action == RowGroupCopyPlanner.Action.COPY) {
-                    appender.copyRowGroup(stream, footer.getBlocks()
-                            .get(g.ordinal()));
-                    COPIED_ROW_GROUPS.increment();
-                } else if (action == RowGroupCopyPlanner.Action.REENCODE) {
-                    reencodeGroup(appender, buffer, g, posToPacked);
+        if (copyable) {
+            try (SeekableInputStream stream = in.newStream()) {
+                for (RowGroupCopyPlanner.Group g : plan.groups()) {
+                    if (g.action() == RowGroupCopyPlanner.Action.COPY) {
+                        appender.copyRowGroup(stream, footer.getBlocks()
+                                .get(g.ordinal()));
+                        COPIED_ROW_GROUPS.increment();
+                    } else if (g.action() == RowGroupCopyPlanner.Action.REENCODE) {
+                        reencodeGroup(appender, buffer, g, posToPacked);
+                    }
+                    // SKIP: every row of the group was deleted -- nothing written.
                 }
-                // SKIP: every row of the group was deleted -- nothing written.
+                appender.close();
+            } catch (IOException ioe) {
+                throw new UncheckedIOException(ioe);
             }
-            if (!plan.copyable()) {
-                appender.endRowGroup();
+        } else {
+            // Full rewrite: re-encode every surviving row this task holds, in _pos order, no copy.
+            try {
+                reencodeAll(appender, buffer, pos, chunkOf, rowInChunk, total);
+                appender.close();
+            } catch (IOException ioe) {
+                throw new UncheckedIOException(ioe);
             }
-            appender.close();
-        } catch (IOException ioe) {
-            throw new UncheckedIOException(ioe);
         }
 
         DataFiles.Builder b = DataFiles.builder(spec.spec())
@@ -304,7 +333,54 @@ public final class IcebergRewriteFileTaskWriter implements AutoCloseable {
                 .withFileSizeInBytes(appender.length())
                 .withMetrics(appender.metrics())
                 .withSplitOffsets(appender.splitOffsets());
+        if (partition != null) {
+            b.withPartition(partition);
+        }
         done.add(b.build());
+    }
+
+    /**
+     * The partition of a file's buffered rows (they share one), or null for an
+     * unpartitioned spec.
+     */
+    private org.apache.iceberg.PartitionKey partitionOf(FileBuffer buffer) {
+        if (keys == null) {
+            return null;
+        }
+        List<VectorBuffers> first = buffer.dataChunks.get(0);
+        Object[][] values = keys.compute(first, 0, 1);
+        return keys.key(values, 0);
+    }
+
+    /**
+     * Re-encodes every surviving row (across all chunks) in {@code _pos} order,
+     * as one group stream.
+     */
+    private void reencodeAll(IcebergParquetAppender appender, FileBuffer buffer, long[] pos,
+            int[] chunkOf, int[] rowInChunk, int total)
+            throws IOException {
+        Integer[] order = new Integer[total];
+        for (int i = 0; i < total; i++) {
+            order[i] = i;
+        }
+        Arrays.sort(order, (x, y) -> Long.compare(pos[x], pos[y]));
+        try (Arena a = Arena.ofConfined()) {
+            int i = 0;
+            while (i < total) {
+                int chunk = chunkOf[order[i]];
+                int j = i;
+                while (j < total && chunkOf[order[j]] == chunk) {
+                    j++;
+                }
+                int[] rows = new int[j - i];
+                for (int t = 0; t < rows.length; t++) {
+                    rows[t] = rowInChunk[order[i + t]];
+                }
+                List<VectorBuffers> gathered = Gather.rows(buffer.dataChunks.get(chunk), rows, a);
+                appender.write(gathered, 0, rows.length);
+                i = j;
+            }
+        }
     }
 
     /**

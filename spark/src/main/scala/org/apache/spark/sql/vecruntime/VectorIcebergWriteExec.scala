@@ -76,14 +76,14 @@ case class VectorIcebergWriteStrategy(session: SparkSession) extends SparkStrate
           if (ordinals.exists(_.isEmpty)) {
             declined(s"write column ${names(ordinals.indexWhere(_.isEmpty))} is in neither projection")
           } else {
-            // #901 M4a: a copy-on-write DELETE (no row data changes, just rows dropped) can copy the row
-            // groups it does not touch, when the flag is on, the target is unpartitioned, and the scan
-            // projects _file / _pos (Iceberg's copy-on-write scan does). Anything else writes every group.
+            // #901 M4a: a copy-on-write DELETE (no row data changes, just rows dropped) copies the row groups
+            // it does not touch, when the flag is on and the scan projects _file / _pos (Iceberg's
+            // copy-on-write scan does). Partitioned and unpartitioned both work -- a rewritten file keeps its
+            // source file's partition. An UPDATE or MERGE rewrites values and is not eligible.
             val copy =
               if (
                 VectorConf.icebergCopyUnchangedEnabled(conf) &&
-                VectorIcebergWriteStrategy.isDelete(r) &&
-                IcebergWriteBridge.isUnpartitioned(w)
+                VectorIcebergWriteStrategy.isDelete(r)
               ) {
                 (ordinal("_file"), ordinal("_pos")) match {
                   case (Some(f), Some(p)) => Some((f, p))
@@ -124,12 +124,26 @@ case class VectorIcebergWriteStrategy(session: SparkSession) extends SparkStrate
       case Some(r) => declined(r)
       case None =>
         val rowOrdinals = ordinals.getOrElse(query.output.indices.toArray)
+        // #901 M4a: for the copy path, cluster the input by _file with a plain hash partitioning
+        // (RepartitionByExpression -> ShuffleExchange hashpartitioning(_file), ENSURE_REQUIREMENTS). This
+        // replaces Iceberg's REBALANCE_PARTITIONS_BY_COL distribution: a plain hash exchange sends every row
+        // of a file to one reducer and is never split by AQE's OptimizeSkewInRebalancePartitions (which only
+        // touches REBALANCE exchanges), so a source file is whole in one task and its row groups can be copied.
+        val child = copy match {
+          case Some((fileOrd, _)) =>
+            org.apache.spark.sql.catalyst.plans.logical.RepartitionByExpression(
+              Seq(query.output(fileOrd)),
+              query,
+              None
+            )
+          case None => query
+        }
         Seq(
           VectorIcebergWriteExec(
             write.get,
             IcebergWriteBridge.specOf(write.get),
             rowOrdinals,
-            planLater(query),
+            planLater(child),
             VectorIcebergWriteStrategy.refreshCache(session, Option(original).getOrElse(table)),
             plan.nodeName,
             copy.map(_._1).getOrElse(-1),
@@ -225,7 +239,14 @@ case class VectorIcebergWriteExec(
     val ordinals = rowOrdinals
     val fileOrd = fileOrdinal
     val posOrd = posOrdinal
-    val copy = copyUnchanged
+    // #901 M4a safe by construction: copy only when the input is clustered by _file (a HashPartitioning on
+    // exactly the _file attribute, after AQE). Our strategy wraps the copy child in RepartitionByExpression
+    // (_file) so this holds; if for any reason it does not (AQE changed it, a plan we did not expect), fall
+    // back to the streaming full rewrite rather than risk a split file.
+    val copy = copyUnchanged && VectorIcebergWriteExec.clusteredByFile(query, fileOrd)
+    if (copyUnchanged && !copy) {
+      logInfo("vecruntime: M4a copy-unchanged declined -- input is not clustered by _file; full rewrite")
+    }
     val messages = new mutable.ArrayBuffer[WriterCommitMessage]()
     try {
       messages ++= nonEmpty
@@ -305,6 +326,47 @@ object VectorIcebergWriteExec extends Logging {
         logInfo(s"vecruntime: the columnar Iceberg writer reads rows from ${p.nodeName} (RowToColumnarExec)")
         (RowToColumnarExec(p).executeColumnar(), true)
     }
+  }
+
+  /**
+   * Whether the resolved child's output is clustered by exactly the `_file` attribute at ordinal
+   * `fileOrdinal` -- a `HashPartitioning` on that one attribute (#901 M4a). This is the safe-by-construction
+   * gate for the copy path: a plain hash partitioning sends every row of a file to one task and is never
+   * split by AQE skew handling, so a source file is whole in one task. Resolved through the adaptive final
+   * plan and below the row transition, the same place [[columnar]] reads the batches.
+   */
+  def clusteredByFile(query: SparkPlan, fileOrdinal: Int): Boolean = {
+    import org.apache.spark.sql.catalyst.expressions.AttributeSet
+    import org.apache.spark.sql.catalyst.plans.physical.{HashPartitioningLike, RangePartitioning}
+    val plan = query match {
+      case a: AdaptiveSparkPlanExec => a.finalPhysicalPlan
+      case p => p
+    }
+    val child = plan match {
+      case t: ColumnarToRowTransition => t.child
+      case w: org.apache.spark.sql.execution.WholeStageCodegenExec
+          if w.child.isInstanceOf[ColumnarToRowTransition] => w.child.children.head
+      case p => p
+    }
+    if (fileOrdinal < 0 || fileOrdinal >= child.output.length) return false
+    val fileAttr = child.output(fileOrdinal)
+    val fileSet = AttributeSet(fileAttr)
+    // Clustered by exactly _file: a hash (or range) partitioning whose expressions reference only _file. A
+    // plain hash partitioning sends every row of a file to one reducer and is never split by AQE skew
+    // handling (that only rewrites REBALANCE exchanges), so a source file is whole in one task.
+    def onlyFile(exprs: Seq[org.apache.spark.sql.catalyst.expressions.Expression]): Boolean =
+      exprs.nonEmpty && exprs.forall(e => e.references.nonEmpty && e.references.subsetOf(fileSet))
+    val ok = child.outputPartitioning match {
+      case h: HashPartitioningLike => onlyFile(h.expressions)
+      case r: RangePartitioning => onlyFile(r.ordering.map(_.child))
+      case _ => false
+    }
+    if (!ok) {
+      logInfo(
+        s"vecruntime: M4a clustering check -- outputPartitioning ${child.outputPartitioning.getClass.getSimpleName} of ${child.nodeName} is not a single-_file hash"
+      )
+    }
+    ok
   }
 
   /** One task: its batches through the bridge's task writer; Iceberg's commit message for the files. */
