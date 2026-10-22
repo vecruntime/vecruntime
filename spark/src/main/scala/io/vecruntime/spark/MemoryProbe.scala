@@ -32,10 +32,13 @@ object MemoryProbe {
 
   /** This JVM's values, by name; bytes unless the name says otherwise. */
   def snapshot(): Map[String, Long] = {
+    PoolSampler.ensureStarted()
     val pool = io.vecruntime.kernels.NativePool.shared()
     val oldGen = heapPools.filter(p => p.getName.contains("Old") || p.getName.contains("Tenured"))
     val (rss, rssPeak) = processRss()
     Map(
+      "offHeapExecutionPeak" -> PoolSampler.offHeapPeak.get(),
+      "onHeapExecutionPeak" -> PoolSampler.onHeapPeak.get(),
       "nativePoolInUse" -> pool.inUseBytes(),
       "nativePoolPeak" -> pool.peakInUseBytes(),
       "nativePoolRetained" -> pool.retainedBytes(),
@@ -58,6 +61,7 @@ object MemoryProbe {
 
   /** Restarts every peak that can be restarted, so the next snapshot's peaks are this interval's. */
   def resetPeaks(): Unit = {
+    PoolSampler.reset()
     io.vecruntime.kernels.NativePool.shared().resetPeak()
     org.apache.spark.sql.vecruntime.PinnedMemory.resetPeak()
     org.apache.spark.sql.vecruntime.VectorParquetScanExec.resetPrefetchPeak()
@@ -121,4 +125,43 @@ object MemoryProbe {
         lines.find(_.startsWith(key)).map(_.split("\\s+")(1).toLong * 1024L).getOrElse(0L)
       (kb("VmRSS:"), kb("VmHWM:"))
     } catch { case _: Exception => (0L, 0L) }
+
+  /**
+   * The peaks of Spark's own execution pools (what `TaskMemoryManager` has granted, on and off heap), which Spark
+   * keeps only as current values: a daemon thread samples them every 100 ms once the first snapshot is taken.
+   */
+  private object PoolSampler {
+    val offHeapPeak = new java.util.concurrent.atomic.AtomicLong()
+    val onHeapPeak = new java.util.concurrent.atomic.AtomicLong()
+    @volatile private var started = false
+
+    def ensureStarted(): Unit = if (!started) synchronized {
+      if (!started) {
+        val t = new Thread(
+          () => {
+            while (true) {
+              val env = org.apache.spark.SparkEnv.get
+              if (env != null) {
+                val mm = env.memoryManager
+                offHeapPeak.accumulateAndGet(mm.offHeapExecutionMemoryUsed, math.max)
+                onHeapPeak.accumulateAndGet(mm.onHeapExecutionMemoryUsed, math.max)
+              }
+              try Thread.sleep(100)
+              catch { case _: InterruptedException => () }
+            }
+          },
+          "vecruntime-memory-probe"
+        )
+        t.setDaemon(true)
+        t.start()
+        started = true
+      }
+    }
+
+    def reset(): Unit = {
+      val env = org.apache.spark.SparkEnv.get
+      offHeapPeak.set(if (env == null) 0L else env.memoryManager.offHeapExecutionMemoryUsed)
+      onHeapPeak.set(if (env == null) 0L else env.memoryManager.onHeapExecutionMemoryUsed)
+    }
+  }
 }

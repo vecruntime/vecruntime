@@ -19,6 +19,7 @@ import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 
 import io.vecruntime.kernels.Bitmap;
+import io.vecruntime.kernels.FixedBinaryVectorBuffers;
 import io.vecruntime.kernels.VecType;
 import io.vecruntime.kernels.VectorBuffers;
 import org.apache.parquet.column.ColumnDescriptor;
@@ -132,10 +133,56 @@ abstract class ColumnEncoder {
                     return new Decimal128Fixed(column, type.getTypeLength());
                 }
                 break;
+            case FIXED_BINARY:
+                if (p == PrimitiveTypeName.FIXED_LEN_BYTE_ARRAY && !decimal) {
+                    return new FixedBinary(column, type.getTypeLength());
+                }
+                break;
             default:
                 break;
         }
         throw new IllegalArgumentException("no encoder for a " + lane + " lane as " + type);
+    }
+
+    /**
+     * A {@link VecType#FIXED_BINARY} lane (Arrow FixedSizeBinary) as a {@code
+     * FIXED_LEN_BYTE_ARRAY} of the same width: each value's bytes as they are.
+     */
+    private static final class FixedBinary extends ColumnEncoder {
+        private final int length;
+
+        FixedBinary(ColumnDescriptor c, int length) {
+            super(c);
+            this.length = length;
+        }
+
+        private byte[] value(VectorBuffers v, int i) {
+            FixedBinaryVectorBuffers f = (FixedBinaryVectorBuffers) v;
+            if (f.width() != length) {
+                throw new IllegalArgumentException("a FIXED_BINARY(" + f.width() + ") lane for a fixed[" + length + "] column");
+            }
+            return f.bytes(i);
+        }
+
+        @Override
+        void put(VectorBuffers v, int i, int rep,
+                 int def, ColumnWriter w) {
+            w.write(Binary.fromConstantByteArray(value(v, i)), rep, def);
+        }
+
+        @Override
+        void write(VectorBuffers v, int from, int to,
+                   ColumnWriter w) {
+            MemorySegment validity = v.validity();
+            for (int i = from; i < to; i++) {
+                if (isNull(validity, i)) {
+                    writeNull(w);
+                } else {
+                    // Constant: the dictionary and the statistics may keep the value past this call.
+                    w.write(Binary.fromConstantByteArray(value(v, i)), 0, maxDef);
+                }
+            }
+        }
     }
 
     // ------------------------------------------------------------------------------------------------------------

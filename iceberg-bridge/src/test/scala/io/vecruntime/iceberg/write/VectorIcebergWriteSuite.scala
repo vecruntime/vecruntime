@@ -223,6 +223,141 @@ class VectorIcebergWriteSuite extends AnyFunSuite with BeforeAndAfterAll {
     assert(on == off)
   }
 
+  test("variant columns write columnar as the variant group, equal to Iceberg's writer") {
+    for (t <- Seq("ice.db.var_on", "ice.db.var_off")) {
+      spark.sql(s"DROP TABLE IF EXISTS $t")
+      spark.sql(
+        s"""CREATE TABLE $t (id BIGINT, v VARIANT, s STRUCT<w: VARIANT>, l ARRAY<VARIANT>)
+           |USING iceberg TBLPROPERTIES ('format-version'='3')""".stripMargin
+      )
+    }
+    val src =
+      """SELECT id,
+        |  if(id % 7 = 0, null, parse_json(concat('{"a":', id, ',"b":"s', id % 13, '","c":[1,2,{"d":null}]}'))),
+        |  if(id % 11 = 0, null, named_struct('w', if(id % 3 = 0, null, parse_json(cast(id * 1.5 as string))))),
+        |  if(id % 5 = 0, null, array(parse_json('"x"'), null, parse_json('true')))
+        |FROM range(3000)""".stripMargin
+    withWriter(on = false)(spark.sql(s"INSERT INTO ice.db.var_off $src").collect())
+    val df = withWriter(on = true)(spark.sql(s"INSERT INTO ice.db.var_on $src"))
+    df.collect()
+    assert(columnar(df), "a variant column no longer falls back")
+    def text(t: String) =
+      spark.sql(s"SELECT id, to_json(v), to_json(s.w), transform(l, x -> to_json(x)) FROM $t ORDER BY id")
+        .collect().map(_.toString).toSeq
+    assert(text("ice.db.var_on") == text("ice.db.var_off"))
+    def metrics(t: String) =
+      spark.sql(
+        s"SELECT record_count, value_counts, null_value_counts, transform_values(lower_bounds, (k, v) -> hex(v)), transform_values(upper_bounds, (k, v) -> hex(v)) FROM $t.files"
+      ).collect().map(_.toString).sorted.toSeq
+    assert(metrics("ice.db.var_on") == metrics("ice.db.var_off"), "file metrics differ from Iceberg's writer")
+  }
+
+  test("a table that shreds variants keeps Iceberg's writer") {
+    val t = "ice.db.var_shred"
+    spark.sql(s"DROP TABLE IF EXISTS $t")
+    spark.sql(
+      s"""CREATE TABLE $t (id BIGINT, v VARIANT) USING iceberg
+         |TBLPROPERTIES ('format-version'='3', 'write.parquet.shred-variants'='true')""".stripMargin
+    )
+    val df =
+      withWriter(on = true)(spark.sql(s"INSERT INTO $t SELECT id, parse_json(cast(id as string)) FROM range(10)"))
+    df.collect()
+    assert(!columnar(df), "a shredded variant must stay on Iceberg's writer")
+    assert(spark.sql(s"SELECT count(*) FROM $t").collect()(0).getLong(0) == 10L)
+  }
+
+  test("fixed columns write columnar as FIXED_LEN_BYTE_ARRAY, equal to Iceberg's writer") {
+    // Spark has no fixed type to declare: the tables are created through Iceberg's catalog.
+    import org.apache.iceberg.types.Types
+    import org.apache.iceberg.types.Types.NestedField.optional
+    val catalog =
+      new org.apache.iceberg.hadoop.HadoopCatalog(new org.apache.hadoop.conf.Configuration(), warehouse.toString)
+    val schema = new org.apache.iceberg.Schema(
+      optional(1, "id", Types.LongType.get()),
+      optional(2, "f", Types.FixedType.ofLength(4)),
+      optional(3, "s", Types.StructType.of(optional(4, "g", Types.FixedType.ofLength(2)))),
+      optional(5, "l", Types.ListType.ofOptional(6, Types.FixedType.ofLength(3)))
+    )
+    for (name <- Seq("fixed_on", "fixed_off")) {
+      val id = org.apache.iceberg.catalog.TableIdentifier.of("db", name)
+      catalog.dropTable(id)
+      catalog.createTable(id, schema, org.apache.iceberg.PartitionSpec.unpartitioned())
+    }
+    val src =
+      """SELECT id,
+        |  if(id % 7 = 0, null, unhex(lpad(hex(id), 8, '0'))),
+        |  if(id % 11 = 0, null, named_struct('g', if(id % 3 = 0, null, unhex(lpad(hex(id % 65536), 4, '0'))))),
+        |  if(id % 5 = 0, null, array(unhex('00ff10'), null, unhex(lpad(hex(id % 4096), 6, '0'))))
+        |FROM range(3000)""".stripMargin
+    withWriter(on = false)(spark.sql(s"INSERT INTO ice.db.fixed_off $src").collect())
+    val df = withWriter(on = true)(spark.sql(s"INSERT INTO ice.db.fixed_on $src"))
+    df.collect()
+    assert(columnar(df), "a fixed column no longer falls back")
+    def text(t: String) =
+      spark.sql(
+        s"SELECT id, hex(f), hex(s.g), transform(l, x -> hex(x)) FROM $t ORDER BY id"
+      ).collect().map(_.toString).toSeq
+    assert(text("ice.db.fixed_on") == text("ice.db.fixed_off"))
+    def metrics(t: String) =
+      spark.sql(
+        s"SELECT record_count, value_counts, null_value_counts, transform_values(lower_bounds, (k, v) -> hex(v)), transform_values(upper_bounds, (k, v) -> hex(v)) FROM $t.files"
+      ).collect().map(_.toString).sorted.toSeq
+    assert(metrics("ice.db.fixed_on") == metrics("ice.db.fixed_off"), "file metrics differ from Iceberg's writer")
+    // A value of the wrong length fails the write, as it does in Iceberg's writer.
+    val e = intercept[Exception](withWriter(on =
+      true
+    )(spark.sql("INSERT INTO ice.db.fixed_on SELECT 1, unhex('00'), null, null").collect()))
+    assert(Iterator.iterate[Throwable](e)(_.getCause).takeWhile(_ != null).exists(_.getMessage.contains("fixed[4]")))
+  }
+
+  test("uuid columns write columnar as 16-byte FIXED_LEN_BYTE_ARRAY, equal to Iceberg's writer") {
+    // Spark has no uuid type to declare: the tables are created through Iceberg's catalog.
+    import org.apache.iceberg.types.Types
+    import org.apache.iceberg.types.Types.NestedField.optional
+    val catalog =
+      new org.apache.iceberg.hadoop.HadoopCatalog(new org.apache.hadoop.conf.Configuration(), warehouse.toString)
+    val schema = new org.apache.iceberg.Schema(
+      optional(1, "id", Types.LongType.get()),
+      optional(2, "u", Types.UUIDType.get()),
+      optional(3, "s", Types.StructType.of(optional(4, "v", Types.UUIDType.get()))),
+      optional(5, "m", Types.MapType.ofOptional(6, 7, Types.StringType.get(), Types.UUIDType.get()))
+    )
+    for (name <- Seq("uuid_on", "uuid_off")) {
+      val id = org.apache.iceberg.catalog.TableIdentifier.of("db", name)
+      catalog.dropTable(id)
+      catalog.createTable(id, schema, org.apache.iceberg.PartitionSpec.unpartitioned())
+    }
+    // Upper and lower case, and the all-zero and all-ones UUIDs at the edges of the bounds.
+    val src =
+      """SELECT id,
+        |  if(id % 7 = 0, null, if(id % 2 = 0, upper(uuid_of(id)), uuid_of(id))),
+        |  if(id % 11 = 0, null, named_struct('v', if(id % 3 = 0, null, uuid_of(id * 31)))),
+        |  if(id % 5 = 0, null, map('z', '00000000-0000-0000-0000-000000000000', 'f', 'ffffffff-ffff-ffff-ffff-ffffffffffff'))
+        |FROM range(3000)""".stripMargin
+    spark.udf.register(
+      "uuid_of",
+      (n: Long) => new java.util.UUID(n * 0x9e3779b97f4a7c15L, ~n * 0xbf58476d1ce4e5b9L).toString
+    )
+    withWriter(on = false)(spark.sql(s"INSERT INTO ice.db.uuid_off $src").collect())
+    val df = withWriter(on = true)(spark.sql(s"INSERT INTO ice.db.uuid_on $src"))
+    df.collect()
+    assert(columnar(df), "a uuid column no longer falls back")
+    def text(t: String) = spark.sql(s"SELECT * FROM $t ORDER BY id").collect().map(_.toString).toSeq
+    assert(text("ice.db.uuid_on") == text("ice.db.uuid_off"))
+    def metrics(t: String) =
+      spark.sql(
+        s"SELECT record_count, value_counts, null_value_counts, transform_values(lower_bounds, (k, v) -> hex(v)), transform_values(upper_bounds, (k, v) -> hex(v)) FROM $t.files"
+      ).collect().map(_.toString).sorted.toSeq
+    assert(metrics("ice.db.uuid_on") == metrics("ice.db.uuid_off"), "file metrics differ from Iceberg's writer")
+    // Text that is not a UUID fails the write, as UUID.fromString fails it in Iceberg's writer.
+    val e = intercept[Exception](
+      withWriter(on = true)(spark.sql("INSERT INTO ice.db.uuid_on SELECT 1, 'not-a-uuid', null, null").collect())
+    )
+    assert(Iterator.iterate[Throwable](e)(_.getCause).takeWhile(_ != null).exists(t =>
+      String.valueOf(t.getMessage).contains("not a UUID")
+    ))
+  }
+
   test("floats and doubles inside lists and maps write columnar, equal to Iceberg's writer") {
     for (t <- Seq("ice.db.fl_on", "ice.db.fl_off")) {
       spark.sql(s"DROP TABLE IF EXISTS $t")

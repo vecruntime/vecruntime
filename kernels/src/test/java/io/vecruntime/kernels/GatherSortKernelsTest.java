@@ -228,8 +228,8 @@ class GatherSortKernelsTest {
         Random rnd = new Random(14);
         try (Arena arena = Arena.ofConfined()) {
             for (VecType type : VecType.values()) {
-                if (type.isNested()) {
-                    continue; // no ColumnBuilder for a nested lane (#705)
+                if (type.isNested() || type == VecType.FIXED_BINARY) {
+                    continue; // no ColumnBuilder for a nested lane (#705) or a FIXED_BINARY one (it reaches no operator)
                 }
                 ColumnBuilder builder = new ColumnBuilder(arena, type, 16);
                 java.util.List<Object> expected = new java.util.ArrayList<>();
@@ -243,7 +243,8 @@ class GatherSortKernelsTest {
                         case BOOL -> ArrowLayout.ofBooleans(arena, booleans(rnd, n), nulls);
                         case UTF8 -> batch % 2 == 0 ? strings(arena, rnd, n, 0.2) : dictionary(arena, strings(arena, rnd, n, 0.2));
                         case DECIMAL128 -> TestData.decimal128s(arena, rnd, n, nulls);
-                        case LIST, MAP, STRUCT -> throw new IllegalStateException("no nested lane here (#705)");
+                        case LIST, MAP, STRUCT, FIXED_BINARY ->
+                                throw new IllegalStateException("no nested or FIXED_BINARY lane here (#705)");
                     };
                     MemorySegment selection = batch % 4 == 1 ? null : TestData.randomBitmap(arena, rnd, n);
                     int count = selection == null ? n : Bitmap.popcount(selection, n);
@@ -275,7 +276,8 @@ class GatherSortKernelsTest {
             case BOOL -> v.getBoolean(i);
             case UTF8 -> v.getString(i);
             case DECIMAL128 -> v.getDecimal128(i);
-            case LIST, MAP, STRUCT -> throw new IllegalStateException("no nested lane here (#705)");
+            case LIST, MAP, STRUCT, FIXED_BINARY ->
+                    throw new IllegalStateException("no nested or FIXED_BINARY lane here (#705)");
         };
     }
 
