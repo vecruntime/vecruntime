@@ -265,7 +265,9 @@ case class VectorIcebergScanExec(
       if (kinds.contains(IcebergTasks.PartitionColumn)) IcebergTasks.partitionType(scan) else null,
       output.zip(kinds).collectFirst { case (a, IcebergTasks.PartitionColumn) =>
         a.dataType.asInstanceOf[StructType]
-      }.orNull
+      }.orNull,
+      // #901 item 6: the output schema for the Iceberg row-reader fallback's row-to-columnar conversion.
+      StructType(output.map(a => StructField(a.name, a.dataType, a.nullable)))
     )
     val out: RDD[ColumnarBatch] =
       if (emitSelection) rdd else rdd.mapPartitionsInternal(_.map(VectorIcebergScanExec.compacted))
@@ -341,7 +343,10 @@ private[vecruntime] final class VectorIcebergRDD(
     // #20 M3a: the table's unified partition type (org.apache.iceberg.types.Type, serializable) and the
     // `_partition` output's Spark struct type; both null when `_partition` is not projected.
     partitionType: AnyRef,
-    partitionSparkType: StructType
+    partitionSparkType: StructType,
+    // #901 item 6: the scan's output schema (names + types, in output order), to convert an Iceberg row-reader
+    // group's InternalRows into columnar batches and reorder them into output order.
+    outputSchema: StructType
 ) extends RDD[ColumnarBatch](sc, Nil) {
 
   override protected def getPartitions: Array[Partition] = parts
@@ -603,23 +608,53 @@ private[vecruntime] final class VectorIcebergRDD(
   }
 
   private def icebergIterator(p: InputPartition, context: TaskContext): Iterator[ColumnarBatch] = {
-    // The planner admits a scan Iceberg does not vectorize only when every task group reads natively.
-    if (!readerFactory.supportColumnarReads(p)) {
-      throw new IllegalStateException("an Iceberg task group needs Iceberg's reader, which is not columnar here")
-    }
-    val reader = readerFactory.createColumnarReader(p)
-    context.addTaskCompletionListener[Unit](_ => reader.close())
-    new Iterator[ColumnarBatch] {
-      private var advanced = false
-      private var more = false
-      override def hasNext: Boolean = {
-        if (!advanced) { more = reader.next(); advanced = true }
-        more
+    if (readerFactory.supportColumnarReads(p)) {
+      val reader = readerFactory.createColumnarReader(p)
+      context.addTaskCompletionListener[Unit](_ => reader.close())
+      return new Iterator[ColumnarBatch] {
+        private var advanced = false
+        private var more = false
+        override def hasNext: Boolean = {
+          if (!advanced) { more = reader.next(); advanced = true }
+          more
+        }
+        override def next(): ColumnarBatch = {
+          if (!hasNext) throw new NoSuchElementException("end of the Iceberg task group")
+          advanced = false
+          reader.get()
+        }
       }
+    }
+    // #861 / #901 item 6: Iceberg does not vectorize this group (nested columns, an ORC/Avro file, a delete our
+    // reader cannot apply, or encryption). Read it with Iceberg's own ROW reader inside this node and convert the
+    // rows to columnar batches, so the other task groups stay native. The row reader yields rows of the scan's
+    // read schema (= the output schema, in output order), so the converter writes straight into output order.
+    // Iceberg's reader reads the group exactly as it would on its own (its FileIO decrypts an encrypted file), so
+    // no group is ever read with wrong values.
+    val reader = readerFactory.createReader(p)
+    context.addTaskCompletionListener[Unit](_ => reader.close())
+    val converter = new org.apache.spark.sql.execution.vector.RowToColumnarAccess(outputSchema)
+    new Iterator[ColumnarBatch] {
+      private var pulled = false
+      private var has = false
+      private def advance(): Unit = if (!pulled) { has = reader.next(); pulled = true }
+      override def hasNext: Boolean = { advance(); has }
       override def next(): ColumnarBatch = {
-        if (!hasNext) throw new NoSuchElementException("end of the Iceberg task group")
-        advanced = false
-        reader.get()
+        advance()
+        if (!has) throw new NoSuchElementException("end of the Iceberg task group")
+        val vectors =
+          org.apache.spark.sql.execution.vectorized.OnHeapColumnVector.allocateColumns(batchSize, outputSchema)
+        val writable = vectors.asInstanceOf[Array[org.apache.spark.sql.execution.vectorized.WritableColumnVector]]
+        var rows = 0
+        while (has && rows < batchSize) {
+          converter.convert(reader.get(), writable)
+          rows += 1
+          has = reader.next()
+        }
+        pulled = true
+        val batch = new ColumnarBatch(vectors.asInstanceOf[Array[ColumnVector]], rows)
+        context.addTaskCompletionListener[Unit](_ => batch.close())
+        batch
       }
     }
   }
@@ -722,8 +757,12 @@ object VectorIcebergScanPlanner {
         return Left(s"unsupported column type ${a.name}:${a.dataType.simpleString}")
       }
     }
-    // Iceberg's reader is not vectorized for some scans (nested columns): every task group must then be read
-    // natively, since the node cannot fall back to Iceberg's columnar reader for one of them.
+    // Iceberg's reader is not vectorized for some scans (nested columns). A task group our reader cannot read
+    // natively (an ORC/Avro file, an encrypted file, a delete we cannot apply) is read by Iceberg's own ROW reader
+    // inside the node and converted to batches (#861 / #901 item 6), so the other groups stay native. This is
+    // admitted ONLY for a data-file scan every one of whose task groups is an Iceberg `FileScanTask` group -- never
+    // a metadata table (`.files`, `.snapshots`, whose partitions are not `SparkInputPartition`/`FileScanTask`),
+    // whose rows our reader cannot shape. A scan where NO group is native gains nothing and keeps Spark's scan.
     if (!b.supportsColumnar) {
       val kinds = b.output.zip(ids).map { case (a, id) => IcebergTasks.columnKind(a.name, id) }
       val constants = kinds.exists(k =>
@@ -733,9 +772,15 @@ object VectorIcebergScanPlanner {
       val parts = b.inputPartitions
       val projected = b.output.zip(ids).zip(kinds).collect { case ((_, id), IcebergTasks.DataColumn) => id }.toSet
       val equality = IcebergTasks.equalityColumnsOf(parts, IcebergTasks.tableSchema(b), projected).isDefined
-      if (!parts.forall(p => IcebergTasks.nativeTasks(p, equality, constants).isDefined)) {
-        return Left("Iceberg scan is not vectorized and a task group needs Iceberg's reader")
+      if (!IcebergTasks.allDataFileGroups(parts)) {
+        return Left("Iceberg scan is not vectorized and is not a data-file scan (metadata table)")
       }
+      val native = parts.count(p => IcebergTasks.nativeTasks(p, equality, constants).isDefined)
+      if (native == 0) {
+        return Left("Iceberg scan is not vectorized and no task group reads natively")
+      }
+      // Some groups native, the rest read by Iceberg's row reader inside the node: admit it (item 6). When every
+      // group is native (native == parts.length) nothing falls to Iceberg's reader, the pre-item-6 case.
     }
     Right(VectorIcebergScanExec(b, ids))
   }
@@ -1068,6 +1113,20 @@ private[vecruntime] object IcebergTasks {
     }
     Some(out.toArray)
   }
+
+  /**
+   * #901 item 6: whether every input partition is an Iceberg `SparkInputPartition` whose task group holds only
+   * `FileScanTask`s -- i.e. a data-file scan, not a metadata table (`.files`, `.snapshots`, `.manifests`, ...)
+   * whose partitions and tasks are different shapes. Only such a scan may admit the row-reader fallback, since the
+   * node reshapes the row reader's rows into the scan's output and a metadata table's rows are not data rows.
+   */
+  def allDataFileGroups(parts: Seq[InputPartition]): Boolean =
+    parts.nonEmpty && parts.forall { p =>
+      p.getClass.getName == "org.apache.iceberg.spark.source.SparkInputPartition" && {
+        val tasks = call(call(p, "taskGroup"), "tasks").asInstanceOf[java.util.Collection[AnyRef]].asScala
+        tasks.nonEmpty && tasks.forall(_.getClass.getName.contains("FileScanTask"))
+      }
+    }
 
   /**
    * #20 M3a: the per-file constants of the three v3 merge-on-read metadata columns, for the data file of one
