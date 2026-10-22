@@ -112,6 +112,9 @@ object WriteBenchRunner {
     s"wb.db.$name"
   }
 
+  /** The table name of case `c`, iteration `it`: the case with every character outside `[A-Za-z0-9]` an `_`. */
+  private def icebergName(c: String, it: Int): String = s"${c.replaceAll("[^A-Za-z0-9]", "_")}_$it"
+
   def main(argv: Array[String]): Unit = {
     val a = parse(argv.toList, Args())
     require(a.tables.nonEmpty && a.out.nonEmpty, "--tables and --out are required")
@@ -141,20 +144,28 @@ object WriteBenchRunner {
               val cols = spec.drop(codec.length + 1).split("\\+").filter(_.nonEmpty).toSeq
               df.write.mode("overwrite").option("compression", codec).partitionBy(cols: _*).parquet(target)
             case p if p.startsWith("iceberg-row-") || p.startsWith("iceberg-vector-") =>
-              // #842: `iceberg-<row|vector>-<codec>`: an append into a new unpartitioned Iceberg table (a Hadoop
+              // #842: `iceberg-<row|vector>-<codec>[@<partitioning>]`: an append into a new Iceberg table (a Hadoop
               // catalog under --write-base), written by Iceberg's own writer (`row`) or the columnar one (`vector`).
+              // `<partitioning>` is the PARTITIONED BY list with `+` between fields, e.g.
+              // `@ss_sold_date_sk` or `@bucket(16,ss_item_sk)+ss_store_sk`; without it the table is unpartitioned.
               val vector = p.startsWith("iceberg-vector-")
-              val codec = p.stripPrefix(if (vector) "iceberg-vector-" else "iceberg-row-")
-              val table = icebergTable(spark, a.writeBase, s"${c.replace('-', '_')}_$it")
+              val spec = p.stripPrefix(if (vector) "iceberg-vector-" else "iceberg-row-")
+              val codec = spec.takeWhile(_ != '@')
+              val partitioning = spec.drop(codec.length + 1).replace('+', ',')
+              val table = icebergTable(spark, a.writeBase, icebergName(c, it))
               spark.sql(
                 s"CREATE TABLE $table (${df.schema.toDDL}) USING iceberg " +
+                  (if (partitioning.nonEmpty) s"PARTITIONED BY ($partitioning) " else "") +
                   s"TBLPROPERTIES ('format-version'='2', 'write.parquet.compression-codec'='$codec')"
               )
               spark.conf.set("spark.vecruntime.iceberg.writer.enabled", vector.toString)
               try df.writeTo(table).append()
               finally spark.conf.unset("spark.vecruntime.iceberg.writer.enabled")
               t1 = System.nanoTime()
-              checksum = spark.table(table).selectExpr("count(*)", "sum(xxhash64(*))").collect()(0).toString
+              checksum = spark.table(table).selectExpr(
+                "count(*)",
+                "sum(cast(xxhash64(*) as decimal(38,0)))"
+              ).collect()(0).toString
             case other => throw new IllegalArgumentException(s"unknown case $other")
           }
         } finally spark.sparkContext.clearJobGroup()
@@ -168,7 +179,7 @@ object WriteBenchRunner {
         out.println(line)
         out.flush()
         if (c.startsWith("iceberg-") && !a.keep) {
-          spark.sql(s"DROP TABLE IF EXISTS ${icebergTable(spark, a.writeBase, s"${c.replace('-', '_')}_$it")} PURGE")
+          spark.sql(s"DROP TABLE IF EXISTS ${icebergTable(spark, a.writeBase, icebergName(c, it))} PURGE")
         } else if (c != "noop" && !a.keep) {
           val fs = FileSystem.get(new URI(target), spark.sparkContext.hadoopConfiguration)
           fs.delete(new HPath(target), true)
