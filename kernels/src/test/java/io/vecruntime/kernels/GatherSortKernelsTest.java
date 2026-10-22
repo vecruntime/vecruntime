@@ -228,8 +228,8 @@ class GatherSortKernelsTest {
         Random rnd = new Random(14);
         try (Arena arena = Arena.ofConfined()) {
             for (VecType type : VecType.values()) {
-                if (type.isNested()) {
-                    continue; // no ColumnBuilder for a nested lane (#705)
+                if (type.isNested() || type == VecType.FIXED_BINARY) {
+                    continue; // no ColumnBuilder for a nested lane (#705) or a FIXED_BINARY one (it reaches no operator)
                 }
                 ColumnBuilder builder = new ColumnBuilder(arena, type, 16);
                 java.util.List<Object> expected = new java.util.ArrayList<>();
