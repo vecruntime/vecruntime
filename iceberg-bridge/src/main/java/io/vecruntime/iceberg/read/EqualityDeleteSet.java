@@ -205,25 +205,19 @@ public final class EqualityDeleteSet {
             case BOOLEAN -> b.put((byte) (((Boolean) v) ? 1 : 0));
             case STRING -> b.putBytes(v.toString()
                     .getBytes(StandardCharsets.UTF_8));
-            case BINARY -> {
-                ByteBuffer bb = ((ByteBuffer) v).duplicate();
-                byte[] a = new byte[bb.remaining()];
-                bb.get(a);
-                b.putBytes(a);
-            }
+            case BINARY -> b.putBytes(bytesOf(v));
             case UUID -> {
                 // The native scan reads a uuid as its canonical lowercase 8-4-4-4-12 text (NativeParquetSupport),
                 // so the delete value is encoded the same way and the data lane (below) is compared text to text.
-                // Iceberg's internal uuid value is a java.util.UUID; a loader handing out the 16 raw bytes is read
-                // the same way.
+                // Iceberg's internal uuid value may be a java.util.UUID, its canonical text, or the 16 raw bytes
+                // (byte[] or ByteBuffer), depending on the delete loader's data model; all three normalise here.
                 String text;
                 if (v instanceof java.util.UUID u) {
                     text = u.toString();
+                } else if (v instanceof CharSequence cs) {
+                    text = cs.toString();
                 } else {
-                    ByteBuffer bb = ((ByteBuffer) v).duplicate();
-                    byte[] a = new byte[bb.remaining()];
-                    bb.get(a);
-                    text = org.apache.iceberg.util.UUIDUtil.convert(a).toString();
+                    text = org.apache.iceberg.util.UUIDUtil.convert(bytesOf(v)).toString();
                 }
                 b.putBytes(text.getBytes(StandardCharsets.UTF_8));
             }
@@ -231,6 +225,20 @@ public final class EqualityDeleteSet {
                     .unscaledValue()
                     .toByteArray());
         }
+    }
+
+    /**
+     * The bytes of a binary/fixed/uuid delete value: a {@code byte[]} (generic
+     * data model) or a {@link ByteBuffer}.
+     */
+    private static byte[] bytesOf(Object v) {
+        if (v instanceof byte[] a) {
+            return a;
+        }
+        ByteBuffer bb = ((ByteBuffer) v).duplicate();
+        byte[] a = new byte[bb.remaining()];
+        bb.get(a);
+        return a;
     }
 
     private static long longOf(Object v) {
