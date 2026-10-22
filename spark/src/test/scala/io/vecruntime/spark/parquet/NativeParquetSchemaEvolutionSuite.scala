@@ -329,4 +329,36 @@ class NativeParquetSchemaEvolutionSuite extends VectorQuerySuite {
       check("SELECT count(*), sum(v), max(w), sum(x), min(y), count(z) FROM evolve_default")
     } finally withPlugin(enabled = false)(spark.sql("DROP TABLE IF EXISTS evolve_default"))
   }
+
+  test("an INT32 or INT64 file read as a decimal of more than 18 digits is decoded natively (type widening)") {
+    // The DECIMAL128 lane fed from the INT32 / INT64 decode path, sign-extended, as Spark's
+    // IntegerToBinaryUpdater / LongToBinaryUpdater widen it (and the ToDecimal forms when rescaled). Spark reads
+    // an un-annotated integer as a decimal only when the requested precision leaves room for its integer digits
+    // (INT32 >= 10, INT64 >= 20), so decimal(20,2) is valid for an INT32 column and decimal(30,2) for an INT64 one;
+    // decimal(38,0) is valid for both.
+    for (v2 <- Seq(false, true); dictionary <- Seq(true, false)) {
+      val path = newTempPath(s"widen-int-to-dec128-$v2-$dictionary")
+      write(
+        spark.range(0, 3000).selectExpr(
+          "cast(id as int) as i32",
+          "case when id % 7 = 0 then null else cast(id * 700001 - 1000000000 as int) end as a32",
+          "case when id % 5 = 0 then null else cast(id * 1000000007 - 1500000000000 as bigint) end as a64"
+        ),
+        path,
+        v2,
+        dictionary
+      )
+      // decimal(20,2) from INT32 and decimal(30,2) from INT64 (both > 18 digits), per the brief.
+      view(path, "i32 int, a32 decimal(20,2), a64 decimal(30,2)", "dw")
+      check("SELECT * FROM dw")
+      check("SELECT sum(a32), sum(a64) FROM dw WHERE a32 IS NOT NULL AND a64 IS NOT NULL")
+      // decimal(38,0) from both INT32 and INT64.
+      view(path, "i32 int, a32 decimal(38,0), a64 decimal(38,0)", "d38")
+      check("SELECT * FROM d38")
+      check("SELECT sum(a32), sum(a64), min(a32), max(a64) FROM d38")
+      // Explicitly assert the native scan decoded it (not a silent fall-over to Spark's reader).
+      assert(nativeRowGroups("SELECT a32, a64 FROM dw") > 0, "INT->decimal(>18) fell over to Spark's reader")
+      assert(nativeRowGroups("SELECT a32, a64 FROM d38") > 0, "INT->decimal(38,0) fell over to Spark's reader")
+    }
+  }
 }

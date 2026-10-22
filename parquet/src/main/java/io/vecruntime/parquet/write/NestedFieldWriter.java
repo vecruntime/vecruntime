@@ -66,13 +66,19 @@ final class NestedFieldWriter {
     }
 
     private final Type field;
+    private final WriteRebase rebase;
     private final IdentityHashMap<Type, Leaf> leaves = new IdentityHashMap<>();
     // Every node's leaves, for the nulls of a null or empty value.
     private final IdentityHashMap<Type, Leaf[]> under = new IdentityHashMap<>();
     private final List<Leaf> all = new ArrayList<>();
 
     NestedFieldWriter(MessageType schema, Type field) {
+        this(schema, field, WriteRebase.NONE);
+    }
+
+    NestedFieldWriter(MessageType schema, Type field, WriteRebase rebase) {
         this.field = field;
+        this.rebase = rebase == null ? WriteRebase.NONE : rebase;
         List<String> path = new ArrayList<>();
         path.add(field.getName());
         collect(schema, field, path);
@@ -137,7 +143,7 @@ final class NestedFieldWriter {
             Leaf l = leaves.get(t);
             if (l.encoder == null || l.lane != v.type()) {
                 // Bound per lane type: a batch from another source may carry the same leaf in another lane.
-                l.encoder = ColumnEncoder.forColumn(v.type(), l.column);
+                l.encoder = ColumnEncoder.forColumn(v.type(), l.column, rebase);
                 l.lane = v.type();
             }
             l.encoder.put(v, i, rep, def, l.writer);
@@ -149,7 +155,7 @@ final class NestedFieldWriter {
         boolean map = a instanceof LogicalTypeAnnotation.MapLogicalTypeAnnotation;
         if (list || map) {
             expect(v, list ? VecType.LIST : VecType.MAP, g);
-            GroupType repeated = g.getType(0).asGroupType();
+            Type repeated = g.getType(0);
             MemorySegment offsets = v.offsets();
             int start = offsets.get(LE_INT, (long) i << 2);
             int end = offsets.get(LE_INT, (long) (i + 1) << 2);
@@ -159,12 +165,24 @@ final class NestedFieldWriter {
             }
             List<VectorBuffers> children = v.children();
             int inner = depth + 1;
+            // The standard 3-level LIST and Spark's legacy nullable `bag { array }` form put the element under a
+            // one-field repeated group; the MAP's repeated `key_value` carries key and value. Spark's legacy
+            // 2-level list (non-null elements, writeLegacyFormat) has no wrapper: the repeated node IS the element
+            // -- a repeated primitive, or a repeated group that is the element struct (isElementType). A LIST lane
+            // always has one child (the element), so a 2-level list maps that one child onto the repeated node.
+            boolean twoLevelElement = list && isElementType(repeated, g.getName());
             for (int j = start; j < end; j++) {
                 int r = j == start ? rep : inner;
                 // The repeated group is present for each element: one more definition level.
-                for (int f = 0; f < repeated.getFieldCount(); f++) {
-                    node(repeated.getType(f), children.get(f), j, r,
+                if (twoLevelElement) {
+                    node(repeated, children.get(0), j, r,
                             def + 1, inner);
+                } else {
+                    GroupType rg = repeated.asGroupType();
+                    for (int f = 0; f < rg.getFieldCount(); f++) {
+                        node(rg.getType(f), children.get(f), j, r,
+                                def + 1, inner);
+                    }
                 }
             }
             return;
@@ -202,5 +220,22 @@ final class NestedFieldWriter {
         if (v.type() != type) {
             throw new IllegalArgumentException("a " + v.type() + " lane for " + g);
         }
+    }
+
+    /**
+     * Spark's {@code ParquetSchemaConverter.isElementType}
+     * backward-compatibility rule: whether the LIST's repeated node is itself
+     * the element (a legacy 2-level list) rather than a one-field wrapper group
+     * around the element (the standard 3-level list, and Spark's legacy
+     * nullable {@code bag { array }} form). True when the repeated node is
+     * primitive, is a group with two or more fields, or is named {@code array}
+     * or {@code <list>_tuple}.
+     */
+    private static boolean isElementType(Type repeated, String parentName) {
+        if (repeated.isPrimitive()) {
+            return true;
+        }
+        GroupType g = repeated.asGroupType();
+        return g.getFieldCount() > 1 || "array".equals(g.getName()) || (parentName + "_tuple").equals(g.getName());
     }
 }

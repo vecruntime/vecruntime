@@ -58,7 +58,7 @@ import org.apache.spark.sql.execution.datasources.parquet.{
   ParquetWriteSupport,
   SparkToParquetSchemaConverter
 }
-import org.apache.spark.sql.internal.{LegacyBehaviorPolicy, SQLConf}
+import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
 import org.apache.spark.sql.vectorized.ColumnarBatch
 import org.apache.spark.util.Utils
@@ -248,26 +248,16 @@ object VectorWritePlanner {
   }
 
   private def typeReason(name: String, dt: DataType, conf: SQLConf): Option[String] = {
-    val rebased = conf.getConf(SQLConf.PARQUET_REBASE_MODE_IN_WRITE) != LegacyBehaviorPolicy.CORRECTED
-    val int96Rebased = conf.getConf(SQLConf.PARQUET_INT96_REBASE_MODE_IN_WRITE) != LegacyBehaviorPolicy.CORRECTED
-    val int96 = conf.parquetOutputTimestampType == SQLConf.ParquetOutputTimestampType.INT96
+    // Date and timestamp rebase (`datetimeRebaseModeInWrite`, `int96RebaseModeInWrite`) in LEGACY and EXCEPTION
+    // are written by the lane rebase kernel (VectorParquetOutputWriter / ColumnEncoder), as Spark's
+    // ParquetWriteSupport writes them; writeLegacyFormat's FIXED_LEN_BYTE_ARRAY decimals and its `bag` / `array`
+    // and `key_value` nested layout are written by the FLBA encoder and NestedFieldWriter from the schema Spark's
+    // own SparkToParquetSchemaConverter builds for the flag. Neither declines any more.
     dt match {
       case BooleanType | ByteType | ShortType | IntegerType | LongType | FloatType | DoubleType | BinaryType => None
       case _: StringType => None
-      case DateType if rebased =>
-        Some(s"columnar write: column $name is a date and datetimeRebaseModeInWrite is not CORRECTED")
-      case DateType => None
-      case TimestampType if int96 && int96Rebased =>
-        Some(s"columnar write: column $name is an INT96 timestamp and int96RebaseModeInWrite is not CORRECTED")
-      case TimestampType if !int96 && rebased =>
-        Some(s"columnar write: column $name is a timestamp and datetimeRebaseModeInWrite is not CORRECTED")
-      case TimestampType | TimestampNTZType => None
-      case d: DecimalType if d.precision <= Decimal.MAX_LONG_DIGITS && conf.writeLegacyParquetFormat =>
-        Some(s"columnar write: column $name is a decimal(${d.precision},${d.scale}) and writeLegacyFormat is on")
+      case DateType | TimestampType | TimestampNTZType => None
       case _: DecimalType => None
-      // Structs, arrays and maps (#842) in Spark's standard layout, of the types above.
-      case _: StructType | _: ArrayType | _: MapType if conf.writeLegacyParquetFormat =>
-        Some(s"columnar write: column $name is nested and writeLegacyFormat is on")
       case s: StructType if s.isEmpty => Some(s"columnar write: column $name is an empty struct")
       case s: StructType =>
         s.fields.iterator.flatMap(f => typeReason(s"$name.${f.name}", f.dataType, conf)).nextOption()
@@ -926,10 +916,30 @@ private[vecruntime] class VectorParquetOutputWriter(val filePath: String, dataSc
       case _ =>
     }
     val props = builder.build()
-    val footer = Map(
+    // The write calendar rebase (#842), as ParquetWriteSupport resolves it: the datetime and INT96 modes in
+    // write and the session time zone, read from SQLConf.get (the task's conf on the executor), exactly as
+    // Spark's writer reads them.
+    val sqlConf = org.apache.spark.sql.internal.SQLConf.get
+    val datetimeMode = sqlConf.getConf(SQLConf.PARQUET_REBASE_MODE_IN_WRITE).toString
+    val int96Mode = sqlConf.getConf(SQLConf.PARQUET_INT96_REBASE_MODE_IN_WRITE).toString
+    val rebase =
+      new io.vecruntime.spark.parquet.ParquetWriteRebase(datetimeMode, int96Mode, sqlConf.sessionLocalTimeZone)
+    // Footer key-value metadata: Spark's version and schema always, and -- when a rebase mode is LEGACY -- the
+    // legacy-datetime / legacy-INT96 markers and the session time zone, the keys Spark's ParquetWriteSupport
+    // writes so its own reader rebases these files back.
+    val footerBuilder = scala.collection.mutable.LinkedHashMap[String, String](
       org.apache.spark.sql.SPARK_VERSION_METADATA_KEY -> SPARK_VERSION_SHORT,
       ParquetReadSupport.SPARK_METADATA_KEY -> conf.get(ParquetWriteSupport.SPARK_ROW_SCHEMA, dataSchema.json)
-    ).asJava
+    )
+    if (rebase.datetimeLegacy()) {
+      footerBuilder(org.apache.spark.sql.SPARK_LEGACY_DATETIME_METADATA_KEY) = ""
+      footerBuilder(org.apache.spark.sql.SPARK_TIMEZONE_METADATA_KEY) = sqlConf.sessionLocalTimeZone
+    }
+    if (rebase.int96Legacy()) {
+      footerBuilder(org.apache.spark.sql.SPARK_LEGACY_INT96_METADATA_KEY) = ""
+      footerBuilder(org.apache.spark.sql.SPARK_TIMEZONE_METADATA_KEY) = sqlConf.sessionLocalTimeZone
+    }
+    val footer = footerBuilder.asJava
     val out = HadoopOutputFile.fromPath(new Path(filePath), conf)
     try {
       new ColumnarParquetWriter(
@@ -938,7 +948,8 @@ private[vecruntime] class VectorParquetOutputWriter(val filePath: String, dataSc
         props,
         codecs.getCompressor(ParquetOutputFormat.getCompression(conf)),
         ParquetOutputFormat.getLongBlockSize(conf),
-        footer
+        footer,
+        rebase
       )
     } catch {
       case t: Throwable =>
