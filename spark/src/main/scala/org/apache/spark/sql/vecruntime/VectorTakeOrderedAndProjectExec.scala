@@ -110,7 +110,7 @@ case class VectorTakeOrderedAndProjectExec(
           runRows,
           spillBytes,
           mode,
-          fairShareBytes = fairShare
+          fairShareBytes = TaskShare.bytes(fairShare) // #926
         ),
         childOutput
       )

@@ -109,6 +109,8 @@ class VectorPlugin extends SparkPlugin {
       )
       // #869: the native pool's totals as executor metrics, and (when on) every task's pooled blocks in its budget.
       if (VectorConf.poolAccountingEnabled(ctx.conf())) org.apache.spark.sql.vecruntime.TaskNativeMemory.install()
+      // #926: the operators' share of the off-heap pool evaluated per task, from how many tasks run now.
+      org.apache.spark.sql.vecruntime.TaskShare.configure(VectorConf.liveTaskShareEnabled(ctx.conf()))
       Seq[(String, () => Long)](
         "nativePoolInUseBytes" -> (() => io.vecruntime.kernels.NativePool.shared().inUseBytes()),
         "nativePoolPeakBytes" -> (() => io.vecruntime.kernels.NativePool.shared().peakInUseBytes()),
@@ -135,10 +137,17 @@ class VectorPlugin extends SparkPlugin {
     // Spark calls these on the task's own thread once the task ends (#667): the hash tables' per-thread
     // scratch keeps no batch, dictionary or table, and none of the arrays a build side grew it to, into
     // the thread's next task.
-    override def onTaskSucceeded(): Unit = io.vecruntime.kernels.GroupKeyTable.releaseThreadScratch()
+    override def onTaskStart(): Unit = org.apache.spark.sql.vecruntime.TaskShare.taskStarted() // #926
 
-    override def onTaskFailed(failureReason: org.apache.spark.TaskFailedReason): Unit =
+    override def onTaskSucceeded(): Unit = {
+      org.apache.spark.sql.vecruntime.TaskShare.taskEnded()
       io.vecruntime.kernels.GroupKeyTable.releaseThreadScratch()
+    }
+
+    override def onTaskFailed(failureReason: org.apache.spark.TaskFailedReason): Unit = {
+      org.apache.spark.sql.vecruntime.TaskShare.taskEnded()
+      io.vecruntime.kernels.GroupKeyTable.releaseThreadScratch()
+    }
   }
 }
 

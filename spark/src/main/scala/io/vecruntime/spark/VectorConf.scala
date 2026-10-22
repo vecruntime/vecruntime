@@ -622,6 +622,16 @@ object VectorConf {
     sparkConf.getBoolean(PoolAccountingEnabled, true)
 
   /**
+   * #926: evaluate the operators' share of the off-heap pool in the task, from the executor's running tasks
+   * (`TaskShare`), instead of `offHeap.size / spark.executor.cores` at plan time: a narrow stage's tasks get more,
+   * and room stays reserved for the slots not yet running. Used by the shuffled hash join's build budget and the
+   * sort's soft spill trigger. Off until measured. Read once, when the executor starts.
+   */
+  val LiveTaskShareEnabled = "spark.vecruntime.memory.liveTaskShare.enabled"
+  def liveTaskShareEnabled(sparkConf: org.apache.spark.SparkConf): Boolean =
+    sparkConf.getBoolean(LiveTaskShareEnabled, false)
+
+  /**
    * #869 step 4: Arrow's buffers (the Flight shuffle's, the shuffle readers', the operators' output vectors) from
    * the native pool instead of Arrow's allocation manager (`-Darrow.allocation.manager.type`), so they are reused
    * blocks of the same pool. Arrow still accounts them and `spark.vecruntime.arrow.maxBytes` still caps them. Read

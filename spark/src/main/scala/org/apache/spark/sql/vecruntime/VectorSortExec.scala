@@ -90,7 +90,7 @@ case class VectorSortExec(sortOrder: Seq[SortOrder], global: Boolean, child: Spa
         runRows = runRows,
         spillBytes = spillBytes,
         memoryMode = mode,
-        fairShareBytes = fairShare
+        fairShareBytes = TaskShare.bytes(fairShare) // #926: re-evaluated per task when the live share is on
       )
     }
   }
