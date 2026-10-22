@@ -279,6 +279,9 @@ object PinnedMemory {
   }
   def bytes: Long = current.get()
   def peakBytes: Long = peak.get()
+
+  /** Restarts the peak from the current bytes (#925: a benchmark reads the peak per query). */
+  def resetPeak(): Unit = peak.set(current.get())
 }
 
 private[vecruntime] final class BuildMemory(
