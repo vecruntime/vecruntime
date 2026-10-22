@@ -223,6 +223,34 @@ class VectorIcebergWriteSuite extends AnyFunSuite with BeforeAndAfterAll {
     assert(on == off)
   }
 
+  test("floats and doubles inside lists and maps write columnar, equal to Iceberg's writer") {
+    for (t <- Seq("ice.db.fl_on", "ice.db.fl_off")) {
+      spark.sql(s"DROP TABLE IF EXISTS $t")
+      spark.sql(
+        s"""CREATE TABLE $t (id BIGINT, ds ARRAY<DOUBLE>, fm MAP<STRING, FLOAT>, s STRUCT<fs: ARRAY<FLOAT>>)
+           |USING iceberg TBLPROPERTIES ('format-version'='2')""".stripMargin
+      )
+    }
+    val src =
+      """SELECT id,
+        |  if(id % 9 = 0, null, array(id * 0.5d, if(id % 5 = 0, cast('NaN' as double), -0.0d), null)),
+        |  if(id % 7 = 0, null, map('a', cast(id as float), 'b', if(id % 3 = 0, cast('NaN' as float), null))),
+        |  if(id % 11 = 0, null, named_struct('fs', if(id % 4 = 0, null, array(cast(id as float) / 3))))
+        |FROM range(5000)""".stripMargin
+    withWriter(on = false)(spark.sql(s"INSERT INTO ice.db.fl_off $src").collect())
+    val df = withWriter(on = true)(spark.sql(s"INSERT INTO ice.db.fl_on $src"))
+    df.collect()
+    assert(columnar(df), "a float inside a list or a map no longer falls back")
+    def text(t: String) = spark.sql(s"SELECT * FROM $t ORDER BY id").collect().map(_.toString).toSeq
+    assert(text("ice.db.fl_on") == text("ice.db.fl_off"))
+    def metrics(t: String) =
+      spark.sql(
+        s"SELECT value_counts, null_value_counts, nan_value_counts, transform_values(lower_bounds, (k, v) -> hex(v)), transform_values(upper_bounds, (k, v) -> hex(v)) FROM $t.files"
+      )
+        .collect().map(_.toString).sorted.toSeq
+    assert(metrics("ice.db.fl_on") == metrics("ice.db.fl_off"), "file metrics differ from Iceberg's writer")
+  }
+
   test("the files' metrics let Iceberg prune on them") {
     val t = "ice.db.prune_on"
     create(t)
