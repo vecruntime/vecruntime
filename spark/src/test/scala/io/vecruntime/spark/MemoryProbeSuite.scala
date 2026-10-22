@@ -34,6 +34,8 @@ class MemoryProbeSuite extends VectorQuerySuite {
       "nativePoolLeaked",
       "pinned",
       "pinnedPeak",
+      "offHeapExecutionPeak",
+      "onHeapExecutionPeak",
       "arrow",
       "arrowPeakSinceStart",
       "prefetchPeak",
