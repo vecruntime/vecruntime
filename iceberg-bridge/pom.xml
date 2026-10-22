@@ -45,6 +45,14 @@
       <scope>provided</scope>
     </dependency>
     <dependency>
+      <!-- Test-only: the columnar shuffle, so a hash- or range-distributed write's exchange runs on
+           batches in the write suites, as it does in a vecruntime deployment. -->
+      <groupId>io.github.vecruntime</groupId>
+      <artifactId>vecruntime-shuffle_${spark.line}_${scala.binary.version}</artifactId>
+      <version>${project.version}</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
       <!-- Test-only: loads the plugin's operator, planner strategy and session extensions so the DV
            writer's integration tests can run the columnar path end to end. The gate's -pl list does
            not include this module, so these tests are run manually (see docs/iceberg-dv-writer.md). -->

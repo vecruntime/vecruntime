@@ -59,8 +59,7 @@ import org.apache.iceberg.mapping.NameMappingParser;
  *       after it was closed is an error, as in Iceberg's {@code
  *       ClusteredWriter};
  *   <li><b>fanout</b>: rows in any order; one open file per partition, each
- *       batch's rows gathered per partition (top-level columns without nested
- *       types only).
+ *       batch's rows gathered per partition, nested columns included.
  * </ul>
  *
  * Like Iceberg's {@code RollingDataWriter}, the size is checked between writes:
