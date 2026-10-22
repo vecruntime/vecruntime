@@ -40,6 +40,11 @@ import org.apache.iceberg.types.Types;
  *   <li>{@code fixed(L)}: Spark's binary (a {@link VecType#UTF8}-shaped lane)
  *       becomes Arrow's {@code FixedSizeBinary(L)}. A value of another length
  *       fails the write, as it does in Iceberg's writer.</li>
+ *   <li>{@code uuid}: Spark's string (the {@code 8-4-4-4-12} text form) becomes
+ *       {@code FixedSizeBinary(16)}, the UUID's big-endian bytes, as Arrow's
+ *       canonical {@code arrow.uuid} extension and Iceberg's file format hold
+ *       it. Text that is not a UUID fails the write, as {@code UUID.fromString}
+ *       fails it in Iceberg's writer.</li>
  * </ul>
  *
  * Columns that need no conversion pass through untouched.
@@ -56,7 +61,7 @@ final class SparkLanes {
 
     private static boolean needed(Type type) {
         return switch (type.typeId()) {
-            case FIXED -> true;
+            case FIXED, UUID -> true;
             case STRUCT, LIST, MAP ->
                     type.asNestedType().fields().stream()
                             .anyMatch(f -> needed(f.type()));
@@ -86,6 +91,8 @@ final class SparkLanes {
         switch (type.typeId()) {
             case FIXED:
                 return toFixed(v, ((Types.FixedType) type).length(), arena);
+            case UUID:
+                return toUuid(v, arena);
             case STRUCT:
                 {
                     NestedVectorBuffers s = (NestedVectorBuffers) v;
@@ -149,5 +156,60 @@ final class SparkLanes {
                     width);
         }
         return out;
+    }
+
+    /**
+     * A string lane of UUIDs in text form as a FIXED_BINARY(16) lane of their
+     * big-endian bytes.
+     */
+    private static VectorBuffers toUuid(VectorBuffers v, Arena arena) {
+        if (v.type() != VecType.UTF8) {
+            throw new IllegalArgumentException("uuid from a " + v.type() + " lane");
+        }
+        int n = v.length();
+        FixedBinaryVectorBuffers out = FixedBinaryVectorBuffers.allocate(arena, n, 16, v.validity());
+        MemorySegment data = out.data();
+        for (int i = 0; i < n; i++) {
+            if (!v.isNull(i)) {
+                uuidBytes(v.getUtf8Bytes(i), data, (long) i << 4);
+            }
+        }
+        return out;
+    }
+
+    /**
+     * Writes the 16 big-endian bytes of the UUID in {@code text} ({@code 8-4-4-4-12}
+     * hex digits, either case) at {@code at}.
+     */
+    static void uuidBytes(byte[] text, MemorySegment out, long at) {
+        if (text.length != 36
+                || text[8] != '-'
+                || text[13] != '-'
+                || text[18] != '-'
+                || text[23] != '-') {
+            throw notUuid(text);
+        }
+        int k = 0;
+        int i = 0;
+        while (i < 36) {
+            if (i == 8
+                    || i == 13
+                    || i == 18
+                    || i == 23) {
+                i++; // the dash
+                continue;
+            }
+            int hi = Character.digit(text[i], 16);
+            int lo = Character.digit(text[i + 1], 16);
+            if (hi < 0 || lo < 0) {
+                throw notUuid(text);
+            }
+            out.set(ValueLayout.JAVA_BYTE, at + k++, (byte) (hi << 4 | lo));
+            i += 2;
+        }
+    }
+
+    private static IllegalArgumentException notUuid(byte[] text) {
+        return new IllegalArgumentException("not a UUID: '" + new String(text, java.nio.charset.StandardCharsets.UTF_8) + "'");
     }
 }

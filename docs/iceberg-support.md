@@ -45,8 +45,8 @@ Turn it on with `spark.vecruntime.scan.nativeIceberg.enabled=true`.
 | Row lineage on v3 | **✓** |
 | Merge-on-read on tables with map columns | **◐** the write is columnar, its input is not yet |
 | float / double inside a list or map | **✓** |
-| `fixed` columns | **✓** |
-| `uuid`, `variant` columns | **✗** for now |
+| `fixed`, `uuid` columns | **✓** |
+| `variant` columns | **✗** for now |
 | ORC / Avro, encrypted tables | **✗** |
 
 Turn it on with `spark.vecruntime.iceberg.writer.enabled=true`. For merge-on-read, also set
