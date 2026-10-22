@@ -1174,13 +1174,20 @@ private[vecruntime] object IcebergTasks {
   /** As [[equalityColumns]], over the scan's input partitions themselves (at plan time). */
   def equalityColumnsOf(inputs: Seq[InputPartition], schema: AnyRef, projected: Set[Int]): Option[Seq[StructField]] = {
     val ids = scala.collection.mutable.LinkedHashSet.empty[Int]
+    // The distinct equality-field-id-sets across the delete files, so a nested ancestor read differently by two
+    // groups can be detected and declined (the union read column would not match a group's delete schema).
+    val idSets = scala.collection.mutable.LinkedHashSet.empty[Seq[Int]]
     inputs.foreach { p =>
       if (p.getClass.getName == "org.apache.iceberg.spark.source.SparkInputPartition") {
         call(call(p, "taskGroup"), "tasks").asInstanceOf[java.util.Collection[AnyRef]].asScala.foreach { task =>
           if (task.getClass.getName.contains("FileScanTask")) {
             val deletes = call(task, "deletes").asInstanceOf[java.util.List[AnyRef]]
             if (deletes != null) deletes.asScala.foreach { d =>
-              if (call(d, "content").toString == "EQUALITY_DELETES") ids ++= equalityFieldIds(d)
+              if (call(d, "content").toString == "EQUALITY_DELETES") {
+                val fieldIds = equalityFieldIds(d)
+                ids ++= fieldIds
+                idSets += fieldIds
+              }
             }
           }
         }
@@ -1188,22 +1195,80 @@ private[vecruntime] object IcebergTasks {
     }
     val cl = schema.getClass.getClassLoader
     val struct = call(schema, "asStruct")
+    val fieldById = struct.getClass.getMethod("field", classOf[Int])
     val typeClass = Class.forName("org.apache.iceberg.types.Type", false, cl)
     val convert = Class.forName("org.apache.iceberg.spark.SparkSchemaUtil", false, cl).getMethod("convert", typeClass)
-    val extra = ids.toSeq.filterNot(projected).sorted.map { id =>
-      // Top-level fields only: a nested equality field is not a column our reader reads on its own.
-      val field = struct.getClass.getMethod("field", classOf[Int]).invoke(struct, Int.box(id))
-      if (field == null) return None
-      val icebergType = call(field, "type")
-      if (!NativeTypes.contains(call(icebergType, "typeId").toString)) return None
-      val dataType = convert.invoke(null, icebergType).asInstanceOf[org.apache.spark.sql.types.DataType]
-      if (!io.vecruntime.spark.parquet.NativeParquetSupport.isReadable(dataType)) return None
-      StructField(
-        s"_vecruntime_eq_$id",
-        dataType,
-        nullable = true,
-        new MetadataBuilder().putLong(ParquetUtils.FIELD_ID_METADATA_KEY, id.toLong).build()
-      )
+    val schemaClass = Class.forName("org.apache.iceberg.Schema", false, cl)
+    val projectStruct =
+      Class.forName(
+        "org.apache.iceberg.types.TypeUtil",
+        false,
+        cl
+      ).getMethod("project", schemaClass, classOf[java.util.Set[_]])
+    // Resolve each equality field id to its top-level ancestor id (itself when top level) via the dotted column name.
+    def topAncestorId(id: Int): Option[Int] = {
+      val columnName = schemaClass.getMethod("findColumnName", classOf[Int]).invoke(schema, Int.box(id))
+      if (columnName == null) return None
+      val top = columnName.asInstanceOf[String].split("\\.", 2)(0)
+      val topField = schemaClass.getMethod("findField", classOf[String]).invoke(schema, top)
+      if (topField == null) None else Some(call(topField, "fieldId").asInstanceOf[Integer].intValue())
+    }
+    // Group the wanted (unprojected) equality ids by their top-level ancestor, preserving first-seen order.
+    val wanted = ids.toSeq.filterNot(projected)
+    val byAncestor = scala.collection.mutable.LinkedHashMap.empty[Int, scala.collection.mutable.LinkedHashSet[Int]]
+    wanted.foreach { id =>
+      topAncestorId(id) match {
+        case None => return None
+        case Some(anc) =>
+          // The ancestor column is read as a pruned extra only when the query does not already project it; when it
+          // does, the row probe reads the leaf from the projected struct and reshapes it to the delete schema (see
+          // equalityFilter), so no second column of the same field id is added (which would collide) (#901 item 5).
+          if (!projected.contains(anc))
+            byAncestor.getOrElseUpdate(anc, scala.collection.mutable.LinkedHashSet.empty) += id
+      }
+    }
+    // #901 item 5: a nested ancestor read under two different equality-field-id-sets would need a union read column
+    // that no single group's delete schema matches; decline it (Iceberg's reader keeps those files).
+    byAncestor.foreach { case (ancId, leafIds) =>
+      if (leafIds.size > 1) {
+        val sets = idSets.filter(s => s.exists(id => topAncestorId(id).contains(ancId))).toSeq
+        if (sets.distinct.size > 1) return None
+      }
+    }
+    val extra = byAncestor.toSeq.sortBy(_._1).map { case (ancId, leafIds) =>
+      val ancField = fieldById.invoke(struct, Int.box(ancId))
+      if (ancField == null) return None
+      val ancType = call(ancField, "type")
+      if (call(ancType, "typeId").toString == "STRUCT") {
+        // #901 item 5: a nested equality key. Project the table schema to the ancestor's needed leaves and read the
+        // ancestor struct, every nested field carrying its Iceberg id. The native lane probe does not decode nested
+        // keys, so these groups take the row probe (equalityFilter), which reads the leaf through the struct as
+        // Iceberg's accessor does -- a null leaf under a null parent struct.
+        val projectedSchema = projectStruct.invoke(null, schema, leafIds.map(Int.box).asJava).asInstanceOf[AnyRef]
+        val projectedTop = fieldById.invoke(call(projectedSchema, "asStruct"), Int.box(ancId))
+        if (projectedTop == null) return None
+        val projectedType = call(projectedTop, "type")
+        val sparkType = convert.invoke(null, projectedType).asInstanceOf[org.apache.spark.sql.types.DataType]
+        if (!io.vecruntime.spark.parquet.NativeParquetSupport.isReadable(sparkType)) return None
+        StructField(
+          s"_vecruntime_eq_$ancId",
+          withFieldIds(sparkType, projectedType),
+          nullable = true,
+          new MetadataBuilder().putLong(ParquetUtils.FIELD_ID_METADATA_KEY, ancId.toLong).build()
+        )
+      } else {
+        // A top-level (flat) equality key: one leaf id equal to the ancestor id.
+        if (leafIds.size != 1 || leafIds.head != ancId) return None
+        if (!NativeTypes.contains(call(ancType, "typeId").toString)) return None
+        val dataType = convert.invoke(null, ancType).asInstanceOf[org.apache.spark.sql.types.DataType]
+        if (!io.vecruntime.spark.parquet.NativeParquetSupport.isReadable(dataType)) return None
+        StructField(
+          s"_vecruntime_eq_$ancId",
+          dataType,
+          nullable = true,
+          new MetadataBuilder().putLong(ParquetUtils.FIELD_ID_METADATA_KEY, ancId.toLong).build()
+        )
+      }
     }
     Some(extra)
   }
@@ -1242,9 +1307,15 @@ private[vecruntime] object IcebergTasks {
       case (f, i) if f.metadata.contains(ParquetUtils.FIELD_ID_METADATA_KEY) =>
         f.metadata.getLong(ParquetUtils.FIELD_ID_METADATA_KEY).toInt -> i
     }.toMap
-    // Per group: the set, the batch ordinals of its fields (in the delete schema's order) and their Spark types.
+    // Per group: the set, the batch ordinals of its delete-schema top-level columns, the delete-schema-shaped
+    // Spark type (so the InternalRowWrapper matches the Iceberg struct exactly), the Iceberg struct, and the
+    // Spark types the data columns were read as (for the per-row reshape when a read column is wider than the
+    // delete column, e.g. a projected ancestor struct holds fields the delete does not).
+    val convertType =
+      Class.forName("org.apache.iceberg.spark.SparkSchemaUtil", false, cl).getMethod("convert", schemaClass)
     val groups = deletes.asScala.groupBy(equalityFieldIds).toSeq.map { case (ids, files) =>
       val deleteSchema = select.invoke(null, tableSchema, ids.map(Int.box).toSet.asJava)
+      val deleteStruct = call(deleteSchema, "asStruct")
       val order = call(deleteSchema, "columns")
         .asInstanceOf[java.util.List[AnyRef]]
         .asScala
@@ -1253,9 +1324,11 @@ private[vecruntime] object IcebergTasks {
       val cacheKey = (files.map(d => call(d, "location").toString).sorted.toSeq, ids)
       val set = cache.getOrElseUpdate(cacheKey, load.invoke(loader, files.asJava, deleteSchema))
       val ordinals = order.map(ordinalOf)
-      val sparkType =
-        StructType(ordinals.map(o => schema(o).copy(metadata = org.apache.spark.sql.types.Metadata.empty)))
-      (set, ordinals, sparkType, call(deleteSchema, "asStruct"), cacheKey)
+      // The delete-schema Spark type (one field per top-level delete column, in order), matching deleteStruct.
+      val sparkType = convertType.invoke(null, deleteSchema).asInstanceOf[StructType]
+      // The data columns' read Spark types, in the same order (a struct here may be wider than the delete field).
+      val readTypes = ordinals.map(o => schema(o).dataType)
+      (set, ordinals, sparkType, deleteStruct, cacheKey, readTypes)
     }
     // #901 R2: each group as the bridge's EqualityDeleteSet, probed with the batch's lanes; None without the
     // bridge or for a key type it does not take, which keeps the row probe below.
@@ -1272,7 +1345,7 @@ private[vecruntime] object IcebergTasks {
             Integer.TYPE,
             classOf[java.lang.foreign.MemorySegment]
           )
-          val all = groups.map { case (set, ordinals, _, struct, cacheKey) =>
+          val all = groups.map { case (set, ordinals, _, struct, cacheKey, _) =>
             val types = call(struct, "fields").asInstanceOf[java.util.List[AnyRef]].asScala.map(call(_, "type"))
             if (!types.forall(t => supports.invoke(null, t).asInstanceOf[java.lang.Boolean].booleanValue())) None
             else {
@@ -1310,15 +1383,23 @@ private[vecruntime] object IcebergTasks {
       }
     }
     batch => {
-      val probes = groups.map { case (set, ordinals, sparkType, icebergStruct, _) =>
+      val probes = groups.map { case (set, ordinals, sparkType, icebergStruct, _, readTypes) =>
         val wrapper = wrapperCtor.newInstance(sparkType, icebergStruct)
         val row = new org.apache.spark.sql.catalyst.expressions.GenericInternalRow(ordinals.length)
-        val types = sparkType.fields.map(_.dataType)
+        val deleteTypes = sparkType.fields.map(_.dataType)
         (i: Int) => {
           var k = 0
           while (k < ordinals.length) {
             val c = batch.column(ordinals(k))
-            row.update(k, if (c.isNullAt(i)) null else batch.getRow(i).get(ordinals(k), types(k)))
+            row.update(
+              k,
+              if (c.isNullAt(i)) null
+              else IcebergTasks.reshapeToDelete(
+                batch.getRow(i).get(ordinals(k), readTypes(k)),
+                readTypes(k),
+                deleteTypes(k)
+              )
+            )
             k += 1
           }
           contains.invoke(set, wrap.invoke(wrapper, row)).asInstanceOf[java.lang.Boolean].booleanValue()
@@ -1326,6 +1407,36 @@ private[vecruntime] object IcebergTasks {
       }
       (i: Int) => probes.exists(probe => probe(i))
     }
+  }
+
+  /**
+   * #901 item 5: reshape a value read with Spark type `read` into Spark type `want` for the equality-delete probe.
+   * Identical types pass through. A struct read wider than wanted (a projected ancestor holding fields the delete
+   * does not) is narrowed to `want`'s fields, matched by name (field-id matching already aligned the readers), and
+   * reshaped recursively; a null struct stays null. Only structs can differ (the delete leaves are atomic).
+   */
+  def reshapeToDelete(
+      value: Any,
+      read: org.apache.spark.sql.types.DataType,
+      want: org.apache.spark.sql.types.DataType
+  ): Any = (read, want) match {
+    case _ if value == null => null
+    case (r: StructType, w: StructType) if r != w =>
+      val src = value.asInstanceOf[InternalRow]
+      val out = new org.apache.spark.sql.catalyst.expressions.GenericInternalRow(w.length)
+      var j = 0
+      while (j < w.length) {
+        val wf = w.fields(j)
+        val ri = r.fieldIndex(wf.name)
+        out.update(
+          j,
+          if (src.isNullAt(ri)) null
+          else reshapeToDelete(src.get(ri, r.fields(ri).dataType), r.fields(ri).dataType, wf.dataType)
+        )
+        j += 1
+      }
+      out
+    case _ => value
   }
 
   /**
