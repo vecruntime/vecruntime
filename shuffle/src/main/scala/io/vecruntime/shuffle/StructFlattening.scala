@@ -37,6 +37,25 @@ import org.apache.spark.unsafe.types.UTF8String
  */
 object StructFlattening {
 
+  /**
+   * Field `j` of a struct column that has no child vector for it -- Spark's `ConstantColumnVector` of a null
+   * struct (a MERGE's `_partition` on its inserted rows) sets none -- as an all-null column of the field's type.
+   * Only a column whose every row is null may lack its children.
+   */
+  def nullChild(struct: ColumnVector, j: Int, n: Int): ColumnVector = {
+    var i = 0
+    while (i < n) {
+      if (!struct.isNullAt(i)) {
+        throw new IllegalStateException(s"a ${struct.dataType().simpleString} column has no child $j at a non-null row")
+      }
+      i += 1
+    }
+    val field = struct.dataType().asInstanceOf[StructType].fields(j)
+    val c = new org.apache.spark.sql.execution.vectorized.ConstantColumnVector(n, field.dataType)
+    c.setNull()
+    c
+  }
+
   sealed trait Node extends Serializable
   final case class Leaf(flat: Int) extends Node
   final case class Struct(dataType: StructType, validity: Int, children: IndexedSeq[Node]) extends Node
@@ -117,7 +136,8 @@ object StructFlattening {
           // A field under a null struct row must read as null (see the object's note on hashing).
           val masked = cv.hasNull
           children.indices.foreach { j =>
-            val c = cv.getChild(j)
+            // Spark's ConstantColumnVector of a null struct leaves its children unset: every field is null.
+            val c = Option(cv.getChild(j)).getOrElse(StructFlattening.nullChild(cv, j, n))
             fill(children(j), if (masked) new NullMaskedColumnVector(c, cv) else c)
           }
       }
@@ -201,7 +221,10 @@ final class NullMaskedColumnVector(inner: ColumnVector, parent: ColumnVector) ex
   override def hasNull(): Boolean = true
   override def numNulls(): Int = throw new UnsupportedOperationException("numNulls of a masked view")
   override def isNullAt(rowId: Int): Boolean = parent.isNullAt(rowId) || inner.isNullAt(rowId)
-  override def getChild(ordinal: Int): ColumnVector = new NullMaskedColumnVector(inner.getChild(ordinal), this)
+  override def getChild(ordinal: Int): ColumnVector = {
+    val c = inner.getChild(ordinal)
+    if (c == null) null else new NullMaskedColumnVector(c, this)
+  }
   override def getBoolean(rowId: Int): Boolean = inner.getBoolean(rowId)
   override def getByte(rowId: Int): Byte = inner.getByte(rowId)
   override def getShort(rowId: Int): Short = inner.getShort(rowId)

@@ -21,6 +21,7 @@ import java.util.List;
 import java.util.stream.Stream;
 
 import io.vecruntime.kernels.Bitmap;
+import io.vecruntime.kernels.NestedVectorBuffers;
 import io.vecruntime.kernels.VectorBuffers;
 import org.apache.iceberg.DoubleFieldMetrics;
 import org.apache.iceberg.FieldMetrics;
@@ -38,30 +39,39 @@ import org.apache.iceberg.types.Types;
  * batches, with Iceberg's own builders, so the merged metrics are the ones
  * Iceberg's writer reports.
  *
- * <p>Covers float and double fields at the top level and inside structs. A
- * float or double inside a list or a map is refused by {@link #check}: its
- * values are not row-aligned, and a file whose bounds could include a NaN must
- * not be committed.
+ * <p>Covers float and double fields at any depth: at the top level, inside
+ * structs, and as (or under) list elements and map keys or values. A field
+ * under a list or map counts each element written, as Iceberg's element
+ * writers count them; elements of a null list or map do not exist and are not
+ * counted, and an element under a null struct inside an element counts as null.
  */
 final class FloatingMetrics {
 
     /**
-     * One float or double field: its position as a path of struct child
-     * indexes, its rows and nulls so far (a null parent struct counts as a
-     * null), and the builder of its NaN count and bounds.
+     * One step from a column to a nested child: a struct field, or a list's
+     * elements / a map's keys or values.
+     */
+    private record Step(boolean repeated, int child) {}
+
+    /**
+     * One float or double field: its steps from its top-level column, its
+     * values and nulls so far, and the builder of its NaN count and bounds.
      */
     private static final class Leaf {
         final int id;
-        final List<Integer> path;
+        final int column;
+        final List<Step> steps;
         final boolean isFloat;
         final FloatFieldMetrics.Builder floats;
         final DoubleFieldMetrics.Builder doubles;
         long values;
         long nulls;
 
-        Leaf(int id, List<Integer> path, boolean isFloat) {
+        Leaf(int id, int column, List<Step> steps,
+             boolean isFloat) {
             this.id = id;
-            this.path = path;
+            this.column = column;
+            this.steps = steps;
             this.isFloat = isFloat;
             this.floats = isFloat ? new FloatFieldMetrics.Builder(id) : null;
             this.doubles = isFloat ? null : new DoubleFieldMetrics.Builder(id);
@@ -71,57 +81,51 @@ final class FloatingMetrics {
     private final List<Leaf> leaves = new ArrayList<>();
 
     FloatingMetrics(Schema schema) {
-        collect(schema.asStruct(), List.of());
+        List<Types.NestedField> fields = schema.asStruct().fields();
+        for (int c = 0; c < fields.size(); c++) {
+            collect(
+                    fields.get(c).fieldId(),
+                    fields.get(c).type(),
+                    c,
+                    List.of());
+        }
     }
 
-    /** Whether {@code schema} has a float or double only inside a list or a map. */
-    static boolean check(Schema schema) {
-        return !repeatedFloating(schema.asStruct(), false);
-    }
-
-    private static boolean repeatedFloating(Type type, boolean repeated) {
+    private void collect(int id, Type type, int column,
+                         List<Step> steps) {
         switch (type.typeId()) {
-            case FLOAT:
-            case DOUBLE:
-                return repeated;
-            case STRUCT:
-                for (Types.NestedField f : type.asStructType().fields()) {
-                    if (repeatedFloating(f.type(), repeated)) {
-                        return true;
-                    }
+            case FLOAT -> leaves.add(new Leaf(id, column, List.copyOf(steps), true));
+            case DOUBLE -> leaves.add(new Leaf(id, column, List.copyOf(steps), false));
+            case STRUCT -> {
+                List<Types.NestedField> fields = type.asStructType().fields();
+                for (int k = 0; k < fields.size(); k++) {
+                    collect(
+                            fields.get(k).fieldId(),
+                            fields.get(k).type(),
+                            column,
+                            with(steps, new Step(false, k)));
                 }
-                return false;
-            case LIST:
-                return repeatedFloating(type.asListType()
-                        .elementType(),
-                        true);
-            case MAP:
-                return repeatedFloating(type.asMapType()
-                        .keyType(),
-                        true)
-                        || repeatedFloating(type.asMapType()
-                        .valueType(),
-                        true);
-            default:
-                return false;
+            }
+            case LIST -> {
+                Types.ListType list = type.asListType();
+                collect(list.elementId(), list.elementType(), column,
+                        with(steps, new Step(true, 0)));
+            }
+            case MAP -> {
+                Types.MapType map = type.asMapType();
+                collect(map.keyId(), map.keyType(), column,
+                        with(steps, new Step(true, 0)));
+                collect(map.valueId(), map.valueType(), column,
+                        with(steps, new Step(true, 1)));
+            }
+            default -> {}
         }
     }
 
-    private void collect(Types.StructType struct, List<Integer> prefix) {
-        List<Types.NestedField> fields = struct.fields();
-        for (int k = 0; k < fields.size(); k++) {
-            Types.NestedField f = fields.get(k);
-            List<Integer> path = new ArrayList<>(prefix);
-            path.add(k);
-            switch (f.type().typeId()) {
-                case FLOAT -> leaves.add(new Leaf(f.fieldId(), List.copyOf(path), true));
-                case DOUBLE -> leaves.add(new Leaf(f.fieldId(), List.copyOf(path), false));
-                case STRUCT -> collect(f.type()
-                                        .asStructType(),
-                        path);
-                default -> {}
-            }
-        }
+    private static List<Step> with(List<Step> steps, Step step) {
+        List<Step> out = new ArrayList<>(steps);
+        out.add(step);
+        return out;
     }
 
     /**
@@ -130,52 +134,84 @@ final class FloatingMetrics {
      */
     void add(List<? extends VectorBuffers> columns, int first, int end) {
         for (Leaf leaf : leaves) {
-            VectorBuffers v = columns.get(leaf.path.get(0));
-            List<VectorBuffers> parents = new ArrayList<>(leaf.path.size() - 1);
-            for (int d = 1; d < leaf.path.size(); d++) {
-                parents.add(v);
-                v = v.children().get(leaf.path.get(d));
-            }
-            boolean anyParentNulls = false;
-            for (VectorBuffers p : parents) {
-                anyParentNulls |= p.hasNulls();
-            }
-            leaf.values += end - first;
-            // The segments once per batch rather than through the per-element accessors.
-            MemorySegment data = v.data();
-            MemorySegment validity = v.validity();
-            if (validity == null && !anyParentNulls) {
-                if (leaf.isFloat) {
-                    for (int r = first; r < end; r++) {
-                        leaf.floats.addValue((float) data.get(VectorBuffers.LE_DOUBLE, (long) r << 3));
-                    }
-                } else {
-                    for (int r = first; r < end; r++) {
-                        leaf.doubles.addValue(data.get(VectorBuffers.LE_DOUBLE, (long) r << 3));
-                    }
-                }
+            VectorBuffers v = columns.get(leaf.column);
+            if (leaf.steps.isEmpty() && v.validity() == null) {
+                addAll(leaf, v.data(), first, end);
                 continue;
             }
-            for (int r = first; r < end; r++) {
-                if ((validity != null && !Bitmap.isSet(validity, r))
-                        || (anyParentNulls && underNull(parents, r))) {
+            // The leaf's rows [first, end) of its own lane, plus, per row, whether an enclosing struct is null.
+            int[] rows = null;
+            boolean[] nullAbove = null;
+            int n = end - first;
+            for (Step step : leaf.steps) {
+                if (!step.repeated()) {
+                    for (int i = 0; i < n; i++) {
+                        int r = rows == null ? first + i : rows[i];
+                        if (v.isNull(r)) {
+                            if (nullAbove == null) {
+                                nullAbove = new boolean[n];
+                            }
+                            nullAbove[i] = true;
+                        }
+                    }
+                    v = v.children().get(step.child());
+                    continue;
+                }
+                // Into the elements: a null list or map (or one under a null struct) has none.
+                NestedVectorBuffers nested = (NestedVectorBuffers) v;
+                int total = 0;
+                for (int i = 0; i < n; i++) {
+                    int r = rows == null ? first + i : rows[i];
+                    if ((nullAbove == null || !nullAbove[i]) && !v.isNull(r)) {
+                        total += nested.end(r) - nested.start(r);
+                    }
+                }
+                int[] next = new int[total];
+                int k = 0;
+                for (int i = 0; i < n; i++) {
+                    int r = rows == null ? first + i : rows[i];
+                    if ((nullAbove == null || !nullAbove[i]) && !v.isNull(r)) {
+                        for (int e = nested.start(r);
+                             e < nested.end(r);
+                             e++) {
+                            next[k++] = e;
+                        }
+                    }
+                }
+                rows = next;
+                n = total;
+                nullAbove = null;
+                v = v.children().get(step.child());
+            }
+            MemorySegment data = v.data();
+            MemorySegment validity = v.validity();
+            for (int i = 0; i < n; i++) {
+                int r = rows == null ? first + i : rows[i];
+                leaf.values++;
+                if ((nullAbove != null && nullAbove[i])
+                        || (validity != null && !Bitmap.isSet(validity, r))) {
                     leaf.nulls++;
-                } else if (leaf.isFloat) {
-                    leaf.floats.addValue((float) data.get(VectorBuffers.LE_DOUBLE, (long) r << 3));
                 } else {
-                    leaf.doubles.addValue(data.get(VectorBuffers.LE_DOUBLE, (long) r << 3));
+                    add(leaf, data.get(VectorBuffers.LE_DOUBLE, (long) r << 3));
                 }
             }
         }
     }
 
-    private static boolean underNull(List<VectorBuffers> parents, int r) {
-        for (VectorBuffers p : parents) {
-            if (p.isNull(r)) {
-                return true;
-            }
+    private static void addAll(Leaf leaf, MemorySegment data, int first,
+            int end) {
+        leaf.values += end - first;
+        for (int r = first; r < end; r++) {
+            add(leaf, data.get(VectorBuffers.LE_DOUBLE, (long) r << 3));
         }
-        return false;
+    }
+
+    private static void add(Leaf leaf, double value) {
+        if (leaf.isFloat) {
+            leaf.floats.addValue((float) value);
+        } else {
+            leaf.doubles.addValue(value);
+        }
     }
 
     /**

@@ -47,6 +47,15 @@ object VectorConf {
   val IcebergDvWriterEnabled = "spark.vecruntime.iceberg.dvWriter.enabled"
 
   /**
+   * The columnar Iceberg data-file writer (#842, W2): `INSERT INTO`, `INSERT OVERWRITE` and copy-on-write
+   * `DELETE` / `UPDATE` / `MERGE INTO` into an Iceberg table write their Parquet data files from our batches
+   * through `IcebergParquetAppender` (the `iceberg-bridge` module) instead of Iceberg's row writer; the commit
+   * stays Iceberg's own (`write.toBatch()`). Unpartitioned output specs only for now; anything else declines to
+   * Spark's writer with a printed reason. Default OFF while it lands.
+   */
+  val IcebergWriterEnabled = "spark.vecruntime.iceberg.writer.enabled"
+
+  /**
    * Logical rewrite (#632): `IsNotNull` on a grouping key that is the only difference between the
    * inputs of two aggregates (a CTE used twice) moves above the aggregates, so the input is shared.
    */
@@ -330,6 +339,9 @@ object VectorConf {
    * merge-on-read suite.
    */
   def icebergDvWriterEnabled(conf: SQLConf): Boolean = bool(conf, IcebergDvWriterEnabled, default = false)
+
+  /** The columnar Iceberg data-file writer (#842, W2). Default `false` while it lands. */
+  def icebergWriterEnabled(conf: SQLConf): Boolean = bool(conf, IcebergWriterEnabled, default = false)
   def aggDictionaryKeys(conf: SQLConf): Boolean = bool(conf, AggDictionaryKeys, default = true)
 
   /** Pass selection bitmaps between spark-vector operators instead of compacting each batch. */
@@ -712,7 +724,7 @@ object VectorConf {
    * (1 TB TPC-DS store_sales is ~14.6k files of ~7 MB). `0` opens each file on the task thread. Memory per
    * task grows by up to N opened files and their first row groups (compressed pages). Capped at 16.
    */
-  def scanNativeParquetPrefetchFiles(conf: SQLConf): Int = intIn(conf, ScanNativeParquetPrefetchFiles, 6, 16)
+  def scanNativeParquetPrefetchFiles(conf: SQLConf): Int = intIn(conf, ScanNativeParquetPrefetchFiles, 12, 16)
 
   /**
    * How many row groups of the current file `VectorParquetScanExec` reads ahead (#559/#566), on platform
@@ -721,7 +733,7 @@ object VectorConf {
    * groups (compressed pages), so it scales with the row-group size. Capped at 16.
    */
   def scanNativeParquetPrefetchRowGroups(conf: SQLConf): Int =
-    intIn(conf, ScanNativeParquetPrefetchRowGroups, 2, 16)
+    intIn(conf, ScanNativeParquetPrefetchRowGroups, 4, 16)
 
   /**
    * #568: the most compressed bytes one task's read-ahead (files opened ahead and row groups read ahead)
@@ -751,7 +763,7 @@ object VectorConf {
    * producer thread of each task's own, so decoding overlaps the operators above the scan. `0` (the default
    * until measured) decodes on the task thread. Memory per task grows by up to N batches. Capped at 16.
    */
-  def scanNativeParquetDecodeAhead(conf: SQLConf): Int = intIn(conf, ScanNativeParquetDecodeAhead, 0, 16)
+  def scanNativeParquetDecodeAhead(conf: SQLConf): Int = intIn(conf, ScanNativeParquetDecodeAhead, 2, 16)
 
   /** The decode-ahead producer's thread kind: `virtual` (the default) or `platform`. */
   def scanNativeParquetDecodeAheadVirtual(conf: SQLConf): Boolean =

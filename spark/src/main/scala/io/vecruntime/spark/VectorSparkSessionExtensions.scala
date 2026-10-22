@@ -40,6 +40,9 @@ class VectorSparkSessionExtensions extends (SparkSessionExtensions => Unit) {
     // The columnar v3 deletion-vector writer (#20): a planner strategy over the logical WriteDelta,
     // gated on spark.vecruntime.iceberg.dvWriter.enabled and a v3 target; declines to Spark otherwise.
     extensions.injectPlannerStrategy(session => VectorWriteDeltaStrategy(session))
+    // The columnar Iceberg data-file writer (#842): INSERT, INSERT OVERWRITE and copy-on-write rewrites, gated
+    // on spark.vecruntime.iceberg.writer.enabled; declines to Spark's own write execs otherwise.
+    extensions.injectPlannerStrategy(session => org.apache.spark.sql.vecruntime.VectorIcebergWriteStrategy(session))
     // FactBloomFilter's build over the join's own creation-side exchange (#659).
     extensions.injectPlannerStrategy(_ => org.apache.spark.sql.vecruntime.BloomCreationRefStrategy)
     // AggregateBelowJoin's pre-aggregate as one aggregate per task, no exchange (#693).
