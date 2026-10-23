@@ -188,6 +188,25 @@ public final class IcebergDataCommitBridge {
     }
 
     /**
+     * The names of the columns the write's output spec partitions by -- each
+     * partition field's source column, resolved against the table schema (#901
+     * M4b). An UPDATE that changes any of these columns is NOT eligible for the
+     * copy path (a row might move partition), so the strategy declines it.
+     */
+    public static String[] partitionSourceNames(Write write) {
+        SparkWrite w = (SparkWrite) write;
+        org.apache.iceberg.Table table = field(w, "table", org.apache.iceberg.Table.class);
+        int specId = field(w, "outputSpecId", Integer.class);
+        org.apache.iceberg.PartitionSpec spec = table.specs().get(specId);
+        org.apache.iceberg.Schema schema = table.schema();
+        return spec.fields().stream()
+                .map(f -> schema.findColumnName(f.sourceId()))
+                .filter(java.util.Objects::nonNull)
+                .distinct()
+                .toArray(String[]::new);
+    }
+
+    /**
      * One task's commit message for {@code files}, as Iceberg's own data writer
      * returns it.
      */
