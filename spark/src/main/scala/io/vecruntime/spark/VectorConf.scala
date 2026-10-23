@@ -343,6 +343,33 @@ object VectorConf {
   /** #735: parquet-java's per-row-group column-chunk buffers come from a small bounded heap pool. Default on. */
   val ScanNativeParquetPoolChunkBuffers = "spark.vecruntime.scan.parquet.poolChunkBuffers.enabled"
 
+  /**
+   * #834: a file whose length is at or under this is fetched WHOLE in one ranged GET on the prefetch thread,
+   * and {@code ParquetFileReader} is served footer, chunks and page indexes from that buffer -- so a 7 MB
+   * {@code store_sales} file (one row group) costs one request instead of footer-length + footer + row-group
+   * reads plus any per-page GETs. The threshold itself is the gate (the Accelerator prefetches a small object
+   * whole), so keep it at the size where reading every byte is cheaper than several ranged reads. `0` off (the
+   * default until a 1 TB A/B settles it); e.g. `8m`.
+   */
+  val ScanNativeParquetSmallFileThreshold = "spark.vecruntime.scan.nativeParquet.smallFileThreshold"
+
+  /**
+   * #834: range merging. When a file is read over its planned byte ranges (the projected column chunks of the
+   * split's row groups, and with the column index on only the selected pages plus the index reads), ranges
+   * whose gap is at or under this are coalesced into one larger GET instead of many small seeks. `<0` (the
+   * DEFAULT, until a 1 TB A/B settles it) turns range merging off, so the read path is parquet-java's own; `0`
+   * merges only exactly-adjacent ranges; a positive value such as `1m` (the Accelerator's
+   * {@code request.coalesce.tolerance}) swallows gaps up to that size.
+   */
+  val ScanNativeParquetRangeMergeGap = "spark.vecruntime.scan.nativeParquet.rangeMergeGap"
+
+  /**
+   * #834: a coalesced run longer than this is split into parts of about this size, issued in parallel on the
+   * prefetch threads, so a long sequential run is not one giant stream that starves S3 bandwidth (DuckDB 2.0's
+   * too-few-too-large result). `0` never splits. Default 8 MiB, the Accelerator's {@code target.request.size}.
+   */
+  val ScanNativeParquetRangeTargetSize = "spark.vecruntime.scan.nativeParquet.rangeTargetSize"
+
   /** Mixed chains (#280): Comet's native operators above ours through the sink leaf. Off until #281 decides an allowlist. */
   val CometMixedEnabled = "spark.vecruntime.comet.mixed.enabled"
 
@@ -877,6 +904,38 @@ object VectorConf {
    */
   def scanNativeParquetPoolChunkBuffers(conf: SQLConf): Boolean =
     bool(conf, ScanNativeParquetPoolChunkBuffers, default = true)
+
+  /**
+   * #834: a file at or under this length is read whole in one GET on the prefetch thread, before the footer,
+   * so the footer, column chunks and page indexes all come from that one buffer. `0` (the default, until a
+   * 1 TB A/B settles it) off. Parsed as a byte string (`8m`); `<= 0` means off.
+   */
+  def scanNativeParquetSmallFileThreshold(conf: SQLConf): Long = {
+    val explicit = conf.getConfString(ScanNativeParquetSmallFileThreshold, "").trim
+    if (explicit.isEmpty) 0L
+    else scala.util.Try(org.apache.spark.network.util.JavaUtils.byteStringAsBytes(explicit)).toOption.getOrElse(0L)
+  }
+
+  /**
+   * #834: the gap (bytes) at or under which two planned byte ranges are coalesced into one GET. `<0` (the
+   * default) turns range merging off; `0` merges only adjacent; a positive byte string (`1m`) swallows gaps.
+   */
+  def scanNativeParquetRangeMergeGap(conf: SQLConf): Long = {
+    val explicit = conf.getConfString(ScanNativeParquetRangeMergeGap, "").trim
+    if (explicit.isEmpty) -1L
+    else if (explicit.startsWith("-")) -1L
+    else scala.util.Try(org.apache.spark.network.util.JavaUtils.byteStringAsBytes(explicit)).toOption.getOrElse(-1L)
+  }
+
+  /** #834: a coalesced run longer than this is split into parallel GETs. `0` never splits. Default 8 MiB. */
+  def scanNativeParquetRangeTargetSize(conf: SQLConf): Long = {
+    val explicit = conf.getConfString(ScanNativeParquetRangeTargetSize, "").trim
+    if (explicit.isEmpty) 8L << 20
+    else
+      scala.util.Try(org.apache.spark.network.util.JavaUtils.byteStringAsBytes(explicit)).toOption
+        .map(v => math.max(0L, v))
+        .getOrElse(8L << 20)
+  }
 
   private def intIn(conf: SQLConf, key: String, default: Int, max: Int): Int =
     scala.util.Try(conf.getConfString(key, default.toString).trim.toInt).toOption.map(n =>
