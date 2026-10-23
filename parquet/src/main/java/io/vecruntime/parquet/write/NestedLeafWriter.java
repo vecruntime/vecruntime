@@ -82,6 +82,12 @@ final class NestedLeafWriter {
     private final int defBitWidth;
     private final int pageRowLimit;
     private final int pageSize;
+    // The write calendar rebase (#842) for a DATE / TIMESTAMP / INT96 leaf; NONE for every other type. The
+    // per-lane bind() derives which of the three rebases (days, micros, int96 micros) this leaf needs.
+    private final WriteRebase rebase;
+    private boolean rebaseDate;
+    private boolean rebaseTimestamp;
+    private boolean rebaseInt96;
 
     private Kind kind;
     private VecType lane;
@@ -104,6 +110,10 @@ final class NestedLeafWriter {
     private final DeltaBinaryPackedEncoder delta = new DeltaBinaryPackedEncoder();
 
     NestedLeafWriter(ColumnDescriptor column, ParquetProperties props) {
+        this(column, props, WriteRebase.NONE);
+    }
+
+    NestedLeafWriter(ColumnDescriptor column, ParquetProperties props, WriteRebase rebase) {
         this.column = column;
         this.maxRep = column.getMaxRepetitionLevel();
         this.maxDef = column.getMaxDefinitionLevel();
@@ -111,6 +121,7 @@ final class NestedLeafWriter {
         this.defBitWidth = RleHybridEncoder.bitWidth(maxDef);
         this.pageRowLimit = props.getPageRowCountLimit();
         this.pageSize = props.getPageSizeThreshold();
+        this.rebase = rebase == null ? WriteRebase.NONE : rebase;
     }
 
     ColumnDescriptor column() {
@@ -150,6 +161,23 @@ final class NestedLeafWriter {
                     case FIXED_BINARY -> Kind.FIXED;
                     default -> throw new IllegalArgumentException("no nested leaf encoder for a " + lane + " lane as " + column.getPrimitiveType());
                 };
+        // The calendar rebase (#842) this leaf needs, by kind: a DATE's days, a TIMESTAMP's micros or millis
+        // (adjusted to UTC only; TIMESTAMP_NTZ is written as stored), or an INT96 timestamp's micros.
+        boolean dateLeaf = kind == Kind.INT32 && logical instanceof org.apache.parquet.schema.LogicalTypeAnnotation.DateLogicalTypeAnnotation;
+        boolean tsLeaf = (kind == Kind.INT64 || kind == Kind.INT64_MILLIS)
+                && logical instanceof org.apache.parquet.schema.LogicalTypeAnnotation.TimestampLogicalTypeAnnotation ts
+                && ts.isAdjustedToUTC();
+        this.rebaseDate = dateLeaf && rebase.datetimeActive();
+        this.rebaseTimestamp = tsLeaf && rebase.datetimeActive();
+        this.rebaseInt96 = kind == Kind.INT96 && rebase.int96Active();
+    }
+
+    /**
+     * A millisecond timestamp rebased: the micros rebase scaled by 1000 (see
+     * FixedWidthChunkWriter).
+     */
+    private long rebaseMillis(long millis) {
+        return Math.floorDiv(rebase.rebaseMicros(Math.multiplyExact(millis, 1000L)), 1000L);
     }
 
     /**
@@ -201,7 +229,10 @@ final class NestedLeafWriter {
             }
             case INT32 -> {
                 ensureFixed();
-                fixedValues[presentValues++] = data.get(LE_INT, (long) i << 2);
+                int d = data.get(LE_INT, (long) i << 2);
+                fixedValues[presentValues++] = rebaseDate && d < rebase.switchGregorianDay()
+                        ? rebase.rebaseDays(d)
+                        : d;
             }
             case INT32_FROM_INT64 -> {
                 ensureFixed();
@@ -209,11 +240,17 @@ final class NestedLeafWriter {
             }
             case INT64 -> {
                 ensureFixed();
-                fixedValues[presentValues++] = data.get(LE_LONG, (long) i << 3);
+                long us = data.get(LE_LONG, (long) i << 3);
+                fixedValues[presentValues++] = rebaseTimestamp && us < rebase.switchGregorianTs()
+                        ? rebase.rebaseMicros(us)
+                        : us;
             }
             case INT64_MILLIS -> {
                 ensureFixed();
-                fixedValues[presentValues++] = Math.floorDiv(data.get(LE_LONG, (long) i << 3), 1000L);
+                long ms = Math.floorDiv(data.get(LE_LONG, (long) i << 3), 1000L);
+                fixedValues[presentValues++] = rebaseTimestamp && ms < Math.floorDiv(rebase.switchGregorianTs(), 1000L)
+                        ? rebaseMillis(ms)
+                        : ms;
             }
             case DOUBLE -> {
                 ensureFixed();
@@ -263,6 +300,9 @@ final class NestedLeafWriter {
             case INT96 -> {
                 presentValues++;
                 long micros = data.get(LE_LONG, (long) i << 3);
+                if (rebaseInt96) {
+                    micros = rebase.rebaseInt96Micros(micros);
+                }
                 long day = Math.floorDiv(micros, MICROS_PER_DAY);
                 long nanos = Math.floorMod(micros, MICROS_PER_DAY) * 1000L;
                 byte[] b = new byte[12];

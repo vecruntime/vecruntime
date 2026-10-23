@@ -125,6 +125,7 @@ import org.apache.spark.sql.catalyst.expressions.{
   Size,
   Greatest,
   GreaterThanOrEqual,
+  HiveHash,
   Hour,
   Hypot,
   If,
@@ -449,6 +450,14 @@ object ExpressionCompiler {
           else compile(c, input).map(v => done :+ ((v, c.dataType)))
         }
       }.map(ks => Murmur3HashExpr(ks.map(_._1), ks.map(_._2), seed))
+    // Hive's bucket hash, which a Hive-compatible bucketed write sorts on (#842): `hive-hash` over the bucket
+    // keys, combined as `31 * h + childHash` with Spark's own HiveHasher per child, so our value equals Spark's.
+    case HiveHash(children) if children.nonEmpty && children.forall(c => HiveHashExpr.supports(c.dataType)) =>
+      children.foldLeft[Either[String, Vector[VectorExpr]]](Right(Vector.empty)) { (acc, c) =>
+        for (done <- acc; v <- compile(c, input)) yield done :+ v
+      }.map(vs => HiveHashExpr(vs, children.map(_.dataType)))
+    // The bucket-id arithmetic over the hash, `pmod(bitwise_and(hive-hash, Int.MaxValue), numBuckets)`, compiles
+    // through the general BitwiseAnd and Pmod cases below, which keep Spark's ANSI divide-by-zero errors.
     // V1Writes puts it on every string partition column: an empty string writes the default partition (#842).
     case org.apache.spark.sql.catalyst.expressions.Empty2Null(child) =>
       compile(child, input).map(Empty2NullExpr(_, child.dataType))

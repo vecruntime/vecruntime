@@ -42,7 +42,6 @@ import org.apache.spark.sql.connector.write.WriterCommitMessage
 import org.apache.spark.sql.execution.SparkPlan
 import org.apache.spark.sql.execution.datasources.{
   BaseDynamicPartitionDataWriter,
-  BucketingUtils,
   FileFormatDataWriter,
   OutputWriter,
   OutputWriterFactory,
@@ -58,7 +57,7 @@ import org.apache.spark.sql.execution.datasources.parquet.{
   ParquetWriteSupport,
   SparkToParquetSchemaConverter
 }
-import org.apache.spark.sql.internal.{LegacyBehaviorPolicy, SQLConf}
+import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
 import org.apache.spark.sql.vectorized.ColumnarBatch
 import org.apache.spark.util.Utils
@@ -182,8 +181,6 @@ object VectorWritePlanner {
       Some(s"columnar write: format ${w.fileFormat.getClass.getSimpleName} is not Parquet")
     } else if (concurrentKeysReason(w, conf).isDefined) {
       concurrentKeysReason(w, conf)
-    } else if (w.options.contains(BucketingUtils.optionForHiveCompatibleBucketWrite)) {
-      Some("columnar write: Hive-compatible bucketing is not supported yet (#842)")
     } else if (!w.child.supportsColumnar && !io.vecruntime.spark.VectorConf.writeColumnarFromRows(conf)) {
       Some(s"columnar write: child ${w.child.nodeName} is not columnar")
     } else {
@@ -248,26 +245,16 @@ object VectorWritePlanner {
   }
 
   private def typeReason(name: String, dt: DataType, conf: SQLConf): Option[String] = {
-    val rebased = conf.getConf(SQLConf.PARQUET_REBASE_MODE_IN_WRITE) != LegacyBehaviorPolicy.CORRECTED
-    val int96Rebased = conf.getConf(SQLConf.PARQUET_INT96_REBASE_MODE_IN_WRITE) != LegacyBehaviorPolicy.CORRECTED
-    val int96 = conf.parquetOutputTimestampType == SQLConf.ParquetOutputTimestampType.INT96
+    // Date and timestamp rebase (`datetimeRebaseModeInWrite`, `int96RebaseModeInWrite`) in LEGACY and EXCEPTION
+    // are written by the lane rebase kernel (VectorParquetOutputWriter / ColumnEncoder), as Spark's
+    // ParquetWriteSupport writes them; writeLegacyFormat's FIXED_LEN_BYTE_ARRAY decimals and its `bag` / `array`
+    // and `key_value` nested layout are written by the FLBA encoder and NestedFieldWriter from the schema Spark's
+    // own SparkToParquetSchemaConverter builds for the flag. Neither declines any more.
     dt match {
       case BooleanType | ByteType | ShortType | IntegerType | LongType | FloatType | DoubleType | BinaryType => None
       case _: StringType => None
-      case DateType if rebased =>
-        Some(s"columnar write: column $name is a date and datetimeRebaseModeInWrite is not CORRECTED")
-      case DateType => None
-      case TimestampType if int96 && int96Rebased =>
-        Some(s"columnar write: column $name is an INT96 timestamp and int96RebaseModeInWrite is not CORRECTED")
-      case TimestampType if !int96 && rebased =>
-        Some(s"columnar write: column $name is a timestamp and datetimeRebaseModeInWrite is not CORRECTED")
-      case TimestampType | TimestampNTZType => None
-      case d: DecimalType if d.precision <= Decimal.MAX_LONG_DIGITS && conf.writeLegacyParquetFormat =>
-        Some(s"columnar write: column $name is a decimal(${d.precision},${d.scale}) and writeLegacyFormat is on")
+      case DateType | TimestampType | TimestampNTZType => None
       case _: DecimalType => None
-      // Structs, arrays and maps (#842) in Spark's standard layout, of the types above.
-      case _: StructType | _: ArrayType | _: MapType if conf.writeLegacyParquetFormat =>
-        Some(s"columnar write: column $name is nested and writeLegacyFormat is on")
       case s: StructType if s.isEmpty => Some(s"columnar write: column $name is an empty struct")
       case s: StructType =>
         s.fields.iterator.flatMap(f => typeReason(s"$name.${f.name}", f.dataType, conf)).nextOption()
@@ -507,6 +494,23 @@ private[vecruntime] class VectorDynamicPartitionDataWriter(
     }
   }
 
+  /**
+   * The bucket-id expression compiled onto the data lanes (#842), used when the Murmur3 kernel fast path above
+   * does not match -- most importantly a Hive-compatible write's
+   * `pmod(bitwise_and(hive-hash(keys), Int.MaxValue), n)`, now that `HiveHashExpr` compiles (the bitwise and
+   * pmod already did). The whole expression is handed to `ExpressionCompiler` (not pattern-matched to one
+   * shape), so any bucket-id expression it can compile is evaluated on lanes; only an expression it rejects
+   * falls to the row-by-row `getBucketId` below.
+   */
+  private val bucketIdExpr: Option[io.vecruntime.spark.expr.VectorExpr] =
+    if (vectorBuckets.isDefined) None
+    else
+      description.bucketSpec.flatMap { spec =>
+        io.vecruntime.spark.expr.ExpressionCompiler
+          .compile(spec.bucketIdExpression, description.dataColumns)
+          .toOption
+      }
+
   override def write(record: InternalRow): Unit =
     throw new UnsupportedOperationException("VectorWriteFilesExec writes batches")
 
@@ -524,7 +528,7 @@ private[vecruntime] class VectorDynamicPartitionDataWriter(
         case _ => null
       }
       def rowOf(k: Int): Int = if (physical == null) k else physical(k)
-      val bucketIds: Array[Int] = if (!isBucketed) null else bucketIdsOf(cols, n, all, rowOf)
+      val bucketIds: Array[Int] = if (!isBucketed) null else bucketIdsOf(cols, n, all, rowOf, arena)
 
       var from = 0
       while (from < n) {
@@ -706,16 +710,41 @@ private[vecruntime] class VectorDynamicPartitionDataWriter(
     }
   }
 
-  private def bucketIdsOf(cols: Array[VectorBuffers], n: Int, all: ColumnarBatch, rowOf: Int => Int): Array[Int] = {
+  private def bucketIdsOf(
+      cols: Array[VectorBuffers],
+      n: Int,
+      all: ColumnarBatch,
+      rowOf: Int => Int,
+      arena: Arena
+  ): Array[Int] = {
     val ids = new Array[Int](n)
     vectorBuckets match {
       case Some((keys, kinds, num)) =>
         PartitionKernels.hashPartitionIds(keys.map(cols), kinds, n, num, new Array[Int](n), ids)
       case None =>
-        var k = 0
-        while (k < n) {
-          ids(k) = getBucketId(all.getRow(rowOf(k)))
-          k += 1
+        bucketIdExpr match {
+          case Some(expr) =>
+            // On lanes: evaluate the compiled bucket-id expression over the data columns (already compacted to
+            // the batch's selection), reading its INT32 result into ids. No per-row Spark projection.
+            val child = Arena.ofConfined()
+            try {
+              val ctx = new io.vecruntime.spark.expr.EvalContext(child, n, ordinal => cols(ordinal))
+              val out = expr.eval(ctx)
+              val data = out.data()
+              var k = 0
+              while (k < n) {
+                ids(k) = data.get(io.vecruntime.kernels.VectorBuffers.LE_INT, (k.toLong) << 2)
+                k += 1
+              }
+            } finally child.close()
+          case None =>
+            // Last resort: a bucket-id expression the compiler cannot take, evaluated per row by Spark's projection.
+            VectorDynamicPartitionDataWriter.rowBucketIdRows.addAndGet(n.toLong)
+            var k = 0
+            while (k < n) {
+              ids(k) = getBucketId(all.getRow(rowOf(k)))
+              k += 1
+            }
         }
     }
     ids
@@ -755,6 +784,14 @@ private[vecruntime] class VectorDynamicPartitionDataWriter(
 private[vecruntime] object VectorDynamicPartitionDataWriter {
 
   /**
+   * Rows whose bucket id was evaluated per row by Spark's projection (the last-resort fallback), summed over
+   * this JVM. A bucketed write handled on lanes -- Spark's Murmur3 kernel path or the compiled bucket-id
+   * expression (#842, Hive-compatible writes included) -- never increments it, so a test can assert the lane
+   * path was taken by reading it stays unchanged (through `VectorWriteTestHooks`).
+   */
+  val rowBucketIdRows = new java.util.concurrent.atomic.AtomicLong()
+
+  /**
    * The kernels' hash kind for a bucket key of type `dt` when it equals Spark's `Murmur3Hash` of that type over
    * our lane; null otherwise (the bucket ids are then evaluated by Spark's projection).
    */
@@ -772,6 +809,13 @@ private[vecruntime] object VectorDynamicPartitionDataWriter {
       case _ => null
     }
   }
+}
+
+/** Public test hooks for the writer's internal, package-private counters (#842). */
+object VectorWriteTestHooks {
+
+  /** Rows whose bucket id was evaluated per row by Spark's projection, summed over this JVM (0 on the lane path). */
+  def rowBucketIdRows: Long = VectorDynamicPartitionDataWriter.rowBucketIdRows.get()
 }
 
 private[vecruntime] object VectorWriteTask2 {
@@ -926,10 +970,30 @@ private[vecruntime] class VectorParquetOutputWriter(val filePath: String, dataSc
       case _ =>
     }
     val props = builder.build()
-    val footer = Map(
+    // The write calendar rebase (#842), as ParquetWriteSupport resolves it: the datetime and INT96 modes in
+    // write and the session time zone, read from SQLConf.get (the task's conf on the executor), exactly as
+    // Spark's writer reads them.
+    val sqlConf = org.apache.spark.sql.internal.SQLConf.get
+    val datetimeMode = sqlConf.getConf(SQLConf.PARQUET_REBASE_MODE_IN_WRITE).toString
+    val int96Mode = sqlConf.getConf(SQLConf.PARQUET_INT96_REBASE_MODE_IN_WRITE).toString
+    val rebase =
+      new io.vecruntime.spark.parquet.ParquetWriteRebase(datetimeMode, int96Mode, sqlConf.sessionLocalTimeZone)
+    // Footer key-value metadata: Spark's version and schema always, and -- when a rebase mode is LEGACY -- the
+    // legacy-datetime / legacy-INT96 markers and the session time zone, the keys Spark's ParquetWriteSupport
+    // writes so its own reader rebases these files back.
+    val footerBuilder = scala.collection.mutable.LinkedHashMap[String, String](
       org.apache.spark.sql.SPARK_VERSION_METADATA_KEY -> SPARK_VERSION_SHORT,
       ParquetReadSupport.SPARK_METADATA_KEY -> conf.get(ParquetWriteSupport.SPARK_ROW_SCHEMA, dataSchema.json)
-    ).asJava
+    )
+    if (rebase.datetimeLegacy()) {
+      footerBuilder(org.apache.spark.sql.SPARK_LEGACY_DATETIME_METADATA_KEY) = ""
+      footerBuilder(org.apache.spark.sql.SPARK_TIMEZONE_METADATA_KEY) = sqlConf.sessionLocalTimeZone
+    }
+    if (rebase.int96Legacy()) {
+      footerBuilder(org.apache.spark.sql.SPARK_LEGACY_INT96_METADATA_KEY) = ""
+      footerBuilder(org.apache.spark.sql.SPARK_TIMEZONE_METADATA_KEY) = sqlConf.sessionLocalTimeZone
+    }
+    val footer = footerBuilder.asJava
     val out = HadoopOutputFile.fromPath(new Path(filePath), conf)
     try {
       new ColumnarParquetWriter(
@@ -938,7 +1002,8 @@ private[vecruntime] class VectorParquetOutputWriter(val filePath: String, dataSc
         props,
         codecs.getCompressor(ParquetOutputFormat.getCompression(conf)),
         ParquetOutputFormat.getLongBlockSize(conf),
-        footer
+        footer,
+        rebase
       )
     } catch {
       case t: Throwable =>
