@@ -40,9 +40,8 @@ object VectorConf {
    * `BaseDVFileWriter.delete(path, index, spec, partition)` call per file -- instead of Spark's
    * row-by-row `WriteDeltaExec`. Inserts and the insert half of updates stay on Iceberg's data
    * writer, and the commit stays Iceberg's own `RowDelta`. v2 tables and anything unsupported decline
-   * to Spark's writer unchanged, with a printed fallback reason. Default OFF while the writer is being
-   * landed slice by slice (the operator is not yet wired); it will default on once every Iceberg
-   * merge-on-read suite is byte-identical with it on and off. See `docs/iceberg.md`.
+   * to Spark's writer unchanged, with a printed fallback reason. Default ON (owner, 2026-10-23). See
+   * `docs/iceberg.md`.
    */
   val IcebergDvWriterEnabled = "spark.vecruntime.iceberg.dvWriter.enabled"
 
@@ -72,8 +71,8 @@ object VectorConf {
    * The columnar Iceberg data-file writer (#842, W2): `INSERT INTO`, `INSERT OVERWRITE` and copy-on-write
    * `DELETE` / `UPDATE` / `MERGE INTO` into an Iceberg table write their Parquet data files from our batches
    * through `IcebergParquetAppender` (the `iceberg-bridge` module) instead of Iceberg's row writer; the commit
-   * stays Iceberg's own (`write.toBatch()`). Unpartitioned output specs only for now; anything else declines to
-   * Spark's writer with a printed reason. Default OFF while it lands.
+   * stays Iceberg's own (`write.toBatch()`). Anything it does not take declines to Spark's writer with a printed
+   * reason. Default ON (owner, 2026-10-23).
    */
   val IcebergWriterEnabled = "spark.vecruntime.iceberg.writer.enabled"
 
@@ -82,7 +81,7 @@ object VectorConf {
    * byte-for-byte row groups of a rewritten file that have no deleted rows, instead of decoding and re-encoding
    * them. Needs the write's `_file` / `_pos` on the batches (Iceberg's copy-on-write scan projects both).
    * Unpartitioned tables only for now; a file whose schema differs from the write schema, or whose tracked
-   * float/double NaN counts a copy cannot supply, falls back to the full rewrite. Default OFF while it lands.
+   * float/double NaN counts a copy cannot supply, falls back to the full rewrite. Default ON.
    */
   val IcebergCopyUnchangedEnabled = "spark.vecruntime.iceberg.copyUnchanged.enabled"
 
@@ -280,7 +279,7 @@ object VectorConf {
   /**
    * #735: Iceberg tables read with our native Parquet reader (VectorIcebergScanExec) over Iceberg's own planning:
    * each task group of data files without deletes is decoded by VectorParquetPartitionReader, any other group by
-   * Iceberg's reader. Off by default until the TPC-DS Iceberg A/B.
+   * Iceberg's reader. Default ON (owner, 2026-10-23).
    */
   val ScanNativeIceberg = "spark.vecruntime.scan.nativeIceberg.enabled"
 
@@ -376,12 +375,11 @@ object VectorConf {
   def shuffleEnabled(conf: SQLConf): Boolean = bool(conf, ShuffleEnabled, default = true)
 
   /**
-   * The columnar Iceberg v3 DV writer (#20). Default `false`: the operator is being landed in slices
-   * and is not wired to the planner yet, so turning it on is currently a no-op reserved for the
-   * writer's own tests. Flips to `true` once the writer is byte-identical to Spark's on every
-   * merge-on-read suite.
+   * The columnar Iceberg merge-on-read writer (#20, #901 M1/M2): deletion vectors on v3, position delete files on
+   * v2, the insert half on the columnar data writer. Default `true` (owner, 2026-10-23); anything it does not take
+   * declines to Spark's `WriteDeltaExec` with a printed reason.
    */
-  def icebergDvWriterEnabled(conf: SQLConf): Boolean = bool(conf, IcebergDvWriterEnabled, default = false)
+  def icebergDvWriterEnabled(conf: SQLConf): Boolean = bool(conf, IcebergDvWriterEnabled, default = true)
   def icebergReadSpecsEnabled(conf: SQLConf): Boolean = bool(conf, IcebergReadSpecsEnabled, default = true)
   def icebergNativeEqualityDeletesEnabled(conf: SQLConf): Boolean =
     bool(conf, IcebergNativeEqualityDeletesEnabled, default = true)
@@ -390,10 +388,10 @@ object VectorConf {
   def icebergPositionDeletesEnabled(conf: SQLConf): Boolean =
     bool(conf, IcebergPositionDeletesEnabled, default = true)
 
-  /** The columnar Iceberg data-file writer (#842, W2). Default `false` while it lands. */
-  def icebergWriterEnabled(conf: SQLConf): Boolean = bool(conf, IcebergWriterEnabled, default = false)
+  /** The columnar Iceberg data-file writer (#842, W2). Default `true` (owner, 2026-10-23). */
+  def icebergWriterEnabled(conf: SQLConf): Boolean = bool(conf, IcebergWriterEnabled, default = true)
 
-  /** Copy delete-free row groups in a copy-on-write DELETE (#901 M4a). Default `false` while it lands. */
+  /** Copy delete-free row groups in a copy-on-write DELETE (#901 M4a). Default `true`. */
   def icebergCopyUnchangedEnabled(conf: SQLConf): Boolean = bool(conf, IcebergCopyUnchangedEnabled, default = true)
   def aggDictionaryKeys(conf: SQLConf): Boolean = bool(conf, AggDictionaryKeys, default = true)
 
@@ -766,9 +764,9 @@ object VectorConf {
   def writeColumnar(conf: SQLConf): Boolean = bool(conf, WriteColumnar, default = false)
   def writeColumnarFromRows(conf: SQLConf): Boolean = bool(conf, WriteColumnarFromRows, default = false)
 
-  /** #735: VectorIcebergScanExec, behind the native Parquet scan's own switch too. */
+  /** #735: VectorIcebergScanExec, behind the native Parquet scan's own switch too. Default on (owner, 2026-10-23). */
   def scanNativeIceberg(conf: SQLConf): Boolean =
-    bool(conf, ScanNativeIceberg, default = false) && scanNativeParquet(conf)
+    bool(conf, ScanNativeIceberg, default = true) && scanNativeParquet(conf)
 
   def scanNativeIcebergPackSplits(conf: SQLConf): Boolean = bool(conf, ScanNativeIcebergPackSplits, default = true)
 
