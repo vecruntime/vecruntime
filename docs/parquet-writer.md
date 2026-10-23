@@ -20,19 +20,34 @@ keeps Spark's writer.
 ## Encodings
 
 The same choices as parquet-java's writer with `WriterVersion.PARQUET_2_0`, so our files and parquet-java's
-can be compared page by page in tests:
+can be compared page by page in tests, with one deliberate exception: **BOOLEAN values are PLAIN, not the
+RLE / bit-packing hybrid parquet-java picks for v2 booleans.** Iceberg's own vectorized Spark reader
+(`VectorizedPageIterator.initDataReader`) rejects an RLE-encoded boolean column, so a table written by
+vecruntime could not be read by Iceberg-on-Spark at its default settings; PLAIN is accepted by every reader
+(parquet-java, Spark, Iceberg, and our own). The definition / repetition levels of a boolean column stay
+RLE / bit-packed in the v2 level sections -- only the values change.
 
 | Parquet type | Pages | When the dictionary falls back |
 |---|---|---|
 | INT32, INT64 | `RLE_DICTIONARY` (PLAIN dictionary page) | `DELTA_BINARY_PACKED` |
 | DOUBLE, FLOAT | `RLE_DICTIONARY` | `PLAIN` |
 | BINARY (strings, binary) | `RLE_DICTIONARY` | `DELTA_BYTE_ARRAY` |
-| BOOLEAN, INT96, FIXED_LEN_BYTE_ARRAY | through parquet-java's v2 column writer | as parquet-java |
+| FIXED_LEN_BYTE_ARRAY (fixed, UUID, decimal > 18) | `RLE_DICTIONARY` | `DELTA_BYTE_ARRAY` |
+| INT96 (Spark timestamp) | `RLE_DICTIONARY` | `PLAIN` |
+| BOOLEAN | `PLAIN` (bit-packed, one bit per value, LSB first; no dictionary) | -- |
+
+Since #901 every type is written by our own chunk writers, not parquet-java's v2 column writer. A FLOAT
+narrowed from a FLOAT64 lane, a millisecond timestamp carried in an INT64 lane of microseconds, and a
+decimal of precision up to 18 held in a DECIMAL128 lane go on `FixedWidthChunkWriter`; BOOLEAN on
+`BooleanChunkWriter`; FIXED_LEN_BYTE_ARRAY and INT96 on `FixedBinaryChunkWriter`; and the leaves of
+structs, arrays and maps on `NestedLeafWriter`.
 
 A column chunk's dictionary falls back to the plain encoding when it outgrows
 `parquet.dictionary.page.size`, or after the first page when the dictionary does not pay for itself.
 Definition levels are RLE/bit-packed hybrid. Page statistics (min, max, null count) and the column
-index are written as parquet-java writes them; binary min/max compare unsigned.
+index are written as parquet-java writes them: binary and fixed min/max compare unsigned, a decimal's
+signed two's-complement, a BOOLEAN's by value; INT96 carries only a null count (no min/max), as the
+type is deprecated for statistics.
 
 ## Layout
 
@@ -44,9 +59,11 @@ index are written as parquet-java writes them; binary min/max compare unsigned.
   `ColumnarParquetWriter.footer()` returns the footer it wrote (statistics, encodings, sizes per column chunk),
   which is what a table format such as Iceberg builds its file metrics from. `ColumnarParquetWriter` takes our `VectorBuffers` columns and
   writes a file through parquet-java's `ParquetFileWriter`, so the footer, the column and offset indexes
-  and compression are parquet-java's own. INT32, INT64, DOUBLE and string columns are encoded by our chunk
-  writers (`FixedWidthChunkWriter`, `BinaryChunkWriter`); the other types go to parquet-java's column
-  writer from the same batch.
+  and compression are parquet-java's own. Every column is encoded by our own chunk writers
+  (`FixedWidthChunkWriter` for INT32/INT64/FLOAT/DOUBLE/millis-timestamp/DECIMAL128-lane decimals,
+  `BinaryChunkWriter` for strings, `BooleanChunkWriter` for BOOLEAN, `FixedBinaryChunkWriter` for
+  FIXED_LEN_BYTE_ARRAY and INT96, `NestedLeafWriter` for the leaves of nested columns); parquet-java is
+  kept only for the footer, indexes and compression (#901).
 - **Spark side**: `VectorWriteFilesExec` replaces Spark's `WriteFilesExec` under the write command. Spark
   keeps the command, the commit protocol, file naming, the write statistics and the table refresh; only
   the task changes. The schema is Spark's (`SparkToParquetSchemaConverter`), the footer carries Spark's
@@ -59,9 +76,14 @@ index are written as parquet-java writes them; binary min/max compare unsigned.
   is cut into runs of equal partition values and bucket id -- adjacent rows compared lane by lane, partition
   values projected once per run -- and each run is one range of the batch's columns written into the current
   file. Opening a file goes through Spark's own `renewCurrentWriter`, so the partition directories (escaping,
-  `__HIVE_DEFAULT_PARTITION__`, custom locations), the bucket file names and the stats trackers are Spark's.
+  `__HIVE_DEFAULT_PARTITION__`, custom locations), the bucket file names (Spark's `_NNNNN` suffix, or Hive's
+  `NNNNN_0_` prefix for a Hive-compatible bucketed write) and the stats trackers are Spark's.
   Bucket ids are `pmod(murmur3hash(keys, 42), n)` from the shuffle's hash kernels over the data lanes;
-  another bucket expression or key type is evaluated row by row by Spark's projection.
+  a Hive-compatible bucketed write (`__hive_compatible_bucketed_table_insertion__`) sorts on
+  `pmod(bitwise_and(hive-hash(keys), Int.MaxValue), n)`, which compiles on lanes too -- `hive-hash` steps per key
+  with Spark's own `HiveHasher` and combines them as `31 * h + childHash`, so our bucket id equals Spark's, and
+  the file keeps Spark's Hive file-name prefix. Another bucket expression or key type is evaluated row by row by
+  Spark's projection.
 - **Concurrent output writers** (`spark.sql.maxConcurrentOutputFileWriters` > 0, Spark's
   `DynamicPartitionDataConcurrentWriter` for batches): the input is not sorted; up to that many files stay open
   per task, one per partition and bucket, each run of a batch written to its own. Opening the last one switches
@@ -72,19 +94,18 @@ index are written as parquet-java writes them; binary min/max compare unsigned.
 
 Taken: Parquet writes of flat types, unpartitioned, partitioned (dynamic partitions) and bucketed -- boolean, byte, short, int, long, float,
 double, decimal (every precision), date, timestamp (INT96, `TIMESTAMP_MICROS`, `TIMESTAMP_MILLIS`),
-string, binary, and structs, arrays and maps of those types (#842) -- over a columnar child. Other writes keep Spark's writer, with the reason in the plan's
-fallback list:
+string, binary, and structs, arrays and maps of those types (#842) -- over a columnar child, in both the standard
+Parquet layout and `spark.sql.parquet.writeLegacyFormat` (decimals as `FIXED_LEN_BYTE_ARRAY`, lists as the
+legacy `bag` / `array` `LIST` and maps as the `key_value` `MAP`), and in every write calendar-rebase mode
+(`datetimeRebaseModeInWrite` / `int96RebaseModeInWrite` = `CORRECTED`, `LEGACY` or `EXCEPTION`). Other writes keep
+Spark's writer, with the reason in the plan's fallback list:
 
 | Write | Reason |
 |---|---|
 | Concurrent output writers whose past-the-limit sort keys do not compile | `concurrent writers' sort key ...` |
-| Hive-compatible bucketing (Hive tables) | `Hive-compatible bucketing is not supported yet (#842)` |
-| Struct, array, map columns under `spark.sql.parquet.writeLegacyFormat` | `column <name> is nested and writeLegacyFormat is on` |
 | Other types (intervals, variant, ...) | `column <name> has type <type>, not supported yet (#842)` |
 | `parquet.writer.version=v1` | `parquet.writer.version is v1, the columnar writer writes Parquet v2` |
 | Encryption; per-column `#` options other than `parquet.enable.dictionary#` and `parquet.bloom.filter.*#` | named in the reason |
-| A date or timestamp with a rebase mode in write other than `CORRECTED` (Spark 4 default) | `... is not CORRECTED` |
-| A decimal under `spark.sql.parquet.writeLegacyFormat` | `... writeLegacyFormat is on` |
 
 **Spark's own write suites** run with the writer on, from the spark-sql tests jar through the `spark-sql-tests`
 module, with the plugin, `spark.vecruntime.write.columnar.enabled=true`, `spark.vecruntime.write.columnar.fromRows=true`
@@ -108,18 +129,43 @@ and off-heap on.
 - `ColumnarParquetWriterTest` checks that every chunk's filter is the bitset parquet-java writes, and
   `VectorWriteSuite` checks it against Spark's writer.
 
-**Nested columns** (#842) use Spark's standard layout: a struct is a group, an array the 3-level `LIST`, a map
-the `MAP` with `key_value`.
+**Nested columns** (#842) take the layout Spark's `SparkToParquetSchemaConverter` builds for the write: the
+standard layout (a struct is a group, an array the 3-level `LIST`, a map the `MAP` with `key_value`), and under
+`spark.sql.parquet.writeLegacyFormat` the legacy layout -- an array as `(LIST) { repeated group bag { optional
+<elem> array } }` (or the 2-level form for non-null elements, by Spark's `isElementType` rule) and a map as
+`(MAP) { repeated group key_value ... }`. `NestedFieldWriter` is generic over the schema parquet-java hands it,
+so the only legacy-specific code is recognising the 2-level list's repeated node as the element itself.
 - `NestedFieldWriter` walks each row's nested lane (Arrow's layout) and works out the Dremel repetition and
   definition levels for every leaf. A null at any level writes a null to each leaf under it; an empty array
   or map writes one a level deeper.
-- The leaves are written through parquet-java's column writers, so they get its v2 encodings and statistics,
-  not the flat fast path.
+- Each leaf is written by its own `NestedLeafWriter` (#901): the repetition and definition levels are
+  RLE/bit-packed hybrid in the data-page-v2 level sections, and the values use the same per-type encoders
+  a flat column does. A reader reconstructs the records from the levels.
 - On the Spark side the lane is built from Spark's getters, and a filtered batch is gathered by its
   selection.
 - Tests: `NestedWriteTest` against parquet-java (nulls at every level, a list of structs holding a list,
   several batch sizes and row groups), and `VectorWriteSuite` against Spark's writer, unpartitioned and
   partitioned.
+
+**Legacy-format decimals** (#842): under `writeLegacyFormat` a decimal of any precision is stored as a
+`FIXED_LEN_BYTE_ARRAY` of the minimal byte length for its precision, as Spark's converter writes it (never INT32
+or INT64). A decimal of precision up to 18 is carried on the INT64 lane of unscaled values, written by the
+`DecimalLongFixed` encoder (sign-extended to the FLBA width, most significant first); a wider one rides the
+DECIMAL128 lane and the existing FLBA encoder. `VectorWriteSuite` checks precisions 1, 9, 10, 18, 19 and 38
+against Spark's writer.
+
+**Write calendar rebase** (#842): `datetimeRebaseModeInWrite` and `int96RebaseModeInWrite` in `LEGACY` or
+`EXCEPTION` are written exactly as Spark's `ParquetWriteSupport` does. `LEGACY` rebases a date's days and a
+timestamp's micros from the proleptic Gregorian to the hybrid Julian calendar
+(`RebaseDateTime.rebaseGregorianToJulianDays` / `...Micros`, in the session time zone); `EXCEPTION` fails an
+ancient value (before the Gregorian switch) with Spark's `SparkUpgradeException`; `CORRECTED` (the Spark 4
+default) writes the value unchanged. The rebase is a lane kernel in the fast writer (`FixedWidthChunkWriter`) and
+per-value in the slow encoders (`ColumnEncoder`), with a per-batch min check that skips the whole pass when every
+value is modern. When a mode is `LEGACY` the footer carries Spark's `org.apache.spark.legacyDateTime` /
+`org.apache.spark.legacyINT96` and `org.apache.spark.timeZone` keys, so Spark's own reader rebases the files
+back. `VectorWriteSuite` checks ancient and modern dates and INT96/INT64 (micros and millis) timestamps against
+Spark's writer, and the `EXCEPTION` error.
+
 | ORC, JSON, CSV | `... is not Parquet` |
 | A child that is not columnar | `child <op> is not columnar` |
 

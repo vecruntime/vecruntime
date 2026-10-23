@@ -73,6 +73,8 @@ A few rules hold the design together:
 - **Close.** At task end, LIMIT or failure, the producer is stopped, the queue is drained, the producer is joined, and only then is the reader closed. A producer failure is rethrown on the task thread in order.
 - **Tests.** `DecodeAheadSuite` checks results against Spark's reader for K = 1 and 4 on both thread kinds, across row groups and files; a LIMIT that ends the task early, with the allocator back at its baseline; a table mixing native and fallback files; and a producer failure.
 
+**Decoding the next row group ahead within a split.** The two stages compose into exactly that: `prefetchRowGroups` reads the next row group's compressed pages ahead (chained, in order), and `decodeAhead` decompresses and decodes a row group's pages on the producer thread while the task thread consumes the batches of the row group before it. Both run on the bounded prefetch pool and both reserve against the same execution-memory accounting (`ReadAheadMemory`, #915) — compressed pages while a row group waits, decoded Arrow bytes while a batch is queued — given back when the row group or batch is used or dropped, so a task ended mid-split (a LIMIT, a kill) releases every reserved byte, held byte and Arrow vector through the close path. Row order is preserved end to end. The decode stays on **one** producer thread rather than a second column-reader set per in-flight row group: a row group's column readers are stateful and single-instance, decode is CPU-bound (a second decode thread per task would contend for the same cores, not overlap I/O the way `prefetchRowGroups` already does), and the existing producer already overlaps decode with the operators above the scan. `NativeParquetDecodeAheadSuite` drives multi-row-group splits with both stages on: rows equal the sequential path, order holds, a mid-split LIMIT releases all read-ahead memory and vectors, and a local timing confirms the ahead path is no slower.
+
 **Arena lifetime.** A column reader exists per column per file, so it must not close a shared FFM arena. Closing a shared arena triggers a JVM-wide handshake, and on q88 those handshakes cost 8–9% of executor CPU; with GC-managed scratch they are 0.2–0.4%.
 
 ## Support matrix
@@ -121,17 +123,40 @@ Everything below returns Spark's own result: either Spark's reader decodes it, o
 
 ### Codecs
 
-Every Parquet codec is read correctly, and every codec's decompressor lives as long as its file (#828, #829). Only zstd and snappy have a dedicated path. The others are no slower than in Spark's own reader, which uses the same parquet-java decompressors, but they do not get the per-page reuse zstd and snappy have. Dedicated gzip and LZ4_RAW paths are tracked in [#830](https://github.com/vecruntime/vecruntime/issues/830), to be measured first.
+Compression is not a decode concern of the scan's own. The scan installs `ReusingCodecFactory`, which decompresses zstd and snappy through one reused buffer per column chunk (#810) and hands every other codec to parquet-java's own `CodecFactory`; each codec's decompressor then lives as long as its file (#828, #829). So the codec is never a fall-back reason — `VectorParquetScanExec.hasUnsupportedEncodingInFooter` checks only encodings and physical types — and a file in any codec whose decompressor is on the classpath is read natively, byte for byte as Spark's own reader (which uses the same parquet-java decompressors). `NativeParquetCodecSuite` pins this for every such codec across v1/v2 pages, dictionary/plain pages and flat/nested columns. Only zstd and snappy have the per-page reuse; the others are no slower than in Spark's reader but do not get it. Dedicated gzip and LZ4_RAW paths are tracked in [#830](https://github.com/vecruntime/vecruntime/issues/830), to be measured first.
 
 | Codec | Decompression | Page into the decoder |
 |---|---|---|
 | ZSTD, SNAPPY | The scan's own (`ReusingCodecFactory`, #810): one reused buffer per column chunk | Read in place, no copy (#786) |
 | UNCOMPRESSED | None | Read in place from the chunk buffer |
-| GZIP, LZ4 (Hadoop framing), LZO | parquet-java, through a Hadoop stream codec, decompressor from Hadoop's `CodecPool` | One copy into the reader's reused page buffer; no new array per page |
+| GZIP, LZ4 (Hadoop framing) | parquet-java, through a Hadoop stream codec, decompressor from Hadoop's `CodecPool` | One copy into the reader's reused page buffer; no new array per page |
 | LZ4_RAW | parquet-java's own codec, through the same stream interface | One copy into the reused page buffer |
-| BROTLI | As GZIP, once its codec jar is on the classpath | One copy into the reused page buffer |
 
-LZO and Brotli need codec libraries VecRuntime does not bundle (LZO is GPL and not shipped with Hadoop), so they stay on parquet-java's path.
+The codecs above are all decoded by aircompressor's pure-Java codecs, which ship on the classpath, so the shipped build reads every one of them. **BROTLI and LZO are the exception**: no Brotli or LZO codec is on the classpath (not in aircompressor, parquet-java or Spark — LZO is GPL and not shipped with Hadoop), so a file in either is read by neither Spark's reader nor this one. Because the codec is not a fall-back reason, such a file is *not* diverted to Spark's reader — the read reaches the decompressor and parquet-java raises `BadConfigurationException` (the missing `BrotliCodec`/`LzoCodec` class), exactly as Spark's own reader would raise it for the same file. Decoding Brotli natively would add a new runtime dependency (`brotli4j` or `org.brotli:dec`); it is left out until that dependency is accepted, and would then wire into `ReusingCodecFactory` beside zstd and snappy.
+
+### Default measurement: column index vs late materialization (SF10, local)
+
+A local SF10 A/B of the two page-skipping defaults (`local[8]`, warm OS cache, so this isolates **decode CPU**, not the S3 I/O the 1 TB numbers above measure), median of 3 runs after 1 warm-up, each flag combination its own JVM, on selective TPC-DS queries:
+
+| query | baseline (both off) | `columnindex=true` | `lateMaterialization=true` | `+ twoPass` |
+|---|---|---|---|---|
+| q3  | 1095 ms | 1086 ms (−1%) | 722 ms (−34%) | 781 ms (−29%) |
+| q7  | 1355 ms | 1153 ms (−15%) | 1116 ms (−18%) | 1138 ms (−16%) |
+| q19 | 959 ms | 1084 ms (**+13%**) | 730 ms (−24%) | 748 ms (−22%) |
+| q42 | 643 ms | 451 ms (−30%) | 399 ms (−38%) | 437 ms (−32%) |
+| q52 | 450 ms | 403 ms (−11%) | 373 ms (−17%) | 421 ms (−7%) |
+| q55 | 453 ms | 412 ms (−9%) | 433 ms (−4%) | 363 ms (−20%) |
+| q96 | 399 ms | 375 ms (−6%) | 294 ms (−26%) | 305 ms (−24%) |
+
+Total task CPU (`executorRunTimeMs`) moves the same way: late materialization lowers it on every query here.
+
+**What this shows, and the recommendation — defaults are left unchanged here, this is input for the maintainer:**
+
+- **Late materialization is the consistent win** on these selective queries: faster on all seven (−4% to −38%, ~−24% median) with lower task CPU throughout, no regression. These are exactly the selective-filter shapes it targets. But its current `false` default rests on a *1 TB* reading where q24b was 10% slower (the regression a warm local cache cannot reproduce), and on `minScanBytes=1 GiB` which an SF10 scan does not clear without the override used here. **Recommend: keep the default `false`, but settle it with a 1 TB A/B over this query set** — the local evidence is strong enough to justify that run, which the 1 TB guidance in `docs/configuration.md` has not yet covered for these queries.
+- **Column index helps most queries (−6% to −30%) but regressed q19 by +13%** even on a warm local cache with no per-page S3 request to pay — consistent with the documented #873 reason (index/offset reads and per-page bookkeeping that only range-merging, #834, pays back). **Recommend: keep the default `false`** until #834 lands; the local data does not contradict the existing guidance.
+- **Two-pass is roughly even with plain late materialization here** (better on q55, worse on q42/q52): its distinctive benefit is skipping the page *I/O* of non-surviving rows, which a warm local cache does not exercise, so this bench cannot credit it. **Recommend: keep the default `false`; it needs the 1 TB I/O-bound measurement its config note already calls for.**
+
+The three suites that cover these paths — `NativeParquetColumnIndexSuite`, `LateMaterializationSuite`, `TwoPassLateMaterializationSuite` — pass with the flags on.
 
 ## Status at 1 TB TPC-DS
 
@@ -335,7 +360,7 @@ The parquet-java reader tests themselves build their files in code; the cases th
     - DATE as `timestamp_ntz`: midnight UTC, after the file's date rebase (`ParquetRebase.daysToMicros`).
     - A decimal `(p, s)` read as `(p', s')` with `s' >= s` and `p' - p >= s' - s`: the unscaled values times `10^(s' - s)`, in the INT64 lane by a long multiply and in the DECIMAL128 lane through `BigInteger` (Spark rescales through `BigDecimal` per value).
     - An un-annotated or signed-integer INT32 as a decimal with at least 10 integer digits.
-    - An INT32 or INT64 read as a decimal of more than 18 digits stays on Spark's reader (the DECIMAL128 lane is fed by binary decimals only).
+    - An INT32 or INT64 read as a decimal of more than 18 digits: each value is decoded into an 8-byte slot and sign-extended to a 16-byte DECIMAL128 slot in place (`WIDEN_LONG_TO_DEC128`; zero-extended for a `UINT_64`, `WIDEN_ULONG_TO_DEC128`), rescaled when the requested scale is larger, as Spark's `IntegerToBinaryUpdater` / `LongToBinaryUpdater` (and their `ToDecimal` forms) widen it. Spark reads an un-annotated integer as a decimal only when the requested precision leaves room for its integer digits (INT32 at least 10, INT64 at least 20). `NativeParquetSchemaEvolutionSuite` covers `decimal(20,2)` and `decimal(38,0)` from INT32 and `decimal(30,2)` / `decimal(38,0)` from INT64.
   - **Field-id matching** (`spark.sql.parquet.fieldId.read.enabled`). `clipParquetSchema` matches by id and keeps the requested order, under the file's names, with a generated name for an id the file lacks (a missing column: null). So every reader pairs the requested fields with the clipped ones by position, not by name: `clippedName` at the top level, and the struct, list and tree readers' fields and leaves. Row-group pushdown is built over the file's schema, as `ParquetFileFormat` builds it. Two cases go to Spark's reader for Spark's outcome:
     - a file with no ids at all when the read schema has some, unless `fieldId.read.ignoreMissing` is set (Spark's `ParquetReadSupport` fails it);
     - a field matched by id that carries a sibling's requested name (`idNameClash`). Spark's reader pairs the clipped fields with the read schema by name after the id match, so it reads such a field as the sibling: a type mismatch, or another column's values.

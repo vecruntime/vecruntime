@@ -334,8 +334,12 @@ private[vecruntime] class VectorSortMergeJoinIterator(
       haveRun = true
       return true
     }
-    val builders = rightRows.columns.map(c => new ColumnBuilder(arena, c.`type`(), to - from))
-    val keyBuilders = rightRows.keys.map(k => new ColumnBuilder(arena, k.`type`(), to - from))
+    // A val, not `to - from` inside the lambdas: capturing the vars `from` and `to` makes scalac box
+    // both into IntRefs at their declaration, two allocations per call -- per right run, the common
+    // in-batch path included (#941: 75M IntRefs on one executor's heap during q78 at 10 TB).
+    val firstRows = to - from
+    val builders = rightRows.columns.map(c => new ColumnBuilder(arena, c.`type`(), firstRows))
+    val keyBuilders = rightRows.keys.map(k => new ColumnBuilder(arena, k.`type`(), firstRows))
     var rows = 0
     var more = true
     while (more) {

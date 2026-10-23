@@ -51,10 +51,10 @@ import org.apache.spark.sql.connector.write.WriterCommitMessage;
  */
 public final class DvDeltaTaskWriter implements AutoCloseable {
 
-    private final ColumnarDvWriter dvWriter;
+    private final DeleteSink dvWriter;
     private final Table table;
 
-    private DvDeltaTaskWriter(ColumnarDvWriter dvWriter, Table table) {
+    private DvDeltaTaskWriter(DeleteSink dvWriter, Table table) {
         this.dvWriter = dvWriter;
         this.table = table;
     }
@@ -69,9 +69,20 @@ public final class DvDeltaTaskWriter implements AutoCloseable {
      */
     public static DvDeltaTaskWriter create(Table table, int partitionId, long taskId,
             Map<String, java.util.List<DeleteFile>> rewritableDeletes) {
+        return create(table, partitionId, taskId, rewritableDeletes, null);
+    }
+
+    /**
+     * As {@link #create(Table, int, long, Map)}, writing a v2 table's Parquet
+     * position delete files (#901 M2) when {@code positionDeletes} is given,
+     * deletion vectors when it is null.
+     */
+    public static DvDeltaTaskWriter create(Table table, int partitionId, long taskId,
+            Map<String, java.util.List<DeleteFile>> rewritableDeletes, PositionDeleteSpec positionDeletes) {
         OutputFileFactory outputFileFactory = OutputFileFactory.builderFor(table, partitionId, taskId)
-                .format(org.apache.iceberg.FileFormat.PUFFIN)
-                .operationId(java.util.UUID.randomUUID().toString())
+                .format(positionDeletes == null ? org.apache.iceberg.FileFormat.PUFFIN : org.apache.iceberg.FileFormat.PARQUET)
+                .operationId(positionDeletes == null ? java.util.UUID.randomUUID().toString() : positionDeletes.operationId())
+                .suffix(positionDeletes == null ? null : "deletes")
                 .build();
         // Same loader as Iceberg's own PreviousDeleteLoader: previous delete files are opened through
         // the table's encryption manager, so an encrypted table's DVs load too.
@@ -87,6 +98,9 @@ public final class DvDeltaTaskWriter implements AutoCloseable {
             }
             return deleteLoader.loadPositionDeletes(files, path);
         };
+        if (positionDeletes != null) {
+            return new DvDeltaTaskWriter(new ColumnarPositionDeleteWriter(table, outputFileFactory, positionDeletes, previousDeletes, new org.apache.hadoop.conf.Configuration()), table);
+        }
         return new DvDeltaTaskWriter(new ColumnarDvWriter(outputFileFactory, previousDeletes), table);
     }
 

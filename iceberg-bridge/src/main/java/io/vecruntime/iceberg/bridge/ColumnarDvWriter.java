@@ -41,7 +41,7 @@ import org.apache.iceberg.io.OutputFileFactory;
  * the only thing that is ours is filling the index from column runs rather than
  * one {@code InternalRow} at a time.
  */
-public final class ColumnarDvWriter implements AutoCloseable {
+public final class ColumnarDvWriter implements DeleteSink {
 
     private final BaseDVFileWriter writer;
 
@@ -60,6 +60,7 @@ public final class ColumnarDvWriter implements AutoCloseable {
      * unique — the roaring bitmap deduplicates. {@code count == 0} is a no-op
      * (an empty delete set for this file writes nothing).
      */
+    @Override
     public void deleteFile(String dataFilePath, long[] positions, int count,
                            PartitionSpec spec, StructLike partition) {
         if (count <= 0) {
@@ -82,6 +83,7 @@ public final class ColumnarDvWriter implements AutoCloseable {
      * Iceberg's per-task result after {@link #close()}: the DV delete files and
      * referenced data files.
      */
+    @Override
     public DeleteWriteResult result() {
         return writer.result();
     }

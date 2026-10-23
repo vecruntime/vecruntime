@@ -247,4 +247,128 @@ class VectorMergeRowsSuite extends VectorQuerySuite {
       unsupported
     ).exists(_.contains("merge clause condition: unsupported expression SoundEx")))
   }
+
+  test("a clause that BUILDS a struct, array and map (named_struct / array / map) agrees with Spark (#901 R2)") {
+    val child = joined("nested_ctor", "id")
+    val tI = attr(child, "t_i"); val tV = attr(child, "t_v"); val tF = attr(child, "t_file")
+    val sI = attr(child, "s_i"); val sV = attr(child, "s_v")
+    val rid = attr(child, "__row_id")
+    import org.apache.spark.sql.catalyst.expressions.{CreateArray, CreateMap, CreateNamedStruct}
+    // The output's last three columns are a built struct, array and map; `op`, `i`, `v`, `rid` are scalar.
+    val nestedOutput: Seq[Attribute] = Seq(
+      AttributeReference("op", IntegerType, nullable = false)(),
+      AttributeReference("i", IntegerType)(),
+      AttributeReference("rid", LongType)(),
+      AttributeReference("st", StructType(Seq(StructField("a", IntegerType), StructField("t", StringType))))(),
+      AttributeReference("arr", ArrayType(StringType))(),
+      AttributeReference("m", MapType(StringType, LongType))(),
+      AttributeReference("aom", ArrayType(MapType(StringType, IntegerType)))()
+    )
+    def st(a: Expression, t: Expression) =
+      CreateNamedStruct(Seq(Literal("a"), a, Literal("t"), t))
+    def arr(es: Expression*) = CreateArray(es)
+    def mp(pairs: Expression*) = CreateMap(pairs)
+    // matched: build from target+source; notMatchedBySource: build from target; notMatched: insert built from source.
+    def built(a: Expression, t: Expression, elems: Seq[Expression], mapKey: Expression, mapVal: Expression)
+        : Seq[Expression] =
+      Seq(
+        Literal(1),
+        tI,
+        rid,
+        st(a, t),
+        CreateArray(elems),
+        mp(mapKey, mapVal),
+        arr(mp(Literal("a"), tI), mp(Literal("b"), sI)) // an array of maps built by constructors
+      )
+    val matched = Seq(
+      MergeRows.Keep(
+        MergeRows.Update,
+        Literal.TrueLiteral,
+        built(
+          tI,
+          tF,
+          Seq(tF, Literal(null, StringType), tF),
+          org.apache.spark.sql.catalyst.expressions.Concat(Seq(Literal("k"), tF)),
+          tV
+        )
+      )
+    )
+    val notMatched = Seq(
+      MergeRows.Keep(
+        MergeRows.Insert,
+        Literal.TrueLiteral,
+        Seq(
+          Literal(3),
+          sI,
+          Literal(null, LongType),
+          st(sI, Literal(null, StringType)),
+          arr(Literal("n")),
+          mp(Literal("z"), sV),
+          arr(mp(Literal("c"), sI))
+        )
+      )
+    )
+    val notMatchedBySource = Seq(
+      MergeRows.Keep(
+        MergeRows.Delete,
+        Literal.TrueLiteral,
+        built(tI, tF, Seq(tF), Literal("only"), tV)
+      )
+    )
+    val s = IsNotNull(attr(child, "s_marker")); val t = IsNotNull(attr(child, "t_marker"))
+    val ours =
+      VectorMergeRowsExec(s, t, matched, notMatched, notMatchedBySource, checkCardinality = false, nestedOutput, child)
+    assert(VectorMergeRowsPlanner.reason(ours).isEmpty, VectorMergeRowsPlanner.reason(ours).getOrElse(""))
+    val theirs = MergeRowsExec(
+      s,
+      t,
+      matched,
+      notMatched,
+      notMatchedBySource,
+      checkCardinality = false,
+      nestedOutput,
+      ColumnarToRowExec(child)
+    )
+    theirs.metrics
+    val schema = StructType(nestedOutput.map(a => StructField(a.name, a.dataType, a.nullable)))
+    def rowsOf(plan: SparkPlan): Seq[String] = {
+      val rows = if (plan.supportsColumnar) ColumnarToRowExec(plan).executeCollect() else plan.executeCollect()
+      rows.map(ir => NestedRender.row(ir.copy(), schema)).toSeq.sorted
+    }
+    val e = rowsOf(theirs)
+    val a = rowsOf(ours)
+    assert(a.length === e.length, s"row counts: ours ${a.length}, Spark ${e.length}")
+    assert(a === e)
+  }
+}
+
+/** Renders an InternalRow (and its nested structs, arrays, maps) to a stable string for comparison. */
+private object NestedRender {
+  import org.apache.spark.sql.catalyst.InternalRow
+  import org.apache.spark.sql.catalyst.util.{ArrayData, MapData}
+  import org.apache.spark.sql.types._
+
+  def row(r: InternalRow, schema: StructType): String =
+    schema.fields.zipWithIndex.map { case (f, i) =>
+      s"${f.name}=" + (if (r.isNullAt(i)) "null" else value(r.get(i, f.dataType), f.dataType))
+    }.mkString("{", ", ", "}")
+
+  private def value(v: Any, dt: DataType): String = dt match {
+    case s: StructType => row(v.asInstanceOf[InternalRow], s)
+    case a: ArrayType => array(v.asInstanceOf[ArrayData], a.elementType)
+    case m: MapType =>
+      val md = v.asInstanceOf[MapData]
+      val ks = md.keyArray(); val vs = md.valueArray()
+      (0 until md.numElements()).map { i =>
+        value(if (ks.isNullAt(i)) null else ks.get(i, m.keyType), m.keyType) + "->" +
+          (if (vs.isNullAt(i)) "null" else value(vs.get(i, m.valueType), m.valueType))
+      }.sorted.mkString("map(", ", ", ")")
+    case _: StringType => if (v == null) "null" else v.toString
+    case _ => String.valueOf(v)
+  }
+
+  private def array(ad: ArrayData, et: DataType): String =
+    (0 until ad.numElements()).map(i =>
+      if (ad.isNullAt(i)) "null" else value(ad.get(i, et), et)
+    ).mkString("[", ", ", "]")
 }

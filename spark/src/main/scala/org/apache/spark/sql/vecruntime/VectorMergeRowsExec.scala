@@ -244,6 +244,11 @@ object VectorMergeRowsPlanner {
           else Right(CompiledOutput(out.name, out.dataType, null, ordinal))
         // An inserted row has no partition struct yet: a `NULL` of the lane-less type is a null column (#273).
         case Literal(null, _) => Right(CompiledOutput(out.name, out.dataType, NullLiteralExpr(out.dataType), -1))
+        // A built nested value (`named_struct`, `array`, `map`, #901 R2): compiled as a projection and
+        // handed to Spark as the nested lane at emit, like the project and expand operators.
+        case other if TypeMapping.nestedTypeOf(out.dataType) != null =>
+          ExpressionCompiler.compileProjection(other, input)
+            .left.map(r => s"${other.sql}: $r").map(c => CompiledOutput(out.name, out.dataType, c, -1))
         case other => Left(s"${other.sql}: unsupported output type ${out.dataType.simpleString} for ${out.name}")
       }
     }).map(_.toArray)
@@ -383,6 +388,17 @@ private[vecruntime] class VectorMergeRowsIterator(
           case lit: LiteralExpr => ArrowOutput.constant(o.name, o.dataType, lit.value, count, allocator)
           case ColumnRef(ordinal, _) =>
             ArrowOutput.compact(o.name, o.dataType, ctx.input(ordinal), mask, count, allocator)
+          // A built nested value (`named_struct`, `array`, `map`, #901 R2): evaluated over the batch
+          // with the clause's rows active, handed to Spark as the nested lane, compacted by the mask.
+          case e if TypeMapping.nestedTypeOf(o.dataType) != null =>
+            if (foreignRows == null) foreignRows = RemappedColumnVector.rowsOf(mask, n, count)
+            val col = io.vecruntime.spark.arrow.VectorNestedColumnVector.of(
+              o.name,
+              o.dataType,
+              ctx.withActive(mask)(e.eval(ctx)),
+              allocator
+            )
+            RemappedColumnVector.owning(col, foreignRows)
           case e => ArrowOutput.compact(o.name, o.dataType, ctx.withActive(mask)(e.eval(ctx)), mask, count, allocator)
         }
       c += 1

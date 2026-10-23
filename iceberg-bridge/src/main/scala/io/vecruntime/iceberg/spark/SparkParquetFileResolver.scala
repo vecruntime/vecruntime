@@ -46,7 +46,7 @@ final class SparkParquetFileResolver(tableSchema: Object, nameMappingJson: Strin
   override def clip(file: MessageType, requested: StructType): Either[String, ParquetFileResolver.Resolved] = {
     val projected = requested.fields.toSeq.map(f => SparkParquetFileResolver.idOf(f).map(id => (f, id)))
     val fields = projected.flatten.map { case (f, id) =>
-      Option(schema.findField(id)) match {
+      SparkParquetFileResolver.fieldOf(schema, id) match {
         case Some(ice) => project(ice, f.dataType)
         case None => Left(s"column ${f.name}: no field $id in the table schema")
       }
@@ -131,8 +131,16 @@ final class SparkParquetFileResolver(tableSchema: Object, nameMappingJson: Strin
 
   /** A field the file does not hold, under a name it does not use: Spark's Parquet type for `dt`. */
   private def missing(name: String, dt: DataType, id: Option[Int]): org.apache.parquet.schema.Type = {
+    import org.apache.spark.sql.types.NullType
+    // NullType (the v3 unknown type, #rtypes) has no Parquet representation: it is always a null column, so the
+    // clipped field is only a placeholder the file never holds. Spark's converter rejects NullType, so build the
+    // placeholder by hand (an optional int32); its missing-prefixed name makes the reader a NativeParquetNullColumn.
     val t =
-      converter.convert(StructType(Seq(StructField(SparkParquetFileResolver.MissingPrefix + name, dt)))).getType(0)
+      if (dt == NullType)
+        org.apache.parquet.schema.Types
+          .optional(org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.INT32)
+          .named(SparkParquetFileResolver.MissingPrefix + name)
+      else converter.convert(StructType(Seq(StructField(SparkParquetFileResolver.MissingPrefix + name, dt)))).getType(0)
     id.fold(t)(t.withId)
   }
 }
@@ -146,6 +154,19 @@ object SparkParquetFileResolver {
     if (f.metadata.contains(ParquetUtils.FIELD_ID_METADATA_KEY))
       Some(f.metadata.getLong(ParquetUtils.FIELD_ID_METADATA_KEY).toInt)
     else None
+
+  /**
+   * The Iceberg field of a requested id: the table schema's, or for the row-lineage columns a v3 file may
+   * materialise (`_row_id`, `_last_updated_sequence_number`, read by their reserved ids) Iceberg's own
+   * metadata field, so a file without them reads nulls as Iceberg's reader does.
+   */
+  def fieldOf(schema: Schema, id: Int): Option[Types.NestedField] =
+    Option(schema.findField(id)).orElse {
+      if (id == org.apache.iceberg.MetadataColumns.ROW_ID.fieldId()) Some(org.apache.iceberg.MetadataColumns.ROW_ID)
+      else if (id == org.apache.iceberg.MetadataColumns.LAST_UPDATED_SEQUENCE_NUMBER.fieldId())
+        Some(org.apache.iceberg.MetadataColumns.LAST_UPDATED_SEQUENCE_NUMBER)
+      else None
+    }
 
   private def elementIsRepeated(g: GroupType): Boolean = {
     val r = g.getType(0)

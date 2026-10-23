@@ -91,6 +91,17 @@ public final class IcebergReadSpecs {
     public record Missing(Types.NestedField field, Object initialDefault) implements Node {}
 
     /**
+     * The row-lineage metadata columns a v3 data file may materialise
+     * ({@code _row_id}, {@code _last_updated_sequence_number}): read from the
+     * file like a data column (missing, so null, where the file lacks them),
+     * the scan deriving the value of a null from the file's first row id or
+     * data sequence number.
+     */
+    static boolean isLineage(int id) {
+        return id == MetadataColumns.ROW_ID.fieldId() || id == MetadataColumns.LAST_UPDATED_SEQUENCE_NUMBER.fieldId();
+    }
+
+    /**
      * One of Iceberg's metadata columns ({@link MetadataColumns}), filled by
      * the scan.
      */
@@ -122,8 +133,9 @@ public final class IcebergReadSpecs {
         List<Node> columns = new ArrayList<>();
         List<org.apache.parquet.schema.Type> kept = new ArrayList<>();
         for (Types.NestedField f : projection.fields()) {
-            org.apache.parquet.schema.Type t = MetadataColumns.isMetadataColumn(f.fieldId()) ? null : byId(withIds, f.fieldId());
-            Node n = MetadataColumns.isMetadataColumn(f.fieldId()) ? new Metadata(f) : r.node(f, t, new String[0]);
+            boolean filled = MetadataColumns.isMetadataColumn(f.fieldId()) && !isLineage(f.fieldId());
+            org.apache.parquet.schema.Type t = filled ? null : byId(withIds, f.fieldId());
+            Node n = filled ? new Metadata(f) : r.node(f, t, new String[0]);
             columns.add(n);
             org.apache.parquet.schema.Type pruned = n instanceof Missing || n instanceof Metadata
                     ? null
@@ -146,6 +158,11 @@ public final class IcebergReadSpecs {
         }
 
         Node node(Types.NestedField f, org.apache.parquet.schema.Type t, String[] parentPath) {
+            if (f.type().typeId() == Type.TypeID.UNKNOWN) {
+                // The v3 unknown type (#rtypes): always null, never stored in a file. Null in every row, as
+                // Iceberg's reader produces it (Spark sees it as NullType).
+                return new Missing(f, null);
+            }
             if (t == null) {
                 if (f.isRequired() && f.initialDefault() == null) {
                     throw new IllegalArgumentException("Missing required field: " + f.name());

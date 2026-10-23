@@ -15,6 +15,7 @@
  */
 package io.vecruntime.parquet.write;
 
+import java.io.IOException;
 import java.lang.foreign.MemorySegment;
 import java.util.ArrayList;
 import java.util.IdentityHashMap;
@@ -24,8 +25,9 @@ import io.vecruntime.kernels.Bitmap;
 import io.vecruntime.kernels.VecType;
 import io.vecruntime.kernels.VectorBuffers;
 import org.apache.parquet.column.ColumnDescriptor;
-import org.apache.parquet.column.ColumnWriteStore;
-import org.apache.parquet.column.ColumnWriter;
+import org.apache.parquet.column.ParquetProperties;
+import org.apache.parquet.column.page.PageWriter;
+import org.apache.parquet.hadoop.ColumnChunkPageWriteStore;
 import org.apache.parquet.schema.GroupType;
 import org.apache.parquet.schema.LogicalTypeAnnotation;
 import org.apache.parquet.schema.MessageType;
@@ -34,10 +36,12 @@ import org.apache.parquet.schema.Type;
 import static io.vecruntime.kernels.VectorBuffers.LE_INT;
 
 /**
- * Writes one top-level struct, array or map field (#842) from its nested lane
- * (Arrow's layout: a struct's children of its length, a list's or map's
- * offsets into its children) into parquet-java's column writers, one per leaf,
- * with the repetition and definition levels of the Dremel encoding.
+ * Writes one top-level struct, array or map field (#842, #901) from its nested
+ * lane (Arrow's layout: a struct's children of its length, a list's or map's
+ * offsets into its children) to the leaves' own v2 page writers ({@link
+ * NestedLeafWriter}), with the repetition and definition levels of the Dremel
+ * encoding. Each leaf is written by our own chunk writer, not parquet-java's
+ * column writer, so it gets the same v2 encodings a flat column does.
  *
  * <p>The schema is the one Spark's {@code SparkToParquetSchemaConverter} writes
  * outside {@code writeLegacyFormat}: a struct is a group of its fields, an
@@ -50,29 +54,34 @@ import static io.vecruntime.kernels.VectorBuffers.LE_INT;
  */
 final class NestedFieldWriter {
 
-    /**
-     * One leaf column of the field: its descriptor and, once a value reached
-     * it, its encoder.
-     */
+    /** One leaf column of the field: its descriptor and its own page writer. */
     private static final class Leaf {
         final ColumnDescriptor column;
-        ColumnEncoder encoder;
-        VecType lane;
-        ColumnWriter writer;
+        final NestedLeafWriter writer;
 
-        Leaf(ColumnDescriptor column) {
+        Leaf(ColumnDescriptor column, ParquetProperties props, WriteRebase rebase) {
             this.column = column;
+            this.writer = new NestedLeafWriter(column, props, rebase);
         }
     }
 
     private final Type field;
+    private final ParquetProperties props;
+    private final WriteRebase rebase;
     private final IdentityHashMap<Type, Leaf> leaves = new IdentityHashMap<>();
     // Every node's leaves, for the nulls of a null or empty value.
     private final IdentityHashMap<Type, Leaf[]> under = new IdentityHashMap<>();
     private final List<Leaf> all = new ArrayList<>();
 
-    NestedFieldWriter(MessageType schema, Type field) {
+    NestedFieldWriter(MessageType schema, Type field, ParquetProperties props) {
+        this(schema, field, props, WriteRebase.NONE);
+    }
+
+    NestedFieldWriter(MessageType schema, Type field, ParquetProperties props,
+                      WriteRebase rebase) {
         this.field = field;
+        this.props = props;
+        this.rebase = rebase == null ? WriteRebase.NONE : rebase;
         List<String> path = new ArrayList<>();
         path.add(field.getName());
         collect(schema, field, path);
@@ -90,7 +99,7 @@ final class NestedFieldWriter {
     private Leaf[] collect(MessageType schema, Type t, List<String> path) {
         Leaf[] out;
         if (t.isPrimitive()) {
-            Leaf l = new Leaf(schema.getColumnDescription(path.toArray(new String[0])));
+            Leaf l = new Leaf(schema.getColumnDescription(path.toArray(new String[0])), props, rebase);
             leaves.put(t, l);
             all.add(l);
             out = new Leaf[] {l};
@@ -109,18 +118,38 @@ final class NestedFieldWriter {
         return out;
     }
 
-    /**
-     * Writes rows {@code [from, to)} of the field's lane {@code v}; the caller
-     * ends each record.
-     */
-    void write(VectorBuffers v, int from, int to,
-               ColumnWriteStore store) {
+    /** Starts every leaf's column chunk on a fresh row group. */
+    void startRowGroup(ColumnChunkPageWriteStore pageStore) {
         for (Leaf l : all) {
-            l.writer = store.getColumnWriter(l.column);
+            PageWriter pages = pageStore.getPageWriter(l.column);
+            l.writer.startChunk(pages);
         }
+    }
+
+    /** Writes rows {@code [from, to)} of the field's lane {@code v}. */
+    void write(VectorBuffers v, int from, int to) throws IOException {
         for (int i = from; i < to; i++) {
             node(field, v, i, 0, 0, 0);
         }
+        for (Leaf l : all) {
+            l.writer.maybeFlush();
+        }
+    }
+
+    /** Ends every leaf's column chunk at the end of a row group. */
+    void endRowGroup() throws IOException {
+        for (Leaf l : all) {
+            l.writer.endChunk();
+        }
+    }
+
+    /** The buffered bytes of every leaf, for the row-group size check. */
+    long bufferedBytes() {
+        long size = 0;
+        for (Leaf l : all) {
+            size += l.writer.bufferedBytes();
+        }
+        return size;
     }
 
     private void node(Type t, VectorBuffers v, int i,
@@ -134,13 +163,8 @@ final class NestedFieldWriter {
             def++;
         }
         if (t.isPrimitive()) {
-            Leaf l = leaves.get(t);
-            if (l.encoder == null || l.lane != v.type()) {
-                // Bound per lane type: a batch from another source may carry the same leaf in another lane.
-                l.encoder = ColumnEncoder.forColumn(v.type(), l.column);
-                l.lane = v.type();
-            }
-            l.encoder.put(v, i, rep, def, l.writer);
+            // #958: the leaf's own NestedLeafWriter encodes the value (the calendar rebase, #842, lives inside it).
+            leaves.get(t).writer.put(v, i, rep, def);
             return;
         }
         GroupType g = t.asGroupType();
@@ -149,7 +173,7 @@ final class NestedFieldWriter {
         boolean map = a instanceof LogicalTypeAnnotation.MapLogicalTypeAnnotation;
         if (list || map) {
             expect(v, list ? VecType.LIST : VecType.MAP, g);
-            GroupType repeated = g.getType(0).asGroupType();
+            Type repeated = g.getType(0);
             MemorySegment offsets = v.offsets();
             int start = offsets.get(LE_INT, (long) i << 2);
             int end = offsets.get(LE_INT, (long) (i + 1) << 2);
@@ -159,18 +183,45 @@ final class NestedFieldWriter {
             }
             List<VectorBuffers> children = v.children();
             int inner = depth + 1;
+            // The standard 3-level LIST and Spark's legacy nullable `bag { array }` form put the element under a
+            // one-field repeated group; the MAP's repeated `key_value` carries key and value. Spark's legacy
+            // 2-level list (non-null elements, writeLegacyFormat) has no wrapper: the repeated node IS the element
+            // -- a repeated primitive, or a repeated group that is the element struct (isElementType). A LIST lane
+            // always has one child (the element), so a 2-level list maps that one child onto the repeated node.
+            boolean twoLevelElement = list && isElementType(repeated, g.getName());
             for (int j = start; j < end; j++) {
                 int r = j == start ? rep : inner;
                 // The repeated group is present for each element: one more definition level.
-                for (int f = 0; f < repeated.getFieldCount(); f++) {
-                    node(repeated.getType(f), children.get(f), j, r,
+                if (twoLevelElement) {
+                    node(repeated, children.get(0), j, r,
                             def + 1, inner);
+                } else {
+                    GroupType rg = repeated.asGroupType();
+                    for (int f = 0; f < rg.getFieldCount(); f++) {
+                        node(rg.getType(f), children.get(f), j, r,
+                                def + 1, inner);
+                    }
                 }
             }
             return;
         }
         expect(v, VecType.STRUCT, g);
         List<VectorBuffers> children = v.children();
+        if (a instanceof LogicalTypeAnnotation.VariantLogicalTypeAnnotation) {
+            // The engine carries a variant as the struct (value, metadata), the order of Spark's variant vectors
+            // (NativeParquetSupport.VARIANT_READ_TYPE); the file's group is matched by name, in its own order.
+            for (int f = 0; f < g.getFieldCount(); f++) {
+                String name = g.getType(f).getName();
+                int k = switch (name) {
+                    case "value" -> 0;
+                    case "metadata" -> 1;
+                    default -> throw new IllegalArgumentException("variant group field '" + name + "' (a shredded variant) is not written natively: " + g);
+                };
+                node(g.getType(f), children.get(k), i, rep,
+                        def, depth);
+            }
+            return;
+        }
         for (int f = 0; f < g.getFieldCount(); f++) {
             node(g.getType(f), children.get(f), i, rep,
                     def, depth);
@@ -179,7 +230,7 @@ final class NestedFieldWriter {
 
     private void nulls(Type t, int rep, int def) {
         for (Leaf l : under.get(t)) {
-            l.writer.writeNull(rep, def);
+            l.writer.putNull(rep, def);
         }
     }
 
@@ -187,5 +238,22 @@ final class NestedFieldWriter {
         if (v.type() != type) {
             throw new IllegalArgumentException("a " + v.type() + " lane for " + g);
         }
+    }
+
+    /**
+     * Spark's {@code ParquetSchemaConverter.isElementType}
+     * backward-compatibility rule: whether the LIST's repeated node is itself
+     * the element (a legacy 2-level list) rather than a one-field wrapper group
+     * around the element (the standard 3-level list, and Spark's legacy
+     * nullable {@code bag { array }} form). True when the repeated node is
+     * primitive, is a group with two or more fields, or is named {@code array}
+     * or {@code <list>_tuple}.
+     */
+    private static boolean isElementType(Type repeated, String parentName) {
+        if (repeated.isPrimitive()) {
+            return true;
+        }
+        GroupType g = repeated.asGroupType();
+        return g.getFieldCount() > 1 || "array".equals(g.getName()) || (parentName + "_tuple").equals(g.getName());
     }
 }

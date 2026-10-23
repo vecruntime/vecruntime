@@ -216,6 +216,31 @@ class IcebergReadSpecsSuite extends AnyFunSuite {
     assert(paths(p) == Seq("a"))
   }
 
+  test("the row-lineage columns are read from a file that materialises them, else missing") {
+    val lineage = struct(
+      optional(1, "a", Types.IntegerType.get()),
+      org.apache.iceberg.MetadataColumns.ROW_ID,
+      org.apache.iceberg.MetadataColumns.LAST_UPDATED_SEQUENCE_NUMBER
+    )
+    val (rowId, seq) = (
+      org.apache.iceberg.MetadataColumns.ROW_ID.fieldId(),
+      org.apache.iceberg.MetadataColumns.LAST_UPDATED_SEQUENCE_NUMBER.fieldId()
+    )
+    val rewritten = file(
+      s"""message table {
+         |  optional int32 a = 1;
+         |  optional int64 _row_id = $rowId;
+         |  optional int64 _last_updated_sequence_number = $seq;
+         |}""".stripMargin
+    )
+    val read = resolve(lineage, rewritten, null)
+    assert(read.columns().asScala.forall(_.isInstanceOf[Leaf]))
+    assert(paths(read) == Seq("a", "_row_id", "_last_updated_sequence_number"))
+    val original = resolve(lineage, file("message table { optional int32 a = 1; }"), null)
+    assert(original.columns().get(1).isInstanceOf[Missing] && original.columns().get(2).isInstanceOf[Missing])
+    assert(paths(original) == Seq("a"))
+  }
+
   // ------------------------------------------------------------- the Spark adapter's specs, type by type
 
   private val pairings: Seq[(Type.PrimitiveType, String)] = Seq(
@@ -237,7 +262,9 @@ class IcebergReadSpecsSuite extends AnyFunSuite {
     Types.DecimalType.of(18, 2) -> "optional int64 c (DECIMAL(18, 2))",
     Types.DecimalType.of(18, 2) -> "optional int32 c (DECIMAL(9, 2))",
     Types.DecimalType.of(30, 2) -> "optional fixed_len_byte_array(13) c (DECIMAL(30, 2))",
-    Types.DecimalType.of(30, 2) -> "optional int64 c (DECIMAL(18, 2))"
+    Types.DecimalType.of(30, 2) -> "optional int64 c (DECIMAL(18, 2))",
+    Types.FixedType.ofLength(4) -> "optional fixed_len_byte_array(4) c",
+    Types.UUIDType.get() -> "optional fixed_len_byte_array(16) c (UUID)"
   )
 
   test("every leaf spec equals the Spark adapter's for the Spark type Iceberg maps the Iceberg type to") {

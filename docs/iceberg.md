@@ -19,7 +19,7 @@ Spark's and Iceberg's, apart from an opt-in columnar deletion-vector writer for 
   other column types, other metadata columns, nested initial defaults, and ORC, Avro or
   encrypted files.
 - **No Comet:** Comet is not needed for any of this.
-- **Writes (in review, #913-#921):** a columnar Iceberg writer covers `INSERT`, `INSERT OVERWRITE`, CTAS/RTAS,
+- **Writes (#913-#921, #936):** a columnar Iceberg writer covers `INSERT`, `INSERT OVERWRITE`, CTAS/RTAS,
   copy-on-write and merge-on-read `DELETE` / `UPDATE` / `MERGE INTO`, partitioned tables and hash and range
   distribution. Merge-on-read writes deletion vectors on v3 and position delete files on v2. It is behind
   `spark.vecruntime.iceberg.writer.enabled`. See [the columnar writer](#the-write-side-the-columnar-iceberg-writer-842-901).
@@ -59,13 +59,14 @@ Format version 1 reads as version 2 does, without delete files.
 | Task-group packing | yes | Task groups are packed into Spark tasks as Spark packs a Parquet scan's splits (`...nativeIceberg.packSplits`) |
 | Storage-partitioned joins | yes | A scan that reports a partitioning keeps Iceberg's groups, unpacked. A scan that reports an ordering is read by Iceberg's reader (scan) |
 | Metadata columns `_file`, `_pos`, `_spec_id` | yes | `_file` and `_spec_id` are per-split constants; `_pos` is the reader's row index |
-| Metadata columns `_partition`, `_deleted` | scan | |
+| Metadata columns `_partition`, `_row_id`, `_last_updated_sequence_number` | yes (#20 M3a) | `_partition` is the per-file struct of the table's unified partition type (empty on an unpartitioned table, where Iceberg returns it null); `_row_id` and `_last_updated_sequence_number` are the file's own column where it materialises them (copy-on-write, compaction), else `firstRowId + _pos` / `dataSequenceNumber`. All three come from `PartitionUtil.constantsMap` and the data file, per batch |
+| Metadata column `_deleted` | scan | |
 | Types: boolean, int, long, float, double, date, timestamp (with zone and without), string, binary, decimal | yes | `decimal(p > 18)` becomes a DECIMAL128 lane |
 | Types: uuid, fixed, time | scan | Iceberg's reader reads them as Spark types our reader does not produce from these files |
 | Types: struct, list, map | yes | At any depth, when every leaf is one of the flat types above. Nested struct fields are matched by their Iceberg field ids, so a renamed nested field reads as Iceberg reads it, and a field added to a struct later reads as nulls from older files. Iceberg's reader does not vectorize nested columns, so such a scan is taken only when every task group reads natively; otherwise it stays Spark's row path |
 | Encrypted files | group | Iceberg's `FileIO` decrypts them |
-| `DELETE`, `UPDATE`, `MERGE INTO` (merge-on-read) | partly; columnar in review (#921) | Their reads run on our operators, and the `MERGE INTO` join and `MergeRows` are columnar (#21, #273). Today Spark's `WriteDeltaExec` and Iceberg's writers write the delete and data files. #921 writes both columnar: position delete files on v2, deletion vectors on v3, and the inserted and updated rows through the columnar data writer |
-| Copy-on-write rewrites, `INSERT`, CTAS | reads only; columnar in review (#913-#919) | Today the write is Spark's row path into Iceberg's Parquet writer. #913-#919 add a columnar writer, see [the columnar writer](#the-write-side-the-columnar-iceberg-writer-842-901) |
+| `DELETE`, `UPDATE`, `MERGE INTO` (merge-on-read) | yes, with `spark.vecruntime.iceberg.writer.enabled` (#921) | Their reads run on our operators, and the `MERGE INTO` join and `MergeRows` are columnar (#21, #273). The writes are columnar too: position delete files on v2, deletion vectors on v3, and the inserted and updated rows through the columnar data writer. Off, Spark's `WriteDeltaExec` and Iceberg's writers write them |
+| Copy-on-write rewrites, `INSERT`, CTAS | yes, with `spark.vecruntime.iceberg.writer.enabled` (#913-#919) | Written by the columnar writer, see [the columnar writer](#the-write-side-the-columnar-iceberg-writer-842-901). Off, the write is Spark's row path into Iceberg's Parquet writer |
 
 ### Format version 3
 
@@ -77,7 +78,7 @@ Everything in the version 2 table applies. The version 3 additions:
 | Writing deletion vectors | opt-in | `spark.vecruntime.iceberg.dvWriter.enabled` (off by default) builds each data file's `PositionDeleteIndex` from our batches and hands it to Iceberg's DV writer, for `DELETE`, `UPDATE` and `MERGE INTO`. The commit stays Iceberg's `RowDelta`. See [the write side](#the-write-side-columnar-v3-deletion-vectors-20) |
 | Default values: `initial-default` | yes, or scan | A top-level column's default is filled into the files written before the column existed, as a constant (Spark's existence default), for boolean, int, long, float, double, decimal, string, binary, date and timestamp columns. A default on a nested field, or of another type, keeps Iceberg's reader for the scan |
 | Default values: `write-default` | n/a | Applied by Iceberg's writer |
-| Row lineage (`_row_id`, `_last_updated_sequence_number`) | scan | Iceberg derives them from the manifests and the files' first row ids |
+| Row lineage (`_row_id`, `_last_updated_sequence_number`) | yes (#20 M3a) | The file's own column where it materialises them, else `firstRowId + _pos` / `dataSequenceNumber`, exactly as Iceberg derives them from the manifests and the files' first row ids |
 | `variant`, shredded or not | yes | Iceberg writes the spec's Parquet variant group, with `typed_value` when `write.parquet.shred-variants` is on. Our Parquet reader reads it as it reads Spark's variants (#787, #812), at the top level and inside structs, under deletes. Iceberg's own vectorized reader cannot read a shredded variant ("Unsupported variant: shredded typed_value primitive"); our scan reads it either way |
 | `timestamp_ns`, `timestamptz_ns` | scan | |
 | `geometry`, `geography` | scan or row | |
@@ -106,7 +107,8 @@ At plan time the node declines, and Spark's `BatchScanExec` stays:
 - a scan that reports an ordering;
 - a scan Iceberg does not vectorize (nested columns) with a task group our reader cannot read: an ORC or Avro
   file, an encrypted file, or equality deletes on a column it does not read;
-- a metadata column other than `_file`, `_pos` and `_spec_id`;
+- a metadata column other than `_file`, `_pos`, `_spec_id`, `_partition`, `_row_id` and
+  `_last_updated_sequence_number` (for example `_deleted`);
 - a nested field with an initial default, or a top-level default our reader cannot fill as a constant;
 - a column type outside the flat types in the table above, or a nested type with such a leaf.
 
@@ -173,9 +175,6 @@ Parquet. They are catalog properties, so the plugin cannot set them for you.
 
 ## The write side: the columnar Iceberg writer (#842, #901)
 
-*In review: #913, #914, #918, #919 and #921, stacked in that order, and #920 for the read side. The rows below
-describe those branches, not `main` yet.*
-
 ### Design
 
 The columnar Iceberg writer reuses Iceberg for everything except encoding rows:
@@ -210,6 +209,15 @@ Per step:
   Hash and range distribution therefore run on batches, through the columnar shuffle manager, with no `SortExec`
   or `ShuffleExchangeExec` left. It also adds nested constructors (`array`, `map`, `if(p, null, nested)`) and
   fanout writes of nested columns (`NestedGatherKernels`).
+- **#901 item 11, per-lane partition keys.** `PartitionKeys` computes each row's partition on lanes with the
+  same `IcebergTransformKernels` — Murmur3 `bucket`, `truncate`, and the time transforms — so the write never
+  boxes a value per row (no `CharSequence` per string, no `BigDecimal`/`BigInteger` per decimal). `bucket` of a
+  decimal reads the unscaled value's minimal two's-complement bytes straight from the `long` (precision ≤ 18)
+  or the 16-byte unscaled (wider), matching Iceberg's `BucketUtil.hash(BigDecimal)` byte for byte. Rows are
+  grouped by hashing the result lanes and comparing, so one `PartitionKey` is materialised per distinct
+  partition in a batch rather than one per row. A partition source may be a top-level field or a field nested
+  inside (possibly nested) structs: the leaf lane is read through the struct children, null when the leaf or any
+  enclosing struct is null, as Iceberg's accessor reads it.
 - **#921, merge-on-read.** `VectorWriteDeltaExec` runs on batches.
   - A task walks each batch's operation lane. DELETE rows feed per-file deletion vectors on v3, or position
     delete files on v2 (`ColumnarPositionDeleteWriter`); both sit behind one `DeleteSink`.
@@ -226,11 +234,10 @@ Per step:
 
 | Case | Why |
 |---|---|
-| A float or double inside a list or map | Its NaN-aware metrics are not computed natively yet |
-| `time`, `uuid`, `timestamp_ns`, `fixed`, `variant`, geometry types | Not encoded by the columnar writer yet |
+| Geometry types; a shredded `variant` (`write.parquet.shred-variants`) | Not encoded by the columnar writer yet. `time` and `timestamp_ns` columns cannot be read or written from Spark with Iceberg 1.12 at all |
 | ORC or Avro data or delete files | The columnar writer writes Parquet only |
 | Encrypted tables | Key metadata is not written |
-| A partition source that is not a top-level column of a supported type | The transform is computed on the batch's top-level lanes |
+| A partition source reached through a list or a map (not a single lane) | The transform needs the source as one lane; a top-level or struct-nested leaf is read on lanes, a list / map element is not |
 
 `spark.vecruntime.explainFallback.enabled=true` logs the reason for each declined write.
 
@@ -259,6 +266,7 @@ partitions with the same record counts, and the snapshot summary.
   - five partitionings (identity; days; months with bucket; hours with truncate; years with decimal truncate)
     under none, hash and range distribution, with fanout off and on, asserting no Spark `SortExec` or
     `ShuffleExchangeExec` under the write;
+  - partition sources inside a struct (`bucket`/`truncate`/`identity` over `st.x` / `st.y`), clustered and fanout;
   - nested columns, clustered and fanout;
   - output metrics, checked through a listener;
   - reading a table with a null identity partition through the engine.
@@ -275,6 +283,10 @@ partitions with the same record counts, and the snapshot summary.
   statement by statement on delete-file kind and format, and on referenced data files. A roll test is included.
 - **`IcebergTransformExprsSuite`:** every transform over every source type, equal to Iceberg's own `invoke` row
   by row.
+- **`PartitionKeysSuite`:** `PartitionKeys` against Iceberg's own `PartitionKey`, row for row, for every
+  transform over every source type (nulls, negatives, pre-1970 dates and decimals included), over several
+  batches and many distinct keys, with its grouping agreeing with Iceberg's key equality; and the same for
+  partition sources nested inside (doubly-nested) structs, with null structs.
 - **`StructFlatteningSuite`:** the columnar exchange's handling of a null struct constant (#922).
 
 ### Measured

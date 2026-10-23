@@ -70,6 +70,7 @@ public final class ColumnarParquetWriter implements AutoCloseable {
     private final ColumnEncoder[] encoders;
     private final VecType[] lanes;
     private final ChunkWriter[] fast;
+    private final WriteRebase rebase;
 
     private ColumnChunkPageWriteStore pageStore;
     private ColumnWriteStore columnStore;
@@ -96,6 +97,27 @@ public final class ColumnarParquetWriter implements AutoCloseable {
     public ColumnarParquetWriter(OutputFile out, MessageType schema, ParquetProperties props,
             CompressionCodecFactory.BytesInputCompressor compressor, long rowGroupSize, Map<String, String> footer)
             throws IOException {
+        this(out, schema, props, compressor, rowGroupSize, footer,
+                WriteRebase.NONE);
+    }
+
+    /**
+     * As above, applying {@code rebase} to the file's date and timestamp values
+     * (#842): a {@code LEGACY} or {@code EXCEPTION} write rebases or refuses
+     * values below the Gregorian calendar switch, as Spark's {@code
+     * ParquetWriteSupport} does. {@link WriteRebase#NONE} (the default
+     * constructor) writes the proleptic Gregorian calendar as stored.
+     */
+    public ColumnarParquetWriter(
+            OutputFile out,
+            MessageType schema,
+            ParquetProperties props,
+            CompressionCodecFactory.BytesInputCompressor compressor,
+            long rowGroupSize,
+            Map<String, String> footer,
+            WriteRebase rebase)
+            throws IOException {
+        this.rebase = rebase == null ? WriteRebase.NONE : rebase;
         this.schema = schema;
         // The writer writes Parquet v2 only (#64): data page v2 and the v2 encodings, also on the column-store path.
         this.props = ParquetProperties.copy(props)
@@ -116,7 +138,7 @@ public final class ColumnarParquetWriter implements AutoCloseable {
                 throw new IllegalArgumentException("repeated primitive field not supported: " + f.getName());
             } else {
                 columns.add(null);
-                nested[i] = new NestedFieldWriter(schema, f);
+                nested[i] = new NestedFieldWriter(schema, f, this.props, rebase);
             }
         }
         this.encoders = new ColumnEncoder[columns.size()];
@@ -136,6 +158,38 @@ public final class ColumnarParquetWriter implements AutoCloseable {
         return props.isBloomFilterEnabled(column) ? pageStore.getBloomFilterWriter(column) : null;
     }
 
+    /**
+     * A flat chunk writer for a {@code lane} column not covered by {@link
+     * FixedWidthChunkWriter} -- a string/binary BINARY, a BOOLEAN, an INT96 or a
+     * FIXED_LEN_BYTE_ARRAY -- or {@code null} when the column (nested, or a lane
+     * with no flat writer) goes through parquet-java's column writer.
+     */
+    private ChunkWriter flatChunkWriter(VecType lane, ColumnDescriptor column) {
+        if (column.getMaxRepetitionLevel() != 0) {
+            return null;
+        }
+        org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName p = column.getPrimitiveType().getPrimitiveTypeName();
+        if (lane == VecType.UTF8 && p == org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.BINARY) {
+            return new BinaryChunkWriter(column, props);
+        }
+        if (lane == VecType.BOOL && p == org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.BOOLEAN) {
+            return new BooleanChunkWriter(column, props);
+        }
+        if (lane == VecType.INT64 && p == org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.INT96) {
+            return new FixedBinaryChunkWriter(FixedBinaryChunkWriter.Kind.INT96, 12, column, props, rebase);
+        }
+        if (p == org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.FIXED_LEN_BYTE_ARRAY) {
+            int fixedWidth = column.getPrimitiveType().getTypeLength();
+            if (lane == VecType.FIXED_BINARY) {
+                return new FixedBinaryChunkWriter(FixedBinaryChunkWriter.Kind.FIXED, fixedWidth, column, props);
+            }
+            if (lane == VecType.DECIMAL128) {
+                return new FixedBinaryChunkWriter(FixedBinaryChunkWriter.Kind.DECIMAL, fixedWidth, column, props);
+            }
+        }
+        return null;
+    }
+
     private void newRowGroup() {
         pageStore = new ColumnChunkPageWriteStore(compressor, schema, new HeapByteBufferAllocator(), props.getColumnIndexTruncateLength(),
                 props.getPageWriteChecksumEnabled());
@@ -147,6 +201,13 @@ public final class ColumnarParquetWriter implements AutoCloseable {
             for (int i = 0; i < fast.length; i++) {
                 if (fast[i] != null) {
                     fast[i].startChunk(pageStore.getPageWriter(columns.get(i)), blooms(columns.get(i)));
+                }
+            }
+        }
+        if (nested != null) {
+            for (NestedFieldWriter n : nested) {
+                if (n != null) {
+                    n.startRowGroup(pageStore);
                 }
             }
         }
@@ -181,16 +242,16 @@ public final class ColumnarParquetWriter implements AutoCloseable {
                 }
                 FixedWidthChunkWriter.Kind kind = FixedWidthChunkWriter.kindFor(lane, columns.get(i));
                 if (kind != null) {
-                    fast[i] = new FixedWidthChunkWriter(kind, columns.get(i), props);
-                    fast[i].startChunk(pageStore.getPageWriter(columns.get(i)), blooms(columns.get(i)));
-                } else if (lane == VecType.UTF8 && columns.get(i).getMaxRepetitionLevel() == 0 && columns.get(i)
-                        .getPrimitiveType()
-                        .getPrimitiveTypeName()
-                        == org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.BINARY) {
-                    fast[i] = new BinaryChunkWriter(columns.get(i), props);
+                    fast[i] = new FixedWidthChunkWriter(kind, columns.get(i), props, rebase);
                     fast[i].startChunk(pageStore.getPageWriter(columns.get(i)), blooms(columns.get(i)));
                 } else {
-                    encoders[i] = ColumnEncoder.forColumn(lane, columns.get(i));
+                    ChunkWriter flat = flatChunkWriter(lane, columns.get(i));
+                    if (flat != null) {
+                        fast[i] = flat;
+                        fast[i].startChunk(pageStore.getPageWriter(columns.get(i)), blooms(columns.get(i)));
+                    } else {
+                        encoders[i] = ColumnEncoder.forColumn(lane, columns.get(i), rebase);
+                    }
                 }
             } else if (lanes[i] != lane) {
                 throw new IllegalArgumentException("column "
@@ -204,7 +265,9 @@ public final class ColumnarParquetWriter implements AutoCloseable {
         if (slowSchema == null) {
             List<org.apache.parquet.schema.Type> slow = new java.util.ArrayList<>();
             for (int i = 0; i < encoders.length; i++) {
-                if (fast[i] == null) {
+                // Nested fields write their leaves themselves; only a flat column with neither a fast writer nor
+                // a nested writer is left on parquet-java's column store.
+                if (fast[i] == null && nested[i] == null) {
                     slow.add(schema.getType(i));
                 }
             }
@@ -219,7 +282,7 @@ public final class ColumnarParquetWriter implements AutoCloseable {
                 if (fast[i] != null) {
                     fast[i].write(vectors.get(i), from, to);
                 } else if (nested[i] != null) {
-                    nested[i].write(vectors.get(i), from, to, columnStore);
+                    nested[i].write(vectors.get(i), from, to);
                 } else {
                     encoders[i].write(vectors.get(i), from, to, columnStore.getColumnWriter(columns.get(i)));
                 }
@@ -247,6 +310,11 @@ public final class ColumnarParquetWriter implements AutoCloseable {
                 f.endChunk();
             }
         }
+        for (NestedFieldWriter n : nested) {
+            if (n != null) {
+                n.endRowGroup();
+            }
+        }
         if (columnStore != null) {
             columnStore.flush();
         }
@@ -264,6 +332,11 @@ public final class ColumnarParquetWriter implements AutoCloseable {
         for (ChunkWriter f : fast) {
             if (f != null) {
                 size += f.bufferedBytes();
+            }
+        }
+        for (NestedFieldWriter n : nested) {
+            if (n != null) {
+                size += n.bufferedBytes();
             }
         }
         return size;

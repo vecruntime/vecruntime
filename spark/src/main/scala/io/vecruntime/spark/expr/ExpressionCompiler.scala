@@ -125,6 +125,7 @@ import org.apache.spark.sql.catalyst.expressions.{
   Size,
   Greatest,
   GreaterThanOrEqual,
+  HiveHash,
   Hour,
   Hypot,
   If,
@@ -243,6 +244,7 @@ import org.apache.spark.sql.types.{
   LongType,
   MapType,
   StringType,
+  StructType,
   TimestampNTZType,
   TimestampType
 }
@@ -448,6 +450,14 @@ object ExpressionCompiler {
           else compile(c, input).map(v => done :+ ((v, c.dataType)))
         }
       }.map(ks => Murmur3HashExpr(ks.map(_._1), ks.map(_._2), seed))
+    // Hive's bucket hash, which a Hive-compatible bucketed write sorts on (#842): `hive-hash` over the bucket
+    // keys, combined as `31 * h + childHash` with Spark's own HiveHasher per child, so our value equals Spark's.
+    case HiveHash(children) if children.nonEmpty && children.forall(c => HiveHashExpr.supports(c.dataType)) =>
+      children.foldLeft[Either[String, Vector[VectorExpr]]](Right(Vector.empty)) { (acc, c) =>
+        for (done <- acc; v <- compile(c, input)) yield done :+ v
+      }.map(vs => HiveHashExpr(vs, children.map(_.dataType)))
+    // The bucket-id arithmetic over the hash, `pmod(bitwise_and(hive-hash, Int.MaxValue), numBuckets)`, compiles
+    // through the general BitwiseAnd and Pmod cases below, which keep Spark's ANSI divide-by-zero errors.
     // V1Writes puts it on every string partition column: an empty string writes the default partition (#842).
     case org.apache.spark.sql.catalyst.expressions.Empty2Null(child) =>
       compile(child, input).map(Empty2NullExpr(_, child.dataType))
@@ -1276,18 +1286,19 @@ object ExpressionCompiler {
     // `if(p, null, x)` / `if(p, x, null)` over a nested `x` (#842): `x` with its validity narrowed.
     case If(p, Literal(null, _), x) => nullWhen(p, x, nullWhenTrue = true, expr.dataType, input)
     case If(p, x, Literal(null, _)) => nullWhen(p, x, nullWhenTrue = false, expr.dataType, input)
-    // `array(...)` and `map(...)` constructors over scalar lanes (#842).
+    // A struct, array or map literal (all-literal children Spark folded): lifted to its constructor and
+    // compiled through the same path, so a folded `named_struct`/`array`/`map` is built like an unfolded one.
+    case Literal(value, dt) if TypeMapping.nestedTypeOf(dt) != null =>
+      if (value == null) Left(s"null literal of ${dt.simpleString}")
+      else compileNested(NestedLiterals.lift(value, dt), input)
+    // `array(...)` and `map(...)` constructors (#842, #901 R2): their children may be scalar lanes,
+    // moved nested columns, null literals or other constructors, to any depth.
     case c: CreateArray if c.children.nonEmpty =>
-      scalarLanes(c.children, "array", input).map(CreateArrayExpr(_, c.dataType))
+      constructorLanes(c.children, "array", input).map(CreateArrayExpr(_, c.dataType))
     case m: CreateMap if m.keys.nonEmpty =>
-      // Spark resolves a duplicate key per its dedup policy: take only maps whose keys cannot repeat -- one
-      // entry, or distinct non-null literals. A null key fails as Spark's does (CreateMapExpr).
-      val literalKeys =
-        m.keys.forall(_.isInstanceOf[Literal]) && !m.keys.exists(k => k.asInstanceOf[Literal].value == null)
-      val distinct = m.keys.length == 1 ||
-        (literalKeys && m.keys.map(_.asInstanceOf[Literal].value).distinct.length == m.keys.length)
-      if (!distinct) Left("map(...) whose keys may repeat")
-      else for (k <- scalarLanes(m.keys, "map", input); v <- scalarLanes(m.values, "map", input))
+      // Keys may repeat: resolved at runtime by Spark's spark.sql.mapKeyDedupPolicy, per row
+      // (CreateMapExpr). A null key fails as Spark's does. Keys and values may be nested to any depth.
+      for (k <- constructorLanes(m.keys, "map", input); v <- constructorLanes(m.values, "map", input))
         yield CreateMapExpr(k, v, m.dataType)
     // Anything else keeps the reason the ordinary compiler gives it (element access with a nested
     // element, ...).
@@ -1306,20 +1317,92 @@ object ExpressionCompiler {
     else for (pe <- compilePredicate(p, input); xe <- compileNested(x, input))
       yield NestedNullWhenExpr(pe, xe, nullWhenTrue, dataType)
 
-  /** The children of an `array(...)` / `map(...)` constructor as scalar lanes of one type (#842). */
-  private def scalarLanes(es: Seq[Expression], what: String, input: Seq[Attribute]): Either[String, Seq[VectorExpr]] =
-    if (es.exists(e => TypeMapping.nestedTypeOf(e.dataType) != null || !TypeMapping.isSupported(e.dataType)))
+  /**
+   * The children of an `array(...)` / `map(...)` constructor, each of one shared element type: a scalar
+   * lane, or -- to any depth (#901 R2) -- a moved nested column, a null literal or another constructor,
+   * compiled as a projection. The constructor's own analysis has given them all one type.
+   */
+  private def constructorLanes(
+      es: Seq[Expression],
+      what: String,
+      input: Seq[Attribute]
+  ): Either[String, Seq[VectorExpr]] =
+    // Spark's analysis has coerced the children to one element type; they can still differ only in
+    // nullability (a `named_struct` of non-null fields beside one of nullable fields), which is not a
+    // mixed type and does not change the lane. Normalising nullability folds that difference away.
+    if (es.map(e => asNullable(e.dataType)).distinct.length != 1) Left(s"$what(...) of mixed element types")
+    else if (TypeMapping.nestedTypeOf(es.head.dataType) != null)
+      // Nested elements: each compiled as a projection (a moved column, a null, or a constructor).
+      es.foldRight[Either[String, List[VectorExpr]]](Right(Nil)) { (e, acc) =>
+        for (done <- acc; v <- compileProjection(e, input)) yield v :: done
+      }
+    else if (es.exists(e => !TypeMapping.isSupported(e.dataType)))
       Left(s"$what(...) of ${es.map(_.dataType.simpleString).distinct.mkString(", ")}")
-    else if (es.map(_.dataType).distinct.length != 1) Left(s"$what(...) of mixed element types")
     else es.foldRight[Either[String, List[VectorExpr]]](Right(Nil)) { (e, acc) =>
       for (done <- acc; v <- compile(e, input)) yield v :: done
     }
+
+  /** A type with every field, element and value made nullable, so two children differ only where their shape does. */
+  private def asNullable(dt: DataType): DataType = dt match {
+    case a: ArrayType => ArrayType(asNullable(a.elementType), containsNull = true)
+    case m: MapType => MapType(asNullable(m.keyType), asNullable(m.valueType), valueContainsNull = true)
+    case s: StructType =>
+      StructType(s.fields.map(f => f.copy(dataType = asNullable(f.dataType), nullable = true)))
+    case other => other
+  }
 
   /** `named_struct(...)`'s fields, each a lane or a nested value, as one struct lane (#705). */
   private def namedStruct(s: CreateNamedStruct, nullWhen: Option[VectorExpr], input: Seq[Attribute]): Result =
     s.valExprs.foldRight[Either[String, List[VectorExpr]]](Right(Nil)) { (f, acc) =>
       for (rest <- acc; v <- compileProjection(f, input)) yield v :: rest
     }.map(fields => NamedStructExpr(fields, nullWhen, s.dataType))
+
+  /**
+   * A folded nested literal (a `named_struct` / `array` / `map` of only literals Spark constant-folded
+   * to one `Literal(InternalRow | ArrayData | MapData, type)`, #901 R2) lifted back to its constructor,
+   * so the compiler builds it exactly as it builds an unfolded one. A non-null value only; the caller
+   * handles a null literal.
+   */
+  private object NestedLiterals {
+    def lift(value: Any, dt: DataType): Expression = dt match {
+      case s: StructType =>
+        val row = value.asInstanceOf[org.apache.spark.sql.catalyst.InternalRow]
+        val args = s.fields.zipWithIndex.flatMap { case (f, i) =>
+          Seq(
+            Literal(org.apache.spark.unsafe.types.UTF8String.fromString(f.name), StringType),
+            fieldLiteral(row, i, f.dataType)
+          )
+        }
+        CreateNamedStruct(args.toSeq)
+      case a: ArrayType =>
+        val data = value.asInstanceOf[org.apache.spark.sql.catalyst.util.ArrayData]
+        CreateArray((0 until data.numElements()).map(i => elementLiteral(data, i, a.elementType)))
+      case m: MapType =>
+        val data = value.asInstanceOf[org.apache.spark.sql.catalyst.util.MapData]
+        val keys = data.keyArray()
+        val vals = data.valueArray()
+        val entries = (0 until data.numElements()).flatMap { i =>
+          Seq(elementLiteral(keys, i, m.keyType), elementLiteral(vals, i, m.valueType))
+        }
+        CreateMap(entries)
+      case other => throw new IllegalStateException(s"not a nested literal type: ${other.simpleString}")
+    }
+
+    private def fieldLiteral(row: org.apache.spark.sql.catalyst.InternalRow, i: Int, dt: DataType): Expression =
+      if (row.isNullAt(i)) Literal(null, dt)
+      else lower(row.get(i, dt), dt)
+
+    private def elementLiteral(
+        data: org.apache.spark.sql.catalyst.util.ArrayData,
+        i: Int,
+        dt: DataType
+    ): Expression =
+      if (data.isNullAt(i)) Literal(null, dt) else lower(data.get(i, dt), dt)
+
+    /** A scalar field/element as a `Literal`, a nested one lifted recursively. */
+    private def lower(v: Any, dt: DataType): Expression =
+      if (TypeMapping.nestedTypeOf(dt) != null) lift(v, dt) else Literal(v, dt)
+  }
 
   /** `zip_with(a, b, (x, y) -> f)` (#705): two arrays with nested lanes, a lambda with a lane result. */
   private def zipWith(

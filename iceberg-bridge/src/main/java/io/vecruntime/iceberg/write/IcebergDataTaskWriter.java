@@ -142,6 +142,7 @@ public final class IcebergDataTaskWriter implements AutoCloseable {
     private final NameMapping nameMapping;
     private final Configuration conf;
     private final PartitionKeys keys;
+    private final boolean arrowLanes;
     private final List<DataFile> done = new ArrayList<>();
     private final List<String> written = new ArrayList<>();
     // Unpartitioned, or clustered: the one open partition.
@@ -167,6 +168,7 @@ public final class IcebergDataTaskWriter implements AutoCloseable {
         this.nameMapping = mapping == null ? null : NameMappingParser.fromJson(mapping);
         this.conf = conf;
         this.keys = spec.spec().isUnpartitioned() ? null : new PartitionKeys(spec.spec(), spec.writeSchema());
+        this.arrowLanes = SparkLanes.needed(spec.writeSchema());
     }
 
     /**
@@ -177,6 +179,18 @@ public final class IcebergDataTaskWriter implements AutoCloseable {
         if (end <= first) {
             return;
         }
+        if (arrowLanes) {
+            // Spark's lanes as the Arrow lanes of the Iceberg types (SparkLanes), for the length of this call: the
+            // encoders copy every value into their pages before it returns.
+            try (java.lang.foreign.Arena arena = java.lang.foreign.Arena.ofConfined()) {
+                writeArrow(SparkLanes.toArrow(spec.writeSchema(), columns, arena), first, end);
+            }
+            return;
+        }
+        writeArrow(columns, first, end);
+    }
+
+    private void writeArrow(List<? extends VectorBuffers> columns, int first, int end) {
         if (keys == null) {
             if (current == null) {
                 current = new Rolling(null);
@@ -190,16 +204,16 @@ public final class IcebergDataTaskWriter implements AutoCloseable {
     }
 
     private void writeClustered(List<? extends VectorBuffers> columns, int first, int end) {
-        Object[][] values = keys.compute(columns, first, end);
+        PartitionKeys.Values values = keys.compute(columns, first, end);
         int n = end - first;
         int start = 0;
         while (start < n) {
             int stop = start + 1;
-            while (stop < n && PartitionKeys.samePartition(values, start, stop)) {
+            while (stop < n && values.samePartition(start, stop)) {
                 stop++;
             }
-            if (current == null || !PartitionKeys.inPartition(values, start, current.key)) {
-                PartitionKey key = keys.key(values, start);
+            if (current == null || !values.inPartition(start, current.key)) {
+                PartitionKey key = values.key(start);
                 if (closedKeys.contains(key)) {
                     throw new IllegalStateException("Incoming records violate the writer assumption that records are"
                             + " clustered by spec and by partition within each spec. Either cluster the incoming"
@@ -221,17 +235,17 @@ public final class IcebergDataTaskWriter implements AutoCloseable {
     }
 
     private void writeFanout(List<? extends VectorBuffers> columns, int first, int end) {
-        Object[][] values = keys.compute(columns, first, end);
+        PartitionKeys.Values values = keys.compute(columns, first, end);
         int n = end - first;
         // Each row's partition as an index into `partitions` (first-seen order); runs reuse the previous row's.
         List<PartitionKey> partitions = new ArrayList<>();
         Map<PartitionKey, Integer> index = new HashMap<>();
         int[] group = new int[n];
         for (int r = 0; r < n; r++) {
-            if (r > 0 && PartitionKeys.samePartition(values, r - 1, r)) {
+            if (r > 0 && values.samePartition(r - 1, r)) {
                 group[r] = group[r - 1];
             } else {
-                PartitionKey k = keys.key(values, r);
+                PartitionKey k = values.key(r);
                 Integer g = index.get(k);
                 if (g == null) {
                     g = partitions.size();

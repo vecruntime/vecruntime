@@ -86,13 +86,28 @@ public final class IcebergDataCommitBridge {
                 .anyMatch(k -> k.startsWith("encryption."))) {
             return "the table is encrypted";
         }
+        if (Boolean.parseBoolean(table.properties()
+                .getOrDefault("write.parquet.shred-variants", "false"))
+                && schema.columns().stream()
+                .anyMatch(f -> hasVariant(f.type()))) {
+            // A shredded variant's typed_value columns are not written natively yet.
+            return "the table shreds variants (write.parquet.shred-variants)";
+        }
         String type = unsupportedType(schema.asStruct());
         return type == null ? null : "write schema type " + type + " is not supported";
     }
 
-    private static String unsupportedType(Type type) {
+    private static boolean hasVariant(Type type) {
+        if (type.typeId() == Type.TypeID.VARIANT) {
+            return true;
+        }
+        return type.isNestedType() && type.asNestedType().fields().stream()
+                .anyMatch(f -> hasVariant(f.type()));
+    }
+
+    static String unsupportedType(Type type) {
         switch (type.typeId()) {
-            case BOOLEAN, INTEGER, LONG, FLOAT, DOUBLE, DATE, TIMESTAMP, STRING, BINARY, DECIMAL:
+            case BOOLEAN, INTEGER, LONG, FLOAT, DOUBLE, DATE, TIMESTAMP, STRING, BINARY, DECIMAL, FIXED, UUID, VARIANT:
                 return null;
             case STRUCT:
                 for (Types.NestedField f : type.asStructType().fields()) {
@@ -111,7 +126,7 @@ public final class IcebergDataCommitBridge {
                 return k != null ? k : unsupportedType(type.asMapType()
                         .valueType());
             default:
-                // TIME, TIMESTAMP_NANO, UUID, FIXED, VARIANT, GEOMETRY, GEOGRAPHY, UNKNOWN: not encoded natively yet.
+                // TIME, TIMESTAMP_NANO, GEOMETRY, GEOGRAPHY, UNKNOWN: not encoded natively yet.
                 return type.toString();
         }
     }

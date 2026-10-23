@@ -32,7 +32,7 @@ Iceberg 1.12 · Spark 4.1 · format versions 1, 2 and 3
 
 Turn it on with `spark.vecruntime.scan.nativeIceberg.enabled=true`.
 
-## Writing *(review)*
+## Writing
 
 | | |
 |---|---|
@@ -40,11 +40,14 @@ Turn it on with `spark.vecruntime.scan.nativeIceberg.enabled=true`.
 | Copy-on-write `DELETE` / `UPDATE` / `MERGE INTO` | **✓** |
 | Merge-on-read `DELETE` / `UPDATE` / `MERGE INTO`: deletion vectors (v3), position deletes (v2) | **✓** |
 | Partitioned tables, every transform; clustered and fanout | **✓** |
+| Partition sources nested inside structs | **✓** |
 | Distribution modes none / hash / range, without Spark's row exchange | **✓** |
 | Nested columns (struct, list, map) | **✓** |
 | Row lineage on v3 | **✓** |
-| Merge-on-read on tables with map columns | **◐** the write is columnar, its input is not yet |
-| float / double inside a list or map | **✗** for now |
+| Merge-on-read on tables with map columns | **◐** `DELETE` and `UPDATE` are columnar end to end; a `MERGE` still reads its input as rows |
+| float / double inside a list or map | **✓** |
+| `fixed`, `uuid` columns | **✓** |
+| `variant` columns (not shredded) | **✓** |
 | ORC / Avro, encrypted tables | **✗** |
 
 Turn it on with `spark.vecruntime.iceberg.writer.enabled=true`. For merge-on-read, also set
