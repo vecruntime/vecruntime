@@ -121,6 +121,25 @@ class NativeParquetRangeMergeSuite extends VectorQuerySuite {
     assert(smallReads == 1, s"the whole object should be one request, got $smallReads (baseline $baseReads)")
   }
 
+  test("part 1: a file SPLIT into several partitions is still fetched whole, results equal Spark's") {
+    // The buffer must hold the whole file (its footer is at the end), not one split's bytes: with several row
+    // groups and a small maxPartitionBytes, Spark gives each split only part of the file. Sizing the buffer by
+    // the split's length hit EOF in readFooter on S3 (1 TB A/B, q44).
+    val dir = newTempPath("rm_split")
+    val countPath = writeTable(dir, n = 60000, blockSize = 256 * 1024, pageSize = 64 * 1024)
+    // Several splits sum the doubles in a different order than one task does, so compare that sum rounded.
+    val q = "SELECT count(*), sum(k), max(s), round(sum(d), 3), sum(dec), count(b), min(ts) FROM t834"
+    val expected = sparkRows(countPath, q)
+    val (rowsSplit, _) = scan(
+      countPath,
+      q,
+      VectorConf.ScanNativeParquetSmallFileThreshold -> "64m",
+      "spark.sql.files.maxPartitionBytes" -> "128k",
+      "spark.sql.files.openCostInBytes" -> "0"
+    )
+    assert(rowsSplit == expected, "split small-file rows differ from Spark")
+  }
+
   test("part 1: a file ABOVE the threshold is not whole-object fetched, results equal Spark's") {
     val dir = newTempPath("rm_above")
     val countPath = writeTable(dir, n = 20000, blockSize = 128 * 1024 * 1024, pageSize = 1024 * 1024)
