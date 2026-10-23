@@ -307,6 +307,26 @@ object VectorConf {
   /** The decode-ahead producer's thread kind (#606): `virtual` or `platform`. */
   val ScanNativeParquetDecodeAheadThreads = "spark.vecruntime.scan.nativeParquet.decodeAhead.threads"
 
+  /**
+   * VectorParquetScanExec parallel row-group decode (#606): how many HELPER threads decode the row groups
+   * AFTER the one the task thread consumes, each on its own column-reader set and vectors, handed over in
+   * file order so the output is identical. `0` (the default) decodes serially / single-producer
+   * (decode-ahead). It engages only for a file with at least two row groups above `parallelDecode.minRowGroupBytes`.
+   */
+  val ScanNativeParquetParallelDecode = "spark.vecruntime.scan.nativeParquet.parallelDecode"
+
+  /** The parallel-decode helper threads' kind (#606): `virtual` (the default) or `platform`. */
+  val ScanNativeParquetParallelDecodeThreads = "spark.vecruntime.scan.nativeParquet.parallelDecode.threads"
+
+  /**
+   * The row-group size (its requested column chunks' compressed bytes) at or above which a file's row groups
+   * are decoded in parallel (#606), when `parallelDecode` > 0 and the file has at least two such row groups.
+   * Default 32 MiB. Below it the file decodes single-producer, since small row groups gain nothing from a
+   * second decode thread (the TPC-DS store_sales shape, ~7 MB single-row-group files).
+   */
+  val ScanNativeParquetParallelDecodeMinRowGroupBytes =
+    "spark.vecruntime.scan.nativeParquet.parallelDecode.minRowGroupBytes"
+
   /** VectorParquetScanExec (#612): dictionary-encoded string columns as dictionary vectors, default on. */
   val ScanNativeParquetDictionaryStrings = "spark.vecruntime.scan.nativeParquet.dictionaryStrings"
 
@@ -856,6 +876,29 @@ object VectorConf {
   /** The decode-ahead producer's thread kind: `virtual` (the default) or `platform`. */
   def scanNativeParquetDecodeAheadVirtual(conf: SQLConf): Boolean =
     !conf.getConfString(ScanNativeParquetDecodeAheadThreads, "virtual").trim.equalsIgnoreCase("platform")
+
+  /**
+   * Parallel row-group decode (#606): how many HELPER threads `VectorParquetScanExec` uses to decode the row
+   * groups after the one the task thread consumes, each with its own column-reader set and vectors, handed
+   * over in file order. `0` (the default) keeps the serial / single-producer (decode-ahead) path. It engages
+   * only for a file with at least two row groups at or above `parallelDecode.minRowGroupBytes`; a file that
+   * does not clear that (the TPC-DS store_sales shape) decodes as before. Off by default: a cluster running as
+   * many tasks as cores already keeps every core busy, so a second decode thread per task only adds contention
+   * there; the win is where cores sit idle (wide row groups, few large files). Capped at 8.
+   */
+  def scanNativeParquetParallelDecode(conf: SQLConf): Int = intIn(conf, ScanNativeParquetParallelDecode, 0, 8)
+
+  /** The parallel-decode helper threads' kind: `virtual` (the default) or `platform`. */
+  def scanNativeParquetParallelDecodeVirtual(conf: SQLConf): Boolean =
+    !conf.getConfString(ScanNativeParquetParallelDecodeThreads, "virtual").trim.equalsIgnoreCase("platform")
+
+  /** The per-row-group byte threshold for parallel decode (#606), default 32 MiB; `0` engages at any size. */
+  def scanNativeParquetParallelDecodeMinRowGroupBytes(conf: SQLConf): Long = {
+    val v = scala.util.Try(
+      conf.getConfString(ScanNativeParquetParallelDecodeMinRowGroupBytes, (32L << 20).toString).trim.toLong
+    ).getOrElse(32L << 20)
+    math.max(0L, v)
+  }
 
   /**
    * #612: the native scan emits a string column's dictionary-encoded batches as dictionary vectors (ids over

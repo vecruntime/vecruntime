@@ -250,6 +250,9 @@ case class VectorIcebergScanExec(
       io.vecruntime.spark.VectorConf.scanNativeParquetPrefetchRowGroups(sqlConf),
       io.vecruntime.spark.VectorConf.scanNativeParquetDecodeAhead(sqlConf),
       io.vecruntime.spark.VectorConf.scanNativeParquetDecodeAheadVirtual(sqlConf),
+      io.vecruntime.spark.VectorConf.scanNativeParquetParallelDecode(sqlConf),
+      io.vecruntime.spark.VectorConf.scanNativeParquetParallelDecodeVirtual(sqlConf),
+      io.vecruntime.spark.VectorConf.scanNativeParquetParallelDecodeMinRowGroupBytes(sqlConf),
       io.vecruntime.spark.VectorConf.scanNativeParquetDictionaryStrings(sqlConf),
       io.vecruntime.spark.VectorConf.scanNativeParquetPrefetchMaxBytes(sqlConf),
       io.vecruntime.spark.VectorConf.scanNativeParquetPrefetchExecutorMaxBytes(sqlConf),
@@ -348,6 +351,9 @@ private[vecruntime] final class VectorIcebergRDD(
     prefetchRowGroups: Int,
     decodeAhead: Int,
     decodeAheadVirtual: Boolean,
+    parallelDecode: Int,
+    parallelDecodeVirtual: Boolean,
+    parallelDecodeMinRowGroupBytes: Long,
     dictionaryStrings: Boolean,
     prefetchMaxBytes: Long,
     prefetchExecutorMaxBytes: Long,
@@ -615,7 +621,7 @@ private[vecruntime] final class VectorIcebergRDD(
       prefetchRowGroups = prefetchRowGroups,
       metrics = metrics,
       context = context,
-      handOff = decodeAhead > 0,
+      handOff = decodeAhead > 0 || parallelDecode > 0,
       poolLimit = math.max(4, decodeAhead + 2),
       dictionaryStrings = dictionaryStrings,
       prefetchMaxBytes = prefetchMaxBytes,
@@ -624,9 +630,13 @@ private[vecruntime] final class VectorIcebergRDD(
       poolChunkBuffers = poolChunkBuffers,
       filterFieldIds = filterFieldIds,
       nameMapping = nameMapping,
-      fileResolver = fileResolver
+      fileResolver = fileResolver,
+      parallelDecode = parallelDecode,
+      parallelDecodeMinRowGroupBytes = parallelDecodeMinRowGroupBytes
     )
-    if (decodeAhead > 0) new DecodeAheadIterator(reader, decodeAhead, decodeAheadVirtual, context) else reader
+    if (parallelDecode > 0) new ParallelDecodeIterator(reader, parallelDecode, parallelDecodeVirtual, context)
+    else if (decodeAhead > 0) new DecodeAheadIterator(reader, decodeAhead, decodeAheadVirtual, context)
+    else reader
   }
 
   private def icebergIterator(p: InputPartition, context: TaskContext): Iterator[ColumnarBatch] = {

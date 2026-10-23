@@ -1076,4 +1076,28 @@ class IcebergNativeScanSuite extends IcebergMorSuiteBase {
       assert(scans(df).isEmpty, finalPlan(df).treeString)
     }
   }
+
+  icebergTest("#606 parallel row-group decode is identical over positional, DV and equality deletes") {
+    // Decode the eligible files' row groups on helper threads (any size, for the small test tables), the lead
+    // still owning delete-file handling and ordering; every result must equal the serial / plugin-off answer.
+    withConf(
+      VectorConf.ScanNativeParquetParallelDecode -> "4",
+      VectorConf.ScanNativeParquetParallelDecodeMinRowGroupBytes -> "0",
+      VectorConf.ScanNativeParquetDecodeAhead -> "0"
+    ) {
+      Seq("t_pos", "t_dv", "t_eq").foreach { name =>
+        useTable(name)
+        Seq(
+          "SELECT count(*), sum(d2), min(i), max(i) FROM t",
+          "SELECT s, count(*), sum(l) FROM t WHERE i % 3 = 1 GROUP BY s",
+          "SELECT i, l, s FROM t WHERE i % 101 = 5"
+        ).foreach { q =>
+          val df = checkVectorized(q, Nil)
+          val (native, iceberg) = groups(df)
+          assert(native > 0 && iceberg == 0, s"$name native $native, Iceberg $iceberg: $q")
+        }
+      }
+      assert(count("SELECT count(*) FROM t") === IcebergTables.EqLiveRows) // t_eq is the view now
+    }
+  }
 }

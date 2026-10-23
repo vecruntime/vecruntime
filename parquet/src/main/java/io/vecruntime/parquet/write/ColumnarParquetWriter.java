@@ -229,7 +229,6 @@ public final class ColumnarParquetWriter implements AutoCloseable {
      * maxRecordsPerFile} in the middle of a batch).
      */
     public void write(List<? extends VectorBuffers> vectors, int first, int end) throws IOException {
-        int rowCount = end - first;
         if (vectors.size() != columns.size()) {
             throw new IllegalArgumentException("expected " + columns.size() + " columns, got " + vectors.size());
         }
@@ -292,11 +291,17 @@ public final class ColumnarParquetWriter implements AutoCloseable {
                     columnStore.endRecord();
                 }
             }
-        }
-        rowGroupRows += rowCount;
-        totalRows += rowCount;
-        if (bufferedSize() >= rowGroupSize) {
-            flushRowGroup();
+            rowGroupRows += to - from;
+            totalRows += to - from;
+            // Check the row-group boundary once per slice, not once per batch. A caller that hands the whole
+            // file in one write() call (the common unpartitioned path) would otherwise roll only a single row
+            // group however small write.parquet.row-group-size-bytes is, because the check ran after the whole
+            // batch was buffered. Iceberg's own writer checks the block size as records accrue, so this matches
+            // its cadence (a group ends at most one slice past the target) and gives a file the several groups
+            // the copy-on-write row-group copy path (#901 M4a) needs to copy the delete-free ones.
+            if (bufferedSize() >= rowGroupSize) {
+                flushRowGroup();
+            }
         }
     }
 
