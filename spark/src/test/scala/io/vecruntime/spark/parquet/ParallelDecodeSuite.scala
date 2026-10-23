@@ -19,6 +19,8 @@ import io.vecruntime.spark.VectorConf
 import io.vecruntime.spark.arrow.VectorAllocators
 import io.vecruntime.spark.test.VectorQuerySuite
 import org.apache.spark.sql.vecruntime.{ParallelDecodeIterator, PlanUtils, VectorParquetScanExec}
+import org.scalatest.concurrent.Eventually._
+import org.scalatest.time.{Seconds, Span}
 
 /**
  * #606: parallel row-group decode in the native Parquet scan. With `parallelDecode` = K > 0 the row groups of
@@ -167,7 +169,55 @@ class ParallelDecodeSuite extends VectorQuerySuite {
       checkVectorized("SELECT i, s, w, st.a FROM pd_t LIMIT 7", Seq(node))
       checkVectorized("SELECT * FROM pd_t WHERE i > 100 LIMIT 1000", Seq(node))
     }
-    assert(root.getAllocatedMemory === before, s"allocated ${root.getAllocatedMemory} vs $before before")
+    // A LIMIT returns once it has its rows; the tasks it cancels release their vectors as they wind down, after
+    // collect() returns. A leak never returns to the baseline; a cancelled task does within a few seconds.
+    eventually(timeout(Span(30, Seconds))) {
+      assert(root.getAllocatedMemory === before, s"allocated ${root.getAllocatedMemory} vs $before before")
+    }
+  }
+
+  test("the task's close does not interrupt an in-flight helper, so no vectors leak (#981)") {
+    // #981 root cause: close() stopped the helpers with pool.shutdownNow(), which INTERRUPTS the running
+    // helper threads. A helper decodes on a pure-CPU thread that does not poll for interruption, so the
+    // interrupt does not stop the decode in an orderly way -- it only makes a later buffer allocation inside
+    // readBatch throw once the flag is set, and that throw escapes with buffers already taken from the job's
+    // child allocator but not yet owned by any reader's pool. The decode's own cleanup cannot free those, so
+    // the child allocator is left with a few KB under the root -- the intermittent LIMIT leak. The fix stops
+    // the pool with shutdown() (no interrupt) and drains every in-flight job to completion.
+    //
+    // This test parks a helper mid-decode (ignoring interrupts, exactly as the real decode does) so it is still
+    // running when the LIMIT cancels the task and close() runs. It asserts two things: (1) the helper's thread
+    // was NEVER interrupted by close() -- the direct guard on the root cause, which fails on the old
+    // shutdownNow() path; and (2) once the helper finishes, the allocator is back to baseline.
+    val root = VectorAllocators.root()
+    val before = root.getAllocatedMemory
+    val sawInterrupt = new java.util.concurrent.atomic.AtomicBoolean(false)
+    val hook: Runnable = () =>
+      if (Thread.currentThread().getName.contains("pdecode")) {
+        // Hold for a window that spans the task's close(), ignoring interrupts like the real pure-CPU decode;
+        // record if close() interrupted us (the old shutdownNow() behaviour).
+        val deadline = System.nanoTime() + 500L * 1000000L
+        while (System.nanoTime() < deadline) {
+          try Thread.sleep(25)
+          catch { case _: InterruptedException => sawInterrupt.set(true) }
+        }
+        if (Thread.interrupted()) sawInterrupt.set(true)
+      }
+    ParallelDecodeIterator.decodeHook = hook
+    try {
+      withParallel(4) {
+        checkVectorized("SELECT i, s, w, st.a FROM pd_t LIMIT 3", Seq(node))
+        checkVectorized("SELECT i, l, s, st.a, arr FROM pd_t WHERE i > 10 LIMIT 5", Seq(node))
+      }
+    } finally ParallelDecodeIterator.decodeHook = null
+    assert(!sawInterrupt.get(), "close() interrupted an in-flight parallel-decode helper (the #981 leak path)")
+    // And no vectors leak: once the in-flight helpers finish, the root returns to baseline. A leak never does.
+    eventually(timeout(Span(30, Seconds))) {
+      assert(
+        root.getAllocatedMemory === before,
+        s"a parallel-decode LIMIT leaked: ${root.getAllocatedMemory} vs $before"
+      )
+    }
   }
 
   test("a table mixing natively decoded and fallback files reads correctly and in order") {
