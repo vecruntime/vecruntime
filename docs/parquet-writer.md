@@ -20,7 +20,12 @@ keeps Spark's writer.
 ## Encodings
 
 The same choices as parquet-java's writer with `WriterVersion.PARQUET_2_0`, so our files and parquet-java's
-can be compared page by page in tests:
+can be compared page by page in tests, with one deliberate exception: **BOOLEAN values are PLAIN, not the
+RLE / bit-packing hybrid parquet-java picks for v2 booleans.** Iceberg's own vectorized Spark reader
+(`VectorizedPageIterator.initDataReader`) rejects an RLE-encoded boolean column, so a table written by
+vecruntime could not be read by Iceberg-on-Spark at its default settings; PLAIN is accepted by every reader
+(parquet-java, Spark, Iceberg, and our own). The definition / repetition levels of a boolean column stay
+RLE / bit-packed in the v2 level sections -- only the values change.
 
 | Parquet type | Pages | When the dictionary falls back |
 |---|---|---|
@@ -29,7 +34,7 @@ can be compared page by page in tests:
 | BINARY (strings, binary) | `RLE_DICTIONARY` | `DELTA_BYTE_ARRAY` |
 | FIXED_LEN_BYTE_ARRAY (fixed, UUID, decimal > 18) | `RLE_DICTIONARY` | `DELTA_BYTE_ARRAY` |
 | INT96 (Spark timestamp) | `RLE_DICTIONARY` | `PLAIN` |
-| BOOLEAN | `RLE` (no dictionary) | -- |
+| BOOLEAN | `PLAIN` (bit-packed, one bit per value, LSB first; no dictionary) | -- |
 
 Since #901 every type is written by our own chunk writers, not parquet-java's v2 column writer. A FLOAT
 narrowed from a FLOAT64 lane, a millisecond timestamp carried in an INT64 lane of microseconds, and a
