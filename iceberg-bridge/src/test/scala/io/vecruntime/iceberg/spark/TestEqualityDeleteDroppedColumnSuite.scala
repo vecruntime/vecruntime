@@ -219,4 +219,102 @@ class TestEqualityDeleteDroppedColumnSuite extends AnyFunSuite with BeforeAndAft
       t.newRowDelta().addDeletes(writer.toDeleteFile()).commit()
     }
   }
+
+  // An equality delete keyed on a NESTED struct member (st.k, as #956 supports) whose field is later DROPPED.
+  // The ancestor struct st survives the drop, but the leaf k is gone from the current schema. Our native scan
+  // resolves st.k against the schema HISTORY (the ancestor path in the schema that still holds the id), reads
+  // the dropped leaf from the pre-drop data files by field id as a hidden probe column, and applies the delete.
+  test("equality delete on a since-dropped NESTED struct member applies on the native scan") {
+    val name = "ice.db.eqdrop_nested"
+    spark.sql(s"DROP TABLE IF EXISTS $name")
+    spark.sql(
+      s"""CREATE TABLE $name (id INT, data STRING, st STRUCT<k: INT, s: STRING>) USING iceberg
+         |TBLPROPERTIES ('format-version'='2', 'write.delete.mode'='merge-on-read')""".stripMargin
+    )
+    spark.sql(
+      s"""INSERT INTO $name VALUES
+         |  (1,'a',named_struct('k',5,'s','p')),
+         |  (2,'b',named_struct('k',10,'s','q')),
+         |  (3,'c',named_struct('k',7,'s','r')),
+         |  (4,'d',named_struct('k',5,'s','u'))""".stripMargin
+    )
+    val t = Spark3Util.loadIcebergTable(spark, name)
+    // delete st.k IN {5} -> removes ids 1 and 4
+    addNestedDeletes(t, Seq("st.k"), Seq(Map("st.k" -> Integer.valueOf(5))), partition = null)
+    spark.sql(s"ALTER TABLE $name DROP COLUMN st.k")
+    refresh(name)
+    val got = nativeCollect(s"SELECT id, data FROM $name")
+    // Explicit expected rows only: Iceberg 1.12's OWN Spark reader over-deletes nested-key equality deletes
+    // (apache/iceberg#18620 -- it drops every row), so it is not a valid oracle here; we pin the correct answer.
+    assert(ids(got) == Seq(2, 3), s"only st.k=5 rows should be gone: ${ids(got)}")
+  }
+
+  // The same, partitioned: one nested-key equality delete per partition, scoped to that partition.
+  test("equality delete on a since-dropped NESTED struct member, partitioned table, native scan") {
+    val name = "ice.db.eqdrop_nested_part"
+    spark.sql(s"DROP TABLE IF EXISTS $name")
+    spark.sql(
+      s"""CREATE TABLE $name (id INT, data STRING, st STRUCT<k: INT, s: STRING>) USING iceberg
+         |PARTITIONED BY (data)
+         |TBLPROPERTIES ('format-version'='2', 'write.delete.mode'='merge-on-read')""".stripMargin
+    )
+    spark.sql(
+      s"""INSERT INTO $name VALUES
+         |  (1,'x',named_struct('k',5,'s','p')),
+         |  (2,'x',named_struct('k',9,'s','q')),
+         |  (3,'y',named_struct('k',5,'s','r')),
+         |  (4,'y',named_struct('k',8,'s','u'))""".stripMargin
+    )
+    val t = Spark3Util.loadIcebergTable(spark, name)
+    // st.k = 5 in each partition -> removes ids 1 (x) and 3 (y)
+    Seq("x", "y").foreach { pv =>
+      val partition = GenericRecord.create(t.spec().partitionType())
+      partition.set(0, pv)
+      addNestedDeletes(t, Seq("st.k"), Seq(Map("st.k" -> Integer.valueOf(5))), partition)
+    }
+    spark.sql(s"ALTER TABLE $name DROP COLUMN st.k")
+    refresh(name)
+    val got = nativeCollect(s"SELECT id, data FROM $name")
+    // Explicit expected rows only (see the unpartitioned case): Iceberg's own Spark reader over-deletes nested
+    // equality deletes (apache/iceberg#18620), so it is not used as an oracle here.
+    assert(ids(got) == Seq(2, 4), s"the st.k=5 row of each partition should be gone: ${ids(got)}")
+  }
+
+  /**
+   * One equality delete file keyed on nested fields (dotted names like "st.k"), optionally scoped to `partition`
+   * (null = table-level). Each delete row is a map leaf-dotted-name -> Iceberg value; the parent struct is built
+   * on the nested delete schema, as IcebergEqualityDeletesSuite's addNestedDeletes does.
+   */
+  private def addNestedDeletes(
+      t: Table,
+      columns: Seq[String],
+      rows: Seq[Map[String, Any]],
+      partition: org.apache.iceberg.StructLike
+  ): Unit = {
+    val schema = t.schema()
+    val deleteSchema = schema.select(columns: _*)
+    val factory = new GenericFileWriterFactory.Builder(t)
+      .deleteFileFormat(FileFormat.PARQUET)
+      .equalityFieldIds(columns.map(c => schema.findField(c).fieldId()).toArray)
+      .equalityDeleteRowSchema(deleteSchema)
+      .build()
+    val out = OutputFileFactory.builderFor(t, 1, 1).format(FileFormat.PARQUET).build().newOutputFile()
+    val writer = factory.newEqualityDeleteWriter(out, t.spec(), partition)
+    val topNames = columns.map(_.split("\\.", 2)(0)).distinct
+    try rows.foreach { r =>
+        val record = GenericRecord.create(deleteSchema)
+        topNames.foreach { top =>
+          val topType = deleteSchema.asStruct().field(top).`type`().asStructType()
+          val child = GenericRecord.create(topType)
+          columns.filter(_.startsWith(s"$top.")).foreach { c =>
+            val leaf = c.substring(top.length + 1)
+            r.get(c).foreach(v => child.setField(leaf, v))
+          }
+          record.setField(top, child)
+        }
+        writer.write(record)
+      }
+    finally writer.close()
+    t.newRowDelta().addDeletes(writer.toDeleteFile()).commit()
+  }
 }

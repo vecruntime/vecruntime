@@ -54,19 +54,22 @@ final class SparkParquetFileResolver(
     if (nameMappingJson == null) null else NameMappingParser.fromJson(nameMappingJson)
   @transient private lazy val converter = new SparkToParquetSchemaConverter()
 
-  /** `id` resolved against the current schema first, then the schema history (a dropped column). */
-  private def fieldInHistory(id: Int): Option[Types.NestedField] =
-    SparkParquetFileResolver.fieldOf(schema, id).orElse(history.iterator.flatMap(s => Option(s.findField(id))).find(_ =>
-      true
-    ))
+  /** Every candidate for `id`: its NestedField in the current schema first, then in each historical schema. */
+  private def fieldCandidates(id: Int): Seq[Types.NestedField] =
+    (SparkParquetFileResolver.fieldOf(schema, id).toSeq ++ history.flatMap(s => Option(s.findField(id)))).distinct
 
   override def clip(file: MessageType, requested: StructType): Either[String, ParquetFileResolver.Resolved] = {
     val projected = requested.fields.toSeq.map(f => SparkParquetFileResolver.idOf(f).map(id => (f, id)))
     val fields = projected.flatten.map { case (f, id) =>
-      fieldInHistory(id) match {
-        case Some(ice) => project(ice, f.dataType)
-        case None => Left(s"column ${f.name}: no field $id in the table schema")
-      }
+      // Try the current schema's version of the field, then each historical one, keeping the first whose subtree
+      // fully projects. A since-dropped NESTED leaf (st.k) resolves only against the schema where st still had k;
+      // the ancestor struct st itself may still exist in the current schema, so a current-schema project would
+      // drop the leaf -- hence we fall through to the historical struct that still holds it.
+      val candidates = fieldCandidates(id)
+      if (candidates.isEmpty) Left(s"column ${f.name}: no field $id in the table schema")
+      else
+        candidates.iterator.map(ice => project(ice, f.dataType)).collectFirst { case r @ Right(_) => r }
+          .getOrElse(project(candidates.head, f.dataType)) // report the first candidate's reason when all fail
     }
     fields.collectFirst { case Left(why) => why } match {
       case Some(why) => Left(why)

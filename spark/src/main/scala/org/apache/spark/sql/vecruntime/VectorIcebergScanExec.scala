@@ -1337,7 +1337,11 @@ private[vecruntime] object IcebergTasks {
     val typeClass = Class.forName("org.apache.iceberg.types.Type", false, cl)
     val convert = Class.forName("org.apache.iceberg.spark.SparkSchemaUtil", false, cl).getMethod("convert", typeClass)
     val projectStruct =
-      Class.forName("org.apache.iceberg.types.TypeUtil", false, cl).getMethod("project", schemaClass, classOf[java.util.Set[_]])
+      Class.forName(
+        "org.apache.iceberg.types.TypeUtil",
+        false,
+        cl
+      ).getMethod("project", schemaClass, classOf[java.util.Set[_]])
     val findColumnName = schemaClass.getMethod("findColumnName", classOf[Int])
     val findFieldByName = schemaClass.getMethod("findField", classOf[String])
     val findFieldById = schemaClass.getMethod("findField", classOf[Int])
@@ -1377,8 +1381,10 @@ private[vecruntime] object IcebergTasks {
       }
     }
     val extra = byAncestor.toSeq.sortBy(_._1).map { case (ancId, leafIds) =>
-      // The schema that holds this ancestor (and its leaves) -- the current one, or an older one for a dropped key.
-      val holder = schemaFor(ancId).getOrElse(return None)
+      // The schema that holds this ancestor AND all of its needed leaves -- the current one, or an older one when
+      // a (nested) key leaf has been dropped. For a dropped NESTED leaf the ancestor struct may still exist in the
+      // current schema while the leaf lives only in history, so resolve against the schema that has every id.
+      val holder = Option(schemaContainingAll(schemas, (leafIds.toSeq :+ ancId).distinct)).getOrElse(return None)
       val struct = call(holder, "asStruct")
       val fieldById = struct.getClass.getMethod("field", classOf[Int])
       val ancField = fieldById.invoke(struct, Int.box(ancId))
