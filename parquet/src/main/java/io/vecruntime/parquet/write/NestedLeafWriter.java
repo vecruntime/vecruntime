@@ -457,10 +457,11 @@ final class NestedLeafWriter {
      * encoding.
      */
     private Encoding encodeValues() {
-        // An all-null leaf: no present value was ever written, so the lane was never bound and there is nothing
-        // to encode. The page carries only its definition/repetition levels (all nulls); the empty value body is
-        // written as PLAIN, as parquet-java does for a page with no non-null value.
         if (presentValues == 0) {
+            // A page of only null / absent occurrences carries no values. The
+            // leaf may never have been bound to a lane (every row of the chunk
+            // had a null ancestor, so put() was never called): PLAIN with an
+            // empty body is valid for every physical type.
             return Encoding.PLAIN;
         }
         switch (kind) {
