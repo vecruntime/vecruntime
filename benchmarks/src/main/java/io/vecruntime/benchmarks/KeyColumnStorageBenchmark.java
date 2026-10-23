@@ -53,8 +53,18 @@ import org.openjdk.jmh.annotations.Warmup;
  *       of that group (q67's shape: four UTF8 ids and a year) with the row's;
  *   <li>{@code dictHeap} / {@code dictNative}: a dictionary lookup of a value
  *       already in it -- hash, probe the id table, compare length, fingerprint
- *       and, past eight bytes, the bytes (product names: 16-48 bytes).
+ *       and, past eight bytes, the bytes (product names: 16-48 bytes);
+ *   <li>{@code keysHeapRow} / {@code keysNativeRow}: the same compare with a
+ *       group's five keys side by side (one line per group, one array or one
+ *       segment for the table);
+ *   <li>{@code dictHeapEntry} / {@code dictNativeEntry}: the same lookup with
+ *       a value's fingerprint, length and offset in one 16-byte entry, so a
+ *       candidate costs one line before the bytes.
  * </ul>
+ *
+ * The first native variants put each array in a segment of its own: 0.41-0.91x
+ * of the heap on five x86 CPUs, which is what the row and entry layouts are
+ * for.
  *
  * {@code size} is the number of groups for the key columns and the number of
  * distinct values for the dictionary; rows pick them uniformly.
@@ -82,6 +92,10 @@ public class KeyColumnStorageBenchmark {
 
     int[][] keys; // per column, per group
     MemorySegment[] nKeys;
+    int[] rowKeysHeap; // group g's keys at g * COLS ..
+    MemorySegment nRowKeys;
+    long[] entries; // per value: fingerprint, then length << 32 | offset
+    MemorySegment nEntries;
 
     // dictionary, heap
     long[] bits;
@@ -127,6 +141,14 @@ public class KeyColumnStorageBenchmark {
                 int v = rnd.nextInt(c == COLS - 1 ? 8 : Math.max(2, size / 4));
                 keys[c][g] = v;
                 nKeys[c].setAtIndex(INT, g, v);
+            }
+        }
+        rowKeysHeap = new int[COLS * size];
+        nRowKeys = pool.allocate(4L * COLS * size, 64);
+        for (int g = 0; g < size; g++) {
+            for (int c = 0; c < COLS; c++) {
+                rowKeysHeap[g * COLS + c] = keys[c][g];
+                nRowKeys.setAtIndex(INT, (long) g * COLS + c, keys[c][g]);
             }
         }
         for (int i = 0; i < N; i++) {
@@ -177,6 +199,14 @@ public class KeyColumnStorageBenchmark {
         MemorySegment.copy(offsets, 0, nOffsets, INT, 0,
                 size + 1);
         MemorySegment.copy(data, 0, nData, ValueLayout.JAVA_BYTE, 0, data.length);
+        entries = new long[2 * size];
+        for (int v = 0; v < size; v++) {
+            entries[2 * v] = bits[v];
+            entries[2 * v + 1] = ((long) lens[v] << 32) | offsets[v];
+        }
+        nEntries = pool.allocate(16L * size, 64);
+        MemorySegment.copy(entries, 0, nEntries, LONG, 0,
+                2 * size);
         // the rows: copies of existing values (a dictionary hit), in a row buffer of their own
         int rowTotal = 0;
         int[] pick = new int[N];
@@ -231,6 +261,102 @@ public class KeyColumnStorageBenchmark {
             same += eq ? 1 : 0;
         }
         return same;
+    }
+
+    @Benchmark
+    @OperationsPerInvocation(N)
+    public int keysHeapRow() {
+        int same = 0;
+        int[] k = rowKeysHeap;
+        for (int i = 0; i < N; i++) {
+            int base = rowGroup[i] * COLS;
+            boolean eq = true;
+            for (int c = 0; c < COLS; c++) {
+                eq &= k[base + c] == rowKeys[c][i];
+            }
+            same += eq ? 1 : 0;
+        }
+        return same;
+    }
+
+    @Benchmark
+    @OperationsPerInvocation(N)
+    public int keysNativeRow() {
+        int same = 0;
+        MemorySegment k = nRowKeys;
+        for (int i = 0; i < N; i++) {
+            long base = (long) rowGroup[i] * COLS;
+            boolean eq = true;
+            for (int c = 0; c < COLS; c++) {
+                eq &= k.getAtIndex(INT, base + c) == rowKeys[c][i];
+            }
+            same += eq ? 1 : 0;
+        }
+        return same;
+    }
+
+    @Benchmark
+    @OperationsPerInvocation(N)
+    public int dictHeapEntry() {
+        int found = 0;
+        long[] e = entries;
+        for (int i = 0; i < N; i++) {
+            int from = rowOff[i];
+            int len = rowOff[i + 1] - from;
+            long fp = rowFp[i];
+            int pos = slotHash(fp, len) & dmask;
+            while (true) {
+                int id = ids[pos];
+                if (id < 0) {
+                    break;
+                }
+                long lo = e[2 * id + 1];
+                if (e[2 * id] == fp && (int) (lo >>> 32) == len) {
+                    int off = (int) lo;
+                    if (Arrays.equals(data, off, off + len, rowBytes, from,
+                            from + len)) {
+                        found += id;
+                        break;
+                    }
+                }
+                pos = (pos + 1) & dmask;
+            }
+        }
+        return found;
+    }
+
+    @Benchmark
+    @OperationsPerInvocation(N)
+    public int dictNativeEntry() {
+        int found = 0;
+        MemorySegment rows = MemorySegment.ofArray(rowBytes);
+        MemorySegment e = nEntries;
+        MemorySegment t = nIds;
+        MemorySegment d = nData;
+        for (int i = 0; i < N; i++) {
+            int from = rowOff[i];
+            int len = rowOff[i + 1] - from;
+            long fp = rowFp[i];
+            int pos = slotHash(fp, len) & dmask;
+            while (true) {
+                int id = t.getAtIndex(INT, pos);
+                if (id < 0) {
+                    break;
+                }
+                long lo = e.getAtIndex(LONG, 2L * id + 1);
+                if (e.getAtIndex(LONG, 2L * id) == fp && (int) (lo >>> 32) == len) {
+                    long off = (int) lo;
+                    if (MemorySegment.mismatch(d, off, off + len, rows, from,
+                            from + len)
+                            < 0) {
+                        found += id;
+                        break;
+                    }
+                }
+                pos = (pos + 1) & dmask;
+            }
+        }
+        return found;
     }
 
     @Benchmark
