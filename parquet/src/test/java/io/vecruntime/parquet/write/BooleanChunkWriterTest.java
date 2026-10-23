@@ -25,6 +25,7 @@ import java.util.Random;
 import io.vecruntime.kernels.ArrowLayout;
 import io.vecruntime.kernels.VectorBuffers;
 import org.apache.hadoop.conf.Configuration;
+import org.apache.parquet.column.Encoding;
 import org.apache.parquet.column.ParquetProperties;
 import org.apache.parquet.column.statistics.Statistics;
 import org.apache.parquet.example.data.Group;
@@ -53,9 +54,11 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * BOOLEAN (#901 item 13) on {@link BooleanChunkWriter}: an optional and a
  * required boolean column, with all-true, all-false, mixed and (optional) all-
  * null runs, written by our writer and by parquet-java's v2 record writer and
- * compared value by value and in each chunk's statistics, value count and
- * encodings. Parquet v2 encodes booleans with the RLE / bit-packing hybrid and
- * writes no Bloom filter for them, which the writer must reproduce.
+ * compared value by value and in each chunk's statistics and value count. Our
+ * writer encodes booleans as PLAIN (not the RLE / bit-packing hybrid parquet-java
+ * picks for v2 booleans), because Iceberg's vectorized reader rejects RLE-encoded
+ * boolean values; parquet-java reads either, so the read-back comparison still
+ * holds. As parquet-java does, no Bloom filter is written for a boolean column.
  */
 class BooleanChunkWriterTest {
 
@@ -204,7 +207,9 @@ class BooleanChunkWriterTest {
             ColumnChunkMetaData y = b.getColumns().get(c);
             String col = y.getPath().toDotString();
             assertEquals(y.getValueCount(), x.getValueCount(), col);
-            assertEquals(y.getEncodings(), x.getEncodings(), col);
+            // Our booleans are PLAIN, not the RLE parquet-java emits (Iceberg's vectorized reader rejects RLE
+            // booleans). The value count and statistics still match parquet-java.
+            assertEquals(java.util.Set.of(Encoding.PLAIN), java.util.Set.copyOf(x.getEncodings()), col);
             Statistics<?> sx = x.getStatistics();
             Statistics<?> sy = y.getStatistics();
             assertEquals(sy.getNumNulls(), sx.getNumNulls(), col);
