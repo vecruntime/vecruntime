@@ -87,6 +87,18 @@ object VectorConf {
   val IcebergCopyUnchangedEnabled = "spark.vecruntime.iceberg.copyUnchanged.enabled"
 
   /**
+   * Columnar bin-pack compaction (#957 M4c): `rewrite_data_files` with the BINPACK strategy compacts a file
+   * group by copying its input files' Parquet row groups byte for byte into target-sized outputs, instead of
+   * decoding and re-encoding every row. A file that cannot be copied -- deletes attached, schema evolution, a
+   * different partition spec, a codec mismatch, v3 unmaterialised row lineage, an unreadable encoding, or a
+   * table tracking float/double NaN counts -- falls back per file to Iceberg's own bin-pack, so the result is
+   * indistinguishable from the stock rewrite. Engaged only through `VectorRewriteDataFiles`, which installs the
+   * vecruntime runner on Iceberg's `RewriteDataFilesSparkAction`. Default ON when the runner is used (there is
+   * no correctness difference, only speed); set false to force the stock decode/encode path for A/B.
+   */
+  val IcebergBinPackCopyEnabled = "spark.vecruntime.iceberg.rewrite.binpackCopy.enabled"
+
+  /**
    * Logical rewrite (#632): `IsNotNull` on a grouping key that is the only difference between the
    * inputs of two aggregates (a CTE used twice) moves above the aggregates, so the input is shared.
    */
@@ -661,6 +673,16 @@ object VectorConf {
   val PoolAccountingEnabled = "spark.vecruntime.memory.poolAccounting.enabled"
   def poolAccountingEnabled(sparkConf: org.apache.spark.SparkConf): Boolean =
     sparkConf.getBoolean(PoolAccountingEnabled, true)
+
+  /**
+   * #941: grouped accumulators past 16,384 groups keep their state in native pool blocks, charged to the task in
+   * the operators' memory mode, instead of `long[]` on the heap (at 10 TB those arrays fill the executors' old
+   * generation). Below that the state stays on the heap. On by default: at 10 TB the full TPC-DS run is the same or
+   * faster with GC -10% and q78's spill -19%. Read once, when the executor starts.
+   */
+  val AggNativeState = "spark.vecruntime.agg.nativeState"
+  def aggNativeState(sparkConf: org.apache.spark.SparkConf): Boolean =
+    sparkConf.getBoolean(AggNativeState, true)
 
   /**
    * #869 step 4: Arrow's buffers (the Flight shuffle's, the shuffle readers', the operators' output vectors) from

@@ -50,6 +50,7 @@ final case class FilteredAgg(inner: VectorAggFunction, predicate: VectorExpr) ex
 
   override def newGroupedState(): GroupedAggState = new GroupedAggState {
     private val s = inner.newGroupedState()
+    override def close(): Unit = s.close()
     override def update(ctx: EvalContext, groups: GroupAssignment): Unit = {
       val n = ctx.numRows
       val bits = FilteredAgg.passing(ctx, predicate)
