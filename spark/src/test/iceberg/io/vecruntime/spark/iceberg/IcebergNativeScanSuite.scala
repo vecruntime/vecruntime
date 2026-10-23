@@ -685,6 +685,89 @@ class IcebergNativeScanSuite extends IcebergMorSuiteBase {
     assert(rowIds.exists(r => !r.isNullAt(0)), "the copy-on-write UPDATE should have materialised some _row_id")
   }
 
+  icebergTest("the _deleted metadata column is produced natively (#901 item 3)") {
+    // Position deletes, deletion vectors and equality deletes: _deleted must agree with Iceberg's reader row for
+    // row (checkVectorized compares plugin-off vs plugin-on), and the native path must be used.
+    Seq("t_pos", "t_dv", "t_eq").foreach { table =>
+      val t = s"$Db.$table"
+      val df = checkVectorized(s"SELECT _deleted, i, s FROM $t WHERE i % 37 = 3", Nil)
+      val (native, iceberg) = groups(df)
+      assert(native > 0 && iceberg == 0, s"$table: native $native, Iceberg $iceberg")
+      // _deleted alone, and grouped, each matched against Iceberg's reader.
+      checkVectorized(s"SELECT _deleted, count(*) FROM $t GROUP BY _deleted", Nil)
+      checkVectorized(s"SELECT i, _deleted, _pos FROM $t WHERE i % 53 = 1", Nil)
+    }
+    // A table with no delete files: _deleted is false in every row.
+    spark.sql(s"CREATE OR REPLACE TABLE $Db.t_del_none USING iceberg AS SELECT * FROM $Db.t_pos")
+    val none = checkVectorized(s"SELECT count(*) FROM $Db.t_del_none WHERE _deleted", Nil)
+    val (n2, i2) = groups(none)
+    assert(n2 > 0 && i2 == 0, s"no-delete native $n2, Iceberg $i2")
+    assert(count(s"SELECT count(*) FROM $Db.t_del_none WHERE _deleted") === 0)
+    // Independent control on t_pos: the rows i % 5 = 0 were deleted. If Iceberg keeps deleted rows under a plain
+    // _deleted projection, every such row is marked; either way the native scan equals Iceberg's reader above.
+    val kept =
+      withPlugin(enabled = false)(spark.sql(s"SELECT i, _deleted FROM $Db.t_pos").collect())
+    val keptNative =
+      withPlugin(enabled = true)(spark.sql(s"SELECT i, _deleted FROM $Db.t_pos").collect())
+    assertRowsEqual(kept, keptNative, 0.0, "_deleted on t_pos: native equals Iceberg's reader")
+    // Whichever rows Iceberg reports as _deleted=true, each must be an originally-deleted position -- i % 5 = 0
+    // (the DELETE) or i % 17 = 1 (the old image the UPDATE removed) -- an independent check of the mark, not only
+    // equality with Iceberg. A live row (neither) must never be marked.
+    kept.filter(r => r.getBoolean(1)).foreach { r =>
+      val i = r.getInt(0)
+      assert(i % 5 == 0 || i % 17 == 1, s"marked a live row: $i")
+    }
+  }
+
+  icebergTest("a nested scan with one non-native group reads that group with Iceberg's reader (#901 item 6)") {
+    // A nested (non-vectorized) table whose files are mostly Parquet (read natively) and some ORC, which our
+    // reader does not read: the ORC group falls to Iceberg's own ROW reader inside the node, converted to batches,
+    // while the Parquet groups stay native. Previously the whole scan declined to Spark's BatchScanExec.
+    val name = "t_mixed_fmt"
+    spark.sql(
+      s"""CREATE OR REPLACE TABLE $Db.$name (k INT, g INT, st STRUCT<a: INT, b: STRING>, arr ARRAY<BIGINT>)
+         |USING iceberg PARTITIONED BY (g)
+         |TBLPROPERTIES ('format-version' = '2', 'write.format.default' = 'parquet',
+         |  'read.split.target-size' = '4096', 'read.split.open-file-cost' = '4096')""".stripMargin
+    )
+    // Partition g=0 written as Parquet (read natively).
+    spark.sql(
+      s"""INSERT INTO $Db.$name SELECT CAST(id AS INT), 0,
+         |  named_struct('a', CAST(id % 9 AS INT), 'b', IF(id % 7 = 0, NULL, concat('b', id % 5))),
+         |  IF(id % 8 = 0, NULL, sequence(0L, id % 4))
+         |FROM range(0, 2000)""".stripMargin
+    )
+    // Partition g=1 written as ORC: its own data files / task group, read by Iceberg's reader inside the node.
+    spark.sql(s"ALTER TABLE $Db.$name SET TBLPROPERTIES ('write.format.default' = 'orc')")
+    spark.sql(
+      s"""INSERT INTO $Db.$name SELECT CAST(id AS INT), 1,
+         |  named_struct('a', CAST(id % 9 AS INT), 'b', concat('o', id % 3)), sequence(1L, 2L)
+         |FROM range(2000, 2600)""".stripMargin
+    )
+    useTable(name)
+    Seq(
+      "SELECT k, st, arr FROM t WHERE k % 29 = 3",
+      "SELECT st.a, count(*), count(st.b), sum(size(arr)) FROM t GROUP BY st.a",
+      "SELECT k, st.b, arr FROM t WHERE k > 1990 AND k < 2010"
+    ).foreach { q =>
+      val df = checkVectorized(q, Nil) // equals Iceberg's reader (plugin off) row for row
+      assert(df.collect().nonEmpty, s"the query should return rows: $q")
+      val (native, iceberg) = groups(df)
+      // The mixed case item 6 names: some groups native, the ORC partition's group(s) read by Iceberg's reader.
+      assert(native > 0, s"expected native groups: native $native, Iceberg $iceberg: $q")
+      assert(iceberg >= 1, s"expected an Iceberg-read (ORC) group: native $native, Iceberg $iceberg: $q")
+    }
+    // Explicit expected set: every k in [0, 2600) survives (no deletes), st.b matches the insert.
+    val rows = spark.sql("SELECT k, st.b FROM t").collect().map(r => (r.getInt(0), r.getString(1))).toSet
+    val expected = ((0 until 2000).map(id => (id, if (id % 7 == 0) null else s"b${id % 5}")) ++
+      (2000 until 2600).map(id => (id, s"o${id % 3}"))).toSet
+    assert(
+      rows == expected,
+      s"mixed-format rows differ: ${rows.diff(expected).take(5)} / ${expected.diff(rows).take(5)}"
+    )
+    assert(count("SELECT count(*) FROM t") === 2600)
+  }
+
   /**
    * #rtypes: the native scan reads uuid, fixed and the v3 unknown type -- types Spark DDL cannot declare -- at the
    * top level and nested, matching Iceberg's reader. Tables are created through Iceberg's catalog API with Iceberg

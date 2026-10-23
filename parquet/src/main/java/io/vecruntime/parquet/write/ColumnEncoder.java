@@ -83,10 +83,20 @@ abstract class ColumnEncoder {
     }
 
     static ColumnEncoder forColumn(VecType lane, ColumnDescriptor column) {
+        return forColumn(lane, column, WriteRebase.NONE);
+    }
+
+    /**
+     * Binds an encoder for a (lane, column) pair, applying {@code rebase} to the
+     * values of a DATE, a non-INT96 TIMESTAMP and an INT96 TIMESTAMP column as
+     * Spark's {@code ParquetWriteSupport} applies its rebase functions.
+     */
+    static ColumnEncoder forColumn(VecType lane, ColumnDescriptor column, WriteRebase rebase) {
         PrimitiveType type = column.getPrimitiveType();
         PrimitiveTypeName p = type.getPrimitiveTypeName();
         LogicalTypeAnnotation logical = type.getLogicalTypeAnnotation();
         boolean decimal = logical instanceof LogicalTypeAnnotation.DecimalLogicalTypeAnnotation;
+        boolean date = logical instanceof LogicalTypeAnnotation.DateLogicalTypeAnnotation;
         switch (lane) {
             case BOOL:
                 if (p == PrimitiveTypeName.BOOLEAN) {
@@ -95,7 +105,8 @@ abstract class ColumnEncoder {
                 break;
             case INT32:
                 if (p == PrimitiveTypeName.INT32) {
-                    return new Int32(column);
+                    // A DATE's days are rebased; a plain byte/short/int is written as stored.
+                    return new Int32(column, date ? rebase : WriteRebase.NONE);
                 }
                 break;
             case INT64:
@@ -103,13 +114,21 @@ abstract class ColumnEncoder {
                     long divisor = logical instanceof LogicalTypeAnnotation.TimestampLogicalTypeAnnotation ts && ts.getUnit() == LogicalTypeAnnotation.TimeUnit.MILLIS
                             ? 1000
                             : 1;
-                    return new Int64(column, divisor);
+                    // A TIMESTAMP's micros are rebased before the millis division (Spark:
+                    // microsToMillis(timestampRebaseFunc(micros))); a long / TIMESTAMP_NTZ / TIME is written as stored.
+                    boolean timestamp = logical instanceof LogicalTypeAnnotation.TimestampLogicalTypeAnnotation ts && ts.isAdjustedToUTC();
+                    return new Int64(column, divisor, timestamp ? rebase : WriteRebase.NONE);
                 }
                 if (p == PrimitiveTypeName.INT32 && decimal) {
                     return new LongToInt32(column);
                 }
+                // writeLegacyFormat stores a decimal of any precision as FIXED_LEN_BYTE_ARRAY; precision <= 18 is
+                // carried on the INT64 lane of unscaled values (p > 18 on the DECIMAL128 lane, Decimal128Fixed).
+                if (p == PrimitiveTypeName.FIXED_LEN_BYTE_ARRAY && decimal) {
+                    return new DecimalLongFixed(column, type.getTypeLength());
+                }
                 if (p == PrimitiveTypeName.INT96) {
-                    return new Int96(column);
+                    return new Int96(column, rebase);
                 }
                 break;
             case FLOAT64:
@@ -213,17 +232,23 @@ abstract class ColumnEncoder {
         }
     }
 
-    /** INT32 from an INT32 lane (byte, short, int, date). */
+    /**
+     * INT32 from an INT32 lane (byte, short, int, date); a DATE's days are
+     * rebased by {@code rebase}.
+     */
     private static final class Int32 extends ColumnEncoder {
-        Int32(ColumnDescriptor c) {
+        private final WriteRebase rebase;
+
+        Int32(ColumnDescriptor c, WriteRebase rebase) {
             super(c);
+            this.rebase = rebase;
         }
 
         @Override
         void put(VectorBuffers v, int i, int rep,
                  int def, ColumnWriter w) {
-            w.write(v.data().get(LE_INT, (long) i << 2), rep,
-                    def);
+            w.write(rebase.rebaseDays(v.data().get(LE_INT, (long) i << 2)),
+                    rep, def);
         }
 
         @Override
@@ -235,30 +260,38 @@ abstract class ColumnEncoder {
                 if (isNull(validity, i)) {
                     writeNull(w);
                 } else {
-                    w.write(data.get(LE_INT, (long) i << 2), 0, maxDef);
+                    w.write(rebase.rebaseDays(data.get(LE_INT, (long) i << 2)), 0, maxDef);
                 }
             }
         }
     }
 
     /**
-     * INT64 from an INT64 lane (long, timestamp micros), divided by {@code
-     * divisor} (1000 for millis).
+     * INT64 from an INT64 lane (long, timestamp micros), rebased by {@code
+     * rebase} (a TIMESTAMP, else {@link WriteRebase#NONE}) then divided by
+     * {@code divisor} (1000 for millis), as Spark's {@code
+     * microsToMillis(timestampRebaseFunc(micros))}.
      */
     private static final class Int64 extends ColumnEncoder {
         private final long divisor;
+        private final WriteRebase rebase;
 
-        Int64(ColumnDescriptor c, long divisor) {
+        Int64(ColumnDescriptor c, long divisor, WriteRebase rebase) {
             super(c);
             this.divisor = divisor;
+            this.rebase = rebase;
+        }
+
+        private long value(long x) {
+            long r = rebase.rebaseMicros(x);
+            return divisor == 1 ? r : Math.floorDiv(r, divisor);
         }
 
         @Override
         void put(VectorBuffers v, int i, int rep,
                  int def, ColumnWriter w) {
-            long x = v.data().get(LE_LONG, (long) i << 3);
-            w.write(divisor == 1 ? x : Math.floorDiv(x, divisor), rep,
-                    def);
+            w.write(value(v.data().get(LE_LONG, (long) i << 3)),
+                    rep, def);
         }
 
         @Override
@@ -270,9 +303,7 @@ abstract class ColumnEncoder {
                 if (isNull(validity, i)) {
                     writeNull(w);
                 } else {
-                    long x = data.get(LE_LONG, (long) i << 3);
-                    w.write(divisor == 1 ? x : Math.floorDiv(x, divisor), 0,
-                            maxDef);
+                    w.write(value(data.get(LE_LONG, (long) i << 3)), 0, maxDef);
                 }
             }
         }
@@ -310,17 +341,21 @@ abstract class ColumnEncoder {
 
     /**
      * Spark's INT96 timestamp: 8 bytes of nanoseconds of the day, then 4 bytes
-     * of Julian day, little-endian.
+     * of Julian day, little-endian. The micros are rebased by {@code rebase}
+     * (Spark's {@code int96RebaseFunc}) before the Julian-day conversion.
      */
     private static final class Int96 extends ColumnEncoder {
-        Int96(ColumnDescriptor c) {
+        private final WriteRebase rebase;
+
+        Int96(ColumnDescriptor c, WriteRebase rebase) {
             super(c);
+            this.rebase = rebase;
         }
 
         @Override
         void put(VectorBuffers v, int i, int rep,
                  int def, ColumnWriter w) {
-            w.write(int96(v.data().get(LE_LONG, (long) i << 3)),
+            w.write(int96(rebase.rebaseInt96Micros(v.data().get(LE_LONG, (long) i << 3))),
                     rep, def);
         }
 
@@ -344,14 +379,8 @@ abstract class ColumnEncoder {
                     writeNull(w);
                     continue;
                 }
-                long micros = data.get(LE_LONG, (long) i << 3);
-                long day = Math.floorDiv(micros, MICROS_PER_DAY);
-                long nanos = Math.floorMod(micros, MICROS_PER_DAY) * 1000L;
-                byte[] b = new byte[12];
-                MemorySegment s = MemorySegment.ofArray(b);
-                s.set(LE_LONG, 0, nanos);
-                s.set(LE_INT, 8, (int) (day + JULIAN_DAY_OF_EPOCH));
-                w.write(Binary.fromConstantByteArray(b), 0, maxDef);
+                w.write(int96(rebase.rebaseInt96Micros(data.get(LE_LONG, (long) i << 3))), 0,
+                        maxDef);
             }
         }
     }
@@ -562,6 +591,54 @@ abstract class ColumnEncoder {
                     b[length - 1 - k] = data.get(ValueLayout.JAVA_BYTE, base + k);
                 }
                 w.write(Binary.fromConstantByteArray(b), 0, maxDef);
+            }
+        }
+    }
+
+    /**
+     * An INT64 lane of unscaled decimal values as a big-endian {@code
+     * FIXED_LEN_BYTE_ARRAY} of {@code length} bytes: writeLegacyFormat stores a
+     * decimal of any precision as FLBA, and a decimal of precision up to 18 is
+     * carried on the INT64 lane (a DECIMAL128 lane for p > 18 goes to {@link
+     * Decimal128Fixed}). The 8-byte value is sign-extended to {@code length}
+     * bytes, most significant first, as Spark's {@code ParquetWriteSupport}
+     * writes its {@code decimalBuffer}.
+     */
+    private static final class DecimalLongFixed extends ColumnEncoder {
+        private final int length;
+
+        DecimalLongFixed(ColumnDescriptor c, int length) {
+            super(c);
+            this.length = length;
+        }
+
+        private byte[] bytes(long unscaled) {
+            byte[] b = new byte[length];
+            for (int k = 0; k < length; k++) {
+                b[length - 1 - k] = (byte) (unscaled >> (8 * k));
+            }
+            return b;
+        }
+
+        @Override
+        void put(VectorBuffers v, int i, int rep,
+                 int def, ColumnWriter w) {
+            w.write(Binary.fromConstantByteArray(bytes(v.data().get(LE_LONG, (long) i << 3))),
+                    rep, def);
+        }
+
+        @Override
+        void write(VectorBuffers v, int from, int to,
+                   ColumnWriter w) {
+            MemorySegment validity = v.validity();
+            MemorySegment data = v.data();
+            for (int i = from; i < to; i++) {
+                if (isNull(validity, i)) {
+                    writeNull(w);
+                    continue;
+                }
+                w.write(Binary.fromConstantByteArray(bytes(data.get(LE_LONG, (long) i << 3))), 0,
+                        maxDef);
             }
         }
     }

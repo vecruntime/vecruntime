@@ -16,8 +16,8 @@ Spark's and Iceberg's, apart from an opt-in columnar deletion-vector writer for 
   deletion vectors and equality deletes itself, and reads `_file`, `_pos` and `_spec_id`.
 - **When it is declined:** the whole scan or a single task group is read by Iceberg's vectorized reader, and our
   operators adapt its batches. That reader is also the path when the switch is off. Declined are some v3 and
-  other column types, other metadata columns, nested initial defaults, and ORC, Avro or
-  encrypted files.
+  other column types, other metadata columns, a nested default our reader cannot fill as a constant, and ORC,
+  Avro or encrypted files.
 - **No Comet:** Comet is not needed for any of this.
 - **Writes (#913-#921, #936):** a columnar Iceberg writer covers `INSERT`, `INSERT OVERWRITE`, CTAS/RTAS,
   copy-on-write and merge-on-read `DELETE` / `UPDATE` / `MERGE INTO`, partitioned tables and hash and range
@@ -44,10 +44,10 @@ Format version 1 reads as version 2 does, without delete files.
 | Feature | Native | How |
 |---|---|---|
 | Parquet data files | yes | `VectorIcebergScanExec` reads each task group of Parquet data files as Spark file splits, with the read-ahead and decode-ahead of our Parquet scan |
-| ORC and Avro data files | group | Iceberg's reader for that group, inside the same node |
+| ORC and Avro data files | group | Iceberg's reader for that group, inside the same node -- its columnar reader when Iceberg vectorizes the scan, else (a nested-column scan, #901 item 6) its row reader converted to batches. The other groups stay native |
 | Snapshots, time travel, branches and tags | yes | Iceberg's planning: `VERSION AS OF`, `TIMESTAMP AS OF` and branch reads plan the snapshot's files, which we then read |
 | Position deletes | yes | The file is read with its row positions. Iceberg's `BaseDeleteLoader` loads the deletes and the deleted rows are deselected, with no copy |
-| Equality deletes | yes, or group | Read natively when every equality column is a top-level column of a native type. Columns the query does not project are added for the match and dropped afterwards. Iceberg's `DeleteFilter` semantics apply, nulls matching nulls. A nested equality column, or one of another type, sends the group to Iceberg's reader |
+| Equality deletes | yes, or group | Read natively when every equality key is a native type, at the top level or (#901 item 5) nested inside a struct -- a nested key is read through its ancestor struct (null leaf under a null parent, as Iceberg's accessors), and reshaped to the delete schema when the query also projects that struct. Columns the query does not project are added for the match and dropped afterwards. Iceberg's `DeleteFilter` semantics apply, nulls matching nulls. A key of a type our reader does not decode sends the group to Iceberg's reader |
 | Schema evolution: add, drop, rename, reorder | yes | Columns are matched by Iceberg field id, never by name. A column added after a file was written reads as nulls from that file |
 | Type promotion (int to long, float to double, decimal precision) | yes | The native reader widens a file's narrower type as it does for Parquet tables, with and without position deletes and deletion vectors; a pushed filter compares the old files' narrow statistics with the wide literal. A decimal promoted past 18 digits reads its 64-bit files into a DECIMAL128 lane |
 | Name mapping (`schema.name-mapping.default`) | yes | A file written without field ids (a table migrated or imported from plain Parquet, `migrate` or `add_files`) gets each column's Iceberg field id from the mapping by name, nested fields included, before our reader resolves its columns. Old names stay aliases after a rename, as Iceberg keeps them. A file that falls back to Spark's reader is read by name (#849) |
@@ -60,10 +60,10 @@ Format version 1 reads as version 2 does, without delete files.
 | Storage-partitioned joins | yes | A scan that reports a partitioning keeps Iceberg's groups, unpacked. A scan that reports an ordering is read by Iceberg's reader (scan) |
 | Metadata columns `_file`, `_pos`, `_spec_id` | yes | `_file` and `_spec_id` are per-split constants; `_pos` is the reader's row index |
 | Metadata columns `_partition`, `_row_id`, `_last_updated_sequence_number` | yes (#20 M3a) | `_partition` is the per-file struct of the table's unified partition type (empty on an unpartitioned table, where Iceberg returns it null); `_row_id` and `_last_updated_sequence_number` are the file's own column where it materialises them (copy-on-write, compaction), else `firstRowId + _pos` / `dataSequenceNumber`. All three come from `PartitionUtil.constantsMap` and the data file, per batch |
-| Metadata column `_deleted` | scan | |
+| Metadata column `_deleted` | yes (#901 item 3) | Computed by the scan: `false` for a live row, `true` for a row a position delete, deletion vector or equality delete marks. When `_deleted` is projected the scan keeps the marked rows instead of dropping them, exactly as Iceberg's reader does, so a changelog or `SELECT _deleted` read sees them |
 | Types: boolean, int, long, float, double, date, timestamp (with zone and without), string, binary, decimal | yes | `decimal(p > 18)` becomes a DECIMAL128 lane |
 | Types: uuid, fixed, time | scan | Iceberg's reader reads them as Spark types our reader does not produce from these files |
-| Types: struct, list, map | yes | At any depth, when every leaf is one of the flat types above. Nested struct fields are matched by their Iceberg field ids, so a renamed nested field reads as Iceberg reads it, and a field added to a struct later reads as nulls from older files. Iceberg's reader does not vectorize nested columns, so such a scan is taken only when every task group reads natively; otherwise it stays Spark's row path |
+| Types: struct, list, map | yes | At any depth, when every leaf is one of the flat types above. Nested struct fields are matched by their Iceberg field ids, so a renamed nested field reads as Iceberg reads it, and a field added to a struct later reads as nulls from older files. Iceberg's reader does not vectorize nested columns; a task group our reader cannot read (an ORC/Avro file, an encrypted file) is read by Iceberg's own row reader inside the node and converted to batches (#901 item 6), so the other groups stay native. Only a scan with no native group at all keeps Spark's row path |
 | Encrypted files | group | Iceberg's `FileIO` decrypts them |
 | `DELETE`, `UPDATE`, `MERGE INTO` (merge-on-read) | yes, with `spark.vecruntime.iceberg.writer.enabled` (#921) | Their reads run on our operators, and the `MERGE INTO` join and `MergeRows` are columnar (#21, #273). The writes are columnar too: position delete files on v2, deletion vectors on v3, and the inserted and updated rows through the columnar data writer. Off, Spark's `WriteDeltaExec` and Iceberg's writers write them |
 | Copy-on-write rewrites, `INSERT`, CTAS | yes, with `spark.vecruntime.iceberg.writer.enabled` (#913-#919) | Written by the columnar writer, see [the columnar writer](#the-write-side-the-columnar-iceberg-writer-842-901). Off, the write is Spark's row path into Iceberg's Parquet writer |
@@ -76,7 +76,7 @@ Everything in the version 2 table applies. The version 3 additions:
 |---|---|---|
 | Deletion vectors (Puffin) | yes | Read once per data file, and the deleted rows are deselected as for position deletes |
 | Writing deletion vectors | opt-in | `spark.vecruntime.iceberg.dvWriter.enabled` (off by default) builds each data file's `PositionDeleteIndex` from our batches and hands it to Iceberg's DV writer, for `DELETE`, `UPDATE` and `MERGE INTO`. The commit stays Iceberg's `RowDelta`. See [the write side](#the-write-side-columnar-v3-deletion-vectors-20) |
-| Default values: `initial-default` | yes, or scan | A top-level column's default is filled into the files written before the column existed, as a constant (Spark's existence default), for boolean, int, long, float, double, decimal, string, binary, date and timestamp columns. A default on a nested field, or of another type, keeps Iceberg's reader for the scan |
+| Default values: `initial-default` | yes, or scan | A column's default is filled into the files written before the column existed, as a constant (Spark's existence default), for boolean, int, long, float, double, decimal, string, binary, date and timestamp columns -- at the top level and (#901 item 4) for a field added inside a struct, which returns the default from older files, not null. A default of another type keeps Iceberg's reader for the scan |
 | Default values: `write-default` | n/a | Applied by Iceberg's writer |
 | Row lineage (`_row_id`, `_last_updated_sequence_number`) | yes (#20 M3a) | The file's own column where it materialises them, else `firstRowId + _pos` / `dataSequenceNumber`, exactly as Iceberg derives them from the manifests and the files' first row ids |
 | `variant`, shredded or not | yes | Iceberg writes the spec's Parquet variant group, with `typed_value` when `write.parquet.shred-variants` is on. Our Parquet reader reads it as it reads Spark's variants (#787, #812), at the top level and inside structs, under deletes. Iceberg's own vectorized reader cannot read a shredded variant ("Unsupported variant: shredded typed_value primitive"); our scan reads it either way |
@@ -97,19 +97,21 @@ Everything in the version 2 table applies. The version 3 additions:
   deselected as a selection, without a copy.
 - **A file with equality deletes** is read the same way, together with its equality columns. Each group of
   equality delete files is loaded once per Spark task into a set, and a row whose values are in it is deselected.
-- **Any other group** is read by Iceberg's columnar reader inside the same node, and its batches are adapted as
-  below.
+- **Any other group** (an ORC or Avro file, an encrypted file, a delete our reader cannot apply) is read by
+  Iceberg's columnar reader inside the same node when Iceberg vectorizes the scan, or (#901 item 6) by Iceberg's
+  own row reader inside the node, converted to batches, when it does not (a nested-column scan); either way the
+  other groups stay native and its rows match what Iceberg's own reader returns.
 
 The node reports how many task groups each reader read (`numNativeGroups`, `numIcebergGroups`), plus files, row
 groups and pages skipped.
 
 At plan time the node declines, and Spark's `BatchScanExec` stays:
 - a scan that reports an ordering;
-- a scan Iceberg does not vectorize (nested columns) with a task group our reader cannot read: an ORC or Avro
-  file, an encrypted file, or equality deletes on a column it does not read;
-- a metadata column other than `_file`, `_pos`, `_spec_id`, `_partition`, `_row_id` and
-  `_last_updated_sequence_number` (for example `_deleted`);
-- a nested field with an initial default, or a top-level default our reader cannot fill as a constant;
+- a nested-column scan (Iceberg not vectorized) with NO task group our reader can read, or whose input is a
+  metadata table (`.files`, `.snapshots`) rather than data-file groups;
+- a metadata column other than `_file`, `_pos`, `_spec_id`, `_partition`, `_row_id`,
+  `_last_updated_sequence_number` and `_deleted`;
+- a nested or top-level default our reader cannot fill as a constant;
 - a column type outside the flat types in the table above, or a nested type with such a leaf.
 
 The switch is off by default until the TPC-DS Iceberg A/B is in.
@@ -313,6 +315,72 @@ The partitioned (hash) append, the read A/B for #920, and a CDC `MERGE` A/B for 
 - **Copying a foreign vector with nulls.** Iceberg's `ConstantColumnVector` of a null partition value throws
   when a null row is read, and the copy path's bulk getters read every row. The 1 TB partitioned run hit it on
   `ss_store_sk`. Fixed on #919, and separately for `main`.
+
+## The write side: partial columnar merge -- copy unchanged row groups (#901 M4)
+
+A copy-on-write `DELETE` / `UPDATE` / `MERGE` rewrites a whole data file today: every row group is decoded,
+filtered and re-encoded through the columnar writer, even the groups the change never touches. M4 copies the
+bytes that do not change and encodes only the rest. **M4a** is the first step: in a copy-on-write `DELETE`, a row
+group with no deleted rows is copied byte for byte into the new file; only a group with at least one deleted row
+is decoded, filtered and re-encoded.
+
+The primitive is on the writer. `ColumnarParquetWriter` sits on parquet-java's `ParquetFileWriter`, whose
+`appendRowGroup(SeekableInputStream, BlockMetaData, dropColumnIndexes=false)` (parquet-java 1.16) copies a
+group's compressed pages without decoding them, each chunk keeping its codec, statistics, column index, offset
+index and Bloom filter:
+
+- `copyRowGroup(source, block)` flushes the open (re-encoded) group, then appends the source group's bytes, so
+  copied and re-encoded groups keep their order and stay separate;
+- `endRowGroup()` cuts a boundary so a run of re-encoded surviving rows is closed before a copied group follows;
+- `copyableFrom(fileSchema)` is the schema guard: a group is copyable only when the source file's Parquet schema
+  matches the write schema -- same columns, order, physical and logical types and field ids. Requiredness
+  (`REQUIRED` vs `OPTIONAL`) is allowed to differ and is taken from the source: Iceberg's own writer marks an
+  always-non-null column `REQUIRED` in the file it writes, while the copy-on-write write schema (converted from
+  the Spark DELETE projection) marks every column `OPTIONAL`, and that difference alone must not force a full
+  rewrite. The copied file is written with the **source file's own schema** (`IcebergParquetAppender.create`
+  takes an explicit output `MessageType`), so a copied group's pages are valid under the footer and a re-encoded
+  group in the same file uses the same schema. Any other difference (a renamed, added, dropped, reordered or
+  promoted column, or a different field id, after schema evolution) is not copyable, and the file is rewritten
+  the normal way.
+
+Because a copied group's chunk statistics reach the writer's `footer()` unchanged, the file's Iceberg metrics are
+combined from the copied groups' footer statistics and the re-encoded groups' metrics by the same
+`ParquetUtil.footerMetrics` path the full rewrite uses, honouring `write.metadata.metrics.*` and bound
+truncation. NaN counts a footer does not carry are the one metric a copy cannot supply: when the table tracks NaN
+counts for a float or double column, a file that would need them derived from copied groups must fall back to the
+full rewrite rather than report wrong metrics. v3 row lineage (`_row_id` / `_last_updated_sequence_number`) is a
+second reason to fall back: a source written by an ordinary append materialises no lineage (its `_row_id` is
+inherited from the data file's `first_row_id` plus the row position), and a copy-on-write `DELETE` must preserve
+each surviving row's original `_row_id`. Copying or re-encoding into a new file would re-inherit lineage from the
+new file's `first_row_id` and new positions, changing `_row_id` once deletions shift the rows. So a v3 source
+that does not already store lineage is not copyable and takes the full rewrite, which writes each surviving row's
+original `_row_id` explicitly -- exactly as Iceberg's own copy-on-write rewrite does.
+
+A DELETE touching one row group of eight (2000 rows each) rewrote in 7.7 ms with M4a against 14.5 ms for the full
+rewrite in a local smoke run -- the shape the cluster A/B (a copy-on-write `DELETE` of 0.1% / 1% / 10% of the
+rows) will measure at 1 TB. The primitive and its guards are covered by `RowGroupCopyTest` in the `parquet`
+module (0, some and all groups copied; rows and order equal; copied statistics, encodings and byte sizes equal
+the source; schema-evolved files reported not copyable; the full-rewrite-vs-copy smoke).
+
+The per-file rewrite operator is wired behind `spark.vecruntime.iceberg.copyUnchanged.enabled` (default **on**).
+For a copy-on-write `DELETE` on a partitioned or unpartitioned table, `VectorIcebergWriteStrategy` recognises the
+`ReplaceData` (its `RowLevelOperation.Command` is `DELETE`, so every output row is an unchanged copy of a
+surviving row -- an `UPDATE` or `MERGE` rewrites values and is not eligible), passes the `_file` / `_pos`
+ordinals Iceberg's copy-on-write scan already projects, and wraps the copy child in a
+`RepartitionByExpression(_file)` -- a plain `hashpartitioning(_file)` exchange that replaces Iceberg's
+`REBALANCE_PARTITIONS_BY_COL` distribution, so a source file's rows all land in one task and AQE's skew handling
+(which rewrites only REBALANCE exchanges) never splits a file. The executor runs `IcebergRewriteFileTaskWriter`:
+it buffers the surviving rows per source file, reads each source footer, asks `RowGroupCopyPlanner` which groups
+to copy / re-encode / skip, and emits the new file through `IcebergParquetAppender` so the metrics are the
+combined footer's. A runtime guard (`clusteredByFile`, accepting `HashPartitioningLike` including AQE's
+`CoalescedHashPartitioning`) checks the input really is clustered by `_file` before copying; if not, or if a
+`_pos` repeats or is out of range for the file, the task falls back to the streaming full rewrite of whatever
+rows it holds (correct data, no byte copy). `RowGroupCopyPlanner` is covered by `RowGroupCopyPlannerSuite` (0 /
+some / all groups, group ranges, schema-evolution and NaN-metrics fallback) and the end-to-end path by
+`VectorCopyUnchangedDeleteSuite` (v2/v3, partitioned/unpartitioned, data + within-table lineage + per-file
+metrics oracle).
+
+Column-chunk copying for `UPDATE` / matched-only `MERGE` (M4b) and `rewrite_data_files` (M4c) follow.
 
 ## The write side: columnar v3 deletion vectors (#20)
 

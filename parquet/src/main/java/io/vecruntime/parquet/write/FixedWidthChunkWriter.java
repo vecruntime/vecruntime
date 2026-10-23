@@ -100,6 +100,11 @@ final class FixedWidthChunkWriter implements ChunkWriter {
     private final int pageRowLimit;
     private final int dictionaryLimit;
     private final boolean dictionaryEnabled;
+    // The write calendar rebase for a DATE (INT32) or a non-INT96 TIMESTAMP (INT64 micros) column; NONE and the
+    // flags false for a long / int / decimal / double (the min check and the pass are then skipped entirely).
+    private final WriteRebase rebase;
+    private final boolean rebaseDate;
+    private final boolean rebaseTimestamp;
 
     private PageWriter pages;
     private final ParquetProperties props;
@@ -178,6 +183,11 @@ final class FixedWidthChunkWriter implements ChunkWriter {
     }
 
     FixedWidthChunkWriter(Kind kind, ColumnDescriptor column, ParquetProperties props) {
+        this(kind, column, props, WriteRebase.NONE);
+    }
+
+    FixedWidthChunkWriter(Kind kind, ColumnDescriptor column, ParquetProperties props,
+                          WriteRebase rebase) {
         this.kind = kind;
         this.column = column;
         this.props = props;
@@ -186,6 +196,18 @@ final class FixedWidthChunkWriter implements ChunkWriter {
         this.pageRowLimit = props.getPageRowCountLimit();
         this.dictionaryLimit = props.getDictionaryPageSizeThreshold();
         this.dictionaryEnabled = props.isDictionaryEnabled(column);
+        WriteRebase r = rebase == null ? WriteRebase.NONE : rebase;
+        var logical = column.getPrimitiveType().getLogicalTypeAnnotation();
+        boolean date = kind == Kind.INT32 && logical instanceof org.apache.parquet.schema.LogicalTypeAnnotation.DateLogicalTypeAnnotation;
+        // A TIMESTAMP adjusted to UTC needs the calendar rebase: on the INT64 lane of micros (Kind.INT64) and, with
+        // #958's own v2 encoders, on the millis fast path too (Kind.INT64_MILLIS, rebased as millis in
+        // rebaseStaged). TIMESTAMP_NTZ (not adjusted) is written as stored.
+        boolean timestamp = (kind == Kind.INT64 || kind == Kind.INT64_MILLIS)
+                && logical instanceof org.apache.parquet.schema.LogicalTypeAnnotation.TimestampLogicalTypeAnnotation ts
+                && ts.isAdjustedToUTC();
+        this.rebaseDate = date && r.datetimeActive();
+        this.rebaseTimestamp = timestamp && r.datetimeActive();
+        this.rebase = r;
     }
 
     /** Starts a column chunk (a row group) on {@code pages}. */
@@ -230,6 +252,14 @@ final class FixedWidthChunkWriter implements ChunkWriter {
                 values[pageValues++] = raw;
             }
         }
+        // Calendar rebase (#842), over the values just staged ([start, pageValues)): a DATE's days or a
+        // TIMESTAMP's micros rebased to the hybrid Julian calendar (LEGACY) or refused (EXCEPTION), as Spark's
+        // ParquetWriteSupport writes them. Only values below the Gregorian switch change, so a cheap min check
+        // skips the whole pass for a batch that is all modern; the bloom filter, dictionary and statistics below
+        // then see the rebased values Spark would write.
+        if (rebaseDate || rebaseTimestamp) {
+            rebaseStaged(start);
+        }
         if (bloom != null) {
             for (int k = start; k < pageValues; k++) {
                 long raw = values[k];
@@ -252,6 +282,73 @@ final class FixedWidthChunkWriter implements ChunkWriter {
         if (pageRows >= pageRowLimit || encodedBytes() >= pageSize) {
             flushPage();
         }
+    }
+
+    /**
+     * Rebases the staged values {@code [start, pageValues)} of a DATE or a
+     * non-INT96 TIMESTAMP column in place: a cheap min pass first, and the
+     * rebase pass only when some value is below the Gregorian switch (every
+     * value of modern data is above it, so the rebase is the identity and the
+     * pass is skipped). Under EXCEPTION the rebase call throws on an ancient
+     * value, as Spark's write does. A millisecond timestamp ({@link
+     * Kind#INT64_MILLIS}) was already reduced to millis by {@link #rawAt}; the
+     * calendar offset is a whole number of days, so the millis switch and the
+     * rebase are the micros ones scaled by 1000 (see {@link #rebaseMillis}).
+     */
+    private void rebaseStaged(int start) {
+        if (rebaseDate) {
+            int sw = rebase.switchGregorianDay();
+            int min = Integer.MAX_VALUE;
+            for (int k = start; k < pageValues; k++) {
+                int d = (int) values[k];
+                if (d < min) {
+                    min = d;
+                }
+            }
+            if (min >= sw) {
+                return;
+            }
+            for (int k = start; k < pageValues; k++) {
+                values[k] = rebase.rebaseDays((int) values[k]);
+            }
+        } else if (kind == Kind.INT64_MILLIS) {
+            long sw = Math.floorDiv(rebase.switchGregorianTs(), 1000L);
+            long min = Long.MAX_VALUE;
+            for (int k = start; k < pageValues; k++) {
+                if (values[k] < min) {
+                    min = values[k];
+                }
+            }
+            if (min >= sw) {
+                return;
+            }
+            for (int k = start; k < pageValues; k++) {
+                values[k] = rebaseMillis(values[k]);
+            }
+        } else {
+            long sw = rebase.switchGregorianTs();
+            long min = Long.MAX_VALUE;
+            for (int k = start; k < pageValues; k++) {
+                if (values[k] < min) {
+                    min = values[k];
+                }
+            }
+            if (min >= sw) {
+                return;
+            }
+            for (int k = start; k < pageValues; k++) {
+                values[k] = rebase.rebaseMicros(values[k]);
+            }
+        }
+    }
+
+    /**
+     * A millisecond timestamp rebased: micros and millis differ only by the
+     * x1000 scale, and the LEGACY calendar shift is a whole number of days, so
+     * the rebase of the micros is exactly 1000x the rebase of the millis.
+     */
+    private long rebaseMillis(long millis) {
+        return Math.floorDiv(rebase.rebaseMicros(Math.multiplyExact(millis, 1000L)), 1000L);
     }
 
     /**

@@ -70,6 +70,7 @@ public final class ColumnarParquetWriter implements AutoCloseable {
     private final ColumnEncoder[] encoders;
     private final VecType[] lanes;
     private final ChunkWriter[] fast;
+    private final WriteRebase rebase;
 
     private ColumnChunkPageWriteStore pageStore;
     private ColumnWriteStore columnStore;
@@ -96,6 +97,27 @@ public final class ColumnarParquetWriter implements AutoCloseable {
     public ColumnarParquetWriter(OutputFile out, MessageType schema, ParquetProperties props,
             CompressionCodecFactory.BytesInputCompressor compressor, long rowGroupSize, Map<String, String> footer)
             throws IOException {
+        this(out, schema, props, compressor, rowGroupSize, footer,
+                WriteRebase.NONE);
+    }
+
+    /**
+     * As above, applying {@code rebase} to the file's date and timestamp values
+     * (#842): a {@code LEGACY} or {@code EXCEPTION} write rebases or refuses
+     * values below the Gregorian calendar switch, as Spark's {@code
+     * ParquetWriteSupport} does. {@link WriteRebase#NONE} (the default
+     * constructor) writes the proleptic Gregorian calendar as stored.
+     */
+    public ColumnarParquetWriter(
+            OutputFile out,
+            MessageType schema,
+            ParquetProperties props,
+            CompressionCodecFactory.BytesInputCompressor compressor,
+            long rowGroupSize,
+            Map<String, String> footer,
+            WriteRebase rebase)
+            throws IOException {
+        this.rebase = rebase == null ? WriteRebase.NONE : rebase;
         this.schema = schema;
         // The writer writes Parquet v2 only (#64): data page v2 and the v2 encodings, also on the column-store path.
         this.props = ParquetProperties.copy(props)
@@ -116,7 +138,7 @@ public final class ColumnarParquetWriter implements AutoCloseable {
                 throw new IllegalArgumentException("repeated primitive field not supported: " + f.getName());
             } else {
                 columns.add(null);
-                nested[i] = new NestedFieldWriter(schema, f, this.props);
+                nested[i] = new NestedFieldWriter(schema, f, this.props, rebase);
             }
         }
         this.encoders = new ColumnEncoder[columns.size()];
@@ -154,7 +176,7 @@ public final class ColumnarParquetWriter implements AutoCloseable {
             return new BooleanChunkWriter(column, props);
         }
         if (lane == VecType.INT64 && p == org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.INT96) {
-            return new FixedBinaryChunkWriter(FixedBinaryChunkWriter.Kind.INT96, 12, column, props);
+            return new FixedBinaryChunkWriter(FixedBinaryChunkWriter.Kind.INT96, 12, column, props, rebase);
         }
         if (p == org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.FIXED_LEN_BYTE_ARRAY) {
             int fixedWidth = column.getPrimitiveType().getTypeLength();
@@ -220,7 +242,7 @@ public final class ColumnarParquetWriter implements AutoCloseable {
                 }
                 FixedWidthChunkWriter.Kind kind = FixedWidthChunkWriter.kindFor(lane, columns.get(i));
                 if (kind != null) {
-                    fast[i] = new FixedWidthChunkWriter(kind, columns.get(i), props);
+                    fast[i] = new FixedWidthChunkWriter(kind, columns.get(i), props, rebase);
                     fast[i].startChunk(pageStore.getPageWriter(columns.get(i)), blooms(columns.get(i)));
                 } else {
                     ChunkWriter flat = flatChunkWriter(lane, columns.get(i));
@@ -228,7 +250,7 @@ public final class ColumnarParquetWriter implements AutoCloseable {
                         fast[i] = flat;
                         fast[i].startChunk(pageStore.getPageWriter(columns.get(i)), blooms(columns.get(i)));
                     } else {
-                        encoders[i] = ColumnEncoder.forColumn(lane, columns.get(i));
+                        encoders[i] = ColumnEncoder.forColumn(lane, columns.get(i), rebase);
                     }
                 }
             } else if (lanes[i] != lane) {
@@ -276,6 +298,67 @@ public final class ColumnarParquetWriter implements AutoCloseable {
         if (bufferedSize() >= rowGroupSize) {
             flushRowGroup();
         }
+    }
+
+    /**
+     * Copies one row group {@code block} of {@code source} into this file
+     * byte for byte, without decoding it (#901 M4a). The compressed pages are
+     * appended as they are, each chunk keeping its codec, statistics, column
+     * index, offset index and Bloom filter, through parquet-java's {@code
+     * ParquetFileWriter.appendRowGroup}. Any rows buffered in the open row
+     * group are flushed first, so copied and encoded groups keep their order
+     * in the file.
+     *
+     * <p>{@code source} must be positioned-readable for the life of the call
+     * and describe a file whose schema equals {@link #copyableFrom this
+     * writer's schema} (same columns, physical and logical types, repetition
+     * and field ids); the caller checks that with {@link #copyableFrom} and
+     * falls back to decoding the group when it does not hold. The copied
+     * group's statistics reach {@link #footer}, so a metrics builder combines
+     * them with the encoded groups' without reading the file again.
+     *
+     * @param source a seekable stream on the file the group comes from
+     * @param block the group's {@code BlockMetaData} from {@code source}'s
+     *     footer
+     */
+    public void copyRowGroup(org.apache.parquet.io.SeekableInputStream source, org.apache.parquet.hadoop.metadata.BlockMetaData block) throws IOException {
+        if (closed) {
+            throw new IllegalStateException("writer is closed");
+        }
+        flushRowGroup();
+        // dropColumnIndexes = false: keep each chunk's column index, offset index and Bloom filter.
+        file.appendRowGroup(source, block, false);
+        totalRows += block.getRowCount();
+    }
+
+    /**
+     * Whether a file with schema {@code fileSchema} can have its row groups
+     * copied into this file without decoding (#901 M4a): its columns must be
+     * exactly this writer's schema -- same names, order, physical and logical
+     * types, repetition and field ids -- so a copied chunk's pages and
+     * statistics are valid under this file's footer schema. A file that
+     * differs (schema evolution: a renamed, added, dropped, reordered or
+     * promoted column, a different field id) is not copyable and the caller
+     * rewrites it the normal way. The text form is the contract parquet-java
+     * uses between two schemas (see {@code fileSchema} in the Iceberg interop),
+     * and it carries the id and logical-type annotations.
+     */
+    public boolean copyableFrom(MessageType fileSchema) {
+        return schema.equals(fileSchema);
+    }
+
+    /**
+     * Ends the open row group now, if it holds any rows, cutting a row-group
+     * boundary at this point (#901 M4a). The M4a rewrite uses it so a group of
+     * re-encoded surviving rows is closed before a byte-for-byte copied group
+     * follows, keeping the groups separate and in order; {@link #copyRowGroup}
+     * calls it for the same reason. A no-op when the open group is empty.
+     */
+    public void endRowGroup() throws IOException {
+        if (closed) {
+            throw new IllegalStateException("writer is closed");
+        }
+        flushRowGroup();
     }
 
     private void flushRowGroup() throws IOException {
