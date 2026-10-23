@@ -61,6 +61,15 @@ object GraceHashJoin extends Logging {
   /** Joins that went to buckets in this JVM, for tests (#868). */
   private[vecruntime] val bucketedJoins = new java.util.concurrent.atomic.AtomicLong
 
+  /** Of those, the ones another consumer's request sent to buckets (#875), for tests. */
+  private[vecruntime] val requestBucketings = new java.util.concurrent.atomic.AtomicLong
+
+  /**
+   * #875: a build side holding less than this is not bucketed on request -- its bytes would not be worth the spill
+   * files, and the request is better met elsewhere. One bucketing chunk's worth of a narrow row.
+   */
+  @volatile private[vecruntime] var requestFloorBytes: Long = 16L << 20
+
   def iterator(
       buildIter: Iterator[ColumnarBatch],
       streamIter: Iterator[ColumnarBatch],
@@ -95,69 +104,116 @@ object GraceHashJoin extends Logging {
     var total = 0
     // The batch that would have grown the builders past the budget: not appended, bucketed first below.
     var overflowBatch: ColumnarBatch = null
+
+    // The buckets, made when the build side first goes to disk: past the budget, at a refusal, or (#875) on
+    // another consumer's request.
+    var allocator: org.apache.arrow.memory.BufferAllocator = null
+    var buildSpill: AggregateSpill = null
+    var probeSpill: AggregateSpill = null
+    var spilledRows = 0L
+    var bucketing = false
+
+    // The rows held so far, a slice at a time (the class note), into the build buckets; the builders freed.
+    def startBucketing(why: String): Unit = {
+      logInfo(
+        s"hash join: build side $why after $total rows (${heldBytes(builders)} bytes held), bucketing both sides into $buckets buckets on disk"
+      )
+      bucketedJoins.incrementAndGet()
+      allocator = VectorAllocators.newChild("VectorShuffledHashJoinExec.grace")
+      val buildAttrs =
+        if (spec.buildIsLeft) spec.joinedAttrs.take(spec.buildTypes.length)
+        else spec.joinedAttrs.drop(spec.streamedWidth)
+      val streamedAttrs =
+        if (spec.buildIsLeft) spec.joinedAttrs.drop(spec.buildTypes.length)
+        else spec.joinedAttrs.take(spec.streamedWidth)
+      buildSpill = new AggregateSpill(buckets, buildAttrs, null, allocator, AggregateSpill.BucketSeed, keyTypes)
+      probeSpill = new AggregateSpill(buckets, streamedAttrs, null, allocator, AggregateSpill.BucketSeed, keyTypes)
+      val views = builders.map(_.view())
+      var from = 0
+      while (from < total) {
+        val to = math.min(total, from + SpillChunkRows)
+        val scratch =
+          io.vecruntime.kernels.NativePool.shared().newArena() // #869: per chunk, so its blocks are reused chunk to chunk
+        try {
+          val slice = views.map(v => plain(v.slice(from, to), scratch))
+          val ctx = new EvalContext(scratch, to - from, c => slice(c))
+          buildSpill.writeBuffers(slice, spec.buildKeys.map(_.eval(ctx)), to - from, scratch)
+        } finally scratch.close()
+        from = to
+      }
+      spilledRows += total
+      builders.foreach(_.close())
+      arena.close()
+      memory.releaseTo(0L)
+      bucketing = true
+    }
+    def spillBuild(batch: ColumnarBatch): Unit = if (batch.numRows() > 0) EvalContexts.withBatch(batch) { ctx =>
+      val cols = Array.tabulate(spec.buildTypes.length)(c => plain(ctx.input(c), ctx.arena))
+      buildSpill.writeBuffers(cols, spec.buildKeys.map(_.eval(ctx)), ctx.numRows, ctx.arena, ctx.selection)
+      spilledRows += ctx.selectedCount
+    }
+
+    // #875: another consumer's request, between two build batches -- while the build side is pulled, which is
+    // where a consumer below (a sort, an aggregate) asks for memory -- starts the bucketing now and gives the held
+    // rows' bytes back. The builders change only under `buildLock`; a request takes it with tryLock, never waits
+    // (the memory manager holds its own lock while it asks, and an append may ask that manager for memory), so a
+    // request from another thread of the task during an append gets nothing. A build side that cannot bucket, or
+    // holds less than one chunk, gives nothing back.
+    val buildLock = new java.util.concurrent.locks.ReentrantLock()
+    val atBoundary = new java.util.concurrent.atomic.AtomicBoolean(false)
+    def pull[T](f: => T): T = {
+      atBoundary.set(true);
+      try f
+      finally atBoundary.set(false)
+    }
+    if (canSpill) memory.setSpillHandler { () =>
+      if (!buildLock.tryLock()) 0L
+      else
+        try {
+          val held = memory.bytes
+          if (!atBoundary.get() || bucketing || overflowBatch != null || held < requestFloorBytes) 0L
+          else {
+            requestBucketings.incrementAndGet()
+            startBucketing("asked for its memory")
+            held
+          }
+        } finally buildLock.unlock()
+    }
+
     // `overflowBatch == null` first (#771): once a batch overflows, the build side must not be asked for another
     // before that batch is spilled. Our shuffle reader closes the last batch it handed out when hasNext finds
     // its stream ended, which released the held batch's buffers (q14b at 3 TB read past a 0-byte segment).
-    while (overflowBatch == null && buildIter.hasNext) {
-      val batch = buildIter.next()
-      if (batch.numRows() > 0) {
-        EvalContexts.withBatch(batch) { ctx =>
-          val after = bytesAfter(builders, ctx)
-          val granted = memory.hold(after)
-          if (canSpill && (after > budgetBytes || !granted)) overflowBatch = batch
-          else {
-            var c = 0
-            while (c < builders.length) { builders(c).append(ctx.input(c), ctx.selection, ctx.selectedCount); c += 1 }
-            total += ctx.selectedCount
+    while (overflowBatch == null && pull(buildIter.hasNext)) {
+      val batch = pull(buildIter.next())
+      buildLock.lock()
+      try {
+        if (bucketing) spillBuild(batch)
+        else if (batch.numRows() > 0) {
+          EvalContexts.withBatch(batch) { ctx =>
+            val after = bytesAfter(builders, ctx)
+            val granted = memory.hold(after)
+            if (canSpill && (after > budgetBytes || !granted)) overflowBatch = batch
+            else {
+              var c = 0
+              while (c < builders.length) { builders(c).append(ctx.input(c), ctx.selection, ctx.selectedCount); c += 1 }
+              total += ctx.selectedCount
+            }
           }
         }
-      }
+      } finally buildLock.unlock()
     }
-    if (overflowBatch == null) {
+    // No request is answered from here on: the build side is either in memory or in its buckets.
+    memory.setSpillHandler(null)
+    buildLock.lock(); buildLock.unlock() // a request that saw the last pull's boundary has finished
+    if (overflowBatch == null && !bucketing) {
       // As before #416: the whole build side in one table, its bytes held until the task ends.
       val table = new BuildTable(arena, builders.map(_.view()), total, spec, builders = builders).build()
       memory.releaseTo(heldBytes(builders))
       return new VectorHashJoinIterator(streamIter, table, spec, metrics)
     }
 
-    logInfo(
-      s"hash join: build side past $budgetBytes bytes after $total rows (${heldBytes(builders)} bytes held), bucketing both sides into $buckets buckets on disk"
-    )
-    bucketedJoins.incrementAndGet()
-    val allocator = VectorAllocators.newChild("VectorShuffledHashJoinExec.grace")
-    val buildAttrs =
-      if (spec.buildIsLeft) spec.joinedAttrs.take(spec.buildTypes.length) else spec.joinedAttrs.drop(spec.streamedWidth)
-    val streamedAttrs =
-      if (spec.buildIsLeft) spec.joinedAttrs.drop(spec.buildTypes.length) else spec.joinedAttrs.take(spec.streamedWidth)
-    val buildSpill = new AggregateSpill(buckets, buildAttrs, null, allocator, AggregateSpill.BucketSeed, keyTypes)
-    val probeSpill = new AggregateSpill(buckets, streamedAttrs, null, allocator, AggregateSpill.BucketSeed, keyTypes)
-    var spilledRows = 0L
-
-    // The rows held so far, a slice at a time (the class note), then the batch that overflowed and the
-    // rest of the build side, into the build buckets.
-    val views = builders.map(_.view())
-    var from = 0
-    while (from < total) {
-      val to = math.min(total, from + SpillChunkRows)
-      val scratch =
-        io.vecruntime.kernels.NativePool.shared().newArena() // #869: per chunk, so its blocks are reused chunk to chunk
-      try {
-        val slice = views.map(v => plain(v.slice(from, to), scratch))
-        val ctx = new EvalContext(scratch, to - from, c => slice(c))
-        buildSpill.writeBuffers(slice, spec.buildKeys.map(_.eval(ctx)), to - from, scratch)
-      } finally scratch.close()
-      from = to
-    }
-    spilledRows += total
-    builders.foreach(_.close())
-    arena.close()
-    memory.releaseTo(0L)
-    def spillBuild(batch: ColumnarBatch): Unit = if (batch.numRows() > 0) EvalContexts.withBatch(batch) { ctx =>
-      val cols = Array.tabulate(spec.buildTypes.length)(c => plain(ctx.input(c), ctx.arena))
-      buildSpill.writeBuffers(cols, spec.buildKeys.map(_.eval(ctx)), ctx.numRows, ctx.arena, ctx.selection)
-      spilledRows += ctx.selectedCount
-    }
-    spillBuild(overflowBatch)
+    if (!bucketing) startBucketing(s"past $budgetBytes bytes")
+    if (overflowBatch != null) spillBuild(overflowBatch)
     while (buildIter.hasNext) spillBuild(buildIter.next())
     // Every streamed row into the probe buckets.
     while (streamIter.hasNext) {
@@ -291,10 +347,18 @@ private[vecruntime] final class BuildMemory(
   // #869: bytes that are the task's own NativePool blocks (a join build's owning builders) reserve through the task's
   // account when the pool's accounting is on, so the blocks they then take are not counted again. Anything else (Arrow
   // vectors, heap mirrors) keeps a consumer of its own: those bytes are not the pool's.
+  @volatile private var handler: () => Long = _
+  private val onRequest: Long => Long = _ => { val h = handler; if (h == null) 0L else h() }
   private val reservation: TaskNativeMemory.Reservation =
-    if (pooled) TaskNativeMemory.reservation(mode, _ => 0L)
-    else TaskNativeMemory.ownReservation(mode, _ => 0L)
+    if (pooled) TaskNativeMemory.reservation(mode, onRequest)
+    else TaskNativeMemory.ownReservation(mode, onRequest)
   private var held = 0L
+
+  /**
+   * #875: what to do when another consumer of the task asks for memory; returns the bytes given back (the handler
+   * calls [[releaseTo]] itself). Without one a request gets nothing.
+   */
+  def setSpillHandler(h: () => Long): Unit = handler = h
   if (reservation != null) org.apache.spark.TaskContext.get().addTaskCompletionListener[Unit](_ => releaseTo(0L))
 
   /** The bytes currently held. */

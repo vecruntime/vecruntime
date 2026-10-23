@@ -281,8 +281,55 @@ class GraceHashJoinSuite extends AnyFunSuite {
     } finally allocator.close()
   }
 
+  test("#875: another consumer's request mid-build sends the join to its buckets, with the same rows") {
+    val expected = intJoin(200000, 100000, perKey = 4, budgetBytes = Long.MaxValue, buckets = 32)
+    val mm = new org.apache.spark.memory.UnifiedMemoryManager(new org.apache.spark.SparkConf(false), 64L << 20, 0L, 1)
+    val tmm = new org.apache.spark.memory.TaskMemoryManager(mm, 0L)
+    val ctx = new RecordingTaskContext(tmm)
+    TaskContext.setTaskContext(ctx)
+    val wasInstalled = TaskNativeMemory.isInstalled
+    TaskNativeMemory.uninstall()
+    val floor = GraceHashJoin.requestFloorBytes
+    GraceHashJoin.requestFloorBytes = 0L
+    val before = GraceHashJoin.requestBucketings.get()
+    try {
+      val other = new org.apache.spark.memory.MemoryConsumer(
+        tmm,
+        tmm.pageSizeBytes(),
+        org.apache.spark.memory.MemoryMode.ON_HEAP
+      ) {
+        override def spill(size: Long, trigger: org.apache.spark.memory.MemoryConsumer): Long = 0L
+      }
+      var granted = 0L
+      // After ten build batches, pulled between two of the join's appends, another consumer asks for the whole pool.
+      val build = intSide("bk", 200000, perKey = 4)(emitted =>
+        if (emitted == 8192L * 10 && granted == 0L) granted = other.acquireMemory(64L << 20)
+      )
+      val out = rowsOf(
+        GraceHashJoin.iterator(build, intSide("k", 100000, perKey = 4)(), intSpec, metrics, 1L << 40, 32),
+        _.getInt(_)
+      )
+      assert(out === expected)
+      assert(GraceHashJoin.requestBucketings.get() === before + 1, "the request sent the build side to its buckets")
+      assert(granted > 0, "the other consumer got the memory the join gave back")
+      other.freeMemory(granted)
+      ctx.complete()
+    } finally {
+      GraceHashJoin.requestFloorBytes = floor
+      TaskContext.unset()
+      if (wasInstalled) TaskNativeMemory.install() else TaskNativeMemory.uninstall()
+    }
+  }
+
+  test("#875: without a memory manager, a join is never bucketed on request") {
+    val before = GraceHashJoin.requestBucketings.get()
+    assert(intJoin(200000, 100000, perKey = 4, budgetBytes = 1L << 40, buckets = 32)._1 === 100000L * 4)
+    assert(GraceHashJoin.requestBucketings.get() === before)
+  }
+
   /** A task context that records the completion listeners and runs them on `complete()`; nothing else. */
-  private final class RecordingTaskContext extends org.apache.spark.sql.vecruntime.shims.TestTaskContextBase {
+  private final class RecordingTaskContext(tmm: org.apache.spark.memory.TaskMemoryManager = null)
+      extends org.apache.spark.sql.vecruntime.shims.TestTaskContextBase {
     private val completion = new ArrayBuffer[TaskCompletionListener]
     def listeners: Int = completion.size
     def complete(): Unit = completion.reverseIterator.foreach(_.onTaskCompletion(this))
@@ -309,7 +356,7 @@ class GraceHashJoinSuite extends AnyFunSuite {
     override def getMetricsSources(sourceName: String): Seq[org.apache.spark.metrics.source.Source] = Nil
     override private[spark] def killTaskIfInterrupted(): Unit = ()
     override private[spark] def getKillReason(): Option[String] = None
-    override private[spark] def taskMemoryManager(): org.apache.spark.memory.TaskMemoryManager = null
+    override private[spark] def taskMemoryManager(): org.apache.spark.memory.TaskMemoryManager = tmm
     override private[spark] def registerAccumulator(a: org.apache.spark.util.AccumulatorV2[_, _]): Unit = ()
     override private[spark] def setFetchFailed(e: org.apache.spark.shuffle.FetchFailedException): Unit = ()
     override private[spark] def markInterrupted(reason: String): Unit = ()
