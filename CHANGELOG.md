@@ -87,6 +87,20 @@ version may change configuration keys or defaults, always noted here.
   6 GB direct cap at Netty's speed, where Arrow on Netty needed about 10 GB. Older images lack the jar: render
   their runs with `ARROW_ALLOCATOR=`.
 
+### Fixed
+
+- The native Parquet scan's parallel row-group decode (#606) no longer leaks Arrow buffers when a task ends early
+  (a `LIMIT`, or a failure), fixing the intermittent `ParallelDecodeSuite` "a LIMIT that ends the task early leaks
+  no vectors" failure on CI, where the whole `spark` module runs in one JVM (#981). The first fix stopped
+  `close()` from `cancel(true)`-ing running helper futures; this one removes the remaining leak path.
+  On close the iterator stopped its helper pool with `shutdownNow()`, which interrupts the running decode threads.
+  A helper decodes pure CPU over already-fetched pages and does not poll for interruption, so the interrupt did not
+  stop it cleanly -- it only made a later buffer allocation inside `readBatch` throw once the flag was set, and
+  that throw escaped with buffers already taken from the job's child allocator but not yet owned by a reader's
+  pool, which the decode's own cleanup could not free. The iterator now stops the pool with `shutdown()` (no
+  interrupt) and drains every in-flight job to completion before closing the lead, so each job's child allocator is
+  released and closed exactly once.
+
 ## 0.0.9 -- 2026-10-19
 
 Iceberg tables are read by the native Parquet reader over Iceberg's own planning, with position deletes,
