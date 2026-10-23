@@ -275,28 +275,43 @@ class VectorCopyUnchangedDeleteSuite extends AnyFunSuite with BeforeAndAfterAll 
   for (version <- Seq(2, 3); partitioned <- Seq(false, true)) {
     val tag = s"v$version ${if (partitioned) "partitioned" else "unpartitioned"}"
     val base = s"${version}_${if (partitioned) "p" else "u"}"
+    // The copy path cannot supply a float/double NaN count (a footer carries none), so a table that tracks
+    // one declines every copy. To exercise the COPY path these cases turn metrics off for the two floating
+    // columns; a dedicated case below keeps NaN tracking and asserts the (correct) no-copy fallback.
+    val noNaN = ", 'write.metadata.metrics.column.d'='none', 'write.metadata.metrics.column.f'='none'"
 
-    test(s"$tag: DELETE touching some groups copies the untouched groups") {
-      // Delete a sparse scatter: every file keeps some whole groups (copied) and loses rows in others.
-      val copied = cow(s"some_$base", version, partitioned, rows = 8000) { t =>
-        s"DELETE FROM $t WHERE id % 97 = 0"
+    // A v3 source written by an ordinary append materialises no row lineage (its _row_id is inherited from
+    // first_row_id + position), so a copy-on-write rewrite of it MUST re-encode every surviving row to write
+    // each row's original _row_id explicitly -- a byte copy cannot. v3 therefore (correctly) falls back to the
+    // full rewrite and copies nothing; the lineage oracle proves _row_id is still preserved. v2 has no lineage
+    // and copies the delete-free groups.
+    def expect(copied: Long, label: String): Unit =
+      if (version == 2) assert(copied > 0, s"$tag $label: expected copied groups > 0, got $copied")
+      else assert(copied == 0L, s"$tag $label: v3 must fall back (unmaterialised lineage), got $copied")
+
+    test(s"$tag: DELETE touching some groups copies the untouched groups (v2) / falls back (v3)") {
+      // Delete a single narrow contiguous block so only the one or two groups covering it are touched and
+      // every other group of the file is delete-free (copied on v2).
+      val copied = cow(s"some_$base", version, partitioned, rows = 8000, metricsProps = noNaN) { t =>
+        s"DELETE FROM $t WHERE id >= 100 AND id < 140"
       }
-      assert(copied > 0, s"$tag some-deleted: expected copied groups > 0, got $copied")
+      expect(copied, "some-deleted")
     }
 
-    test(s"$tag: DELETE touching all rows of some files still copies others") {
-      // A contiguous id range: files fully inside it are skipped/rewritten, files outside are all-copied.
-      val copied = cow(s"range_$base", version, partitioned, rows = 8000) { t =>
+    test(s"$tag: DELETE touching all rows of some files still copies others (v2) / falls back (v3)") {
+      // A contiguous id range: files fully inside it are skipped/rewritten, files outside are all-copied (v2).
+      val copied = cow(s"range_$base", version, partitioned, rows = 8000, metricsProps = noNaN) { t =>
         s"DELETE FROM $t WHERE id >= 2000 AND id < 2500"
       }
-      assert(copied > 0, s"$tag range-deleted: expected copied groups > 0, got $copied")
+      expect(copied, "range-deleted")
     }
 
-    test(s"$tag: DELETE matching nothing copies every group") {
-      val copied = cow(s"none_$base", version, partitioned, rows = 8000) { t =>
-        s"DELETE FROM $t WHERE id < 0"
+    test(s"$tag: DELETE removing a single row copies almost every group (v2) / falls back (v3)") {
+      // One row deleted: the one group holding it is re-encoded, every other group is copied (v2).
+      val copied = cow(s"one_$base", version, partitioned, rows = 8000, metricsProps = noNaN) { t =>
+        s"DELETE FROM $t WHERE id = 4242"
       }
-      assert(copied > 0, s"$tag none-deleted: expected copied groups > 0, got $copied")
+      expect(copied, "one-row-deleted")
     }
   }
 

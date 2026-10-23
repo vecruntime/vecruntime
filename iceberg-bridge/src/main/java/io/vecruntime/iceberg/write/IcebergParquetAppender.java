@@ -116,7 +116,38 @@ public final class IcebergParquetAppender implements FileAppender<IcebergParquet
     public static IcebergParquetAppender create(OutputFile file, Schema schema, Map<String, String> properties,
             MetricsConfig metricsConfig, NameMapping nameMapping, Configuration conf)
             throws IOException {
-        MessageType fileSchema = IcebergParquetInterop.fileSchema(schema, "table");
+        return create(file, schema, null, properties, metricsConfig, nameMapping,
+                conf);
+    }
+
+    /**
+     * As {@link #create(OutputFile, Schema, Map, MetricsConfig, NameMapping,
+     * Configuration)}, but with an explicit Parquet {@code outputSchema} (#901
+     * M4a). The row-group copy path passes the SOURCE file's own
+     * {@link MessageType} here, so a copied group's pages are valid under this
+     * file's footer schema and a re-encoded group in the same file is written
+     * with the same schema. {@code outputSchema} must carry Iceberg's field ids
+     * (it does: it is read from a file Iceberg's writer wrote), so
+     * {@code ParquetUtil.footerMetrics} keys the metrics by the same ids. When
+     * {@code outputSchema} is {@code null} the schema is Iceberg's own
+     * conversion of {@code schema}, i.e. the ordinary (full-rewrite / append)
+     * path.
+     *
+     * <p>The field metrics a footer cannot carry (float/double NaN counts and
+     * NaN-free bounds) are still collected from the re-encoded batches by field
+     * id against {@code schema}, so they land under the same ids regardless of
+     * which physical schema the file uses.
+     */
+    public static IcebergParquetAppender create(
+            OutputFile file,
+            Schema schema,
+            MessageType outputSchema,
+            Map<String, String> properties,
+            MetricsConfig metricsConfig,
+            NameMapping nameMapping,
+            Configuration conf)
+            throws IOException {
+        MessageType fileSchema = outputSchema != null ? outputSchema : IcebergParquetInterop.fileSchema(schema, "table");
         int pageSize = intProp(properties, TableProperties.PARQUET_PAGE_SIZE_BYTES, TableProperties.PARQUET_PAGE_SIZE_BYTES_DEFAULT);
         ParquetProperties.Builder props = ParquetProperties.builder()
                 .withPageSize(pageSize)

@@ -277,6 +277,16 @@ public final class IcebergRewriteFileTaskWriter implements AutoCloseable {
         RowGroupCopyPlanner plan = safe ? RowGroupCopyPlanner.plan(footer, writeSchema, deleted, spec.writeSchema(), metricsConfig) : null;
         boolean copyable = safe && plan.copyable();
 
+        // #901 M4a required-column guard: on the copy path the output file uses the source schema, which may
+        // mark a top-level column REQUIRED (Iceberg's writer does for an always-non-null column). A re-encoded
+        // group written under that schema MUST NOT receive a null in such a column. This cannot happen for a
+        // survivor whose data came from that very column -- a REQUIRED column holds no nulls -- but guard
+        // anyway: if any buffered survivor is null in a source-REQUIRED top-level column, decline the copy and
+        // fall back to the full rewrite (output schema then = the all-optional write schema).
+        if (copyable && survivorHasNullInRequired(buffer, plan.fileSchema())) {
+            copyable = false;
+        }
+
         // The partition of this file's rows (all share one partition), from the first buffered row. Null for an
         // unpartitioned spec; used so a rewritten file keeps its source file's partition.
         org.apache.iceberg.PartitionKey partition = partitionOf(buffer);
@@ -286,8 +296,14 @@ public final class IcebergRewriteFileTaskWriter implements AutoCloseable {
         written.add(location);
         IcebergParquetAppender appender;
         try {
-            appender = IcebergParquetAppender.create(out.encryptingOutputFile(), spec.writeSchema(), spec.properties(),
-                    metricsConfig, nameMapping, conf);
+            // #901 M4a: on the copy path the output file uses the SOURCE file's own Parquet schema, so a
+            // copied group's pages are valid under the footer and a re-encoded group in the same file is
+            // written with the same schema. The source schema carries Iceberg's field ids, so the footer
+            // metrics stay keyed by the same ids. The full-rewrite path keeps Iceberg's own conversion of the
+            // write schema (outputSchema = null).
+            MessageType outputSchema = copyable ? plan.fileSchema() : null;
+            appender = IcebergParquetAppender.create(out.encryptingOutputFile(), spec.writeSchema(), outputSchema,
+                    spec.properties(), metricsConfig, nameMapping, conf);
         } catch (IOException ioe) {
             throw new UncheckedIOException(ioe);
         }
@@ -302,6 +318,7 @@ public final class IcebergRewriteFileTaskWriter implements AutoCloseable {
         }
 
         if (copyable) {
+            int dataCols = plan.dataFieldCount();
             try (SeekableInputStream stream = in.newStream()) {
                 for (RowGroupCopyPlanner.Group g : plan.groups()) {
                     if (g.action() == RowGroupCopyPlanner.Action.COPY) {
@@ -309,7 +326,7 @@ public final class IcebergRewriteFileTaskWriter implements AutoCloseable {
                                 .get(g.ordinal()));
                         COPIED_ROW_GROUPS.increment();
                     } else if (g.action() == RowGroupCopyPlanner.Action.REENCODE) {
-                        reencodeGroup(appender, buffer, g, posToPacked);
+                        reencodeGroup(appender, buffer, g, posToPacked, dataCols);
                     }
                     // SKIP: every row of the group was deleted -- nothing written.
                 }
@@ -353,6 +370,40 @@ public final class IcebergRewriteFileTaskWriter implements AutoCloseable {
     }
 
     /**
+     * Whether any buffered survivor is null in a top-level column the source
+     * schema marks REQUIRED (#901 M4a guard). The buffered data columns are in
+     * write-schema field order, which {@link RowGroupCopyPlanner#compatibleForCopy}
+     * has verified equals the source schema's top-level field order, so index
+     * {@code i} of {@code dataChunks} is top-level field {@code i} of {@code
+     * fileSchema}. A REQUIRED column that a survivor is null in cannot be
+     * written under the source schema, so the file must take the full rewrite
+     * instead. Checks only the lineage-free data columns (ids below the write
+     * schema's data field count); v3 lineage columns are the writer's own.
+     */
+    private boolean survivorHasNullInRequired(FileBuffer buffer, MessageType fileSchema) {
+        int fields = Math.min(fileSchema.getFieldCount(), dataOrdinals.length);
+        for (int f = 0; f < fields; f++) {
+            org.apache.parquet.schema.Type type = fileSchema.getType(f);
+            if (!type.isRepetition(org.apache.parquet.schema.Type.Repetition.REQUIRED)) {
+                continue;
+            }
+            for (List<VectorBuffers> chunk : buffer.dataChunks) {
+                VectorBuffers col = chunk.get(f);
+                if (!col.hasNulls()) {
+                    continue;
+                }
+                int rows = col.length();
+                for (int r = 0; r < rows; r++) {
+                    if (col.isNull(r)) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    /**
      * Re-encodes every surviving row (across all chunks) in {@code _pos} order,
      * as one group stream.
      */
@@ -385,10 +436,13 @@ public final class IcebergRewriteFileTaskWriter implements AutoCloseable {
 
     /**
      * Re-encodes the surviving rows of one row group, in {@code _pos} order,
-     * through the appender.
+     * through the appender. {@code dataCols} is how many leading columns to
+     * write: the source file's own field count on the copy path, which on a v3
+     * table drops the trailing lineage columns the source does not materialise,
+     * so a re-encoded group matches the copied groups' (source) schema.
      */
     private void reencodeGroup(IcebergParquetAppender appender, FileBuffer buffer, RowGroupCopyPlanner.Group g,
-            long[] posToPacked)
+            long[] posToPacked, int dataCols)
             throws IOException {
         long start = g.start();
         long endPos = start + g.rowCount();
@@ -418,7 +472,7 @@ public final class IcebergRewriteFileTaskWriter implements AutoCloseable {
                     rows[t] = (int) (packed.get(i + t) & 0xffffffffL);
                 }
                 List<VectorBuffers> gathered = Gather.rows(buffer.dataChunks.get(chunk), rows, a);
-                appender.write(gathered, 0, rows.length);
+                appender.write(gathered.subList(0, dataCols), 0, rows.length);
                 i = j;
             }
             appender.endRowGroup();

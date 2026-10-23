@@ -145,7 +145,7 @@ public final class RowGroupCopyPlanner {
             groups.add(new Group(g, start[g], rows, action));
         }
 
-        if (!writeSchema.equals(fileSchema)) {
+        if (!compatibleForCopy(writeSchema, fileSchema)) {
             return new RowGroupCopyPlanner(false, "source file schema differs from the write schema", groups, fileSchema);
         }
         // Only a copy loses NaN information; a file re-encoded group by group counts NaNs like the full rewrite.
@@ -154,6 +154,103 @@ public final class RowGroupCopyPlanner {
                     groups, fileSchema);
         }
         return new RowGroupCopyPlanner(true, null, groups, fileSchema);
+    }
+
+    /**
+     * Whether a source file of schema {@code fileSchema} can have its row
+     * groups copied into an output file of the source's own schema (#901 M4a).
+     * The output schema IS the source schema, so a copied group's pages are
+     * trivially valid; what this guards is that the source really is the table
+     * the write schema describes -- same fields, same order, same field ids,
+     * same physical and logical types -- so the copied-and-re-encoded file is a
+     * faithful rewrite of the same rows.
+     *
+     * <p>Requiredness (REQUIRED vs OPTIONAL) is ALLOWED to differ and is taken
+     * from the source: Iceberg's own writer marks an always-non-null column
+     * REQUIRED in the file it writes, while the copy-on-write write schema
+     * (converted from the Spark DELETE projection) marks every column OPTIONAL.
+     * That difference alone must not force a full rewrite -- a REQUIRED source
+     * column holds no nulls, so copying its pages is sound, and a re-encoded
+     * group of survivors from that column holds no nulls either (guarded in the
+     * re-encode path). Any OTHER difference (a renamed, added, dropped,
+     * reordered or promoted column, a different field id or logical type)
+     * leaves the schemas incompatible and the file falls back to the full
+     * rewrite. The comparison is by the Parquet text form -- the contract
+     * parquet-java uses between two schemas, carrying ids and logical-type
+     * annotations -- with repetition normalised to OPTIONAL on both sides.
+     *
+     * <p>On a format v3 table the write schema carries two trailing row-lineage
+     * columns ({@code _row_id} and {@code _last_updated_sequence_number}). A
+     * copy-on-write DELETE must preserve each surviving row's {@code _row_id},
+     * and a source file written by an ordinary append does NOT materialise
+     * lineage -- it inherits it from the data file's {@code first_row_id} plus
+     * the row position. Copying or re-encoding such a file into a NEW data file
+     * would re-inherit lineage from the new file's {@code first_row_id} and new
+     * positions, changing the surviving rows' {@code _row_id} after deletions
+     * shift them. So a source that does not already materialise lineage is NOT
+     * copyable on v3 and falls back to the full rewrite, which writes each
+     * surviving row's original {@code _row_id} explicitly. This is enforced by
+     * the exact field-count-and-ids match below: the source must carry the same
+     * columns the write schema has, lineage included.
+     */
+    static boolean compatibleForCopy(MessageType writeSchema, MessageType fileSchema) {
+        if (writeSchema.equals(fileSchema)) {
+            return true;
+        }
+        return normalizeRepetition(writeSchema).equals(normalizeRepetition(fileSchema));
+    }
+
+    /**
+     * How many data columns the source file actually has: its own field count,
+     * which is the number of columns a re-encoded group writes. Equal to the
+     * write schema's field count whenever the file is copyable.
+     */
+    public int dataFieldCount() {
+        return fileSchema.getFieldCount();
+    }
+
+    /**
+     * {@code type} with every REQUIRED repetition rewritten to OPTIONAL,
+     * recursively.
+     */
+    private static org.apache.parquet.schema.Type normalizeRepetition(org.apache.parquet.schema.Type type) {
+        org.apache.parquet.schema.Type.Repetition rep = type.isRepetition(org.apache.parquet.schema.Type.Repetition.REPEATED) ? org.apache.parquet.schema.Type.Repetition.REPEATED : org.apache.parquet.schema.Type.Repetition.OPTIONAL;
+        if (type.isPrimitive()) {
+            org.apache.parquet.schema.PrimitiveType p = type.asPrimitiveType();
+            org.apache.parquet.schema.Types.PrimitiveBuilder<org.apache.parquet.schema.PrimitiveType> b = org.apache.parquet.schema.Types.primitive(p.getPrimitiveTypeName(), rep);
+            if (p.getPrimitiveTypeName() == org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.FIXED_LEN_BYTE_ARRAY) {
+                b.length(p.getTypeLength());
+            }
+            if (p.getLogicalTypeAnnotation() != null) {
+                b.as(p.getLogicalTypeAnnotation());
+            }
+            if (p.getId() != null) {
+                b.id(p.getId()
+                      .intValue());
+            }
+            return b.named(p.getName());
+        }
+        org.apache.parquet.schema.GroupType g = type.asGroupType();
+        java.util.List<org.apache.parquet.schema.Type> children = new ArrayList<>(g.getFieldCount());
+        for (org.apache.parquet.schema.Type f : g.getFields()) {
+            children.add(normalizeRepetition(f));
+        }
+        if (g instanceof MessageType) {
+            return new MessageType(g.getName(), children);
+        }
+        org.apache.parquet.schema.GroupType built = rep == org.apache.parquet.schema.Type.Repetition.REPEATED ? org.apache.parquet.schema.Types.repeatedGroup()
+                .as(g.getLogicalTypeAnnotation())
+                .addFields(children.toArray(new org.apache.parquet.schema.Type[0]))
+                .named(g.getName())
+                : org.apache.parquet.schema.Types.optionalGroup()
+                .as(g.getLogicalTypeAnnotation())
+                .addFields(children.toArray(new org.apache.parquet.schema.Type[0]))
+                .named(g.getName());
+        if (g.getId() != null) {
+            return built.withId(g.getId()
+                                 .intValue());
+        }
+        return built;
     }
 
     /** The group whose range contains {@code pos}, or -1 when out of range. */
