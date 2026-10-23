@@ -49,8 +49,12 @@ class CountBelowJoinSuite extends VectorQuerySuite {
       .write.mode("overwrite").parquet(newTempPath("cbj/address"))
     spark.read.parquet(newTempPath("cbj/sales")).createOrReplaceTempView("cbj_sales")
     spark.read.parquet(newTempPath("cbj/address")).createOrReplaceTempView("cbj_address")
-    // The same address table with statistics.
-    spark.read.parquet(newTempPath("cbj/address")).write.mode("overwrite").saveAsTable("cbj_address_stats")
+    // The same address table with statistics. Its size on disk is what the broadcast test weighs, so it is
+    // written by Spark's row writer (Parquet v1 pages, PLAIN for the unique key): the columnar writer's v2
+    // DELTA_BINARY_PACKED shrinks the sequential a_sk to almost nothing and the table under the threshold.
+    withConf(VectorConf.WriteColumnar -> "false") {
+      spark.read.parquet(newTempPath("cbj/address")).write.mode("overwrite").saveAsTable("cbj_address_stats")
+    }
     spark.sql("ANALYZE TABLE cbj_address_stats COMPUTE STATISTICS FOR ALL COLUMNS")
   }
 
