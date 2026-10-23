@@ -382,7 +382,7 @@ object VectorConf {
   def icebergWriterEnabled(conf: SQLConf): Boolean = bool(conf, IcebergWriterEnabled, default = false)
 
   /** Copy delete-free row groups in a copy-on-write DELETE (#901 M4a). Default `false` while it lands. */
-  def icebergCopyUnchangedEnabled(conf: SQLConf): Boolean = bool(conf, IcebergCopyUnchangedEnabled, default = false)
+  def icebergCopyUnchangedEnabled(conf: SQLConf): Boolean = bool(conf, IcebergCopyUnchangedEnabled, default = true)
   def aggDictionaryKeys(conf: SQLConf): Boolean = bool(conf, AggDictionaryKeys, default = true)
 
   /** Pass selection bitmaps between spark-vector operators instead of compacting each batch. */
