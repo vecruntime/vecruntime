@@ -28,7 +28,7 @@ Iceberg 1.12 · Spark 4.1 · format versions 1, 2 and 3
 | Partition transforms and partition-spec evolution | **✓** |
 | Time travel, branches and tags | **✓** |
 | v3 default values, variants | **✓** |
-| ORC / Avro files, encrypted files, `time` / `uuid` / `timestamp_ns` | **✗** |
+| ORC / Avro files, encrypted files, `time` / `timestamp_ns` | **✗** |
 
 On by default; turn it off with `spark.vecruntime.scan.nativeIceberg.enabled=false`.
 
@@ -44,7 +44,7 @@ On by default; turn it off with `spark.vecruntime.scan.nativeIceberg.enabled=fal
 | Distribution modes none / hash / range, without Spark's row exchange | **✓** |
 | Nested columns (struct, list, map) | **✓** |
 | Row lineage on v3 | **✓** |
-| Merge-on-read on tables with map columns | **◐** `DELETE` and `UPDATE` are columnar end to end; a `MERGE` still reads its input as rows |
+| Merge-on-read on tables with map columns | **✓** `DELETE`, `UPDATE` and `MERGE` are columnar end to end, including `map<_, struct>` and a map nested in a struct |
 | float / double inside a list or map | **✓** |
 | `fixed`, `uuid` columns | **✓** |
 | `variant` columns (not shredded) | **✓** |
