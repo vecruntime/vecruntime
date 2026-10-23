@@ -277,4 +277,55 @@ class IcebergReadSpecsScanSuite extends AnyFunSuite with BeforeAndAfterAll {
       }).toSet
     assert(rows == expected, s"nested defaults differ:\n${rows.diff(expected).take(5)}\n${expected.diff(rows).take(5)}")
   }
+
+  test("uuid, fixed and the v3 unknown type resolve and read natively (SparkParquetFileResolver accepts them)") {
+    import org.apache.iceberg.types.Types
+    import org.apache.iceberg.types.Types.NestedField.{optional, required}
+    val iceCatalog = spark.sessionState.catalogManager
+      .catalog("ice")
+      .asInstanceOf[org.apache.iceberg.spark.SparkCatalog]
+      .icebergCatalog()
+    val schema = new org.apache.iceberg.Schema(
+      required(1, "id", Types.LongType.get()),
+      optional(2, "u", Types.UUIDType.get()),
+      optional(3, "f", Types.FixedType.ofLength(4)),
+      optional(4, "unk", Types.UnknownType.get()),
+      optional(
+        5,
+        "st",
+        Types.StructType.of(
+          optional(6, "su", Types.UUIDType.get()),
+          optional(7, "sf", Types.FixedType.ofLength(2))
+        )
+      ),
+      optional(8, "lu", Types.ListType.ofOptional(9, Types.UUIDType.get())),
+      optional(10, "mf", Types.MapType.ofOptional(11, 12, Types.StringType.get(), Types.FixedType.ofLength(3)))
+    )
+    val tid = org.apache.iceberg.catalog.TableIdentifier.of("db", "rtypes")
+    iceCatalog.dropTable(tid, false)
+    iceCatalog.createTable(
+      tid,
+      schema,
+      org.apache.iceberg.PartitionSpec.unpartitioned(),
+      java.util.Map.of("format-version", "3")
+    )
+    spark.sql("REFRESH TABLE ice.db.rtypes")
+    spark.udf.register(
+      "uuid_of",
+      (n: Long) => new java.util.UUID(n * 0x9e3779b97f4a7c15L, ~n * 0xbf58476d1ce4e5b9L).toString
+    )
+    withConf("spark.vecruntime.enabled" -> "false")(spark.sql(
+      """INSERT INTO ice.db.rtypes SELECT id,
+        |  if(id % 7 = 0, null, uuid_of(id)),
+        |  if(id % 5 = 0, null, unhex(lpad(hex(id), 8, '0'))),
+        |  null,
+        |  if(id % 9 = 0, null, named_struct('su', uuid_of(id * 3), 'sf', unhex(lpad(hex(id % 65536), 4, '0')))),
+        |  if(id % 6 = 0, null, array(uuid_of(id), null)),
+        |  if(id % 8 = 0, null, map('k', unhex('aabbcc')))
+        |FROM range(0, 2000)""".stripMargin
+    ).collect())
+    check("SELECT id, u, hex(f), unk, st.su, hex(st.sf), lu, transform_values(mf, (k, v) -> hex(v)) FROM ice.db.rtypes")
+    check("SELECT count(*), count(u), count(f), count(unk), count(st.su), count(lu), count(mf) FROM ice.db.rtypes")
+    check("SELECT u, count(*) FROM ice.db.rtypes WHERE u IS NOT NULL GROUP BY u")
+  }
 }

@@ -15,6 +15,8 @@
  */
 package io.vecruntime.spark.iceberg
 
+import scala.jdk.CollectionConverters._
+
 import io.vecruntime.spark.{VectorConf, VectorPlugin}
 import io.vecruntime.spark.test.IcebergTest
 import org.apache.spark.sql.DataFrame
@@ -764,6 +766,306 @@ class IcebergNativeScanSuite extends IcebergMorSuiteBase {
       s"mixed-format rows differ: ${rows.diff(expected).take(5)} / ${expected.diff(rows).take(5)}"
     )
     assert(count("SELECT count(*) FROM t") === 2600)
+  }
+
+  /**
+   * #rtypes: the native scan reads uuid, fixed and the v3 unknown type -- types Spark DDL cannot declare -- at the
+   * top level and nested, matching Iceberg's reader. Tables are created through Iceberg's catalog API with Iceberg
+   * `Types` and populated with Spark SQL INSERT (the plugin off, so Iceberg's own row writer runs), the way the
+   * columnar write suite does.
+   */
+  private def iceCatalog: org.apache.iceberg.catalog.Catalog =
+    spark.sessionState.catalogManager
+      .catalog(IcebergTables.Catalog)
+      .asInstanceOf[org.apache.iceberg.spark.SparkCatalog]
+      .icebergCatalog()
+
+  private def createIcebergTable(
+      name: String,
+      schema: org.apache.iceberg.Schema,
+      props: Map[String, String] = Map.empty
+  ): Unit = {
+    val id = org.apache.iceberg.catalog.TableIdentifier.of("db", name)
+    iceCatalog.dropTable(id, false)
+    iceCatalog.createTable(id, schema, org.apache.iceberg.PartitionSpec.unpartitioned(), props.asJava)
+    spark.sql(s"REFRESH TABLE $Db.$name")
+  }
+
+  /** A deterministic canonical-text UUID from a seed; registered as the SQL function `uuid_of`. */
+  private def registerUuidOf(): Unit =
+    spark.udf.register(
+      "uuid_of",
+      (n: Long) => new java.util.UUID(n * 0x9e3779b97f4a7c15L, ~n * 0xbf58476d1ce4e5b9L).toString
+    )
+
+  /** Runs each query twice -- native scan vs plugin off -- asserting the rows match and VectorIcebergScan is used. */
+  private def checkRtypes(queries: Seq[String]): Unit = queries.foreach { q =>
+    val df = checkVectorized(q, Nil)
+    val (native, iceberg) = groups(df)
+    assert(native > 0 && iceberg == 0, s"native $native, Iceberg $iceberg: $q")
+  }
+
+  /**
+   * As [[checkRtypes]] but only asserts the rows match Spark and no task group fell to Iceberg's reader -- a
+   * selective predicate (a uuid `=`, a fixed `hex()`) may legitimately prune every file in Iceberg's planning, so
+   * the native group count is not required to be positive.
+   */
+  private def checkRtypesCorrect(queries: Seq[String]): Unit = queries.foreach { q =>
+    val df = checkVectorized(q, Nil)
+    assert(groups(df)._2 == 0, s"a task group went to Iceberg's reader: $q")
+  }
+
+  icebergTest("uuid and fixed columns are read natively, at the top level and nested, matching Iceberg's reader") {
+    import org.apache.iceberg.types.Types
+    import org.apache.iceberg.types.Types.NestedField.{optional, required}
+    registerUuidOf()
+    // fixed[1], fixed[16], fixed[33]; uuid; and both nested inside a struct, a list and a map value.
+    val schema = new org.apache.iceberg.Schema(
+      required(1, "id", Types.LongType.get()),
+      optional(2, "u", Types.UUIDType.get()),
+      optional(3, "f1", Types.FixedType.ofLength(1)),
+      optional(4, "f16", Types.FixedType.ofLength(16)),
+      optional(5, "f33", Types.FixedType.ofLength(33)),
+      optional(
+        6,
+        "st",
+        Types.StructType.of(
+          optional(7, "su", Types.UUIDType.get()),
+          optional(8, "sf", Types.FixedType.ofLength(4))
+        )
+      ),
+      optional(9, "lu", Types.ListType.ofOptional(10, Types.UUIDType.get())),
+      optional(11, "lf", Types.ListType.ofOptional(12, Types.FixedType.ofLength(3))),
+      optional(13, "mu", Types.MapType.ofOptional(14, 15, Types.StringType.get(), Types.UUIDType.get())),
+      optional(16, "mf", Types.MapType.ofOptional(17, 18, Types.StringType.get(), Types.FixedType.ofLength(2)))
+    )
+    createIcebergTable("t_rtypes", schema)
+    val src =
+      """SELECT id,
+        |  if(id % 7 = 0, null, if(id % 2 = 0, upper(uuid_of(id)), uuid_of(id))),
+        |  if(id % 9 = 0, null, unhex(lpad(hex(id % 256), 2, '0'))),
+        |  if(id % 5 = 0, null, unhex(lpad(hex(id), 32, '0'))),
+        |  if(id % 11 = 0, null, unhex(lpad(hex(id), 66, '0'))),
+        |  if(id % 13 = 0, null, named_struct(
+        |    'su', if(id % 3 = 0, null, uuid_of(id * 31)),
+        |    'sf', if(id % 4 = 0, null, unhex(lpad(hex(id % 65536), 8, '0'))))),
+        |  if(id % 6 = 0, null, array(uuid_of(id), null, uuid_of(id + 1))),
+        |  if(id % 8 = 0, null, array(unhex('00ff10'), null, unhex(lpad(hex(id % 4096), 6, '0')))),
+        |  if(id % 10 = 0, null, map('a', uuid_of(id * 7), 'z', '00000000-0000-0000-0000-000000000000')),
+        |  if(id % 12 = 0, null, map('k', unhex('beef'), 'n', null))
+        |FROM range(3000)""".stripMargin
+    withConf(VectorConf.Enabled -> "false")(spark.sql(s"INSERT INTO $Db.t_rtypes $src").collect())
+    useTable("t_rtypes")
+    checkRtypes(Seq(
+      "SELECT id, u, hex(f1), hex(f16), hex(f33), st.su, hex(st.sf), lu, transform(lf, x -> hex(x)) lfh, mu, " +
+        "transform_values(mf, (k, v) -> hex(v)) mfh FROM t WHERE id % 97 = 3",
+      "SELECT id, u, hex(f1), hex(f16), hex(f33) FROM t WHERE id > 100 AND id < 2000",
+      "SELECT id, u, hex(f16) FROM t WHERE u IS NULL OR f16 IS NULL",
+      "SELECT st.su, hex(st.sf), lu, transform(lf, x -> hex(x)), mu, transform_values(mf, (k, v) -> hex(v)) FROM t WHERE id % 31 = 2",
+      "SELECT id, lu[0], hex(lf[2]), mu['a'], hex(mf['k']) FROM t WHERE id > 2900",
+      "SELECT count(u), count(f16), count(st.su), count(mu) FROM t",
+      "SELECT u, count(*) FROM t WHERE u IS NOT NULL GROUP BY u"
+    ))
+    // A filter on a uuid column (= '…', the canonical lowercase text) and on a fixed column through hex(): rows
+    // match Spark and nothing falls to Iceberg's reader. A selective predicate may prune every file in planning,
+    // so the native group count is not required to be positive.
+    checkRtypesCorrect(Seq(
+      s"SELECT id, u FROM t WHERE u = '${new java.util.UUID(1L * 0x9e3779b97f4a7c15L, ~1L * 0xbf58476d1ce4e5b9L)}'",
+      "SELECT id, hex(f16) FROM t WHERE hex(f16) = lpad(hex(123), 32, '0')"
+    ))
+  }
+
+  icebergTest("uuid and fixed columns read natively under position deletes and deletion vectors") {
+    import org.apache.iceberg.types.Types
+    import org.apache.iceberg.types.Types.NestedField.{optional, required}
+    registerUuidOf()
+    Seq(2, 3).foreach { v =>
+      val name = s"t_rtypes_v$v"
+      val schema = new org.apache.iceberg.Schema(
+        required(1, "id", Types.LongType.get()),
+        optional(2, "u", Types.UUIDType.get()),
+        optional(3, "f", Types.FixedType.ofLength(4))
+      )
+      createIcebergTable(
+        name,
+        schema,
+        Map("format-version" -> v.toString, "write.delete.mode" -> "merge-on-read")
+      )
+      withConf(VectorConf.Enabled -> "false")(spark.sql(
+        s"""INSERT INTO $Db.$name SELECT id, if(id % 7 = 0, null, uuid_of(id)),
+           |  if(id % 5 = 0, null, unhex(lpad(hex(id), 8, '0'))) FROM range(3000)""".stripMargin
+      ).collect())
+      spark.sql(s"DELETE FROM $Db.$name WHERE id % 5 = 0")
+      useTable(name)
+      assert(count("SELECT count(*) FROM t") === (0 until 3000).count(_ % 5 != 0))
+      checkRtypes(Seq(
+        s"SELECT id, u, hex(f) FROM t WHERE id % 53 = 4",
+        s"SELECT count(u), count(f), count(*) FROM t"
+      ))
+      checkRtypesCorrect(Seq(s"SELECT id, u FROM t WHERE u = uuid_of(7)"))
+    }
+  }
+
+  icebergTest("equality deletes keyed on uuid, fixed, or a composite (uuid, int) key are probed on the native scan") {
+    import org.apache.iceberg.types.Types
+    import org.apache.iceberg.types.Types.NestedField.{optional, required}
+    registerUuidOf()
+    // Every table is a v2 merge-on-read table with an equality delete file (Iceberg Java API) keyed on a uuid, a
+    // fixed, or the composite (uuid, int). The native equality probe reads and matches the key -- a uuid as its
+    // canonical text, a fixed as its bytes, with a null key matching the null rows -- so the scan stays native and
+    // the rows match Iceberg's own reader (the plugin off) exactly, whatever Iceberg's own deletion verdict is.
+    def check(
+        name: String,
+        extraCols: Seq[(Int, String, org.apache.iceberg.types.Type)],
+        insert: String,
+        eqFields: Seq[String],
+        addDeletes: () => Unit,
+        projectKey: String
+    ): Unit = {
+      val fields = Seq(required(1, "id", Types.LongType.get())) ++
+        extraCols.map { case (fid, n, t) => optional(fid, n, t) } ++
+        Seq(optional(50, "s", Types.StringType.get()))
+      val schema = new org.apache.iceberg.Schema(fields: _*)
+      createIcebergTable(name, schema, Map("format-version" -> "2", "write.delete.mode" -> "merge-on-read"))
+      withConf(VectorConf.Enabled -> "false")(spark.sql(s"INSERT INTO $Db.$name $insert").collect())
+      addDeletes()
+      useTable(name)
+      // The native scan's rows equal Iceberg's own reader (plugin off), and no task group falls to Iceberg's
+      // reader -- the equality key is read and probed natively.
+      val q1 = s"SELECT id, $projectKey, s FROM t ORDER BY id"
+      val exp1 = withConf(VectorConf.Enabled -> "false")(spark.sql(q1).collect().map(_.toString).toSeq)
+      val df1 = spark.sql(q1)
+      assert(df1.collect().map(_.toString).toSeq == exp1, s"$name: rows differ from Iceberg's reader")
+      assert(scans(df1).nonEmpty, s"$name: expected the native scan:\n${finalPlan(df1).treeString}")
+      assert(groups(df1)._2 == 0, s"$name: a task group fell to Iceberg's reader, got ${groups(df1)}")
+      // The key not projected at all: it is read only for the deletes, then dropped. Still native, still correct.
+      val q2 = "SELECT s, count(*) FROM t GROUP BY s"
+      val exp2 = withConf(VectorConf.Enabled -> "false")(spark.sql(q2).collect().map(_.toString).sorted.toSeq)
+      val df2 = spark.sql(q2)
+      assert(df2.collect().map(_.toString).sorted.toSeq == exp2, s"$name: unprojected-key rows differ")
+      assert(groups(df2)._2 == 0, s"$name: unprojected key fell to Iceberg's reader, got ${groups(df2)}")
+      val expCount = withConf(VectorConf.Enabled -> "false")(count("SELECT count(*) FROM t"))
+      assert(count("SELECT count(*) FROM t") === expCount, s"$name: count differs from Iceberg's reader")
+    }
+
+    // uuid key, including a null key value that deletes the null-uuid rows (id % 7 = 0).
+    check(
+      "t_eq_uuid",
+      Seq((2, "k", Types.UUIDType.get())),
+      "SELECT id, if(id % 7 = 0, null, uuid_of(id)), concat('s', id % 7) FROM range(3000)",
+      Seq("k"),
+      () =>
+        addEqualityDeletes(
+          "t_eq_uuid",
+          Seq("k"),
+          ((0 until 3000 by 11).map(i =>
+            Seq(new java.util.UUID(i.toLong * 0x9e3779b97f4a7c15L, ~i.toLong * 0xbf58476d1ce4e5b9L))
+          ) :+ Seq[Any](null)) // a null key matches the null-uuid rows
+        ),
+      "k"
+    )
+    // fixed[4] key.
+    check(
+      "t_eq_fixed",
+      Seq((2, "k", Types.FixedType.ofLength(4))),
+      "SELECT id, if(id % 9 = 0, null, unhex(lpad(hex(id), 8, '0'))), concat('s', id % 7) FROM range(3000)",
+      Seq("k"),
+      () =>
+        addEqualityDeletes(
+          "t_eq_fixed",
+          Seq("k"),
+          (0 until 3000 by 11).map(i => Seq(f"$i%08X".sliding(2, 2).map(Integer.parseInt(_, 16).toByte).toArray))
+        ),
+      "hex(k)"
+    )
+    // composite (uuid, int) key: a row is deleted only when BOTH match.
+    check(
+      "t_eq_comp",
+      Seq((2, "u", Types.UUIDType.get()), (3, "n", Types.IntegerType.get())),
+      "SELECT id, uuid_of(id), CAST(id % 5 AS INT), concat('s', id % 7) FROM range(3000)",
+      Seq("u", "n"),
+      () =>
+        addEqualityDeletes(
+          "t_eq_comp",
+          Seq("u", "n"),
+          (0 until 3000 by 11).map(i =>
+            Seq(
+              new java.util.UUID(i.toLong * 0x9e3779b97f4a7c15L, ~i.toLong * 0xbf58476d1ce4e5b9L),
+              Integer.valueOf(i % 5)
+            )
+          )
+        ),
+      "u, n"
+    )
+  }
+
+  icebergTest("a v3 unknown column reads as nulls, at the top level and nested") {
+    import org.apache.iceberg.types.Types
+    import org.apache.iceberg.types.Types.NestedField.{optional, required}
+    // Iceberg 1.12 supports the v3 unknown type through the catalog API.
+    try {
+      val schema = new org.apache.iceberg.Schema(
+        required(1, "id", Types.LongType.get()),
+        optional(2, "unk", Types.UnknownType.get()),
+        optional(
+          3,
+          "st",
+          Types.StructType.of(
+            optional(4, "k", Types.IntegerType.get()),
+            optional(5, "su", Types.UnknownType.get())
+          )
+        )
+      )
+      createIcebergTable("t_unknown", schema, Map("format-version" -> "3"))
+      // An unknown column takes only null; Spark writes it as NullType.
+      withConf(VectorConf.Enabled -> "false")(spark.sql(
+        s"INSERT INTO $Db.t_unknown SELECT id, null, named_struct('k', CAST(id % 9 AS INT), 'su', null) FROM range(3000)"
+      ).collect())
+      useTable("t_unknown")
+      checkRtypes(Seq(
+        "SELECT id, unk, st FROM t WHERE id % 97 = 3",
+        "SELECT count(*), count(unk), count(st.su) FROM t",
+        "SELECT st.k, count(*) FROM t WHERE unk IS NULL GROUP BY st.k"
+      ))
+      assert(count("SELECT count(*) FROM t WHERE unk IS NULL") === 3000)
+    } catch {
+      case e: Exception
+          if Iterator.iterate[Throwable](e)(_.getCause).takeWhile(_ != null).exists(t =>
+            String.valueOf(t.getMessage).toLowerCase.contains("unknown")
+          ) =>
+        cancel(s"Iceberg 1.12 cannot create or write an unknown column: ${e.getMessage}")
+    }
+  }
+
+  /**
+   * Writes one Parquet equality delete file on `columns` (one or more key fields) with the Iceberg Java API: each
+   * row of `rows` is the key values in `columns` order (a uuid as java.util.UUID, a fixed as byte[], an int as
+   * Integer; null allowed). The delete gets a sequence number above every data file, so it applies to all of them.
+   */
+  private def addEqualityDeletes(name: String, columns: Seq[String], rows: Seq[Seq[Any]]): Unit = {
+    import org.apache.iceberg.{FileFormat, Table}
+    import org.apache.iceberg.data.{GenericFileWriterFactory, GenericRecord}
+    import org.apache.iceberg.io.OutputFileFactory
+    val t = s"$Db.$name"
+    val table: Table = org.apache.iceberg.spark.Spark3Util.loadIcebergTable(spark, t)
+    val schema = table.schema()
+    val ids = columns.map(c => schema.findField(c).fieldId())
+    val deleteSchema = schema.select(columns: _*)
+    val factory = new GenericFileWriterFactory.Builder(table)
+      .deleteFileFormat(FileFormat.PARQUET)
+      .equalityFieldIds(ids.toArray)
+      .equalityDeleteRowSchema(deleteSchema)
+      .build()
+    val outputFile = OutputFileFactory.builderFor(table, 1, 1).format(FileFormat.PARQUET).build().newOutputFile()
+    val writer = factory.newEqualityDeleteWriter(outputFile, table.spec(), null)
+    try rows.foreach { values =>
+        val record = GenericRecord.create(deleteSchema)
+        columns.zip(values).foreach { case (c, v) => record.setField(c, v) }
+        writer.write(record)
+      }
+    finally writer.close()
+    table.newRowDelta().addDeletes(writer.toDeleteFile()).commit()
+    spark.sql(s"REFRESH TABLE $t")
   }
 
   icebergTest("switched off, Spark's BatchScanExec stays") {

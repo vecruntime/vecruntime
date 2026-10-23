@@ -262,7 +262,9 @@ class IcebergReadSpecsSuite extends AnyFunSuite {
     Types.DecimalType.of(18, 2) -> "optional int64 c (DECIMAL(18, 2))",
     Types.DecimalType.of(18, 2) -> "optional int32 c (DECIMAL(9, 2))",
     Types.DecimalType.of(30, 2) -> "optional fixed_len_byte_array(13) c (DECIMAL(30, 2))",
-    Types.DecimalType.of(30, 2) -> "optional int64 c (DECIMAL(18, 2))"
+    Types.DecimalType.of(30, 2) -> "optional int64 c (DECIMAL(18, 2))",
+    Types.FixedType.ofLength(4) -> "optional fixed_len_byte_array(4) c",
+    Types.UUIDType.get() -> "optional fixed_len_byte_array(16) c (UUID)"
   )
 
   test("every leaf spec equals the Spark adapter's for the Spark type Iceberg maps the Iceberg type to") {
