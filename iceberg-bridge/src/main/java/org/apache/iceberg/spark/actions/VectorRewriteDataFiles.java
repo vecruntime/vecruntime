@@ -42,6 +42,10 @@ public final class VectorRewriteDataFiles {
 
     public static final String FLAG = "spark.vecruntime.iceberg.rewrite.binpackCopy.enabled";
 
+    // Logged at most once per JVM when the private-field hook is not present as expected, so a repeated
+    // rewrite does not spam the log while still correctly running Iceberg's stock bin-pack.
+    private static final java.util.concurrent.atomic.AtomicBoolean WARNED = new java.util.concurrent.atomic.AtomicBoolean(false);
+
     private VectorRewriteDataFiles() {}
 
     /**
@@ -69,14 +73,48 @@ public final class VectorRewriteDataFiles {
                     .equalsIgnoreCase("true");
     }
 
+    /**
+     * Installs the vecruntime runner on {@code action} by setting its private
+     * {@code runner} field, FAIL-CLOSED: if the field is absent, not a {@link
+     * org.apache.iceberg.actions.FileRewriteRunner}, or does not currently hold
+     * Iceberg's own bin-pack runner (so the Iceberg internals changed shape
+     * under us), nothing is replaced -- the action runs Iceberg's stock
+     * bin-pack unchanged -- and the reason is logged once per JVM. Correctness
+     * never depends on the swap succeeding; only the fast path does.
+     */
     private static void installRunner(SparkSession spark, Table table, RewriteDataFilesSparkAction action) {
         try {
             Field runner = RewriteDataFilesSparkAction.class.getDeclaredField("runner");
+            if (!org.apache.iceberg.actions.FileRewriteRunner.class.isAssignableFrom(runner.getType())) {
+                warnOnce("vecruntime: RewriteDataFilesSparkAction.runner is not a FileRewriteRunner (" + runner.getType().getName() + "); using the stock bin-pack", null);
+                return;
+            }
             runner.setAccessible(true);
+            Object current = runner.get(action);
+            // binPack() above must have set Iceberg's own bin-pack runner. If it is null or some other type,
+            // the action's shape is not what we expect -- do not overwrite it.
+            if (!(current instanceof SparkBinPackFileRewriteRunner)) {
+                warnOnce(
+                        "vecruntime: RewriteDataFilesSparkAction.runner after binPack() was "
+                                + (current == null ? "null" : current.getClass().getName())
+                                + ", not the stock bin-pack runner; using the stock bin-pack",
+                        null);
+                return;
+            }
             runner.set(action, new VectorBinPackFileRewriteRunner(spark, table));
         } catch (ReflectiveOperationException | RuntimeException e) {
             // Leave the stock bin-pack runner in place: the action is still correct, only slower.
-            org.slf4j.LoggerFactory.getLogger(VectorRewriteDataFiles.class).warn("vecruntime: could not install the bin-pack copy runner; using the stock bin-pack", e);
+            warnOnce("vecruntime: could not install the bin-pack copy runner; using the stock bin-pack", e);
+        }
+    }
+
+    private static void warnOnce(String message, Throwable cause) {
+        if (WARNED.compareAndSet(false, true)) {
+            if (cause == null) {
+                org.slf4j.LoggerFactory.getLogger(VectorRewriteDataFiles.class).warn(message);
+            } else {
+                org.slf4j.LoggerFactory.getLogger(VectorRewriteDataFiles.class).warn(message, cause);
+            }
         }
     }
 }

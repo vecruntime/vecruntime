@@ -23,7 +23,7 @@ import org.apache.iceberg.{MetricsConfig, Table}
 import org.apache.iceberg.hadoop.HadoopInputFile
 import org.apache.iceberg.parquet.ParquetUtil
 import org.apache.iceberg.spark.Spark3Util
-import org.apache.iceberg.spark.actions.VectorRewriteDataFiles
+import org.apache.iceberg.spark.actions.{VectorBinPackFileRewriteRunner, VectorRewriteDataFiles}
 import org.apache.spark.sql.SparkSession
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.funsuite.AnyFunSuite
@@ -213,21 +213,22 @@ class VectorBinPackRewriteSuite extends AnyFunSuite with BeforeAndAfterAll {
       mutate(t)
     }
 
-    BinPackCopyWriter.COPIED_ROW_GROUPS.reset()
-    BinPackCopyWriter.COPIED_OUTPUT_FILES.reset()
+    VectorBinPackFileRewriteRunner.COPIED_ROW_GROUPS.reset()
+    VectorBinPackFileRewriteRunner.COPIED_OUTPUT_FILES.reset()
     // OFF: vecruntime runner installed but copy flag off -> delegates each file to Iceberg's bin-pack.
     withConf(Flag -> "false", WriterFlag -> "true") {
       VectorRewriteDataFiles.binPackCopy(spark, table(off)).execute()
     }
-    val copiedOffSide = BinPackCopyWriter.COPIED_ROW_GROUPS.sum()
+    val copiedOffSide = VectorBinPackFileRewriteRunner.COPIED_ROW_GROUPS.sum()
     assert(copiedOffSide == 0L, s"$name: nothing may be copied with the flag off, got $copiedOffSide")
 
-    BinPackCopyWriter.COPIED_ROW_GROUPS.reset()
+    VectorBinPackFileRewriteRunner.COPIED_ROW_GROUPS.reset()
+    VectorBinPackFileRewriteRunner.TASKS.reset()
     // ON: byte copy where valid.
     withConf(Flag -> "true", WriterFlag -> "true") {
       VectorRewriteDataFiles.binPackCopy(spark, table(on)).execute()
     }
-    (BinPackCopyWriter.COPIED_ROW_GROUPS.sum(), on, off)
+    (VectorBinPackFileRewriteRunner.COPIED_ROW_GROUPS.sum(), on, off)
   }
 
   private def assertIndistinguishable(name: String, on: String, off: String): Unit = {
@@ -302,9 +303,9 @@ class VectorBinPackRewriteSuite extends AnyFunSuite with BeforeAndAfterAll {
       spark.sql(s"ALTER TABLE $t ADD COLUMN extra INT")
       spark.sql(s"INSERT INTO $t SELECT id, concat('w', id), cast(id as int) FROM range(6000, 12000)")
     }
-    BinPackCopyWriter.COPIED_ROW_GROUPS.reset()
+    VectorBinPackFileRewriteRunner.COPIED_ROW_GROUPS.reset()
     withConf(Flag -> "false", WriterFlag -> "true")(VectorRewriteDataFiles.binPackCopy(spark, table(off)).execute())
-    BinPackCopyWriter.COPIED_ROW_GROUPS.reset()
+    VectorBinPackFileRewriteRunner.COPIED_ROW_GROUPS.reset()
     withConf(Flag -> "true", WriterFlag -> "true")(VectorRewriteDataFiles.binPackCopy(spark, table(on)).execute())
     // The old files (no `extra`) are not copyable; the new files (with `extra`) match the write schema and are.
     def data(t: String): Map[Long, String] =
@@ -321,6 +322,51 @@ class VectorBinPackRewriteSuite extends AnyFunSuite with BeforeAndAfterAll {
       rewriteBoth("nancol_2u", version = 2, partitioned = false, rows = 7000, files = 5, nan = true)
     assertIndistinguishable("nan", on, off)
     assert(copied == 0L, s"NaN-tracking table must not copy, got $copied")
+  }
+
+  test("the copy runs distributed: a multi-bin group uses more than one Spark task") {
+    // A small target file size + several input files forces several output bins, so the copy must fan out to
+    // more than one Spark task. TASKS is incremented once per bin (= one task per bin) and COPIED_ROW_GROUPS
+    // is summed from a task-side accumulator, so both prove the copy actually ran in executor tasks, not on
+    // the driver.
+    val noNaN = ", 'write.metadata.metrics.column.d'='none', 'write.metadata.metrics.column.f'='none'"
+    val (copied, on, off) =
+      rewriteBoth("dist_2u", version = 2, partitioned = false, rows = 16000, files = 10, metricsProps = noNaN)
+    assertIndistinguishable("dist", on, off)
+    assert(copied > 0, s"dist: expected copied row groups > 0, got $copied")
+    val tasks = VectorBinPackFileRewriteRunner.TASKS.sum()
+    assert(tasks > 1L, s"dist: expected the copy to fan out to more than one task, got $tasks")
+    // Every output bin is one task and one output file.
+    assert(
+      VectorBinPackFileRewriteRunner.COPIED_OUTPUT_FILES.sum() == tasks,
+      s"dist: output files (${VectorBinPackFileRewriteRunner.COPIED_OUTPUT_FILES.sum()}) must equal tasks ($tasks)"
+    )
+  }
+
+  test("flag off runs Iceberg's stock bin-pack unchanged (no copy)") {
+    // The copy fast path is opt-out: with the flag off, binPackCopy must not install the vecruntime runner, so
+    // the rewrite is exactly Iceberg's stock bin-pack -- a correct compaction that copies no row groups. This
+    // is also the behaviour the reflective install falls back to if the private runner field ever changes
+    // shape (fail-closed), so a correct stock rewrite here is the safety net exercised end to end.
+    val off = "ice.db.flagoff"
+    spark.sql(s"DROP TABLE IF EXISTS $off")
+    spark.sql(
+      s"""CREATE TABLE $off ($Columns) USING iceberg
+         |TBLPROPERTIES ('format-version'='2', 'write.parquet.row-group-size-bytes'='16384',
+         |  'write.target-file-size-bytes'='131072')""".stripMargin
+    )
+    0.until(6).foreach { k => spark.sql(s"INSERT INTO $off ${source(k * 2000L, (k + 1) * 2000L, nan = false)}") }
+    val before = spark.sql(s"SELECT count(*) FROM $off").collect()(0).getLong(0)
+    val filesBefore = fileCount(off)
+
+    VectorBinPackFileRewriteRunner.COPIED_ROW_GROUPS.reset()
+    withConf(Flag -> "false", WriterFlag -> "true") {
+      assert(!VectorRewriteDataFiles.enabled(spark), "enabled() must be false when the flag is off")
+      VectorRewriteDataFiles.binPackCopy(spark, table(off)).execute()
+    }
+    assert(VectorBinPackFileRewriteRunner.COPIED_ROW_GROUPS.sum() == 0L, "flag off must copy nothing")
+    assert(spark.sql(s"SELECT count(*) FROM $off").collect()(0).getLong(0) == before, "row count changed")
+    assert(fileCount(off) < filesBefore, "stock bin-pack should still compact the small files")
   }
 
   // ----- benchmark --------------------------------------------------------------------------------
@@ -362,9 +408,9 @@ class VectorBinPackRewriteSuite extends AnyFunSuite with BeforeAndAfterAll {
 
       // Decode leg first (OFF), then copy leg (ON), each a cold rewrite of the same ~1 GB.
       val decodeMs = timeRewrite(off, copy = false)
-      BinPackCopyWriter.COPIED_ROW_GROUPS.reset()
+      VectorBinPackFileRewriteRunner.COPIED_ROW_GROUPS.reset()
       val copyMs = timeRewrite(on, copy = true)
-      val copied = BinPackCopyWriter.COPIED_ROW_GROUPS.sum()
+      val copied = VectorBinPackFileRewriteRunner.COPIED_ROW_GROUPS.sum()
       val inBytes = spark.sql(s"SELECT coalesce(sum(file_size_in_bytes),0) FROM $on.files WHERE content = 0")
         .collect()(0).getLong(0)
 

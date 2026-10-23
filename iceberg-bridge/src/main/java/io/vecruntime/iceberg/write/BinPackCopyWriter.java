@@ -17,139 +17,133 @@ package io.vecruntime.iceberg.write;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
-import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.atomic.LongAdder;
+import java.util.function.LongConsumer;
 
 import org.apache.hadoop.conf.Configuration;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.DataFiles;
 import org.apache.iceberg.FileFormat;
 import org.apache.iceberg.MetricsConfig;
+import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.StructLike;
 import org.apache.iceberg.encryption.EncryptedOutputFile;
+import org.apache.iceberg.io.FileIO;
+import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.io.OutputFileFactory;
 import org.apache.iceberg.mapping.NameMapping;
 import org.apache.iceberg.mapping.NameMappingParser;
 import org.apache.parquet.hadoop.ParquetFileReader;
 import org.apache.parquet.hadoop.metadata.BlockMetaData;
 import org.apache.parquet.hadoop.metadata.ParquetMetadata;
-import org.apache.parquet.hadoop.util.HadoopInputFile;
 import org.apache.parquet.io.SeekableInputStream;
 import org.apache.parquet.schema.MessageType;
 
 /**
- * Bin-packs the copyable source files of one {@code rewrite_data_files} file
- * group into target-sized output data files by copying their Parquet row groups
- * byte for byte (#957 M4c). All the files handed to one instance share the same
- * partition (the runner groups by partition first) and the same Parquet schema
- * (each was proven copyable against the table write schema by
- * {@link BinPackCopyPlanner}), so their compressed pages are all valid under one
- * output footer and can be concatenated with no decode or re-encode.
+ * Copies one pre-planned bin -- an ordered list of (source file, row-group
+ * ordinals) all sharing one partition -- into a SINGLE output data file by
+ * copying the Parquet row groups byte for byte (#957 M4c). One bin becomes one
+ * output file, so the driver decides the bin boundaries (each bin filled to the
+ * target size) and this writer runs on the EXECUTOR, one Spark task per bin, so
+ * the copy is distributed exactly like Iceberg's own runner rather than
+ * streamed through the driver.
  *
- * <p>Row groups are appended through {@link IcebergParquetAppender#copyRowGroup}
- * -- i.e. parquet-java's {@code ParquetFileWriter.appendRowGroup}, which keeps
- * each chunk's codec, statistics, column index, offset index, Bloom filter and
- * dictionary pages. When the current output file reaches {@code
- * targetFileSize}, it is closed into a {@link DataFile} (metrics, split offsets
- * and size come from {@link IcebergParquetAppender}, the same footer path
- * Iceberg's own writer uses) and a fresh one is opened. The output file's
- * schema is the table write schema; because every input matches it, a copied
- * group's statistics land under the same field ids Iceberg would use.
- *
- * <p>Files the planner declined are NOT handled here; the runner routes those
- * to the columnar decode/encode path and merges the two output sets.
+ * <p>Source files are opened through the table's {@link FileIO} ({@link
+ * IcebergParquetInterop#parquetInput}), not Hadoop, so the copy uses the
+ * table's configured IO wherever Spark places the task. Row groups are appended
+ * through {@link IcebergParquetAppender#copyRowGroup} -- parquet-java's {@code
+ * ParquetFileWriter.appendRowGroup}, which keeps each chunk's codec,
+ * statistics, column/offset index, Bloom filter and dictionary pages. All files
+ * in a bin share one Parquet schema (the planner proved each equals the table
+ * write schema), and the output uses the first source file's OWN schema so a
+ * copied chunk's pages and logical-type annotations are valid under the output
+ * footer. Metrics, split offsets and size come from {@link
+ * IcebergParquetAppender}, the same footer path Iceberg's own writer uses; the
+ * output keeps the bin's partition tuple (a partitioned table does not store
+ * partition columns in the file) and sortOrderId 0.
  */
 public final class BinPackCopyWriter implements AutoCloseable {
 
-    /**
-     * Row groups copied byte for byte across all bin-pack tasks (test/metric
-     * counter).
-     */
-    public static final LongAdder COPIED_ROW_GROUPS = new LongAdder();
-
-    /**
-     * Output files produced by copy across all bin-pack tasks (test/metric
-     * counter).
-     */
-    public static final LongAdder COPIED_OUTPUT_FILES = new LongAdder();
-
-    private final IcebergWriteSpec spec;
+    private final FileIO io;
+    private final PartitionSpec outputSpec;
     private final OutputFileFactory files;
     private final MetricsConfig metricsConfig;
     private final NameMapping nameMapping;
+    private final java.util.Map<String, String> properties;
     private final Configuration conf;
     private final Schema writeSchema;
-    private final long targetFileSize;
     private final StructLike partition;
-
-    private final List<DataFile> done = new ArrayList<>();
-    private final List<String> written = new ArrayList<>();
+    // Called once per copied row group, on the executor, so the task can tally into a Spark accumulator.
+    private final LongConsumer onCopiedGroup;
 
     private IcebergParquetAppender appender;
     private String openLocation;
+    private DataFile result;
     private boolean closed;
 
     /**
-     * @param spec the write spec (table, write schema, properties)
-     * @param files the output-file factory for this task (already defaulted to
-     *     the output spec)
-     * @param targetFileSize the byte size at which an output file is rolled
-     * @param partition the shared partition tuple of this writer's files (the
-     *     source files' own {@code DataFile.partition()}), or null for an
-     *     unpartitioned spec. A partitioned table does NOT store the partition
-     *     columns in the data file; the value is carried in the manifest, so a
-     *     copied file MUST keep its source file's partition tuple or the reader
-     *     reconstructs the partition columns as null.
-     * @param conf the Hadoop configuration the readers and codecs use
+     * @param table the (serializable) table -- its {@code FileIO} opens source
+     *     and output files, its properties drive {@code write.parquet.*}, and
+     *     its {@code MetricsConfig} keys the output metrics
+     * @param outputSpec the spec the rewrite writes under
+     * @param writeSchema the table's Iceberg write schema
+     * @param files the output-file factory for this task
+     * @param partition the bin's partition tuple (all its files share it), or
+     *     null for an unpartitioned spec
+     * @param conf the Hadoop configuration the page codecs are created with
+     * @param onCopiedGroup called once per copied row group (executor-side
+     *     counter), or null
      */
-    public BinPackCopyWriter(IcebergWriteSpec spec, OutputFileFactory files, long targetFileSize,
-            StructLike partition, Configuration conf) {
-        this.spec = spec;
+    public BinPackCopyWriter(
+            org.apache.iceberg.Table table,
+            PartitionSpec outputSpec,
+            Schema writeSchema,
+            OutputFileFactory files,
+            StructLike partition,
+            Configuration conf,
+            LongConsumer onCopiedGroup) {
+        this.io = table.io();
+        this.outputSpec = outputSpec;
+        this.writeSchema = writeSchema;
+        this.properties = table.properties();
         this.files = files;
-        this.metricsConfig = MetricsConfig.forTable(spec.table());
-        String mapping = spec.table()
-                             .properties()
-                             .get(org.apache.iceberg.TableProperties.DEFAULT_NAME_MAPPING);
+        this.metricsConfig = MetricsConfig.forTable(table);
+        String mapping = properties.get(org.apache.iceberg.TableProperties.DEFAULT_NAME_MAPPING);
         this.nameMapping = mapping == null ? null : NameMappingParser.fromJson(mapping);
         this.conf = conf;
-        this.writeSchema = spec.writeSchema();
-        this.targetFileSize = targetFileSize;
         this.partition = partition;
+        this.onCopiedGroup = onCopiedGroup;
     }
 
     /**
-     * Copies every row group of one source file into the open output, rolling a
-     * new output file whenever the open one reaches the target size. The file's
-     * footer is passed in so the caller (which already read it to plan) does not
-     * read it twice. The output file uses the SOURCE file's OWN Parquet schema
-     * (read from the footer), which the planner proved equals the table write
-     * schema's physical form -- using the source schema verbatim guarantees a
-     * copied chunk's pages, logical-type annotations and column order are valid
-     * under the output footer (a mismatch in a timestamp unit or decimal scale
-     * annotation would silently reinterpret the copied bytes).
-     *
-     * <p>All copyable files handed to one writer share one schema (same
-     * partition group, each equal to the write schema), so the first file's
-     * schema is the output schema for every one; a later file whose schema
-     * somehow differs would fail parquet-java's {@code appendRowGroup} identity
-     * check, which the runner catches and falls back from.
+     * Copies the given row groups of one source file into the open output. The
+     * row groups are named by ordinal (their position in the source footer), so
+     * the driver's bin plan controls exactly which groups go where; an empty or
+     * null {@code ordinals} copies every group.
      */
-    public void copyFile(String location, ParquetMetadata footer) {
-        MessageType sourceSchema = footer.getFileMetaData().getSchema();
-        org.apache.hadoop.fs.Path path = new org.apache.hadoop.fs.Path(location);
-        try {
-            HadoopInputFile in = HadoopInputFile.fromPath(path, conf);
-            try (SeekableInputStream stream = in.newStream()) {
-                for (BlockMetaData block : footer.getBlocks()) {
-                    ensureOpen(sourceSchema);
-                    appender.copyRowGroup(stream, block);
-                    COPIED_ROW_GROUPS.increment();
-                    // Roll after a group if the file has reached the target size (whole groups only -- a row
-                    // group is the copy unit, so an output file lands at or just over the target).
-                    if (appender.length() >= targetFileSize) {
-                        rollOutput();
+    public void copyGroups(String location, int[] ordinals) {
+        InputFile in = io.newInputFile(location);
+        org.apache.parquet.io.InputFile parquetIn = IcebergParquetInterop.parquetInput(in);
+        try (ParquetFileReader reader = ParquetFileReader.open(parquetIn)) {
+            ParquetMetadata footer = reader.getFooter();
+            MessageType sourceSchema = footer.getFileMetaData().getSchema();
+            List<BlockMetaData> blocks = footer.getBlocks();
+            ensureOpen(sourceSchema);
+            try (SeekableInputStream stream = parquetIn.newStream()) {
+                if (ordinals == null || ordinals.length == 0) {
+                    for (BlockMetaData block : blocks) {
+                        appender.copyRowGroup(stream, block);
+                        if (onCopiedGroup != null) {
+                            onCopiedGroup.accept(1L);
+                        }
+                    }
+                } else {
+                    for (int ordinal : ordinals) {
+                        appender.copyRowGroup(stream, blocks.get(ordinal));
+                        if (onCopiedGroup != null) {
+                            onCopiedGroup.accept(1L);
+                        }
                     }
                 }
             }
@@ -158,24 +152,33 @@ public final class BinPackCopyWriter implements AutoCloseable {
         }
     }
 
-    private void ensureOpen(MessageType outputSchema) {
+    private void ensureOpen(MessageType sourceSchema) {
         if (appender != null) {
             return;
         }
-        EncryptedOutputFile out = partition == null ? files.newOutputFile() : files.newOutputFile(spec.spec(), partition);
+        EncryptedOutputFile out = partition == null ? files.newOutputFile() : files.newOutputFile(outputSpec, partition);
         openLocation = out.encryptingOutputFile().location();
-        written.add(openLocation);
         try {
-            // The copy path writes under the SOURCE file's physical schema (== table write schema's physical
-            // form), so a copied group's pages and statistics are valid under this footer.
-            appender = IcebergParquetAppender.create(out.encryptingOutputFile(), writeSchema, outputSchema, spec.properties(),
-                    metricsConfig, nameMapping, conf);
+            // Output under the SOURCE file's own schema so a copied group's pages/annotations are valid.
+            appender = IcebergParquetAppender.create(out.encryptingOutputFile(), writeSchema, sourceSchema, properties, metricsConfig,
+                    nameMapping, conf);
         } catch (IOException ioe) {
             throw new UncheckedIOException(ioe);
         }
     }
 
-    private void rollOutput() {
+    /** Finishes the single output file of this bin and returns its DataFile. */
+    public DataFile finish() {
+        close();
+        return result;
+    }
+
+    @Override
+    public void close() {
+        if (closed) {
+            return;
+        }
+        closed = true;
         if (appender == null) {
             return;
         }
@@ -184,7 +187,7 @@ public final class BinPackCopyWriter implements AutoCloseable {
         } catch (IOException ioe) {
             throw new UncheckedIOException(ioe);
         }
-        DataFiles.Builder b = DataFiles.builder(spec.spec())
+        DataFiles.Builder b = DataFiles.builder(outputSpec)
                 .withPath(openLocation)
                 .withFormat(FileFormat.PARQUET)
                 .withFileSizeInBytes(appender.length())
@@ -195,28 +198,10 @@ public final class BinPackCopyWriter implements AutoCloseable {
         if (partition != null) {
             b.withPartition(partition);
         }
-        done.add(b.build());
-        COPIED_OUTPUT_FILES.increment();
-        appender = null;
-        openLocation = null;
+        result = b.build();
     }
 
-    /** Finishes any open output and returns the copied data files. */
-    public List<DataFile> dataFiles() {
-        close();
-        return done;
-    }
-
-    @Override
-    public void close() {
-        if (closed) {
-            return;
-        }
-        closed = true;
-        rollOutput();
-    }
-
-    /** Abandons the task, deleting whatever output files it wrote. */
+    /** Abandons the output, deleting it if written. */
     public void abort(Throwable cause) {
         closed = true;
         if (appender != null) {
@@ -227,40 +212,25 @@ public final class BinPackCopyWriter implements AutoCloseable {
             }
             appender = null;
         }
-        for (String path : written) {
+        if (openLocation != null) {
             try {
-                spec.table()
-                    .io()
-                    .deleteFile(path);
+                io.deleteFile(openLocation);
             } catch (RuntimeException e) {
                 cause.addSuppressed(e);
             }
         }
-        done.clear();
     }
 
     /**
-     * Reads a source file's Parquet footer (shared helper for the runner's
-     * planning).
+     * Reads a source file's Parquet footer through the table's FileIO
+     * (driver-side planning helper).
      */
-    public static ParquetMetadata readFooter(String location, Configuration conf) {
-        org.apache.hadoop.fs.Path path = new org.apache.hadoop.fs.Path(location);
-        try {
-            HadoopInputFile in = HadoopInputFile.fromPath(path, conf);
-            try (ParquetFileReader reader = ParquetFileReader.open(in)) {
-                return reader.getFooter();
-            }
+    public static ParquetMetadata readFooter(FileIO io, String location) {
+        try (ParquetFileReader reader = ParquetFileReader.open(IcebergParquetInterop.parquetInput(io.newInputFile(location)))) {
+            return reader.getFooter();
         } catch (IOException ioe) {
             throw new UncheckedIOException(ioe);
         }
-    }
-
-    /**
-     * The partition of a source file, computed from its scan-task partition
-     * struct.
-     */
-    public static StructLike taskPartition(org.apache.iceberg.FileScanTask task) {
-        return task.file().partition();
     }
 
     /**

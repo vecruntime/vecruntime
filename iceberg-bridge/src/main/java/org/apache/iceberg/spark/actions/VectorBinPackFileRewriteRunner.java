@@ -21,10 +21,11 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.LongAdder;
 
+import io.vecruntime.iceberg.write.BinPackCopyBin;
 import io.vecruntime.iceberg.write.BinPackCopyPlanner;
 import io.vecruntime.iceberg.write.BinPackCopyWriter;
-import io.vecruntime.iceberg.write.IcebergWriteSpec;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.FileScanTask;
@@ -34,7 +35,6 @@ import org.apache.iceberg.Schema;
 import org.apache.iceberg.StructLike;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.actions.RewriteFileGroup;
-import org.apache.iceberg.io.OutputFileFactory;
 import org.apache.parquet.hadoop.metadata.ParquetMetadata;
 import org.apache.parquet.schema.MessageType;
 import org.apache.spark.sql.SparkSession;
@@ -84,6 +84,24 @@ import org.slf4j.LoggerFactory;
 public class VectorBinPackFileRewriteRunner extends SparkBinPackFileRewriteRunner {
 
     private static final Logger LOG = LoggerFactory.getLogger(VectorBinPackFileRewriteRunner.class);
+
+    /**
+     * Row groups copied byte for byte across all bin-pack copies (test/metric
+     * counter).
+     */
+    public static final LongAdder COPIED_ROW_GROUPS = new LongAdder();
+
+    /**
+     * Output files produced by copy across all bin-pack copies (test/metric
+     * counter).
+     */
+    public static final LongAdder COPIED_OUTPUT_FILES = new LongAdder();
+
+    /**
+     * Spark tasks launched for the distributed copy across all bin-pack copies
+     * (test/metric counter).
+     */
+    public static final LongAdder TASKS = new LongAdder();
 
     private final SparkSession spark;
     private final Table table;
@@ -144,7 +162,7 @@ public class VectorBinPackFileRewriteRunner extends SparkBinPackFileRewriteRunne
             }
             ParquetMetadata footer;
             try {
-                footer = BinPackCopyWriter.readFooter(location, conf);
+                footer = BinPackCopyWriter.readFooter(table.io(), location);
             } catch (RuntimeException e) {
                 LOG.debug("vecruntime bin-pack: cannot read footer of {}, decoding it", location, e);
                 decodeTasks.add(task);
@@ -180,17 +198,7 @@ public class VectorBinPackFileRewriteRunner extends SparkBinPackFileRewriteRunne
 
     private Set<DataFile> copyBinPack(RewriteFileGroup group, PartitionSpec outputSpec, Schema writeSchema,
             List<FileScanTask> copyTasks, Map<FileScanTask, ParquetMetadata> footers, Configuration conf) {
-        IcebergWriteSpec writeSpec = new IcebergWriteSpec(table, writeSchema, outputSpec.specId(), group.maxOutputFileSize(),
-                table.properties(), "vecruntime-binpack-" + group.info().globalIndex(), false);
-
-        // One output-file factory for the whole copy of this group; a partition id and a task id just name the
-        // files uniquely.
-        OutputFileFactory files = OutputFileFactory.builderFor(table, group.info().partitionIndex(),
-                        group.info().globalIndex())
-                .format(org.apache.iceberg.FileFormat.PARQUET)
-                .operationId(writeSpec.operationId())
-                .defaultSpec(outputSpec)
-                .build();
+        long target = group.maxOutputFileSize();
 
         // Group copyable files by partition; files in different partitions must not share an output file.
         Map<PartKey, List<FileScanTask>> byPartition = new LinkedHashMap<>();
@@ -199,29 +207,84 @@ public class VectorBinPackFileRewriteRunner extends SparkBinPackFileRewriteRunne
             byPartition.computeIfAbsent(new PartKey(part), k -> new ArrayList<>()).add(task);
         }
 
-        Set<DataFile> out = new LinkedHashSet<>();
-        List<BinPackCopyWriter> openWriters = new ArrayList<>();
-        try {
-            for (Map.Entry<PartKey, List<FileScanTask>> e : byPartition.entrySet()) {
-                // The source files' own partition tuple (already computed in the manifest). A partitioned
-                // table does not store the partition columns in the file, so the copied file must carry this
-                // tuple or the reader reconstructs those columns as null.
-                StructLike partition = outputSpec.isUnpartitioned() ? null : e.getKey().struct;
-                BinPackCopyWriter writer = new BinPackCopyWriter(writeSpec, files, group.maxOutputFileSize(), partition, conf);
-                openWriters.add(writer);
-                for (FileScanTask task : e.getValue()) {
-                    writer.copyFile(task.file().location(),
-                            footers.get(task));
+        // Plan bins at ROW-GROUP granularity: within one partition, fill a bin to the target size with whole
+        // row groups (the copy unit), so a large file is split across bins and every output lands near target.
+        List<BinPackCopyBin> bins = new ArrayList<>();
+        for (Map.Entry<PartKey, List<FileScanTask>> e : byPartition.entrySet()) {
+            StructLike partition = outputSpec.isUnpartitioned() ? null : copyPartition(outputSpec, e.getKey().struct);
+            List<BinPackCopyBin.Entry> binEntries = new ArrayList<>();
+            List<Integer> currentOrdinals = new ArrayList<>();
+            String currentFile = null;
+            long currentBytes = 0;
+            for (FileScanTask task : e.getValue()) {
+                String location = task.file().location();
+                List<org.apache.parquet.hadoop.metadata.BlockMetaData> blocks = footers.get(task).getBlocks();
+                for (int g = 0; g < blocks.size(); g++) {
+                    if (currentFile != null && !currentFile.equals(location)) {
+                        binEntries.add(new BinPackCopyBin.Entry(currentFile, toIntArray(currentOrdinals)));
+                        currentOrdinals = new ArrayList<>();
+                    }
+                    currentFile = location;
+                    currentOrdinals.add(g);
+                    currentBytes += blocks.get(g).getCompressedSize();
+                    if (currentBytes >= target) {
+                        binEntries.add(new BinPackCopyBin.Entry(currentFile, toIntArray(currentOrdinals)));
+                        bins.add(new BinPackCopyBin(binEntries, partition));
+                        binEntries = new ArrayList<>();
+                        currentOrdinals = new ArrayList<>();
+                        currentFile = null;
+                        currentBytes = 0;
+                    }
                 }
-                out.addAll(writer.dataFiles());
+                // Flush the open file entry at a file boundary so a bin's entries each name one file.
+                if (currentFile != null && !currentOrdinals.isEmpty()) {
+                    binEntries.add(new BinPackCopyBin.Entry(currentFile, toIntArray(currentOrdinals)));
+                    currentOrdinals = new ArrayList<>();
+                    currentFile = null;
+                }
             }
-            return out;
-        } catch (RuntimeException | Error ex) {
-            for (BinPackCopyWriter w : openWriters) {
-                w.abort(ex);
+            if (!binEntries.isEmpty()) {
+                bins.add(new BinPackCopyBin(binEntries, partition));
             }
-            throw ex;
         }
+
+        if (bins.isEmpty()) {
+            return new LinkedHashSet<>();
+        }
+
+        // Distribute: one Spark task per bin. A serializable table copy carries the FileIO to the executors;
+        // a task-side accumulator counts copied row groups so a test can prove the copy ran in tasks.
+        Table serializableTable = org.apache.iceberg.SerializableTable.copyOf(table);
+        org.apache.spark.api.java.JavaSparkContext jsc = org.apache.spark.api.java.JavaSparkContext.fromSparkContext(spark.sparkContext());
+        org.apache.spark.util.LongAccumulator copiedGroups = jsc.sc().longAccumulator("vecruntime-binpack-copied-groups");
+        long taskIdBase = (long) group.info().globalIndex() << 20;
+        List<DataFile> copied = BinPackCopyExec.run(jsc, serializableTable, outputSpec.specId(), writeSchema, conf,
+                bins, taskIdBase, copiedGroups);
+        COPIED_ROW_GROUPS.add(copiedGroups.value());
+        COPIED_OUTPUT_FILES.add(bins.size());
+        TASKS.add(bins.size());
+        return new LinkedHashSet<>(copied);
+    }
+
+    private static int[] toIntArray(List<Integer> xs) {
+        int[] a = new int[xs.size()];
+        for (int i = 0; i < a.length; i++) {
+            a[i] = xs.get(i);
+        }
+        return a;
+    }
+
+    /**
+     * A serializable copy of a source file's partition tuple into {@code
+     * outputSpec}'s partition type (Iceberg {@code PartitionData}), so the bin
+     * ships to the executor and the output file keeps the source partition.
+     */
+    private static StructLike copyPartition(PartitionSpec outputSpec, StructLike source) {
+        org.apache.iceberg.PartitionData data = new org.apache.iceberg.PartitionData(outputSpec.partitionType());
+        for (int i = 0; i < data.size(); i++) {
+            data.set(i, source.get(i, Object.class));
+        }
+        return data;
     }
 
     /**
