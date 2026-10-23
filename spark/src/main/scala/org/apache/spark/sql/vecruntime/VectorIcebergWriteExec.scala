@@ -103,6 +103,12 @@ case class VectorIcebergWriteStrategy(session: SparkSession) extends SparkStrate
                   case _ => None
                 }
               } else None
+
+            // #901 M4b: MERGE is NOT eligible for the copy path. Its copy-on-write rewrite is a MergeRows
+            // whose target scan Iceberg builds to project only `_file`, never `_pos`, and `_pos` cannot be
+            // threaded in from a Spark extension (the relation exposes no `_pos` metadata column at resolution
+            // and the scan is Iceberg's to build). Without a per-row source position the copy path cannot map
+            // rows to groups, so a MERGE takes the full rewrite. DELETE and UPDATE are the eligible operations.
             take(plan, r.table, r.query, r.write, Some(ordinals.map(_.get)), r.originalTable, copy)
           }
         case _ => take(plan, r.table, r.query, r.write, None, r.originalTable)
