@@ -227,7 +227,7 @@ case class VectorIcebergScanExec(
     )
     val rdd = new VectorIcebergRDD(
       session.sparkContext,
-      VectorIcebergRDD.packed(scan, sqlConf, session.leafNodeDefaultParallelism),
+      VectorIcebergRDD.packed(scan, sqlConf),
       scan.readerFactory,
       fieldIds.toArray,
       confBroadcast,
@@ -715,25 +715,36 @@ private[vecruntime] object VectorIcebergRDD {
   }
 
   /**
-   * The wrapped scan's partitions packed as Spark packs a file scan's splits (`FilePartition.maxSplitBytes` and
-   * `getFilePartitions`), see [[io.vecruntime.spark.VectorConf.ScanNativeIcebergPackSplits]]: each input partition
-   * weighs its task group's bytes plus `spark.sql.files.openCostInBytes` per file, the largest first, next-fit into
-   * tasks of at most `min(maxPartitionBytes, max(openCost, total / minPartitionNum))`. The scan's own partitions
-   * when it reports a partitioning, when packing is off or merges nothing, or when a group's size is unknown.
+   * The wrapped scan's partitions coalesced only within Iceberg's own split boundary: Iceberg already grouped the
+   * task files honouring `read.split.target-size`, `read.split.open-file-cost` and `read.split.planning-lookback`
+   * (see [[io.vecruntime.spark.VectorConf.ScanNativeIcebergPackSplits]]), so we may merge adjacent groups ONLY up
+   * to Iceberg's own target split size, weighing each group by Iceberg's own open-file-cost per file. This still
+   * coalesces genuinely tiny groups (Iceberg's lookback can leave several small groups), but it never merges groups
+   * Iceberg deliberately kept apart -- e.g. a table with a huge `read.split.open-file-cost` (one file per group, as
+   * the Iceberg copy-on-write skew tests set it) keeps one partition per group, so the write produces one file per
+   * group as Spark's own path does. The scan's own partitions when it reports a partitioning, when packing is off
+   * or merges nothing, or when a group's size is unknown.
    */
-  def packed(scan: BatchScanExec, conf: SQLConf, leafParallelism: Int): Array[Partition] = {
+  def packed(scan: BatchScanExec, conf: SQLConf): Array[Partition] = {
     val parts = scan.inputRDD.partitions
     if (
       parts.length < 2 || !io.vecruntime.spark.VectorConf.scanNativeIcebergPackSplits(conf) ||
       !scan.outputPartitioning.isInstanceOf[org.apache.spark.sql.catalyst.plans.physical.UnknownPartitioning]
     ) return parts
-    val openCost = conf.filesOpenCostInBytes
+    // Iceberg's OWN split settings (table properties, with Iceberg's defaults), not Spark's file-scan knobs: using
+    // Spark's spark.sql.files.openCostInBytes / maxPartitionBytes / minPartitionNum re-packs the groups to the
+    // cluster's parallelism and merges groups Iceberg kept separate (a read.split.open-file-cost it set high), which
+    // collapses the output-file count of a row-level write below what Iceberg planned.
+    val openCost = IcebergTasks.splitOpenFileCost(scan)
+    val targetSize = IcebergTasks.splitSize(scan)
     val inputs = parts.map(p => shims.SparkShims.dataSourceInputPartitions(p))
     val sizes = inputs.map(_.map(IcebergTasks.groupBytes(_, openCost)))
     if (sizes.exists(_.exists(_ < 0))) return parts
     val weights = sizes.map(_.sum)
-    val minPartitions = conf.filesMinPartitionNum.getOrElse(leafParallelism).max(1)
-    val maxSplit = math.min(conf.filesMaxPartitionBytes, math.max(openCost, weights.sum / minPartitions))
+    // Never beyond Iceberg's own target split size: a merge up to targetSize keeps the file-size contract Iceberg's
+    // grouping already enforced, so no group Iceberg kept separate (because merging would exceed its target) is
+    // merged here either. We do NOT widen the split to weights.sum / parallelism the way a Spark file scan does.
+    val maxSplit = math.max(openCost, targetSize)
     val out = Array.newBuilder[Partition]
     var current = Seq.newBuilder[InputPartition]
     var currentSize = 0L
@@ -1247,6 +1258,31 @@ private[vecruntime] object IcebergTasks {
       val files = call(group, "filesCount").asInstanceOf[java.lang.Integer].intValue()
       bytes + files.toLong * openCost
     }
+
+  /** A long table property of the scanned table, or `default` when unset or unparsable. */
+  private def tableLongProperty(scan: BatchScanExec, key: String, default: Long): Long = {
+    val props = call(call(scan.scan, "table"), "properties").asInstanceOf[java.util.Map[String, String]]
+    Option(props.get(key)).flatMap(v => scala.util.Try(v.trim.toLong).toOption).getOrElse(default)
+  }
+
+  /**
+   * Iceberg's own split target size for the scanned table (`read.split.target-size`, default 128 MB), the size
+   * Iceberg groups task files up to. Our packing never merges task groups beyond this, so it respects the same
+   * file-size contract Iceberg's own grouping did. (A split size set as a scan READ OPTION overrides the table
+   * property in Iceberg; for the row-level writes and the skew tests the value comes from the table property, which
+   * this reads, matching `SparkReadConf.splitSize`'s fallback.)
+   */
+  def splitSize(scan: BatchScanExec): Long =
+    tableLongProperty(scan, "read.split.target-size", 128L * 1024 * 1024)
+
+  /**
+   * Iceberg's own per-file open cost for the scanned table (`read.split.open-file-cost`, default 4 MB), the weight
+   * Iceberg adds per file when grouping. A table that sets this very high (the Iceberg copy-on-write skew tests set
+   * it to Int.MAX so every file is its own group) makes each group weigh more than the split size, so our packing
+   * keeps one partition per group, as Iceberg planned.
+   */
+  def splitOpenFileCost(scan: BatchScanExec): Long =
+    tableLongProperty(scan, "read.split.open-file-cost", 4L * 1024 * 1024)
 
   /** Iceberg's own `BaseDeleteLoader`, opening delete files through the partition's `FileIO`, and its class. */
   private def deleteLoader(p: InputPartition): (Class[_], AnyRef) = {
