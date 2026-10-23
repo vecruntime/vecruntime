@@ -112,6 +112,40 @@ final class IcebergParquetInterop {
         };
     }
 
+    /**
+     * An Iceberg {@code InputFile} as the {@code InputFile} parquet-java reads
+     * from (#957 M4c). The distributed bin-pack copy opens each source file on
+     * the executor through the table's {@code FileIO}, not Hadoop, so the copy
+     * runs wherever Spark places the task and uses the table's configured IO.
+     */
+    static org.apache.parquet.io.InputFile parquetInput(org.apache.iceberg.io.InputFile file) {
+        return new org.apache.parquet.io.InputFile() {
+            @Override
+            public long getLength() throws IOException {
+                return file.getLength();
+            }
+
+            @Override
+            public org.apache.parquet.io.SeekableInputStream newStream() throws IOException {
+                return wrapIn(file.newStream());
+            }
+        };
+    }
+
+    private static org.apache.parquet.io.SeekableInputStream wrapIn(org.apache.iceberg.io.SeekableInputStream in) {
+        return new org.apache.parquet.io.DelegatingSeekableInputStream(in) {
+            @Override
+            public long getPos() throws IOException {
+                return in.getPos();
+            }
+
+            @Override
+            public void seek(long newPos) throws IOException {
+                in.seek(newPos);
+            }
+        };
+    }
+
     private static org.apache.parquet.io.PositionOutputStream wrap(org.apache.iceberg.io.PositionOutputStream out) {
         return new org.apache.parquet.io.PositionOutputStream() {
             @Override
