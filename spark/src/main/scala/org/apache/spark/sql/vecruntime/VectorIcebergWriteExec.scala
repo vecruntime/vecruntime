@@ -305,27 +305,56 @@ object VectorIcebergWriteExec extends Logging {
   /**
    * The child's batches -- from below the row transition Spark (or adaptive execution) put above it -- and
    * whether they had to be built from rows.
+   *
+   * A command declares a row child, so Spark puts a `ColumnarToRow` above the child's final plan and adaptive
+   * execution wraps the whole thing in query-stage nodes. When the stage below that transition is actually
+   * columnar -- our shuffle read, our Expand/Filter/MergeRows chain -- reading it row by row and converting
+   * back with `RowToColumnarExec` is a pointless columnar->row->columnar round trip that drops the whole
+   * merge-on-read MERGE/UPDATE write to rows (the `_spec_id`/`_partition`/`_file` clustering Iceberg requires
+   * is satisfied by our columnar exchange, but the write never read it columnar). So descend through the
+   * transparent adaptive wrappers (`AdaptiveSparkPlanExec`, the query stages, whole-stage codegen, the input
+   * adapter) and peel the `ColumnarToRow` transition, and read the first columnar node directly. Only a child
+   * that is genuinely row at the stage root (a Spark row MergeRows over a row source) is converted from rows.
    */
   def columnar(query: SparkPlan): (RDD[ColumnarBatch], Boolean) = {
-    val plan = query match {
-      case a: AdaptiveSparkPlanExec => a.finalPhysicalPlan
-      case p => p
+    VectorIcebergWriteExec.columnarChild(query) match {
+      case Some(columnar) =>
+        logDebug(s"reads ${columnar.nodeName} columnar")
+        (columnar.executeColumnar(), false)
+      case None =>
+        val rowRoot = VectorIcebergWriteExec.rowStageRoot(query)
+        logInfo(s"vecruntime: the columnar Iceberg writer reads rows from ${rowRoot.nodeName} (RowToColumnarExec)")
+        (RowToColumnarExec(rowRoot).executeColumnar(), true)
     }
-    plan match {
-      case t: ColumnarToRowTransition if t.child.supportsColumnar =>
-        logDebug(s"reads ${t.child.nodeName} columnar, from below ${t.nodeName}")
-        (t.child.executeColumnar(), false)
-      case w: org.apache.spark.sql.execution.WholeStageCodegenExec
-          if w.child.isInstanceOf[ColumnarToRowTransition] && w.child.children.head.supportsColumnar =>
-        // A transition collapsed into a codegen stage (adaptive execution plans the child on its own).
-        (w.child.children.head.executeColumnar(), false)
-      case p if p.supportsColumnar =>
-        logDebug(s"reads ${p.nodeName} columnar")
-        (p.executeColumnar(), false)
-      case p =>
-        logInfo(s"vecruntime: the columnar Iceberg writer reads rows from ${p.nodeName} (RowToColumnarExec)")
-        (RowToColumnarExec(p).executeColumnar(), true)
-    }
+  }
+
+  /**
+   * The first columnar node reachable from a command's child through the transparent adaptive wrappers Spark
+   * puts above it, or None when the stage is genuinely row at its root. The wrappers are single-child nodes
+   * whose output is their child's output unchanged: the adaptive plan (its final physical plan), a query stage
+   * (its wrapped plan), whole-stage codegen, the input adapter, and the `ColumnarToRow` transition Spark
+   * inserts because a command declares a row child. A node that already produces batches ends the descent;
+   * the transition is peeled rather than executed so the batches below it are read directly.
+   */
+  def columnarChild(plan: SparkPlan): Option[SparkPlan] = plan match {
+    case p if p.supportsColumnar => Some(p)
+    case a: AdaptiveSparkPlanExec => columnarChild(a.finalPhysicalPlan)
+    case q: org.apache.spark.sql.execution.adaptive.QueryStageExec => columnarChild(q.plan)
+    case w: org.apache.spark.sql.execution.WholeStageCodegenExec => columnarChild(w.child)
+    case i: org.apache.spark.sql.execution.InputAdapter => columnarChild(i.child)
+    case t: ColumnarToRowTransition => columnarChild(t.child)
+    case _ => None
+  }
+
+  /**
+   * The row node to convert when the stage is genuinely row: the adaptive plan's final physical plan (or the
+   * query stage's wrapped plan), so a `RowToColumnarExec` sits over the real stage root rather than over the
+   * `AdaptiveSparkPlanExec` wrapper (which cannot be re-executed columnar).
+   */
+  def rowStageRoot(plan: SparkPlan): SparkPlan = plan match {
+    case a: AdaptiveSparkPlanExec => rowStageRoot(a.finalPhysicalPlan)
+    case q: org.apache.spark.sql.execution.adaptive.QueryStageExec => rowStageRoot(q.plan)
+    case p => p
   }
 
   /**
