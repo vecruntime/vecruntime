@@ -234,7 +234,71 @@ public final class RowGroupCopyPlanner {
             return new RowGroupCopyPlanner(false, "the table tracks NaN counts for a float/double column and a copied group has none",
                     groups, fileSchema, null, null);
         }
+        // #901 M4b cost guard: a mixed copy pays a per-group overhead (footer/index reads, gather + encode of
+        // the changed columns, two-pass chunk writes). It only pays off when the COPIED columns are a
+        // meaningful share of the group's bytes. When an UPDATE changes almost everything (only one or two
+        // narrow columns untouched), copying saves little and the overhead can make it slower than the full
+        // rewrite -- so fall back. Measured from the footer: the copied columns' compressed bytes as a fraction
+        // of the whole group, over the first group (representative; all groups share the schema/mask).
+        if (copyMask != null && !blocks.isEmpty()) {
+            double copiedFraction = copiedByteFraction(blocks.get(0), fileSchema, copyMask);
+            if (copiedFraction < COPY_MIN_BYTE_FRACTION) {
+                return new RowGroupCopyPlanner(false, "copied columns are only "
+                        + Math.round(copiedFraction * 100)
+                        + "% of the group's bytes (< "
+                        + Math.round(COPY_MIN_BYTE_FRACTION * 100)
+                        + "%); the full rewrite is cheaper",
+                        groups, fileSchema, null, null);
+            }
+        }
         return new RowGroupCopyPlanner(true, null, groups, fileSchema, copyOutputSchema, copyMask);
+    }
+
+    /**
+     * Below this copied-byte share of a group, a mixed copy is not worth its
+     * overhead (M4b cost guard).
+     */
+    static final double COPY_MIN_BYTE_FRACTION = 0.25;
+
+    /**
+     * The fraction of {@code block}'s total compressed column-chunk bytes that
+     * the copied columns account for. A copied field's bytes are all its leaf
+     * chunks' compressed sizes; the denominator is every leaf chunk. Lineage
+     * columns (always encoded, source-absent) are not in the source block, so
+     * they do not appear.
+     */
+    private static double copiedByteFraction(BlockMetaData block, MessageType fileSchema, boolean[] copyMask) {
+        long copied = 0;
+        long total = 0;
+        // Map each source leaf chunk to its top-level field, so a field's copy flag applies to all its leaves.
+        List<org.apache.parquet.hadoop.metadata.ColumnChunkMetaData> chunks = block.getColumns();
+        int chunkIdx = 0;
+        for (int f = 0; f < fileSchema.getFieldCount(); f++) {
+            int leaves = leafCount(fileSchema.getType(f));
+            boolean copyThis = f < copyMask.length && copyMask[f];
+            for (int l = 0;
+                 l < leaves && chunkIdx < chunks.size();
+                 l++, chunkIdx++) {
+                long sz = chunks.get(chunkIdx).getTotalSize();
+                total += sz;
+                if (copyThis) {
+                    copied += sz;
+                }
+            }
+        }
+        return total == 0 ? 0.0 : (double) copied / total;
+    }
+
+    /** Leaf (primitive) column count under a schema field. */
+    private static int leafCount(org.apache.parquet.schema.Type type) {
+        if (type.isPrimitive()) {
+            return 1;
+        }
+        int n = 0;
+        for (org.apache.parquet.schema.Type f : type.asGroupType().getFields()) {
+            n += leafCount(f);
+        }
+        return n;
     }
 
     /**

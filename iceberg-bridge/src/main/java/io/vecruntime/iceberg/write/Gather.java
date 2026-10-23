@@ -45,6 +45,27 @@ final class Gather {
         return out;
     }
 
+    /**
+     * Gathers only the columns {@code gather[c]} marks, up to {@code width},
+     * into a {@code width}-long list; un-gathered slots are {@code null} (#901
+     * M4b). The mixed-group copy only needs the ENCODED columns' values -- the
+     * copied columns' bytes come straight from the source file, so gathering
+     * them is wasted work (it dominated the every-row UPDATE). A {@code null}
+     * slot is never read: the writer encodes only the non-copied columns, and
+     * the float/double metrics skip null columns (a tracked float/double is
+     * always encoded, never copied, so its slot is populated).
+     */
+    static List<VectorBuffers> rowsSelected(List<? extends VectorBuffers> columns, int[] idx, boolean[] gather,
+            int width, Arena arena) {
+        List<VectorBuffers> out = new ArrayList<>(width);
+        for (int c = 0; c < width; c++) {
+            out.add(c < gather.length && gather[c]
+                    ? column(columns.get(c), idx, arena)
+                    : null);
+        }
+        return out;
+    }
+
     private static VectorBuffers column(VectorBuffers in, int[] idx, Arena arena) {
         int n = idx.length;
         if (in.type().isNested()) {

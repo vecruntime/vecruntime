@@ -94,6 +94,51 @@ class RowGroupCopyPlannerSuite extends AnyFunSuite {
   private def plan(f: ParquetMetadata, deleted: Array[Long]): RowGroupCopyPlanner =
     RowGroupCopyPlanner.plan(f, WriteSchema, deleted, IceSchema, MetricsConfig.getDefault())
 
+  test("M4b per-column mask: copying the large column s and encoding id is eligible") {
+    // WriteSchema = { id (long), s (string) }. Encode id (tiny), copy s (the large string column, a meaningful
+    // byte share), so the copy is accepted.
+    val f = footer(writeSource(3, 500))
+    val encodeId = Array(true, false) // encode id, copy s
+    val p =
+      RowGroupCopyPlanner.plan(f, WriteSchema, Array.emptyLongArray, IceSchema, MetricsConfig.getDefault(), encodeId)
+    assert(p.copyable(), s"expected copyable, got ${p.fallbackReason()}")
+    assert(p.copyMask() != null && !p.copyMask()(0) && p.copyMask()(1))
+    assert(p.groups().asScala.forall(g => g.action() == RowGroupCopyPlanner.Action.COPY && !g.copiesWholeGroup()))
+  }
+
+  test("M4b cost guard: encoding the only large column declines the copy (copied bytes too small)") {
+    // A wide-string table: one big string `s` plus a tiny `id`. Encoding `s` leaves only `id` copied -- a small
+    // byte share -- so the cost guard declines (full rewrite is cheaper).
+    import org.apache.parquet.schema.MessageTypeParser
+    val schema = MessageTypeParser.parseMessageType(
+      "message table { optional int64 id = 1; optional binary s (STRING) = 2; }"
+    )
+    val p = new org.apache.hadoop.fs.Path(dir.resolve("big.parquet").toString)
+    val codecs = new CodecFactory(conf, 1 << 20)
+    val props = ParquetProperties.builder().withPageSize(1 << 20).withDictionaryEncoding(false).build()
+    val w = new ColumnarParquetWriter(
+      HadoopOutputFile.fromPath(p, conf),
+      schema,
+      props,
+      codecs.getCompressor(CompressionCodecName.UNCOMPRESSED),
+      1L << 30,
+      JMap.of()
+    )
+    try {
+      val id = Array.tabulate(2000)(_.toLong)
+      // A long random-ish string per row so `s` dwarfs `id` and defeats dictionary/compression.
+      val s = id.map(v => "payload-" + v + "-" + (v * 2654435761L).toHexString + "-" + (v * 40503L).toHexString)
+      val a = Arena.ofConfined()
+      try w.write(JList.of(ArrowLayout.ofLongs(a, id, new Array[Boolean](2000)), ArrowLayout.ofStrings(a, s)), 0, 2000)
+      finally a.close()
+    } finally { w.close(); codecs.release() }
+    val encodeS = Array(false, true) // copy id (tiny), encode s (huge)
+    val planner =
+      RowGroupCopyPlanner.plan(footer(p), schema, Array.emptyLongArray, IceSchema, MetricsConfig.getDefault(), encodeS)
+    assert(!planner.copyable(), "expected the cost guard to decline (copied bytes too small)")
+    assert(planner.fallbackReason().contains("%"))
+  }
+
   test("v3 source missing lineage is copyable with a data-copy / lineage-encode mask") {
     import org.apache.iceberg.MetadataColumns
     import org.apache.iceberg.parquet.ParquetSchemaUtil

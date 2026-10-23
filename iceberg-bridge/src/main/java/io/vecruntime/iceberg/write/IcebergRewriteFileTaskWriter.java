@@ -567,8 +567,13 @@ public final class IcebergRewriteFileTaskWriter implements AutoCloseable {
         }
         try (Arena a = Arena.ofConfined()) {
             // Gather, per source chunk, the rows that fall in this group, in position order: one sub-run per
-            // contiguous run of the same chunk. Each run is the full column set (data + lineage), sliced to the
-            // output columns.
+            // contiguous run of the same chunk. Gather ONLY the columns the writer will ENCODE (copyMask[c] ==
+            // false) within outCols -- a copied column's bytes come straight from the source, so gathering its
+            // values is wasted work. Un-gathered slots are null and never read.
+            boolean[] gather = new boolean[outCols];
+            for (int c = 0; c < outCols; c++) {
+                gather[c] = c >= copyMask.length || !copyMask[c];
+            }
             List<List<VectorBuffers>> runs = new ArrayList<>();
             int i = 0;
             while (i < packed.size()) {
@@ -581,8 +586,7 @@ public final class IcebergRewriteFileTaskWriter implements AutoCloseable {
                 for (int t = 0; t < rows.length; t++) {
                     rows[t] = (int) (packed.get(i + t) & 0xffffffffL);
                 }
-                runs.add(new ArrayList<>(Gather.rows(buffer.dataChunks.get(chunk), rows, a)
-                        .subList(0, outCols)));
+                runs.add(Gather.rowsSelected(buffer.dataChunks.get(chunk), rows, gather, outCols, a));
                 i = j;
             }
             appender.copyRowGroupColumns(indexReader, stream, sourceBlock, copyMask, runs,

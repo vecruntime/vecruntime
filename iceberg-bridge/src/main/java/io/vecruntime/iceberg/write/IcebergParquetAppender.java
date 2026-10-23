@@ -259,22 +259,29 @@ public final class IcebergParquetAppender implements FileAppender<IcebergParquet
      * @param sourceBlock the source group whose copied chunks are taken
      * @param copy per output column, copy its chunk ({@code true}) or encode it
      *     ({@code false})
-     * @param runs the group's values, one or more schema-ordered column sets
-     *     whose rows concatenate to the whole group (a group may span several
-     *     batches); copied columns are present too (they feed the float/double
-     *     metrics; the writer ignores their bytes)
+     * @param runs the group's values for the ENCODED columns, as one or more
+     *     schema-ordered, {@code outCols}-wide column sets whose rows
+     *     concatenate to the whole group; a COPIED column's slot is {@code
+     *     null} (its bytes come from the source, not these values)
      * @param rowCount the group's row count (the runs' rows sum to it)
      */
     public void copyRowGroupColumns(org.apache.parquet.hadoop.ParquetFileReader reader, org.apache.parquet.io.SeekableInputStream source, org.apache.parquet.hadoop.metadata.BlockMetaData sourceBlock,
             boolean[] copy, List<? extends List<? extends VectorBuffers>> runs, int rowCount) {
         try {
             writer.copyRowGroupColumns(reader, source, sourceBlock, copy, runs, rowCount);
-            // Feed every run's columns to FloatingMetrics (it reads float/double leaves by position). A copied
-            // float/double column is safe: the planner's NaN guard declines the copy when the table tracks that
-            // column, so a tracked column is always encoded; counting an untracked copied column is harmless.
+            // Feed the ENCODED columns to FloatingMetrics (it reads float/double leaves by position and skips
+            // null, i.e. copied, slots). A copied float/double column never needs a NaN count: the planner's
+            // NaN guard declines the copy when the table tracks any float/double, so a tracked column is always
+            // encoded (its slot populated) and an untracked copied column contributes nothing reported.
             for (List<? extends VectorBuffers> run : runs) {
-                floating.add(run, 0,
-                        run.get(0).length());
+                int n = 0;
+                for (VectorBuffers v : run) {
+                    if (v != null) {
+                        n = v.length();
+                        break;
+                    }
+                }
+                floating.add(run, 0, n);
             }
         } catch (IOException e) {
             throw new UncheckedIOException(e);

@@ -135,6 +135,12 @@ final class FloatingMetrics {
     void add(List<? extends VectorBuffers> columns, int first, int end) {
         for (Leaf leaf : leaves) {
             VectorBuffers v = columns.get(leaf.column);
+            // A null column is a COPIED column on the M4b copy path (its values were not gathered). A copied
+            // float/double is never NaN-tracked (the planner declines the copy otherwise), so it contributes
+            // no metric -- skip it.
+            if (v == null) {
+                continue;
+            }
             if (leaf.steps.isEmpty() && v.validity() == null) {
                 addAll(leaf, v.data(), first, end);
                 continue;
