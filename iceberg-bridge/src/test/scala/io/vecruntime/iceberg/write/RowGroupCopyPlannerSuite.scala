@@ -94,6 +94,89 @@ class RowGroupCopyPlannerSuite extends AnyFunSuite {
   private def plan(f: ParquetMetadata, deleted: Array[Long]): RowGroupCopyPlanner =
     RowGroupCopyPlanner.plan(f, WriteSchema, deleted, IceSchema, MetricsConfig.getDefault())
 
+  test("M4b per-column mask: copying the large column s and encoding id is eligible") {
+    // WriteSchema = { id (long), s (string) }. Encode id (tiny), copy s (the large string column, a meaningful
+    // byte share), so the copy is accepted.
+    val f = footer(writeSource(3, 500))
+    val encodeId = Array(true, false) // encode id, copy s
+    val p =
+      RowGroupCopyPlanner.plan(f, WriteSchema, Array.emptyLongArray, IceSchema, MetricsConfig.getDefault(), encodeId)
+    assert(p.copyable(), s"expected copyable, got ${p.fallbackReason()}")
+    assert(p.copyMask() != null && !p.copyMask()(0) && p.copyMask()(1))
+    assert(p.groups().asScala.forall(g => g.action() == RowGroupCopyPlanner.Action.COPY && !g.copiesWholeGroup()))
+  }
+
+  test("M4b cost guard: encoding the only large column declines the copy (copied bytes too small)") {
+    // A wide-string table: one big string `s` plus a tiny `id`. Encoding `s` leaves only `id` copied -- a small
+    // byte share -- so the cost guard declines (full rewrite is cheaper).
+    import org.apache.parquet.schema.MessageTypeParser
+    val schema = MessageTypeParser.parseMessageType(
+      "message table { optional int64 id = 1; optional binary s (STRING) = 2; }"
+    )
+    val p = new org.apache.hadoop.fs.Path(dir.resolve("big.parquet").toString)
+    val codecs = new CodecFactory(conf, 1 << 20)
+    val props = ParquetProperties.builder().withPageSize(1 << 20).withDictionaryEncoding(false).build()
+    val w = new ColumnarParquetWriter(
+      HadoopOutputFile.fromPath(p, conf),
+      schema,
+      props,
+      codecs.getCompressor(CompressionCodecName.UNCOMPRESSED),
+      1L << 30,
+      JMap.of()
+    )
+    try {
+      val id = Array.tabulate(2000)(_.toLong)
+      // A long random-ish string per row so `s` dwarfs `id` and defeats dictionary/compression.
+      val s = id.map(v => "payload-" + v + "-" + (v * 2654435761L).toHexString + "-" + (v * 40503L).toHexString)
+      val a = Arena.ofConfined()
+      try w.write(JList.of(ArrowLayout.ofLongs(a, id, new Array[Boolean](2000)), ArrowLayout.ofStrings(a, s)), 0, 2000)
+      finally a.close()
+    } finally { w.close(); codecs.release() }
+    val encodeS = Array(false, true) // copy id (tiny), encode s (huge)
+    val planner =
+      RowGroupCopyPlanner.plan(footer(p), schema, Array.emptyLongArray, IceSchema, MetricsConfig.getDefault(), encodeS)
+    assert(!planner.copyable(), "expected the cost guard to decline (copied bytes too small)")
+    assert(planner.fallbackReason().contains("%"))
+  }
+
+  test("v3 source missing lineage is copyable with a data-copy / lineage-encode mask") {
+    import org.apache.iceberg.MetadataColumns
+    import org.apache.iceberg.parquet.ParquetSchemaUtil
+    // The write schema a v3 copy-on-write rewrite uses: the data columns plus the two row-lineage columns.
+    val v3Ice = MetadataColumns.schemaWithRowLineage(IceSchema)
+    val shadedWrite = ParquetSchemaUtil.convert(v3Ice, "table")
+    val writeSchema = MessageTypeParser.parseMessageType(shadedWrite.toString)
+    // The source file an ordinary append wrote: just the data columns, no lineage.
+    val src = writeSource(3, 200)
+    val f = footer(src)
+    val fileSchema = f.getFileMetaData.getSchema
+    val mask = RowGroupCopyPlanner.lineageCopyMask(writeSchema, fileSchema)
+    assert(mask != null, s"expected a lineage copy mask;\n write=$writeSchema\n file=$fileSchema")
+    assert(mask.length == writeSchema.getFieldCount)
+    // Data columns copied, the two trailing lineage columns encoded.
+    for (i <- 0 until fileSchema.getFieldCount) assert(mask(i), s"data col $i should copy")
+    for (i <- fileSchema.getFieldCount until writeSchema.getFieldCount)
+      assert(!mask(i), s"lineage col $i should encode")
+
+    val planner =
+      RowGroupCopyPlanner.plan(f, writeSchema, Array(201L), v3Ice, MetricsConfig.getDefault())
+    assert(planner.copyable(), s"v3 planner not copyable: ${planner.fallbackReason()}")
+    // The copy output schema is the source's data columns (keeping their repetition) plus the two lineage cols.
+    assert(planner.copyOutputSchema().getFieldCount == writeSchema.getFieldCount)
+    assert(
+      planner.copyOutputSchema().getType(fileSchema.getFieldCount).getName == "_row_id",
+      "lineage column present in copy output schema"
+    )
+    assert(planner.copyMask() != null)
+    val groups = planner.groups()
+    // group 0 (rows [0,200)) delete-free -> mixed COPY; group 1 (holds 201) re-encode; group 2 copy.
+    assert(groups.get(0).action() == RowGroupCopyPlanner.Action.COPY && !groups.get(0).copiesWholeGroup())
+    assert(groups.get(1).action() == RowGroupCopyPlanner.Action.REENCODE)
+    assert(groups.get(2).action() == RowGroupCopyPlanner.Action.COPY && !groups.get(2).copiesWholeGroup())
+    assert(planner.copiedGroups() == 2)
+    assert(planner.outputFieldCount() == writeSchema.getFieldCount)
+  }
+
   test("no deletes copies every group") {
     val p = plan(footer(writeSource(4, 500)), Array.emptyLongArray)
     assert(p.copyable())
