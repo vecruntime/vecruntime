@@ -1,0 +1,266 @@
+diff --git a/spark/v4.1/build.gradle b/spark/v4.1/build.gradle
+index 9b7657d..9e5ba60 100644
+--- a/spark/v4.1/build.gradle
++++ b/spark/v4.1/build.gradle
+@@ -111,8 +111,46 @@ project(":iceberg-spark:iceberg-spark-${sparkMajorVersion}_${scalaVersion}") {
+     testImplementation(testFixtures(project(':iceberg-parquet')))
+   }
+ 
++  // --- vecruntime harness: put the plugin jars on the test runtime classpath (crew patch) ---
++  dependencies {
++    if (System.getProperty('vecruntime.jars')) {
++      System.getProperty('vecruntime.jars').split(File.pathSeparator).each { p ->
++        if (p?.trim()) { testRuntimeOnly files(p.trim()) }
++      }
++    }
++  }
++
+   test {
+     useJUnitPlatform()
++    // Iceberg's Gradle must launch on JDK 17/21, but the spark-vector jars need JDK 25 at test
++    // runtime (the Vector API incubator module). Run the TEST JVM on the JDK 25 toolchain while
++    // Gradle itself stays on 21 (crew patch). The JDK 25 home is supplied to Gradle via
++    // -Porg.gradle.java.installations.paths=<jdk25> by the driver / CI.
++    if (System.getProperty('vecruntime.testJavaVersion')) {
++      javaLauncher = javaToolchains.launcherFor {
++        languageVersion = JavaLanguageVersion.of(System.getProperty('vecruntime.testJavaVersion') as Integer)
++      }
++    }
++    // The spark-vector plugin needs the Vector API module and native access (crew patch).
++    jvmArgs '--add-modules=jdk.incubator.vector',
++            '--enable-native-access=ALL-UNNAMED',
++            '--sun-misc-unsafe-memory-access=allow'
++    if (System.getProperty('vecruntime.jars')) {
++      systemProperty 'vecruntime.jars', System.getProperty('vecruntime.jars')
++    }
++    if (System.getProperty('vecruntime.enabled')) {
++      systemProperty 'vecruntime.enabled', System.getProperty('vecruntime.enabled')
++    }
++    // Harness exclusions (crew patch): -Dvecruntime.excludeTests=Class#method,Class,... skips the
++    // tests triaged out in benchmarks/iceberg-tests/exclusions.txt. '#' is turned into '.' because
++    // Gradle's excludeTestsMatching matches fully-qualified Class.method names.
++    if (System.getProperty('vecruntime.excludeTests')) {
++      filter {
++        System.getProperty('vecruntime.excludeTests').split(',').each { pat ->
++          if (pat?.trim()) { excludeTestsMatching pat.trim().replace('#', '.') }
++        }
++      }
++    }
+   }
+ 
+   tasks.withType(Test) {
+@@ -180,8 +218,46 @@ project(":iceberg-spark:iceberg-spark-extensions-${sparkMajorVersion}_${scalaVer
+     antlr libs.antlr.antlr413
+   }
+ 
++  // --- vecruntime harness: put the plugin jars on the test runtime classpath (crew patch) ---
++  dependencies {
++    if (System.getProperty('vecruntime.jars')) {
++      System.getProperty('vecruntime.jars').split(File.pathSeparator).each { p ->
++        if (p?.trim()) { testRuntimeOnly files(p.trim()) }
++      }
++    }
++  }
++
+   test {
+     useJUnitPlatform()
++    // Iceberg's Gradle must launch on JDK 17/21, but the spark-vector jars need JDK 25 at test
++    // runtime (the Vector API incubator module). Run the TEST JVM on the JDK 25 toolchain while
++    // Gradle itself stays on 21 (crew patch). The JDK 25 home is supplied to Gradle via
++    // -Porg.gradle.java.installations.paths=<jdk25> by the driver / CI.
++    if (System.getProperty('vecruntime.testJavaVersion')) {
++      javaLauncher = javaToolchains.launcherFor {
++        languageVersion = JavaLanguageVersion.of(System.getProperty('vecruntime.testJavaVersion') as Integer)
++      }
++    }
++    // The spark-vector plugin needs the Vector API module and native access (crew patch).
++    jvmArgs '--add-modules=jdk.incubator.vector',
++            '--enable-native-access=ALL-UNNAMED',
++            '--sun-misc-unsafe-memory-access=allow'
++    if (System.getProperty('vecruntime.jars')) {
++      systemProperty 'vecruntime.jars', System.getProperty('vecruntime.jars')
++    }
++    if (System.getProperty('vecruntime.enabled')) {
++      systemProperty 'vecruntime.enabled', System.getProperty('vecruntime.enabled')
++    }
++    // Harness exclusions (crew patch): -Dvecruntime.excludeTests=Class#method,Class,... skips the
++    // tests triaged out in benchmarks/iceberg-tests/exclusions.txt. '#' is turned into '.' because
++    // Gradle's excludeTestsMatching matches fully-qualified Class.method names.
++    if (System.getProperty('vecruntime.excludeTests')) {
++      filter {
++        System.getProperty('vecruntime.excludeTests').split(',').each { pat ->
++          if (pat?.trim()) { excludeTestsMatching pat.trim().replace('#', '.') }
++        }
++      }
++    }
+   }
+ 
+   generateGrammarSource {
+diff --git a/spark/v4.1/spark-extensions/src/test/java/org/apache/iceberg/spark/extensions/ExtensionsTestBase.java b/spark/v4.1/spark-extensions/src/test/java/org/apache/iceberg/spark/extensions/ExtensionsTestBase.java
+index f766fbb..7ac25fc 100644
+--- a/spark/v4.1/spark-extensions/src/test/java/org/apache/iceberg/spark/extensions/ExtensionsTestBase.java
++++ b/spark/v4.1/spark-extensions/src/test/java/org/apache/iceberg/spark/extensions/ExtensionsTestBase.java
+@@ -59,19 +59,28 @@ public abstract class ExtensionsTestBase extends CatalogTestBase {
+     TestBase.spark.stop();
+ 
+     TestBase.spark =
+-        SparkSession.builder()
+-            .master("local[2]")
+-            .config("spark.driver.host", InetAddress.getLoopbackAddress().getHostAddress())
+-            .config("spark.testing", "true")
+-            .config(SQLConf.PARTITION_OVERWRITE_MODE().key(), "dynamic")
+-            .config("spark.sql.extensions", IcebergSparkSessionExtensions.class.getName())
+-            .config("spark.hadoop." + METASTOREURIS.varname, hiveConf.get(METASTOREURIS.varname))
+-            .config("spark.sql.shuffle.partitions", "4")
+-            .config("spark.sql.hive.metastorePartitionPruningFallbackOnException", "true")
+-            .config("spark.sql.legacy.respectNullabilityInTextDatasetConversion", "true")
+-            .config(
+-                SQLConf.ADAPTIVE_EXECUTION_ENABLED().key(), String.valueOf(RANDOM.nextBoolean()))
+-            .config(TestBase.DISABLE_UI)
++        VectorTestConf.apply(
++                SparkSession.builder()
++                    .master("local[2]")
++                    .config(
++                        "spark.driver.host", InetAddress.getLoopbackAddress().getHostAddress())
++                    .config("spark.testing", "true")
++                    .config(SQLConf.PARTITION_OVERWRITE_MODE().key(), "dynamic")
++                    .config(
++                        "spark.sql.extensions",
++                        IcebergSparkSessionExtensions.class.getName())
++                    .config(
++                        "spark.hadoop." + METASTOREURIS.varname,
++                        hiveConf.get(METASTOREURIS.varname))
++                    .config("spark.sql.shuffle.partitions", "4")
++                    .config(
++                        "spark.sql.hive.metastorePartitionPruningFallbackOnException", "true")
++                    .config(
++                        "spark.sql.legacy.respectNullabilityInTextDatasetConversion", "true")
++                    .config(
++                        SQLConf.ADAPTIVE_EXECUTION_ENABLED().key(),
++                        String.valueOf(RANDOM.nextBoolean()))
++                    .config(TestBase.DISABLE_UI))
+             .enableHiveSupport()
+             .getOrCreate();
+ 
+diff --git a/spark/v4.1/spark/src/test/java/org/apache/iceberg/spark/TestBase.java b/spark/v4.1/spark/src/test/java/org/apache/iceberg/spark/TestBase.java
+index 507d7b3..617da6c 100644
+--- a/spark/v4.1/spark/src/test/java/org/apache/iceberg/spark/TestBase.java
++++ b/spark/v4.1/spark/src/test/java/org/apache/iceberg/spark/TestBase.java
+@@ -80,14 +80,19 @@ public abstract class TestBase extends SparkTestHelperBase {
+     TestBase.hiveConf = metastore.hiveConf();
+ 
+     TestBase.spark =
+-        SparkSession.builder()
+-            .master("local[2]")
+-            .config("spark.driver.host", InetAddress.getLoopbackAddress().getHostAddress())
+-            .config(SQLConf.PARTITION_OVERWRITE_MODE().key(), "dynamic")
+-            .config("spark.hadoop." + METASTOREURIS.varname, hiveConf.get(METASTOREURIS.varname))
+-            .config("spark.sql.legacy.respectNullabilityInTextDatasetConversion", "true")
+-            .config("spark.ui.enabled", "false")
+-            .config(DISABLE_UI)
++        VectorTestConf.apply(
++                SparkSession.builder()
++                    .master("local[2]")
++                    .config(
++                        "spark.driver.host", InetAddress.getLoopbackAddress().getHostAddress())
++                    .config(SQLConf.PARTITION_OVERWRITE_MODE().key(), "dynamic")
++                    .config(
++                        "spark.hadoop." + METASTOREURIS.varname,
++                        hiveConf.get(METASTOREURIS.varname))
++                    .config(
++                        "spark.sql.legacy.respectNullabilityInTextDatasetConversion", "true")
++                    .config("spark.ui.enabled", "false")
++                    .config(DISABLE_UI))
+             .enableHiveSupport()
+             .getOrCreate();
+ 
+diff --git a/spark/v4.1/spark/src/test/java/org/apache/iceberg/spark/VectorTestConf.java b/spark/v4.1/spark/src/test/java/org/apache/iceberg/spark/VectorTestConf.java
+new file mode 100644
+index 0000000..9f8a332
+--- /dev/null
++++ b/spark/v4.1/spark/src/test/java/org/apache/iceberg/spark/VectorTestConf.java
+@@ -0,0 +1,84 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *   http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++package org.apache.iceberg.spark;
++
++import org.apache.spark.sql.SparkSession;
++
++/**
++ * Injects the vecruntime (spark-vector) plugin into the SparkSession built by the Iceberg Spark
++ * test bases, so Apache Iceberg's OWN Spark 4.1 suites run with vecruntime's path on. This is NOT
++ * part of Iceberg; it is applied by the crew harness patch
++ * (benchmarks/iceberg-tests/iceberg-1.12.0.patch in vecruntime/vecruntime) and reverted after the
++ * run.
++ *
++ * <p>How the plugin gets wired:
++ *
++ * <ul>
++ *   <li>{@code spark.plugins=io.vecruntime.spark.VectorPlugin} registers the plugin. Its driver side
++ *       idempotently APPENDS {@code io.vecruntime.spark.VectorSparkSessionExtensions} to
++ *       {@code spark.sql.extensions}, so in the extensions suites the chain becomes
++ *       {@code IcebergSparkSessionExtensions,VectorSparkSessionExtensions} with no double
++ *       registration -- we do not touch {@code spark.sql.extensions} here.
++ *   <li>The vecruntime jars (kernels, parquet, spark, shuffle, iceberg-bridge) are put on the test
++ *       runtime classpath by the patched build.gradle via {@code testRuntimeOnly files(...)}, keyed
++ *       off the system property {@code vecruntime.jars} that the driver script sets.
++ *   <li>The JVM args the plugin needs (--add-modules=jdk.incubator.vector,
++ *       --enable-native-access=ALL-UNNAMED, --sun-misc-unsafe-memory-access=allow) are added to the
++ *       test task JVM by the patched build.gradle (the session runs {@code local[2]}, in process, so
++ *       the Gradle test JVM IS the driver and the executor).
++ * </ul>
++ *
++ * <p>Set {@code -Dvecruntime.enabled=false} to make this a no-op: the same harness then runs the
++ * suites on vanilla Iceberg, which is the "plugin OFF" baseline the triage compares against.
++ */
++public final class VectorTestConf {
++
++  private VectorTestConf() {}
++
++  public static final boolean ENABLED =
++      Boolean.parseBoolean(System.getProperty("vecruntime.enabled", "true"));
++
++  private static final String PLUGIN = "io.vecruntime.spark.VectorPlugin";
++
++  /** Returns the builder with the vecruntime plugin wired in, or unchanged when disabled. */
++  public static SparkSession.Builder apply(SparkSession.Builder builder) {
++    if (!ENABLED) {
++      return builder;
++    }
++
++    builder
++        .config("spark.plugins", PLUGIN)
++        // Native Iceberg scan (read side) and the columnar / merge-on-read writers. The writers and
++        // the native-scan switch default OFF in vecruntime main while they land slice by slice
++        // (VectorConf: scan.nativeIceberg, iceberg.writer, iceberg.dvWriter are all off by default);
++        // the whole point of this harness is to exercise them, so turn them on explicitly.
++        .config("spark.vecruntime.scan.nativeIceberg.enabled", "true")
++        .config("spark.vecruntime.iceberg.readSpecs.enabled", "true")
++        .config("spark.vecruntime.iceberg.nativeEqualityDeletes.enabled", "true")
++        .config("spark.vecruntime.iceberg.writer.enabled", "true")
++        .config("spark.vecruntime.iceberg.dvWriter.enabled", "true")
++        .config("spark.vecruntime.iceberg.positionDeletes.enabled", "true")
++        // The columnar writer sorts partitioned / bucketed output off-heap; only the off-heap pool
++        // tracks that native memory, so the writer docs require it on for those writes.
++        .config("spark.memory.offHeap.enabled", "true")
++        .config("spark.memory.offHeap.size", "1g");
++
++    return builder;
++  }
++}
