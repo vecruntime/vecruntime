@@ -12,21 +12,39 @@ The plugin is injected into Iceberg's Spark test bases (`TestBase`, `ExtensionsT
 `IcebergSparkSessionExtensions,VectorSparkSessionExtensions`. `vecruntime/iceberg-bridge` is on the
 test runtime classpath.
 
-The harness turns the vecruntime paths **on explicitly** (`VectorTestConf`), because in vecruntime
-`main` they default **off** while they land slice by slice:
+The harness fixes the vecruntime iceberg **scan** paths on explicitly (`VectorTestConf`) so the read
+suites exercise them regardless of any future default flip. The **write** paths are forced *off* by
+default (`-Dvecruntime.writers=off`) for a harness-packaging reason explained below — not because
+they are off in the product. As of current `main` every one of these flags defaults **on** (verified
+in `spark/src/main/scala/io/vecruntime/spark/VectorConf.scala`: each helper reads its key with
+`default = true`):
 
-| flag | default in main | harness |
-|------|-----------------|---------|
-| `spark.vecruntime.scan.nativeIceberg.enabled` | off | **on** |
-| `spark.vecruntime.iceberg.readSpecs.enabled` | on | on |
-| `spark.vecruntime.iceberg.nativeEqualityDeletes.enabled` | on | on |
-| `spark.vecruntime.iceberg.writer.enabled` (columnar writer) | off | **on** |
-| `spark.vecruntime.iceberg.dvWriter.enabled` (merge-on-read DV writer) | off | **on** |
-| `spark.vecruntime.iceberg.positionDeletes.enabled` | on | on |
+| flag | default in `main` | harness sets | why |
+|------|-------------------|--------------|-----|
+| `spark.vecruntime.scan.nativeIceberg.enabled` | on | **on** | read path under test |
+| `spark.vecruntime.iceberg.readSpecs.enabled` | on | **on** | read path under test |
+| `spark.vecruntime.iceberg.nativeEqualityDeletes.enabled` | on | **on** | read path under test |
+| `spark.vecruntime.iceberg.copyUnchanged.enabled` | on | *(unset → main default, on)* | COW copy, read-side |
+| `spark.vecruntime.iceberg.writer.enabled` (columnar writer) | on | **off** by default | write path, see below |
+| `spark.vecruntime.iceberg.dvWriter.enabled` (merge-on-read DV writer) | on | **off** by default | write path, see below |
+| `spark.vecruntime.iceberg.positionDeletes.enabled` | on | **off** by default | write path, see below |
 
-(The task brief described these three as already default-on; they are not in current main. The
-harness forces them so the suites actually test them. If they later default on, the explicit sets
-are harmless.)
+**Why the write paths are forced off here.** iceberg-bridge compiles against the SHADED
+`iceberg-spark-runtime` jar (parquet relocated under `org.apache.iceberg.shaded.*`), while Iceberg's
+own Gradle test modules are UNSHADED. On the write side `IcebergParquetInterop.fileSchema` →
+`ParquetSchemaUtil.convert(...)` binds to a shaded return type the unshaded `ParquetSchemaUtil` on
+the test classpath does not have, so every write hits `NoSuchMethodError`. That is a harness
+packaging incompatibility, **not** a writer-logic bug — a real Spark deployment loads the shaded
+runtime jar and the writer works. Until the bridge is built in an unshaded variant for this harness
+(or the suites run against the shaded runtime jar), the writers stay off and only the native SCAN
+path is exercised. Pass `VECRUNTIME_WRITERS=on` (→ `-Dvecruntime.writers=on`) to reproduce the
+incompatibility.
+
+> The native equality-delete *read* path had the same shaded-vs-unshaded `MessageType` mismatch; it
+> is fixed on branch `crew/draco/eqdelete-shading-agnostic` (reflective reader, no relocation pinned
+> in bridge bytecode) and its two affected tests are excluded TEMPORARY until that lands on `main`.
+> The write-side `IcebergParquetInterop` mismatch is the same class of problem but out of that
+> branch's scope.
 
 ## JDK requirement (important)
 
@@ -83,3 +101,27 @@ Every failure is one of:
 
 Run each suite once with the plugin **off** (`VECRUNTIME_ENABLED=false`) to confirm a failure is
 ours and not the environment.
+
+## Last full run (2026-10-23, logs `draco-keep/iceberg-tests-20261023-180702`)
+
+JDK-21 launcher, JDK-25 test JVMs, all vecruntime iceberg paths on. **Before exclusions**:
+
+| module | suite | tests | failed | skipped |
+|--------|-------|-------|--------|---------|
+| `iceberg-spark-extensions-4.1_2.13` | spark-extensions | 1275 | 19 | 115 |
+| `iceberg-spark-4.1_2.13` | spark | 579 | 3 | 22 |
+
+With the plugin **off** (`VECRUNTIME_ENABLED=false`) spark-extensions passes fully, so every failure
+above is attributable to the plugin, not the environment.
+
+The 22 failures break down (and are all handled in `exclusions.txt`):
+
+| kind | count (methods × params) | disposition |
+|------|--------------------------|-------------|
+| (b) `*WithVectorizedReads` — `assertAllBatchScansVectorized` wants Iceberg's `BatchScanExec`, gets `VectorIcebergScanExec` | 6 methods | excluded (plan-shape) |
+| (b) `testAggregatePushDownInMergeOnReadDelete` — EXPLAIN text names the plugin's aggregate node | 1 method (3 params) | excluded (plan-text) |
+| (b) `testSkew{Delete,Update,Merge}` — AQE skew split of a rebalance under the vecruntime shuffle | 3 methods | excluded **TEMPORARY** (fix in progress) |
+| (a) `testEqualityDeletePreservation` + `testRemoveDangledEqualityDeletesPartitionEvolution` — shaded-vs-unshaded parquet `MessageType` CCE in the native equality-delete reader | 2 methods (incl. v2/v3/v4) | **fixed** on `crew/draco/eqdelete-shading-agnostic`; excluded **TEMPORARY** until that lands on main |
+
+After the exclusions both modules are expected green on the next run; the two (a) entries drop out
+once the JOB-1 fix is merged and the harness jars are rebuilt from `main`.

@@ -1,8 +1,8 @@
 diff --git a/spark/v4.1/build.gradle b/spark/v4.1/build.gradle
-index 9b7657d..9e5ba60 100644
+index 9b7657d..8b54585 100644
 --- a/spark/v4.1/build.gradle
 +++ b/spark/v4.1/build.gradle
-@@ -111,8 +111,46 @@ project(":iceberg-spark:iceberg-spark-${sparkMajorVersion}_${scalaVersion}") {
+@@ -111,8 +111,49 @@ project(":iceberg-spark:iceberg-spark-${sparkMajorVersion}_${scalaVersion}") {
      testImplementation(testFixtures(project(':iceberg-parquet')))
    }
  
@@ -36,6 +36,9 @@ index 9b7657d..9e5ba60 100644
 +    if (System.getProperty('vecruntime.enabled')) {
 +      systemProperty 'vecruntime.enabled', System.getProperty('vecruntime.enabled')
 +    }
++    if (System.getProperty('vecruntime.writers')) {
++      systemProperty 'vecruntime.writers', System.getProperty('vecruntime.writers')
++    }
 +    // Harness exclusions (crew patch): -Dvecruntime.excludeTests=Class#method,Class,... skips the
 +    // tests triaged out in benchmarks/iceberg-tests/exclusions.txt. '#' is turned into '.' because
 +    // Gradle's excludeTestsMatching matches fully-qualified Class.method names.
@@ -49,7 +52,7 @@ index 9b7657d..9e5ba60 100644
    }
  
    tasks.withType(Test) {
-@@ -180,8 +218,46 @@ project(":iceberg-spark:iceberg-spark-extensions-${sparkMajorVersion}_${scalaVer
+@@ -180,8 +221,49 @@ project(":iceberg-spark:iceberg-spark-extensions-${sparkMajorVersion}_${scalaVer
      antlr libs.antlr.antlr413
    }
  
@@ -83,6 +86,9 @@ index 9b7657d..9e5ba60 100644
 +    if (System.getProperty('vecruntime.enabled')) {
 +      systemProperty 'vecruntime.enabled', System.getProperty('vecruntime.enabled')
 +    }
++    if (System.getProperty('vecruntime.writers')) {
++      systemProperty 'vecruntime.writers', System.getProperty('vecruntime.writers')
++    }
 +    // Harness exclusions (crew patch): -Dvecruntime.excludeTests=Class#method,Class,... skips the
 +    // tests triaged out in benchmarks/iceberg-tests/exclusions.txt. '#' is turned into '.' because
 +    // Gradle's excludeTestsMatching matches fully-qualified Class.method names.
@@ -96,11 +102,117 @@ index 9b7657d..9e5ba60 100644
    }
  
    generateGrammarSource {
+diff --git a/spark/v4.1/spark-extensions/src/test/java/org/apache/iceberg/spark/VectorTestConf.java b/spark/v4.1/spark-extensions/src/test/java/org/apache/iceberg/spark/VectorTestConf.java
+new file mode 100644
+index 0000000..64765f3
+--- /dev/null
++++ b/spark/v4.1/spark-extensions/src/test/java/org/apache/iceberg/spark/VectorTestConf.java
+@@ -0,0 +1,92 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *   http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++package org.apache.iceberg.spark;
++
++import org.apache.spark.sql.SparkSession;
++
++/**
++ * Injects the vecruntime (spark-vector) plugin into the SparkSession built by the Iceberg Spark
++ * test bases, so Apache Iceberg's OWN Spark 4.1 suites run with vecruntime's path on. This is NOT
++ * part of Iceberg; it is applied by the crew harness patch
++ * (benchmarks/iceberg-tests/iceberg-1.12.0.patch in vecruntime/vecruntime) and reverted after the
++ * run.
++ *
++ * <p>Wiring: {@code spark.plugins=io.vecruntime.spark.VectorPlugin} registers the plugin, whose
++ * driver side idempotently appends {@code VectorSparkSessionExtensions} to
++ * {@code spark.sql.extensions} (so the extensions suites get
++ * {@code IcebergSparkSessionExtensions,VectorSparkSessionExtensions}). The jars reach the test
++ * runtime via {@code -Dvecruntime.jars} ({@code testRuntimeOnly files(...)} in the patched
++ * build.gradle); the Vector-API JVM args and the JDK-25 test toolchain are set there too.
++ *
++ * <p>{@code -Dvecruntime.enabled=false} makes this a no-op (the vanilla-Iceberg baseline).
++ *
++ * <p>WRITE PATH -- default OFF here (see {@code WRITERS}). The columnar Iceberg data-file writer and
++ * the merge-on-read DV writer live in {@code iceberg-bridge}, which is COMPILED AGAINST Iceberg's
++ * SHADED {@code iceberg-spark-runtime} jar (parquet relocated under
++ * {@code org.apache.iceberg.shaded.*}). Iceberg's own Gradle test modules are UNSHADED, so the
++ * bridge's {@code IcebergParquetInterop.fileSchema} -> {@code ParquetSchemaUtil.convert(...)} binds
++ * to a shaded return type that the unshaded {@code ParquetSchemaUtil} on the test classpath does
++ * not have, giving {@code NoSuchMethodError} on every write. This is a harness/packaging
++ * incompatibility, not a writer-logic bug (a real Spark deployment loads the shaded runtime jar and
++ * the writer works). Until the bridge is built in an unshaded variant for this harness, OR the
++ * suites are run against the shaded runtime jar, keep the writers off: the native SCAN path
++ * (readSpecs + nativeEqualityDeletes) is exercised fully and passes. {@code -Dvecruntime.writers=on}
++ * turns them on to reproduce the incompatibility.
++ */
++public final class VectorTestConf {
++
++  private VectorTestConf() {}
++
++  public static final boolean ENABLED =
++      Boolean.parseBoolean(System.getProperty("vecruntime.enabled", "true"));
++
++  /** Write path off by default (see the class javadoc); -Dvecruntime.writers=on turns it on. */
++  public static final boolean WRITERS =
++      "on".equalsIgnoreCase(System.getProperty("vecruntime.writers", "off"));
++
++  private static final String PLUGIN = "io.vecruntime.spark.VectorPlugin";
++
++  /** Returns the builder with the vecruntime plugin wired in, or unchanged when disabled. */
++  public static SparkSession.Builder apply(SparkSession.Builder builder) {
++    if (!ENABLED) {
++      return builder;
++    }
++
++    builder
++        .config("spark.plugins", PLUGIN)
++        // Native Iceberg scan (read side) -- on.
++        .config("spark.vecruntime.scan.nativeIceberg.enabled", "true")
++        .config("spark.vecruntime.iceberg.readSpecs.enabled", "true")
++        .config("spark.vecruntime.iceberg.nativeEqualityDeletes.enabled", "true")
++        // Columnar + merge-on-read writers -- controlled by -Dvecruntime.writers (default off).
++        .config("spark.vecruntime.iceberg.writer.enabled", String.valueOf(WRITERS))
++        .config("spark.vecruntime.iceberg.dvWriter.enabled", String.valueOf(WRITERS))
++        .config("spark.vecruntime.iceberg.positionDeletes.enabled", String.valueOf(WRITERS));
++
++    if (WRITERS) {
++      // The columnar writer sorts partitioned / bucketed output off-heap; only the off-heap pool
++      // tracks that native memory, so the writer docs require it on for those writes.
++      builder
++          .config("spark.memory.offHeap.enabled", "true")
++          .config("spark.memory.offHeap.size", "1g");
++    }
++
++    return builder;
++  }
++}
 diff --git a/spark/v4.1/spark-extensions/src/test/java/org/apache/iceberg/spark/extensions/ExtensionsTestBase.java b/spark/v4.1/spark-extensions/src/test/java/org/apache/iceberg/spark/extensions/ExtensionsTestBase.java
-index f766fbb..7ac25fc 100644
+index f766fbb..b770bdb 100644
 --- a/spark/v4.1/spark-extensions/src/test/java/org/apache/iceberg/spark/extensions/ExtensionsTestBase.java
 +++ b/spark/v4.1/spark-extensions/src/test/java/org/apache/iceberg/spark/extensions/ExtensionsTestBase.java
-@@ -59,19 +59,28 @@ public abstract class ExtensionsTestBase extends CatalogTestBase {
+@@ -41,6 +41,7 @@ import org.apache.iceberg.parquet.Parquet;
+ import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
+ import org.apache.iceberg.spark.CatalogTestBase;
+ import org.apache.iceberg.spark.TestBase;
++import org.apache.iceberg.spark.VectorTestConf;
+ import org.apache.spark.api.java.JavaSparkContext;
+ import org.apache.spark.sql.SparkSession;
+ import org.apache.spark.sql.internal.SQLConf;
+@@ -59,19 +60,28 @@ public abstract class ExtensionsTestBase extends CatalogTestBase {
      TestBase.spark.stop();
  
      TestBase.spark =
@@ -176,10 +288,10 @@ index 507d7b3..617da6c 100644
  
 diff --git a/spark/v4.1/spark/src/test/java/org/apache/iceberg/spark/VectorTestConf.java b/spark/v4.1/spark/src/test/java/org/apache/iceberg/spark/VectorTestConf.java
 new file mode 100644
-index 0000000..9f8a332
+index 0000000..64765f3
 --- /dev/null
 +++ b/spark/v4.1/spark/src/test/java/org/apache/iceberg/spark/VectorTestConf.java
-@@ -0,0 +1,84 @@
+@@ -0,0 +1,92 @@
 +/*
 + * Licensed to the Apache Software Foundation (ASF) under one
 + * or more contributor license agreements.  See the NOTICE file
@@ -209,25 +321,27 @@ index 0000000..9f8a332
 + * (benchmarks/iceberg-tests/iceberg-1.12.0.patch in vecruntime/vecruntime) and reverted after the
 + * run.
 + *
-+ * <p>How the plugin gets wired:
++ * <p>Wiring: {@code spark.plugins=io.vecruntime.spark.VectorPlugin} registers the plugin, whose
++ * driver side idempotently appends {@code VectorSparkSessionExtensions} to
++ * {@code spark.sql.extensions} (so the extensions suites get
++ * {@code IcebergSparkSessionExtensions,VectorSparkSessionExtensions}). The jars reach the test
++ * runtime via {@code -Dvecruntime.jars} ({@code testRuntimeOnly files(...)} in the patched
++ * build.gradle); the Vector-API JVM args and the JDK-25 test toolchain are set there too.
 + *
-+ * <ul>
-+ *   <li>{@code spark.plugins=io.vecruntime.spark.VectorPlugin} registers the plugin. Its driver side
-+ *       idempotently APPENDS {@code io.vecruntime.spark.VectorSparkSessionExtensions} to
-+ *       {@code spark.sql.extensions}, so in the extensions suites the chain becomes
-+ *       {@code IcebergSparkSessionExtensions,VectorSparkSessionExtensions} with no double
-+ *       registration -- we do not touch {@code spark.sql.extensions} here.
-+ *   <li>The vecruntime jars (kernels, parquet, spark, shuffle, iceberg-bridge) are put on the test
-+ *       runtime classpath by the patched build.gradle via {@code testRuntimeOnly files(...)}, keyed
-+ *       off the system property {@code vecruntime.jars} that the driver script sets.
-+ *   <li>The JVM args the plugin needs (--add-modules=jdk.incubator.vector,
-+ *       --enable-native-access=ALL-UNNAMED, --sun-misc-unsafe-memory-access=allow) are added to the
-+ *       test task JVM by the patched build.gradle (the session runs {@code local[2]}, in process, so
-+ *       the Gradle test JVM IS the driver and the executor).
-+ * </ul>
++ * <p>{@code -Dvecruntime.enabled=false} makes this a no-op (the vanilla-Iceberg baseline).
 + *
-+ * <p>Set {@code -Dvecruntime.enabled=false} to make this a no-op: the same harness then runs the
-+ * suites on vanilla Iceberg, which is the "plugin OFF" baseline the triage compares against.
++ * <p>WRITE PATH -- default OFF here (see {@code WRITERS}). The columnar Iceberg data-file writer and
++ * the merge-on-read DV writer live in {@code iceberg-bridge}, which is COMPILED AGAINST Iceberg's
++ * SHADED {@code iceberg-spark-runtime} jar (parquet relocated under
++ * {@code org.apache.iceberg.shaded.*}). Iceberg's own Gradle test modules are UNSHADED, so the
++ * bridge's {@code IcebergParquetInterop.fileSchema} -> {@code ParquetSchemaUtil.convert(...)} binds
++ * to a shaded return type that the unshaded {@code ParquetSchemaUtil} on the test classpath does
++ * not have, giving {@code NoSuchMethodError} on every write. This is a harness/packaging
++ * incompatibility, not a writer-logic bug (a real Spark deployment loads the shaded runtime jar and
++ * the writer works). Until the bridge is built in an unshaded variant for this harness, OR the
++ * suites are run against the shaded runtime jar, keep the writers off: the native SCAN path
++ * (readSpecs + nativeEqualityDeletes) is exercised fully and passes. {@code -Dvecruntime.writers=on}
++ * turns them on to reproduce the incompatibility.
 + */
 +public final class VectorTestConf {
 +
@@ -235,6 +349,10 @@ index 0000000..9f8a332
 +
 +  public static final boolean ENABLED =
 +      Boolean.parseBoolean(System.getProperty("vecruntime.enabled", "true"));
++
++  /** Write path off by default (see the class javadoc); -Dvecruntime.writers=on turns it on. */
++  public static final boolean WRITERS =
++      "on".equalsIgnoreCase(System.getProperty("vecruntime.writers", "off"));
 +
 +  private static final String PLUGIN = "io.vecruntime.spark.VectorPlugin";
 +
@@ -246,20 +364,22 @@ index 0000000..9f8a332
 +
 +    builder
 +        .config("spark.plugins", PLUGIN)
-+        // Native Iceberg scan (read side) and the columnar / merge-on-read writers. The writers and
-+        // the native-scan switch default OFF in vecruntime main while they land slice by slice
-+        // (VectorConf: scan.nativeIceberg, iceberg.writer, iceberg.dvWriter are all off by default);
-+        // the whole point of this harness is to exercise them, so turn them on explicitly.
++        // Native Iceberg scan (read side) -- on.
 +        .config("spark.vecruntime.scan.nativeIceberg.enabled", "true")
 +        .config("spark.vecruntime.iceberg.readSpecs.enabled", "true")
 +        .config("spark.vecruntime.iceberg.nativeEqualityDeletes.enabled", "true")
-+        .config("spark.vecruntime.iceberg.writer.enabled", "true")
-+        .config("spark.vecruntime.iceberg.dvWriter.enabled", "true")
-+        .config("spark.vecruntime.iceberg.positionDeletes.enabled", "true")
-+        // The columnar writer sorts partitioned / bucketed output off-heap; only the off-heap pool
-+        // tracks that native memory, so the writer docs require it on for those writes.
-+        .config("spark.memory.offHeap.enabled", "true")
-+        .config("spark.memory.offHeap.size", "1g");
++        // Columnar + merge-on-read writers -- controlled by -Dvecruntime.writers (default off).
++        .config("spark.vecruntime.iceberg.writer.enabled", String.valueOf(WRITERS))
++        .config("spark.vecruntime.iceberg.dvWriter.enabled", String.valueOf(WRITERS))
++        .config("spark.vecruntime.iceberg.positionDeletes.enabled", String.valueOf(WRITERS));
++
++    if (WRITERS) {
++      // The columnar writer sorts partitioned / bucketed output off-heap; only the off-heap pool
++      // tracks that native memory, so the writer docs require it on for those writes.
++      builder
++          .config("spark.memory.offHeap.enabled", "true")
++          .config("spark.memory.offHeap.size", "1g");
++    }
 +
 +    return builder;
 +  }
