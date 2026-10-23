@@ -87,6 +87,18 @@ object VectorConf {
   val IcebergCopyUnchangedEnabled = "spark.vecruntime.iceberg.copyUnchanged.enabled"
 
   /**
+   * Columnar bin-pack compaction (#957 M4c): `rewrite_data_files` with the BINPACK strategy compacts a file
+   * group by copying its input files' Parquet row groups byte for byte into target-sized outputs, instead of
+   * decoding and re-encoding every row. A file that cannot be copied -- deletes attached, schema evolution, a
+   * different partition spec, a codec mismatch, v3 unmaterialised row lineage, an unreadable encoding, or a
+   * table tracking float/double NaN counts -- falls back per file to Iceberg's own bin-pack, so the result is
+   * indistinguishable from the stock rewrite. Engaged only through `VectorRewriteDataFiles`, which installs the
+   * vecruntime runner on Iceberg's `RewriteDataFilesSparkAction`. Default ON when the runner is used (there is
+   * no correctness difference, only speed); set false to force the stock decode/encode path for A/B.
+   */
+  val IcebergBinPackCopyEnabled = "spark.vecruntime.iceberg.rewrite.binpackCopy.enabled"
+
+  /**
    * Logical rewrite (#632): `IsNotNull` on a grouping key that is the only difference between the
    * inputs of two aggregates (a CTE used twice) moves above the aggregates, so the input is shared.
    */
