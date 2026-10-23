@@ -934,6 +934,19 @@ private[vecruntime] final class VectorParquetPartitionReader(
     var r: ParquetFileReader = null
     try {
       stream = inputFile.newStream()
+      // #834 part 1: a file at or under the threshold is read WHOLE in one GET here, BEFORE the footer, so the
+      // footer, column chunks and page indexes all come from that one buffer (no footer-length read, no footer
+      // read, no per-page GET). The split keeps one file per row group, so file.length is the bytes to read.
+      // The column-share gate cannot apply before the footer; for a file this small the whole-object read is
+      // the point, so size alone decides. Range merging (part 2) still applies to larger files in openStream.
+      if (
+        smallFileThreshold > 0 && file.length > 0 && file.length <= smallFileThreshold &&
+        file.length <= Integer.MAX_VALUE - 8
+      ) {
+        val whole = io.vecruntime.spark.parquet.BufferBackedSeekableInputStream.wholeObject(stream, file.length)
+        stream.close()
+        stream = whole
+      }
       val read0: ParquetMetadata = ParquetFileReader.readFooter(inputFile, rangeOpts, stream)
       // #901 R1: the table format resolves the file's columns itself (by its field ids, its name mapping, its
       // positional fallback): the footer carries the ids the columns were matched by, and the clipped schema is
@@ -1039,7 +1052,12 @@ private[vecruntime] final class VectorParquetPartitionReader(
         poolChunkBuffers
       )
       val readOpts = readOptsBuilder.build()
-      r = ParquetFileReader.open(inputFile, footer, readOpts, stream)
+      // #834: serve the reader from an in-memory buffer where it pays, so ParquetFileReader issues fewer and
+      // larger GETs. readStream is the original S3A stream unless small-object prefetch or range merging
+      // replaces it; openStream handles closing/keeping the source.
+      val readStream = openStream(inputFile, file, footer, clipped, stream)
+      if (readStream ne stream) stream = null // the buffer stream owns (or has consumed+closed) the source now
+      r = ParquetFileReader.open(inputFile, footer, readOpts, readStream)
       stream = null
       r.setRequestedSchema(clipped)
       // #812: under two-pass the first row group is read by index too (twoPassRowGroup), not ahead here.
@@ -1051,6 +1069,57 @@ private[vecruntime] final class VectorParquetPartitionReader(
       if (stream != null) stream.close()
       if (r != null) r.close()
     }
+  }
+
+  /**
+   * #834 part 2 (range merging): the stream `ParquetFileReader.open` reads from, when the file was NOT already
+   * read whole by small-object prefetch (which runs before the footer read, in `prepare`). By default this is
+   * the original S3A `source`, returned as is. When range merging fires, the projected column chunks of the
+   * split's row groups are planned into coalesced, split byte ranges ({@link ParquetReadRangePlanner}) and read
+   * into a sparse buffer here on this (prefetch) thread; `source` is kept as the delegate for any read the plan
+   * did not cover (there should be none, but a miss stays correct). It fires only when it actually reduces the
+   * request count. The buffered bytes are charged to the executor's read-ahead budget (`prefetchExecutorMaxBytes`)
+   * through the enclosing file's reserved size, released when the Prepared is used or dropped.
+   */
+  private def openStream(
+      inputFile: HadoopInputFile,
+      file: PartitionedFile,
+      footer: ParquetMetadata,
+      clipped: MessageType,
+      source: SeekableInputStream
+  ): SeekableInputStream = {
+    // Already a whole-object buffer (small-file prefetch ran before the footer): nothing more to do.
+    if (source.isInstanceOf[io.vecruntime.spark.parquet.BufferBackedSeekableInputStream]) return source
+    if (rangeMergeGap < 0) return source
+    // The projected column chunks of the row groups this split keeps (its range), by path, as the reader reads.
+    val wanted = new java.util.HashSet[Seq[String]]()
+    clipped.getColumns.forEach(cd => wanted.add(cd.getPath.toArray.toSeq))
+    val start = file.start
+    val end = file.start + file.length
+    val chunkRanges = new java.util.ArrayList[io.vecruntime.spark.parquet.ParquetReadRangePlanner.Range]()
+    footer.getBlocks.forEach { block =>
+      val mid = block.getStartingPos + block.getCompressedSize / 2
+      if (mid >= start && mid < end) {
+        block.getColumns.forEach { cc =>
+          if (wanted.contains(cc.getPath.toArray.toSeq)) {
+            val len = cc.getTotalSize
+            if (len > 0) {
+              chunkRanges.add(new io.vecruntime.spark.parquet.ParquetReadRangePlanner.Range(cc.getStartingPos, len))
+            }
+          }
+        }
+      }
+    }
+    // Range merging over the projected column chunks. No chunk, or a single chunk already contiguous, is
+    // nothing to merge -- leave the original stream (parquet-java merges exactly-consecutive chunks itself).
+    if (chunkRanges.size() < 2) return source
+    val planner =
+      new io.vecruntime.spark.parquet.ParquetReadRangePlanner(rangeMergeGap, rangeTargetSize, RangeToleranceRatio)
+    val planned = planner.plan(chunkRanges)
+    // Only serve from a buffer when it issues fewer requests than the chunks themselves would (coalescing won
+    // over splitting). Otherwise the original stream is as good and keeps memory to zero.
+    if (planned.size() >= chunkRanges.size()) return source
+    io.vecruntime.spark.parquet.BufferBackedSeekableInputStream.plannedRanges(source, planned, file.length, source)
   }
 
   /** Makes a prepared file the current one (task thread): column readers, partition values, metrics. */
@@ -1267,6 +1336,37 @@ private[vecruntime] final class VectorParquetPartitionReader(
     hadoopConf.getDouble(io.vecruntime.spark.VectorConf.ScanNativeParquetLateMaterializationTwoPassMaxFraction, 0.5)
   private var currentClipped: MessageType = _
   private var twoPassDenseRun = 0
+
+  // ----- #834: small-object prefetch and range merging, read from the Hadoop conf (it carries spark.* keys,
+  // as two-pass above does). All off/identity when their keys are unset, so the read path is unchanged by default.
+
+  /** #834 part 1: a file at or under this length is read whole in one GET; `<= 0` off. */
+  private lazy val smallFileThreshold: Long =
+    scala.util.Try(
+      hadoopConf.get(io.vecruntime.spark.VectorConf.ScanNativeParquetSmallFileThreshold, "").trim match {
+        case "" => 0L
+        case s => org.apache.spark.network.util.JavaUtils.byteStringAsBytes(s)
+      }
+    ).getOrElse(0L)
+
+  /** #834 part 2: coalesce planned ranges whose gap is at or under this; `< 0` (the default) disables merging. */
+  private lazy val rangeMergeGap: Long =
+    hadoopConf.get(io.vecruntime.spark.VectorConf.ScanNativeParquetRangeMergeGap, "").trim match {
+      case "" => -1L
+      case s if s.startsWith("-") => -1L
+      case s => scala.util.Try(org.apache.spark.network.util.JavaUtils.byteStringAsBytes(s)).getOrElse(-1L)
+    }
+
+  /** #834 part 2: split a coalesced run longer than this into parallel GETs; `0` never splits. */
+  private lazy val rangeTargetSize: Long =
+    scala.util.Try(
+      hadoopConf.get(io.vecruntime.spark.VectorConf.ScanNativeParquetRangeTargetSize, "").trim match {
+        case "" => 8L << 20
+        case s => math.max(0L, org.apache.spark.network.util.JavaUtils.byteStringAsBytes(s))
+      }
+    ).getOrElse(8L << 20)
+
+  private val RangeToleranceRatio = 1.4
 
   /**
    * #812: row group `i` (an index into the reader's filtered row groups) read in two passes. First its filter
