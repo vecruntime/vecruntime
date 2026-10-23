@@ -83,7 +83,11 @@ class TestMergeOnReadUpdateMergePortedSuite extends AnyFunSuite with BeforeAndAf
   private val OnFlags = Seq(
     "spark.vecruntime.iceberg.dvWriter.enabled" -> "true",
     "spark.vecruntime.iceberg.writer.enabled" -> "true",
-    "spark.vecruntime.scan.nativeIceberg.enabled" -> "true"
+    "spark.vecruntime.scan.nativeIceberg.enabled" -> "true",
+    // The MERGE twins use a VALUES source, planned as a LocalTableScan; with it columnar the MERGE's join,
+    // project and row operator convert too, so the delta write's exchange is our columnar one (in production
+    // the source is an ordinary scan, already columnar). This keeps the MERGE write columnar end to end.
+    "spark.vecruntime.exec.localTableScan.enabled" -> "true"
   )
 
   private def withPath[T](on: Boolean)(f: => T): T = {
@@ -130,6 +134,31 @@ class TestMergeOnReadUpdateMergePortedSuite extends AnyFunSuite with BeforeAndAf
       val df = spark.sql(sql.replace("%s", s"${base}_on"))
       val had = planHasVectorWriteDelta(df)
       df.collect()
+      had
+    }
+  }
+
+  /**
+   * Like [[onOff]], but also asserts the merge-on-read write stayed COLUMNAR end to end: the clustering Iceberg
+   * requires for delete-file granularity (by `_spec_id`/`_partition`/`_file`) must be carried by our columnar
+   * exchange, and the write must read that stage's batches directly rather than a row-to-columnar round trip
+   * (`VectorWriteDeltaExec` reads rows when its child is row). The counter is JVM-global, so the baseline is
+   * snapshotted HERE, immediately before the on-side execution, and only the delta from this one run is
+   * asserted -- never an absolute value, and never captured in the constructor.
+   */
+  private def onOffColumnar(base: String, sql: String): Boolean = {
+    withPath(on = false)(spark.sql(sql.replace("%s", s"${base}_off")).collect())
+    withPath(on = true) {
+      val df = spark.sql(sql.replace("%s", s"${base}_on"))
+      val had = planHasVectorWriteDelta(df)
+      val rowInputBefore = org.apache.spark.sql.vecruntime.VectorWriteDeltaExec.rowInputWrites.get()
+      df.collect()
+      val rowInputAfter = org.apache.spark.sql.vecruntime.VectorWriteDeltaExec.rowInputWrites.get()
+      assert(
+        rowInputAfter == rowInputBefore,
+        s"$base: the merge-on-read write read ROWS (RowToColumnarExec) -- it must stay columnar end to end " +
+          s"(rowInputWrites went $rowInputBefore -> $rowInputAfter)"
+      )
       had
     }
   }
@@ -200,7 +229,10 @@ class TestMergeOnReadUpdateMergePortedSuite extends AnyFunSuite with BeforeAndAf
         createMor(s"${base}_$suffix", partitioned = true, granularity)
         seedHrIt(s"${base}_$suffix")
       }
-      assert(onOff(base, "UPDATE %s SET id = id - 1 WHERE id = 1 OR id = 3"), s"$base: UPDATE must plan our operator")
+      assert(
+        onOffColumnar(base, "UPDATE %s SET id = id - 1 WHERE id = 1 OR id = 3"),
+        s"$base: UPDATE must plan our operator"
+      )
       assertSameTwin(base)
       val expected = if (granularity == "file") 4L else 2L
       assert(deleteFileStats(s"${base}_off")._1 == expected, s"$base: Iceberg delete-file count != $expected")
@@ -303,7 +335,7 @@ class TestMergeOnReadUpdateMergePortedSuite extends AnyFunSuite with BeforeAndAf
         """MERGE INTO %s AS t USING mrg_src AS s ON t.id = s.value
           |WHEN MATCHED THEN DELETE
           |WHEN NOT MATCHED THEN INSERT (id, dep) VALUES (-1, 'other')""".stripMargin
-      assert(onOff(base, merge), s"$base: MERGE must plan our operator")
+      assert(onOffColumnar(base, merge), s"$base: MERGE must plan our operator")
       assertSameTwin(base)
       val expected = if (granularity == "file") 4L else 2L
       assert(deleteFileStats(s"${base}_off")._1 == expected, s"$base: Iceberg delete-file count != $expected")
