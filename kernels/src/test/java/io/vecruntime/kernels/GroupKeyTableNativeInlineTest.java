@@ -119,7 +119,12 @@ class GroupKeyTableNativeInlineTest {
         table.allowNative();
         fill(table, 300_000, 943, 35);
         assertFalse(table.inlineKeys(), "a null key group ends the inline path");
-        assertEquals(0L, table.nativeBytes(), "and gives the pool block back");
+        assertFalse(table.nativeInline(), "and gives the pairs' pool block back");
+        // #941 phase 2b: the generic slots, past the threshold too, stay in the pool until close
+        assertTrue(table.nativeSlots(), "the generic slots are in the pool");
+        assertEquals(8L * Integer.highestOneBit((int) (table.nativeBytes() / 8)), table.nativeBytes(),
+                "only the slot entries are left in the pool");
         table.close();
+        assertEquals(0L, table.nativeBytes(), "closed");
     }
 }
