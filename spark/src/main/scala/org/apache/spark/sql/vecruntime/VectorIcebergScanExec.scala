@@ -1220,9 +1220,9 @@ private[vecruntime] object IcebergTasks {
    * built directly into ONE Iceberg `Expression` (an IN set, a range `And(>=, <=)`, equality, null checks; any
    * other shape skipped, so pruning stays conservative). Iceberg's Spark scan strips per-file column bounds from
    * its task `DataFile`s, so they cannot be evaluated directly; instead a FRESH table scan is planned on the
-   * driver on the SAME snapshot, with the scan's residual AND the runtime expression, asking Iceberg to KEEP
-   * column stats (`includeColumnStats`). Iceberg then applies its own `InclusiveMetricsEvaluator` over the
-   * manifests it already read and cached, yielding exactly the files that can still match -- the KEEP set.
+   * driver on the SAME snapshot, with the scan's residual AND the runtime expression. Iceberg's manifest reader
+   * applies its own `InclusiveMetricsEvaluator` to each entry while planning (re-reading the snapshot's manifests;
+   * no data file is opened), yielding exactly the files that can still match -- the KEEP set.
    * Every task file NOT in the KEEP set is dropped. A file under metrics mode `none` (no bounds) stays in the
    * KEEP set, as the evaluator keeps it; truncated string bounds are handled by the evaluator itself.
    *
@@ -1231,7 +1231,7 @@ private[vecruntime] object IcebergTasks {
    * always safe for its delete files (position deletes, deletion vectors and equality deletes only REMOVE rows,
    * so a file with no matching row has no matching row after deletes either) and for v3 row lineage (`_row_id` /
    * `_last_updated_sequence_number` are per-file, so dropping a file drops only its own rows). The re-plan is
-   * driver-side and reads only manifests (already cached from the first planning) -- it opens no data file.
+   * driver-side and reads the snapshot's manifests again -- it opens no data file.
    */
   def runtimeFilePruneDropSet(
       scan: BatchScanExec,
@@ -1291,10 +1291,10 @@ private[vecruntime] object IcebergTasks {
 
       // Iceberg's Spark scan STRIPS per-file column bounds from its task `DataFile`s (they keep only the record
       // count), so `task.file()` cannot be evaluated directly. Re-plan on the driver instead: a fresh table scan
-      // on the SAME snapshot, with the scan's residual AND the runtime expression, asking Iceberg to KEEP column
-      // stats -- Iceberg then applies its own `InclusiveMetricsEvaluator` over the manifests (which it already
-      // read and cached when it first planned) and yields exactly the files that can still match. This opens no
-      // data file. The KEEP set is those files; our task files NOT in it are pruned.
+      // on the SAME snapshot, with the scan's residual AND the runtime expression. Iceberg's manifest reader
+      // applies its own `InclusiveMetricsEvaluator` to each entry's bounds while planning (the returned tasks need
+      // no stats, so none are kept) and yields exactly the files that can still match. This opens no data file;
+      // it reads the snapshot's manifests again. The KEEP set is those files; our task files NOT in it are pruned.
       val sparkScan = scan.scan // Iceberg's SparkBatchQueryScan
       val table = call(sparkScan, "table")
       val residual = call(sparkScan, "filter") // the scan's already-applied residual expression
@@ -1310,8 +1310,7 @@ private[vecruntime] object IcebergTasks {
         scanClass.getMethod("caseSensitive", java.lang.Boolean.TYPE)
           .invoke(onSnapshot, java.lang.Boolean.valueOf(caseSensitive))
       val filtered = scanClass.getMethod("filter", exprClass).invoke(caseSens, fullExpr)
-      val withStats = scanClass.getMethod("includeColumnStats").invoke(filtered)
-      val plan = scanClass.getMethod("planFiles").invoke(withStats)
+      val plan = scanClass.getMethod("planFiles").invoke(filtered)
       val keep = scala.collection.mutable.HashSet.empty[String]
       val closeable = plan.asInstanceOf[java.lang.Iterable[AnyRef]]
       val it = closeable.iterator()
