@@ -56,10 +56,13 @@ import org.apache.spark.sql.vectorized.ColumnarBatch
  *    opens stay on the lead's platform prefetch pool. A `platform` switch keeps platform threads for an A/B.
  *  - '''Bounded in flight.''' At most `depth` + 1 units are outstanding, so the extra memory is a bounded
  *    number of row groups' decoded batches, and the consumer blocks on the pool rather than running ahead.
- *  - '''Close / LIMIT / failure.''' On task end, a LIMIT or a failure the consumer stops polling, cancels and
- *    drains the queued units (releasing every decoded batch and closing every in-flight job's set / allocator),
- *    and only then closes the lead. A helper's exception is raised on the consumer thread when it takes that
- *    job's result, in order.
+ *  - '''Close / LIMIT / failure.''' On task end, a LIMIT or a failure the consumer stops polling and drains the
+ *    queued units (releasing every decoded batch and closing every in-flight job's set / allocator), and only
+ *    then closes the lead. The bounded set of in-flight helper jobs is let run to completion UNINTERRUPTED and
+ *    drained in order: interrupting a pure-CPU decode mid-`readBatch` does not stop it, it only makes a later
+ *    allocation throw with buffers already taken from the job's child allocator but not yet pooled, which the
+ *    decode's own cleanup cannot free -- so the close must not interrupt (#981). A helper's exception is raised
+ *    on the consumer thread when it takes that job's result, in order.
  */
 private[vecruntime] final class ParallelDecodeIterator(
     lead: VectorParquetPartitionReader,
@@ -208,6 +211,8 @@ private[vecruntime] final class ParallelDecodeIterator(
   private def decode(job: RowGroupJob): JobResult = {
     val alloc = io.vecruntime.spark.arrow.VectorAllocators.newChild("VectorParquetScanExec-pdecode")
     val readers = lead.readersForJob(job, alloc)
+    val hook = ParallelDecodeIterator.decodeHook
+    if (hook != null) hook.run() // test-only seam (#981): hold a HELPER mid-decode across the task's close
     try new JobResult(lead.decodeJob(job, readers, alloc), readers, alloc)
     catch {
       case t: Throwable =>
@@ -243,14 +248,16 @@ private[vecruntime] final class ParallelDecodeIterator(
         }
         o = pending.poll()
       }
-      // Stop the helpers: a job not started yet never runs (its slot completes empty); a running one is
-      // interrupted and either finishes or fails (closing its own set). Then drain every queued slot, waiting for a
-      // running job's result, releasing its batches and closing its set. A running job's future is never
-      // cancelled: its result would be dropped with its allocator still open.
-      pool.shutdownNow().forEach {
-        case t: DecodeTask => t.result.completeExceptionally(new java.util.concurrent.CancellationException())
-        case _ => ()
-      }
+      // Stop the helpers WITHOUT interrupting a running decode. A helper decodes on a thread that does not
+      // check interrupts, so interrupting it (the old `shutdownNow`) does not stop the decode -- it only makes
+      // an allocation deep in `readBatch` throw once the interrupt flag is set, and that throw escapes with
+      // buffers already taken from the job's child allocator but not yet owned by a reader's pool, so the
+      // decode's own cleanup cannot free them and the child allocator leaks (#981: a few KB left under the root
+      // after every LIMIT, intermittently failing the leak assertion on a shared-JVM CI run). Instead we
+      // `shutdown()` (refuse new work; the bounded set of already-enqueued jobs still runs to completion
+      // untouched) and drain every queued slot, blocking on each running job's result in order, releasing its
+      // batches and closing its set. Every job thus finishes cleanly and exactly one party closes its set.
+      pool.shutdown()
       var slot = slots.poll()
       while (slot != null) {
         try {
@@ -275,6 +282,13 @@ object ParallelDecodeIterator {
   /** Helper threads started in this JVM, and how many were virtual (read by tests). */
   val started = new java.util.concurrent.atomic.AtomicLong()
   val startedVirtual = new java.util.concurrent.atomic.AtomicLong()
+
+  /**
+   * Test-only seam (default null, no production cost): if set, [[ParallelDecodeIterator.decode]] runs it once a
+   * child allocator exists but before the batches are built. The #981 regression test uses it to hold a helper
+   * mid-decode so it is still running when the task is cancelled, reproducing the shutdown leak deterministically.
+   */
+  @volatile var decodeHook: Runnable = _
 
   /** An already-completed future wrapping `v`. */
   private def done[T](v: T): Future[T] = java.util.concurrent.CompletableFuture.completedFuture(v)
