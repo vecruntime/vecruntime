@@ -38,17 +38,18 @@ import static io.vecruntime.kernels.VectorBuffers.LE_LONG;
 /**
  * Writes one leaf column of a nested field (#901 item 13) straight to its
  * {@link PageWriter}, off parquet-java's per-value column writer. The caller
- * ({@link NestedFieldWriter}) walks each row's nested lane and feeds this writer
- * a repetition and definition level per leaf occurrence ({@link #putNull} for a
- * null or absent leaf, {@link #put} for a present value).
+ * ({@link NestedFieldWriter}) walks each row's nested lane and feeds this
+ * writer a repetition and definition level per leaf occurrence ({@link
+ * #putNull} for a null or absent leaf, {@link #put} for a present value).
  *
  * <p>Data page v2: the repetition and definition levels are RLE / bit-packed
- * hybrid, bit width {@code bitWidth(maxRep)} and {@code bitWidth(maxDef)}, in the
- * page's separate level sections (no length prefix); the values are encoded with
- * the same per-type encoders a flat column uses -- DELTA_BINARY_PACKED for INT32
- * and INT64, PLAIN for DOUBLE and FLOAT, dictionary ({@code RLE_DICTIONARY}) with
- * a DELTA_BYTE_ARRAY fallback for BINARY, PLAIN for FIXED_LEN_BYTE_ARRAY and
- * INT96, RLE for BOOLEAN. Page statistics carry the min, max and null count the
+ * hybrid, bit width {@code bitWidth(maxRep)} and {@code bitWidth(maxDef)}, in
+ * the page's separate level sections (no length prefix); the values are encoded
+ * with the same per-type encoders a flat column uses -- DELTA_BINARY_PACKED for
+ * INT32 and INT64, PLAIN for DOUBLE and FLOAT, dictionary ({@code
+ * RLE_DICTIONARY}) with a DELTA_BYTE_ARRAY fallback for BINARY, PLAIN for
+ * FIXED_LEN_BYTE_ARRAY and INT96, PLAIN (one bit per value, least significant
+ * bit first) for BOOLEAN. Page statistics carry the min, max and null count the
  * leaf's comparator defines (INT96 and the levels histogram aside). A reader --
  * parquet-java's, Spark's or ours -- reconstructs the records from the levels.
  */
@@ -101,7 +102,6 @@ final class NestedLeafWriter {
     private final ByteSink repSink = new ByteSink(256);
     private final ByteSink defSink = new ByteSink(256);
     private final DeltaBinaryPackedEncoder delta = new DeltaBinaryPackedEncoder();
-    private final ByteSink rleScratch = new ByteSink(256);
 
     NestedLeafWriter(ColumnDescriptor column, ParquetProperties props) {
         this.column = column;
@@ -426,15 +426,14 @@ final class NestedLeafWriter {
         }
         switch (kind) {
             case BOOLEAN -> {
-                rleScratch.reset();
+                // PLAIN BOOLEAN: one bit per value, least significant bit first, in ceil(n / 8) bytes with
+                // no length prefix (Iceberg's vectorized reader rejects RLE-encoded boolean values).
                 int[] b = new int[presentValues];
                 for (int k = 0; k < presentValues; k++) {
                     b[k] = (int) fixedValues[k];
                 }
-                RleHybridEncoder.encode(b, presentValues, 1, rleScratch);
-                body.writeIntLE(rleScratch.size());
-                body.write(rleScratch);
-                return Encoding.RLE;
+                body.packBits(b, 0, presentValues, (presentValues + 7) & ~7, 1);
+                return Encoding.PLAIN;
             }
             case DOUBLE, FLOAT -> {
                 if (kind == Kind.DOUBLE) {

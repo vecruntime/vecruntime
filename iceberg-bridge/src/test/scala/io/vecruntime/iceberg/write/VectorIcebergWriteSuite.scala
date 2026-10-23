@@ -646,4 +646,41 @@ class VectorIcebergWriteSuite extends AnyFunSuite with BeforeAndAfterAll {
     df.collect()
     assert(!columnar(df))
   }
+
+  test("booleans written columnar read back through Iceberg's own vectorized reader") {
+    // Our columnar writer emits BOOLEAN values as PLAIN, not RLE: Iceberg's vectorized Spark reader
+    // (VectorizedPageIterator.initDataReader) rejects an RLE-encoded boolean column, so a vecruntime-written
+    // table must be readable by stock Iceberg-on-Spark with vectorization at its default. The write runs with
+    // the columnar writer on; the read-back runs with the engine off, so Iceberg's own reader decodes it.
+    val cols = "id BIGINT, b BOOLEAN, st STRUCT<x: BOOLEAN>, xs ARRAY<BOOLEAN>, m MAP<STRING, BOOLEAN>"
+    // Buckets of all-true, all-false and mixed runs, each with nulls, so flat and nested boolean leaves cover
+    // every run shape and null placement.
+    val src =
+      """SELECT id,
+        |  CASE WHEN id % 7 = 0 THEN null WHEN id % 300 < 100 THEN true
+        |       WHEN id % 300 < 200 THEN false ELSE id % 2 = 0 END as b,
+        |  if(id % 11 = 0, null, named_struct('x', if(id % 3 = 0, null, id % 300 < 150))) as st,
+        |  if(id % 5 = 0, null, array(id % 2 = 0, id % 300 < 150, null, false, true)) as xs,
+        |  if(id % 13 = 0, null, map('a', id % 2 = 0, 'b', if(id % 4 = 0, null, id % 300 < 150))) as m
+        |FROM range(6000)""".stripMargin
+    val (off, on) = ("ice.db.bool_off", "ice.db.bool_on")
+    Seq(off, on).foreach { t =>
+      spark.sql(s"DROP TABLE IF EXISTS $t")
+      spark.sql(s"CREATE TABLE $t ($cols) USING iceberg TBLPROPERTIES ('format-version'='2')")
+    }
+    // Both tables written by Iceberg's own row writer (off) and our columnar writer (on).
+    withWriter(on = false)(spark.sql(s"INSERT INTO $off $src").collect())
+    val df = withWriter(on = true)(spark.sql(s"INSERT INTO $on $src"))
+    df.collect()
+    assert(columnar(df), "the boolean append must run the columnar writer")
+    // Read both back with the engine OFF, so Iceberg's own vectorized reader at its default decodes the files.
+    spark.conf.set("spark.vecruntime.enabled", "false")
+    try {
+      def read(t: String) =
+        spark.sql(s"SELECT id, b, st.x, xs, m FROM $t ORDER BY id").collect().map(_.toString).toSeq
+      val onRows = read(on)
+      assert(onRows == read(off), "the vecruntime-written booleans differ when read by Iceberg's reader")
+      assert(onRows.length == 6000)
+    } finally spark.conf.unset("spark.vecruntime.enabled")
+  }
 }
