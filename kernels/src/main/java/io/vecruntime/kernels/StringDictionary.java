@@ -15,6 +15,7 @@
  */
 package io.vecruntime.kernels;
 
+import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.lang.invoke.MethodHandles;
@@ -47,6 +48,157 @@ public final class StringDictionary {
     private int[] offsets = new int[33];
     private MemorySegment dataSegment = MemorySegment.ofArray(data);
     private MemorySegment offsetSegment = MemorySegment.ofArray(offsets);
+
+    /**
+     * Whether this JVM runs on aarch64, where the pool layout was measured
+     * faster (#941 phase 2d).
+     */
+    static final boolean AARCH64 = "aarch64".equals(System.getProperty("os.arch"));
+
+    /**
+     * Value bytes from which a dictionary whose owner {@link #allowNative allows
+     * it} moves into pool blocks (#941 phase 2d). {@code
+     * KeyColumnStorageBenchmark} on Graviton4, pool against heap: a lookup
+     * 1.29-3.28x at every size, the key output's gather 0.79-0.95x to 256K
+     * values and 1.01-1.29x from 1M; on Skylake-SP, Sapphire Rapids, Granite
+     * Rapids, Genoa and Turin the lookup is 0.39-0.90x and the gather
+     * 0.31-0.50x, so there the default is never. 16 MiB -- a G1 humongous
+     * array with 32 MiB regions -- is about 500K product-name values, past
+     * the gather's crossover. Measured on Graviton4 only among aarch64 CPUs.
+     */
+    static final long NATIVE_DICT_BYTES = Long.getLong("vecruntime.agg.nativeDictBytes", AARCH64 ? 16L << 20 : Long.MAX_VALUE);
+
+    /**
+     * {@link #NATIVE_DICT_BYTES} unless a test moved it ({@link
+     * #setNativeBytesForTests}).
+     */
+    private static long nativeBytesFrom = NATIVE_DICT_BYTES;
+
+    /**
+     * Package-private, for the tests: the size past which an allowed dictionary
+     * moves; -1 restores the default.
+     */
+    static void setNativeBytesForTests(long bytes) {
+        nativeBytesFrom = bytes < 0 ? NATIVE_DICT_BYTES : bytes;
+    }
+
+    private static final ValueLayout.OfLong N_LONG = ValueLayout.JAVA_LONG;
+    private static final ValueLayout.OfInt N_INT = ValueLayout.JAVA_INT;
+
+    private boolean nativeAllowed;
+
+    // Pool mode (all null on the heap): per id one 16-byte entry -- fingerprint, length, offset -- so a probe's
+    // candidate is one line before the bytes; the id table; the offsets again, contiguous, for view(); the bytes.
+    private MemorySegment nEntries;
+    private MemorySegment nIds;
+    private MemorySegment nOffsets;
+    private MemorySegment nData;
+    private Arena aEntries;
+    private Arena aIds;
+    private Arena aOffsets;
+    private Arena aData;
+
+    /**
+     * Lets the values move into pool blocks past {@link #NATIVE_DICT_BYTES};
+     * the owner must {@link #close}.
+     */
+    public void allowNative() {
+        nativeAllowed = true;
+    }
+
+    /**
+     * Whether the values live in pool blocks: {@link #bytes} is then
+     * unavailable, use {@link #dataSegment}.
+     */
+    public boolean isNative() {
+        return nData != null;
+    }
+
+    /**
+     * The value bytes, wherever they live (heap or pool); valid until the next
+     * insert.
+     */
+    public MemorySegment dataSegment() {
+        return dataSegment;
+    }
+
+    /** Pool bytes held. */
+    public long nativeBytes() {
+        if (nData == null) {
+            return 0L;
+        }
+        return nEntries.byteSize()
+                + nIds.byteSize()
+                + nOffsets.byteSize()
+                + nData.byteSize();
+    }
+
+    /** Gives the pool blocks back; the dictionary is not used afterwards. */
+    public void close() {
+        for (Arena a : new Arena[] {aEntries, aIds, aOffsets, aData}) {
+            if (a != null) {
+                a.close();
+            }
+        }
+        aEntries = aIds = aOffsets = aData = null;
+        nEntries = nIds = nOffsets = nData = null;
+    }
+
+    private static MemorySegment alloc(long bytes, Arena a) {
+        return a.allocate(Math.max(8L, bytes), 64);
+    }
+
+    /**
+     * The heap arrays into pool blocks of the same capacity; the arrays are
+     * dropped.
+     */
+    private void toNative() {
+        int cap = bits.length;
+        Arena ae = NativePool.shared().newArena();
+        MemorySegment e = alloc(16L * cap, ae);
+        for (int id = 0; id < size; id++) {
+            e.setAtIndex(N_LONG, 2L * id, bits[id]);
+            e.set(N_INT, 16L * id + 8, lens[id]);
+            e.set(N_INT, 16L * id + 12, offsets[id]);
+        }
+        Arena ai = NativePool.shared().newArena();
+        MemorySegment t = alloc(4L * ids.length, ai);
+        MemorySegment.copy(ids, 0, t, N_INT, 0, ids.length);
+        Arena ao = NativePool.shared().newArena();
+        MemorySegment o = alloc(4L * offsets.length, ao);
+        MemorySegment.copy(offsets, 0, o, N_INT, 0, offsets.length);
+        Arena ad = NativePool.shared().newArena();
+        MemorySegment d = alloc(data.length, ad);
+        MemorySegment.copy(data, 0, d, ValueLayout.JAVA_BYTE, 0, used);
+        nEntries = e;
+        nIds = t;
+        nOffsets = o;
+        nData = d;
+        aEntries = ae;
+        aIds = ai;
+        aOffsets = ao;
+        aData = ad;
+        dataSegment = d;
+        offsetSegment = o;
+        bits = null;
+        lens = null;
+        ids = null;
+        offsets = null;
+        data = null;
+    }
+
+    /**
+     * {@code seg} regrown to at least {@code bytes}, contents kept; the old
+     * block is given back.
+     */
+    private MemorySegment regrow(MemorySegment seg, Arena[] arena, long bytes) {
+        Arena a = NativePool.shared().newArena();
+        MemorySegment n = alloc(Math.max(bytes, 2 * seg.byteSize()), a);
+        MemorySegment.copy(seg, 0, n, 0, seg.byteSize());
+        arena[0].close();
+        arena[0] = a;
+        return n;
+    }
 
     public int size() {
         return size;
@@ -143,7 +295,11 @@ public final class StringDictionary {
      * every pending row is flushed).
      */
     public void clear() {
-        Arrays.fill(ids, -1);
+        if (nData != null) {
+            nIds.fill((byte) -1);
+        } else {
+            Arrays.fill(ids, -1);
+        }
         Arrays.fill(singleByte, -1);
         size = 0;
         used = 0;
@@ -152,6 +308,9 @@ public final class StringDictionary {
     private int probe(long packed, int len, byte[] src,
                       int from, boolean insert) {
         int pos = HashKernels.finish(HashKernels.mix32(HashKernels.fold(packed), len)) & mask;
+        if (nData != null) {
+            return probeNative(packed, len, src, from, insert, pos);
+        }
         while (true) {
             int id = ids[pos];
             if (id < 0) {
@@ -164,6 +323,83 @@ public final class StringDictionary {
             }
             pos = (pos + 1) & mask;
         }
+    }
+
+    private int probeNative(long packed, int len, byte[] src,
+                            int from, boolean insert, int pos) {
+        MemorySegment e = nEntries;
+        MemorySegment t = nIds;
+        while (true) {
+            int id = t.getAtIndex(N_INT, pos);
+            if (id < 0) {
+                return insert ? insertNative(packed, len, src, from, pos) : -1;
+            }
+            long at = 16L * id;
+            if (e.get(N_LONG, at) == packed
+                    && e.get(N_INT, at + 8) == len
+                    && (len <= PACKED_KEY_BYTES || MemorySegment.mismatch(nData, e.get(N_INT, at + 12), e.get(N_INT, at + 12) + (long) len,
+                            MemorySegment.ofArray(src), from, from + (long) len)
+                            < 0)) {
+                return id;
+            }
+            pos = (pos + 1) & mask;
+        }
+    }
+
+    private int insertNative(long packed, int len, byte[] src,
+            int from, int pos) {
+        int id = size;
+        Arena[] box = new Arena[1];
+        if (16L * (id + 1) > nEntries.byteSize()) {
+            box[0] = aEntries;
+            nEntries = regrow(nEntries, box, 16L * (id + 1));
+            aEntries = box[0];
+        }
+        if (4L * (id + 2) > nOffsets.byteSize()) {
+            box[0] = aOffsets;
+            nOffsets = regrow(nOffsets, box, 4L * (id + 2));
+            aOffsets = box[0];
+            offsetSegment = nOffsets;
+        }
+        if ((long) used + len > nData.byteSize()) {
+            box[0] = aData;
+            nData = regrow(nData, box, (long) used + len);
+            aData = box[0];
+            dataSegment = nData;
+        }
+        long at = 16L * id;
+        nEntries.set(N_LONG, at, packed);
+        nEntries.set(N_INT, at + 8, len);
+        nEntries.set(N_INT, at + 12, used);
+        MemorySegment.copy(src, from, nData, ValueLayout.JAVA_BYTE, used, len);
+        used += len;
+        nOffsets.setAtIndex(N_INT, id + 1, used);
+        nIds.setAtIndex(N_INT, pos, id);
+        size++;
+        if (size * 2L > mask + 1L) {
+            rehashNative();
+        }
+        return id;
+    }
+
+    private void rehashNative() {
+        long slots = 2L * (mask + 1L);
+        Arena a = NativePool.shared().newArena();
+        MemorySegment t = alloc(4L * slots, a);
+        t.fill((byte) -1);
+        int newMask = (int) (slots - 1);
+        for (int id = 0; id < size; id++) {
+            long at = 16L * id;
+            int pos = HashKernels.finish(HashKernels.mix32(HashKernels.fold(nEntries.get(N_LONG, at)), nEntries.get(N_INT, at + 8))) & newMask;
+            while (t.getAtIndex(N_INT, pos) >= 0) {
+                pos = (pos + 1) & newMask;
+            }
+            t.setAtIndex(N_INT, pos, id);
+        }
+        aIds.close();
+        aIds = a;
+        nIds = t;
+        mask = newMask;
     }
 
     private boolean sameBytes(int id, byte[] src, int from,
@@ -188,6 +424,10 @@ public final class StringDictionary {
             data = Arrays.copyOf(data,
                     Math.max(data.length * 2, used + len));
             dataSegment = MemorySegment.ofArray(data);
+            if (nativeAllowed && data.length >= nativeBytesFrom) {
+                toNative();
+                return insertNative(packed, len, src, from, pos);
+            }
         }
         bits[id] = packed;
         lens[id] = len;
@@ -226,14 +466,24 @@ public final class StringDictionary {
     }
 
     public int offset(int id) {
-        return offsets[id];
+        return nData == null ? offsets[id] : nOffsets.getAtIndex(N_INT, id);
     }
 
     public int length(int id) {
+        if (nData != null) {
+            return nOffsets.getAtIndex(N_INT, id + 1) - nOffsets.getAtIndex(N_INT, id);
+        }
         return offsets[id + 1] - offsets[id];
     }
 
+    /**
+     * The value bytes on the heap; not for a dictionary in the pool ({@link
+     * #isNative}).
+     */
     public byte[] bytes() {
+        if (nData != null) {
+            throw new IllegalStateException("the dictionary is in the pool: read dataSegment()");
+        }
         return data;
     }
 
@@ -243,6 +493,9 @@ public final class StringDictionary {
     }
 
     public long memoryBytes() {
+        if (nData != null) {
+            return 4L * singleByte.length; // the rest is in the pool (nativeBytes)
+        }
         return 8L * bits.length
                 + 4L * lens.length
                 + 4L * ids.length
