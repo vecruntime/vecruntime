@@ -99,6 +99,7 @@ public class PagedAccumulatorBenchmark {
     long[] countArr;
     MemorySegment sumSeg;
     MemorySegment countSeg;
+    MemorySegment pairSeg;
 
     int shift; // log2(longs per page)
     long mask;
@@ -125,6 +126,7 @@ public class PagedAccumulatorBenchmark {
         countArr = new long[groups];
         sumSeg = pool.allocate(8L * groups, 64).fill((byte) 0);
         countSeg = pool.allocate(8L * groups, 64).fill((byte) 0);
+        pairSeg = pool.allocate(16L * groups, 64).fill((byte) 0);
 
         long pageBytes = 1024L * pageKiB;
         int perPage = (int) (pageBytes / 8);
@@ -255,6 +257,43 @@ public class PagedAccumulatorBenchmark {
         }
         int k = g[0];
         return all.get(LONG, pages[k >>> s] + ((k & m) << 4));
+    }
+
+    /**
+     * One flat pool block, a group's sum and count side by side: the pairing
+     * without the page lookup (on Graviton 4 the flat block beat the paged
+     * pairs past 1M groups, so this splits the two effects).
+     */
+    @Benchmark
+    @OperationsPerInvocation(N)
+    public long scatterFlatPair() {
+        long[] x = scratch;
+        MemorySegment.copy(input, LE_LONG, 0, x, 0, N);
+        MemorySegment all = ALL;
+        long base = pairSeg.address();
+        int[] g = ids;
+        for (int i = 0; i < N; i++) {
+            long a = base + ((long) g[i] << 4);
+            all.set(LONG, a, all.get(LONG, a) + x[i]);
+            all.set(LONG, a + 8, all.get(LONG, a + 8) + 1);
+        }
+        return all.get(LONG, base + ((long) g[0] << 4));
+    }
+
+    /** {@link #scatterFlatPair} through the block's own segment, not by address. */
+    @Benchmark
+    @OperationsPerInvocation(N)
+    public long scatterFlatPairSeg() {
+        long[] x = scratch;
+        MemorySegment.copy(input, LE_LONG, 0, x, 0, N);
+        MemorySegment p = pairSeg;
+        int[] g = ids;
+        for (int i = 0; i < N; i++) {
+            long k = (long) g[i] << 1;
+            p.setAtIndex(LONG, k, p.getAtIndex(LONG, k) + x[i]);
+            p.setAtIndex(LONG, k + 1, p.getAtIndex(LONG, k + 1) + 1);
+        }
+        return p.getAtIndex(LONG, (long) g[0] << 1);
     }
 
     /**

@@ -48,7 +48,7 @@ public final class GroupedAccumulators {
     /**
      * #941: whether an accumulator past {@link #COLLAPSE_GROUPS} groups -- one
      * copy, millions of groups at 10 TB -- moves its state from heap arrays
-     * into {@link NativePool} blocks ({@link NativeLongs}), which a task
+     * into {@link NativePool} blocks ({@link InterleavedSlots}), which a task
      * thread's arena charges to the task in the operators' memory mode. Below
      * the threshold the state stays on the heap: it is small there, and the
      * interleaved copies and the masked path are tuned on arrays (on AVX-512 a
@@ -365,8 +365,7 @@ public final class GroupedAccumulators {
         private int copies = INTERLEAVE; // 1 once past COLLAPSE_GROUPS groups
         private long[] sum = new long[64 * INTERLEAVE];
         private long[] count = new long[64 * INTERLEAVE];
-        private NativeLongs nSum; // #941: the state once native; sum and count are then null
-        private NativeLongs nCount;
+        private InterleavedSlots nat; // #941: sum (field 0) and count (1) once native; the arrays are then null
         private final Scratch scratch = new Scratch();
         private final boolean checked;
 
@@ -392,13 +391,11 @@ public final class GroupedAccumulators {
                         long s = ints
                                 ? AggKernels.sumInt(sub)
                                 : (checked ? AggKernels.sumLongExact(sub) : AggKernels.sumLong(sub));
-                        if (nSum != null) {
-                            MemorySegment ns = nSum.segment();
-                            MemorySegment nc = nCount.segment();
-                            long old = ns.getAtIndex(NativeLongs.LONG, g);
-                            ns.setAtIndex(NativeLongs.LONG, g,
+                        if (nat != null) {
+                            long old = nat.get(g, 0);
+                            nat.set(g, 0,
                                     checked ? Math.addExact(old, s) : old + s);
-                            nc.setAtIndex(NativeLongs.LONG, g, nc.getAtIndex(NativeLongs.LONG, g) + c);
+                            nat.set(g, 1, nat.get(g, 1) + c);
                         } else {
                             sum[g] = checked ? Math.addExact(sum[g], s) : sum[g] + s;
                             count[g] += c;
@@ -412,7 +409,7 @@ public final class GroupedAccumulators {
             // Ints are widened into the long scratch so one loop serves both types.
             long[] x = ints ? scratch.longsFromInts(v.data(), n) : scratch.longs(v.data(), n);
             MemorySegment validity = a.effectiveValidity(v);
-            if (nSum != null) {
+            if (nat != null) {
                 updateNative(x, ids, n, validity);
                 return;
             }
@@ -478,9 +475,8 @@ public final class GroupedAccumulators {
         private void ensure(int groups) {
             if (groups > capacity) {
                 int cap = grow(capacity, groups);
-                if (nSum != null) {
-                    nSum.grow(cap);
-                    nCount.grow(cap);
+                if (nat != null) {
+                    nat.grow(cap);
                     capacity = cap;
                     return;
                 }
@@ -493,34 +489,38 @@ public final class GroupedAccumulators {
                     count = collapse(count, capacity, cap, copies, false);
                     copies = c;
                 }
+                int old = capacity;
                 capacity = cap;
                 if (goNative(copies, cap)) {
-                    nSum = new NativeLongs(sum, cap, cap);
-                    nCount = new NativeLongs(count, cap, cap);
+                    nat = new InterleavedSlots(2, cap);
+                    nat.load(0, sum, old);
+                    nat.load(1, count, old);
                     sum = null;
                     count = null;
                 }
             }
         }
 
-        /** The one-copy scatter over the native state (#941). */
+        /**
+         * The one-copy scatter over the native state, sum and count side by
+         * side (#941).
+         */
         private void updateNative(long[] x, int[] ids, int n,
                 MemorySegment validity) {
-            MemorySegment sum = nSum.segment();
-            MemorySegment count = nCount.segment();
+            MemorySegment st = nat.segment();
             if (validity == null && !checked) {
                 for (int i = 0; i < n; i++) {
-                    long g = ids[i];
-                    sum.setAtIndex(NativeLongs.LONG, g, sum.getAtIndex(NativeLongs.LONG, g) + x[i]);
-                    count.setAtIndex(NativeLongs.LONG, g, count.getAtIndex(NativeLongs.LONG, g) + 1);
+                    long k = (long) ids[i] << 1;
+                    st.setAtIndex(InterleavedSlots.LONG, k, st.getAtIndex(InterleavedSlots.LONG, k) + x[i]);
+                    st.setAtIndex(InterleavedSlots.LONG, k + 1, st.getAtIndex(InterleavedSlots.LONG, k + 1) + 1);
                 }
                 return;
             }
             if (validity == null) {
                 for (int i = 0; i < n; i++) {
-                    long g = ids[i];
-                    sum.setAtIndex(NativeLongs.LONG, g, Math.addExact(sum.getAtIndex(NativeLongs.LONG, g), x[i]));
-                    count.setAtIndex(NativeLongs.LONG, g, count.getAtIndex(NativeLongs.LONG, g) + 1);
+                    long k = (long) ids[i] << 1;
+                    st.setAtIndex(InterleavedSlots.LONG, k, Math.addExact(st.getAtIndex(InterleavedSlots.LONG, k), x[i]));
+                    st.setAtIndex(InterleavedSlots.LONG, k + 1, st.getAtIndex(InterleavedSlots.LONG, k + 1) + 1);
                 }
                 return;
             }
@@ -531,18 +531,18 @@ public final class GroupedAccumulators {
                 while (bits != 0L) {
                     int i = (w << 6) + Long.numberOfTrailingZeros(bits);
                     bits &= bits - 1;
-                    long g = ids[i];
-                    long s = sum.getAtIndex(NativeLongs.LONG, g);
-                    sum.setAtIndex(NativeLongs.LONG, g,
+                    long k = (long) ids[i] << 1;
+                    long s = st.getAtIndex(InterleavedSlots.LONG, k);
+                    st.setAtIndex(InterleavedSlots.LONG, k,
                             checked ? Math.addExact(s, x[i]) : s + x[i]);
-                    count.setAtIndex(NativeLongs.LONG, g, count.getAtIndex(NativeLongs.LONG, g) + 1);
+                    st.setAtIndex(InterleavedSlots.LONG, k + 1, st.getAtIndex(InterleavedSlots.LONG, k + 1) + 1);
                 }
             }
         }
 
         /** Bytes of state outside the heap: 0 until the table goes native. */
         public long nativeBytes() {
-            return nSum == null ? 0L : nSum.bytes() + nCount.bytes();
+            return nat == null ? 0L : nat.bytes();
         }
 
         /**
@@ -551,9 +551,8 @@ public final class GroupedAccumulators {
          */
         @Override
         public void close() {
-            if (nSum != null) {
-                nSum.close();
-                nCount.close();
+            if (nat != null) {
+                nat.close();
             }
         }
 
@@ -602,8 +601,8 @@ public final class GroupedAccumulators {
         }
 
         public long sum(int g) {
-            if (nSum != null) {
-                return nSum.get(g);
+            if (nat != null) {
+                return nat.get(g, 0);
             }
             long s = 0;
             for (int k = 0; k < copies; k++) {
@@ -613,8 +612,8 @@ public final class GroupedAccumulators {
         }
 
         public long count(int g) {
-            if (nCount != null) {
-                return nCount.get(g);
+            if (nat != null) {
+                return nat.get(g, 1);
             }
             long c = 0;
             for (int k = 0; k < copies; k++) {
@@ -641,13 +640,8 @@ public final class GroupedAccumulators {
         private long[] lo = new long[64];
         private long[] count = new long[64];
         private boolean[] overflowed = new boolean[64]; // on the heap even when native: one byte a group
-        // #941: hi, lo and count once native (the arrays are then null); the segments are cached per growth.
-        private NativeLongs nHi;
-        private NativeLongs nLo;
-        private NativeLongs nCount;
-        private MemorySegment sHi;
-        private MemorySegment sLo;
-        private MemorySegment sCount;
+        // #941: lo (field 0), hi (1) and count (2) side by side once native; the arrays are then null.
+        private InterleavedSlots nat;
         private final Scratch scratch = new Scratch();
 
         /**
@@ -657,6 +651,10 @@ public final class GroupedAccumulators {
          */
         public void update(VectorBuffers v, GroupAssignment a) {
             ensure(a.numGroups());
+            if (nat != null) {
+                updateNative(v, a);
+                return;
+            }
             if (v.type() == VecType.DECIMAL128) {
                 updateWide(v, a);
                 return;
@@ -695,6 +693,10 @@ public final class GroupedAccumulators {
         /** The ungrouped path: every valid row of {@code v} into group 0. */
         public void updateAll(VectorBuffers v) {
             ensure(1);
+            if (nat != null) {
+                allNative(v, 0);
+                return;
+            }
             if (v.type() == VecType.DECIMAL128) {
                 addAllWide(v, 0);
             } else {
@@ -764,10 +766,6 @@ public final class GroupedAccumulators {
          * as a value.
          */
         private void addWide(int g, long xh, long xl) {
-            if (sHi != null) {
-                addWideNative(g, xh, xl);
-                return;
-            }
             long l = lo[g];
             long sum = l + xl;
             long carry = ((l & xl) | ((l | xl) & ~sum)) >>> 63;
@@ -817,10 +815,6 @@ public final class GroupedAccumulators {
          * then the sign word.
          */
         private void add(int g, long x) {
-            if (sHi != null) {
-                addNative(g, x);
-                return;
-            }
             long l = lo[g];
             long sum = l + x;
             long carry = ((l & x) | ((l | x) & ~sum)) >>> 63;
@@ -829,43 +823,119 @@ public final class GroupedAccumulators {
             count[g]++;
         }
 
-        /** {@link #add} on the native state (#941). */
-        private void addNative(int g, long x) {
-            long l = sLo.getAtIndex(NativeLongs.LONG, g);
-            long sum = l + x;
-            long carry = ((l & x) | ((l | x) & ~sum)) >>> 63;
-            sLo.setAtIndex(NativeLongs.LONG, g, sum);
-            sHi.setAtIndex(NativeLongs.LONG, g, sHi.getAtIndex(NativeLongs.LONG, g) + (x >> 63) + carry);
-            sCount.setAtIndex(NativeLongs.LONG, g, sCount.getAtIndex(NativeLongs.LONG, g) + 1);
+        /**
+         * Every row of the batch into the native state (#941), the same
+         * arithmetic as {@link #add} / {@link #addWide}; one dispatch a batch,
+         * so the heap loops above stay as they were.
+         */
+        private void updateNative(VectorBuffers v, GroupAssignment a) {
+            if (a.useMasks()) {
+                for (int g = 0; g < a.numGroups(); g++) {
+                    if (a.maskCount(g) != 0) {
+                        allNative(a.restrict(v, g), g);
+                    }
+                }
+                return;
+            }
+            MemorySegment st = nat.segment();
+            int[] ids = a.ids();
+            int n = a.numRows();
+            MemorySegment validity = a.effectiveValidity(v);
+            boolean wide = v.type() == VecType.DECIMAL128;
+            MemorySegment data = v.data();
+            long[] x = wide
+                    ? null
+                    : v.type() == VecType.INT32 ? scratch.longsFromInts(data, n) : scratch.longs(data, n);
+            if (validity == null) {
+                for (int i = 0; i < n; i++) {
+                    if (wide) {
+                        addWideNative(st, ids[i], Decimal128.hi(data, i), Decimal128.lo(data, i));
+                    } else {
+                        addNative(st, ids[i], x[i]);
+                    }
+                }
+                return;
+            }
+            for (int w = 0, words = Bitmap.wordsFor(n);
+                 w < words;
+                 w++) {
+                long bits = Bitmap.wordAt(validity, w, n);
+                while (bits != 0L) {
+                    int i = (w << 6) + Long.numberOfTrailingZeros(bits);
+                    bits &= bits - 1;
+                    if (wide) {
+                        addWideNative(st, ids[i], Decimal128.hi(data, i), Decimal128.lo(data, i));
+                    } else {
+                        addNative(st, ids[i], x[i]);
+                    }
+                }
+            }
         }
 
-        /** {@link #addWide} on the native state (#941). */
-        private void addWideNative(int g, long xh, long xl) {
-            long l = sLo.getAtIndex(NativeLongs.LONG, g);
+        /** Every valid row of {@code v} into group {@code g} of the native state. */
+        private void allNative(VectorBuffers v, int g) {
+            MemorySegment st = nat.segment();
+            int n = v.length();
+            MemorySegment validity = v.validity();
+            boolean wide = v.type() == VecType.DECIMAL128;
+            MemorySegment data = v.data();
+            long[] x = wide
+                    ? null
+                    : v.type() == VecType.INT32 ? scratch.longsFromInts(data, n) : scratch.longs(data, n);
+            for (int i = 0; i < n; i++) {
+                if (validity != null && !Bitmap.isSet(validity, i)) {
+                    continue;
+                }
+                if (wide) {
+                    addWideNative(st, g, Decimal128.hi(data, i), Decimal128.lo(data, i));
+                } else {
+                    addNative(st, g, x[i]);
+                }
+            }
+        }
+
+        /**
+         * {@link #add} on the native state: lo, hi and count of group {@code g}
+         * side by side.
+         */
+        private static void addNative(MemorySegment st, int g, long x) {
+            long k = 3L * g;
+            long l = st.getAtIndex(InterleavedSlots.LONG, k);
+            long sum = l + x;
+            long carry = ((l & x) | ((l | x) & ~sum)) >>> 63;
+            st.setAtIndex(InterleavedSlots.LONG, k, sum);
+            st.setAtIndex(InterleavedSlots.LONG, k + 1, st.getAtIndex(InterleavedSlots.LONG, k + 1) + (x >> 63) + carry);
+            st.setAtIndex(InterleavedSlots.LONG, k + 2, st.getAtIndex(InterleavedSlots.LONG, k + 2) + 1);
+        }
+
+        /** {@link #addWide} on the native state. */
+        private void addWideNative(MemorySegment st, int g, long xh,
+                long xl) {
+            long k = 3L * g;
+            long l = st.getAtIndex(InterleavedSlots.LONG, k);
             long sum = l + xl;
             long carry = ((l & xl) | ((l | xl) & ~sum)) >>> 63;
-            long h = sHi.getAtIndex(NativeLongs.LONG, g);
+            long h = st.getAtIndex(InterleavedSlots.LONG, k + 1);
             long hsum = h + xh + carry;
             if (((h ^ hsum) & (xh ^ hsum)) < 0) {
                 overflowed[g] = true;
             }
-            sLo.setAtIndex(NativeLongs.LONG, g, sum);
-            sHi.setAtIndex(NativeLongs.LONG, g, hsum);
-            sCount.setAtIndex(NativeLongs.LONG, g, sCount.getAtIndex(NativeLongs.LONG, g) + 1);
+            st.setAtIndex(InterleavedSlots.LONG, k, sum);
+            st.setAtIndex(InterleavedSlots.LONG, k + 1, hsum);
+            st.setAtIndex(InterleavedSlots.LONG, k + 2, st.getAtIndex(InterleavedSlots.LONG, k + 2) + 1);
         }
 
         private void ensure(int groups) {
             if (groups > capacity) {
                 int cap = grow(capacity, groups);
                 overflowed = Arrays.copyOf(overflowed, cap);
-                if (nHi != null) {
-                    nHi.grow(cap);
-                    nLo.grow(cap);
-                    nCount.grow(cap);
+                if (nat != null) {
+                    nat.grow(cap);
                 } else if (goNative(1, cap)) {
-                    nHi = new NativeLongs(hi, capacity, cap);
-                    nLo = new NativeLongs(lo, capacity, cap);
-                    nCount = new NativeLongs(count, capacity, cap);
+                    nat = new InterleavedSlots(3, cap);
+                    nat.load(0, lo, capacity);
+                    nat.load(1, hi, capacity);
+                    nat.load(2, count, capacity);
                     hi = null;
                     lo = null;
                     count = null;
@@ -874,18 +944,13 @@ public final class GroupedAccumulators {
                     lo = Arrays.copyOf(lo, cap);
                     count = Arrays.copyOf(count, cap);
                 }
-                if (nHi != null) {
-                    sHi = nHi.segment();
-                    sLo = nLo.segment();
-                    sCount = nCount.segment();
-                }
                 capacity = cap;
             }
         }
 
         /** Bytes of state outside the heap: 0 until the table goes native. */
         public long nativeBytes() {
-            return nHi == null ? 0L : nHi.bytes() + nLo.bytes() + nCount.bytes();
+            return nat == null ? 0L : nat.bytes();
         }
 
         /**
@@ -894,28 +959,23 @@ public final class GroupedAccumulators {
          */
         @Override
         public void close() {
-            if (nHi != null) {
-                nHi.close();
-                nLo.close();
-                nCount.close();
-                sHi = null;
-                sLo = null;
-                sCount = null;
+            if (nat != null) {
+                nat.close();
             }
         }
 
         /** High word of the group's signed 128-bit sum. */
         public long hi(int g) {
-            return sHi != null ? sHi.getAtIndex(NativeLongs.LONG, g) : hi[g];
+            return nat != null ? nat.get(g, 1) : hi[g];
         }
 
         /** Low word (unsigned) of the group's signed 128-bit sum. */
         public long lo(int g) {
-            return sLo != null ? sLo.getAtIndex(NativeLongs.LONG, g) : lo[g];
+            return nat != null ? nat.get(g, 0) : lo[g];
         }
 
         public long count(int g) {
-            return sCount != null ? sCount.getAtIndex(NativeLongs.LONG, g) : count[g];
+            return nat != null ? nat.get(g, 2) : count[g];
         }
 
         /** The group's sum as a {@link java.math.BigInteger}. */
@@ -940,12 +1000,12 @@ public final class GroupedAccumulators {
         private int capacity = 64;
         private int copies = INTERLEAVE; // 1 once past COLLAPSE_GROUPS groups
         private long[] count = new long[64 * INTERLEAVE];
-        private NativeLongs nCount; // #941: the state once native; count is then null
+        private InterleavedSlots nat; // #941: the state once native; count is then null
 
         /** Counts every row of each group. */
         public void updateAll(GroupAssignment a) {
             ensure(a.numGroups());
-            if (nCount != null) {
+            if (nat != null) {
                 updateNative(a, a.useMasks() ? null : a.selection());
                 return;
             }
@@ -1006,7 +1066,7 @@ public final class GroupedAccumulators {
                 updateAll(a);
                 return;
             }
-            if (nCount != null && !a.useMasks()) {
+            if (nat != null && !a.useMasks()) {
                 updateNative(a, validity);
                 return;
             }
@@ -1014,9 +1074,9 @@ public final class GroupedAccumulators {
                 for (int g = 0; g < a.numGroups(); g++) {
                     if (a.maskCount(g) > 0) {
                         long c = AggKernels.countValid(a.restrict(v, g));
-                        if (nCount != null) {
-                            MemorySegment s = nCount.segment();
-                            s.setAtIndex(NativeLongs.LONG, g, s.getAtIndex(NativeLongs.LONG, g) + c);
+                        if (nat != null) {
+                            MemorySegment s = nat.segment();
+                            s.setAtIndex(InterleavedSlots.LONG, g, s.getAtIndex(InterleavedSlots.LONG, g) + c);
                         } else {
                             count[g] += c;
                         }
@@ -1048,8 +1108,8 @@ public final class GroupedAccumulators {
         private void ensure(int groups) {
             if (groups > capacity) {
                 int cap = grow(capacity, groups);
-                if (nCount != null) {
-                    nCount.grow(cap);
+                if (nat != null) {
+                    nat.grow(cap);
                     capacity = cap;
                     return;
                 }
@@ -1058,7 +1118,8 @@ public final class GroupedAccumulators {
                 copies = c;
                 capacity = cap;
                 if (goNative(copies, cap)) {
-                    nCount = new NativeLongs(count, cap, cap);
+                    nat = new InterleavedSlots(1, cap);
+                    nat.load(0, count, cap);
                     count = null;
                 }
             }
@@ -1071,10 +1132,10 @@ public final class GroupedAccumulators {
          * counted from its per-group counts.
          */
         private void updateNative(GroupAssignment a, MemorySegment bits) {
-            MemorySegment s = nCount.segment();
+            MemorySegment s = nat.segment();
             if (a.useMasks()) {
                 for (int g = 0; g < a.numGroups(); g++) {
-                    s.setAtIndex(NativeLongs.LONG, g, s.getAtIndex(NativeLongs.LONG, g) + a.maskCount(g));
+                    s.setAtIndex(InterleavedSlots.LONG, g, s.getAtIndex(InterleavedSlots.LONG, g) + a.maskCount(g));
                 }
                 return;
             }
@@ -1083,7 +1144,7 @@ public final class GroupedAccumulators {
             if (bits == null) {
                 for (int i = 0; i < n; i++) {
                     long g = ids[i];
-                    s.setAtIndex(NativeLongs.LONG, g, s.getAtIndex(NativeLongs.LONG, g) + 1);
+                    s.setAtIndex(InterleavedSlots.LONG, g, s.getAtIndex(InterleavedSlots.LONG, g) + 1);
                 }
                 return;
             }
@@ -1094,14 +1155,14 @@ public final class GroupedAccumulators {
                 while (word != 0L) {
                     long g = ids[(w << 6) + Long.numberOfTrailingZeros(word)];
                     word &= word - 1;
-                    s.setAtIndex(NativeLongs.LONG, g, s.getAtIndex(NativeLongs.LONG, g) + 1);
+                    s.setAtIndex(InterleavedSlots.LONG, g, s.getAtIndex(InterleavedSlots.LONG, g) + 1);
                 }
             }
         }
 
         /** Bytes of state outside the heap: 0 until the table goes native. */
         public long nativeBytes() {
-            return nCount == null ? 0L : nCount.bytes();
+            return nat == null ? 0L : nat.bytes();
         }
 
         /**
@@ -1110,14 +1171,14 @@ public final class GroupedAccumulators {
          */
         @Override
         public void close() {
-            if (nCount != null) {
-                nCount.close();
+            if (nat != null) {
+                nat.close();
             }
         }
 
         public long count(int g) {
-            if (nCount != null) {
-                return nCount.get(g);
+            if (nat != null) {
+                return nat.get(g, 0);
             }
             long c = 0;
             for (int k = 0; k < copies; k++) {
