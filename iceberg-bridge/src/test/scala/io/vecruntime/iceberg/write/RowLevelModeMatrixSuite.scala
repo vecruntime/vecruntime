@@ -119,8 +119,12 @@ class RowLevelModeMatrixSuite extends AnyFunSuite with BeforeAndAfterAll {
     "id BIGINT, i INT, d DOUBLE, b BOOLEAN, s STRING, day DATE, dec DECIMAL(9,2), " +
       "wide DECIMAL(38,6), st STRUCT<x: INT, y: STRING>, xs ARRAY<INT>, m MAP<STRING, BIGINT>"
 
+  // Seeded through ONE task so both twins get the same data-file layout. With several write tasks the number
+  // of seed files varies run to run (task count and file-roll boundaries on a 2-core runner), and counts such
+  // as `added-delete-files` at partition granularity follow the data-file layout, so independently seeded twins
+  // could legitimately differ. One task still rolls several files at the 256 KB target size.
   private def source(rows: Int): String =
-    s"""SELECT id, cast(id % 1000 as int) as i, if(id % 17 = 0, null, id * 0.5d) as d,
+    s"""SELECT /*+ REPARTITION(1) */ id, cast(id % 1000 as int) as i, if(id % 17 = 0, null, id * 0.5d) as d,
        |  id % 3 = 0 as b, if(id % 10 = 0, null, concat('v', id % 300)) as s,
        |  date_add(date'2020-01-01', cast(id % 500 as int)) as day,
        |  cast(id % 10000 as decimal(9,2)) / 7 as dec, cast(id as decimal(38,6)) * 1000000 as wide,
