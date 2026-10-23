@@ -209,6 +209,15 @@ Per step:
   Hash and range distribution therefore run on batches, through the columnar shuffle manager, with no `SortExec`
   or `ShuffleExchangeExec` left. It also adds nested constructors (`array`, `map`, `if(p, null, nested)`) and
   fanout writes of nested columns (`NestedGatherKernels`).
+- **#901 item 11, per-lane partition keys.** `PartitionKeys` computes each row's partition on lanes with the
+  same `IcebergTransformKernels` — Murmur3 `bucket`, `truncate`, and the time transforms — so the write never
+  boxes a value per row (no `CharSequence` per string, no `BigDecimal`/`BigInteger` per decimal). `bucket` of a
+  decimal reads the unscaled value's minimal two's-complement bytes straight from the `long` (precision ≤ 18)
+  or the 16-byte unscaled (wider), matching Iceberg's `BucketUtil.hash(BigDecimal)` byte for byte. Rows are
+  grouped by hashing the result lanes and comparing, so one `PartitionKey` is materialised per distinct
+  partition in a batch rather than one per row. A partition source may be a top-level field or a field nested
+  inside (possibly nested) structs: the leaf lane is read through the struct children, null when the leaf or any
+  enclosing struct is null, as Iceberg's accessor reads it.
 - **#921, merge-on-read.** `VectorWriteDeltaExec` runs on batches.
   - A task walks each batch's operation lane. DELETE rows feed per-file deletion vectors on v3, or position
     delete files on v2 (`ColumnarPositionDeleteWriter`); both sit behind one `DeleteSink`.
@@ -228,7 +237,7 @@ Per step:
 | Geometry types; a shredded `variant` (`write.parquet.shred-variants`) | Not encoded by the columnar writer yet. `time` and `timestamp_ns` columns cannot be read or written from Spark with Iceberg 1.12 at all |
 | ORC or Avro data or delete files | The columnar writer writes Parquet only |
 | Encrypted tables | Key metadata is not written |
-| A partition source that is not a top-level column of a supported type | The transform is computed on the batch's top-level lanes |
+| A partition source reached through a list or a map (not a single lane) | The transform needs the source as one lane; a top-level or struct-nested leaf is read on lanes, a list / map element is not |
 
 `spark.vecruntime.explainFallback.enabled=true` logs the reason for each declined write.
 
@@ -257,6 +266,7 @@ partitions with the same record counts, and the snapshot summary.
   - five partitionings (identity; days; months with bucket; hours with truncate; years with decimal truncate)
     under none, hash and range distribution, with fanout off and on, asserting no Spark `SortExec` or
     `ShuffleExchangeExec` under the write;
+  - partition sources inside a struct (`bucket`/`truncate`/`identity` over `st.x` / `st.y`), clustered and fanout;
   - nested columns, clustered and fanout;
   - output metrics, checked through a listener;
   - reading a table with a null identity partition through the engine.
@@ -273,6 +283,10 @@ partitions with the same record counts, and the snapshot summary.
   statement by statement on delete-file kind and format, and on referenced data files. A roll test is included.
 - **`IcebergTransformExprsSuite`:** every transform over every source type, equal to Iceberg's own `invoke` row
   by row.
+- **`PartitionKeysSuite`:** `PartitionKeys` against Iceberg's own `PartitionKey`, row for row, for every
+  transform over every source type (nulls, negatives, pre-1970 dates and decimals included), over several
+  batches and many distinct keys, with its grouping agreeing with Iceberg's key equality; and the same for
+  partition sources nested inside (doubly-nested) structs, with null structs.
 - **`StructFlatteningSuite`:** the columnar exchange's handling of a null struct constant (#922).
 
 ### Measured

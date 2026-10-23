@@ -131,8 +131,16 @@ final class SparkParquetFileResolver(tableSchema: Object, nameMappingJson: Strin
 
   /** A field the file does not hold, under a name it does not use: Spark's Parquet type for `dt`. */
   private def missing(name: String, dt: DataType, id: Option[Int]): org.apache.parquet.schema.Type = {
+    import org.apache.spark.sql.types.NullType
+    // NullType (the v3 unknown type, #rtypes) has no Parquet representation: it is always a null column, so the
+    // clipped field is only a placeholder the file never holds. Spark's converter rejects NullType, so build the
+    // placeholder by hand (an optional int32); its missing-prefixed name makes the reader a NativeParquetNullColumn.
     val t =
-      converter.convert(StructType(Seq(StructField(SparkParquetFileResolver.MissingPrefix + name, dt)))).getType(0)
+      if (dt == NullType)
+        org.apache.parquet.schema.Types
+          .optional(org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.INT32)
+          .named(SparkParquetFileResolver.MissingPrefix + name)
+      else converter.convert(StructType(Seq(StructField(SparkParquetFileResolver.MissingPrefix + name, dt)))).getType(0)
     id.fold(t)(t.withId)
   }
 }
