@@ -27,10 +27,17 @@ class VectorDvWriteColumnarSuite extends VectorDvWriteSuite {
 
   override protected def columnarData: Boolean = true
 
+  // The counters are JVM-global and other suites sharing the JVM bump them, so this suite measures from its own
+  // start (suite bodies run their tests in declaration order, after construction).
+  private val rowInputAtStart = VectorWriteDeltaExec.rowInputWrites.get()
+  private val columnarAtStart = VectorWriteDeltaExec.columnarDataTasks.get()
+
   test("the data half of the UPDATEs and MERGEs above ran on the columnar data writer") {
-    assert(VectorWriteDeltaExec.columnarDataTasks.get() > 0, "no task wrote its data half columnar")
-    info(s"delta writes whose child produced rows: ${VectorWriteDeltaExec.rowInputWrites.get()}")
+    val columnar = VectorWriteDeltaExec.columnarDataTasks.get() - columnarAtStart
+    val rowInput = VectorWriteDeltaExec.rowInputWrites.get() - rowInputAtStart
+    assert(columnar > 0, "no task wrote its data half columnar")
+    info(s"delta writes whose child produced rows: $rowInput")
     // With the columnar exchange, the UPDATE's Expand (carrying `_partition`) and the MERGE's rows stay batches.
-    assert(VectorWriteDeltaExec.rowInputWrites.get() == 0, "a delta write read rows through RowToColumnarExec")
+    assert(rowInput == 0, "a delta write read rows through RowToColumnarExec")
   }
 }
