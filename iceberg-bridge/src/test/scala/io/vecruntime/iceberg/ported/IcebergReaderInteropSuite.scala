@@ -25,8 +25,8 @@ package io.vecruntime.iceberg.ported
  * Iceberg's vectorized reader left at its default (on), and asserts the rows equal what our writer put
  * in. A type whose read Iceberg's vectorized reader rejects is a WRITER bug (owner wants Parquet v2
  * data pages, but per-type encodings must stay within what Iceberg's vectorized reader accepts, e.g.
- * PLAIN booleans). Those cases are tagged org.scalatest.Tag("interop-known-fail") and filtered OUT of
- * the test run / commit; they are listed in the commit message and report with the exact rejection.
+ * PLAIN booleans). Every type passes; a regression here means the writer emitted an encoding Iceberg's
+ * vectorized reader rejects.
  *
  * The footer-inspection test records, for each column, the Parquet page version (V1/V2) and the data
  * encodings our writer emits, side by side with Iceberg's own writer for the same table, so the fix
@@ -43,12 +43,8 @@ import org.apache.parquet.hadoop.ParquetFileReader
 import org.apache.parquet.hadoop.util.HadoopInputFile
 import org.apache.spark.sql.{DataFrame, Row, SparkSession}
 import org.apache.spark.sql.execution.SparkPlan
-import org.scalatest.Tag
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.funsuite.AnyFunSuite
-
-/** Cases that currently FAIL the interop read; filtered out of the run via `-l interop-known-fail`. */
-object KnownInteropFail extends Tag("interop-known-fail")
 
 class IcebergReaderInteropSuite extends AnyFunSuite with BeforeAndAfterAll {
 
@@ -260,13 +256,10 @@ class IcebergReaderInteropSuite extends AnyFunSuite with BeforeAndAfterAll {
     )
   }
 
-  // Boolean is the one confirmed interop FAILURE: our columnar writer emits an RLE-encoded boolean in a
-  // Parquet v2 data page, and Iceberg's vectorized reader throws
-  //   UnsupportedOperationException: Cannot support vectorized reads for column [c] optional boolean c = 2
-  //   with encoding RLE. Disable vectorized reads to read this table/file
-  // Tagged known-fail and excluded from the committed run (-DtagsToExclude=interop-known-fail); see the
-  // report matrix. Fix: emit PLAIN booleans in the v2 page (Iceberg's own writer uses PLAIN for booleans).
-  test("interop_boolean", KnownInteropFail) {
+  // Boolean was the one interop failure: the columnar writer used to emit RLE-encoded booleans in a v2
+  // data page, which Iceberg's vectorized reader rejects ("Cannot support vectorized reads ... with
+  // encoding RLE"). #963 writes them PLAIN, as Iceberg's own writer does.
+  test("interop_boolean") {
     interop("bool", "id BIGINT, c BOOLEAN", s"SELECT id, ${lowCard("id % 2 = 0")} FROM range($N)")
   }
 

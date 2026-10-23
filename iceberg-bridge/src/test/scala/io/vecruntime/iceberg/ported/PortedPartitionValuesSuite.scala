@@ -144,9 +144,7 @@ class PortedPartitionValuesSuite extends AnyFunSuite with BeforeAndAfterAll {
 
   test("testPartitionedByNestedString") {
     // identity partition on a string inside a struct; upstream guards a ClassCastException building the path.
-    // Whether our columnar writer handles this or falls back to Iceberg's row writer, the data it writes must
-    // equal the twin. Nested partition sources move onto lanes and take the columnar path once #955 lands;
-    // this test asserts only data/partition equality, which holds either way.
+    // Since #955 nested partition sources are carried on lanes, so this append runs columnar.
     val (off, on) = ("ice.db.nestedstr_off", "ice.db.nestedstr_on")
     Seq(off, on).foreach { t =>
       spark.sql(s"DROP TABLE IF EXISTS $t")
@@ -159,6 +157,7 @@ class PortedPartitionValuesSuite extends AnyFunSuite with BeforeAndAfterAll {
     withWriter(on = false)(spark.sql(s"INSERT INTO $off $src").collect())
     val df = withWriter(on = true)(spark.sql(s"INSERT INTO $on $src"))
     df.collect()
+    assert(columnar(df), "a nested partition source must run on the columnar writer")
     def text(t: String) =
       spark.sql(s"SELECT struct.string FROM $t ORDER BY struct.string").collect().map(_.toString).toSeq
     assert(text(on) == text(off), "nested-string-partition rows must match Iceberg's writer")
@@ -167,10 +166,8 @@ class PortedPartitionValuesSuite extends AnyFunSuite with BeforeAndAfterAll {
 
   test("testPartitionValueTypes") {
     // identity partition over every supported primitive type, one column at a time, comparing rows + partitions.
-    // Rows are read back with Iceberg's vectorized reader DISABLED: Iceberg's own Arrow reader cannot decode an
-    // RLE-encoded boolean/primitive page (UnsupportedOperationException in VectorizedPageIterator), which is a
-    // read-path limitation of the twin's own data, unrelated to the writer under test. The writer is judged on
-    // row equality and the `partitions`/`files` metadata, which require no vectorized decode.
+    // Rows are read back with Iceberg's vectorized reader at its default (on): since #963 booleans are written
+    // PLAIN, so every type our writer emits is readable by it.
     val columns =
       "id BIGINT, b BOOLEAN, i INT, l BIGINT, f FLOAT, d DOUBLE, dt DATE, ts TIMESTAMP, s STRING, " +
         "bytes BINARY, dec9 DECIMAL(9,0), dec11 DECIMAL(11,2), dec38 DECIMAL(38,10)"
@@ -193,8 +190,7 @@ class PortedPartitionValuesSuite extends AnyFunSuite with BeforeAndAfterAll {
         spark.sql(s"DROP TABLE IF EXISTS $t")
         spark.sql(
           s"CREATE TABLE $t ($columns) USING iceberg PARTITIONED BY ($col) " +
-            s"TBLPROPERTIES ('write.distribution-mode'='none', 'write.spark.fanout.enabled'='false', " +
-            s"'read.parquet.vectorization.enabled'='false')"
+            s"TBLPROPERTIES ('write.distribution-mode'='none', 'write.spark.fanout.enabled'='false')"
         )
       }
       withWriter(on = false)(spark.sql(s"INSERT INTO $off $src").collect())

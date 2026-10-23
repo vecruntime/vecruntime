@@ -30,8 +30,8 @@ package io.vecruntime.iceberg.ported
  *  - Apache DataFusion Comet main @ a0cbb0fa06515acd5647538025a3a894be71b9bd:
  *      spark/src/test/scala/org/apache/comet/CometIcebergWriteDetectionSuite.scala
  *    Comet detects when its native writer is compatible with an Iceberg write and otherwise falls back
- *    to Spark. The analog for our writer is: a clean Parquet append runs columnar, while a write our
- *    writer does not cover (a shredded variant, a nested partition source) falls back to Iceberg's own
+ *    to Spark. The analog for our writer is: a clean Parquet append and a nested partition source run
+ *    columnar, while a write our writer does not cover (a shredded variant) falls back to Iceberg's own
  *    writer and still produces identical data. These are the `writeDetection_*` cases below.
  */
 
@@ -288,9 +288,8 @@ class PortedWriterStatsTwinSuite extends AnyFunSuite with BeforeAndAfterAll {
   }
 
   test("writeDetection_nestedPartitionSourceMatchesIceberg") {
-    // A table partitioned by a nested (struct-member) source. Whether our columnar writer handles it directly
-    // or routes through Iceberg's writer, the rows and partitions must equal Iceberg's own. Nested partition
-    // sources are carried on lanes and take the columnar path once #955 lands; this asserts equality only.
+    // A table partitioned by a nested (struct-member) source. Since #955 nested partition sources are
+    // carried on lanes, so this append runs columnar and must equal Iceberg's own rows and partitions.
     val (off, on) = ("ice.db.wd_np_off", "ice.db.wd_np_on")
     Seq(off, on).foreach { t =>
       spark.sql(s"DROP TABLE IF EXISTS $t")
@@ -302,7 +301,11 @@ class PortedWriterStatsTwinSuite extends AnyFunSuite with BeforeAndAfterAll {
     withWriter(on = false)(spark.sql(s"INSERT INTO $off $src").collect())
     val df = withWriter(on = true)(spark.sql(s"INSERT INTO $on $src"))
     df.collect()
+    assert(columnar(df), "a nested partition source must run on the columnar writer")
     def text(t: String) = spark.sql(s"SELECT id, s.k FROM $t ORDER BY id").collect().map(_.toString).toSeq
     assert(text(on) == text(off), "nested-partition rows must match Iceberg's writer")
+    def parts(t: String) =
+      spark.sql(s"SELECT partition, record_count FROM $t.partitions ORDER BY partition").collect().map(_.toString).toSeq
+    assert(parts(on) == parts(off), "nested-partition partitions must match Iceberg's writer")
   }
 }
