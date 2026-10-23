@@ -59,7 +59,12 @@ import org.openjdk.jmh.annotations.Warmup;
  *       segment for the table);
  *   <li>{@code dictHeapEntry} / {@code dictNativeEntry}: the same lookup with
  *       a value's fingerprint, length and offset in one 16-byte entry, so a
- *       candidate costs one line before the bytes.
+ *       candidate costs one line before the bytes;
+ *   <li>{@code emitHeap} / {@code emitNative}: the aggregate's key output --
+ *       gather the values of a batch of groups, by id, into an output segment:
+ *       from the heap through a heap scratch and one bulk copy (today's
+ *       {@code GroupKeyTable.writeKeys}), and from a pool block with one
+ *       segment copy per value.
  * </ul>
  *
  * The first native variants put each array in a segment of its own: 0.41-0.91x
@@ -114,6 +119,9 @@ public class KeyColumnStorageBenchmark {
     byte[] rowBytes;
     int[] rowOff = new int[N + 1];
     long[] rowFp = new long[N];
+    final int[] emitIds = new int[N];
+    byte[] emitScratch;
+    MemorySegment emitOut;
 
     static long fingerprint(byte[] src, int from, int len) {
         long h = 0x9E3779B97F4A7C15L ^ len;
@@ -224,6 +232,11 @@ public class KeyColumnStorageBenchmark {
             rowFp[i] = bits[pick[i]];
         }
         rowOff[N] = at;
+        for (int i = 0; i < N; i++) {
+            emitIds[i] = rnd.nextInt(size);
+        }
+        emitScratch = new byte[64 * N];
+        emitOut = pool.allocate(64L * N, 64);
     }
 
     @TearDown(Level.Trial)
@@ -357,6 +370,39 @@ public class KeyColumnStorageBenchmark {
             }
         }
         return found;
+    }
+
+    @Benchmark
+    @OperationsPerInvocation(N)
+    public int emitHeap() {
+        byte[] scratch = emitScratch;
+        int out = 0;
+        for (int i = 0; i < N; i++) {
+            int id = emitIds[i];
+            int off = offsets[id];
+            int len = offsets[id + 1] - off;
+            System.arraycopy(data, off, scratch, out, len);
+            out += len;
+        }
+        MemorySegment.copy(scratch, 0, emitOut, ValueLayout.JAVA_BYTE, 0, out);
+        return out;
+    }
+
+    @Benchmark
+    @OperationsPerInvocation(N)
+    public int emitNative() {
+        MemorySegment o = emitOut;
+        MemorySegment d = nData;
+        MemorySegment offs = nOffsets;
+        long out = 0;
+        for (int i = 0; i < N; i++) {
+            int id = emitIds[i];
+            long off = offs.getAtIndex(INT, id);
+            long len = offs.getAtIndex(INT, id + 1) - off;
+            MemorySegment.copy(d, off, o, out, len);
+            out += len;
+        }
+        return (int) out;
     }
 
     @Benchmark
