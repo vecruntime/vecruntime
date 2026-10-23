@@ -281,6 +281,11 @@ class RowLevelModeMatrixSuite extends AnyFunSuite with BeforeAndAfterAll {
 
     // ON run, capturing whether our merge-on-read operator ran and whether a columnar-data task fired.
     val dvBefore = org.apache.spark.sql.vecruntime.VectorWriteDeltaExec.columnarDataTasks.get()
+    // The columnar delta write bumps this JVM-global counter whenever it has to read ROWS from its child
+    // (a RowToColumnarExec under the write, because some operator left the columnar path). We never compare
+    // the absolute value -- other suites in the same JVM move it too -- only this run's DELTA, so a
+    // merge-on-read command that stays columnar end to end must add exactly zero. (e) below asserts it.
+    val rowInBefore = org.apache.spark.sql.vecruntime.VectorWriteDeltaExec.rowInputWrites.get()
     val (onNode, ourDeltaRan) = withFeatures(on = true) {
       val df = spark.sql(command(on))
       val node = commandNodeOf(df)
@@ -289,6 +294,7 @@ class RowLevelModeMatrixSuite extends AnyFunSuite with BeforeAndAfterAll {
       (node, ours)
     }
     val dvTasks = org.apache.spark.sql.vecruntime.VectorWriteDeltaExec.columnarDataTasks.get() - dvBefore
+    val rowInput = org.apache.spark.sql.vecruntime.VectorWriteDeltaExec.rowInputWrites.get() - rowInBefore
 
     // (a) the planned command node matches the expected mode, and is the SAME on both runs.
     val expected = if (expectCow) ReplaceDataNode else WriteDeltaNode
@@ -366,6 +372,16 @@ class RowLevelModeMatrixSuite extends AnyFunSuite with BeforeAndAfterAll {
     // (e) our path actually ran where it supports the case: merge-on-read goes through VectorWriteDeltaExec.
     if (!expectCow) {
       assert(ourDeltaRan, s"$base: merge-on-read ON run did not plan VectorWriteDeltaExec")
+      // ...and it ran COLUMNAR end to end: the columnar delta write read batches from a columnar child, never
+      // rows via a RowToColumnarExec. Every MOR case of the matrix -- DELETE, UPDATE and MERGE, v2 position
+      // deletes and v3 DVs, partitioned or not -- must add zero to rowInputWrites for this run. A MERGE used
+      // to fall back here (its MergeRowsExec declined to vectorize on a `CAST(NULL AS DECIMAL(38,6))` projection
+      // column), which this assertion guards against regressing.
+      assert(
+        rowInput == 0L,
+        s"$base: merge-on-read ON run was NOT columnar end to end -- the delta write read rows from its child " +
+          s"(rowInputWrites added $rowInput this run); an operator left the columnar path"
+      )
       // An UPDATE/MERGE with an insert half additionally writes data columnar; a delete-only command has none.
       if (dvTasks > 0) assert(dvTasks >= 1) // sanity on the counter when a data half exists
     }
