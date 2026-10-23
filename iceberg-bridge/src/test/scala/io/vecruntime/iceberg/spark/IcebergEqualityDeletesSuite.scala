@@ -168,6 +168,103 @@ class IcebergEqualityDeletesSuite extends AnyFunSuite with BeforeAndAfterAll {
     assert(check(s"SELECT * FROM $T") > 0)
   }
 
+  /**
+   * One equality delete file on nested key fields given by dotted name (e.g. "st.k"). Each delete row is a map
+   * leaf-dotted-name -> Iceberg Java value; a leaf absent from the map is left null. The record is built on the
+   * nested delete schema (`GenericRecord.create(deleteSchema)`), its parent struct populated.
+   */
+  private def addNestedDeletes(t: String, columns: Seq[String], rows: Seq[Map[String, Any]]): Unit = {
+    val table: Table = Spark3Util.loadIcebergTable(spark, t)
+    val schema = table.schema()
+    val deleteSchema = schema.select(columns: _*)
+    val factory = new GenericFileWriterFactory.Builder(table)
+      .deleteFileFormat(FileFormat.PARQUET)
+      .equalityFieldIds(columns.map(c => schema.findField(c).fieldId()).toArray)
+      .equalityDeleteRowSchema(deleteSchema)
+      .build()
+    val out = OutputFileFactory.builderFor(table, 1, 1).format(FileFormat.PARQUET).build().newOutputFile()
+    val writer = factory.newEqualityDeleteWriter(out, table.spec(), null)
+    val topNames = columns.map(_.split("\\.", 2)(0)).distinct
+    try rows.foreach { r =>
+        val record = GenericRecord.create(deleteSchema)
+        topNames.foreach { top =>
+          val topType = deleteSchema.asStruct().field(top).`type`().asStructType()
+          val child = GenericRecord.create(topType)
+          columns.filter(_.startsWith(s"$top.")).foreach { c =>
+            val leaf = c.substring(top.length + 1)
+            r.get(c).foreach(v => child.setField(leaf, v))
+          }
+          record.setField(top, child)
+        }
+        writer.write(record)
+      }
+    finally writer.close()
+    table.newRowDelta().addDeletes(writer.toDeleteFile()).commit()
+    spark.sql(s"REFRESH TABLE $t")
+  }
+
+  /** Rows of table `t` Iceberg core's generic reader keeps (applies equality deletes via GenericDeleteFilter). */
+  private def genericIds(t: String): Set[Int] = {
+    val table = Spark3Util.loadIcebergTable(spark, t)
+    val scan = org.apache.iceberg.data.IcebergGenerics.read(table).build()
+    val ids = scala.collection.mutable.ArrayBuffer.empty[Int]
+    try {
+      val it = scan.iterator()
+      while (it.hasNext) ids += it.next().asInstanceOf[org.apache.iceberg.data.Record]
+        .getField("id").asInstanceOf[Integer].intValue()
+    } finally scan.close()
+    ids.toSet
+  }
+
+  test("#901 item 5: equality deletes on a key field nested inside a struct") {
+    val t = "ice.db.eq_nested"
+    spark.sql(s"DROP TABLE IF EXISTS $t")
+    spark.sql(
+      s"""CREATE TABLE $t (id INT, st STRUCT<k: INT, s: STRING>, payload BIGINT) USING iceberg
+         |  TBLPROPERTIES ('format-version' = '2', 'write.delete.mode' = 'merge-on-read')""".stripMargin
+    )
+    spark.sql(
+      s"""INSERT INTO $t SELECT cast(id AS INT),
+         |  named_struct('k', cast(id % 50 AS INT), 's', concat('s', id % 7)), id * 3
+         |FROM range(0, 6000)""".stripMargin
+    )
+    addNestedDeletes(t, Seq("st.k"), Seq(Map("st.k" -> Integer.valueOf(5)), Map("st.k" -> Integer.valueOf(10))))
+
+    // The explicit expected survivor set: st.k not in {5, 10}.
+    val expected = (0 until 6000).filter(id => { val k = id % 50; k != 5 && k != 10 }).toSet
+    // Control oracle: Iceberg core's generic reader (NOT its Spark reader, which over-deletes nested equality
+    // keys -- see draco-keep/stage900/iceberg-upstream-bugs.md bug 3). It must delete exactly the expected rows.
+    assert(genericIds(t) == expected, "IcebergGenerics control differs from the expected set")
+
+    // The native scan (nested key not projected: read through the struct for the probe, then dropped) matches.
+    val before = ParquetFileResolver.nativeEqualityBatches.get()
+    val got = spark.sql(s"SELECT id FROM $t").collect().map(_.getInt(0)).toSet
+    val probed = ParquetFileResolver.nativeEqualityBatches.get() - before
+    assert(got == expected, s"native survivors differ: ${got.diff(expected).take(5)} / ${expected.diff(got).take(5)}")
+    assert(probed == 0, "a nested key uses the row probe, not the native lane probe")
+    // The projected-struct form reads the same rows, and a group-by on the nested key agrees with its own count.
+    val proj = spark.sql(s"SELECT id FROM $t WHERE st IS NOT NULL").collect().map(_.getInt(0)).toSet
+    assert(proj == expected, "projected-struct read differs")
+    assert(spark.sql(s"SELECT count(*) FROM $t").collect()(0).getLong(0) == expected.size.toLong)
+    // Confirm the native path was used (no file to Spark's reader, no group to Iceberg's); scan nodes are ours.
+    val plan = spark.sql(s"SELECT id, payload FROM $t").queryExecution.executedPlan
+    def nodes(p: org.apache.spark.sql.execution.SparkPlan): Seq[org.apache.spark.sql.execution.SparkPlan] = {
+      val nested = p.getClass.getSimpleName match {
+        case "AdaptiveSparkPlanExec" =>
+          p.getClass.getMethods.find(m => m.getName == "executedPlan" && m.getParameterCount == 0)
+            .map(_.invoke(p).asInstanceOf[org.apache.spark.sql.execution.SparkPlan]).toSeq
+        case n if n.endsWith("QueryStageExec") =>
+          p.getClass.getMethods.find(m => m.getName == "plan" && m.getParameterCount == 0)
+            .map(_.invoke(p).asInstanceOf[org.apache.spark.sql.execution.SparkPlan]).toSeq
+        case _ => Seq.empty
+      }
+      p +: (p.children ++ nested).flatMap(nodes)
+    }
+    spark.sql(s"SELECT id, payload FROM $t").collect()
+    val scans = nodes(plan).filter(_.getClass.getSimpleName == "VectorIcebergScanExec")
+    assert(scans.nonEmpty, s"not the native scan: $plan")
+  }
+
   test("equality deletes keyed on uuid, fixed, and a composite (uuid, int) key") {
     import org.apache.iceberg.types.Types
     import org.apache.iceberg.types.Types.NestedField.{optional, required}
