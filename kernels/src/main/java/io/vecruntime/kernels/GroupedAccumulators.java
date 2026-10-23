@@ -846,13 +846,24 @@ public final class GroupedAccumulators {
             long[] x = wide
                     ? null
                     : v.type() == VecType.INT32 ? scratch.longsFromInts(data, n) : scratch.longs(data, n);
+            if (!wide && validity == null) {
+                // The hot loop (q23/q67/q78 decimal sums over long lanes) inlined, one cache line a row:
+                // q23a's profile showed addNative compiled out of line, its VarHandle stores un-intrinsified.
+                for (int i = 0; i < n; i++) {
+                    long k = 3L * ids[i];
+                    long xi = x[i];
+                    long l = st.getAtIndex(InterleavedSlots.LONG, k);
+                    long sum = l + xi;
+                    long carry = ((l & xi) | ((l | xi) & ~sum)) >>> 63;
+                    st.setAtIndex(InterleavedSlots.LONG, k, sum);
+                    st.setAtIndex(InterleavedSlots.LONG, k + 1, st.getAtIndex(InterleavedSlots.LONG, k + 1) + (xi >> 63) + carry);
+                    st.setAtIndex(InterleavedSlots.LONG, k + 2, st.getAtIndex(InterleavedSlots.LONG, k + 2) + 1);
+                }
+                return;
+            }
             if (validity == null) {
                 for (int i = 0; i < n; i++) {
-                    if (wide) {
-                        addWideNative(st, ids[i], Decimal128.hi(data, i), Decimal128.lo(data, i));
-                    } else {
-                        addNative(st, ids[i], x[i]);
-                    }
+                    addWideNative(st, ids[i], Decimal128.hi(data, i), Decimal128.lo(data, i));
                 }
                 return;
             }
