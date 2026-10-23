@@ -229,6 +229,11 @@ class VectorCopyUnchangedDeleteSuite extends AnyFunSuite with BeforeAndAfterAll 
    * Runs `delete` (given the table name) as a copy-on-write DELETE on a flag-OFF table and a flag-ON
    * table built the same way, then checks the two are indistinguishable by the corrected oracle and (for
    * v3) that lineage is preserved within each table. Returns the groups copied by the ON run.
+   *
+   * `seedWithVectorWriter` picks which writer lays down the seed files the DELETE later rewrites: the
+   * seed `INSERT INTO` runs with `spark.vecruntime.iceberg.writer.enabled` pinned to it explicitly (NOT
+   * left at the session default), so the case covers that seed writer on purpose. Iceberg's own writer
+   * (false) and our columnar writer (true) must both produce files the copy path can copy from.
    */
   private def cow(
       name: String,
@@ -236,13 +241,23 @@ class VectorCopyUnchangedDeleteSuite extends AnyFunSuite with BeforeAndAfterAll 
       partitioned: Boolean,
       rows: Int,
       nan: Boolean = false,
-      metricsProps: String = ""
+      metricsProps: String = "",
+      seedWithVectorWriter: Boolean = false
   )(delete: String => String): Long = {
     val off = s"ice.db.${name}_off"
     val on = s"ice.db.${name}_on"
     Seq(off, on).foreach { t =>
       create(t, version, partitioned, metricsProps)
-      spark.sql(s"INSERT INTO $t ${source(rows, nan)}")
+      // Seed under an EXPLICIT writer toggle, so the case pins which writer wrote the files the DELETE
+      // rewrites (Iceberg's own, or our columnar writer) instead of inheriting the session default.
+      val seedKey = WriterFlag
+      val prevSeed = spark.conf.getOption(seedKey)
+      spark.conf.set(seedKey, seedWithVectorWriter.toString)
+      try spark.sql(s"INSERT INTO $t ${source(rows, nan)}")
+      finally prevSeed match {
+          case Some(v) => spark.conf.set(seedKey, v)
+          case None => spark.conf.unset(seedKey)
+        }
     }
     // Lineage before the DELETE (v3 only), for the within-table preservation check.
     val lineageBefore = if (version >= 3) lineageById(on) else Map.empty[Long, (Long, Long)]
@@ -278,9 +293,10 @@ class VectorCopyUnchangedDeleteSuite extends AnyFunSuite with BeforeAndAfterAll 
 
   // ----- cases --------------------------------------------------------------------------------------
 
-  for (version <- Seq(2, 3); partitioned <- Seq(false, true)) {
-    val tag = s"v$version ${if (partitioned) "partitioned" else "unpartitioned"}"
-    val base = s"${version}_${if (partitioned) "p" else "u"}"
+  for (version <- Seq(2, 3); partitioned <- Seq(false, true); seedVector <- Seq(false, true)) {
+    val seedTag = if (seedVector) "vector-seeded" else "iceberg-seeded"
+    val tag = s"v$version ${if (partitioned) "partitioned" else "unpartitioned"} [$seedTag]"
+    val base = s"${version}_${if (partitioned) "p" else "u"}_${if (seedVector) "vw" else "iw"}"
     // The copy path cannot supply a float/double NaN count (a footer carries none), so a table that tracks
     // one declines every copy. To exercise the COPY path these cases turn metrics off for the two floating
     // columns; a dedicated case below keeps NaN tracking and asserts the (correct) no-copy fallback.
@@ -291,21 +307,34 @@ class VectorCopyUnchangedDeleteSuite extends AnyFunSuite with BeforeAndAfterAll 
     // byte for byte and the two lineage columns (_row_id, _last_updated_sequence_number), which the scan
     // resolved per surviving row, are freshly encoded, so the surviving rows keep the lineage they had. v2 has
     // no lineage and copies the whole delete-free groups. Both therefore copy the delete-free groups.
+    //
+    // The seed files are laid down by BOTH writers in turn (seedVector): Iceberg's own writer, and our
+    // columnar writer, which must roll several row groups per unpartitioned file for the copy to have
+    // delete-free groups to copy -- the whole point of honouring write.parquet.row-group-size-bytes.
     def expect(copied: Long, label: String): Unit =
       assert(copied > 0, s"$tag $label: expected copied groups > 0, got $copied")
 
     test(s"$tag: DELETE touching some groups copies the untouched groups (v2) / falls back (v3)") {
       // Delete a single narrow contiguous block so only the one or two groups covering it are touched and
       // every other group of the file is delete-free (copied on v2).
-      val copied = cow(s"some_$base", version, partitioned, rows = 8000, metricsProps = noNaN) { t =>
-        s"DELETE FROM $t WHERE id >= 100 AND id < 140"
-      }
+      val copied =
+        cow(s"some_$base", version, partitioned, rows = 8000, metricsProps = noNaN, seedWithVectorWriter = seedVector) {
+          t =>
+            s"DELETE FROM $t WHERE id >= 100 AND id < 140"
+        }
       expect(copied, "some-deleted")
     }
 
     test(s"$tag: DELETE touching all rows of some files still copies others (v2) / falls back (v3)") {
       // A contiguous id range: files fully inside it are skipped/rewritten, files outside are all-copied (v2).
-      val copied = cow(s"range_$base", version, partitioned, rows = 8000, metricsProps = noNaN) { t =>
+      val copied = cow(
+        s"range_$base",
+        version,
+        partitioned,
+        rows = 8000,
+        metricsProps = noNaN,
+        seedWithVectorWriter = seedVector
+      ) { t =>
         s"DELETE FROM $t WHERE id >= 2000 AND id < 2500"
       }
       expect(copied, "range-deleted")
@@ -313,9 +342,11 @@ class VectorCopyUnchangedDeleteSuite extends AnyFunSuite with BeforeAndAfterAll 
 
     test(s"$tag: DELETE removing a single row copies almost every group (v2) / falls back (v3)") {
       // One row deleted: the one group holding it is re-encoded, every other group is copied (v2).
-      val copied = cow(s"one_$base", version, partitioned, rows = 8000, metricsProps = noNaN) { t =>
-        s"DELETE FROM $t WHERE id = 4242"
-      }
+      val copied =
+        cow(s"one_$base", version, partitioned, rows = 8000, metricsProps = noNaN, seedWithVectorWriter = seedVector) {
+          t =>
+            s"DELETE FROM $t WHERE id = 4242"
+        }
       expect(copied, "one-row-deleted")
     }
   }
