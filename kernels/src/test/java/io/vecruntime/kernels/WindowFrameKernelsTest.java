@@ -442,6 +442,136 @@ class WindowFrameKernelsTest {
         assertThrows(ArithmeticException.class, () -> WindowFrameKernels.bound(Long.MAX_VALUE, 1, 64, true));
     }
 
+    /**
+     * {@link WindowFrameKernels#rangeBounds128} must agree with the 64-bit
+     * {@link WindowFrameKernels#rangeBounds} for every key and offset that fits
+     * 64 bits (the high limb is the sign extension), across every frame shape,
+     * order and null placement -- the 64-bit path is the one checked against
+     * Spark's buffer walk, so this pins the limb arithmetic to it. A decimal
+     * order key never raises (DecimalAddNoOverflowCheck), so the unchecked
+     * 64-bit bound is the reference.
+     */
+    @Test
+    void rangeBounds128MatchesThe64BitWalkForFittingKeys() {
+        Random rnd = new Random(980);
+        for (int n : SIZES) {
+            for (long[] frame : FRAMES) {
+                for (boolean descending : new boolean[] {false, true}) {
+                    for (boolean nullsFirst : new boolean[] {false, true}) {
+                        long[][] vOut = new long[1][];
+                        long[] keys = sortedKeys(rnd, n, 64, descending, nullsFirst, vOut);
+                        long[] validity = vOut[0];
+                        boolean loUnb = frame[0] != 0;
+                        boolean hiUnb = frame[2] != 0;
+                        int[] lo64 = new int[n];
+                        int[] hi64 = new int[n];
+                        WindowFrameKernels.rangeBounds(
+                                keys,
+                                validity,
+                                n,
+                                descending,
+                                nullsFirst,
+                                loUnb,
+                                frame[1],
+                                hiUnb,
+                                frame[3],
+                                64,
+                                false,
+                                lo64,
+                                hi64);
+                        // High limbs are the sign extension of the 64-bit keys / offsets.
+                        long[] keysHi = new long[n];
+                        for (int i = 0; i < n; i++) {
+                            keysHi[i] = keys[i] >> 63;
+                        }
+                        int[] lo128 = new int[n];
+                        int[] hi128 = new int[n];
+                        WindowFrameKernels.rangeBounds128(
+                                keysHi,
+                                keys,
+                                validity,
+                                n,
+                                descending,
+                                nullsFirst,
+                                loUnb,
+                                frame[1] >> 63,
+                                frame[1],
+                                hiUnb,
+                                frame[3] >> 63,
+                                frame[3],
+                                lo128,
+                                hi128);
+                        String label = "n="
+                                + n
+                                + " frame="
+                                + Arrays.toString(frame)
+                                + " desc="
+                                + descending
+                                + " nf="
+                                + nullsFirst;
+                        assertArrayEquals(lo64, lo128, label + " lo");
+                        assertArrayEquals(hi64, hi128, label + " hi");
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * A wide-decimal key near the two's-complement limits: the true bound runs
+     * past +/-2^127, which {@link WindowFrameKernels#bound128} reports as a
+     * saturation so the comparison answers +/-inf -- a bound beyond every
+     * decimal(38) key. Keys (ASC): -2^127, -1, 0, 1, 2^127-1.
+     */
+    @Test
+    void rangeBounds128SaturatesOnOverflow() {
+        long[] keysHi = {Long.MIN_VALUE, -1L, 0L, 0L, Long.MAX_VALUE};
+        long[] keysLo = {0L, -1L, 0L, 1L, -1L};
+        int n = 5;
+        int[] lo = new int[n];
+        int[] hi = new int[n];
+        // +10 FOLLOWING offset (hi=0, lo=10): the top key's upper bound overflows above -> +inf,
+        // so its frame extends to the end; the bottom key's +10 bound is exact.
+        WindowFrameKernels.rangeBounds128(
+                keysHi,
+                keysLo,
+                null,
+                n,
+                false,
+                true,
+                false,
+                0L,
+                0L,
+                false,
+                0L,
+                10L,
+                lo,
+                hi);
+        // Upper bound key+10: for the max key it overflows (+inf) so hi = n; others include only themselves
+        // plus any key within +10 (all the small middle keys are within 10 of each other).
+        assertEquals(n, hi[n - 1], "max key upper bound saturates to +inf");
+        for (int i = 0; i < n; i++) {
+            assertTrue(lo[i] <= hi[i] && lo[i] == i, "row " + i + " lo");
+        }
+        // A PRECEDING offset whose bound underflows below the min key -> -inf (lo stays 0).
+        WindowFrameKernels.rangeBounds128(
+                keysHi,
+                keysLo,
+                null,
+                n,
+                false,
+                true,
+                false,
+                -1L,
+                -10L,
+                true,
+                0L,
+                0L,
+                lo,
+                hi);
+        assertEquals(0, lo[0], "min key lower bound saturates to -inf");
+    }
+
     @Test
     void checkedSumRaisesWhereSparksPartialSumOverflows() {
         // MAX + 1 - 1: the frame's total fits, its partial sum does not -- Spark's ANSI sum raises.

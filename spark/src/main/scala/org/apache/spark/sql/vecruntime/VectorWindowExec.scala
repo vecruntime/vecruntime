@@ -139,21 +139,23 @@ import scala.collection.mutable
  *
  * `RANGE` frames with value offsets (layer 2d, `RANGE BETWEEN 5 PRECEDING AND CURRENT ROW`, `1 FOLLOWING
  * AND 3 FOLLOWING`, an unbounded side with an offset on the other): the same five aggregates over one
- * integral, `date` or `decimal(p <= 18)` order key, computed per partition by `WindowFrameKernels` once
- * the partition is held -- the keys and the input gathered into primitive arrays reused across partitions,
+ * integral, `date` or decimal order key, computed per partition by `WindowFrameKernels` once the
+ * partition is held -- the keys and the input gathered into primitive arrays reused across partitions,
  * the frame of every row found by Spark's two-pointer walk (`rangeBounds`: the bound is the key plus the
- * offset in the key's own arithmetic -- a decimal key rides the INT64 lane as its unscaled long and its
- * offset carries the same scale, so the long add is Spark's `DecimalAddNoOverflowCheck` and never wraps or
- * raises -- compared in the `SortOrder`'s direction and null ordering, so a null key's frame is the null
- * peer group), and the aggregate re-run in row order per frame as Spark's `SlidingWindowFunctionFrame`
- * does (a frame whose lower bound has not moved continues the previous accumulation; counts and unchecked
- * bigint sums slide). The peer-bounded `RANGE` frames without an offset (`CURRENT ROW AND UNBOUNDED
- * FOLLOWING`, `CURRENT ROW AND CURRENT ROW`) take the row path over any key type.
+ * offset in the key's own arithmetic -- a decimal(p <= 18) key rides the INT64 lane as its unscaled long
+ * and its offset carries the same scale, so the long add is Spark's `DecimalAddNoOverflowCheck` and never
+ * wraps or raises; a wide decimal (p > 18) rides the DECIMAL128 lane and `rangeBounds128` adds the bound
+ * on the two limbs and compares with Decimal128 order, saturating the rare 128-bit overflow to +/-inf
+ * since no decimal(38) key reaches it -- compared in the `SortOrder`'s direction and null ordering, so a
+ * null key's frame is the null peer group), and the aggregate re-run in row order per frame as Spark's
+ * `SlidingWindowFunctionFrame` does (a frame whose lower bound has not moved continues the previous
+ * accumulation; counts and unchecked bigint sums slide). The peer-bounded `RANGE` frames without an
+ * offset (`CURRENT ROW AND UNBOUNDED FOLLOWING`, `CURRENT ROW AND CURRENT ROW`) take the row path over
+ * any key type.
  *
  * `IGNORE NULLS`, decimal aggregates (#28), the other aggregate functions over sliding frames, `RANGE`
- * offsets over a timestamp (interval) or string order key, a wide decimal (DECIMAL128) key whose 128-bit
- * value the 64-bit `rangeBounds` walk cannot compare, and `min`/`max` over strings in such a frame are
- * refused with a reason naming the function and frame.
+ * offsets over a timestamp (interval) or string order key, and `min`/`max` over strings in such a frame
+ * are refused with a reason naming the function and frame.
  */
 case class VectorWindowExec(
     windowExpression: Seq[NamedExpression],
@@ -461,7 +463,11 @@ object VectorWindowPlanner {
       keyBits: Int,
       descending: Boolean,
       nullsFirst: Boolean,
-      checked: Boolean
+      checked: Boolean,
+      // High limbs of the offsets when the key is a wide decimal (keyBits == 128); for a 64-bit key
+      // they are the sign extension of `lo` / `hi`, so the limb pair equals the single long (#980).
+      loOffHi: Long = 0L,
+      hiOffHi: Long = 0L
   )
 
   /** Sliding-frame aggregates (`ROWS BETWEEN a AND b`, any bounds): re-aggregated per row over the frame's rows, in order, as Spark does. */
@@ -500,20 +506,21 @@ object VectorWindowPlanner {
     // `DecimalAddNoOverflowCheck(key, offset, d)`: plain BigDecimal addition of two scale-s values, no
     // overflow check -- so unscaled `key + offset` in 64-bit arithmetic is the same value, and it never
     // wraps (|unscaled| < 10^18, so the sum is below 2^63). The comparison is Decimal order, which at a
-    // shared scale is the order of the unscaled longs. A wider decimal has a lane (DECIMAL128, two
-    // limbs) but the RANGE two-pointer walk compares a single `long[]` and adds the bound in 64-bit
-    // arithmetic, so a 128-bit key would need a wider `rangeBounds` -- deferred to a later slice. (#980)
+    // shared scale is the order of the unscaled longs. A wider decimal (p > 18) rides the DECIMAL128
+    // lane as two limbs: the 128-bit `rangeBounds128` adds the bound on the limbs and compares with
+    // Decimal128 order, saturating the rare 128-bit overflow to +/-inf (no decimal(38) key reaches it).
+    // (#980)
     case d: SparkDecimalType if d.precision <= TypeMapping.MAX_DECIMAL_PRECISION => Some(64)
+    case _: SparkDecimalType => Some(128)
     case _ => None
   }
 
   /**
    * The [[RangeSpec]] of a `RANGE` frame with at least one value offset, or why it is not computed: the
-   * order key must be one integral, `date`, or `decimal(p <= 18)` column (Spark itself rejects several
-   * order keys here) and each offset a foldable value of the key's type -- an int for a date key, as
-   * `DateAdd` takes; a `decimal(p, s)` of the key's own scale for a decimal key, read as its unscaled
-   * long (#980). Interval offsets over date and timestamp keys, and wide decimal keys (DECIMAL128, whose
-   * 128-bit value the 64-bit bound walk cannot compare), are refused.
+   * order key must be one integral, `date`, or `decimal` column (Spark itself rejects several order keys
+   * here) and each offset a foldable value of the key's type -- an int for a date key, as `DateAdd`
+   * takes; a `decimal(p, s)` of the key's own scale for a decimal key, read as its unscaled value (a long
+   * for p <= 18, two limbs otherwise) (#980). Interval offsets over date and timestamp keys are refused.
    */
   private def rangeSpec(
       name: String,
@@ -531,27 +538,35 @@ object VectorWindowPlanner {
     val bits = rangeKeyBits(keyType) match {
       case Some(b) => b
       case None => return Left(
-          s"window aggregate $name over frame ${frame.sql}: RANGE offsets over a ${keyType.simpleString} order key not supported (integral, date and decimal(p<=18) keys are)"
+          s"window aggregate $name over frame ${frame.sql}: RANGE offsets over a ${keyType.simpleString} order key not supported (integral, date and decimal keys are)"
         )
     }
     val descending = order.direction == org.apache.spark.sql.catalyst.expressions.Descending
     val decimalKey = keyType.isInstanceOf[SparkDecimalType]
-    // Spark's WindowFrameCoercion cast the offsets to the key's type; a date key keeps an int offset (DateAdd),
-    // and a decimal key a decimal offset of the key's own (p, s) -- read as its unscaled long, the same scale
-    // as the key, so unscaled `key + offset` is the scaled addition DecimalAddNoOverflowCheck computes (#980).
-    def offset(b: Expression): Either[String, Option[Long]] = b match {
+    val wideKey = bits == 128
+    // Spark's WindowFrameCoercion cast the offsets to the key's type; a date key keeps an int offset
+    // (DateAdd), and a decimal key a decimal offset of the key's own (p, s) -- the same scale as the key,
+    // so unscaled `key + offset` is the scaled addition DecimalAddNoOverflowCheck computes. The offset is
+    // returned as two's complement limbs (hi, lo); for a 64-bit key hi is the sign extension of lo, for a
+    // wide decimal the unscaled value may exceed a long and is split from its BigInteger (#980).
+    def offset(b: Expression): Either[String, Option[(Long, Long)]] = b match {
       case UnboundedPreceding | UnboundedFollowingBound => Right(None)
-      case CurrentRow => Right(Some(0L))
+      case CurrentRow => Right(Some((0L, 0L)))
       case other
           if other.foldable && (other.dataType == keyType || (keyType == DateType && other.dataType == IntegerType)) =>
         other.eval(EmptyRow) match {
           case null => Left(s"window aggregate $name over frame ${frame.sql}: a null RANGE offset")
+          case d: org.apache.spark.sql.types.Decimal if wideKey =>
+            // Spark's UnaryMinus under DESC, in BigInteger so a wide unscaled value is exact.
+            val u = d.toJavaBigDecimal.unscaledValue()
+            val signed = if (descending) u.negate() else u
+            Right(Some((io.vecruntime.kernels.Decimal128.hiOf(signed), io.vecruntime.kernels.Decimal128.loOf(signed))))
           case d: org.apache.spark.sql.types.Decimal =>
             val signed = if (descending) -d.toUnscaledLong else d.toUnscaledLong // Spark's UnaryMinus under DESC
-            Right(Some(signed))
+            Right(Some((signed >> 63, signed)))
           case v: java.lang.Number =>
             val signed = if (descending) -v.longValue() else v.longValue() // Spark's UnaryMinus under DESC
-            Right(Some(signed))
+            Right(Some((signed >> 63, signed)))
           case _ => Left(s"window aggregate $name over frame ${frame.sql}: RANGE offset ${other.sql} is not integral")
         }
       case other => Left(
@@ -560,12 +575,14 @@ object VectorWindowPlanner {
     }
     for (lo <- offset(frame.lower); hi <- offset(frame.upper)) yield RangeSpec(
       loUnbounded = lo.isEmpty,
-      lo = lo.getOrElse(0L),
+      lo = lo.map(_._2).getOrElse(0L),
       hiUnbounded = hi.isEmpty,
-      hi = hi.getOrElse(0L),
+      hi = hi.map(_._2).getOrElse(0L),
       keyBits = bits,
       descending = descending,
       nullsFirst = order.nullOrdering == org.apache.spark.sql.catalyst.expressions.NullsFirst,
+      loOffHi = lo.map(_._1).getOrElse(0L),
+      hiOffHi = hi.map(_._1).getOrElse(0L),
       // Add in the key's type raises under ANSI; DateAdd never does, and a decimal key's bound is
       // DecimalAddNoOverflowCheck, which never raises either (so it is unchecked regardless of ANSI).
       checked = keyType != DateType && !decimalKey && org.apache.spark.sql.internal.SQLConf.get.ansiEnabled
@@ -1561,6 +1578,9 @@ private[vecruntime] class VectorWindowOffsetIterator(
       val posOf: Array[Int],
       val peerOf: Array[Int],
       val keys: Array[Long],
+      // High limbs of a wide-decimal (DECIMAL128) order key; null for a 64-bit key, where `keys` is the
+      // whole value. The low limbs live in `keys` either way (#980).
+      val keysHi: Array[Long],
       val keyValidity: Array[Long]
   ) {
 
@@ -1632,8 +1652,11 @@ private[vecruntime] class VectorWindowOffsetIterator(
       val posOf = new Array[Int](outRows)
       val peerOf = new Array[Int](outRows)
       val keys = if (rangeMode) new Array[Long](outRows) else null
-      val keyValidity = if (rangeMode) new Array[Long]((outRows + 63) >>> 6) else null
       val keyLane = if (rangeMode) order.lane(0) else null
+      val keyWide = rangeMode && keyLane.`type`() == io.vecruntime.kernels.VecType.DECIMAL128
+      val keysHi = if (keyWide) new Array[Long](outRows) else null
+      val keyData = if (keyWide) keyLane.data() else null
+      val keyValidity = if (rangeMode) new Array[Long]((outRows + 63) >>> 6) else null
       val keyIsInt = rangeMode && keyLane.`type`() == io.vecruntime.kernels.VecType.INT32
       var anyNullKey = false
       var out = 0
@@ -1658,7 +1681,10 @@ private[vecruntime] class VectorWindowOffsetIterator(
           peerOf(out) = numPeers - 1
           if (rangeMode) {
             if (Rows.valid(keyLane, i)) {
-              keys(out) = if (keyIsInt) keyLane.getInt(i).toLong else keyLane.getLong(i)
+              if (keyWide) {
+                keysHi(out) = io.vecruntime.kernels.Decimal128.hi(keyData, i)
+                keys(out) = io.vecruntime.kernels.Decimal128.lo(keyData, i)
+              } else keys(out) = if (keyIsInt) keyLane.getInt(i).toLong else keyLane.getLong(i)
               keyValidity(out >>> 6) |= 1L << (out & 63)
             } else anyNullKey = true
           }
@@ -1683,6 +1709,7 @@ private[vecruntime] class VectorWindowOffsetIterator(
         posOf,
         peerOf,
         keys,
+        keysHi,
         if (anyNullKey) keyValidity else null
       ))
       memory.track(allocator.getAllocatedMemory)
@@ -1864,7 +1891,9 @@ private[vecruntime] class VectorWindowOffsetIterator(
     private val doubles = fn.kind == VectorWindowPlanner.SlidingAvg ||
       (fn.kind != VectorWindowPlanner.SlidingCount && inputLane == io.vecruntime.kernels.VecType.FLOAT64)
     private var capacity = 0
+    private val wideKey = spec.keyBits == 128
     private var keys: Array[Long] = _
+    private var keysHi: Array[Long] = _
     private var keyValidity: Array[Long] = _
     private var lo: Array[Int] = _
     private var hi: Array[Int] = _
@@ -1880,6 +1909,7 @@ private[vecruntime] class VectorWindowOffsetIterator(
       capacity = math.max(len, math.max(1024, capacity * 2))
       val words = (capacity + 63) >>> 6
       keys = new Array[Long](capacity)
+      if (wideKey) keysHi = new Array[Long](capacity)
       keyValidity = new Array[Long](words)
       lo = new Array[Int](capacity)
       hi = new Array[Int](capacity)
@@ -1911,6 +1941,7 @@ private[vecruntime] class VectorWindowOffsetIterator(
           val r0 = (from - h.firstGlobal).toInt
           val count = (to - from).toInt
           System.arraycopy(h.keys, r0, keys, o, count)
+          if (wideKey) System.arraycopy(h.keysHi, r0, keysHi, o, count)
           if (h.keyValidity != null) {
             anyNullKey = true
             var j = 0
@@ -1947,30 +1978,48 @@ private[vecruntime] class VectorWindowOffsetIterator(
       }
       val kv = if (anyNullKey) keyValidity else null
       val vv = if (anyNullValue) validity else null
-      try {
-        io.vecruntime.kernels.WindowFrameKernels.rangeBounds(
+      if (wideKey) {
+        io.vecruntime.kernels.WindowFrameKernels.rangeBounds128(
+          keysHi,
           keys,
           kv,
           len,
           spec.descending,
           spec.nullsFirst,
           spec.loUnbounded,
+          spec.loOffHi,
           spec.lo,
           spec.hiUnbounded,
+          spec.hiOffHi,
           spec.hi,
-          spec.keyBits,
-          spec.checked,
           lo,
           hi
         )
-      } catch {
-        case _: ArithmeticException =>
-          throw VectorErrors.arithmeticOverflow(
-            if (spec.keyBits == 64) "long overflow" else "integer overflow",
-            "try_add",
-            fn.context
+      } else
+        try {
+          io.vecruntime.kernels.WindowFrameKernels.rangeBounds(
+            keys,
+            kv,
+            len,
+            spec.descending,
+            spec.nullsFirst,
+            spec.loUnbounded,
+            spec.lo,
+            spec.hiUnbounded,
+            spec.hi,
+            spec.keyBits,
+            spec.checked,
+            lo,
+            hi
           )
-      }
+        } catch {
+          case _: ArithmeticException =>
+            throw VectorErrors.arithmeticOverflow(
+              if (spec.keyBits == 64) "long overflow" else "integer overflow",
+              "try_add",
+              fn.context
+            )
+        }
       fn.kind match {
         case VectorWindowPlanner.SlidingCount =>
           io.vecruntime.kernels.WindowFrameKernels.frameCount(vv, lo, hi, len, fn.countAll, outLongs)

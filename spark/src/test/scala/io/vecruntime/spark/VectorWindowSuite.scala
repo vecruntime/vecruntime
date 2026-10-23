@@ -397,7 +397,7 @@ class VectorWindowSuite extends VectorQuerySuite {
     )
   }
 
-  test("RANGE value offsets over a decimal order key equal Spark (#980 slice A)") {
+  test("RANGE value offsets over a decimal order key equal Spark, narrow and wide (#980)") {
     // A decimal(p <= 18) order key rides the INT64 lane as its unscaled long; its frame offset carries the
     // same scale (WindowFrameCoercion) and Spark's bound is DecimalAddNoOverflowCheck -- so the kernel's
     // 64-bit `key + offset` matches bit for bit. Fractional offsets (the scale is real, not a widened int),
@@ -425,11 +425,18 @@ class VectorWindowSuite extends VectorQuerySuite {
     checkWindow(
       "SELECT i, sum(l) OVER (PARTITION BY s ORDER BY cast(i % 100 AS decimal(18,4)) RANGE BETWEEN 5.0000 PRECEDING AND CURRENT ROW) AS moving, sum(l) OVER (PARTITION BY s ORDER BY cast(i % 100 AS decimal(18,4)) ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS rows3, rank() OVER (PARTITION BY s ORDER BY cast(i % 100 AS decimal(18,4))) AS rk FROM t"
     )
-    // A wide decimal key (precision > 18, DECIMAL128) has a lane but the 64-bit bound walk cannot compare it: refused.
-    checkFallback(
-      "SELECT i, sum(l) OVER (PARTITION BY s ORDER BY cast(i % 100 AS decimal(28,2)) RANGE BETWEEN 5.00 PRECEDING AND CURRENT ROW) AS moving FROM t",
-      Seq(Window),
-      "RANGE offsets over a decimal(28,2) order key not supported"
+    // A wide decimal key (precision > 18, DECIMAL128): the 128-bit rangeBounds adds the bound on the two
+    // limbs and compares in Decimal128 order. decimal(28,2) and decimal(38,4) (the latter exercises the
+    // 128-bit overflow saturation: a bound beyond every decimal(38) key is treated as +/-inf), ASC and DESC.
+    checkWindow(
+      "SELECT i, l, sum(l) OVER (PARTITION BY s ORDER BY cast(i % 100 AS decimal(28,2)) RANGE BETWEEN 5.50 PRECEDING AND CURRENT ROW) AS moving, count(*) OVER (PARTITION BY s ORDER BY cast(i % 100 AS decimal(28,2)) RANGE BETWEEN 3.00 PRECEDING AND 3.00 FOLLOWING) AS n FROM t"
+    )
+    checkWindow(
+      "SELECT i, l, sum(i) OVER (PARTITION BY i % 7 ORDER BY cast(nullif(l % 97, 0) AS decimal(38,4)) DESC RANGE BETWEEN 6.0000 PRECEDING AND 3.0000 FOLLOWING) AS moving, avg(l) OVER (PARTITION BY i % 7 ORDER BY cast(nullif(l % 97, 0) AS decimal(38,4)) ASC NULLS FIRST RANGE BETWEEN 2.0000 PRECEDING AND CURRENT ROW) AS mean FROM t"
+    )
+    // Negative keys and a wide decimal across batches (one partition of 20000 rows, many ties).
+    checkWindow(
+      "SELECT i, sum(l) OVER (ORDER BY cast((i % 5000) - 2500 AS decimal(30,3)) RANGE BETWEEN 100.000 PRECEDING AND 100.000 FOLLOWING) AS wide FROM t"
     )
   }
 

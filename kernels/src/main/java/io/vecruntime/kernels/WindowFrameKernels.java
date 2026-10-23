@@ -164,6 +164,124 @@ public final class WindowFrameKernels {
     }
 
     /**
+     * The {@code SortOrder} comparison of a 128-bit key against a 128-bit
+     * bound, the wide-decimal (DECIMAL128) analogue of {@link #compare}. The
+     * bound carries a {@code saturation} the 64-bit path does not need: Spark's
+     * {@code DecimalAddNoOverflowCheck} computes {@code key + offset} in
+     * unbounded {@code BigDecimal} and never wraps, but a two's-complement
+     * 128-bit add can overflow at precision 38 ({@code 2 * 10^38 > 2^127}).
+     * When it does, the true bound lies beyond every {@code decimal(38)} key
+     * (all {@code < 10^38 < 2^127}), so {@code saturation} is {@code +1} (above
+     * all keys) or {@code -1} (below all), and the comparison answers as if the
+     * bound were {@code +inf} / {@code -inf} -- exactly what Spark's
+     * full-precision compare would do.
+     */
+    static int compare128(
+            boolean keyValid,
+            long keyHi,
+            long keyLo,
+            boolean boundValid,
+            long boundHi,
+            long boundLo,
+            int saturation,
+            boolean descending,
+            boolean nullsFirst) {
+        if (keyValid && boundValid) {
+            int c = saturation != 0 ? -saturation : Decimal128.compare(keyHi, keyLo, boundHi, boundLo);
+            return descending ? -c : c;
+        }
+        if (!keyValid && !boundValid) {
+            return 0;
+        }
+        if (!keyValid) {
+            return nullsFirst ? -1 : 1;
+        }
+        return nullsFirst ? 1 : -1;
+    }
+
+    /**
+     * {@code key + offset} as a 128-bit two's complement value, returned in
+     * {@code out[0] = hi}, {@code out[1] = lo}, with the signed-overflow
+     * direction as the return value: {@code 0} when the sum is exact in 128
+     * bits, {@code +1} / {@code -1} when it overflowed above / below (a bound
+     * beyond every {@code decimal(38)} key). Spark's {@code
+     * DecimalAddNoOverflowCheck} never raises, so this never throws.
+     */
+    static int bound128(long keyHi, long keyLo, long offHi,
+                        long offLo, long[] out) {
+        long rl = keyLo + offLo;
+        long carry = Long.compareUnsigned(rl, keyLo) < 0 ? 1L : 0L;
+        long rh = keyHi + offHi + carry;
+        out[0] = rh;
+        out[1] = rl;
+        // Signed overflow: operands of the same sign, result of the other. The sign of the
+        // operands (equal here) is the direction the true value ran off to.
+        if (((keyHi ^ rh) & (offHi ^ rh)) < 0) {
+            return keyHi < 0 ? -1 : 1;
+        }
+        return 0;
+    }
+
+    /**
+     * {@link #rangeBounds} for a wide-decimal order key: the keys are the two
+     * limbs of a DECIMAL128 ({@code keysHi} / {@code keysLo}), and the offsets
+     * are a decimal of the key's own scale, split into limbs the same way. The
+     * bound is {@code key + offset} on the limbs ({@link #bound128}), compared
+     * with {@link #compare128}. Never throws: Spark's bound for a decimal key
+     * is {@code DecimalAddNoOverflowCheck}, unchecked regardless of ANSI.
+     */
+    public static void rangeBounds128(
+            long[] keysHi,
+            long[] keysLo,
+            long[] validity,
+            int n,
+            boolean descending,
+            boolean nullsFirst,
+            boolean loUnbounded,
+            long loOffHi,
+            long loOffLo,
+            boolean hiUnbounded,
+            long hiOffHi,
+            long hiOffLo,
+            int[] lo,
+            int[] hi) {
+        long[] scratch = new long[2];
+        int l = 0;
+        int h = 0;
+        for (int i = 0; i < n; i++) {
+            boolean kv = valid(validity, i);
+            long kh = keysHi[i];
+            long kl = keysLo[i];
+            if (hiUnbounded) {
+                h = n;
+            } else if (h < n) {
+                int sat = kv ? bound128(kh, kl, hiOffHi, hiOffLo, scratch) : 0;
+                long bh = scratch[0];
+                long bl = scratch[1];
+                while (h < n && compare128(valid(validity, h), keysHi[h], keysLo[h], kv, bh,
+                        bl, sat, descending, nullsFirst)
+                        <= 0) {
+                    h++;
+                }
+            }
+            if (loUnbounded) {
+                l = 0;
+            } else if (l < h) {
+                int sat = kv ? bound128(kh, kl, loOffHi, loOffLo, scratch) : 0;
+                long bh = scratch[0];
+                long bl = scratch[1];
+                while (l < h && compare128(valid(validity, l), keysHi[l], keysLo[l], kv, bh,
+                        bl, sat, descending, nullsFirst)
+                        < 0) {
+                    l++;
+                }
+            }
+            lo[i] = l;
+            hi[i] = h;
+        }
+    }
+
+    /**
      * {@code count} over each frame: every row when {@code countAll} ({@code
      * count(*)}, {@code count(1)}), the valid ones otherwise. Slides: the rows
      * leaving at the lower bound are subtracted, the rows entering at the
