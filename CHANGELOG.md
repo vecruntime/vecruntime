@@ -8,6 +8,14 @@ version may change configuration keys or defaults, always noted here.
 
 ### Added
 
+- Regression guard that our columnar shuffle takes part in AQE's skew splitting of rebalance partitions
+  (`RebalanceSkewSplitSuite`, iceberg-bridge): the six Iceberg 1.12 `testSkew{Delete,Update,Merge}` scenarios
+  (copy-on-write and merge-on-read) run with our write/scan/shuffle features off and on with a tiny Iceberg
+  advisory partition size (100) and `spark.sql.adaptive.optimizeSkewsInRebalancePartitions.enabled=true`, and
+  both produce four files -- confirming `VectorShuffleExchangeExec` preserves the REBALANCE `shuffleOrigin`,
+  honours the user's advisory size, and reads `PartialReducerPartitionSpec` splits, so
+  `OptimizeSkewInRebalancePartitions` splits the skewed rebalance reduce partition over our exchange exactly
+  as over Spark's own.
 - Grouped aggregate state in the native pool (#941, `spark.vecruntime.agg.nativeState`, on by default): past 16,384
   groups, the long sum, count and 128-bit decimal sum accumulators keep their state in one pool block each, a group's
   fields side by side, charged to the task in the operators' memory mode, instead of `long[]` on the heap. At 10 TB
