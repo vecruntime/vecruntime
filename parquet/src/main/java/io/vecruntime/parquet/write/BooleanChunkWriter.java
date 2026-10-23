@@ -33,15 +33,18 @@ import org.apache.parquet.column.statistics.Statistics;
  * Writes one flat BOOLEAN column (a BOOL lane) straight to its {@link
  * PageWriter}, with no per-value object and no parquet-java column writer.
  *
- * <p>Parquet v2 encodes BOOLEAN values with the RLE / bit-packing hybrid, bit
- * width 1 (parquet-java's {@code DefaultV2ValuesWriterFactory} picks the RLE
- * writer for booleans), never a dictionary. The values section carries a 4-byte
- * little-endian length prefix before the hybrid stream, as parquet-java's RLE
- * values writer writes it; the definition levels are the validity bits, RLE /
- * bit-packed hybrid without a prefix, outside the body as data page v2 keeps
- * them. Page statistics are the min, max and null count, and -- as parquet-java
- * does -- a BOOLEAN column gets no Bloom filter (its value collector never feeds
- * one).
+ * <p>Parquet v2 data pages, with BOOLEAN values encoded as PLAIN: each value a
+ * single bit, least significant bit first, packed into {@code ceil(n / 8)}
+ * bytes with no length prefix (the Parquet spec's PLAIN for booleans). The
+ * definition levels of an optional column stay in the v2 level section as the
+ * RLE / bit-packed hybrid of the validity bits. parquet-java's {@code
+ * DefaultV2ValuesWriterFactory} picks the RLE values writer for booleans
+ * instead, but Iceberg's own vectorized Spark reader rejects an RLE-encoded
+ * boolean column ({@code VectorizedPageIterator.initDataReader}), so the writer
+ * emits PLAIN, which every reader accepts at its default settings. No
+ * dictionary. Page statistics are the min, max and null count, and -- as
+ * parquet-java does -- a BOOLEAN column gets no Bloom filter (its value
+ * collector never feeds one).
  */
 final class BooleanChunkWriter implements ChunkWriter {
 
@@ -66,7 +69,6 @@ final class BooleanChunkWriter implements ChunkWriter {
     private int trueCount;
 
     private final ByteSink body = new ByteSink(4 * 1024);
-    private final ByteSink values = new ByteSink(4 * 1024);
     private final ByteSink levels = new ByteSink(1024);
 
     BooleanChunkWriter(ColumnDescriptor column, ParquetProperties props) {
@@ -131,19 +133,18 @@ final class BooleanChunkWriter implements ChunkWriter {
         if (optional) {
             RleHybridEncoder.encodeValidity(MemorySegment.ofArray(pageValidity), 0, pageRows, levels);
         }
-        // The RLE / bit-packed hybrid of the values, bit width 1, with a 4-byte little-endian length prefix.
-        values.reset();
-        RleHybridEncoder.encode(bits, pageValues, 1, values);
+        // PLAIN BOOLEAN: the values bit-packed, one bit per value, least significant bit first, in
+        // ceil(pageValues / 8) bytes with no length prefix and no RLE header (Iceberg's vectorized reader
+        // rejects RLE-encoded boolean values; PLAIN is readable by every reader at its default settings).
         body.reset();
-        body.writeIntLE(values.size());
-        body.write(values);
+        body.packBits(bits, 0, pageValues, (pageValues + 7) & ~7, 1);
         pages.writePageV2(
                 pageRows,
                 pageRows - pageValues,
                 pageRows,
                 BytesInput.empty(),
                 BytesInput.from(levels.toByteArray()),
-                Encoding.RLE,
+                Encoding.PLAIN,
                 BytesInput.from(body.toByteArray()),
                 statistics(),
                 new org.apache.parquet.column.statistics.SizeStatistics(column.getPrimitiveType(), 0L, java.util.List.of(),
