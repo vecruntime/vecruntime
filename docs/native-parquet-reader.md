@@ -121,17 +121,16 @@ Everything below returns Spark's own result: either Spark's reader decodes it, o
 
 ### Codecs
 
-Every Parquet codec is read correctly, and every codec's decompressor lives as long as its file (#828, #829). Only zstd and snappy have a dedicated path. The others are no slower than in Spark's own reader, which uses the same parquet-java decompressors, but they do not get the per-page reuse zstd and snappy have. Dedicated gzip and LZ4_RAW paths are tracked in [#830](https://github.com/vecruntime/vecruntime/issues/830), to be measured first.
+Compression is not a decode concern of the scan's own. The scan installs `ReusingCodecFactory`, which decompresses zstd and snappy through one reused buffer per column chunk (#810) and hands every other codec to parquet-java's own `CodecFactory`; each codec's decompressor then lives as long as its file (#828, #829). So the codec is never a fall-back reason — `VectorParquetScanExec.hasUnsupportedEncodingInFooter` checks only encodings and physical types — and a file in any codec whose decompressor is on the classpath is read natively, byte for byte as Spark's own reader (which uses the same parquet-java decompressors). `NativeParquetCodecSuite` pins this for every such codec across v1/v2 pages, dictionary/plain pages and flat/nested columns. Only zstd and snappy have the per-page reuse; the others are no slower than in Spark's reader but do not get it. Dedicated gzip and LZ4_RAW paths are tracked in [#830](https://github.com/vecruntime/vecruntime/issues/830), to be measured first.
 
 | Codec | Decompression | Page into the decoder |
 |---|---|---|
 | ZSTD, SNAPPY | The scan's own (`ReusingCodecFactory`, #810): one reused buffer per column chunk | Read in place, no copy (#786) |
 | UNCOMPRESSED | None | Read in place from the chunk buffer |
-| GZIP, LZ4 (Hadoop framing), LZO | parquet-java, through a Hadoop stream codec, decompressor from Hadoop's `CodecPool` | One copy into the reader's reused page buffer; no new array per page |
+| GZIP, LZ4 (Hadoop framing) | parquet-java, through a Hadoop stream codec, decompressor from Hadoop's `CodecPool` | One copy into the reader's reused page buffer; no new array per page |
 | LZ4_RAW | parquet-java's own codec, through the same stream interface | One copy into the reused page buffer |
-| BROTLI | As GZIP, once its codec jar is on the classpath | One copy into the reused page buffer |
 
-LZO and Brotli need codec libraries VecRuntime does not bundle (LZO is GPL and not shipped with Hadoop), so they stay on parquet-java's path.
+The codecs above are all decoded by aircompressor's pure-Java codecs, which ship on the classpath, so the shipped build reads every one of them. **BROTLI and LZO are the exception**: no Brotli or LZO codec is on the classpath (not in aircompressor, parquet-java or Spark — LZO is GPL and not shipped with Hadoop), so a file in either is read by neither Spark's reader nor this one. Because the codec is not a fall-back reason, such a file is *not* diverted to Spark's reader — the read reaches the decompressor and parquet-java raises `BadConfigurationException` (the missing `BrotliCodec`/`LzoCodec` class), exactly as Spark's own reader would raise it for the same file. Decoding Brotli natively would add a new runtime dependency (`brotli4j` or `org.brotli:dec`); it is left out until that dependency is accepted, and would then wire into `ReusingCodecFactory` beside zstd and snappy.
 
 ## Status at 1 TB TPC-DS
 
