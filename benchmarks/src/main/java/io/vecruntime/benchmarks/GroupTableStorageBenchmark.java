@@ -52,6 +52,9 @@ import org.openjdk.jmh.annotations.Warmup;
  *       one entry (one cache line a probe instead of two);
  *   <li>{@code probeNativePacked}: the same packed entry in a pool block, keys
  *       in a pool block;
+ *   <li>{@code probeHeapInline}: the same inline entry in a heap {@code
+ *       long[]} -- what the table's #677 fast path already is for integer
+ *       keys, so the fair baseline for moving that path into the pool;
  *   <li>{@code probeNativeInline}: a pool block whose entry carries the key
  *       itself next to the group id (hash re-derived only on a mismatch), the
  *       shape of the table's inline-key fast path (#677), so a hit touches one
@@ -85,6 +88,7 @@ public class GroupTableStorageBenchmark {
     int[] hashes;
     long[] keys;
     long[] packed;
+    long[] heapInline; // pairs on the heap: key, (hash << 32 | id) -- the table's #677 fast layout
     MemorySegment nPacked;
     MemorySegment nKeys;
     MemorySegment nInline; // pairs: key, (hash << 32 | id); id -1 = empty
@@ -102,6 +106,10 @@ public class GroupTableStorageBenchmark {
         slots = new int[cap];
         hashes = new int[cap];
         packed = new long[cap];
+        heapInline = new long[2 * cap];
+        for (int p = 0; p < cap; p++) {
+            heapInline[2 * p + 1] = -1L;
+        }
         java.util.Arrays.fill(slots, -1);
         java.util.Arrays.fill(packed, -1L);
         keys = new long[groups];
@@ -129,6 +137,8 @@ public class GroupTableStorageBenchmark {
             nPacked.setAtIndex(LONG, pos, e);
             nInline.setAtIndex(LONG, 2L * pos, k);
             nInline.setAtIndex(LONG, 2L * pos + 1, e);
+            heapInline[2 * pos] = k;
+            heapInline[2 * pos + 1] = e;
         }
         for (int i = 0; i < N; i++) {
             long k = keys[rnd.nextInt(groups)];
@@ -203,6 +213,26 @@ public class GroupTableStorageBenchmark {
             long e;
             while ((e = t.getAtIndex(LONG, pos)) != -1L
                     && ((int) (e >>> 32) != h || ks.getAtIndex(LONG, (int) e) != k)) {
+                pos = (pos + 1) & m;
+            }
+            int id = (int) e;
+            out[i] = id;
+            acc += id;
+        }
+        return acc;
+    }
+
+    @Benchmark
+    @OperationsPerInvocation(N)
+    public int probeHeapInline() {
+        long[] t = heapInline;
+        int m = mask;
+        int acc = 0;
+        for (int i = 0; i < N; i++) {
+            long k = rowKeys[i];
+            int pos = rowHashes[i] & m;
+            long e;
+            while ((e = t[2 * pos + 1]) != -1L && t[2 * pos] != k) {
                 pos = (pos + 1) & m;
             }
             int id = (int) e;
