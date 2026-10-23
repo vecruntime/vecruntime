@@ -40,6 +40,9 @@ class IcebergScanSuite extends IcebergMorSuiteBase {
     icebergConf ++ Map(
       "spark.plugins" -> classOf[VectorPlugin].getName,
       "spark.sql.adaptive.enabled" -> "true",
+      // This suite covers Iceberg's own vectorized reader under our operators (the batch adapters); the native
+      // Iceberg scan, on by default, is covered by IcebergNativeScanSuite.
+      "spark.vecruntime.scan.nativeIceberg.enabled" -> "false",
       // Several batches per file so a delete-carrying batch is not the only shape seen.
       s"spark.sql.catalog.${IcebergTables.Catalog}.read.parquet.vectorization.batch-size" -> "1024"
     )

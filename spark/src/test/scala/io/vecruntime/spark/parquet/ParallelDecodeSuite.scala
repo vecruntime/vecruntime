@@ -19,6 +19,8 @@ import io.vecruntime.spark.VectorConf
 import io.vecruntime.spark.arrow.VectorAllocators
 import io.vecruntime.spark.test.VectorQuerySuite
 import org.apache.spark.sql.vecruntime.{ParallelDecodeIterator, PlanUtils, VectorParquetScanExec}
+import org.scalatest.concurrent.Eventually._
+import org.scalatest.time.{Seconds, Span}
 
 /**
  * #606: parallel row-group decode in the native Parquet scan. With `parallelDecode` = K > 0 the row groups of
@@ -167,7 +169,11 @@ class ParallelDecodeSuite extends VectorQuerySuite {
       checkVectorized("SELECT i, s, w, st.a FROM pd_t LIMIT 7", Seq(node))
       checkVectorized("SELECT * FROM pd_t WHERE i > 100 LIMIT 1000", Seq(node))
     }
-    assert(root.getAllocatedMemory === before, s"allocated ${root.getAllocatedMemory} vs $before before")
+    // A LIMIT returns once it has its rows; the tasks it cancels release their vectors as they wind down, after
+    // collect() returns. A leak never returns to the baseline; a cancelled task does within a few seconds.
+    eventually(timeout(Span(30, Seconds))) {
+      assert(root.getAllocatedMemory === before, s"allocated ${root.getAllocatedMemory} vs $before before")
+    }
   }
 
   test("a table mixing natively decoded and fallback files reads correctly and in order") {
