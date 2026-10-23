@@ -318,6 +318,59 @@ class VectorWriteSuite extends VectorQuerySuite {
     spark.sql("DROP TABLE bk_spark")
   }
 
+  test("Hive-compatible bucketed writes: HiveHash bucket id, Hive file names and rows as Spark's writer") {
+    import org.apache.spark.sql.execution.datasources.BucketingUtils
+    val hiveOption = BucketingUtils.optionForHiveCompatibleBucketWrite
+    // Hive names a bucket file `<bucketId %05d>_0_<uuid>...`, so the id is a PREFIX, not Spark's `_NNNNN` suffix.
+    val hivePrefix = """^(\d{5})_0_.*""".r
+    def hiveBucketId(name: String): Option[Int] = name match {
+      case hivePrefix(id) => Some(id.toInt)
+      case _ => None
+    }
+    def write(table: String, columnar: Boolean, keys: Seq[String], partitioned: Boolean): SparkPlan = {
+      lastWritePlan = null
+      withConf(VectorConf.WriteColumnar -> columnar.toString) {
+        spark.sql(s"DROP TABLE IF EXISTS $table")
+        val w = spark.table("t").selectExpr("i", "l", "s", "d2", "b").write
+          .option(hiveOption, "true")
+          .bucketBy(5, keys.head, keys.tail: _*)
+        (if (partitioned) w.partitionBy("b") else w).format("parquet").saveAsTable(table)
+      }
+      org.apache.spark.sql.vecruntime.TestListenerSync.drain(spark)
+      lastWritePlan
+    }
+    def byBucket(table: String): Map[(String, Int), Seq[String]] = {
+      val location =
+        spark.sessionState.catalog.getTableMetadata(spark.sessionState.sqlParser.parseTableIdentifier(table)).location
+      val root = new Path(location.toString).toString
+      val files = parquetFiles(location.toString)
+      // Every file must carry a Hive bucket-id prefix (so the naming matches Spark's, not the `_NNNNN` suffix).
+      files.foreach(f => assert(hiveBucketId(f.getName).isDefined, s"not a Hive bucket file name: ${f.getName}"))
+      files.groupBy(f => (f.getParent.toString.stripPrefix(root), hiveBucketId(f.getName).get)).map { case (k, fs) =>
+        k -> withPlugin(enabled = false)(spark.read.parquet(fs.map(_.toString): _*).collect()).map(_.toString).sorted
+      }
+    }
+    // int, string and multi-column bucket keys, each unpartitioned and bucketed+partitioned.
+    for (keys <- Seq(Seq("i"), Seq("s"), Seq("s", "i")); partitioned <- Seq(false, true)) {
+      val label = s"keys=${keys.mkString(",")} partitioned=$partitioned"
+      // The bucket id must be computed on lanes (the compiled hive-hash/pmod expression), never row by row.
+      val rowBucketsBefore = org.apache.spark.sql.vecruntime.VectorWriteTestHooks.rowBucketIdRows
+      val plan = write("hbk_ours", columnar = true, keys, partitioned)
+      assert(hasVectorWrite(plan), s"$label: ${plan.treeString}\n${fallbackReasons(plan)}")
+      assert(
+        org.apache.spark.sql.vecruntime.VectorWriteTestHooks.rowBucketIdRows == rowBucketsBefore,
+        s"$label: bucket ids were evaluated row by row, not on lanes"
+      )
+      write("hbk_spark", columnar = false, keys, partitioned)
+      val ours = byBucket("hbk_ours")
+      val theirs = byBucket("hbk_spark")
+      assert(ours.keySet === theirs.keySet, s"$label: bucket files / ids")
+      ours.foreach { case (k, rows) => assert(rows === theirs(k), s"$label: bucket $k rows") }
+      spark.sql("DROP TABLE hbk_ours")
+      spark.sql("DROP TABLE hbk_spark")
+    }
+  }
+
   test("empty2null and collation_aware_hash run in our projection, as Spark computes them") {
     import org.apache.spark.sql.catalyst.analysis.UnresolvedAttribute
     import org.apache.spark.sql.catalyst.expressions.{CollationAwareMurmur3Hash, Empty2Null}
@@ -442,6 +495,111 @@ class VectorWriteSuite extends VectorQuerySuite {
     assert(hasVectorWrite(pp), s"${pp.treeString}\n${fallbackReasons(pp)}")
   }
 
+  test("writeLegacyFormat nested: bag/array lists, key_value maps, structs of lists -- Spark's legacy schema") {
+    // Legacy layout: lists as group (LIST){ repeated group bag { optional elem array } }, maps as
+    // (MAP){ repeated group key_value ... }, with nulls at every level, empty collections and nesting at depth.
+    val nested = (s: SparkSession) =>
+      wide(s).selectExpr(
+        "i",
+        "IF(i % 9 = 0, NULL, named_struct('a', i, 'b', s, 'ts', ts)) AS st",
+        "CASE WHEN i % 5 = 0 THEN NULL WHEN i % 5 = 1 THEN array() ELSE array(l, NULL, l + 1) END AS arr",
+        "CASE WHEN i % 7 = 0 THEN NULL WHEN i % 7 = 1 THEN map() ELSE map(coalesce(s, 'x'), l, 'k', NULL) END AS m",
+        // A struct holding a list, a list of structs holding a list (depth), and a list of lists.
+        "named_struct('n', by, 'ys', IF(i % 4 = 0, NULL, array(s, cast(b as string)))) AS so",
+        "array(named_struct('x', sh, 'ys', IF(i % 6 = 0, NULL, array(l))), NULL) AS deep",
+        "array(array(sh), array(), NULL) AS aa",
+        "map(i, named_struct('d', dt, 's', s)) AS ms"
+      )
+    // The source is written in legacy format too, so our scan reads a legacy-layout file and our writer re-emits it.
+    val src = newTempPath("write/legacy-nested-src")
+    withConf("spark.sql.parquet.writeLegacyFormat" -> "true") {
+      withPlugin(enabled = false)(nested(spark).write.mode("overwrite").parquet(src))
+      val (plan, footers) = compareWrites("legacy-nested", s => s.read.parquet(src).where("i % 11 <> 3"))
+      assert(hasVectorWrite(plan), s"${plan.treeString}\n${fallbackReasons(plan)}")
+      // The legacy layout is present: a repeated group named `bag` (lists) and `key_value` (maps).
+      val groups = footers.head.getFileMetaData.getSchema.getColumns.asScala.flatMap(_.getPath.toSeq).toSet
+      assert(groups.contains("bag"), s"legacy list layout (bag) missing: $groups")
+      assert(groups.contains("key_value"), s"legacy map layout missing: $groups")
+      // Partitioned: runs cut at partition boundaries slice the legacy nested lanes too.
+      val (pp, _) = compareWrites(
+        "legacy-nested-part",
+        s => s.read.parquet(src).selectExpr("*", "i % 3 AS pk"),
+        partitionBy = Seq("pk")
+      )
+      assert(hasVectorWrite(pp), s"${pp.treeString}\n${fallbackReasons(pp)}")
+    }
+  }
+
+  test("writeLegacyFormat decimals: every precision written as FIXED_LEN_BYTE_ARRAY, as Spark's legacy writer") {
+    // Precisions 1, 9, 10, 18, 19 and 38: all FLBA in legacy format (p<=18 on the INT64 lane, p>18 DECIMAL128).
+    val decs = (s: SparkSession) =>
+      s.table("t").selectExpr(
+        "i",
+        "cast(i % 9 as decimal(1,0)) as d1",
+        "cast(l as decimal(9,2)) as d9",
+        "cast(l as decimal(10,3)) as d10",
+        "cast(l * 1000 as decimal(18,4)) as d18",
+        "cast(l * 1000 as decimal(19,4)) as d19",
+        "cast(l as decimal(38,10)) as d38"
+      )
+    withConf("spark.sql.parquet.writeLegacyFormat" -> "true") {
+      val (plan, footers) = compareWrites("legacy-dec", decs)
+      assert(hasVectorWrite(plan), s"${plan.treeString}\n${fallbackReasons(plan)}")
+      import org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.FIXED_LEN_BYTE_ARRAY
+      val cols = footers.head.getFileMetaData.getSchema.getColumns.asScala
+      cols.filter(_.getPath()(0).startsWith("d")).foreach(c =>
+        assert(c.getPrimitiveType.getPrimitiveTypeName == FIXED_LEN_BYTE_ARRAY, s"${c.getPath()(0)} not FLBA")
+      )
+    }
+  }
+
+  test("write calendar rebase LEGACY: dates and timestamps rebased and the legacy metadata keys written") {
+    // Ancient and modern dates and timestamps, INT96 and INT64 (MICROS and MILLIS) timestamps.
+    val dates = (s: SparkSession) =>
+      s.range(0, 4000).selectExpr(
+        "cast(id as int) as i",
+        "case when id % 13 = 0 then null else date_add(date'1000-01-01', cast(id * 211 as int)) end as d",
+        "case when id % 11 = 0 then null else timestamp_micros(cast((id - 3000) * 86400000003 as bigint)) end as ts"
+      )
+    Seq("TIMESTAMP_MICROS", "TIMESTAMP_MILLIS", "INT96").foreach { tsType =>
+      withConf(
+        "spark.sql.parquet.datetimeRebaseModeInWrite" -> "LEGACY",
+        "spark.sql.parquet.int96RebaseModeInWrite" -> "LEGACY",
+        "spark.sql.parquet.outputTimestampType" -> tsType
+      ) {
+        val (plan, footers) = compareWrites(s"rebase-legacy-$tsType", dates)
+        assert(hasVectorWrite(plan), s"$tsType: ${plan.treeString}\n${fallbackReasons(plan)}")
+        val kv = footers.head.getFileMetaData.getKeyValueMetaData
+        assert(kv.containsKey("org.apache.spark.legacyDateTime"), s"$tsType: missing legacyDateTime key")
+        assert(kv.containsKey("org.apache.spark.timeZone"), s"$tsType: missing timeZone key")
+        if (tsType == "INT96") {
+          assert(kv.containsKey("org.apache.spark.legacyINT96"), "missing legacyINT96 key for INT96 output")
+        }
+      }
+    }
+  }
+
+  test("write calendar rebase EXCEPTION: an ancient date or timestamp fails as Spark's write fails") {
+    def ancient(s: SparkSession): DataFrame =
+      s.range(0, 10).selectExpr("cast(id as int) as i", "date'1000-01-01' as d")
+    withConf("spark.sql.parquet.datetimeRebaseModeInWrite" -> "EXCEPTION") {
+      val p = newTempPath("write/rebase-exc")
+      val ex = intercept[Exception](write(ancient(spark), p, columnar = true))
+      def causes(t: Throwable): List[Throwable] = if (t == null) Nil else t :: causes(t.getCause)
+      assert(
+        causes(ex).exists(_.getClass.getSimpleName == "SparkUpgradeException"),
+        s"expected a SparkUpgradeException in the cause chain, got ${causes(ex).map(_.getClass.getName)}"
+      )
+    }
+    // A modern-only date under EXCEPTION writes fine and matches Spark.
+    val modern = (s: SparkSession) =>
+      s.range(0, 1000).selectExpr("cast(id as int) as i", "date_add(date'2020-01-01', cast(id % 365 as int)) as d")
+    withConf("spark.sql.parquet.datetimeRebaseModeInWrite" -> "EXCEPTION") {
+      val (plan, _) = compareWrites("rebase-exc-modern", modern)
+      assert(hasVectorWrite(plan), s"${plan.treeString}\n${fallbackReasons(plan)}")
+    }
+  }
+
   test("parquet.enable.dictionary#<column>: the column named is written without a dictionary, as Spark writes it") {
     val (plan, ours) =
       compareWrites(
@@ -527,13 +685,6 @@ class VectorWriteSuite extends VectorQuerySuite {
     assert(
       reasonsOf(p => spark.table("t").write.option("parquet.writer.version", "v1").parquet(p))
         .exists(_.contains("writes Parquet v2"))
-    )
-    assert(
-      reasonsOf { p =>
-        withConf("spark.sql.parquet.writeLegacyFormat" -> "true") {
-          spark.table("t").selectExpr("i", "named_struct('a', i, 'b', s) AS st").write.parquet(p)
-        }
-      }.exists(_.contains("is nested and writeLegacyFormat is on"))
     )
     assert(reasonsOf(p => spark.table("t").write.orc(p)).exists(_.contains("is not Parquet")))
   }

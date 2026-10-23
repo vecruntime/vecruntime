@@ -117,9 +117,21 @@ final class FixedBinaryChunkWriter implements ChunkWriter {
     // One value's bytes, reused: the lane's bytes (FIXED) or the big-endian two's-complement (DECIMAL).
     private final byte[] scratch;
     private final MemorySegment scratchSeg;
+    // The write calendar rebase for an INT96 TIMESTAMP column; NONE (and int96Active false) for FIXED / DECIMAL,
+    // so the INT96 micros pass through unchanged.
+    private final WriteRebase rebase;
+    private final boolean rebaseInt96;
 
     FixedBinaryChunkWriter(Kind kind, int width, ColumnDescriptor column,
                            ParquetProperties props) {
+        this(kind, width, column, props, WriteRebase.NONE);
+    }
+
+    FixedBinaryChunkWriter(Kind kind, int width, ColumnDescriptor column,
+                           ParquetProperties props, WriteRebase rebase) {
+        WriteRebase r = rebase == null ? WriteRebase.NONE : rebase;
+        this.rebase = r;
+        this.rebaseInt96 = kind == Kind.INT96 && r.int96Active();
         this.kind = kind;
         this.width = width;
         this.column = column;
@@ -164,8 +176,12 @@ final class FixedBinaryChunkWriter implements ChunkWriter {
             }
         } else {
             // INT96: micros of the day since the epoch -> 8 bytes nanoseconds of the day, 4 bytes Julian day,
-            // little-endian, as Spark writes its INT96 timestamp. The micros are already rebased upstream.
+            // little-endian, as Spark writes its INT96 timestamp. Under LEGACY the micros are rebased to the
+            // hybrid Julian calendar first (EXCEPTION throws on an ancient value), as Spark's write does.
             long micros = data.get(VectorBuffers.LE_LONG, (long) i << 3);
+            if (rebaseInt96) {
+                micros = rebase.rebaseInt96Micros(micros);
+            }
             long day = Math.floorDiv(micros, MICROS_PER_DAY);
             long nanos = Math.floorMod(micros, MICROS_PER_DAY) * 1000L;
             scratchSeg.set(VectorBuffers.LE_LONG, 0, nanos);

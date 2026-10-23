@@ -70,6 +70,7 @@ public final class ColumnarParquetWriter implements AutoCloseable {
     private final ColumnEncoder[] encoders;
     private final VecType[] lanes;
     private final ChunkWriter[] fast;
+    private final WriteRebase rebase;
 
     private ColumnChunkPageWriteStore pageStore;
     private ColumnWriteStore columnStore;
@@ -96,6 +97,27 @@ public final class ColumnarParquetWriter implements AutoCloseable {
     public ColumnarParquetWriter(OutputFile out, MessageType schema, ParquetProperties props,
             CompressionCodecFactory.BytesInputCompressor compressor, long rowGroupSize, Map<String, String> footer)
             throws IOException {
+        this(out, schema, props, compressor, rowGroupSize, footer,
+                WriteRebase.NONE);
+    }
+
+    /**
+     * As above, applying {@code rebase} to the file's date and timestamp values
+     * (#842): a {@code LEGACY} or {@code EXCEPTION} write rebases or refuses
+     * values below the Gregorian calendar switch, as Spark's {@code
+     * ParquetWriteSupport} does. {@link WriteRebase#NONE} (the default
+     * constructor) writes the proleptic Gregorian calendar as stored.
+     */
+    public ColumnarParquetWriter(
+            OutputFile out,
+            MessageType schema,
+            ParquetProperties props,
+            CompressionCodecFactory.BytesInputCompressor compressor,
+            long rowGroupSize,
+            Map<String, String> footer,
+            WriteRebase rebase)
+            throws IOException {
+        this.rebase = rebase == null ? WriteRebase.NONE : rebase;
         this.schema = schema;
         // The writer writes Parquet v2 only (#64): data page v2 and the v2 encodings, also on the column-store path.
         this.props = ParquetProperties.copy(props)
@@ -116,7 +138,7 @@ public final class ColumnarParquetWriter implements AutoCloseable {
                 throw new IllegalArgumentException("repeated primitive field not supported: " + f.getName());
             } else {
                 columns.add(null);
-                nested[i] = new NestedFieldWriter(schema, f, this.props);
+                nested[i] = new NestedFieldWriter(schema, f, this.props, rebase);
             }
         }
         this.encoders = new ColumnEncoder[columns.size()];
@@ -154,7 +176,7 @@ public final class ColumnarParquetWriter implements AutoCloseable {
             return new BooleanChunkWriter(column, props);
         }
         if (lane == VecType.INT64 && p == org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.INT96) {
-            return new FixedBinaryChunkWriter(FixedBinaryChunkWriter.Kind.INT96, 12, column, props);
+            return new FixedBinaryChunkWriter(FixedBinaryChunkWriter.Kind.INT96, 12, column, props, rebase);
         }
         if (p == org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.FIXED_LEN_BYTE_ARRAY) {
             int fixedWidth = column.getPrimitiveType().getTypeLength();
@@ -220,7 +242,7 @@ public final class ColumnarParquetWriter implements AutoCloseable {
                 }
                 FixedWidthChunkWriter.Kind kind = FixedWidthChunkWriter.kindFor(lane, columns.get(i));
                 if (kind != null) {
-                    fast[i] = new FixedWidthChunkWriter(kind, columns.get(i), props);
+                    fast[i] = new FixedWidthChunkWriter(kind, columns.get(i), props, rebase);
                     fast[i].startChunk(pageStore.getPageWriter(columns.get(i)), blooms(columns.get(i)));
                 } else {
                     ChunkWriter flat = flatChunkWriter(lane, columns.get(i));
@@ -228,7 +250,7 @@ public final class ColumnarParquetWriter implements AutoCloseable {
                         fast[i] = flat;
                         fast[i].startChunk(pageStore.getPageWriter(columns.get(i)), blooms(columns.get(i)));
                     } else {
-                        encoders[i] = ColumnEncoder.forColumn(lane, columns.get(i));
+                        encoders[i] = ColumnEncoder.forColumn(lane, columns.get(i), rebase);
                     }
                 }
             } else if (lanes[i] != lane) {

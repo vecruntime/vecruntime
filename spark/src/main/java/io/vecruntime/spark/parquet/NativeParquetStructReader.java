@@ -101,7 +101,11 @@ public final class NativeParquetStructReader extends StructColumnReader implemen
             DataType dt = fs[i].dataType();
             String childName = name + "." + fs[i].name();
             if (file != null && !holds(file, childPath)) {
-                fields[i] = new NativeParquetNullColumn(childName, dt, allocator);
+                // #901 item 4: a nested field added with an initial default returns that default in a file written
+                // before it, not null -- as Iceberg's reader does. The default rides the field's metadata as an
+                // existence default (EXISTS_DEFAULT), set by IcebergTasks.withFieldIds.
+                Object dflt = org.apache.spark.sql.catalyst.util.ResolveDefaultColumns.getExistenceDefaultValue(fs[i]);
+                fields[i] = new NativeParquetNullColumn(childName, dt, allocator, dflt);
                 continue;
             }
             if (levelField < 0) {
