@@ -15,6 +15,7 @@
  */
 package io.vecruntime.parquet.write;
 
+import java.io.IOException;
 import java.lang.foreign.MemorySegment;
 import java.util.ArrayList;
 import java.util.IdentityHashMap;
@@ -24,8 +25,9 @@ import io.vecruntime.kernels.Bitmap;
 import io.vecruntime.kernels.VecType;
 import io.vecruntime.kernels.VectorBuffers;
 import org.apache.parquet.column.ColumnDescriptor;
-import org.apache.parquet.column.ColumnWriteStore;
-import org.apache.parquet.column.ColumnWriter;
+import org.apache.parquet.column.ParquetProperties;
+import org.apache.parquet.column.page.PageWriter;
+import org.apache.parquet.hadoop.ColumnChunkPageWriteStore;
 import org.apache.parquet.schema.GroupType;
 import org.apache.parquet.schema.LogicalTypeAnnotation;
 import org.apache.parquet.schema.MessageType;
@@ -34,10 +36,12 @@ import org.apache.parquet.schema.Type;
 import static io.vecruntime.kernels.VectorBuffers.LE_INT;
 
 /**
- * Writes one top-level struct, array or map field (#842) from its nested lane
- * (Arrow's layout: a struct's children of its length, a list's or map's
- * offsets into its children) into parquet-java's column writers, one per leaf,
- * with the repetition and definition levels of the Dremel encoding.
+ * Writes one top-level struct, array or map field (#842, #901) from its nested
+ * lane (Arrow's layout: a struct's children of its length, a list's or map's
+ * offsets into its children) to the leaves' own v2 page writers ({@link
+ * NestedLeafWriter}), with the repetition and definition levels of the Dremel
+ * encoding. Each leaf is written by our own chunk writer, not parquet-java's
+ * column writer, so it gets the same v2 encodings a flat column does.
  *
  * <p>The schema is the one Spark's {@code SparkToParquetSchemaConverter} writes
  * outside {@code writeLegacyFormat}: a struct is a group of its fields, an
@@ -50,29 +54,27 @@ import static io.vecruntime.kernels.VectorBuffers.LE_INT;
  */
 final class NestedFieldWriter {
 
-    /**
-     * One leaf column of the field: its descriptor and, once a value reached
-     * it, its encoder.
-     */
+    /** One leaf column of the field: its descriptor and its own page writer. */
     private static final class Leaf {
         final ColumnDescriptor column;
-        ColumnEncoder encoder;
-        VecType lane;
-        ColumnWriter writer;
+        final NestedLeafWriter writer;
 
-        Leaf(ColumnDescriptor column) {
+        Leaf(ColumnDescriptor column, ParquetProperties props) {
             this.column = column;
+            this.writer = new NestedLeafWriter(column, props);
         }
     }
 
     private final Type field;
+    private final ParquetProperties props;
     private final IdentityHashMap<Type, Leaf> leaves = new IdentityHashMap<>();
     // Every node's leaves, for the nulls of a null or empty value.
     private final IdentityHashMap<Type, Leaf[]> under = new IdentityHashMap<>();
     private final List<Leaf> all = new ArrayList<>();
 
-    NestedFieldWriter(MessageType schema, Type field) {
+    NestedFieldWriter(MessageType schema, Type field, ParquetProperties props) {
         this.field = field;
+        this.props = props;
         List<String> path = new ArrayList<>();
         path.add(field.getName());
         collect(schema, field, path);
@@ -90,7 +92,7 @@ final class NestedFieldWriter {
     private Leaf[] collect(MessageType schema, Type t, List<String> path) {
         Leaf[] out;
         if (t.isPrimitive()) {
-            Leaf l = new Leaf(schema.getColumnDescription(path.toArray(new String[0])));
+            Leaf l = new Leaf(schema.getColumnDescription(path.toArray(new String[0])), props);
             leaves.put(t, l);
             all.add(l);
             out = new Leaf[] {l};
@@ -109,18 +111,38 @@ final class NestedFieldWriter {
         return out;
     }
 
-    /**
-     * Writes rows {@code [from, to)} of the field's lane {@code v}; the caller
-     * ends each record.
-     */
-    void write(VectorBuffers v, int from, int to,
-               ColumnWriteStore store) {
+    /** Starts every leaf's column chunk on a fresh row group. */
+    void startRowGroup(ColumnChunkPageWriteStore pageStore) {
         for (Leaf l : all) {
-            l.writer = store.getColumnWriter(l.column);
+            PageWriter pages = pageStore.getPageWriter(l.column);
+            l.writer.startChunk(pages);
         }
+    }
+
+    /** Writes rows {@code [from, to)} of the field's lane {@code v}. */
+    void write(VectorBuffers v, int from, int to) throws IOException {
         for (int i = from; i < to; i++) {
             node(field, v, i, 0, 0, 0);
         }
+        for (Leaf l : all) {
+            l.writer.maybeFlush();
+        }
+    }
+
+    /** Ends every leaf's column chunk at the end of a row group. */
+    void endRowGroup() throws IOException {
+        for (Leaf l : all) {
+            l.writer.endChunk();
+        }
+    }
+
+    /** The buffered bytes of every leaf, for the row-group size check. */
+    long bufferedBytes() {
+        long size = 0;
+        for (Leaf l : all) {
+            size += l.writer.bufferedBytes();
+        }
+        return size;
     }
 
     private void node(Type t, VectorBuffers v, int i,
@@ -134,13 +156,7 @@ final class NestedFieldWriter {
             def++;
         }
         if (t.isPrimitive()) {
-            Leaf l = leaves.get(t);
-            if (l.encoder == null || l.lane != v.type()) {
-                // Bound per lane type: a batch from another source may carry the same leaf in another lane.
-                l.encoder = ColumnEncoder.forColumn(v.type(), l.column);
-                l.lane = v.type();
-            }
-            l.encoder.put(v, i, rep, def, l.writer);
+            leaves.get(t).writer.put(v, i, rep, def);
             return;
         }
         GroupType g = t.asGroupType();
@@ -194,7 +210,7 @@ final class NestedFieldWriter {
 
     private void nulls(Type t, int rep, int def) {
         for (Leaf l : under.get(t)) {
-            l.writer.writeNull(rep, def);
+            l.writer.putNull(rep, def);
         }
     }
 

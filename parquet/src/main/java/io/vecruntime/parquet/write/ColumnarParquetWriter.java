@@ -116,7 +116,7 @@ public final class ColumnarParquetWriter implements AutoCloseable {
                 throw new IllegalArgumentException("repeated primitive field not supported: " + f.getName());
             } else {
                 columns.add(null);
-                nested[i] = new NestedFieldWriter(schema, f);
+                nested[i] = new NestedFieldWriter(schema, f, this.props);
             }
         }
         this.encoders = new ColumnEncoder[columns.size()];
@@ -182,6 +182,13 @@ public final class ColumnarParquetWriter implements AutoCloseable {
                 }
             }
         }
+        if (nested != null) {
+            for (NestedFieldWriter n : nested) {
+                if (n != null) {
+                    n.startRowGroup(pageStore);
+                }
+            }
+        }
     }
 
     /**
@@ -236,7 +243,9 @@ public final class ColumnarParquetWriter implements AutoCloseable {
         if (slowSchema == null) {
             List<org.apache.parquet.schema.Type> slow = new java.util.ArrayList<>();
             for (int i = 0; i < encoders.length; i++) {
-                if (fast[i] == null) {
+                // Nested fields write their leaves themselves; only a flat column with neither a fast writer nor
+                // a nested writer is left on parquet-java's column store.
+                if (fast[i] == null && nested[i] == null) {
                     slow.add(schema.getType(i));
                 }
             }
@@ -251,7 +260,7 @@ public final class ColumnarParquetWriter implements AutoCloseable {
                 if (fast[i] != null) {
                     fast[i].write(vectors.get(i), from, to);
                 } else if (nested[i] != null) {
-                    nested[i].write(vectors.get(i), from, to, columnStore);
+                    nested[i].write(vectors.get(i), from, to);
                 } else {
                     encoders[i].write(vectors.get(i), from, to, columnStore.getColumnWriter(columns.get(i)));
                 }
@@ -279,6 +288,11 @@ public final class ColumnarParquetWriter implements AutoCloseable {
                 f.endChunk();
             }
         }
+        for (NestedFieldWriter n : nested) {
+            if (n != null) {
+                n.endRowGroup();
+            }
+        }
         if (columnStore != null) {
             columnStore.flush();
         }
@@ -296,6 +310,11 @@ public final class ColumnarParquetWriter implements AutoCloseable {
         for (ChunkWriter f : fast) {
             if (f != null) {
                 size += f.bufferedBytes();
+            }
+        }
+        for (NestedFieldWriter n : nested) {
+            if (n != null) {
+                size += n.bufferedBytes();
             }
         }
         return size;
