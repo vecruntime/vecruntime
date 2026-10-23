@@ -277,12 +277,12 @@ public final class IcebergRewriteFileTaskWriter implements AutoCloseable {
         RowGroupCopyPlanner plan = safe ? RowGroupCopyPlanner.plan(footer, writeSchema, deleted, spec.writeSchema(), metricsConfig) : null;
         boolean copyable = safe && plan.copyable();
 
-        // #901 M4a required-column guard: on the copy path the output file uses the source schema, which may
-        // mark a top-level column REQUIRED (Iceberg's writer does for an always-non-null column). A re-encoded
-        // group written under that schema MUST NOT receive a null in such a column. This cannot happen for a
-        // survivor whose data came from that very column -- a REQUIRED column holds no nulls -- but guard
-        // anyway: if any buffered survivor is null in a source-REQUIRED top-level column, decline the copy and
-        // fall back to the full rewrite (output schema then = the all-optional write schema).
+        // #901 M4a required-column guard: on the copy path the output file uses the source schema (v2) or the
+        // write schema (v3), either of which may mark a top-level data column REQUIRED (Iceberg's writer does
+        // for an always-non-null column). A re-encoded group written under that schema MUST NOT receive a null
+        // in such a column. This cannot happen for a survivor whose data came from that very column -- a
+        // REQUIRED column holds no nulls -- but guard anyway: if any buffered survivor is null in a
+        // source-REQUIRED top-level data column, decline the copy and fall back to the full rewrite.
         if (copyable && survivorHasNullInRequired(buffer, plan.fileSchema())) {
             copyable = false;
         }
@@ -296,12 +296,12 @@ public final class IcebergRewriteFileTaskWriter implements AutoCloseable {
         written.add(location);
         IcebergParquetAppender appender;
         try {
-            // #901 M4a: on the copy path the output file uses the SOURCE file's own Parquet schema, so a
-            // copied group's pages are valid under the footer and a re-encoded group in the same file is
-            // written with the same schema. The source schema carries Iceberg's field ids, so the footer
-            // metrics stay keyed by the same ids. The full-rewrite path keeps Iceberg's own conversion of the
-            // write schema (outputSchema = null).
-            MessageType outputSchema = copyable ? plan.fileSchema() : null;
+            // #901 M4a: on the copy path the output file uses the planner's copy output schema -- the SOURCE
+            // file's own Parquet schema for a v2 whole-group copy, or the full write schema (data + the two v3
+            // lineage columns) for a v3 mixed-group copy, where the data chunks are copied and the lineage
+            // chunks encoded. Either carries Iceberg's field ids, so footer metrics stay keyed by the same ids.
+            // The full-rewrite path keeps Iceberg's own conversion of the write schema (outputSchema = null).
+            MessageType outputSchema = copyable ? plan.copyOutputSchema() : null;
             appender = IcebergParquetAppender.create(out.encryptingOutputFile(), spec.writeSchema(), outputSchema,
                     spec.properties(), metricsConfig, nameMapping, conf);
         } catch (IOException ioe) {
@@ -318,15 +318,34 @@ public final class IcebergRewriteFileTaskWriter implements AutoCloseable {
         }
 
         if (copyable) {
-            int dataCols = plan.dataFieldCount();
-            try (SeekableInputStream stream = in.newStream()) {
+            // How many columns a re-encoded group writes: the output schema's field count. On a v2 whole-group
+            // copy that is the source field count (no lineage); on a v3 mixed-group copy it is the write
+            // schema's (data + the two lineage columns), so a re-encoded group matches the copied groups' layout.
+            int outCols = plan.outputFieldCount();
+            try (SeekableInputStream stream = in.newStream();
+                 ParquetFileReader indexReader = ParquetFileReader.open(in)) {
                 for (RowGroupCopyPlanner.Group g : plan.groups()) {
                     if (g.action() == RowGroupCopyPlanner.Action.COPY) {
-                        appender.copyRowGroup(stream, footer.getBlocks()
-                                .get(g.ordinal()));
+                        if (g.copiesWholeGroup()) {
+                            appender.copyRowGroup(stream, footer.getBlocks()
+                                    .get(g.ordinal()));
+                        } else {
+                            // Mixed group (v3): copy the data chunks, encode the lineage chunks from the
+                            // group's surviving (here: all) rows, resolved by the scan into the batch.
+                            copyMixedGroup(
+                                    appender,
+                                    indexReader,
+                                    stream,
+                                    footer.getBlocks().get(g.ordinal()),
+                                    g,
+                                    plan.copyMask(),
+                                    buffer,
+                                    posToPacked,
+                                    outCols);
+                        }
                         COPIED_ROW_GROUPS.increment();
                     } else if (g.action() == RowGroupCopyPlanner.Action.REENCODE) {
-                        reencodeGroup(appender, buffer, g, posToPacked, dataCols);
+                        reencodeGroup(appender, buffer, g, posToPacked, outCols);
                     }
                     // SKIP: every row of the group was deleted -- nothing written.
                 }
@@ -431,6 +450,65 @@ public final class IcebergRewriteFileTaskWriter implements AutoCloseable {
                 appender.write(gathered, 0, rows.length);
                 i = j;
             }
+        }
+    }
+
+    /**
+     * Copies one row group as a MIX of copied and encoded column chunks (#901
+     * M4a v3 lineage): the data chunks are copied byte for byte from {@code
+     * sourceBlock} and the columns the mask marks for encoding (the two v3
+     * lineage columns) are encoded from the group's rows. Every row of the
+     * group survives (this is a COPY group, no deletions), so the rows are the
+     * whole group in {@code _pos} order. The group may span several buffered
+     * batches, so its rows are gathered into one or more sub-runs (one per
+     * source chunk run) and the writer concatenates them into one group.
+     */
+    private void copyMixedGroup(
+            IcebergParquetAppender appender,
+            ParquetFileReader indexReader,
+            SeekableInputStream stream,
+            org.apache.parquet.hadoop.metadata.BlockMetaData sourceBlock,
+            RowGroupCopyPlanner.Group g,
+            boolean[] copyMask,
+            FileBuffer buffer,
+            long[] posToPacked,
+            int outCols)
+            throws IOException {
+        long start = g.start();
+        long endPos = start + g.rowCount();
+        // The (chunk,row) of every position in this group, in position order. A COPY group has every position.
+        List<Long> packed = new ArrayList<>((int) g.rowCount());
+        for (long p = start; p < endPos; p++) {
+            long pk = posToPacked[(int) p];
+            if (pk >= 0) {
+                packed.add(pk);
+            }
+        }
+        if (packed.isEmpty()) {
+            return;
+        }
+        try (Arena a = Arena.ofConfined()) {
+            // Gather, per source chunk, the rows that fall in this group, in position order: one sub-run per
+            // contiguous run of the same chunk. Each run is the full column set (data + lineage), sliced to the
+            // output columns.
+            List<List<VectorBuffers>> runs = new ArrayList<>();
+            int i = 0;
+            while (i < packed.size()) {
+                int chunk = (int) (packed.get(i) >>> 32);
+                int j = i;
+                while (j < packed.size() && (int) (packed.get(j) >>> 32) == chunk) {
+                    j++;
+                }
+                int[] rows = new int[j - i];
+                for (int t = 0; t < rows.length; t++) {
+                    rows[t] = (int) (packed.get(i + t) & 0xffffffffL);
+                }
+                runs.add(new ArrayList<>(Gather.rows(buffer.dataChunks.get(chunk), rows, a)
+                        .subList(0, outCols)));
+                i = j;
+            }
+            appender.copyRowGroupColumns(indexReader, stream, sourceBlock, copyMask, runs,
+                    packed.size());
         }
     }
 

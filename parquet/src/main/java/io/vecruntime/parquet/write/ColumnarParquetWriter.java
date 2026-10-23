@@ -269,6 +269,202 @@ public final class ColumnarParquetWriter implements AutoCloseable {
     }
 
     /**
+     * Writes one row group whose columns are a mix of chunks copied byte for
+     * byte from a source row group and chunks freshly encoded from buffered
+     * values (#901 M4a v3 lineage, M4b column-chunk copy). Every column holds
+     * the same {@code rowCount} rows, in source order, so the group is valid.
+     *
+     * <p>This is the partial-columnar-merge unit: a copy-on-write rewrite that
+     * drops no row from this group (a v3 DELETE copy, or an UPDATE/MERGE group
+     * whose rows all survive) copies the chunks it does not touch and re-encodes
+     * only the rest. On a v3 DELETE copy the two row-lineage chunks are encoded
+     * (their values come from the scan, which already resolved {@code _row_id}
+     * and {@code _last_updated_sequence_number} per surviving row) while every
+     * data chunk is copied. On an UPDATE/MERGE the changed columns are encoded
+     * and the untouched ones copied.
+     *
+     * <p>The columns are written in this writer's (output) schema order. A
+     * copied chunk keeps its codec, statistics, column index, offset index and
+     * Bloom filter, read from {@code source}. An encoded chunk goes through the
+     * same page, encoding and statistics code {@link #write} uses, so its
+     * statistics reach the footer the same way. Any rows buffered in the open
+     * row group are flushed first, so this group keeps its order in the file.
+     *
+     * <p>Only flat top-level columns are supported here (the copy-on-write
+     * write schema is flat: data columns and, on v3, two lineage longs); a
+     * nested column makes the caller fall back to the full rewrite, as the
+     * schema guard already does.
+     *
+     * @param reader a reader on the source file, for its column index, offset
+     *     index and Bloom filter (read per copied chunk)
+     * @param source a seekable stream on the same file, positioned by {@code
+     *     appendColumnChunk} to each copied chunk's pages
+     * @param sourceBlock the source group whose chunks are copied; its columns
+     *     are in the source schema's order, which equals this writer's data
+     *     columns' order (the schema guard verified it)
+     * @param copy per output column, whether to copy its chunk from {@code
+     *     sourceBlock} ({@code true}) or encode it from {@code encodedRuns}
+     *     ({@code false})
+     * @param encodedRuns the group's values as one or more schema-ordered
+     *     column sets whose rows concatenate to the whole group (a group may
+     *     span several buffered batches); the encoded columns are read, a
+     *     copied column's entry is ignored
+     * @param rowCount the group's row count (every column's)
+     */
+    public void copyRowGroupColumns(org.apache.parquet.hadoop.ParquetFileReader reader, org.apache.parquet.io.SeekableInputStream source, org.apache.parquet.hadoop.metadata.BlockMetaData sourceBlock,
+            boolean[] copy, List<? extends List<? extends VectorBuffers>> encodedRuns, int rowCount)
+            throws IOException {
+        if (closed) {
+            throw new IllegalStateException("writer is closed");
+        }
+        if (copy.length != columns.size()) {
+            throw new IllegalArgumentException("expected " + columns.size() + " columns, got " + copy.length);
+        }
+        flushRowGroup();
+
+        // The source block's per-LEAF chunk metadata, in leaf order (depth-first over the schema). The source
+        // schema equals this writer's copied fields (the schema guard verified it), so the copied fields' leaf
+        // chunks are exactly the leading source chunks, in order. A nested copied field copies ALL its leaf
+        // chunks; a flat copied field copies its one chunk.
+        List<org.apache.parquet.hadoop.metadata.ColumnChunkMetaData> srcChunks = sourceBlock.getColumns();
+        // All output leaf descriptors in schema (leaf) order, so a copied chunk is appended under the right one.
+        List<ColumnDescriptor> outLeaves = schema.getColumns();
+
+        file.startBlock(rowCount);
+        // Copied chunks first (in leaf order), then encoded chunks: the physical order of chunks within a block
+        // is free (the footer records each chunk's offset and a reader seeks by it), and keeping copies and
+        // encodes in two passes avoids interleaving a direct file append with a page-store flush. A copied
+        // field may be nested, so it owns a RANGE of leaves; the encoded fields (the flat v3 lineage columns)
+        // are the trailing leaves.
+        int leaf = 0;
+        int srcIdx = 0;
+        for (int i = 0; i < schema.getFieldCount(); i++) {
+            int leaves = leafCount(schema.getType(i));
+            if (copy[i]) {
+                for (int l = 0; l < leaves; l++) {
+                    ColumnDescriptor desc = outLeaves.get(leaf + l);
+                    org.apache.parquet.hadoop.metadata.ColumnChunkMetaData src = srcChunks.get(srcIdx);
+                    file.appendColumnChunk(desc, source, src, reader.readBloomFilter(src),
+                            reader.readColumnIndex(src), reader.readOffsetIndex(src));
+                    srcIdx++;
+                }
+            }
+            leaf += leaves;
+        }
+        for (int i = 0; i < schema.getFieldCount(); i++) {
+            if (copy[i]) {
+                continue;
+            }
+            if (nested[i] != null) {
+                throw new IllegalArgumentException("mixed-group copy can ENCODE only flat columns; field " + schema.getType(i).getName() + " is nested (a changed nested column must take the full rewrite)");
+            }
+            encodeColumnChunk(i, encodedRuns, rowCount);
+        }
+        file.endBlock();
+        totalRows += rowCount;
+    }
+
+    /**
+     * The number of leaf (primitive) columns under a schema field: 1 for a flat
+     * field, more for a nested one.
+     */
+    private static int leafCount(org.apache.parquet.schema.Type type) {
+        if (type.isPrimitive()) {
+            return 1;
+        }
+        int n = 0;
+        for (org.apache.parquet.schema.Type f : type.asGroupType().getFields()) {
+            n += leafCount(f);
+        }
+        return n;
+    }
+
+    /**
+     * Encodes one output column {@code i} into its own single-column chunk and
+     * writes it to the file at the current position (within an open block). The
+     * column's values come from {@code runs}: each run is a schema-ordered
+     * column set holding a contiguous slice of the group's rows (a group may
+     * span several buffered batches), and they are written in order so the one
+     * chunk holds the whole group. The column is bound and written exactly as
+     * {@link #write} binds and writes it, into a one-column page store so the
+     * one chunk can be flushed on its own.
+     */
+    private void encodeColumnChunk(int i, List<? extends List<? extends VectorBuffers>> runs,
+            int rowCount)
+            throws IOException {
+        if (nested[i] != null) {
+            throw new IllegalArgumentException("mixed-group copy supports flat columns only; field " + schema.getType(i).getName() + " is nested");
+        }
+        int runTotal = 0;
+        for (List<? extends VectorBuffers> run : runs) {
+            runTotal += run.get(i).length();
+        }
+        if (runTotal != rowCount) {
+            throw new IllegalArgumentException("encoded column "
+                    + columns.get(i)
+                    + " has "
+                    + runTotal
+                    + " rows across runs, expected "
+                    + rowCount);
+        }
+        ColumnDescriptor desc = columns.get(i);
+        VecType lane = runs.get(0)
+                           .get(i)
+                           .type();
+        MessageType oneCol = new MessageType(schema.getName(), schema.getType(i));
+        ColumnChunkPageWriteStore pages = new ColumnChunkPageWriteStore(compressor, oneCol, new HeapByteBufferAllocator(), props.getColumnIndexTruncateLength(),
+                props.getPageWriteChecksumEnabled());
+        org.apache.parquet.column.values.bloomfilter.BloomFilterWriter bloom = props.isBloomFilterEnabled(desc) ? pages.getBloomFilterWriter(desc) : null;
+        FixedWidthChunkWriter.Kind kind = FixedWidthChunkWriter.kindFor(lane, desc);
+        if (kind != null) {
+            ChunkWriter w = new FixedWidthChunkWriter(kind, desc, props);
+            w.startChunk(pages.getPageWriter(desc), bloom);
+            for (List<? extends VectorBuffers> run : runs) {
+                writeInSlices(w, run.get(i),
+                        run.get(i).length());
+            }
+            w.endChunk();
+        } else if (lane == VecType.UTF8 && desc.getMaxRepetitionLevel() == 0 && desc.getPrimitiveType().getPrimitiveTypeName() == org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.BINARY) {
+            ChunkWriter w = new BinaryChunkWriter(desc, props);
+            w.startChunk(pages.getPageWriter(desc), bloom);
+            for (List<? extends VectorBuffers> run : runs) {
+                writeInSlices(w, run.get(i),
+                        run.get(i).length());
+            }
+            w.endChunk();
+        } else {
+            ColumnEncoder enc = ColumnEncoder.forColumn(lane, desc);
+            ColumnWriteStore store = props.newColumnWriteStore(oneCol, pages, pages);
+            org.apache.parquet.column.ColumnWriter cw = store.getColumnWriter(desc);
+            for (List<? extends VectorBuffers> run : runs) {
+                VectorBuffers values = run.get(i);
+                int n = values.length();
+                for (int from = 0; from < n; from += SLICE) {
+                    int to = Math.min(n, from + SLICE);
+                    enc.write(values, from, to, cw);
+                    for (int r = from; r < to; r++) {
+                        store.endRecord();
+                    }
+                }
+            }
+            store.flush();
+            store.close();
+        }
+        pages.flushToFileWriter(file);
+        pages.close();
+    }
+
+    /**
+     * Writes rows {@code [0, rowCount)} of {@code values} to a fast {@link
+     * ChunkWriter} in slices.
+     */
+    private void writeInSlices(ChunkWriter w, VectorBuffers values, int rowCount) throws IOException {
+        for (int from = 0; from < rowCount; from += SLICE) {
+            w.write(values, from, Math.min(rowCount, from + SLICE));
+        }
+    }
+
+    /**
      * Whether a file with schema {@code fileSchema} can have its row groups
      * copied into this file without decoding (#901 M4a): its columns must be
      * exactly this writer's schema -- same names, order, physical and logical

@@ -94,6 +94,44 @@ class RowGroupCopyPlannerSuite extends AnyFunSuite {
   private def plan(f: ParquetMetadata, deleted: Array[Long]): RowGroupCopyPlanner =
     RowGroupCopyPlanner.plan(f, WriteSchema, deleted, IceSchema, MetricsConfig.getDefault())
 
+  test("v3 source missing lineage is copyable with a data-copy / lineage-encode mask") {
+    import org.apache.iceberg.MetadataColumns
+    import org.apache.iceberg.parquet.ParquetSchemaUtil
+    // The write schema a v3 copy-on-write rewrite uses: the data columns plus the two row-lineage columns.
+    val v3Ice = MetadataColumns.schemaWithRowLineage(IceSchema)
+    val shadedWrite = ParquetSchemaUtil.convert(v3Ice, "table")
+    val writeSchema = MessageTypeParser.parseMessageType(shadedWrite.toString)
+    // The source file an ordinary append wrote: just the data columns, no lineage.
+    val src = writeSource(3, 200)
+    val f = footer(src)
+    val fileSchema = f.getFileMetaData.getSchema
+    val mask = RowGroupCopyPlanner.lineageCopyMask(writeSchema, fileSchema)
+    assert(mask != null, s"expected a lineage copy mask;\n write=$writeSchema\n file=$fileSchema")
+    assert(mask.length == writeSchema.getFieldCount)
+    // Data columns copied, the two trailing lineage columns encoded.
+    for (i <- 0 until fileSchema.getFieldCount) assert(mask(i), s"data col $i should copy")
+    for (i <- fileSchema.getFieldCount until writeSchema.getFieldCount)
+      assert(!mask(i), s"lineage col $i should encode")
+
+    val planner =
+      RowGroupCopyPlanner.plan(f, writeSchema, Array(201L), v3Ice, MetricsConfig.getDefault())
+    assert(planner.copyable(), s"v3 planner not copyable: ${planner.fallbackReason()}")
+    // The copy output schema is the source's data columns (keeping their repetition) plus the two lineage cols.
+    assert(planner.copyOutputSchema().getFieldCount == writeSchema.getFieldCount)
+    assert(
+      planner.copyOutputSchema().getType(fileSchema.getFieldCount).getName == "_row_id",
+      "lineage column present in copy output schema"
+    )
+    assert(planner.copyMask() != null)
+    val groups = planner.groups()
+    // group 0 (rows [0,200)) delete-free -> mixed COPY; group 1 (holds 201) re-encode; group 2 copy.
+    assert(groups.get(0).action() == RowGroupCopyPlanner.Action.COPY && !groups.get(0).copiesWholeGroup())
+    assert(groups.get(1).action() == RowGroupCopyPlanner.Action.REENCODE)
+    assert(groups.get(2).action() == RowGroupCopyPlanner.Action.COPY && !groups.get(2).copiesWholeGroup())
+    assert(planner.copiedGroups() == 2)
+    assert(planner.outputFieldCount() == writeSchema.getFieldCount)
+  }
+
   test("no deletes copies every group") {
     val p = plan(footer(writeSource(4, 500)), Array.emptyLongArray)
     assert(p.copyable())

@@ -281,13 +281,12 @@ class VectorCopyUnchangedDeleteSuite extends AnyFunSuite with BeforeAndAfterAll 
     val noNaN = ", 'write.metadata.metrics.column.d'='none', 'write.metadata.metrics.column.f'='none'"
 
     // A v3 source written by an ordinary append materialises no row lineage (its _row_id is inherited from
-    // first_row_id + position), so a copy-on-write rewrite of it MUST re-encode every surviving row to write
-    // each row's original _row_id explicitly -- a byte copy cannot. v3 therefore (correctly) falls back to the
-    // full rewrite and copies nothing; the lineage oracle proves _row_id is still preserved. v2 has no lineage
-    // and copies the delete-free groups.
+    // first_row_id + position). #901 M4a step 1 copies such a file anyway: the data column chunks are copied
+    // byte for byte and the two lineage columns (_row_id, _last_updated_sequence_number), which the scan
+    // resolved per surviving row, are freshly encoded, so the surviving rows keep the lineage they had. v2 has
+    // no lineage and copies the whole delete-free groups. Both therefore copy the delete-free groups.
     def expect(copied: Long, label: String): Unit =
-      if (version == 2) assert(copied > 0, s"$tag $label: expected copied groups > 0, got $copied")
-      else assert(copied == 0L, s"$tag $label: v3 must fall back (unmaterialised lineage), got $copied")
+      assert(copied > 0, s"$tag $label: expected copied groups > 0, got $copied")
 
     test(s"$tag: DELETE touching some groups copies the untouched groups (v2) / falls back (v3)") {
       // Delete a single narrow contiguous block so only the one or two groups covering it are touched and
