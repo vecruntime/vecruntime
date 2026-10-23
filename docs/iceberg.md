@@ -82,7 +82,7 @@ Everything in the version 2 table applies. The version 3 additions:
 | `variant`, shredded or not | yes | Iceberg writes the spec's Parquet variant group, with `typed_value` when `write.parquet.shred-variants` is on. Our Parquet reader reads it as it reads Spark's variants (#787, #812), at the top level and inside structs, under deletes. Iceberg's own vectorized reader cannot read a shredded variant ("Unsupported variant: shredded typed_value primitive"); our scan reads it either way |
 | `timestamp_ns`, `timestamptz_ns` | scan | |
 | `geometry`, `geography` | scan or row | |
-| `unknown` | scan | |
+| `unknown` | scan or write | v3 `unknown` is always null and is not stored in a data file (Iceberg's `TypeToMessageType` omits it). The native scan reads it as nulls; the columnar writer writes a table with an `unknown` column at the top level or inside a struct by omitting it, exactly as Iceberg's own writer does, so no data-file column and no metrics carry the unknown field id. An `unknown` list element or map value is declined (Iceberg's writer rejects it too), and a partition source on `unknown` is not carried |
 | Table encryption | group | As encrypted files above |
 
 ## How the native scan reads a table

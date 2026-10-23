@@ -53,33 +53,50 @@ final class SparkLanes {
 
     private SparkLanes() {}
 
-    /** Whether any field of {@code schema}, at any depth, needs a conversion. */
+    /**
+     * Whether any field of {@code schema}, at any depth, needs the conversion
+     * or the stripping {@link #toArrow} does -- a {@code fixed} or {@code uuid}
+     * lane to convert, or a v3 {@code unknown} field to drop.
+     */
     static boolean needed(Schema schema) {
         return schema.columns().stream()
-                .anyMatch(f -> needed(f.type()));
+                .anyMatch(f -> f.type().typeId() == Type.TypeID.UNKNOWN || needed(f.type()));
     }
 
     private static boolean needed(Type type) {
         return switch (type.typeId()) {
-            case FIXED, UUID -> true;
+            case FIXED, UUID, UNKNOWN -> true;
             case STRUCT, LIST, MAP ->
                     type.asNestedType().fields().stream()
-                            .anyMatch(f -> needed(f.type()));
+                            .anyMatch(f -> f.type().typeId() == Type.TypeID.UNKNOWN || needed(f.type()));
             default -> false;
         };
     }
 
     /**
-     * {@code columns} (one per top-level field of {@code schema}) with every
-     * converted lane allocated in {@code arena}; the caller keeps the arena open
-     * while the result is written.
+     * {@code columns} (one per top-level field of {@code schema}) as the
+     * writer's physical columns, with every converted lane allocated in {@code
+     * arena}; the caller keeps the arena open while the result is written.
+     *
+     * <p>A v3 {@code unknown} field is DROPPED -- the top-level column is
+     * omitted from the result, and an unknown struct child is omitted from the
+     * struct's children -- so the result lines up one-for-one with the Parquet
+     * schema Iceberg writes ({@code ParquetSchemaUtil.convert} /
+     * {@code TypeToMessageType}, which omit unknown fields the same way). An
+     * unknown list element or map key/value cannot occur here: such a write is
+     * declined before it reaches the writer ({@code
+     * IcebergDataCommitBridge.unsupportedType}).
      */
     static List<VectorBuffers> toArrow(Schema schema, List<? extends VectorBuffers> columns, Arena arena) {
         List<Types.NestedField> fields = schema.columns();
         List<VectorBuffers> out = new ArrayList<>(columns.size());
         for (int c = 0; c < columns.size(); c++) {
-            out.add(convert(fields.get(c).type(),
-                    columns.get(c), arena));
+            Type type = fields.get(c).type();
+            if (type.typeId() == Type.TypeID.UNKNOWN) {
+                // Not stored in a data file: the column is dropped so the result matches Iceberg's Parquet schema.
+                continue;
+            }
+            out.add(convert(type, columns.get(c), arena));
         }
         return out;
     }
@@ -93,12 +110,23 @@ final class SparkLanes {
                 return toFixed(v, ((Types.FixedType) type).length(), arena);
             case UUID:
                 return toUuid(v, arena);
+            case UNKNOWN:
+                // Unreachable: a top-level/struct unknown is dropped by the caller, and an unknown list element
+                // or map value is declined before the write reaches here.
+                throw new IllegalArgumentException("the v3 unknown type is not stored in data files");
             case STRUCT:
                 {
                     NestedVectorBuffers s = (NestedVectorBuffers) v;
                     List<Types.NestedField> fs = type.asStructType().fields();
                     List<VectorBuffers> children = new ArrayList<>(fs.size());
                     for (int k = 0; k < fs.size(); k++) {
+                        if (fs.get(k)
+                              .type()
+                              .typeId()
+                                == Type.TypeID.UNKNOWN) {
+                            // Dropped, as Iceberg's TypeToMessageType omits an unknown struct field from the group.
+                            continue;
+                        }
                         children.add(
                                 convert(fs.get(k).type(),
                                         s.children().get(k), arena));
