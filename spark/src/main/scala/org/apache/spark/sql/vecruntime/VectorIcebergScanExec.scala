@@ -201,10 +201,18 @@ case class VectorIcebergScanExec(
       .map(extra => VectorIcebergRDD.withPositions(StructType(requiredSchema.fields ++ extra)))
     val equalityConfBroadcast = equalitySchema.map(confFor)
 
-    // Pushed filters by field id: the data columns' quoted names, as the translated filters name them.
+    // Pushed filters by field id: the data columns' quoted names, as the translated filters name them. A uuid
+    // column is excluded (#rtypes): it reads as Spark's StringType (canonical text) but is stored as the raw
+    // 16 bytes, so a string predicate against the file's byte statistics would skip the wrong row groups/pages.
     val filterFieldIds =
       if (filters.isEmpty || !sqlConf.parquetFilterPushDown) null
-      else dataColumns.map { case (a, id) => org.apache.spark.sql.catalyst.util.quoteIfNeeded(a.name) -> id }.toMap
+      else
+        dataColumns.collect {
+          case (a, id)
+              if IcebergTasks.columnKind(a.name, id) != IcebergTasks.DataColumn ||
+                !IcebergTasks.isUuid(scan, id) =>
+            org.apache.spark.sql.catalyst.util.quoteIfNeeded(a.name) -> id
+        }.toMap
     val m = ScanMetrics(
       longMetric("numFiles"),
       longMetric("numOutputRows"),
@@ -725,11 +733,26 @@ object VectorIcebergScanPlanner {
  */
 private[vecruntime] object IcebergTasks {
 
-  // Iceberg types whose Spark type and Parquet encoding our reader decodes as Iceberg's reader does. Not: uuid
-  // (16 bytes in the file, a string in Spark), fixed, time, timestamp_ns, geometry, unknown. A variant column is
-  // read natively too (see unsupportedType), but is never an equality column.
+  // Iceberg types whose Spark type and Parquet encoding our reader decodes as Iceberg's reader does. uuid (16
+  // bytes in the file, a string in Spark) and fixed (a FIXED_LEN_BYTE_ARRAY, binary in Spark) are read natively
+  // too (#rtypes); the v3 unknown type (NullType in Spark) is produced as a null column, see unsupportedType. Not:
+  // time, timestamp_ns, geometry. A variant column is read natively too (see unsupportedType), but is never an
+  // equality column.
   private val NativeTypes =
-    Set("BOOLEAN", "INTEGER", "LONG", "FLOAT", "DOUBLE", "DATE", "TIMESTAMP", "STRING", "BINARY", "DECIMAL")
+    Set(
+      "BOOLEAN",
+      "INTEGER",
+      "LONG",
+      "FLOAT",
+      "DOUBLE",
+      "DATE",
+      "TIMESTAMP",
+      "STRING",
+      "BINARY",
+      "DECIMAL",
+      "FIXED",
+      "UUID"
+    )
 
   private def call(target: AnyRef, name: String): AnyRef = {
     var c: Class[_] = target.getClass
@@ -890,6 +913,8 @@ private[vecruntime] object IcebergTasks {
         unsupportedType(call(icebergType, "keyType"), s"$path.key")
           .orElse(unsupportedType(call(icebergType, "valueType"), s"$path.value"))
       case t if NativeTypes.contains(t) => None
+      // #rtypes: the v3 unknown type is always null, never stored in a file; produced as a null column.
+      case "UNKNOWN" => None
       // A v3 variant, shredded or not: Iceberg writes the spec's Parquet variant group (metadata, value and the
       // shredded typed_value), which our reader reads as it reads Spark's (#787, #812).
       case "VARIANT" => None
@@ -940,6 +965,9 @@ private[vecruntime] object IcebergTasks {
 
   /** The Iceberg type of the projected field `id` of `b`'s scan. */
   def projectedType(b: BatchScanExec, id: Int): AnyRef = call(projectedField(b, id), "type")
+
+  /** #rtypes: whether the projected field `id` of `b`'s scan is a uuid column (kept out of pushdown). */
+  def isUuid(b: BatchScanExec, id: Int): Boolean = call(projectedType(b, id), "typeId").toString == "UUID"
 
   /**
    * One file scan task read natively: its split, the data file's location, its position delete files (and deletion
@@ -1080,8 +1108,8 @@ private[vecruntime] object IcebergTasks {
     val deleteFileClass = Class.forName("org.apache.iceberg.DeleteFile", false, cl)
     val newInputFile =
       Class.forName("org.apache.iceberg.io.FileIO", false, cl).getMethod("newInputFile", deleteFileClass)
-    val io = call(p, "io")
-    val open: java.util.function.Function[AnyRef, AnyRef] = d => newInputFile.invoke(io, d)
+    val fileIo = call(p, "io")
+    val open: java.util.function.Function[AnyRef, AnyRef] = d => newInputFile.invoke(fileIo, d)
     val loaderClass = Class.forName("org.apache.iceberg.data.BaseDeleteLoader", false, cl)
     (loaderClass, loaderClass.getConstructor(classOf[java.util.function.Function[_, _]]).newInstance(open))
   }
@@ -1183,6 +1211,13 @@ private[vecruntime] object IcebergTasks {
       case (f, i) if f.metadata.contains(ParquetUtils.FIELD_ID_METADATA_KEY) =>
         f.metadata.getLong(ParquetUtils.FIELD_ID_METADATA_KEY).toInt -> i
     }.toMap
+    // #rtypes: the native set reads the delete files directly (below), through the partition's own FileIO -- the
+    // same handle Iceberg's loader opens them with. `newInputFile(DeleteFile)` turns each selected delete file
+    // into an InputFile for the bridge's copying reader.
+    val deleteFileClass = Class.forName("org.apache.iceberg.DeleteFile", false, cl)
+    val fileIo = call(p, "io")
+    val newInputFile =
+      Class.forName("org.apache.iceberg.io.FileIO", false, cl).getMethod("newInputFile", deleteFileClass)
     // Per group: the set, the batch ordinals of its fields (in the delete schema's order) and their Spark types.
     val groups = deletes.asScala.groupBy(equalityFieldIds).toSeq.map { case (ids, files) =>
       val deleteSchema = select.invoke(null, tableSchema, ids.map(Int.box).toSet.asJava)
@@ -1192,11 +1227,21 @@ private[vecruntime] object IcebergTasks {
         .map(f => call(f, "fieldId").asInstanceOf[Integer].intValue())
         .toArray
       val cacheKey = (files.map(d => call(d, "location").toString).sorted.toSeq, ids)
-      val set = cache.getOrElseUpdate(cacheKey, load.invoke(loader, files.asJava, deleteSchema))
+      // Iceberg's own set, loaded only when the row probe below needs it: the native path reads the delete files
+      // itself (EqualityDeleteSet.ofDeleteFiles), so an eager load here would read every delete file twice.
+      val set = () =>
+        cache.synchronized(
+          cache.getOrElseUpdate(
+            cacheKey, {
+              ParquetFileResolver.icebergEqualityLoads.incrementAndGet()
+              load.invoke(loader, files.asJava, deleteSchema)
+            }
+          )
+        )
       val ordinals = order.map(ordinalOf)
       val sparkType =
         StructType(ordinals.map(o => schema(o).copy(metadata = org.apache.spark.sql.types.Metadata.empty)))
-      (set, ordinals, sparkType, call(deleteSchema, "asStruct"), cacheKey)
+      (set, ordinals, sparkType, call(deleteSchema, "asStruct"), cacheKey, deleteSchema, files)
     }
     // #901 R2: each group as the bridge's EqualityDeleteSet, probed with the batch's lanes; None without the
     // bridge or for a key type it does not take, which keeps the row probe below.
@@ -1206,22 +1251,29 @@ private[vecruntime] object IcebergTasks {
         try {
           val cls = Class.forName("io.vecruntime.iceberg.read.EqualityDeleteSet", true, cl)
           val supports = cls.getMethod("supports", Class.forName("org.apache.iceberg.types.Type", false, cl))
-          val of = cls.getMethod("of", structTypeClass, classOf[java.lang.Iterable[_]])
+          val schemaCls = Class.forName("org.apache.iceberg.Schema", false, cl)
+          val ofDeleteFiles = cls.getMethod("ofDeleteFiles", schemaCls, classOf[java.lang.Iterable[_]])
           val clear = cls.getMethod(
             "clearDeleted",
             classOf[Array[io.vecruntime.kernels.VectorBuffers]],
             Integer.TYPE,
             classOf[java.lang.foreign.MemorySegment]
           )
-          val all = groups.map { case (set, ordinals, _, struct, cacheKey) =>
+          val all = groups.map { case (_, ordinals, _, struct, cacheKey, deleteSchema, files) =>
             val types = call(struct, "fields").asInstanceOf[java.util.List[AnyRef]].asScala.map(call(_, "type"))
             if (!types.forall(t => supports.invoke(null, t).asInstanceOf[java.lang.Boolean].booleanValue())) None
             else {
-              // Built once per task and group, beside the loaded set (the key's "#native" marks it).
+              // #rtypes: the native set is read STRAIGHT from the delete files, encoding each record's key before
+              // the next is read, so a fixed/binary equality delete is not collapsed to one key the way Iceberg's
+              // BaseDeleteLoader StructLikeSet collapses it (FixedReader buffer reuse + reference-only set copy).
+              // Built once per task and group (the key's "#native" marks it); applicability is already decided --
+              // `files` are only the delete files selected for this data file.
               val built = cache.synchronized {
                 cache.getOrElseUpdate(
-                  (cacheKey._1 :+ "#native", cacheKey._2),
-                  of.invoke(null, struct, set.asInstanceOf[java.lang.Iterable[_]])
+                  (cacheKey._1 :+ "#native", cacheKey._2), {
+                    val inputs: java.lang.Iterable[AnyRef] = files.map(d => newInputFile.invoke(fileIo, d)).asJava
+                    ofDeleteFiles.invoke(null, deleteSchema, inputs)
+                  }
                 )
               }
               Some((built, clear, ordinals))
@@ -1251,7 +1303,8 @@ private[vecruntime] object IcebergTasks {
       }
     }
     batch => {
-      val probes = groups.map { case (set, ordinals, sparkType, icebergStruct, _) =>
+      val probes = groups.map { case (loadSet, ordinals, sparkType, icebergStruct, _, _, _) =>
+        val set = loadSet()
         val wrapper = wrapperCtor.newInstance(sparkType, icebergStruct)
         val row = new org.apache.spark.sql.catalyst.expressions.GenericInternalRow(ordinals.length)
         val types = sparkType.fields.map(_.dataType)

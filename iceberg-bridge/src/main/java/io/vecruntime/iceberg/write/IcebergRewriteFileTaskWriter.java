@@ -402,8 +402,7 @@ public final class IcebergRewriteFileTaskWriter implements AutoCloseable {
             return null;
         }
         List<VectorBuffers> first = buffer.dataChunks.get(0);
-        Object[][] values = keys.compute(first, 0, 1);
-        return keys.key(values, 0);
+        return keys.compute(first, 0, 1).key(0);
     }
 
     /**

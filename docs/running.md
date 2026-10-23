@@ -136,13 +136,17 @@ is separate: Spark adds it to the container on top of the heap and the overhead.
 
 | setting | value |
 |---|---|
-| `spark.executor.memory` (heap) | 20 GB |
+| `spark.executor.memory` (heap) | 26 GB |
 | `-XX:MaxDirectMemorySize` | 6 GB, with Arrow on `arrow-memory-unsafe` (10 GB on Netty) |
 | `spark.executor.memoryOverhead` | 10 GB: the direct cap plus about 4 GB |
-| `spark.memory.offHeap.size` | the rest of the node: allocatable less heap, overhead and ~512 MB for daemonsets |
+| `spark.memory.offHeap.size` | the rest of the node: allocatable less heap, overhead and ~512 MB for daemonsets (22,784 MB here) |
 
-On 11 such executors this passes the 99 TPC-DS queries at 10 TB in 2,893 s, against 2,806 s for 14 GB
-overhead and a 10 GB direct cap with Arrow on Netty, with GC time down 45 % (#840). Below a 6 GB direct cap
+On 11 such executors this passes the 99 TPC-DS queries at 10 TB in 2,344 s. With a 20 GB heap and
+28,928 MB off-heap (the same pod) it took 2,430 s, with 19 % more GC and q78 spilling 947 GiB instead of
+758 GiB: the aggregates' tables are on the heap, and execution off-heap peaked under 4 GiB per executor
+(#926; 30 GB / 18,688 MB measured the same 2,340 s with 2.4 GiB more RSS). Earlier, the 20 GB heap with
+10 GB overhead and a 6 GB direct cap passed in 2,893 s against 2,806 s for 14 GB overhead and a 10 GB
+direct cap with Arrow on Netty, with GC time down 45 % (#840). Below a 6 GB direct cap
 the Flight transport's own buffers run out; a fixed 4 MiB HTTP/2 window
 (`spark.vecruntime.shuffle.flight.clientWindow=4m`) fits 4 GB at about 10 % more time on the heaviest
 shuffles (#897).

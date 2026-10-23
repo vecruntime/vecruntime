@@ -1828,6 +1828,76 @@ public final class ColumnChunkDecoder {
 
     // ------------------------------------------------------------------ flush the batch (one bulk copy each)
 
+    private static final byte[] HEX = "0123456789abcdef".getBytes(java.nio.charset.StandardCharsets.US_ASCII);
+
+    /**
+     * Converts the finished batch of {@code rows} uuids, staged as 16-byte
+     * FIXED_LEN_BYTE_ARRAY values (Parquet's uuid layout, big-endian), into a
+     * UTF8 batch of their canonical lowercase {@code 8-4-4-4-12} text -- 36
+     * bytes a present value -- as Iceberg's Spark reader produces it ({@code
+     * UUIDUtil.convert(bytes).toString()}). A null row writes an empty value
+     * (its validity masks it). Fills {@code utf8Offsets} / {@code utf8Data} and
+     * {@code utf8Len} so {@link #flushUtf8} then copies them out, like any other
+     * UTF8 batch.
+     */
+    public void toUuidText(int rows, MemorySegment outValidity) {
+        byte[] src = utf8Data;
+        int[] off = utf8Offsets;
+        // Each present value becomes 36 bytes; stage them into a fresh region after the raw bytes, then move.
+        byte[] text = new byte[rows * 36];
+        int pos = 0;
+        int[] newOff = outOffsetsScratch(rows + 1);
+        for (int i = 0; i < rows; i++) {
+            newOff[i] = pos;
+            int s = off[i];
+            int len = off[i + 1] - s;
+            if (len == 0) {
+                continue; // a null row
+            }
+            if (len != 16) {
+                throw new IllegalStateException("a uuid value of " + len + " bytes");
+            }
+            pos = uuidText(src, s, text, pos);
+        }
+        newOff[rows] = pos;
+        if (utf8Data.length < pos) {
+            utf8Data = new byte[Math.max(pos, 2 * utf8Data.length)];
+        }
+        System.arraycopy(text, 0, utf8Data, 0, pos);
+        System.arraycopy(newOff, 0, utf8Offsets, 0, rows + 1);
+        utf8Len = pos;
+    }
+
+    private int[] uuidOffsetScratch = new int[0];
+
+    private int[] outOffsetsScratch(int n) {
+        if (uuidOffsetScratch.length < n) {
+            uuidOffsetScratch = new int[Math.max(n, 2 * uuidOffsetScratch.length)];
+        }
+        return uuidOffsetScratch;
+    }
+
+    /**
+     * Writes the 36-byte lowercase {@code 8-4-4-4-12} text of the 16 bytes at
+     * {@code src[s]} into {@code out[pos]}.
+     */
+    private static int uuidText(byte[] src, int s, byte[] out,
+            int pos) {
+        int p = pos;
+        for (int j = 0; j < 16; j++) {
+            if (j == 4
+                    || j == 6
+                    || j == 8
+                    || j == 10) {
+                out[p++] = '-';
+            }
+            int b = src[s + j] & 0xFF;
+            out[p++] = HEX[b >>> 4];
+            out[p++] = HEX[b & 0xF];
+        }
+        return p;
+    }
+
     private static final java.lang.invoke.VarHandle BA_LONG_LE = java.lang.invoke.MethodHandles.byteArrayViewVarHandle(long[].class, java.nio.ByteOrder.LITTLE_ENDIAN);
     private static final java.lang.invoke.VarHandle BA_INT_LE = java.lang.invoke.MethodHandles.byteArrayViewVarHandle(int[].class, java.nio.ByteOrder.LITTLE_ENDIAN);
 
