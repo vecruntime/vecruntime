@@ -136,6 +136,26 @@ public final class ColumnarParquetWriter implements AutoCloseable {
         return props.isBloomFilterEnabled(column) ? pageStore.getBloomFilterWriter(column) : null;
     }
 
+    /**
+     * A flat chunk writer for a {@code lane} column not covered by {@link
+     * FixedWidthChunkWriter} -- a string/binary BINARY, a BOOLEAN, an INT96 or a
+     * FIXED_LEN_BYTE_ARRAY -- or {@code null} when the column (nested, or a lane
+     * with no flat writer) goes through parquet-java's column writer.
+     */
+    private ChunkWriter flatChunkWriter(VecType lane, ColumnDescriptor column) {
+        if (column.getMaxRepetitionLevel() != 0) {
+            return null;
+        }
+        org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName p = column.getPrimitiveType().getPrimitiveTypeName();
+        if (lane == VecType.UTF8 && p == org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.BINARY) {
+            return new BinaryChunkWriter(column, props);
+        }
+        if (lane == VecType.BOOL && p == org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.BOOLEAN) {
+            return new BooleanChunkWriter(column, props);
+        }
+        return null;
+    }
+
     private void newRowGroup() {
         pageStore = new ColumnChunkPageWriteStore(compressor, schema, new HeapByteBufferAllocator(), props.getColumnIndexTruncateLength(),
                 props.getPageWriteChecksumEnabled());
@@ -183,14 +203,14 @@ public final class ColumnarParquetWriter implements AutoCloseable {
                 if (kind != null) {
                     fast[i] = new FixedWidthChunkWriter(kind, columns.get(i), props);
                     fast[i].startChunk(pageStore.getPageWriter(columns.get(i)), blooms(columns.get(i)));
-                } else if (lane == VecType.UTF8 && columns.get(i).getMaxRepetitionLevel() == 0 && columns.get(i)
-                        .getPrimitiveType()
-                        .getPrimitiveTypeName()
-                        == org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.BINARY) {
-                    fast[i] = new BinaryChunkWriter(columns.get(i), props);
-                    fast[i].startChunk(pageStore.getPageWriter(columns.get(i)), blooms(columns.get(i)));
                 } else {
-                    encoders[i] = ColumnEncoder.forColumn(lane, columns.get(i));
+                    ChunkWriter flat = flatChunkWriter(lane, columns.get(i));
+                    if (flat != null) {
+                        fast[i] = flat;
+                        fast[i].startChunk(pageStore.getPageWriter(columns.get(i)), blooms(columns.get(i)));
+                    } else {
+                        encoders[i] = ColumnEncoder.forColumn(lane, columns.get(i));
+                    }
                 }
             } else if (lanes[i] != lane) {
                 throw new IllegalArgumentException("column "
