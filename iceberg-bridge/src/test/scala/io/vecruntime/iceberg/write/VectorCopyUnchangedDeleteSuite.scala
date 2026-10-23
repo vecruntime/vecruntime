@@ -84,6 +84,12 @@ class VectorCopyUnchangedDeleteSuite extends AnyFunSuite with BeforeAndAfterAll 
       // Small partitions so the clustering shuffle keeps files apart (one source file per task).
       .config("spark.sql.adaptive.advisoryPartitionSizeInBytes", "16384")
       .config("spark.sql.adaptive.coalescePartitions.minPartitionSize", "1024")
+      // The copy path only fires over a COLUMNAR Iceberg COW scan (the rewrite copies the child's batches),
+      // which needs the native Iceberg scan on. This suite used to "pass" only when a prior native-scan COW
+      // suite had already built the shared SparkSession with this flag; run alone it built its own session
+      // without it, the scan fell back to rows, and copiedGroups was 0. Set it here so the suite is
+      // self-sufficient (writer/copyUnchanged are still toggled per-run by withCopy for the A/B).
+      .config("spark.vecruntime.scan.nativeIceberg.enabled", "true")
       .getOrCreate()
   }
 

@@ -63,6 +63,10 @@ class VectorCopyUnchangedMergeSuite extends AnyFunSuite with BeforeAndAfterAll {
       .config("spark.sql.warehouse.dir", warehouse.resolve("spark").toString)
       .config("spark.sql.adaptive.advisoryPartitionSizeInBytes", "16384")
       .config("spark.sql.adaptive.coalescePartitions.minPartitionSize", "1024")
+      // Pin the native Iceberg scan so this suite does not inherit it from a prior suite's shared SparkSession
+      // (the session is a JVM singleton). MERGE is ineligible for the copy path regardless, so copied stays 0;
+      // this only makes the suite's session configuration explicit and run-alone-stable like its siblings.
+      .config("spark.vecruntime.scan.nativeIceberg.enabled", "true")
       .getOrCreate()
   }
 
