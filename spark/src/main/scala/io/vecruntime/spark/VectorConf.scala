@@ -20,6 +20,14 @@ import org.apache.spark.sql.internal.SQLConf
 /** Configuration keys for the spark-vector plugin. All keys are read from the session's SQLConf. */
 object VectorConf {
 
+  /** #962: the tri-state of `spark.vecruntime.scan.nativeParquet.lateMaterialization`. */
+  sealed trait LateMode
+  object LateMode {
+    case object Off extends LateMode
+    case object On extends LateMode
+    case object Auto extends LateMode
+  }
+
   val Enabled = "spark.vecruntime.enabled"
   val FilterEnabled = "spark.vecruntime.exec.filter.enabled"
   val MergeRowsEnabled = "spark.vecruntime.exec.mergeRows.enabled"
@@ -334,6 +342,30 @@ object VectorConf {
   val ScanNativeParquetLateMaterialization = "spark.vecruntime.scan.nativeParquet.lateMaterialization"
   val ScanNativeParquetLateMaterializationMinBytes =
     "spark.vecruntime.scan.nativeParquet.lateMaterialization.minScanBytes"
+
+  /**
+   * #962: plan-time gate for `auto`. The decode filter is attached only when the filter columns are a small
+   * fraction of the projected bytes, weighted by estimated byte width (strings, decimals and nested columns
+   * count heavily). This is the largest that fraction may be (default 0.5): at or above it the filter already
+   * covers most of what the projection decodes, so late materialization cannot pay and the eager path is kept.
+   */
+  val ScanNativeParquetLateMaterializationMaxFilterBytesFraction =
+    "spark.vecruntime.scan.nativeParquet.lateMaterialization.auto.maxFilterBytesFraction"
+
+  /**
+   * #962: read-time threshold for `auto`. A row group is late-materialized only when its estimated surviving
+   * fraction (from column statistics, dictionary pages, bloom filters and the observed selectivity of earlier
+   * row groups of the same file) is at or below this (default 0.2); otherwise it is decoded eagerly.
+   */
+  val ScanNativeParquetLateMaterializationLateFraction =
+    "spark.vecruntime.scan.nativeParquet.lateMaterialization.auto.lateFraction"
+
+  /**
+   * #962: the surviving fraction below which `auto` escalates a late-materialized row group to two passes
+   * (default 0.05, i.e. very low). The A/B (#901) shows two-pass overhead dominates otherwise.
+   */
+  val ScanNativeParquetLateMaterializationTwoPassFraction =
+    "spark.vecruntime.scan.nativeParquet.lateMaterialization.auto.twoPassFraction"
 
   /**
    * #812: two-pass late materialization. With a decode filter (#611), each row group's filter columns are read
@@ -909,15 +941,45 @@ object VectorConf {
     bool(conf, ScanNativeParquetDictionaryStrings, default = true)
 
   /**
-   * #611: a filter directly over the native Parquet scan hands it its condition; the scan decodes the
-   * condition's columns first and the others only at the surviving rows (a run of dropped rows is skipped in
-   * the page streams, a batch with no survivor is skipped whole), emitting the batch with its selection.
-   * Off by default: it saves decode CPU, not I/O, and on TPC-DS at 1 TB it is even overall with q24b 10% slower.
-   * Worth turning on for very selective filters over large tables, wide string columns behind a selective
-   * filter, or data clustered on the filtered column (see docs/configuration.md).
+   * #611/#962: whether a filter directly over the native Parquet scan is handed to it as a decode filter --
+   * the scan decodes the condition's columns first and the others only at the surviving rows (a run of dropped
+   * rows is skipped in the page streams, a batch with no survivor is skipped whole), emitting the batch with
+   * its selection.
+   *
+   *   - `off` / `false`: never; the eager path always.
+   *   - `on` / `true`: always, for any filter the plan-time shape check (`markDecodeFilters`) admits -- the
+   *     #611 behaviour.
+   *   - `auto` (the default): the plan-time gate adds the decode filter only when the filter columns are a
+   *     small fraction of the projected bytes (byte-width weighted), and the reader then decides per row group
+   *     from statistics / dictionaries / bloom filters / observed selectivity whether to late-materialize it.
+   *
+   * The A/B (#901) showed a global flip loses on TPC-DS at 1 TB (q24b +11.5%) with no query winning, so the
+   * default is `auto`, which keeps the eager path except where the filter is selective on a wide projection.
    */
+  def scanNativeParquetLateMaterializationMode(conf: SQLConf): LateMode = {
+    val raw = conf.getConfString(ScanNativeParquetLateMaterialization, "auto").trim.toLowerCase(java.util.Locale.ROOT)
+    raw match {
+      case "on" | "true" => LateMode.On
+      case "off" | "false" => LateMode.Off
+      case _ => LateMode.Auto
+    }
+  }
+
+  /** #611: late materialization is at all considered at plan time (`on` or `auto`). */
   def scanNativeParquetLateMaterialization(conf: SQLConf): Boolean =
-    bool(conf, ScanNativeParquetLateMaterialization, default = false)
+    scanNativeParquetLateMaterializationMode(conf) != LateMode.Off
+
+  /** #962: the plan-time filter-bytes-fraction ceiling for `auto` (default 0.5). */
+  def scanNativeParquetLateMaterializationMaxFilterBytesFraction(conf: SQLConf): Double =
+    doubleIn(conf, ScanNativeParquetLateMaterializationMaxFilterBytesFraction, 0.5)
+
+  /** #962: the per-row-group surviving-fraction threshold for late materialization under `auto` (default 0.2). */
+  def scanNativeParquetLateMaterializationLateFraction(conf: SQLConf): Double =
+    doubleIn(conf, ScanNativeParquetLateMaterializationLateFraction, 0.2)
+
+  /** #962: the surviving-fraction threshold below which `auto` escalates to two passes (default 0.05). */
+  def scanNativeParquetLateMaterializationTwoPassFraction(conf: SQLConf): Double =
+    doubleIn(conf, ScanNativeParquetLateMaterializationTwoPassFraction, 0.05)
 
   /**
    * #611: the smallest scan (bytes on storage) a decode filter is handed to. A dimension-sized scan saves
@@ -982,6 +1044,12 @@ object VectorConf {
     scala.util.Try(conf.getConfString(key, default.toString).trim.toInt).toOption.map(n =>
       math.max(0, math.min(n, max))
     ).getOrElse(default)
+
+  /** A fraction in [0, 1] read from `key`, falling back to `default` on a missing or malformed value. */
+  private def doubleIn(conf: SQLConf, key: String, default: Double): Double =
+    scala.util.Try(conf.getConfString(key, default.toString).trim.toDouble).toOption
+      .filter(d => d >= 0.0 && d <= 1.0)
+      .getOrElse(default)
   def cometPreferComet(conf: SQLConf): String = conf.getConfString(CometPreferComet, "")
 
   /**

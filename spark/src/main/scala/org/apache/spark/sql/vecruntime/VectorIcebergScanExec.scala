@@ -104,6 +104,10 @@ case class VectorIcebergScanExec(
     "numRowGroups" -> SQLMetrics.createMetric(sparkContext, "number of row groups read"),
     "numLateSkippedRows" -> SQLMetrics.createMetric(sparkContext, "rows the decode filter dropped before decoding"),
     "numPagesSkipped" -> SQLMetrics.createMetric(sparkContext, "pages the column index skipped"),
+    "numRowGroupsLate" -> SQLMetrics.createMetric(sparkContext, "row groups late-materialized (auto)"),
+    "numRowGroupsEager" -> SQLMetrics.createMetric(sparkContext, "row groups decoded eagerly (auto)"),
+    "lateSelectivityPpm" ->
+      SQLMetrics.createAverageMetric(sparkContext, "observed surviving fraction (ppm, auto late groups)"),
     "numNativeGroups" -> SQLMetrics.createMetric(sparkContext, "task groups read natively"),
     "numIcebergGroups" -> SQLMetrics.createMetric(sparkContext, "task groups read by Iceberg's reader"),
     "scanTime" -> SQLMetrics.createTimingMetric(sparkContext, "scan time")
@@ -223,7 +227,10 @@ case class VectorIcebergScanExec(
       longMetric("numRowGroups"),
       longMetric("scanTime"),
       longMetric("numLateSkippedRows"),
-      longMetric("numPagesSkipped")
+      longMetric("numPagesSkipped"),
+      longMetric("numRowGroupsLate"),
+      longMetric("numRowGroupsEager"),
+      longMetric("lateSelectivityPpm")
     )
     val rdd = new VectorIcebergRDD(
       session.sparkContext,

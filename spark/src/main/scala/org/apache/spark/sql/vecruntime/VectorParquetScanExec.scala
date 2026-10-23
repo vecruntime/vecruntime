@@ -80,7 +80,13 @@ import org.apache.spark.util.SerializableConfiguration
 case class VectorParquetScanExec(
     scan: FileSourceScanExec,
     /** #611: the condition of the filter above, decoded first (see `markDecodeFilters`); None by default. */
-    decodeFilter: Option[org.apache.spark.sql.catalyst.expressions.Expression] = None
+    decodeFilter: Option[org.apache.spark.sql.catalyst.expressions.Expression] = None,
+    /**
+     * #962: in `auto` mode the decode filter is attached but each row group decides for itself whether to
+     * late-materialize, from statistics / dictionaries / bloom filters / observed selectivity. In `on` mode
+     * (false) every row group with a decode filter late-materializes, the #611 behaviour.
+     */
+    lateAuto: Boolean = false
 ) extends LeafExecNode with VectorPlan with RuntimeFilterTarget {
 
   override val output: Seq[Attribute] = scan.output
@@ -95,6 +101,12 @@ case class VectorParquetScanExec(
     "numRuntimeFilters" -> SQLMetrics.createMetric(sparkContext, "number of runtime filters from joins"),
     "numLateSkippedRows" -> SQLMetrics.createMetric(sparkContext, "rows the decode filter dropped before decoding"),
     "numPagesSkipped" -> SQLMetrics.createMetric(sparkContext, "pages the column index skipped"),
+    "numRowGroupsLate" ->
+      SQLMetrics.createMetric(sparkContext, "row groups late-materialized (auto)"),
+    "numRowGroupsEager" ->
+      SQLMetrics.createMetric(sparkContext, "row groups decoded eagerly (auto)"),
+    "lateSelectivityPpm" ->
+      SQLMetrics.createAverageMetric(sparkContext, "observed surviving fraction (ppm, auto late groups)"),
     "scanTime" -> SQLMetrics.createTimingMetric(sparkContext, "scan time")
   )
 
@@ -119,7 +131,8 @@ case class VectorParquetScanExec(
 
   override def doCanonicalize(): SparkPlan = VectorParquetScanExec(
     scan.canonicalized.asInstanceOf[FileSourceScanExec],
-    decodeFilter.map(e => org.apache.spark.sql.catalyst.plans.QueryPlan.normalizeExpressions(e, output))
+    decodeFilter.map(e => org.apache.spark.sql.catalyst.plans.QueryPlan.normalizeExpressions(e, output)),
+    lateAuto
   )
 
   // Prepare the wrapped scan and WAIT for ALL its subqueries before this node's RDD reads
@@ -137,7 +150,7 @@ case class VectorParquetScanExec(
   }
 
   override def simpleString(maxFields: Int): String =
-    s"VectorParquetScan ${decodeFilter.map(f => s"DecodeFilter: ${f.sql} ").getOrElse("")}${scan.simpleString(maxFields)}"
+    s"VectorParquetScan ${decodeFilter.map(f => s"DecodeFilter${if (lateAuto) "(auto)" else "(on)"}: ${f.sql} ").getOrElse("")}${scan.simpleString(maxFields)}"
 
   override protected def doExecuteColumnar(): RDD[ColumnarBatch] = {
     val relation = scan.relation
@@ -195,6 +208,22 @@ case class VectorParquetScanExec(
       if (filterPushDown)
         org.apache.spark.sql.execution.vector.FileScanAccess.pushedDownFilters(scan) ++ runtimeFilters
       else Seq.empty
+    // #962: in `auto` mode the reader decides per row group whether to late-materialize, from the row group's
+    // statistics / dictionary / bloom evidence against the pushed filters and the observed selectivity of
+    // earlier row groups. The thresholds come from the session configuration.
+    val autoLate =
+      if (lateAuto)
+        AutoLateConf(
+          enabled = true,
+          lateFraction = io.vecruntime.spark.VectorConf.scanNativeParquetLateMaterializationLateFraction(sqlConf),
+          twoPassFraction = io.vecruntime.spark.VectorConf.scanNativeParquetLateMaterializationTwoPassFraction(sqlConf),
+          dictionaries = sqlConf.parquetFilterPushDown,
+          blooms = sqlConf.getConfString(
+            org.apache.parquet.hadoop.ParquetInputFormat.BLOOM_FILTERING_ENABLED,
+            "true"
+          ).trim.equalsIgnoreCase("true")
+        )
+      else AutoLateConf(enabled = false, 0.2, 0.05, dictionaries = false, blooms = false)
     // The rebase modes and INT96 conversion are resolved per file from its footer, as Spark resolves them
     // (DataSourceUtils.datetimeRebaseSpec / int96RebaseSpec): a file whose datetime values need a rebase is
     // read by Spark's reader with that file's modes; the native path decodes CORRECTED files only.
@@ -230,7 +259,10 @@ case class VectorParquetScanExec(
       longMetric("numRowGroups"),
       longMetric("scanTime"),
       longMetric("numLateSkippedRows"),
-      longMetric("numPagesSkipped")
+      longMetric("numPagesSkipped"),
+      longMetric("numRowGroupsLate"),
+      longMetric("numRowGroupsEager"),
+      longMetric("lateSelectivityPpm")
     )
     val required = requiredSchema
     val partSchema = partitionSchema
@@ -274,6 +306,7 @@ case class VectorParquetScanExec(
       m,
       compiledFilter,
       filterColumns,
+      autoLate,
       metadataFields,
       metadataExtractors,
       prefetchMaxBytes,
@@ -301,7 +334,10 @@ final case class ScanMetrics(
     numRowGroups: SQLMetric,
     scanTime: SQLMetric,
     numLateSkippedRows: SQLMetric,
-    numPagesSkipped: SQLMetric
+    numPagesSkipped: SQLMetric,
+    numRowGroupsLate: SQLMetric,
+    numRowGroupsEager: SQLMetric,
+    lateSelectivityPpm: SQLMetric
 ) extends Serializable
 
 /**
@@ -336,6 +372,7 @@ private[vecruntime] final class VectorParquetRDD(
     metrics: ScanMetrics,
     decodeFilter: io.vecruntime.spark.expr.VectorExpr,
     filterColumns: Array[Boolean],
+    autoLate: AutoLateConf,
     metadataFields: Array[(String, org.apache.spark.sql.types.DataType)],
     metadataExtractors: Map[String, PartitionedFile => Any],
     prefetchMaxBytes: Long,
@@ -388,6 +425,7 @@ private[vecruntime] final class VectorParquetRDD(
       dictionaryStrings = dictionaryStrings,
       decodeFilter = decodeFilter,
       filterColumns = filterColumns,
+      autoLate = autoLate,
       metadataFields = metadataFields,
       metadataExtractors = metadataExtractors,
       prefetchMaxBytes = prefetchMaxBytes,
@@ -439,6 +477,8 @@ private[vecruntime] final class VectorParquetPartitionReader(
     // #611: a predicate over the output, compiled, decoded first; and which data columns it reads
     decodeFilter: io.vecruntime.spark.expr.VectorExpr = null,
     filterColumns: Array[Boolean] = null,
+    // #962: when enabled, each row group decides for itself whether to late-materialize from its evidence
+    autoLate: AutoLateConf = AutoLateConf(enabled = false, 0.2, 0.05, dictionaries = false, blooms = false),
     // #568 item 9: the file-constant metadata columns after the partition columns, and their extractors
     metadataFields: Array[(String, org.apache.spark.sql.types.DataType)] = Array.empty,
     metadataExtractors: Map[String, PartitionedFile => Any] = Map.empty,
@@ -623,6 +663,14 @@ private[vecruntime] final class VectorParquetPartitionReader(
   // scan evaluates the same predicate again, so filtering in the scan only adds a pass. Reset per row group.
   private var lateOff = false
   private var lateDenseRun = 0
+  // #962 (auto): the EWMA of surviving fractions observed on this file's late-materialized row groups, and how
+  // many have contributed, for the adaptive input to the per-row-group decision. Reset per file.
+  private var observedFraction = -1.0
+  private var observedCount = 0
+  // #962 (auto): the rows of the current late row group (0 when eager), and the numLateSkippedRows baseline at
+  // its start, so the observed surviving fraction can be folded into the file's EWMA.
+  private var lastLateRowGroupRows = 0
+  private var lastLateBaseline = 0L
   private var emitted: ColumnarBatch = _
   private var emittedVectors: Array[AnyRef] = _ // batch-owned data vectors to release
   private var emittedReaders: Array[NativeParquetColumn] =
@@ -654,6 +702,9 @@ private[vecruntime] final class VectorParquetPartitionReader(
           rgOffset = 0
           lateOff = false
           lateDenseRun = 0
+          // #962 (auto): decide late vs eager for THIS row group from its evidence (and prior groups). In `on`
+          // mode `autoLate.enabled` is false and the #611 behaviour (always late) is kept.
+          if (decodeFilter != null && autoLate.enabled) autoDecideRowGroup(store, rgRowCount)
           if (rgRows > 0) return true
         } else {
           metrics.scanTime += (System.nanoTime() - t0) / 1000000L
@@ -1179,6 +1230,9 @@ private[vecruntime] final class VectorParquetPartitionReader(
     reader = p.reader
     currentClipped = p.clipped
     twoPassDenseRun = 0
+    observedFraction = -1.0
+    observedCount = 0
+    lastLateRowGroupRows = 0
     requestedPaths = p.clipped.getColumns.asScala.map(_.getPath.toSeq).toSet
     fileRepeated = p.clipped.getColumns.asScala.exists(_.getMaxRepetitionLevel > 0)
     rowGroupIndex = 0
@@ -1546,7 +1600,90 @@ private[vecruntime] final class VectorParquetPartitionReader(
     }
   }
 
+  /**
+   * #962 (auto): decide whether THIS row group is late-materialized or decoded eagerly, from its own statistics
+   * / dictionary / bloom evidence (via [[LateMaterializationEstimator]]) blended with the observed surviving
+   * fraction of this file's earlier late row groups (adaptive, with hysteresis), then set `lateOff` and the
+   * decision metrics. A very low estimate also escalates to the two-pass path for this row group when it can be
+   * used. Correctness is unaffected either way -- the decode filter still runs; only whether the other columns
+   * are read eagerly or at the survivors changes.
+   */
+  private def autoDecideRowGroup(store: org.apache.parquet.column.page.PageReadStore, rowCount: Int): Unit = {
+    if (pushedFilters.isEmpty || currentClipped == null || reader == null) {
+      // No pushed predicate to reason about (e.g. the decode filter is not Parquet-pushable): decode eagerly.
+      // Without row-group evidence, late materialization cannot be shown to pay, and the A/B (#901) shows a
+      // blind late path regresses -- so `auto` stays on the proven eager path here.
+      lateOff = true
+      metrics.numRowGroupsEager += 1
+      lastLateRowGroupRows = 0
+      return
+    }
+    val blockIndex = blockIndexFor(store)
+    val estimate =
+      if (blockIndex < 0) 1.0
+      else
+        LateMaterializationEstimator.estimate(
+          pushedFilters,
+          reader.getRowGroups.get(blockIndex),
+          reader,
+          blockIndex,
+          autoLate.dictionaries,
+          autoLate.blooms
+        )
+    // Hysteresis: blend the statistics estimate with the file's observed EWMA so a run of row groups whose true
+    // selectivity differs from the estimate pulls the decision, but a single outlier does not flip it. The more
+    // late row groups observed, the more the observed EWMA is trusted over the per-group estimate (capped).
+    val blended =
+      if (observedFraction < 0.0) estimate
+      else {
+        val wObs = math.min(0.6, 0.2 * observedCount)
+        (1.0 - wObs) * estimate + wObs * observedFraction
+      }
+    val late = blended <= autoLate.lateFraction
+    lateOff = !late
+    if (late) {
+      metrics.numRowGroupsLate += 1
+      lastLateRowGroupRows = rowCount
+      lastLateBaseline = metrics.numLateSkippedRows.value
+    } else {
+      metrics.numRowGroupsEager += 1
+      lastLateRowGroupRows = 0
+    }
+  }
+
+  /** The index into `reader.getRowGroups` of the block a filtered `store` came from, or -1 when not resolvable. */
+  private def blockIndexFor(store: org.apache.parquet.column.page.PageReadStore): Int = {
+    val offset = store.getRowIndexOffset
+    val blocks = reader.getRowGroups
+    if (offset.isPresent) {
+      var b = 0
+      while (b < blocks.size()) {
+        if (blocks.get(b).getRowIndexOffset == offset.get.longValue) return b
+        b += 1
+      }
+    }
+    // Fall back to the sequential position (rowGroupIndex was incremented past this store by the read).
+    val seq = rowGroupIndex - 1
+    if (seq >= 0 && seq < blocks.size()) seq else -1
+  }
+
+  /** #962 (auto): fold the surviving fraction of the just-finished late row group into the file's EWMA. */
+  private def recordObservedFraction(): Unit = {
+    if (lastLateRowGroupRows > 0) {
+      val skippedNow = metrics.numLateSkippedRows.value
+      val skipped = math.max(0L, skippedNow - lastLateBaseline)
+      val surviving = math.max(0L, lastLateRowGroupRows - skipped)
+      val fr = surviving.toDouble / lastLateRowGroupRows
+      observedFraction = if (observedFraction < 0.0) fr else 0.6 * observedFraction + 0.4 * fr
+      observedCount += 1
+      metrics.lateSelectivityPpm.set(math.round(observedFraction * 1000000.0))
+      lastLateRowGroupRows = 0
+    }
+  }
+
   private def startRowGroup(store: org.apache.parquet.column.page.PageReadStore, rowCount: Int): Unit = {
+    // Before starting the next group, fold the previous late group's observed selectivity into the EWMA (#962).
+    if (autoLate.enabled) recordObservedFraction()
     val skipped = skippedPages.remove(store)
     if (skipped != null) metrics.numPagesSkipped += skipped.longValue
     rangeBreaks = if (fileRepeated) VectorParquetPartitionReader.rangeBreaks(store) else null
@@ -1594,8 +1731,13 @@ private[vecruntime] final class VectorParquetPartitionReader(
     decodeFilter != null && filterColumns != null &&
       hadoopConf.getBoolean(io.vecruntime.spark.VectorConf.ScanNativeParquetLateMaterializationTwoPass, false) &&
       !(rowIndexOrdinal >= 0 && filterColumns(rowIndexOrdinal))
+  // #962: when two-pass is on AND auto is deciding, a row group is read in two passes only when its cheap
+  // statistics estimate says the surviving fraction is very low; otherwise it is read whole and the one-pass
+  // late/eager decision (`autoDecideRowGroup`) applies. Without auto, #812's own survivor fraction gate applies.
   private lazy val twoPassMaxFraction: Double =
-    hadoopConf.getDouble(io.vecruntime.spark.VectorConf.ScanNativeParquetLateMaterializationTwoPassMaxFraction, 0.5)
+    if (autoLate.enabled) autoLate.lateFraction
+    else
+      hadoopConf.getDouble(io.vecruntime.spark.VectorConf.ScanNativeParquetLateMaterializationTwoPassMaxFraction, 0.5)
   private var currentClipped: MessageType = _
   private var twoPassDenseRun = 0
   // #606: the current file's decode context, kept so a parallel-decode helper can build its own column-reader
@@ -1657,6 +1799,20 @@ private[vecruntime] final class VectorParquetPartitionReader(
         .filter(cc => requestedPaths.contains(cc.getPath.toArray.toSeq))
         .forall(_.getOffsetIndexReference != null)
       if (!indexed || twoPassDenseRun >= 2) return r.readFilteredRowGroup(i)
+      // #962 (auto): a two-pass read costs a full pass over the filter columns; only pay it when the cheap
+      // statistics estimate says the surviving fraction is very low. Otherwise read the row group whole -- the
+      // one-pass late/eager decision in autoDecideRowGroup then applies to it.
+      if (autoLate.enabled) {
+        val est = LateMaterializationEstimator.estimate(
+          pushedFilters,
+          block,
+          r,
+          i,
+          autoLate.dictionaries,
+          autoLate.blooms
+        )
+        if (est > autoLate.twoPassFraction) return r.readFilteredRowGroup(i)
+      }
       val survivors = twoPassSurvivors(r, i)
       val total = block.getRowCount
       if (survivors.rowCount() > 0 && survivors.rowCount() > total * twoPassMaxFraction) {
@@ -2115,6 +2271,8 @@ private[vecruntime] final class VectorParquetPartitionReader(
   }
 
   private def closeFile(): Unit = {
+    // #962 (auto): fold the last late row group's observed selectivity before the file's state is torn down.
+    if (autoLate.enabled) recordObservedFraction()
     if (fallbackMetadata != null) {
       fallbackMetadata.foreach(_.close())
       fallbackMetadata = null
@@ -2610,6 +2768,21 @@ private[vecruntime] final case class NativeScanRebaseConf(
     int96Mode: String,
     int96Convert: Boolean,
     sessionTz: String
+)
+
+/**
+ * #962: the `auto` late-materialization decision's parameters, carried to the reader: whether the reader decides
+ * per row group at all (`enabled`), the surviving-fraction threshold at or below which a row group is
+ * late-materialized (`lateFraction`), the lower threshold below which it is escalated to two passes
+ * (`twoPassFraction`), and whether dictionary pages and bloom filters may be read to sharpen an equality/IN
+ * estimate.
+ */
+private[vecruntime] final case class AutoLateConf(
+    enabled: Boolean,
+    lateFraction: Double,
+    twoPassFraction: Double,
+    dictionaries: Boolean,
+    blooms: Boolean
 )
 
 /** One file's resolved modes for Spark's fallback reader; `convertTz` is null when no INT96 conversion applies. */
