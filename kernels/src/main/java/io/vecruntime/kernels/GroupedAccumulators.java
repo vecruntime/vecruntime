@@ -52,13 +52,13 @@ public final class GroupedAccumulators {
      * thread's arena charges to the task in the operators' memory mode. Below
      * the threshold the state stays on the heap: it is small there, and the
      * interleaved copies and the masked path are tuned on arrays (on AVX-512 a
-     * segment scatter at a few groups measured slower). Off by default for the
-     * A/B; the executor plugin sets it from {@code
-     * spark.vecruntime.agg.nativeState}, {@code
-     * -Dvecruntime.agg.nativeState=true} sets it outside Spark. Read when a
-     * table grows, so a change applies to tables that grow afterwards.
+     * segment scatter at a few groups measured slower). On by default; the
+     * executor plugin sets it from {@code spark.vecruntime.agg.nativeState},
+     * {@code -Dvecruntime.agg.nativeState=false} turns it off outside Spark.
+     * Read when a table grows, so a change applies to tables that grow
+     * afterwards.
      */
-    private static volatile boolean nativeState = Boolean.getBoolean("vecruntime.agg.nativeState");
+    private static volatile boolean nativeState = Boolean.parseBoolean(System.getProperty("vecruntime.agg.nativeState", "true"));
 
     public static void setNativeState(boolean on) {
         nativeState = on;

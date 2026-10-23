@@ -643,12 +643,12 @@ object VectorConf {
   /**
    * #941: grouped accumulators past 16,384 groups keep their state in native pool blocks, charged to the task in
    * the operators' memory mode, instead of `long[]` on the heap (at 10 TB those arrays fill the executors' old
-   * generation). Below that the state stays on the heap. Off by default until the 10 TB A/B. Read once, when the
-   * executor starts.
+   * generation). Below that the state stays on the heap. On by default: at 10 TB the full TPC-DS run is the same or
+   * faster with GC -10% and q78's spill -19%. Read once, when the executor starts.
    */
   val AggNativeState = "spark.vecruntime.agg.nativeState"
   def aggNativeState(sparkConf: org.apache.spark.SparkConf): Boolean =
-    sparkConf.getBoolean(AggNativeState, false)
+    sparkConf.getBoolean(AggNativeState, true)
 
   /**
    * #869 step 4: Arrow's buffers (the Flight shuffle's, the shuffle readers', the operators' output vectors) from

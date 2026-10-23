@@ -8,6 +8,11 @@ version may change configuration keys or defaults, always noted here.
 
 ### Added
 
+- Grouped aggregate state in the native pool (#941, `spark.vecruntime.agg.nativeState`, on by default): past 16,384
+  groups, the long sum, count and 128-bit decimal sum accumulators keep their state in one pool block each, a group's
+  fields side by side, charged to the task in the operators' memory mode, instead of `long[]` on the heap. At 10 TB
+  (26g heap, two full 99-query rounds each way) the run is 2,307 s against 2,328 s, GC -9.5%, q78's spill 613 GiB
+  against 760 GiB; on the heaviest queries after inlining the decimal-sum loop, -2.5% (q78 -10.8 s).
 - The native Parquet scan's read-ahead in the task's memory budget (#915): the compressed pages read ahead and the
   batches decode-ahead queues are held in Spark execution memory, granted only from free memory, so read-ahead
   narrows its window when the operators above it need the pool instead of making them spill. The byte caps
