@@ -48,6 +48,7 @@ Turn it on with `spark.vecruntime.scan.nativeIceberg.enabled=true`.
 | float / double inside a list or map | **✓** |
 | `fixed`, `uuid` columns | **✓** |
 | `variant` columns (not shredded) | **✓** |
+| `unknown` columns (v3), at the top level and inside structs | **✓** not stored, as Iceberg's writer omits them |
 | ORC / Avro, encrypted tables | **✗** |
 
 Turn it on with `spark.vecruntime.iceberg.writer.enabled=true`. For merge-on-read, also set

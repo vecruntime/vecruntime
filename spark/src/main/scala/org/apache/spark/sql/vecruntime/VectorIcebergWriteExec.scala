@@ -322,9 +322,64 @@ object VectorIcebergWriteExec extends Logging {
         logDebug(s"reads ${columnar.nodeName} columnar")
         (columnar.executeColumnar(), false)
       case None =>
-        val rowRoot = VectorIcebergWriteExec.rowStageRoot(query)
+        val rowRoot = VectorIcebergWriteExec.nullSafeRowRoot(VectorIcebergWriteExec.rowStageRoot(query))
         logInfo(s"vecruntime: the columnar Iceberg writer reads rows from ${rowRoot.nodeName} (RowToColumnarExec)")
         (RowToColumnarExec(rowRoot).executeColumnar(), true)
+    }
+  }
+
+  /**
+   * The row root made safe for Spark's `RowToColumnarExec`, which cannot convert a `NullType` (VOID) column at
+   * any depth (`[UNSUPPORTED_DATATYPE] Unsupported data type "VOID"`). A `NullType` is the Spark form of a v3
+   * `unknown` field, whose value is never stored and is dropped from the write (`SparkLanes`), so its value is
+   * irrelevant here. Each output column that carries a `NullType` -- at the top level, or inside a struct at
+   * any depth -- is rewritten, in place, to an expression that holds a typed null (`null` as `int`) in place of
+   * every `NullType` leaf, through a `ProjectExec`; the leaf is dropped before the Parquet writer. A struct is
+   * rebuilt with `CreateNamedStruct` so its real fields keep their values and only the unknown field is
+   * substituted. Lists and maps need no handling: an unknown element or map value is declined before the write
+   * reaches the columnar path. When no output column carries a `NullType` the root is returned unchanged, so
+   * the common path is untouched.
+   */
+  def nullSafeRowRoot(root: SparkPlan): SparkPlan = {
+    import org.apache.spark.sql.catalyst.expressions.{
+      Alias,
+      CreateNamedStruct,
+      Expression,
+      GetStructField,
+      If,
+      IsNull,
+      Literal,
+      NamedExpression
+    }
+    import org.apache.spark.sql.types.{DataType, IntegerType, NullType, StructType}
+
+    def hasNull(dt: DataType): Boolean = dt match {
+      case _: NullType => true
+      case s: StructType => s.fields.exists(f => hasNull(f.dataType))
+      case _ => false // an array/map of unknown is declined, so it never reaches here
+    }
+
+    // An expression of the same shape as `e` with every NullType leaf replaced by a typed null literal. A
+    // rebuilt struct keeps its own nullability: a null struct stays null rather than becoming a struct of
+    // nulls (CreateNamedStruct is never null), so the rows match Iceberg's writer.
+    def rewrite(e: Expression): Expression = e.dataType match {
+      case _: NullType => Literal(null, IntegerType)
+      case s: StructType =>
+        val fields = s.fields.zipWithIndex.flatMap { case (f, i) =>
+          Seq(Literal(f.name), rewrite(GetStructField(e, i, Some(f.name))))
+        }
+        val rebuilt = CreateNamedStruct(fields.toIndexedSeq)
+        If(IsNull(e), Literal(null, rebuilt.dataType), rebuilt)
+      case _ => e
+    }
+
+    if (!root.output.exists(a => hasNull(a.dataType))) {
+      root
+    } else {
+      val projectList: Seq[NamedExpression] = root.output.map { a =>
+        if (hasNull(a.dataType)) Alias(rewrite(a), a.name)(exprId = a.exprId) else a
+      }
+      org.apache.spark.sql.execution.ProjectExec(projectList, root)
     }
   }
 

@@ -107,6 +107,7 @@ public final class IcebergRewriteFileTaskWriter implements AutoCloseable {
     private final int posOrdinal;
     private final int[] dataOrdinals;
     private final PartitionKeys keys;
+    private final boolean arrowLanes;
     private final Arena arena = Arena.ofShared();
     private final Map<String, FileBuffer> buffers = new LinkedHashMap<>();
     private final List<DataFile> done = new ArrayList<>();
@@ -145,6 +146,7 @@ public final class IcebergRewriteFileTaskWriter implements AutoCloseable {
         this.posOrdinal = posOrdinal;
         this.dataOrdinals = dataOrdinals;
         this.keys = spec.spec().isUnpartitioned() ? null : new PartitionKeys(spec.spec(), spec.writeSchema());
+        this.arrowLanes = SparkLanes.needed(spec.writeSchema());
     }
 
     /**
@@ -181,7 +183,12 @@ public final class IcebergRewriteFileTaskWriter implements AutoCloseable {
             for (int o : dataOrdinals) {
                 picked.add(columns.get(o));
             }
-            data.addAll(Gather.rows(picked, rows, arena));
+            List<VectorBuffers> gathered = Gather.rows(picked, rows, arena);
+            // As the streaming writer does (IcebergDataTaskWriter): convert Spark's fixed/uuid lanes to the
+            // Arrow lanes the file format holds, and DROP any v3 unknown field, so the buffered columns line up
+            // one-for-one with this writer's Parquet schema (which omits unknown fields). The converted lanes
+            // are kept across batches, so they live in this writer's own (shared) arena.
+            data.addAll(arrowLanes ? SparkLanes.toArrow(spec.writeSchema(), gathered, arena) : gathered);
             buffers.computeIfAbsent(e.getKey(), k -> new FileBuffer()).add(data, pos);
         }
     }

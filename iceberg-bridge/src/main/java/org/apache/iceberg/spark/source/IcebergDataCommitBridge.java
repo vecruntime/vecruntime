@@ -106,12 +106,37 @@ public final class IcebergDataCommitBridge {
     }
 
     static String unsupportedType(Type type) {
+        return unsupportedType(type, false);
+    }
+
+    /**
+     * Why the columnar Parquet writer cannot encode {@code type}, or {@code
+     * null} when it can. {@code inCollection} is true when {@code type} is
+     * reached as a list element or a map key/value: it changes only how the v3
+     * {@code unknown} type is treated.
+     *
+     * <p>The v3 {@code unknown} type is "not stored in data files" (Iceberg
+     * spec): Iceberg's own {@code TypeToMessageType} omits an unknown field
+     * from the Parquet schema at the top level and inside a struct (so the
+     * column is simply absent and reads back null), but {@code
+     * TypeToMessageType.list}/{@code map} fail a {@code Preconditions} check on
+     * an unknown element or value ("Cannot convert element/value Parquet").
+     * We match that exactly: an unknown top-level or struct field is written
+     * natively (the writer drops it, see {@code SparkLanes}), and an unknown
+     * list element or map key/value is declined so the write falls back to
+     * Iceberg's own writer, which would itself throw on such a schema.
+     */
+    private static String unsupportedType(Type type, boolean inCollection) {
         switch (type.typeId()) {
             case BOOLEAN, INTEGER, LONG, FLOAT, DOUBLE, DATE, TIMESTAMP, STRING, BINARY, DECIMAL, FIXED, UUID, VARIANT:
                 return null;
+            case UNKNOWN:
+                // Omitted from data files at the top level and inside a struct, as Iceberg's writer omits it;
+                // not writable as a list element or map key/value (Iceberg's own writer rejects it there).
+                return inCollection ? type.toString() : null;
             case STRUCT:
                 for (Types.NestedField f : type.asStructType().fields()) {
-                    String t = unsupportedType(f.type());
+                    String t = unsupportedType(f.type(), inCollection);
                     if (t != null) {
                         return t;
                     }
@@ -119,14 +144,17 @@ public final class IcebergDataCommitBridge {
                 return null;
             case LIST:
                 return unsupportedType(type.asListType()
-                        .elementType());
+                        .elementType(),
+                        true);
             case MAP:
                 String k = unsupportedType(type.asMapType()
-                        .keyType());
+                        .keyType(),
+                        true);
                 return k != null ? k : unsupportedType(type.asMapType()
-                        .valueType());
+                        .valueType(),
+                        true);
             default:
-                // TIME, TIMESTAMP_NANO, GEOMETRY, GEOGRAPHY, UNKNOWN: not encoded natively yet.
+                // TIME, TIMESTAMP_NANO, GEOMETRY, GEOGRAPHY: not encoded natively yet.
                 return type.toString();
         }
     }
