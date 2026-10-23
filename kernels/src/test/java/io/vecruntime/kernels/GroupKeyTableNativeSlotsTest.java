@@ -105,7 +105,42 @@ class GroupKeyTableNativeSlotsTest {
         GroupKeyTable table = new GroupKeyTable(new VecType[] {VecType.INT64, VecType.INT64});
         fillLongPairs(table);
         assertFalse(table.nativeSlots(), "a table that was not allowed keeps its slots on the heap");
+        assertTrue(table.packedSlots(), "past " + GroupKeyTable.PACKED_SLOTS + " slots, packed");
         assertEquals(0L, table.nativeBytes());
+    }
+
+    /** Below PACKED_SLOTS the table keeps today's split slots and hashes. */
+    @Test
+    void aSmallTableKeepsTheSplitSlots() {
+        GroupKeyTable table = new GroupKeyTable(new VecType[] {VecType.INT64, VecType.INT64});
+        table.allowNative();
+        Map<Long, Integer> reference = new HashMap<>();
+        Random rnd = new Random(944);
+        try (Arena arena = Arena.ofConfined()) {
+            for (int b = 0; b < 8; b++) {
+                int n = 4096;
+                long[] a = new long[n];
+                long[] c = new long[n];
+                for (int i = 0; i < n; i++) {
+                    long g = rnd.nextInt(50_000);
+                    a[i] = g;
+                    c[i] = -g;
+                }
+                int[] ids = new int[n];
+                int groups = table.assign(new VectorBuffers[] {ArrowLayout.ofLongs(arena, a, null), ArrowLayout.ofLongs(arena, c, null)}, n,
+                        ids, null);
+                for (int i = 0; i < n; i++) {
+                    Integer known = reference.putIfAbsent(a[i], ids[i]);
+                    if (known != null) {
+                        assertEquals(known.intValue(), ids[i], "row " + i + " of batch " + b);
+                    }
+                }
+                assertEquals(reference.size(), groups, "groups after batch " + b);
+            }
+        }
+        assertFalse(table.packedSlots(), "below the threshold the slots stay split");
+        assertFalse(table.nativeSlots());
+        table.close();
     }
 
     /**

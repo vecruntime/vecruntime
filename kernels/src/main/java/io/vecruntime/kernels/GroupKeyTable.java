@@ -145,14 +145,24 @@ public final class GroupKeyTable {
     private final VecType[] types;
 
     /**
-     * The open-addressing slots, one packed entry each: the group's row hash in
-     * the high 32 bits, its id in the low 32, {@link #EMPTY} for an empty slot
-     * (#941 phase 2b). A probe compares the hash from the slot it already read
-     * instead of loading it from a per-group array -- one cache line a probe
-     * instead of two, which past the caches is the miss that counted ({@code
-     * GroupTableStorageBenchmark}, against the split slots and hashes: 1.5-1.85x
-     * from 1M groups on Graviton, Skylake-SP and Sapphire Rapids). Null while
-     * the entries are in the pool ({@link #slotSeg}).
+     * The open-addressing slots while the table is below {@link #PACKED_SLOTS}:
+     * the group id or -1, the group's row hash in {@link #groupHashes}. Null
+     * once the table is packed ({@link #slots}) or in the pool ({@link
+     * #slotSeg}).
+     */
+    private int[] splitSlots;
+
+    /** Row hash per group, for {@link #splitSlots} only; null once packed. */
+    private int[] groupHashes;
+
+    /**
+     * The open-addressing slots from {@link #PACKED_SLOTS} on, one packed entry
+     * each: the group's row hash in the high 32 bits, its id in the low 32,
+     * {@link #EMPTY} for an empty slot (#941 phase 2b). A probe compares the
+     * hash from the slot it already read instead of loading it from {@link
+     * #groupHashes} -- one cache line a probe instead of two, which past the
+     * caches is the miss that counts. Null below the threshold and while the
+     * entries are in the pool ({@link #slotSeg}).
      */
     private long[] slots;
 
@@ -235,6 +245,17 @@ public final class GroupKeyTable {
      */
     static final int NATIVE_FAST_SLOTS = Integer.getInteger("vecruntime.agg.nativeFastSlots", 1 << 21);
 
+    /**
+     * Slots from which the table packs hash and id into one entry ({@link
+     * #slots}). {@code GroupTableStorageBenchmark}, packed against split, 3
+     * forks: from 256K groups (512K slots at the benchmark's 0.5 load) 1.08-1.69x
+     * on Graviton4, Skylake-SP, Sapphire Rapids, Granite Rapids, Genoa and
+     * Turin, 1.43-2.12x from 1M; below it, in cache, the split arrays are
+     * faster on every recent x86 (Turin 0.64x at 1K groups, Granite Rapids
+     * 0.84-0.88x to 64K) and only Graviton and Skylake gain.
+     */
+    static final int PACKED_SLOTS = Integer.getInteger("vecruntime.agg.packedSlots", 1 << 19);
+
     /** An empty slot: no group has id -1. */
     private static final long EMPTY = -1L;
 
@@ -242,16 +263,34 @@ public final class GroupKeyTable {
         return ((long) hash << 32) | (gid & 0xFFFF_FFFFL);
     }
 
+    /** Slot {@code pos} as a packed entry, whatever the layout. */
     private long entry(int pos) {
+        if (splitSlots != null) {
+            int gid = splitSlots[pos];
+            return gid < 0 ? EMPTY : entryOf(groupHashes[gid], gid);
+        }
         return slotSeg == null ? slots[pos] : slotSeg.getAtIndex(PAIR, pos);
     }
 
     private void setEntry(int pos, int hash, int gid) {
-        long e = entryOf(hash, gid);
-        if (slotSeg == null) {
-            slots[pos] = e;
+        if (splitSlots != null) {
+            splitSlots[pos] = gid;
+            groupHashes[gid] = hash;
+        } else if (slotSeg == null) {
+            slots[pos] = entryOf(hash, gid);
         } else {
-            slotSeg.setAtIndex(PAIR, pos, e);
+            slotSeg.setAtIndex(PAIR, pos, entryOf(hash, gid));
+        }
+    }
+
+    /** Every slot empty, whatever the layout. */
+    private void clearSlots() {
+        if (splitSlots != null) {
+            Arrays.fill(splitSlots, -1);
+        } else if (slotSeg == null) {
+            Arrays.fill(slots, EMPTY);
+        } else {
+            slotSeg.fill((byte) -1);
         }
     }
 
@@ -361,8 +400,13 @@ public final class GroupKeyTable {
         this.types = types.clone();
         this.dictionaryLimit = dictionaryLimit;
         this.slotCount = INITIAL_CAPACITY * 2;
-        this.slots = new long[slotCount];
-        Arrays.fill(slots, EMPTY);
+        if (slotCount < PACKED_SLOTS) {
+            this.splitSlots = new int[slotCount];
+            this.groupHashes = new int[INITIAL_CAPACITY];
+        } else {
+            this.slots = new long[slotCount];
+        }
+        clearSlots();
         this.mask = slotCount - 1;
         if (fastKeys(types)) {
             this.fast = emptyFast(slotCount);
@@ -867,6 +911,20 @@ public final class GroupKeyTable {
 
     private int lookupOnly(ProbeKeys keys, int row, int hash) {
         int pos = hash & mask;
+        int[] split = splitSlots;
+        if (split != null) {
+            int[] hashes = groupHashes;
+            while (true) {
+                int gid = split[pos];
+                if (gid < 0) {
+                    return -1;
+                }
+                if (hashes[gid] == hash && equals(gid, keys, row)) {
+                    return gid;
+                }
+                pos = (pos + 1) & mask;
+            }
+        }
         while (true) {
             long e = entry(pos);
             if (e == EMPTY) {
@@ -902,6 +960,20 @@ public final class GroupKeyTable {
 
     private int lookupOnly(Bound keys, int row, int hash) {
         int pos = hash & mask;
+        int[] split = splitSlots;
+        if (split != null) {
+            int[] hashes = groupHashes;
+            while (true) {
+                int gid = split[pos];
+                if (gid < 0) {
+                    return -1;
+                }
+                if (hashes[gid] == hash && equals(gid, keys, row)) {
+                    return gid;
+                }
+                pos = (pos + 1) & mask;
+            }
+        }
         while (true) {
             long e = entry(pos);
             if (e == EMPTY) {
@@ -1637,6 +1709,14 @@ public final class GroupKeyTable {
         return slotSeg != null;
     }
 
+    /**
+     * Package-private, for the tests: whether the slots are packed hash/id
+     * entries on the heap.
+     */
+    boolean packedSlots() {
+        return slots != null;
+    }
+
     /** Gives the pool blocks back; the table is not used afterwards. */
     public void close() {
         freeFastSeg();
@@ -1981,6 +2061,20 @@ public final class GroupKeyTable {
 
     private int lookupOrInsert(Bound keys, int row, int hash) {
         int pos = hash & mask;
+        int[] split = splitSlots;
+        if (split != null) {
+            int[] hashes = groupHashes;
+            while (true) {
+                int gid = split[pos];
+                if (gid < 0) {
+                    return insert(keys, row, hash, pos);
+                }
+                if (hashes[gid] == hash && equals(gid, keys, row)) {
+                    return gid;
+                }
+                pos = (pos + 1) & mask;
+            }
+        }
         while (true) {
             long e = entry(pos);
             if (e == EMPTY) {
@@ -2147,11 +2241,7 @@ public final class GroupKeyTable {
         recUsed[c] = used;
         dicts[c] = null;
         strIds[c] = null;
-        if (slotSeg == null) {
-            Arrays.fill(slots, EMPTY);
-        } else {
-            slotSeg.fill((byte) -1);
-        }
+        clearSlots();
         for (int gid = 0; gid < size; gid++) {
             int hash = groupHash(gid); // the record bytes hash differently from the dictionary ids
             setEntry(emptySlot(hash), hash, gid);
@@ -2241,6 +2331,9 @@ public final class GroupKeyTable {
         }
         int cap = Math.max(needed, groupCap * 2);
         groupCap = cap;
+        if (groupHashes != null) {
+            groupHashes = Arrays.copyOf(groupHashes, cap);
+        }
         for (int c = 0; c < types.length; c++) {
             switch (types[c]) {
                 case INT32, BOOL -> intKeys[c] = Arrays.copyOf(intKeys[c], cap);
@@ -2271,6 +2364,7 @@ public final class GroupKeyTable {
      */
     public long memoryBytes() {
         long bytes = (slots == null ? 0L : 8L * slots.length)
+                + (splitSlots == null ? 0L : 4L * splitSlots.length + 4L * groupHashes.length)
                 + (fast == null ? 0L : 8L * fast.length);
         for (int c = 0; c < types.length; c++) {
             switch (types[c]) {
@@ -2314,8 +2408,11 @@ public final class GroupKeyTable {
         int newMask = newCount - 1;
         // #941 phase 2b: the entries go to (or stay in) the pool past NATIVE_FAST_SLOTS. The generic probes read
         // the slot fields on every call, so they can move right here, mid-batch.
+        // Below PACKED_SLOTS the split arrays stay (the faster layout in cache); a table never goes back.
         boolean slotsNative = slotSeg != null
                 || (nativeAllowed && GroupedAccumulators.nativeState() && newCount >= NATIVE_FAST_SLOTS);
+        boolean packed = !slotsNative && (slots != null || newCount >= PACKED_SLOTS);
+        int[] newSplit = null;
         long[] newSlots = null;
         Arena newSlotArena = null;
         MemorySegment newSlotSeg = null;
@@ -2323,9 +2420,12 @@ public final class GroupKeyTable {
             newSlotArena = NativePool.shared().newArena();
             newSlotSeg = newSlotArena.allocate(8L * newCount, 64);
             newSlotSeg.fill((byte) -1); // every entry EMPTY
-        } else {
+        } else if (packed) {
             newSlots = new long[newCount];
             Arrays.fill(newSlots, EMPTY);
+        } else {
+            newSplit = new int[newCount];
+            Arrays.fill(newSplit, -1);
         }
         // #941: past NATIVE_FAST_SLOTS the inline pairs go to (or stay in) the pool.
         // A heap table crossing the size moves at the start of the next assign (pendingNative): the loop that
@@ -2354,7 +2454,12 @@ public final class GroupKeyTable {
             int hash = (int) (e >>> 32);
             int gid = (int) e;
             int pos = hash & newMask;
-            if (newSlotSeg == null) {
+            if (newSplit != null) {
+                while (newSplit[pos] >= 0) {
+                    pos = (pos + 1) & newMask;
+                }
+                newSplit[pos] = gid; // its hash stays in groupHashes
+            } else if (newSlotSeg == null) {
                 while (newSlots[pos] != EMPTY) {
                     pos = (pos + 1) & newMask;
                 }
@@ -2383,6 +2488,10 @@ public final class GroupKeyTable {
         if (slotArena != null) {
             slotArena.close();
         }
+        if (newSplit == null) {
+            groupHashes = null; // the entries carry the hash from here on
+        }
+        splitSlots = newSplit;
         slots = newSlots;
         slotSeg = newSlotSeg;
         slotArena = newSlotArena;
