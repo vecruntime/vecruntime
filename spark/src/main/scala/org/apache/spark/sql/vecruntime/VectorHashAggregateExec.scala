@@ -475,7 +475,7 @@ private[vecruntime] class VectorGroupedAggregateIterator(
   private val OutputBatchSize = 4096
 
   private val allocator: BufferAllocator = VectorAllocators.newChild("VectorHashAggregateExec")
-  private var table = new GroupKeyTable(keyExprs.map(_.vecType), dictionaryStrings)
+  private var table = newTable()
   private val dictionaryKeys = VectorConf.aggDictionaryKeys(org.apache.spark.sql.internal.SQLConf.get)
   private val keyDicts = new Array[SharedDictionary](keyExprs.length)
   private var states: Array[GroupedAggState] = aggs.map(_.newGroupedState())
@@ -659,7 +659,8 @@ private[vecruntime] class VectorGroupedAggregateIterator(
   private def reset(): Unit = {
     // #886: the reservation stays -- the next table regrows into it; close returns it.
     releaseDictionaries()
-    table = new GroupKeyTable(keyExprs.map(_.vecType), dictionaryStrings)
+    table.close()
+    table = newTable()
     closeStates()
     states = aggs.map(_.newGroupedState())
     representatives = newRepresentatives()
@@ -1011,9 +1012,17 @@ private[vecruntime] class VectorGroupedAggregateIterator(
       releaseMemory()
       releaseDictionaries()
       closeStates()
+      table.close()
       metrics.recordPeakNative(allocator.getPeakMemoryAllocation) // #874: measured, not reserved
       allocator.close()
     }
+  }
+
+  /** #941 phase 2: a key table whose inline pairs may move into the pool; this operator closes it. */
+  private def newTable(): GroupKeyTable = {
+    val t = new GroupKeyTable(keyExprs.map(_.vecType), dictionaryStrings)
+    t.allowNative()
+    t
   }
 
   /** #941: the states' off-heap accumulators back to the pool; each state is closed exactly once. */
