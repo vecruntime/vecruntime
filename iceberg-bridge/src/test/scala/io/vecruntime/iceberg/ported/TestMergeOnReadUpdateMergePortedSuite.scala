@@ -255,6 +255,39 @@ class TestMergeOnReadUpdateMergePortedSuite extends AnyFunSuite with BeforeAndAf
     assertSameTwin(base)
   }
 
+  // ---- TestMergeOnReadUpdate.testMergeOnReadUpdateSetsSortOrderIdOnNewDataFiles ----
+  // With a table sort order set, the new data files of a merge-on-read UPDATE (the reinserted rows)
+  // must carry the table's sort order id, as Iceberg's own writer does. The write requests the ordering
+  // (RequiresDistributionAndOrdering), so the rows reach our columnar data writer already sorted; #901 R3
+  // stamps the same sort order id Iceberg resolved (SparkWriteConf.outputSortOrderId) on every data file.
+  // The twin asserts our files-table sort_order_id equals Iceberg's, and that the rows within each file
+  // our writer produced are actually sorted.
+  test("UPDATE new data files carry the sort order id (sorted) like Iceberg") {
+    val base = "ice.db.upd_sortorder"
+    for (suffix <- Seq("on", "off")) {
+      createMor(s"${base}_$suffix", partitioned = true, "partition")
+      spark.sql(s"INSERT INTO ${base}_$suffix VALUES (1,'hr'),(2,'hr'),(3,'hr'),(5,'hr')")
+      // The table sort order (orderId 1), set through the table API so no Iceberg SQL extension is needed.
+      Spark3Util.loadIcebergTable(spark, s"${base}_$suffix").replaceSortOrder().asc("id").commit()
+    }
+    assert(onOff(base, "UPDATE %s SET id = id + 10 WHERE id = 1 OR id = 2"), s"$base: UPDATE must plan our operator")
+    assertSameTwin(base)
+    // The added data files of the latest snapshot carry the table's sort order id (1) on both paths.
+    val tableOrderId = Spark3Util.loadIcebergTable(spark, s"${base}_on").sortOrder().orderId()
+    assert(tableOrderId == 1, s"$base: expected table sort order id 1, got $tableOrderId")
+    assert(
+      addedDataFileSortOrderIds(s"${base}_on") == addedDataFileSortOrderIds(s"${base}_off"),
+      s"$base: added-data-file sort order ids differ: on=${addedDataFileSortOrderIds(s"${base}_on")} " +
+        s"off=${addedDataFileSortOrderIds(s"${base}_off")}"
+    )
+    assert(
+      addedDataFileSortOrderIds(s"${base}_on") == Set(tableOrderId),
+      s"$base: our added data files must all carry the table sort order id: ${addedDataFileSortOrderIds(s"${base}_on")}"
+    )
+    // Our writer's new data files are physically sorted by id (what the stamped order claims).
+    assert(dataFilesSortedBy(s"${base}_on", "id"), s"$base: our new data files are not sorted by id")
+  }
+
   // ---- TestMergeOnReadMerge.checkMergeDeleteGranularity (FILE / PARTITION) ----
   for (granularity <- Seq("file", "partition")) {
     test(
@@ -331,5 +364,23 @@ class TestMergeOnReadUpdateMergePortedSuite extends AnyFunSuite with BeforeAndAf
     val set = scala.collection.mutable.ArrayBuffer[org.apache.iceberg.DeleteFile]()
     table.newScan().planFiles().iterator().asScala.foreach(ft => ft.deletes().asScala.foreach(set += _))
     set.distinct.filter(org.apache.iceberg.util.ContentFileUtil.isDV).toSeq
+  }
+
+  /** The sort order ids of the data files added by a table's current snapshot. */
+  private def addedDataFileSortOrderIds(t: String): Set[Int] = {
+    val table = Spark3Util.loadIcebergTable(spark, t)
+    table.currentSnapshot().addedDataFiles(table.io()).asScala.map(_.sortOrderId().intValue()).toSet
+  }
+
+  /** Whether every data file the table's latest UPDATE added holds its rows sorted ascending by `col`. */
+  private def dataFilesSortedBy(t: String, col: String): Boolean = {
+    val table = Spark3Util.loadIcebergTable(spark, t)
+    val added = table.currentSnapshot().addedDataFiles(table.io()).asScala.map(_.location()).toSet
+    // Read each added data file on its own and check its rows are ascending by `col`.
+    added.forall { path =>
+      val vals = spark.read.format("iceberg").load(t).where(s"input_file_name() = '$path'")
+        .select(col).collect().map(_.getInt(0)).toSeq
+      vals == vals.sorted
+    }
   }
 }

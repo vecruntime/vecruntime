@@ -152,7 +152,27 @@ public final class IcebergDataCommitBridge {
                 field(w, "targetFileSize", Long.class),
                 props,
                 field(w, "queryId", String.class),
-                field(w, "useFanoutWriter", Boolean.class));
+                field(w, "useFanoutWriter", Boolean.class),
+                outputSortOrderId(w));
+    }
+
+    /**
+     * The sort order id Iceberg's own data writer stamps on this write's files:
+     * {@code SparkWriteConf.outputSortOrderId(writeRequirements)}, computed from
+     * the two private {@code SparkWrite} fields Iceberg itself reads in {@code
+     * createWriterFactory} (#901 R3). The table's sort order id when the write's
+     * required ordering satisfies it, 0 (unsorted) otherwise.
+     */
+    private static int outputSortOrderId(SparkWrite w) {
+        Object writeConf = field(w, "writeConf", Object.class);
+        Object requirements = field(w, "writeRequirements", Object.class);
+        try {
+            java.lang.reflect.Method m = writeConf.getClass().getMethod("outputSortOrderId", requirements.getClass());
+            m.setAccessible(true);
+            return (Integer) m.invoke(writeConf, requirements);
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("SparkWriteConf.outputSortOrderId is not callable in this Iceberg version", e);
+        }
     }
 
     /**

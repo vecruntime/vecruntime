@@ -115,6 +115,7 @@ public final class IcebergDataTaskWriter implements AutoCloseable {
                     .withFormat(FileFormat.PARQUET)
                     .withFileSizeInBytes(appender.length())
                     .withMetrics(appender.metrics())
+                    .withSortOrderId(spec.sortOrderId())
                     .withSplitOffsets(appender.splitOffsets());
             if (key != null) {
                 b.withPartition(key);
