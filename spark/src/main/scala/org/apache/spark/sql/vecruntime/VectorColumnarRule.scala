@@ -736,27 +736,66 @@ case class VectorExecRule(session: SparkSession) extends Rule[SparkPlan] with Lo
    * columns: the scan then decodes the filter's columns first and the others at the survivors only. The
    * filter stays (it compacts a sparse selection, as over any input).
    */
-  private def markDecodeFilters(plan: SparkPlan): SparkPlan = plan.transformUp {
-    case f @ VectorFilterExec(cond, s: VectorParquetScanExec, _) if s.decodeFilter.isEmpty && cond.deterministic =>
-      val data = s.scan.requiredSchema.fieldNames.toSet
-      val refs = cond.references.map(_.name).toSet
-      val compiles = ExpressionCompiler.compilePredicate(cond, s.output).isRight
-      val dataRefs = refs.intersect(data)
-      // A conjunction of null checks (the join-key guards on every TPC-DS fact scan) drops almost nothing.
-      def conjuncts(e: org.apache.spark.sql.catalyst.expressions.Expression)
-          : Seq[org.apache.spark.sql.catalyst.expressions.Expression] =
-        e match {
-          case org.apache.spark.sql.catalyst.expressions.And(l, r) => conjuncts(l) ++ conjuncts(r)
-          case other => Seq(other)
-        }
-      val onlyNullChecks = conjuncts(cond).forall(_.isInstanceOf[org.apache.spark.sql.catalyst.expressions.IsNotNull])
-      if (
-        compiles && !onlyNullChecks && refs.subsetOf(s.output.map(_.name).toSet) && dataRefs.nonEmpty &&
-        dataRefs.size < data.size &&
-        s.scan.relation.location.sizeInBytes >= VectorConf.scanNativeParquetLateMaterializationMinBytes(conf)
-      )
-        f.copy(child = s.copy(decodeFilter = Some(cond)))
-      else f
+  private def markDecodeFilters(plan: SparkPlan): SparkPlan = {
+    val mode = VectorConf.scanNativeParquetLateMaterializationMode(conf)
+    val auto = mode == VectorConf.LateMode.Auto
+    plan.transformUp {
+      case f @ VectorFilterExec(cond, s: VectorParquetScanExec, _) if s.decodeFilter.isEmpty && cond.deterministic =>
+        val data = s.scan.requiredSchema.fieldNames.toSet
+        val refs = cond.references.map(_.name).toSet
+        val compiles = ExpressionCompiler.compilePredicate(cond, s.output).isRight
+        val dataRefs = refs.intersect(data)
+        // A conjunction of null checks (the join-key guards on every TPC-DS fact scan) drops almost nothing.
+        def conjuncts(e: org.apache.spark.sql.catalyst.expressions.Expression)
+            : Seq[org.apache.spark.sql.catalyst.expressions.Expression] =
+          e match {
+            case org.apache.spark.sql.catalyst.expressions.And(l, r) => conjuncts(l) ++ conjuncts(r)
+            case other => Seq(other)
+          }
+        val onlyNullChecks =
+          conjuncts(cond).forall(_.isInstanceOf[org.apache.spark.sql.catalyst.expressions.IsNotNull])
+        // #962 (auto): the filter columns must be a small fraction of the projected bytes, weighted by byte
+        // width -- late materialization pays by NOT decoding the wide projected columns at the dropped rows, so
+        // it is worth attaching only when the filter reads much less (by byte width) than the projection does.
+        val projectedBytes = byteWidth(s.scan.requiredSchema)
+        val filterBytes =
+          byteWidth(org.apache.spark.sql.types.StructType(
+            s.scan.requiredSchema.fields.filter(fld => dataRefs.contains(fld.name))
+          ))
+        val bytesGate =
+          !auto || (projectedBytes > 0 &&
+            filterBytes.toDouble / projectedBytes <
+            VectorConf.scanNativeParquetLateMaterializationMaxFilterBytesFraction(conf))
+        if (
+          compiles && !onlyNullChecks && refs.subsetOf(s.output.map(_.name).toSet) && dataRefs.nonEmpty &&
+          dataRefs.size < data.size && bytesGate &&
+          s.scan.relation.location.sizeInBytes >= VectorConf.scanNativeParquetLateMaterializationMinBytes(conf)
+        )
+          f.copy(child = s.copy(decodeFilter = Some(cond), lateAuto = auto))
+        else f
+    }
+  }
+
+  /**
+   * #962: a rough per-row byte width of a projection, used only to compare the filter columns against the whole
+   * projection. Fixed-width atoms count their natural size; a string, decimal, or any nested / complex column
+   * counts heavily (they dominate the decode cost a late materialization avoids).
+   */
+  private def byteWidth(schema: org.apache.spark.sql.types.StructType): Long = {
+    import org.apache.spark.sql.types._
+    def w(dt: DataType): Long = dt match {
+      case BooleanType | ByteType => 1L
+      case ShortType => 2L
+      case IntegerType | FloatType | DateType => 4L
+      case LongType | DoubleType | TimestampType | TimestampNTZType => 8L
+      case _: DecimalType => 16L
+      case _: StringType | BinaryType => 32L // variable width, counted heavily
+      case st: StructType => math.max(16L, st.fields.map(fld => w(fld.dataType)).sum)
+      case ArrayType(e, _) => math.max(32L, 4L * w(e))
+      case MapType(k, v, _) => math.max(32L, 4L * (w(k) + w(v)))
+      case _ => 16L
+    }
+    schema.fields.map(fld => w(fld.dataType)).sum
   }
 
   /**

@@ -50,7 +50,23 @@ version may change configuration keys or defaults, always noted here.
 - JMH `ParquetWriteBenchmark` and `DeltaEncodeBenchmark`.
 - `ColumnarParquetWriter.footer()`: the footer the writer wrote, after close (#900, #901).
 
+- Native Parquet late materialization is now decided automatically per scan and per row group from filter
+  selectivity (#962). `spark.vecruntime.scan.nativeParquet.lateMaterialization` gains a new default `auto`
+  (`off`/`on`/`false`/`true` still force it off/on): at plan time the decode filter is attached only when the
+  filter columns are a small fraction of the projected bytes (byte-width weighted; ceiling
+  `auto.maxFilterBytesFraction`), and the reader then late-materializes a row group only when its estimated
+  surviving fraction (column statistics, dictionary pages for equality/IN, bloom filters, and the observed
+  selectivity of earlier row groups of the same file, with hysteresis) is at or below `auto.lateFraction`
+  (two-pass escalation below `auto.twoPassFraction`), decoding eagerly otherwise. New metrics
+  `numRowGroupsLate`, `numRowGroupsEager`, `lateSelectivityPpm`; `EXPLAIN` shows `DecodeFilter(auto|on)`. Locally
+  (4M rows) a selective wide-projection query runs ~34% faster than `off` while `auto` matches `off` on a
+  q24b-like non-selective query where the global `on` is +12% -- the regression (#901) that kept the feature off.
+
 ### Changed
+
+- `spark.vecruntime.scan.nativeParquet.lateMaterialization` default changed from `false` to `auto` (#962); the
+  key now accepts `off`/`on`/`auto` as well as the legacy `false`/`true`. `auto` keeps the eager path except
+  where a filter is selective on a wide projection, so it is safe to leave on by default.
 
 - One Spark-free `parquet` module (`vecruntime-parquet_<spark line>`, #900) replaces `parquet-writer` and takes
   the page decoders out of `kernels`: `io.vecruntime.kernels.parquet` is now `io.vecruntime.parquet.codec`, beside
