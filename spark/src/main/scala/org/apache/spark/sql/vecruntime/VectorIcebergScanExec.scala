@@ -99,6 +99,8 @@ case class VectorIcebergScanExec(
   override lazy val metrics: Map[String, SQLMetric] = Map(
     "numRuntimeFilters" -> SQLMetrics.createMetric(sparkContext, "number of runtime filters from joins"),
     "numFiles" -> SQLMetrics.createMetric(sparkContext, "number of files read"),
+    "numFilesPrunedByRuntimeFilter" ->
+      SQLMetrics.createMetric(sparkContext, "data files not opened, pruned by a join's runtime filter"),
     "numOutputRows" -> SQLMetrics.createMetric(sparkContext, "number of output rows"),
     "numOutputBatches" -> SQLMetrics.createMetric(sparkContext, "number of output batches"),
     "numRowGroups" -> SQLMetrics.createMetric(sparkContext, "number of row groups read"),
@@ -130,6 +132,15 @@ case class VectorIcebergScanExec(
     // driver before executing this side.
     val runtime = if (sqlConf.parquetFilterPushDown) runtimeFilters else Nil
     val filters = pushedFilters ++ runtime
+    // #iceberg-file-pruning: the data-file locations a join's runtime filters prove cannot match, computed on the
+    // driver from each file's Iceberg metrics (InclusiveMetricsEvaluator). Those files are dropped before the
+    // partitions are built, so they are never opened (a HEAD + footer read each avoided), instead of being opened
+    // and only their row groups skipped. Empty when pruning is off, there is no runtime filter, or none converts.
+    val runtimeDropLocations: Set[String] =
+      if (runtime.isEmpty || !io.vecruntime.spark.VectorConf.scanNativeIcebergRuntimeFilePruning(sqlConf)) Set.empty
+      else IcebergTasks.runtimeFilePruneDropSet(scan, runtime, sqlConf.caseSensitiveAnalysis).getOrElse(Set.empty)
+    // The count is exact and known on the driver (these files are never scheduled), so set the metric here.
+    if (runtimeDropLocations.nonEmpty) longMetric("numFilesPrunedByRuntimeFilter") += runtimeDropLocations.size
     // As the Parquet scan: runtime filters prune row groups by statistics only; with no static filter but null
     // checks, Parquet's dictionary and bloom checks (an object-store request per row group) are off.
     val statsOnly = runtime.nonEmpty && pushedFilters.forall(_.isInstanceOf[org.apache.spark.sql.sources.IsNotNull])
@@ -227,7 +238,7 @@ case class VectorIcebergScanExec(
     )
     val rdd = new VectorIcebergRDD(
       session.sparkContext,
-      VectorIcebergRDD.packed(scan, sqlConf, session.leafNodeDefaultParallelism),
+      VectorIcebergRDD.packed(scan, sqlConf, session.leafNodeDefaultParallelism, runtimeDropLocations),
       scan.readerFactory,
       fieldIds.toArray,
       confBroadcast,
@@ -291,7 +302,8 @@ case class VectorIcebergScanExec(
         a.dataType.asInstanceOf[StructType]
       }.orNull,
       // #901 item 6: the output schema for the Iceberg row-reader fallback's row-to-columnar conversion.
-      StructType(output.map(a => StructField(a.name, a.dataType, a.nullable)))
+      StructType(output.map(a => StructField(a.name, a.dataType, a.nullable))),
+      runtimeDropLocations
     )
     val out: RDD[ColumnarBatch] =
       if (emitSelection) rdd else rdd.mapPartitionsInternal(_.map(VectorIcebergScanExec.compacted))
@@ -374,7 +386,10 @@ private[vecruntime] final class VectorIcebergRDD(
     partitionSparkType: StructType,
     // #901 item 6: the scan's output schema (names + types, in output order), to convert an Iceberg row-reader
     // group's InternalRows into columnar batches and reorder them into output order.
-    outputSchema: StructType
+    outputSchema: StructType,
+    // #iceberg-file-pruning: data-file locations a join's runtime filters proved cannot match. A native task
+    // whose data file is in this set is dropped in `compute`, so the file is never opened. Empty: nothing pruned.
+    runtimeDropLocations: Set[String]
 ) extends RDD[ColumnarBatch](sc, Nil) {
 
   override protected def getPartitions: Array[Partition] = parts
@@ -424,15 +439,19 @@ private[vecruntime] final class VectorIcebergRDD(
         case Some(tasks) =>
           nativeGroups += 1
           tasks.foreach { t =>
-            if (needsMeta) fileMeta.getOrElseUpdate(t.location, IcebergTasks.fileMetadata(t.task, partitionType))
-            if (t.deletes.isEmpty && t.equalityDeletes.isEmpty) {
-              pending += t.file
-              pendingCount += 1
-            } else {
-              // A file with delete files: read with its row positions (and its equality columns), the deleted
-              // rows deselected (its delete files are loaded when its first batch is read).
-              flush()
-              segments += (() => deletedIterator(split.index, p, t, equalitySets, fileMeta, context))
+            // #iceberg-file-pruning: a data file a join's runtime filter proved cannot match is dropped here, so
+            // its reader is never built and the file is never opened. (The pruned-file count is set on the driver.)
+            if (!runtimeDropLocations.contains(t.location)) {
+              if (needsMeta) fileMeta.getOrElseUpdate(t.location, IcebergTasks.fileMetadata(t.task, partitionType))
+              if (t.deletes.isEmpty && t.equalityDeletes.isEmpty) {
+                pending += t.file
+                pendingCount += 1
+              } else {
+                // A file with delete files: read with its row positions (and its equality columns), the deleted
+                // rows deselected (its delete files are loaded when its first batch is read).
+                flush()
+                segments += (() => deletedIterator(split.index, p, t, equalitySets, fileMeta, context))
+              }
             }
           }
         case None =>
@@ -721,7 +740,7 @@ private[vecruntime] object VectorIcebergRDD {
    * tasks of at most `min(maxPartitionBytes, max(openCost, total / minPartitionNum))`. The scan's own partitions
    * when it reports a partitioning, when packing is off or merges nothing, or when a group's size is unknown.
    */
-  def packed(scan: BatchScanExec, conf: SQLConf, leafParallelism: Int): Array[Partition] = {
+  def packed(scan: BatchScanExec, conf: SQLConf, leafParallelism: Int, dropLocations: Set[String]): Array[Partition] = {
     val parts = scan.inputRDD.partitions
     if (
       parts.length < 2 || !io.vecruntime.spark.VectorConf.scanNativeIcebergPackSplits(conf) ||
@@ -731,7 +750,13 @@ private[vecruntime] object VectorIcebergRDD {
     val inputs = parts.map(p => shims.SparkShims.dataSourceInputPartitions(p))
     val sizes = inputs.map(_.map(IcebergTasks.groupBytes(_, openCost)))
     if (sizes.exists(_.exists(_ < 0))) return parts
-    val weights = sizes.map(_.sum)
+    // #iceberg-file-pruning: a pruned file is never opened, so it carries no weight. Discount the pruned files'
+    // bytes + open cost from each group's weight; a group left at weight 0 (every file pruned) is dropped from
+    // packing entirely. The pruned tasks themselves are skipped in `compute`, so an un-dropped partial group is
+    // still correct -- this only keeps the packing balanced and avoids scheduling an all-pruned group.
+    val weights =
+      if (dropLocations.isEmpty) sizes.map(_.sum)
+      else inputs.map(ps => ps.map(p => IcebergTasks.groupBytes(p, openCost, dropLocations)).filter(_ >= 0).sum)
     val minPartitions = conf.filesMinPartitionNum.getOrElse(leafParallelism).max(1)
     val maxSplit = math.min(conf.filesMaxPartitionBytes, math.max(openCost, weights.sum / minPartitions))
     val out = Array.newBuilder[Partition]
@@ -745,13 +770,18 @@ private[vecruntime] object VectorIcebergRDD {
       currentSize = 0L
     }
     weights.indices.sortBy(i => -weights(i)).foreach { i =>
-      if (currentSize > 0 && currentSize + weights(i) > maxSplit) close()
-      current ++= inputs(i)
-      currentSize += weights(i)
+      // An all-pruned group (weight 0) is dropped: it would open no file and schedule an empty task.
+      if (weights(i) > 0) {
+        if (currentSize > 0 && currentSize + weights(i) > maxSplit) close()
+        current ++= inputs(i)
+        currentSize += weights(i)
+      }
     }
     close()
     val packedParts = out.result()
-    if (packedParts.length == parts.length) parts else packedParts
+    // Nothing merged AND nothing pruned: keep the scan's own partitions (identity). When pruning dropped whole
+    // groups the packed list is the pruned one, even if its length matches.
+    if (packedParts.length == parts.length && dropLocations.isEmpty) parts else packedParts
   }
 
   /**
@@ -1185,6 +1215,130 @@ private[vecruntime] object IcebergTasks {
     }
 
   /**
+   * #iceberg-file-pruning: the data-file LOCATIONS that `runtimeFilters` prove cannot match, so the files are
+   * never opened. The runtime filters (a broadcast hash join's build-key min/max ranges and IN sets, #610) are
+   * built directly into ONE Iceberg `Expression` (an IN set, a range `And(>=, <=)`, equality, null checks; any
+   * other shape skipped, so pruning stays conservative). Iceberg's Spark scan strips per-file column bounds from
+   * its task `DataFile`s, so they cannot be evaluated directly; instead a FRESH table scan is planned on the
+   * driver on the SAME snapshot, with the scan's residual AND the runtime expression, asking Iceberg to KEEP
+   * column stats (`includeColumnStats`). Iceberg then applies its own `InclusiveMetricsEvaluator` over the
+   * manifests it already read and cached, yielding exactly the files that can still match -- the KEEP set.
+   * Every task file NOT in the KEEP set is dropped. A file under metrics mode `none` (no bounds) stays in the
+   * KEEP set, as the evaluator keeps it; truncated string bounds are handled by the evaluator itself.
+   *
+   * `None` when nothing is pruned -- no runtime filter converted, the snapshot has no files, or the Iceberg
+   * classes are not on the classpath -- so the caller leaves the task list untouched. Dropping a data file is
+   * always safe for its delete files (position deletes, deletion vectors and equality deletes only REMOVE rows,
+   * so a file with no matching row has no matching row after deletes either) and for v3 row lineage (`_row_id` /
+   * `_last_updated_sequence_number` are per-file, so dropping a file drops only its own rows). The re-plan is
+   * driver-side and reads only manifests (already cached from the first planning) -- it opens no data file.
+   */
+  def runtimeFilePruneDropSet(
+      scan: BatchScanExec,
+      runtimeFilters: Seq[org.apache.spark.sql.sources.Filter],
+      caseSensitive: Boolean
+  ): Option[Set[String]] = {
+    if (runtimeFilters.isEmpty) return None
+    try {
+      // The data-file locations our plan will read, and the classloader that reaches Iceberg's classes.
+      val taskLocations = scala.collection.mutable.HashSet.empty[String]
+      var loader: ClassLoader = null
+      scan.inputRDD.partitions.foreach { part =>
+        shims.SparkShims.dataSourceInputPartitions(part).foreach { p =>
+          if (p.getClass.getName == "org.apache.iceberg.spark.source.SparkInputPartition") {
+            call(call(p, "taskGroup"), "tasks").asInstanceOf[java.util.Collection[AnyRef]].asScala.foreach { task =>
+              if (task.getClass.getName.contains("FileScanTask")) {
+                if (loader == null) loader = task.getClass.getClassLoader
+                taskLocations += call(call(task, "file"), "location").toString
+              }
+            }
+          }
+        }
+      }
+      if (taskLocations.isEmpty || loader == null) return None
+      val cl = loader
+      val exprClass = Class.forName("org.apache.iceberg.expressions.Expression", false, cl)
+      val expressionsClass = Class.forName("org.apache.iceberg.expressions.Expressions", false, cl)
+      // The #610 runtime filters are v1 `org.apache.spark.sql.sources.Filter`s (Iceberg 1.12 dropped the v1
+      // `SparkFilters` converter). Build the Iceberg `Expression` DIRECTLY from the shapes #610 produces -- an IN
+      // set, a range `And(>=lo, <=hi)`, equality, null checks -- skipping any other shape (so pruning stays
+      // conservative: an unconvertible filter simply prunes nothing).
+      val andM = expressionsClass.getMethod("and", exprClass, exprClass)
+      val inM = expressionsClass.getMethod("in", classOf[String], classOf[java.lang.Iterable[_]])
+      val equalM = expressionsClass.getMethod("equal", classOf[String], classOf[Object])
+      val geM = expressionsClass.getMethod("greaterThanOrEqual", classOf[String], classOf[Object])
+      val leM = expressionsClass.getMethod("lessThanOrEqual", classOf[String], classOf[Object])
+      val notNullM = expressionsClass.getMethod("notNull", classOf[String])
+      def lit(v: Any): AnyRef = v match {
+        case us: org.apache.spark.unsafe.types.UTF8String => us.toString
+        case other => other.asInstanceOf[AnyRef]
+      }
+      import org.apache.spark.sql.sources._
+      def toIceberg(f: Filter): Option[AnyRef] = f match {
+        case In(a, vs) if vs != null && vs.nonEmpty => Some(inM.invoke(null, a, vs.toSeq.map(lit).asJava))
+        case EqualTo(a, v) if v != null => Some(equalM.invoke(null, a, lit(v)))
+        case GreaterThan(a, v) if v != null => Some(geM.invoke(null, a, lit(v))) // widen to >= (sound, keeps more)
+        case GreaterThanOrEqual(a, v) if v != null => Some(geM.invoke(null, a, lit(v)))
+        case LessThan(a, v) if v != null => Some(leM.invoke(null, a, lit(v))) // widen to <=
+        case LessThanOrEqual(a, v) if v != null => Some(leM.invoke(null, a, lit(v)))
+        case IsNotNull(a) => Some(notNullM.invoke(null, a))
+        case And(l, r) => for (x <- toIceberg(l); y <- toIceberg(r)) yield andM.invoke(null, x, y)
+        case _ => None
+      }
+      val exprs = runtimeFilters.flatMap(toIceberg)
+      if (exprs.isEmpty) return None
+      val runtimeExpr = exprs.reduceLeft((a, b) => andM.invoke(null, a, b))
+
+      // Iceberg's Spark scan STRIPS per-file column bounds from its task `DataFile`s (they keep only the record
+      // count), so `task.file()` cannot be evaluated directly. Re-plan on the driver instead: a fresh table scan
+      // on the SAME snapshot, with the scan's residual AND the runtime expression, asking Iceberg to KEEP column
+      // stats -- Iceberg then applies its own `InclusiveMetricsEvaluator` over the manifests (which it already
+      // read and cached when it first planned) and yields exactly the files that can still match. This opens no
+      // data file. The KEEP set is those files; our task files NOT in it are pruned.
+      val sparkScan = scan.scan // Iceberg's SparkBatchQueryScan
+      val table = call(sparkScan, "table")
+      val residual = call(sparkScan, "filter") // the scan's already-applied residual expression
+      val fullExpr = if (residual == null) runtimeExpr else andM.invoke(null, residual, runtimeExpr)
+      val tableScan0 = table.getClass.getMethod("newScan").invoke(table)
+      val tableScanClass = Class.forName("org.apache.iceberg.TableScan", false, cl)
+      val snapshotId = call(sparkScan, "snapshotId").asInstanceOf[java.lang.Long]
+      val onSnapshot =
+        if (snapshotId == null) tableScan0
+        else tableScanClass.getMethod("useSnapshot", java.lang.Long.TYPE).invoke(tableScan0, snapshotId)
+      val scanClass = Class.forName("org.apache.iceberg.Scan", false, cl)
+      val caseSens =
+        scanClass.getMethod("caseSensitive", java.lang.Boolean.TYPE)
+          .invoke(onSnapshot, java.lang.Boolean.valueOf(caseSensitive))
+      val filtered = scanClass.getMethod("filter", exprClass).invoke(caseSens, fullExpr)
+      val withStats = scanClass.getMethod("includeColumnStats").invoke(filtered)
+      val plan = scanClass.getMethod("planFiles").invoke(withStats)
+      val keep = scala.collection.mutable.HashSet.empty[String]
+      val closeable = plan.asInstanceOf[java.lang.Iterable[AnyRef]]
+      val it = closeable.iterator()
+      try {
+        while (it.hasNext) {
+          val task = it.next()
+          if (task.getClass.getName.contains("FileScanTask"))
+            keep += call(call(task, "file"), "location").toString
+        }
+      } finally plan match {
+          case c: java.io.Closeable => c.close()
+          case _ =>
+        }
+      // Drop any file our plan holds that the re-plan with the runtime filter did NOT keep.
+      val drop = taskLocations.diff(keep)
+      if (drop.isEmpty) None else Some(drop.toSet)
+    } catch {
+      // Any Iceberg-API mismatch, a non-convertible shape, or the classes being absent: prune nothing (correct,
+      // just not optimised). Never let pruning change results or fail the scan.
+      case _: ReflectiveOperationException | _: ClassNotFoundException | _: NoClassDefFoundError => None
+    }
+  }
+
+  /** The data-file location of one native `FileScanTask` (for pruning), via reflection. */
+  def taskFileLocation(task: AnyRef): String = call(call(task, "file"), "location").toString
+
+  /**
    * #20 M3a: the per-file constants of the three v3 merge-on-read metadata columns, for the data file of one
    * native task: the `_partition` struct as a Spark `InternalRow` (Iceberg's `PartitionUtil.constantsMap`
    * converted with `SparkUtil.internalToSpark`, keyed by `PARTITION_COLUMN_ID`), the file's `firstRowId` (null
@@ -1247,6 +1401,27 @@ private[vecruntime] object IcebergTasks {
       val files = call(group, "filesCount").asInstanceOf[java.lang.Integer].intValue()
       bytes + files.toLong * openCost
     }
+
+  /**
+   * #iceberg-file-pruning: as [[groupBytes]] but discounting files whose location is in `dropLocations` (pruned,
+   * never opened), so a group packs at only the weight of the files that are actually read. Walks the group's
+   * `FileScanTask`s to sum each surviving data file's size + `openCost`; `-1` when `p` is not an Iceberg input
+   * partition. `0` when every file is pruned.
+   */
+  def groupBytes(p: InputPartition, openCost: Long, dropLocations: Set[String]): Long = {
+    if (p.getClass.getName != "org.apache.iceberg.spark.source.SparkInputPartition") return -1L
+    if (dropLocations.isEmpty) return groupBytes(p, openCost)
+    val tasks = call(call(p, "taskGroup"), "tasks").asInstanceOf[java.util.Collection[AnyRef]].asScala
+    var total = 0L
+    tasks.foreach { task =>
+      if (!task.getClass.getName.contains("FileScanTask")) return groupBytes(p, openCost) // not a pure data group
+      val file = call(task, "file")
+      if (!dropLocations.contains(call(file, "location").toString)) {
+        total += call(task, "length").asInstanceOf[java.lang.Long].longValue() + openCost
+      }
+    }
+    total
+  }
 
   /** Iceberg's own `BaseDeleteLoader`, opening delete files through the partition's `FileIO`, and its class. */
   private def deleteLoader(p: InputPartition): (Class[_], AnyRef) = {
