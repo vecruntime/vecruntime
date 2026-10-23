@@ -139,18 +139,21 @@ import scala.collection.mutable
  *
  * `RANGE` frames with value offsets (layer 2d, `RANGE BETWEEN 5 PRECEDING AND CURRENT ROW`, `1 FOLLOWING
  * AND 3 FOLLOWING`, an unbounded side with an offset on the other): the same five aggregates over one
- * integral or date order key, computed per partition by `WindowFrameKernels` once the partition is held --
- * the keys and the input gathered into primitive arrays reused across partitions, the frame of every row
- * found by Spark's two-pointer walk (`rangeBounds`: the bound is the key plus the offset in the key's own
- * arithmetic, compared in the `SortOrder`'s direction and null ordering, so a null key's frame is the null
+ * integral, `date` or `decimal(p <= 18)` order key, computed per partition by `WindowFrameKernels` once
+ * the partition is held -- the keys and the input gathered into primitive arrays reused across partitions,
+ * the frame of every row found by Spark's two-pointer walk (`rangeBounds`: the bound is the key plus the
+ * offset in the key's own arithmetic -- a decimal key rides the INT64 lane as its unscaled long and its
+ * offset carries the same scale, so the long add is Spark's `DecimalAddNoOverflowCheck` and never wraps or
+ * raises -- compared in the `SortOrder`'s direction and null ordering, so a null key's frame is the null
  * peer group), and the aggregate re-run in row order per frame as Spark's `SlidingWindowFunctionFrame`
  * does (a frame whose lower bound has not moved continues the previous accumulation; counts and unchecked
  * bigint sums slide). The peer-bounded `RANGE` frames without an offset (`CURRENT ROW AND UNBOUNDED
  * FOLLOWING`, `CURRENT ROW AND CURRENT ROW`) take the row path over any key type.
  *
  * `IGNORE NULLS`, decimal aggregates (#28), the other aggregate functions over sliding frames, `RANGE`
- * offsets over decimal, timestamp (interval) and string keys, and `min`/`max` over strings in such a frame
- * are refused with a reason naming the function and frame.
+ * offsets over a timestamp (interval) or string order key, a wide decimal (DECIMAL128) key whose 128-bit
+ * value the 64-bit `rangeBounds` walk cannot compare, and `min`/`max` over strings in such a frame are
+ * refused with a reason naming the function and frame.
  */
 case class VectorWindowExec(
     windowExpression: Seq[NamedExpression],
@@ -491,14 +494,26 @@ object VectorWindowPlanner {
     case ShortType => Some(16)
     case IntegerType | DateType => Some(32)
     case LongType => Some(64)
+    // A decimal(p <= 18) order key rides the INT64 lane as its unscaled long, exactly as Spark's own
+    // WritableColumnVector stores it, and both the key and the frame offset carry the same scale
+    // (WindowFrameCoercion casts the bound to the order key's type). Spark's bound is
+    // `DecimalAddNoOverflowCheck(key, offset, d)`: plain BigDecimal addition of two scale-s values, no
+    // overflow check -- so unscaled `key + offset` in 64-bit arithmetic is the same value, and it never
+    // wraps (|unscaled| < 10^18, so the sum is below 2^63). The comparison is Decimal order, which at a
+    // shared scale is the order of the unscaled longs. A wider decimal has a lane (DECIMAL128, two
+    // limbs) but the RANGE two-pointer walk compares a single `long[]` and adds the bound in 64-bit
+    // arithmetic, so a 128-bit key would need a wider `rangeBounds` -- deferred to a later slice. (#980)
+    case d: SparkDecimalType if d.precision <= TypeMapping.MAX_DECIMAL_PRECISION => Some(64)
     case _ => None
   }
 
   /**
    * The [[RangeSpec]] of a `RANGE` frame with at least one value offset, or why it is not computed: the
-   * order key must be one integral or date column (Spark itself rejects several order keys here) and
-   * each offset a foldable value of the key's type -- an int for a date key, as `DateAdd` takes;
-   * interval offsets over date and timestamp keys and decimal keys are refused.
+   * order key must be one integral, `date`, or `decimal(p <= 18)` column (Spark itself rejects several
+   * order keys here) and each offset a foldable value of the key's type -- an int for a date key, as
+   * `DateAdd` takes; a `decimal(p, s)` of the key's own scale for a decimal key, read as its unscaled
+   * long (#980). Interval offsets over date and timestamp keys, and wide decimal keys (DECIMAL128, whose
+   * 128-bit value the 64-bit bound walk cannot compare), are refused.
    */
   private def rangeSpec(
       name: String,
@@ -516,11 +531,14 @@ object VectorWindowPlanner {
     val bits = rangeKeyBits(keyType) match {
       case Some(b) => b
       case None => return Left(
-          s"window aggregate $name over frame ${frame.sql}: RANGE offsets over a ${keyType.simpleString} order key not supported (integral and date keys are)"
+          s"window aggregate $name over frame ${frame.sql}: RANGE offsets over a ${keyType.simpleString} order key not supported (integral, date and decimal(p<=18) keys are)"
         )
     }
     val descending = order.direction == org.apache.spark.sql.catalyst.expressions.Descending
-    // Spark's WindowFrameCoercion cast the offsets to the key's type; a date key keeps an int offset (DateAdd).
+    val decimalKey = keyType.isInstanceOf[SparkDecimalType]
+    // Spark's WindowFrameCoercion cast the offsets to the key's type; a date key keeps an int offset (DateAdd),
+    // and a decimal key a decimal offset of the key's own (p, s) -- read as its unscaled long, the same scale
+    // as the key, so unscaled `key + offset` is the scaled addition DecimalAddNoOverflowCheck computes (#980).
     def offset(b: Expression): Either[String, Option[Long]] = b match {
       case UnboundedPreceding | UnboundedFollowingBound => Right(None)
       case CurrentRow => Right(Some(0L))
@@ -528,6 +546,9 @@ object VectorWindowPlanner {
           if other.foldable && (other.dataType == keyType || (keyType == DateType && other.dataType == IntegerType)) =>
         other.eval(EmptyRow) match {
           case null => Left(s"window aggregate $name over frame ${frame.sql}: a null RANGE offset")
+          case d: org.apache.spark.sql.types.Decimal =>
+            val signed = if (descending) -d.toUnscaledLong else d.toUnscaledLong // Spark's UnaryMinus under DESC
+            Right(Some(signed))
           case v: java.lang.Number =>
             val signed = if (descending) -v.longValue() else v.longValue() // Spark's UnaryMinus under DESC
             Right(Some(signed))
@@ -545,8 +566,9 @@ object VectorWindowPlanner {
       keyBits = bits,
       descending = descending,
       nullsFirst = order.nullOrdering == org.apache.spark.sql.catalyst.expressions.NullsFirst,
-      // Add in the key's type raises under ANSI; DateAdd never does.
-      checked = keyType != DateType && org.apache.spark.sql.internal.SQLConf.get.ansiEnabled
+      // Add in the key's type raises under ANSI; DateAdd never does, and a decimal key's bound is
+      // DecimalAddNoOverflowCheck, which never raises either (so it is unchecked regardless of ANSI).
+      checked = keyType != DateType && !decimalKey && org.apache.spark.sql.internal.SQLConf.get.ansiEnabled
     )
   }
 

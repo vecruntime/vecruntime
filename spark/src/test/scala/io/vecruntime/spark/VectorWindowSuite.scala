@@ -384,12 +384,7 @@ class VectorWindowSuite extends VectorQuerySuite {
     withConf("spark.sql.ansi.enabled" -> "false") {
       checkWindow(overflowingSum, Seq[Class[_ <: org.apache.spark.sql.execution.SparkPlan]](classOf[VectorFilterExec]))
     }
-    // Refused with a reason: a decimal order key, a string input to min/max, a timestamp key with an interval offset.
-    checkFallback(
-      "SELECT i, sum(l) OVER (PARTITION BY s ORDER BY cast(i AS decimal(12,2)) RANGE BETWEEN 5 PRECEDING AND CURRENT ROW) AS moving FROM t",
-      Seq(Window),
-      "RANGE offsets over a decimal(12,2) order key not supported"
-    )
+    // Refused with a reason: a string input to min/max, a timestamp key with an interval offset.
     checkFallback(
       "SELECT i, max(s) OVER (PARTITION BY b ORDER BY i RANGE BETWEEN 5 PRECEDING AND CURRENT ROW) AS m FROM t",
       Seq(Window),
@@ -399,6 +394,42 @@ class VectorWindowSuite extends VectorQuerySuite {
       "SELECT i, sum(l) OVER (PARTITION BY s ORDER BY cast(dt AS timestamp) RANGE BETWEEN INTERVAL 5 DAYS PRECEDING AND CURRENT ROW) AS moving FROM t",
       Seq(Window),
       "RANGE offsets over a timestamp order key not supported"
+    )
+  }
+
+  test("RANGE value offsets over a decimal order key equal Spark (#980 slice A)") {
+    // A decimal(p <= 18) order key rides the INT64 lane as its unscaled long; its frame offset carries the
+    // same scale (WindowFrameCoercion) and Spark's bound is DecimalAddNoOverflowCheck -- so the kernel's
+    // 64-bit `key + offset` matches bit for bit. Fractional offsets (the scale is real, not a widened int),
+    // preceding-only / following-only / both-sided frames, nulls in the key (a null partition s, nullif).
+    checkWindow(
+      "SELECT i, l, sum(l) OVER (PARTITION BY s ORDER BY cast(i % 100 AS decimal(12,2)) RANGE BETWEEN 5.50 PRECEDING AND CURRENT ROW) AS moving, count(*) OVER (PARTITION BY s ORDER BY cast(i % 100 AS decimal(12,2)) RANGE BETWEEN 5.50 PRECEDING AND CURRENT ROW) AS n, count(l) OVER (PARTITION BY s ORDER BY cast(i % 100 AS decimal(12,2)) RANGE BETWEEN 3.00 PRECEDING AND 3.00 FOLLOWING) AS nn FROM t"
+    )
+    // FOLLOWING-only and PRECEDING-only frames (empty near the ends), avg and min/max over the decimal key.
+    checkWindow(
+      "SELECT i, sum(l) OVER (PARTITION BY s ORDER BY cast(i % 100 AS decimal(10,1)) RANGE BETWEEN 1.0 FOLLOWING AND 3.0 FOLLOWING) AS ahead, avg(i) OVER (PARTITION BY s ORDER BY cast(i % 100 AS decimal(10,1)) RANGE BETWEEN 10.0 PRECEDING AND 5.0 PRECEDING) AS behind, min(l) OVER (PARTITION BY s ORDER BY cast(i % 100 AS decimal(10,1)) RANGE BETWEEN 2.0 PRECEDING AND 2.0 FOLLOWING) AS lo, max(i) OVER (PARTITION BY s ORDER BY cast(i % 100 AS decimal(10,1)) RANGE BETWEEN 2.0 PRECEDING AND 2.0 FOLLOWING) AS hi FROM t"
+    )
+    // DESC over a decimal key with nulls (NULLS LAST default, then NULLS FIRST): a null key's frame is the null peer group.
+    checkWindow(
+      "SELECT i, l, sum(i) OVER (PARTITION BY i % 7 ORDER BY cast(nullif(l % 97, 0) AS decimal(14,3)) DESC RANGE BETWEEN 6.000 PRECEDING AND 3.000 FOLLOWING) AS moving, count(*) OVER (PARTITION BY i % 7 ORDER BY cast(nullif(l % 97, 0) AS decimal(14,3)) ASC NULLS FIRST RANGE BETWEEN 6.000 PRECEDING AND 3.000 FOLLOWING) AS n FROM t"
+    )
+    // An unbounded side with an offset on the other, and the peer-only RANGE frames over a decimal key.
+    checkWindow(
+      "SELECT i, sum(l) OVER (PARTITION BY s ORDER BY cast(i % 100 AS decimal(12,2)) RANGE BETWEEN UNBOUNDED PRECEDING AND 6.00 FOLLOWING) AS ahead, sum(i) OVER (PARTITION BY s ORDER BY cast(i % 100 AS decimal(12,2)) RANGE BETWEEN 6.00 PRECEDING AND UNBOUNDED FOLLOWING) AS behind FROM t"
+    )
+    // A partition of 20000 rows across several held batches, a decimal key with many ties (i % 5000).
+    checkWindow(
+      "SELECT i, sum(l) OVER (ORDER BY cast(i % 5000 AS decimal(12,2)) RANGE BETWEEN 100.00 PRECEDING AND 100.00 FOLLOWING) AS wide FROM t"
+    )
+    // decimal(18, s) -- the widest precision on the long lane -- beside a ROWS frame, a running frame and a rank in one operator.
+    checkWindow(
+      "SELECT i, sum(l) OVER (PARTITION BY s ORDER BY cast(i % 100 AS decimal(18,4)) RANGE BETWEEN 5.0000 PRECEDING AND CURRENT ROW) AS moving, sum(l) OVER (PARTITION BY s ORDER BY cast(i % 100 AS decimal(18,4)) ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS rows3, rank() OVER (PARTITION BY s ORDER BY cast(i % 100 AS decimal(18,4))) AS rk FROM t"
+    )
+    // A wide decimal key (precision > 18, DECIMAL128) has a lane but the 64-bit bound walk cannot compare it: refused.
+    checkFallback(
+      "SELECT i, sum(l) OVER (PARTITION BY s ORDER BY cast(i % 100 AS decimal(28,2)) RANGE BETWEEN 5.00 PRECEDING AND CURRENT ROW) AS moving FROM t",
+      Seq(Window),
+      "RANGE offsets over a decimal(28,2) order key not supported"
     )
   }
 
