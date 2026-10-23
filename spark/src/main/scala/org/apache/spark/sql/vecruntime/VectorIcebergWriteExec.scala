@@ -55,6 +55,7 @@ case class VectorIcebergWriteStrategy(session: SparkSession) extends SparkStrate
     case o: OverwriteByExpression => take(plan, o.table, o.query, o.write, None)
     case o: OverwritePartitionsDynamic => take(plan, o.table, o.query, o.write, None)
     case r: ReplaceData =>
+      val conf = session.sessionState.conf
       // The write's columns, in the order of Iceberg's write schema: the row's data columns from the row
       // projection and, on a format v3 table, the row lineage the copied rows keep (_row_id and
       // _last_updated_sequence_number, which Iceberg appends to the write schema) from the metadata projection.
@@ -75,7 +76,21 @@ case class VectorIcebergWriteStrategy(session: SparkSession) extends SparkStrate
           if (ordinals.exists(_.isEmpty)) {
             declined(s"write column ${names(ordinals.indexWhere(_.isEmpty))} is in neither projection")
           } else {
-            take(plan, r.table, r.query, r.write, Some(ordinals.map(_.get)), r.originalTable)
+            // #901 M4a: a copy-on-write DELETE (no row data changes, just rows dropped) copies the row groups
+            // it does not touch, when the flag is on and the scan projects _file / _pos (Iceberg's
+            // copy-on-write scan does). Partitioned and unpartitioned both work -- a rewritten file keeps its
+            // source file's partition. An UPDATE or MERGE rewrites values and is not eligible.
+            val copy =
+              if (
+                VectorConf.icebergCopyUnchangedEnabled(conf) &&
+                VectorIcebergWriteStrategy.isDelete(r)
+              ) {
+                (ordinal("_file"), ordinal("_pos")) match {
+                  case (Some(f), Some(p)) => Some((f, p))
+                  case _ => None
+                }
+              } else None
+            take(plan, r.table, r.query, r.write, Some(ordinals.map(_.get)), r.originalTable, copy)
           }
         case _ => take(plan, r.table, r.query, r.write, None, r.originalTable)
       }
@@ -95,7 +110,8 @@ case class VectorIcebergWriteStrategy(session: SparkSession) extends SparkStrate
       query: LogicalPlan,
       write: Option[Write],
       ordinals: Option[Array[Int]],
-      original: LogicalPlan = null
+      original: LogicalPlan = null,
+      copy: Option[(Int, Int)] = None
   ): Seq[SparkPlan] = {
     val conf = session.sessionState.conf
     val reason =
@@ -108,14 +124,30 @@ case class VectorIcebergWriteStrategy(session: SparkSession) extends SparkStrate
       case Some(r) => declined(r)
       case None =>
         val rowOrdinals = ordinals.getOrElse(query.output.indices.toArray)
+        // #901 M4a: for the copy path, cluster the input by _file with a plain hash partitioning
+        // (RepartitionByExpression -> ShuffleExchange hashpartitioning(_file), ENSURE_REQUIREMENTS). This
+        // replaces Iceberg's REBALANCE_PARTITIONS_BY_COL distribution: a plain hash exchange sends every row
+        // of a file to one reducer and is never split by AQE's OptimizeSkewInRebalancePartitions (which only
+        // touches REBALANCE exchanges), so a source file is whole in one task and its row groups can be copied.
+        val child = copy match {
+          case Some((fileOrd, _)) =>
+            org.apache.spark.sql.catalyst.plans.logical.RepartitionByExpression(
+              Seq(query.output(fileOrd)),
+              query,
+              None
+            )
+          case None => query
+        }
         Seq(
           VectorIcebergWriteExec(
             write.get,
             IcebergWriteBridge.specOf(write.get),
             rowOrdinals,
-            planLater(query),
+            planLater(child),
             VectorIcebergWriteStrategy.refreshCache(session, Option(original).getOrElse(table)),
-            plan.nodeName
+            plan.nodeName,
+            copy.map(_._1).getOrElse(-1),
+            copy.map(_._2).getOrElse(-1)
           )
         )
     }
@@ -142,6 +174,16 @@ object VectorIcebergWriteStrategy {
       case other => cacheManager.recacheByPlan(classic, other)
     }
   }
+
+  /**
+   * Whether a `ReplaceData` is a copy-on-write DELETE (as opposed to UPDATE or MERGE): every output row is an
+   * unchanged copy of a surviving source row, so a delete-free row group is byte-identical and can be copied.
+   * An UPDATE or MERGE rewrites column values, so a "delete-free" group can still hold changed rows and must not
+   * be copied. Read from the operation's command (`RowLevelOperation.Command.DELETE`).
+   */
+  def isDelete(r: ReplaceData): Boolean =
+    try r.operation.command() == org.apache.spark.sql.connector.write.RowLevelOperation.Command.DELETE
+    catch { case _: Throwable => false }
 }
 
 /**
@@ -163,7 +205,9 @@ case class VectorIcebergWriteExec(
     rowOrdinals: Array[Int],
     query: SparkPlan,
     refreshCache: () => Unit,
-    operation: String
+    operation: String,
+    fileOrdinal: Int = -1,
+    posOrdinal: Int = -1
 ) extends V2CommandExec
     with AdaptiveSparkPlanHelper
     with Logging {
@@ -177,7 +221,11 @@ case class VectorIcebergWriteExec(
     "rowInput" -> org.apache.spark.sql.execution.metric.SQLMetrics.createMetric(sparkContext, "child read as rows")
   )
 
-  override def simpleString(maxFields: Int): String = s"VectorIcebergWriteExec $operation"
+  /** Whether this write copies the delete-free row groups of the files it rewrites (#901 M4a). */
+  private def copyUnchanged: Boolean = fileOrdinal >= 0 && posOrdinal >= 0
+
+  override def simpleString(maxFields: Int): String =
+    s"VectorIcebergWriteExec $operation${if (copyUnchanged) " (copy-unchanged)" else ""}"
 
   override protected def run(): Seq[InternalRow] = {
     val batchWrite = write.toBatch
@@ -189,11 +237,33 @@ case class VectorIcebergWriteExec(
       session.sparkContext.broadcast(new SerializableConfiguration(session.sessionState.newHadoopConf()))
     val taskSpec = session.sparkContext.broadcast(spec)
     val ordinals = rowOrdinals
+    val fileOrd = fileOrdinal
+    val posOrd = posOrdinal
+    // #901 M4a safe by construction: copy only when the input is clustered by _file (a HashPartitioning on
+    // exactly the _file attribute, after AQE). Our strategy wraps the copy child in RepartitionByExpression
+    // (_file) so this holds; if for any reason it does not (AQE changed it, a plan we did not expect), fall
+    // back to the streaming full rewrite rather than risk a split file.
+    val copy = copyUnchanged && VectorIcebergWriteExec.clusteredByFile(query, fileOrd)
+    if (copyUnchanged && !copy) {
+      logInfo("vecruntime: M4a copy-unchanged declined -- input is not clustered by _file; full rewrite")
+    }
     val messages = new mutable.ArrayBuffer[WriterCommitMessage]()
     try {
       messages ++= nonEmpty
         .mapPartitions { batches =>
-          Iterator.single(VectorIcebergWriteExec.writeTask(taskSpec.value, hadoopConf.value.value, ordinals, batches))
+          Iterator.single(
+            if (copy)
+              VectorIcebergWriteExec.rewriteTask(
+                taskSpec.value,
+                hadoopConf.value.value,
+                ordinals,
+                fileOrd,
+                posOrd,
+                batches
+              )
+            else
+              VectorIcebergWriteExec.writeTask(taskSpec.value, hadoopConf.value.value, ordinals, batches)
+          )
         }
         .collect()
       writeSummary(query) match {
@@ -258,6 +328,47 @@ object VectorIcebergWriteExec extends Logging {
     }
   }
 
+  /**
+   * Whether the resolved child's output is clustered by exactly the `_file` attribute at ordinal
+   * `fileOrdinal` -- a `HashPartitioning` on that one attribute (#901 M4a). This is the safe-by-construction
+   * gate for the copy path: a plain hash partitioning sends every row of a file to one task and is never
+   * split by AQE skew handling, so a source file is whole in one task. Resolved through the adaptive final
+   * plan and below the row transition, the same place [[columnar]] reads the batches.
+   */
+  def clusteredByFile(query: SparkPlan, fileOrdinal: Int): Boolean = {
+    import org.apache.spark.sql.catalyst.expressions.AttributeSet
+    import org.apache.spark.sql.catalyst.plans.physical.{HashPartitioningLike, RangePartitioning}
+    val plan = query match {
+      case a: AdaptiveSparkPlanExec => a.finalPhysicalPlan
+      case p => p
+    }
+    val child = plan match {
+      case t: ColumnarToRowTransition => t.child
+      case w: org.apache.spark.sql.execution.WholeStageCodegenExec
+          if w.child.isInstanceOf[ColumnarToRowTransition] => w.child.children.head
+      case p => p
+    }
+    if (fileOrdinal < 0 || fileOrdinal >= child.output.length) return false
+    val fileAttr = child.output(fileOrdinal)
+    val fileSet = AttributeSet(fileAttr)
+    // Clustered by exactly _file: a hash (or range) partitioning whose expressions reference only _file. A
+    // plain hash partitioning sends every row of a file to one reducer and is never split by AQE skew
+    // handling (that only rewrites REBALANCE exchanges), so a source file is whole in one task.
+    def onlyFile(exprs: Seq[org.apache.spark.sql.catalyst.expressions.Expression]): Boolean =
+      exprs.nonEmpty && exprs.forall(e => e.references.nonEmpty && e.references.subsetOf(fileSet))
+    val ok = child.outputPartitioning match {
+      case h: HashPartitioningLike => onlyFile(h.expressions)
+      case r: RangePartitioning => onlyFile(r.ordering.map(_.child))
+      case _ => false
+    }
+    if (!ok) {
+      logInfo(
+        s"vecruntime: M4a clustering check -- outputPartitioning ${child.outputPartitioning.getClass.getSimpleName} of ${child.nodeName} is not a single-_file hash"
+      )
+    }
+    ok
+  }
+
   /** One task: its batches through the bridge's task writer; Iceberg's commit message for the files. */
   def writeTask(
       spec: AnyRef,
@@ -278,6 +389,57 @@ object VectorIcebergWriteExec extends Logging {
       }
       val files = writer.dataFiles()
       // Spark's output metrics (UI, listeners), as its DataWritingSparkTask reports them for a v2 write.
+      val (records, bytes) = IcebergWriteBridge.fileTotals(files)
+      val out = ctx.taskMetrics().outputMetrics
+      out.setRecordsWritten(out.recordsWritten + records)
+      out.setBytesWritten(out.bytesWritten + bytes)
+      IcebergWriteBridge.taskCommit(files)
+    } catch {
+      case t: Throwable =>
+        writer.abort(t)
+        throw t
+    }
+  }
+
+  /**
+   * One task of a copy-on-write DELETE rewritten with row-group copies (#901 M4a). The batch's data columns
+   * (at `ordinals`) and its `_file` / `_pos` columns are handed to the bridge's rewrite task writer, which
+   * buffers by source file and, on close, copies the delete-free row groups of each file and re-encodes the
+   * rest. Returns Iceberg's own commit message for the new data files.
+   */
+  def rewriteTask(
+      spec: AnyRef,
+      conf: org.apache.hadoop.conf.Configuration,
+      ordinals: Array[Int],
+      fileOrdinal: Int,
+      posOrdinal: Int,
+      batches: Iterator[ColumnarBatch]
+  ): WriterCommitMessage = {
+    val ctx = TaskContext.get()
+    // Dense column list per batch: the data columns, then _file, then _pos. The writer reads data at
+    // [0, ordinals.length), _file at ordinals.length, _pos at ordinals.length + 1.
+    val all = ordinals :+ fileOrdinal :+ posOrdinal
+    val dataIdx = ordinals.indices.toArray
+    val writer =
+      IcebergWriteBridge.createRewriteTaskWriter(
+        spec,
+        ctx.partitionId(),
+        ctx.taskAttemptId(),
+        conf,
+        ordinals.length,
+        ordinals.length + 1,
+        dataIdx
+      )
+    try {
+      while (batches.hasNext) {
+        val batch = batches.next()
+        val arena = Arena.ofConfined()
+        try {
+          val (cols, n) = VectorWriteTask2.columns(batch, all, arena)
+          writer.write(java.util.Arrays.asList(cols: _*), 0, n)
+        } finally arena.close()
+      }
+      val files = writer.dataFiles()
       val (records, bytes) = IcebergWriteBridge.fileTotals(files)
       val out = ctx.taskMetrics().outputMetrics
       out.setRecordsWritten(out.recordsWritten + records)

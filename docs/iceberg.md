@@ -316,6 +316,72 @@ The partitioned (hash) append, the read A/B for #920, and a CDC `MERGE` A/B for 
   when a null row is read, and the copy path's bulk getters read every row. The 1 TB partitioned run hit it on
   `ss_store_sk`. Fixed on #919, and separately for `main`.
 
+## The write side: partial columnar merge -- copy unchanged row groups (#901 M4)
+
+A copy-on-write `DELETE` / `UPDATE` / `MERGE` rewrites a whole data file today: every row group is decoded,
+filtered and re-encoded through the columnar writer, even the groups the change never touches. M4 copies the
+bytes that do not change and encodes only the rest. **M4a** is the first step: in a copy-on-write `DELETE`, a row
+group with no deleted rows is copied byte for byte into the new file; only a group with at least one deleted row
+is decoded, filtered and re-encoded.
+
+The primitive is on the writer. `ColumnarParquetWriter` sits on parquet-java's `ParquetFileWriter`, whose
+`appendRowGroup(SeekableInputStream, BlockMetaData, dropColumnIndexes=false)` (parquet-java 1.16) copies a
+group's compressed pages without decoding them, each chunk keeping its codec, statistics, column index, offset
+index and Bloom filter:
+
+- `copyRowGroup(source, block)` flushes the open (re-encoded) group, then appends the source group's bytes, so
+  copied and re-encoded groups keep their order and stay separate;
+- `endRowGroup()` cuts a boundary so a run of re-encoded surviving rows is closed before a copied group follows;
+- `copyableFrom(fileSchema)` is the schema guard: a group is copyable only when the source file's Parquet schema
+  matches the write schema -- same columns, order, physical and logical types and field ids. Requiredness
+  (`REQUIRED` vs `OPTIONAL`) is allowed to differ and is taken from the source: Iceberg's own writer marks an
+  always-non-null column `REQUIRED` in the file it writes, while the copy-on-write write schema (converted from
+  the Spark DELETE projection) marks every column `OPTIONAL`, and that difference alone must not force a full
+  rewrite. The copied file is written with the **source file's own schema** (`IcebergParquetAppender.create`
+  takes an explicit output `MessageType`), so a copied group's pages are valid under the footer and a re-encoded
+  group in the same file uses the same schema. Any other difference (a renamed, added, dropped, reordered or
+  promoted column, or a different field id, after schema evolution) is not copyable, and the file is rewritten
+  the normal way.
+
+Because a copied group's chunk statistics reach the writer's `footer()` unchanged, the file's Iceberg metrics are
+combined from the copied groups' footer statistics and the re-encoded groups' metrics by the same
+`ParquetUtil.footerMetrics` path the full rewrite uses, honouring `write.metadata.metrics.*` and bound
+truncation. NaN counts a footer does not carry are the one metric a copy cannot supply: when the table tracks NaN
+counts for a float or double column, a file that would need them derived from copied groups must fall back to the
+full rewrite rather than report wrong metrics. v3 row lineage (`_row_id` / `_last_updated_sequence_number`) is a
+second reason to fall back: a source written by an ordinary append materialises no lineage (its `_row_id` is
+inherited from the data file's `first_row_id` plus the row position), and a copy-on-write `DELETE` must preserve
+each surviving row's original `_row_id`. Copying or re-encoding into a new file would re-inherit lineage from the
+new file's `first_row_id` and new positions, changing `_row_id` once deletions shift the rows. So a v3 source
+that does not already store lineage is not copyable and takes the full rewrite, which writes each surviving row's
+original `_row_id` explicitly -- exactly as Iceberg's own copy-on-write rewrite does.
+
+A DELETE touching one row group of eight (2000 rows each) rewrote in 7.7 ms with M4a against 14.5 ms for the full
+rewrite in a local smoke run -- the shape the cluster A/B (a copy-on-write `DELETE` of 0.1% / 1% / 10% of the
+rows) will measure at 1 TB. The primitive and its guards are covered by `RowGroupCopyTest` in the `parquet`
+module (0, some and all groups copied; rows and order equal; copied statistics, encodings and byte sizes equal
+the source; schema-evolved files reported not copyable; the full-rewrite-vs-copy smoke).
+
+The per-file rewrite operator is wired behind `spark.vecruntime.iceberg.copyUnchanged.enabled` (default **on**).
+For a copy-on-write `DELETE` on a partitioned or unpartitioned table, `VectorIcebergWriteStrategy` recognises the
+`ReplaceData` (its `RowLevelOperation.Command` is `DELETE`, so every output row is an unchanged copy of a
+surviving row -- an `UPDATE` or `MERGE` rewrites values and is not eligible), passes the `_file` / `_pos`
+ordinals Iceberg's copy-on-write scan already projects, and wraps the copy child in a
+`RepartitionByExpression(_file)` -- a plain `hashpartitioning(_file)` exchange that replaces Iceberg's
+`REBALANCE_PARTITIONS_BY_COL` distribution, so a source file's rows all land in one task and AQE's skew handling
+(which rewrites only REBALANCE exchanges) never splits a file. The executor runs `IcebergRewriteFileTaskWriter`:
+it buffers the surviving rows per source file, reads each source footer, asks `RowGroupCopyPlanner` which groups
+to copy / re-encode / skip, and emits the new file through `IcebergParquetAppender` so the metrics are the
+combined footer's. A runtime guard (`clusteredByFile`, accepting `HashPartitioningLike` including AQE's
+`CoalescedHashPartitioning`) checks the input really is clustered by `_file` before copying; if not, or if a
+`_pos` repeats or is out of range for the file, the task falls back to the streaming full rewrite of whatever
+rows it holds (correct data, no byte copy). `RowGroupCopyPlanner` is covered by `RowGroupCopyPlannerSuite` (0 /
+some / all groups, group ranges, schema-evolution and NaN-metrics fallback) and the end-to-end path by
+`VectorCopyUnchangedDeleteSuite` (v2/v3, partitioned/unpartitioned, data + within-table lineage + per-file
+metrics oracle).
+
+Column-chunk copying for `UPDATE` / matched-only `MERGE` (M4b) and `rewrite_data_files` (M4c) follow.
+
 ## The write side: columnar v3 deletion vectors (#20)
 
 On the **write** side, the DELETE half of a merge-on-read `DELETE` / `UPDATE` / `MERGE INTO` is Spark's

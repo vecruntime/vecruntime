@@ -175,6 +175,20 @@ public final class IcebergDataCommitBridge {
         return new SparkWrite.TaskCommit(files);
     }
 
+    /**
+     * Whether the write's output spec is unpartitioned.
+     */
+    public static boolean isUnpartitioned(Write write) {
+        if (!(write instanceof SparkWrite w)) {
+            return false;
+        }
+        Table table = field(w, "table", Table.class);
+        int specId = field(w, "outputSpecId", Integer.class);
+        return table.specs()
+                    .get(specId)
+                    .isUnpartitioned();
+    }
+
     private static <T> T field(SparkWrite w, String name, Class<T> type) {
         try {
             Field f = SparkWrite.class.getDeclaredField(name);
