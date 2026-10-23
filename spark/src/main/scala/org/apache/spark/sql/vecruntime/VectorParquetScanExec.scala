@@ -958,14 +958,17 @@ private[vecruntime] final class VectorParquetPartitionReader(
       stream = inputFile.newStream()
       // #834 part 1: a file at or under the threshold is read WHOLE in one GET here, BEFORE the footer, so the
       // footer, column chunks and page indexes all come from that one buffer (no footer-length read, no footer
-      // read, no per-page GET). The split keeps one file per row group, so file.length is the bytes to read.
+      // read, no per-page GET). The buffer must hold the WHOLE file -- the footer is at its end -- so it is sized
+      // by the file's length, not by this split's: Spark splits and packs files by maxPartitionBytes, and a split
+      // can cover only part of a file (reading split-length bytes then hit EOF in readFooter on S3).
       // The column-share gate cannot apply before the footer; for a file this small the whole-object read is
       // the point, so size alone decides. Range merging (part 2) still applies to larger files in openStream.
+      val fileLength = VectorParquetPartitionReader.fileLength(file, inputFile)
       if (
-        smallFileThreshold > 0 && file.length > 0 && file.length <= smallFileThreshold &&
-        file.length <= Integer.MAX_VALUE - 8
+        smallFileThreshold > 0 && fileLength > 0 && fileLength <= smallFileThreshold &&
+        fileLength <= Integer.MAX_VALUE - 8
       ) {
-        val whole = io.vecruntime.spark.parquet.BufferBackedSeekableInputStream.wholeObject(stream, file.length)
+        val whole = io.vecruntime.spark.parquet.BufferBackedSeekableInputStream.wholeObject(stream, fileLength)
         stream.close()
         stream = whole
       }
@@ -1141,7 +1144,12 @@ private[vecruntime] final class VectorParquetPartitionReader(
     // Only serve from a buffer when it issues fewer requests than the chunks themselves would (coalescing won
     // over splitting). Otherwise the original stream is as good and keeps memory to zero.
     if (planned.size() >= chunkRanges.size()) return source
-    io.vecruntime.spark.parquet.BufferBackedSeekableInputStream.plannedRanges(source, planned, file.length, source)
+    io.vecruntime.spark.parquet.BufferBackedSeekableInputStream.plannedRanges(
+      source,
+      planned,
+      VectorParquetPartitionReader.fileLength(file, null),
+      source
+    )
   }
 
   /** Makes a prepared file the current one (task thread): column readers, partition values, metrics. */
@@ -2159,6 +2167,17 @@ private[vecruntime] final class VectorParquetPartitionReader(
 }
 
 private[vecruntime] object VectorParquetPartitionReader {
+
+  /**
+   * #834: the length of the whole FILE a split belongs to (`PartitionedFile.fileSize`, the store's length),
+   * not the split's own `length` -- Spark splits and packs files, so a split may cover only part of a file. A
+   * split without a recorded file size (0, e.g. one built by hand) falls back to `inputFile`'s length when one
+   * is given, else to the split's end.
+   */
+  def fileLength(file: PartitionedFile, inputFile: org.apache.parquet.io.InputFile): Long =
+    if (file.fileSize > 0) file.fileSize
+    else if (inputFile != null) inputFile.getLength
+    else file.start + file.length
 
   /**
    * #626: the next row group of `r` (Parquet's `readNextFilteredRowGroup`), recording in `skipped` how many
