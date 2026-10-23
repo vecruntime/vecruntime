@@ -59,8 +59,18 @@ final class FixedBinaryChunkWriter implements ChunkWriter {
          * A DECIMAL128 lane (16-byte stride): the low {@code width} bytes,
          * big-endian.
          */
-        DECIMAL
+        DECIMAL,
+        /**
+         * Spark's INT96 timestamp from an INT64 lane of microseconds: 12 bytes,
+         * 8 bytes of nanoseconds of the day then 4 bytes of Julian day, little-
+         * endian. The fallback encoding is PLAIN (not DELTA_BYTE_ARRAY) and the
+         * column carries no min/max statistics, as parquet-java writes it.
+         */
+        INT96
     }
+
+    private static final long MICROS_PER_DAY = 86_400_000_000L;
+    private static final int JULIAN_DAY_OF_EPOCH = 2_440_588;
 
     private final Kind kind;
     private final int width;
@@ -146,12 +156,20 @@ final class FixedBinaryChunkWriter implements ChunkWriter {
         if (kind == Kind.FIXED) {
             MemorySegment.copy(data, ValueLayout.JAVA_BYTE, (long) i * width, scratch, 0,
                     width);
-        } else {
+        } else if (kind == Kind.DECIMAL) {
             long base = (long) i << 4;
             // Little-endian 16 bytes -> big-endian width bytes: the low `width` bytes, most significant first.
             for (int k = 0; k < width; k++) {
                 scratch[width - 1 - k] = data.get(ValueLayout.JAVA_BYTE, base + k);
             }
+        } else {
+            // INT96: micros of the day since the epoch -> 8 bytes nanoseconds of the day, 4 bytes Julian day,
+            // little-endian, as Spark writes its INT96 timestamp. The micros are already rebased upstream.
+            long micros = data.get(VectorBuffers.LE_LONG, (long) i << 3);
+            long day = Math.floorDiv(micros, MICROS_PER_DAY);
+            long nanos = Math.floorMod(micros, MICROS_PER_DAY) * 1000L;
+            scratchSeg.set(VectorBuffers.LE_LONG, 0, nanos);
+            scratchSeg.set(VectorBuffers.LE_INT, 8, (int) (day + JULIAN_DAY_OF_EPOCH));
         }
     }
 
@@ -314,6 +332,10 @@ final class FixedBinaryChunkWriter implements ChunkWriter {
     }
 
     private void updateMinMaxBytes(MemorySegment seg, long offset) {
+        // INT96 carries no min/max statistics, as parquet-java writes none (the type is deprecated for stats).
+        if (kind == Kind.INT96) {
+            return;
+        }
         if (pageStats == null) {
             pageStats = freshStats();
         }
@@ -349,6 +371,10 @@ final class FixedBinaryChunkWriter implements ChunkWriter {
             RleHybridEncoder.encode(ids, pageValues, bitWidth, body);
             valuesEncoding = Encoding.RLE_DICTIONARY;
             dictionaryPagesWritten++;
+        } else if (kind == Kind.INT96) {
+            // INT96 falls back to PLAIN (FixedLenByteArrayPlainValuesWriter), the fixed-width bytes back to back.
+            body.write(plain.segment(), 0, plain.size());
+            valuesEncoding = Encoding.PLAIN;
         } else {
             deltaByteArray(body);
             valuesEncoding = Encoding.DELTA_BYTE_ARRAY;

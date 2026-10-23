@@ -153,6 +153,9 @@ public final class ColumnarParquetWriter implements AutoCloseable {
         if (lane == VecType.BOOL && p == org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.BOOLEAN) {
             return new BooleanChunkWriter(column, props);
         }
+        if (lane == VecType.INT64 && p == org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.INT96) {
+            return new FixedBinaryChunkWriter(FixedBinaryChunkWriter.Kind.INT96, 12, column, props);
+        }
         if (p == org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.FIXED_LEN_BYTE_ARRAY) {
             int fixedWidth = column.getPrimitiveType().getTypeLength();
             if (lane == VecType.FIXED_BINARY) {
