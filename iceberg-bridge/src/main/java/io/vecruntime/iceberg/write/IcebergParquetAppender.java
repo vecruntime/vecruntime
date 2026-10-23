@@ -33,7 +33,6 @@ import org.apache.iceberg.TableProperties;
 import org.apache.iceberg.io.FileAppender;
 import org.apache.iceberg.io.OutputFile;
 import org.apache.iceberg.mapping.NameMapping;
-import org.apache.iceberg.parquet.ParquetUtil;
 import org.apache.parquet.column.ParquetProperties;
 import org.apache.parquet.hadoop.CodecFactory;
 import org.apache.parquet.hadoop.metadata.BlockMetaData;
@@ -340,7 +339,6 @@ public final class IcebergParquetAppender implements FileAppender<IcebergParquet
         }
         offsets.sort(null);
         splitOffsets = List.copyOf(offsets);
-        metrics = ParquetUtil.footerMetrics(IcebergParquetInterop.shadedFooter(footer),
-                floating.metrics(), metricsConfig, nameMapping);
+        metrics = IcebergParquetInterop.footerMetrics(footer, floating.metrics(), metricsConfig, nameMapping);
     }
 }
