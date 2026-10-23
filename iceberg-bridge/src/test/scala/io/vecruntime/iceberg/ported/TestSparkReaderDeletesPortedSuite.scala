@@ -50,14 +50,16 @@
  *                                                -> "position deletes across row groups of one parquet file"
  *   (+ a v3 deletion-vector survivor case)       -> "v3 deletion-vector deletes: survivors correct on native scan"
  *
- * DOCUMENTED NATIVE-SCAN FALLBACKS (tagged `DeletedColumnFallsBack`, asserted against Iceberg's reader):
+ * DOCUMENTED NATIVE-SCAN FALLBACK (tagged `DeletedColumnFallsBack`, asserted against Iceberg's reader):
  *   - Projecting Iceberg's `_deleted` metadata column: VectorIcebergScanExec.outputFieldIds returns
  *     Left("Iceberg metadata column _deleted"), so those queries keep Iceberg's reader. Surfacing deleted
  *     rows marked `_deleted=true` is the opposite of our columnar delete-application (which removes the
  *     deleted lanes), so the native path declines by design -- not a bug.
- *   - An equality delete keyed on a column DROPPED from the table: equalityColumnsOf resolves the delete
- *     field id against the current schema and finds nothing to load, so those files keep Iceberg's reader.
  *   The SURVIVOR set (the part our native scan owns) is still asserted natively in every such case.
+ *
+ * An equality delete keyed on a column DROPPED from the table now runs natively (the field id is resolved
+ * against the schema history and the column read as a hidden probe column) -- see the dedicated
+ * TestEqualityDeleteDroppedColumnSuite and the eq-delete schema-evolution case below.
  *
  * Runtime note: the repo's iceberg-spark-runtime jar reports "Apache Iceberg 1.12.0" at run time (matching
  * the ported tag). Position/equality delete files are written with Iceberg's own `GenericFileWriterFactory`
@@ -345,13 +347,12 @@ class TestSparkReaderDeletesPortedSuite extends AnyFunSuite with BeforeAndAfterA
 
   // testEqualityDeleteWithSchemaEvolution
   //
-  // FINDING / documented fallback: the equality delete here is keyed on `status`, which is then DROPPED
-  // from the table. VectorIcebergScanExec.equalityColumnsOf resolves each equality field id against the
-  // CURRENT table schema (`struct.field(id)`); a dropped column resolves to null, so those files keep
-  // Iceberg's reader (the native path has no current-schema column to load and probe). Correct answer is
-  // still produced -- via Iceberg's reader -- which we assert; the native-scan engagement is not expected
-  // for this edge case, so it is not asserted and the case is tagged.
-  test("an equality delete on a since-dropped column still applies (Iceberg reader)", DeletedColumnFallsBack) {
+  // The equality delete here is keyed on `status`, which is then DROPPED from the table. Our native scan
+  // resolves the delete's equality field id against the table's SCHEMA HISTORY (not only the current
+  // schema), reads the dropped column from the pre-drop data files as a hidden probe-only column by field
+  // id, and applies the delete itself -- so this now runs on VectorIcebergScanExec with no fallback. (The
+  // dedicated native-scan coverage of this gap lives in TestEqualityDeleteDroppedColumnSuite.)
+  test("an equality delete on a since-dropped column still applies, our native scan ran") {
     val (_, name) = buildTable("ice.db.eq_evo")
     spark.sql(s"ALTER TABLE $name ADD COLUMN status STRING")
     spark.sql(s"INSERT INTO $name VALUES (200,'h','ACTIVE'),(201,'i','INACTIVE'),(202,'j','ACTIVE')")
@@ -359,14 +360,11 @@ class TestSparkReaderDeletesPortedSuite extends AnyFunSuite with BeforeAndAfterA
     addEqualityDeletes(t2, Seq("status"), Seq(Seq("INACTIVE"))) // removes id 201
     spark.sql(s"ALTER TABLE $name DROP COLUMN status")
     refresh(name)
-    // Iceberg's reader gives the correct answer (only id 201 gone); our path matches it by falling back.
-    val got = icebergRows(s"SELECT id, data FROM $name")
+    val got = nativeCollect(s"SELECT id, data FROM $name")
     val expected = (DATA ++ Seq(200 -> "h", 202 -> "j")).sortBy(_._1)
     assert(sortById(got) == expected, s"only id 201 should be gone: ${sortById(got)}")
     assert(!got.map(_.getInt(0)).contains(201))
-    // Our path (plugin on) returns the same rows, declining to native only for the files carrying the
-    // dropped-column delete; the result is identical.
-    assert(sortById(spark.sql(s"SELECT id, data FROM $name").collect().toSeq) == expected)
+    assert(sortById(got) == sortById(icebergRows(s"SELECT id, data FROM $name")), "must match Iceberg's reader")
   }
 
   // testPosDeletesOnParquetFileWithMultipleRowGroups (SQL-level analog: one big data file, deletes scattered)
