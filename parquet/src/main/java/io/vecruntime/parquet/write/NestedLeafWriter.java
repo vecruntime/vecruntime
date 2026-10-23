@@ -417,6 +417,13 @@ final class NestedLeafWriter {
      * encoding.
      */
     private Encoding encodeValues() {
+        if (presentValues == 0) {
+            // A page of only null / absent occurrences carries no values. The
+            // leaf may never have been bound to a lane (every row of the chunk
+            // had a null ancestor, so put() was never called): PLAIN with an
+            // empty body is valid for every physical type.
+            return Encoding.PLAIN;
+        }
         switch (kind) {
             case BOOLEAN -> {
                 rleScratch.reset();
