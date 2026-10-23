@@ -232,6 +232,37 @@ Per step:
 
 `spark.vecruntime.explainFallback.enabled=true` logs the reason for each declined write.
 
+### Row-level operation modes
+
+A row-level command (`DELETE`, `UPDATE`, `MERGE`) runs in one of two modes, chosen per command by the table
+properties `write.delete.mode`, `write.update.mode` and `write.merge.mode`, each `copy-on-write` or
+`merge-on-read`. We honour the table's mode exactly, on both format version 2 and version 3, and each command
+independently -- a table may set `write.delete.mode=merge-on-read` and `write.update.mode=copy-on-write` at the
+same time, and each command follows its own property.
+
+We never decide the mode ourselves. Spark's optimizer, driven by Iceberg's `SparkRowLevelOperationBuilder`,
+turns the mode property into the plan: a `ReplaceData` for copy-on-write (its rewritten data files replace the
+touched ones, and no delete files are written) and a `WriteDelta` for merge-on-read (the deletes are written as
+delete files beside the unchanged data). Our two planner strategies route only on that node type plus our
+feature flags -- `VectorIcebergWriteStrategy` takes `ReplaceData`, `VectorWriteDeltaStrategy` takes
+`WriteDelta` -- so the mode the table asks for is always the mode that runs.
+
+- **Defaults when unset (Iceberg 1.12):** every command defaults to `copy-on-write` on both v2 and v3, and
+  `write.delete.granularity` defaults to `partition`. We read the defaults from Iceberg (`TableProperties`), so
+  an unset table behaves exactly as Iceberg's own writer would.
+- **Overrides:** Iceberg 1.12 exposes no Spark write-option or session-conf override for the mode itself (there
+  is no `spark.sql.iceberg.*` mode key, and `SparkWriteConf` has no `deleteMode`/`updateMode`/`mergeMode`), so
+  the mode comes only from the table property. The granularity, the delete file format and the delete-file
+  Parquet properties, which Iceberg does resolve on the write's `SparkWriteConf`, we read back from the write's
+  own resolved context (`useDVs`, `deleteGranularity`, `deleteFileFormat`) rather than recomputing them -- so a
+  write option that influences them is honoured.
+- **v2 vs v3 delete-file format (merge-on-read):** on a v2 table the deletes are written as Parquet **position
+  delete files**, at the table's `write.delete.granularity` (`partition`: one delete file per partition;
+  `file`: one per data file, naming the data file it covers). On a v3 table the deletes are written as
+  **deletion vectors** (Puffin), at most one deletion vector per data file, merging any previously committed
+  deletion vector for that file. Which of the two a write uses is Iceberg's decision (`useDVs`, which is v3's
+  Puffin delete format); we follow it.
+
 ### Table properties
 
 | Property | Honoured |
