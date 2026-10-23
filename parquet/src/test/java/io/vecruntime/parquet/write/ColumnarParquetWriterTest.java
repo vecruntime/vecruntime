@@ -400,6 +400,21 @@ class ColumnarParquetWriterTest {
                 + s.getDefinitionLevelHistogram();
     }
 
+    /**
+     * Encodings must match parquet-java's, except for the BOOLEAN column: our
+     * writer encodes booleans as PLAIN rather than the RLE parquet-java picks
+     * (Iceberg's vectorized reader rejects RLE booleans), so for that column we
+     * assert PLAIN instead of equality.
+     */
+    private static void assertBooleanAwareEncodings(String col, ColumnChunkMetaData ours, ColumnChunkMetaData theirs) {
+        if (ours.getPrimitiveType().getPrimitiveTypeName() == org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.BOOLEAN) {
+            assertEquals(java.util.Set.of(org.apache.parquet.column.Encoding.PLAIN),
+                    java.util.Set.copyOf(ours.getEncodings()), col);
+        } else {
+            assertEquals(theirs.getEncodings(), ours.getEncodings(), col);
+        }
+    }
+
     @Test
     void sameChunkStatisticsAndEncodings() throws Exception {
         List<Row> rows = rows(20_000, 2);
@@ -415,7 +430,7 @@ class ColumnarParquetWriterTest {
             ColumnChunkMetaData y = b.getColumns().get(c);
             String col = y.getPath().toDotString();
             assertEquals(y.getValueCount(), x.getValueCount(), col);
-            assertEquals(y.getEncodings(), x.getEncodings(), col);
+            assertBooleanAwareEncodings(col, x, y);
             Statistics<?> sx = x.getStatistics();
             Statistics<?> sy = y.getStatistics();
             assertEquals(sy.getNumNulls(), sx.getNumNulls(), col);
