@@ -481,10 +481,42 @@ class VectorWindowSuite extends VectorQuerySuite {
     }
   }
 
+  test("offset functions with IGNORE NULLS equal Spark (#980)") {
+    // l is null for one row in seven, so IGNORE NULLS skips real nulls. lag/lead skip backward/forward to
+    // the k-th non-null (with and without a default); first_value/last_value/nth_value find the non-null
+    // in the frame. Compared against Spark row-for-row.
+    checkWindow(
+      "SELECT i, l, lag(l, 2) IGNORE NULLS OVER (PARTITION BY s ORDER BY i) AS lag2, lead(l, 1) IGNORE NULLS OVER (PARTITION BY s ORDER BY i) AS lead1, lag(l, 3, -1) IGNORE NULLS OVER (PARTITION BY s ORDER BY i) AS lag3d FROM t"
+    )
+    checkWindow(
+      "SELECT i, l, first_value(l) IGNORE NULLS OVER (PARTITION BY s ORDER BY i) AS fv, last_value(l) IGNORE NULLS OVER (PARTITION BY s ORDER BY i ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS lv, nth_value(l, 2) IGNORE NULLS OVER (PARTITION BY s ORDER BY i) AS nv FROM t"
+    )
+    // A partition longer than a batch, no PARTITION BY, and a string input (nulls in s).
+    checkWindow(
+      "SELECT i, s, lag(s, 1) IGNORE NULLS OVER (ORDER BY i) AS prev, first_value(s) IGNORE NULLS OVER (ORDER BY i ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS fv FROM t"
+    )
+  }
+
+  test("sliding ROWS frames of stddev / variance equal Spark (#980)") {
+    // Welford replayed per frame. var_pop/var_samp/stddev_pop/stddev_samp over a sliding ROWS frame; a
+    // single-row frame exercises the n==1 sample edge (null by default). Compared bit-identically to Spark.
+    checkWindow(
+      "SELECT i, stddev_pop(l) OVER (PARTITION BY s ORDER BY i ROWS BETWEEN 3 PRECEDING AND CURRENT ROW) AS sp, stddev_samp(l) OVER (PARTITION BY s ORDER BY i ROWS BETWEEN 3 PRECEDING AND CURRENT ROW) AS ss, var_pop(l) OVER (PARTITION BY s ORDER BY i ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING) AS vp, var_samp(l) OVER (PARTITION BY s ORDER BY i ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING) AS vs FROM t"
+    )
+    // A single-row frame (CURRENT ROW AND CURRENT ROW): var_samp/stddev_samp are the n==1 null edge; var_pop is 0.
+    checkWindow(
+      "SELECT i, var_pop(l) OVER (PARTITION BY s ORDER BY i ROWS BETWEEN CURRENT ROW AND CURRENT ROW) AS vp1, var_samp(l) OVER (PARTITION BY s ORDER BY i ROWS BETWEEN CURRENT ROW AND CURRENT ROW) AS vs1 FROM t"
+    )
+    // A double input (NaN / infinities / nulls in d), a partition across batches, beside a sliding sum.
+    checkWindow(
+      "SELECT i, stddev_samp(d) OVER (ORDER BY i ROWS BETWEEN 10 PRECEDING AND CURRENT ROW) AS sd, sum(l) OVER (ORDER BY i ROWS BETWEEN 10 PRECEDING AND CURRENT ROW) AS sm FROM t"
+    )
+  }
+
   test("other window functions and frames fall back with a reason; the operator can be disabled") {
     // Sliding frames of functions without a form here, and two frame kinds in one operator.
     checkFallback(
-      "SELECT i, stddev(l) OVER (PARTITION BY s ORDER BY i ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS sd FROM t",
+      "SELECT i, skewness(l) OVER (PARTITION BY s ORDER BY i ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS sk FROM t",
       Seq(Window),
       "over a sliding frame not supported"
     )
@@ -519,11 +551,6 @@ class VectorWindowSuite extends VectorQuerySuite {
       "SELECT i, lag(l) OVER (PARTITION BY s ORDER BY i) AS previous, stddev(l) OVER (PARTITION BY s ORDER BY i) AS sd FROM t",
       Seq(Window),
       "running frame for stddev not supported"
-    )
-    checkFallback(
-      "SELECT i, lag(l, 1) IGNORE NULLS OVER (PARTITION BY s ORDER BY i) AS previous FROM t",
-      Seq(Window),
-      "IGNORE NULLS not supported"
     )
     checkFallback(
       "SELECT i, first_value(l) OVER (PARTITION BY s ORDER BY i ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS f FROM t",
