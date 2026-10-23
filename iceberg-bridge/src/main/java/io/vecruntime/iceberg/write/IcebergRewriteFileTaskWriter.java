@@ -106,6 +106,9 @@ public final class IcebergRewriteFileTaskWriter implements AutoCloseable {
     private final int fileOrdinal;
     private final int posOrdinal;
     private final int[] dataOrdinals;
+    // Per write-schema column, true to RE-ENCODE the column (a changed UPDATE column, or a v3 lineage column),
+    // false to COPY its chunk byte for byte. Length == dataOrdinals.length.
+    private final boolean[] encodeColumns;
     private final PartitionKeys keys;
     private final Arena arena = Arena.ofShared();
     private final Map<String, FileBuffer> buffers = new LinkedHashMap<>();
@@ -119,6 +122,9 @@ public final class IcebergRewriteFileTaskWriter implements AutoCloseable {
      * @param posOrdinal the {@code _pos} column's ordinal in the batches
      * @param dataOrdinals the write-schema columns' ordinals in the batches
      *     (data columns and, on v3, the row-lineage columns)
+     * @param encodeColumns per write-schema column, true to re-encode the
+     *     column (a changed UPDATE column, or a v3 lineage column), false to
+     *     copy its chunk byte for byte
      */
     public IcebergRewriteFileTaskWriter(
             IcebergWriteSpec spec,
@@ -127,7 +133,8 @@ public final class IcebergRewriteFileTaskWriter implements AutoCloseable {
             Configuration conf,
             int fileOrdinal,
             int posOrdinal,
-            int[] dataOrdinals) {
+            int[] dataOrdinals,
+            boolean[] encodeColumns) {
         this.spec = spec;
         this.files = OutputFileFactory.builderFor(spec.table(), partitionId, taskId)
                 .format(FileFormat.PARQUET)
@@ -144,6 +151,7 @@ public final class IcebergRewriteFileTaskWriter implements AutoCloseable {
         this.fileOrdinal = fileOrdinal;
         this.posOrdinal = posOrdinal;
         this.dataOrdinals = dataOrdinals;
+        this.encodeColumns = encodeColumns == null ? new boolean[dataOrdinals.length] : encodeColumns;
         this.keys = spec.spec().isUnpartitioned() ? null : new PartitionKeys(spec.spec(), spec.writeSchema());
     }
 
@@ -274,16 +282,26 @@ public final class IcebergRewriteFileTaskWriter implements AutoCloseable {
             deleted = new long[0];
         }
 
-        RowGroupCopyPlanner plan = safe ? RowGroupCopyPlanner.plan(footer, writeSchema, deleted, spec.writeSchema(), metricsConfig) : null;
+        RowGroupCopyPlanner plan = safe ? RowGroupCopyPlanner.plan(footer, writeSchema, deleted, spec.writeSchema(), metricsConfig,
+                maskOrNull())
+                : null;
         boolean copyable = safe && plan.copyable();
 
-        // #901 M4a required-column guard: on the copy path the output file uses the source schema (v2) or the
-        // write schema (v3), either of which may mark a top-level data column REQUIRED (Iceberg's writer does
-        // for an always-non-null column). A re-encoded group written under that schema MUST NOT receive a null
-        // in such a column. This cannot happen for a survivor whose data came from that very column -- a
-        // REQUIRED column holds no nulls -- but guard anyway: if any buffered survivor is null in a
-        // source-REQUIRED top-level data column, decline the copy and fall back to the full rewrite.
-        if (copyable && survivorHasNullInRequired(buffer, plan.fileSchema())) {
+        // #901 M4a/M4b required-column guard: a COPIED column keeps the SOURCE's repetition, which may be
+        // REQUIRED (Iceberg's writer marks an always-non-null column REQUIRED). A re-encoded group writes all
+        // columns under the output schema, so a null in a REQUIRED copied column would be invalid. This cannot
+        // happen for a survivor whose value came from that very column -- a REQUIRED column holds no nulls --
+        // but guard anyway. Only COPIED columns matter: an ENCODED (changed) column uses the write schema's
+        // OPTIONAL field, so a null there is fine.
+        if (copyable && survivorHasNullInRequiredCopied(buffer, plan.fileSchema(), plan.copyMask())) {
+            copyable = false;
+        }
+
+        // #901 M4b partition-change guard: if an UPDATE changes a column the table partitions by, a rewritten
+        // row may move partition, but the copy path keeps the source file's partition. Decline the copy and
+        // fall back to the full rewrite (which routes rows to the right partition). Only relevant when a data
+        // column is re-encoded (an UPDATE); a DELETE never changes a value.
+        if (copyable && changesPartitionColumn()) {
             copyable = false;
         }
 
@@ -399,9 +417,13 @@ public final class IcebergRewriteFileTaskWriter implements AutoCloseable {
      * instead. Checks only the lineage-free data columns (ids below the write
      * schema's data field count); v3 lineage columns are the writer's own.
      */
-    private boolean survivorHasNullInRequired(FileBuffer buffer, MessageType fileSchema) {
+    private boolean survivorHasNullInRequiredCopied(FileBuffer buffer, MessageType fileSchema, boolean[] copyMask) {
         int fields = Math.min(fileSchema.getFieldCount(), dataOrdinals.length);
         for (int f = 0; f < fields; f++) {
+            // Only a COPIED REQUIRED column matters; an ENCODED column uses the write schema's OPTIONAL field.
+            if (copyMask != null && f < copyMask.length && !copyMask[f]) {
+                continue;
+            }
             org.apache.parquet.schema.Type type = fileSchema.getType(f);
             if (!type.isRepetition(org.apache.parquet.schema.Type.Repetition.REQUIRED)) {
                 continue;
@@ -420,6 +442,62 @@ public final class IcebergRewriteFileTaskWriter implements AutoCloseable {
             }
         }
         return false;
+    }
+
+    /**
+     * Whether an UPDATE re-encodes (changes) a column the table partitions by,
+     * so a rewritten row might move partition. The write-schema Parquet fields
+     * carry Iceberg's source field ids; a partition field's {@code sourceId}
+     * names the column it transforms. Only meaningful when a data column is
+     * re-encoded (an UPDATE); a DELETE changes no value.
+     */
+    private boolean changesPartitionColumn() {
+        if (maskOrNull() == null || spec.spec().isUnpartitioned()) {
+            return false;
+        }
+        java.util.Set<Integer> partitionSourceIds = new java.util.HashSet<>();
+        for (org.apache.iceberg.PartitionField pf : spec.spec().fields()) {
+            partitionSourceIds.add(pf.sourceId());
+        }
+        int dataCols = writeSchema.getFieldCount();
+        for (int i = 0;
+             i < dataCols && i < encodeColumns.length;
+             i++) {
+            if (!encodeColumns[i]) {
+                continue;
+            }
+            org.apache.parquet.schema.Type t = writeSchema.getType(i);
+            if (t.getId() != null && partitionSourceIds.contains(t.getId()
+                    .intValue())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * The encode mask to hand the planner, or {@code null} to keep the M4a copy
+     * logic (copy every data column, encode only v3 lineage). Returns the mask
+     * only when a DATA column (not just lineage) is marked for re-encoding --
+     * i.e. an UPDATE whose changed columns the strategy identified. A DELETE
+     * (lineage-only mask) returns {@code null} so M4a's whole-group / lineage
+     * copy runs unchanged.
+     */
+    private boolean[] maskOrNull() {
+        // The two v3 lineage columns are the trailing write-schema columns; a mask that marks only those (or
+        // nothing) is a DELETE-shaped mask. Treat the leading (data) columns only.
+        int dataCols = writeSchema.getFieldCount();
+        // Lineage columns are those whose field id is one of the reserved lineage ids.
+        for (int i = 0;
+             i < dataCols && i < encodeColumns.length;
+             i++) {
+            org.apache.parquet.schema.Type t = writeSchema.getType(i);
+            boolean lineage = t.getId() != null && (t.getId().intValue() == Integer.MAX_VALUE - 107 || t.getId().intValue() == Integer.MAX_VALUE - 108);
+            if (encodeColumns[i] && !lineage) {
+                return encodeColumns;
+            }
+        }
+        return null;
     }
 
     /**

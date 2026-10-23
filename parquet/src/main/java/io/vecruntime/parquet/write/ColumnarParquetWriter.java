@@ -333,21 +333,28 @@ public final class ColumnarParquetWriter implements AutoCloseable {
         file.startBlock(rowCount);
         // Copied chunks first (in leaf order), then encoded chunks: the physical order of chunks within a block
         // is free (the footer records each chunk's offset and a reader seeks by it), and keeping copies and
-        // encodes in two passes avoids interleaving a direct file append with a page-store flush. A copied
-        // field may be nested, so it owns a RANGE of leaves; the encoded fields (the flat v3 lineage columns)
-        // are the trailing leaves.
+        // encodes in two passes avoids interleaving a direct file append with a page-store flush.
+        //
+        // The source file holds a chunk for every DATA column (copied OR changed/encoded), in schema order, but
+        // NOT the v3 lineage columns (which the source never materialises). So the source leaf cursor `srcIdx`
+        // must advance over a changed data column's leaves too -- otherwise a later copied column would read the
+        // wrong source chunk. It must NOT advance over a source-absent (lineage) encoded column. A column is
+        // source-absent iff it is a v3 lineage column (reserved field id).
         int leaf = 0;
         int srcIdx = 0;
         for (int i = 0; i < schema.getFieldCount(); i++) {
             int leaves = leafCount(schema.getType(i));
+            boolean sourceAbsent = isLineageField(schema.getType(i));
             if (copy[i]) {
                 for (int l = 0; l < leaves; l++) {
                     ColumnDescriptor desc = outLeaves.get(leaf + l);
-                    org.apache.parquet.hadoop.metadata.ColumnChunkMetaData src = srcChunks.get(srcIdx);
+                    org.apache.parquet.hadoop.metadata.ColumnChunkMetaData src = srcChunks.get(srcIdx + l);
                     file.appendColumnChunk(desc, source, src, reader.readBloomFilter(src),
                             reader.readColumnIndex(src), reader.readOffsetIndex(src));
-                    srcIdx++;
                 }
+            }
+            if (!sourceAbsent) {
+                srcIdx += leaves; // this data column occupies leaves in the source, whether copied or re-encoded
             }
             leaf += leaves;
         }
@@ -362,6 +369,18 @@ public final class ColumnarParquetWriter implements AutoCloseable {
         }
         file.endBlock();
         totalRows += rowCount;
+    }
+
+    /**
+     * Whether a schema field is a v3 row-lineage column (reserved field id),
+     * which a source file never holds.
+     */
+    private static boolean isLineageField(org.apache.parquet.schema.Type type) {
+        if (type.getId() == null) {
+            return false;
+        }
+        int id = type.getId().intValue();
+        return id == Integer.MAX_VALUE - 107 || id == Integer.MAX_VALUE - 108;
     }
 
     /**

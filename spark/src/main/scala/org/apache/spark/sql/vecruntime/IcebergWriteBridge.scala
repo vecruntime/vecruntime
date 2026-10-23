@@ -75,6 +75,14 @@ object IcebergWriteBridge {
   /** The top-level field names of the write's Iceberg write schema, in order. */
   def writeSchemaNames(write: Write): Array[String] = static("writeSchemaNames", write).asInstanceOf[Array[String]]
 
+  /**
+   * The names of the columns the write's output spec partitions by (its partition fields' source columns),
+   * for the #901 M4b guard that declines a copy when an UPDATE changes a partition column (the row may move
+   * partition, which the copy path -- one output file per source file and partition -- cannot do).
+   */
+  def partitionSourceNames(write: Write): Array[String] =
+    static("partitionSourceNames", write).asInstanceOf[Array[String]]
+
   /** What the tasks need (a serializable `IcebergWriteSpec`), read from Iceberg's `SparkWrite` on the driver. */
   def specOf(write: Write): AnyRef = static("specOf", write)
 
@@ -112,10 +120,11 @@ object IcebergWriteBridge {
       conf: Configuration,
       fileOrdinal: Int,
       posOrdinal: Int,
-      dataOrdinals: Array[Int]
+      dataOrdinals: Array[Int],
+      encodeColumns: Array[Boolean]
   ): IcebergDataTaskWriterHandle = {
     val c = rewriteWriter.getOrElse(throw new IllegalStateException("vecruntime: iceberg-bridge not on the classpath"))
-    val ctor = c.getConstructors.find(_.getParameterCount == 7).get
+    val ctor = c.getConstructors.find(_.getParameterCount == 8).get
     new IcebergDataTaskWriterHandle(
       ctor.newInstance(
         spec,
@@ -124,7 +133,8 @@ object IcebergWriteBridge {
         conf,
         Integer.valueOf(fileOrdinal),
         Integer.valueOf(posOrdinal),
-        dataOrdinals
+        dataOrdinals,
+        encodeColumns
       ).asInstanceOf[AnyRef]
     )
   }

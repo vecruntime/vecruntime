@@ -138,6 +138,25 @@ public final class RowGroupCopyPlanner {
      */
     public static RowGroupCopyPlanner plan(ParquetMetadata footer, MessageType writeSchema, long[] deletedPositions,
             Schema icebergSchema, MetricsConfig metricsConfig) {
+        return plan(footer, writeSchema, deletedPositions, icebergSchema, metricsConfig, null);
+    }
+
+    /**
+     * As {@link #plan(ParquetMetadata, MessageType, long[], Schema,
+     * MetricsConfig)}, but with a per-write-column {@code encodeColumns} mask
+     * (#901 M4b): {@code true} re-encodes the column (a changed UPDATE column,
+     * or a v3 lineage column), {@code false} copies its chunk byte for byte.
+     * {@code null} means the M4a default -- copy every data column and, on a v3
+     * source missing lineage, encode only the two lineage columns.
+     *
+     * <p>A copied column keeps the SOURCE's field (its repetition, so a
+     * REQUIRED source chunk's pages, which carry no definition levels, stay
+     * valid); an encoded column uses the WRITE schema's field. The copy is
+     * declined when a column marked for copy is not present in the source at
+     * its position (schema evolution).
+     */
+    public static RowGroupCopyPlanner plan(ParquetMetadata footer, MessageType writeSchema, long[] deletedPositions,
+            Schema icebergSchema, MetricsConfig metricsConfig, boolean[] encodeColumns) {
         MessageType fileSchema = footer.getFileMetaData().getSchema();
         List<BlockMetaData> blocks = footer.getBlocks();
 
@@ -159,22 +178,22 @@ public final class RowGroupCopyPlanner {
             }
         }
 
-        // The copy mode and the mask a COPY group uses. Three outcomes:
-        //   - exact match: the source already has every write-schema column (v2, or a v3 source that
-        //     materialises lineage) -- a COPY copies the whole group, output schema = source schema.
-        //   - source + trailing lineage: a v3 source written by an ordinary append has the data columns but not
-        //     _row_id / _last_updated_sequence_number -- a COPY copies the data chunks and ENCODES the two
-        //     lineage chunks (the scan resolved their values per surviving row). The output schema is the
-        //     SOURCE's data columns (keeping their exact repetition, so a REQUIRED source chunk's pages, which
-        //     carry no definition levels, stay valid under a REQUIRED output column) plus the write schema's
-        //     two lineage columns.
-        //   - otherwise: not copyable (schema evolution).
+        // The copy mode and the mask a COPY group uses.
         MessageType copyOutputSchema;
         boolean[] copyMask;
-        if (compatibleForCopy(writeSchema, fileSchema)) {
+        if (encodeColumns != null) {
+            // #901 M4b: a per-column copy/encode mask (changed UPDATE columns + v3 lineage are encoded, the
+            // rest copied). Build the output schema per column and verify every copied column matches the
+            // source at its position.
+            CopyColumns cc = copyColumns(writeSchema, fileSchema, encodeColumns);
+            copyOutputSchema = cc == null ? null : cc.outputSchema;
+            copyMask = cc == null ? null : cc.copyMask;
+        } else if (compatibleForCopy(writeSchema, fileSchema)) {
+            // Exact match (v2, or a v3 source that materialises lineage): copy the whole group.
             copyOutputSchema = fileSchema;
             copyMask = null;
         } else {
+            // v3 source missing lineage: copy the data chunks, encode the two lineage chunks.
             boolean[] lineageMask = lineageCopyMask(writeSchema, fileSchema);
             if (lineageMask != null) {
                 copyOutputSchema = lineageOutputSchema(writeSchema, fileSchema);
@@ -268,6 +287,74 @@ public final class RowGroupCopyPlanner {
     private static final int ROW_ID_FIELD_ID = Integer.MAX_VALUE - 107;
 
     private static final int SEQ_NUM_FIELD_ID = Integer.MAX_VALUE - 108;
+
+    /** The output schema and copy mask for a per-column M4b copy. */
+    private static final class CopyColumns {
+        final MessageType outputSchema;
+        final boolean[] copyMask;
+
+        CopyColumns(MessageType outputSchema, boolean[] copyMask) {
+            this.outputSchema = outputSchema;
+            this.copyMask = copyMask;
+        }
+    }
+
+    /**
+     * Builds the output schema and copy mask for a per-column copy (#901 M4b),
+     * or {@code null} when it is not safe. {@code encodeColumns} marks each
+     * write-schema column to re-encode ({@code true}) or copy ({@code false}).
+     * A copied column takes the SOURCE field at its position (keeping its
+     * repetition, so a REQUIRED source chunk's level-free pages stay valid); an
+     * encoded column takes the WRITE-schema field. The source file's columns are
+     * the leading data columns in write-schema order (v3 lineage is always
+     * encoded and trailing), so copied column {@code i} is source column
+     * {@code i}. Declined ({@code null}) if any copied column is absent from the
+     * source or does not match it by id/type/name (schema evolution), or if
+     * nothing is copied.
+     */
+    private static CopyColumns copyColumns(MessageType writeSchema, MessageType fileSchema, boolean[] encodeColumns) {
+        int wf = writeSchema.getFieldCount();
+        if (encodeColumns.length != wf) {
+            return null;
+        }
+        List<org.apache.parquet.schema.Type> out = new ArrayList<>(wf);
+        boolean[] copyMask = new boolean[wf];
+        boolean anyCopy = false;
+        for (int i = 0; i < wf; i++) {
+            if (encodeColumns[i]) {
+                // The mixed-group writer can ENCODE only flat columns; a changed NESTED column declines the
+                // whole copy (full rewrite). An untouched nested column is fine -- it is copied byte for byte.
+                if (!writeSchema.getType(i).isPrimitive()) {
+                    return null;
+                }
+                out.add(writeSchema.getType(i));
+                copyMask[i] = false;
+            } else {
+                if (i >= fileSchema.getFieldCount()) {
+                    return null;
+                }
+                org.apache.parquet.schema.Type src = fileSchema.getType(i);
+                if (!sameColumnIgnoringRepetition(writeSchema.getType(i), src)) {
+                    return null;
+                }
+                out.add(src);
+                copyMask[i] = true;
+                anyCopy = true;
+            }
+        }
+        if (!anyCopy) {
+            return null;
+        }
+        return new CopyColumns(new MessageType(fileSchema.getName(), out), copyMask);
+    }
+
+    /**
+     * Whether two fields are the same column up to repetition (id, name,
+     * physical and logical type).
+     */
+    private static boolean sameColumnIgnoringRepetition(org.apache.parquet.schema.Type a, org.apache.parquet.schema.Type b) {
+        return normalizeRepetition(a).equals(normalizeRepetition(b));
+    }
 
     /**
      * The output schema for a v3 mixed copy: the SOURCE file's own data columns,

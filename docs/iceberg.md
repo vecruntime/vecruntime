@@ -304,9 +304,13 @@ The partitioned (hash) append, the read A/B for #920, and a CDC `MERGE` A/B for 
 
 A copy-on-write `DELETE` / `UPDATE` / `MERGE` rewrites a whole data file today: every row group is decoded,
 filtered and re-encoded through the columnar writer, even the groups the change never touches. M4 copies the
-bytes that do not change and encodes only the rest. **M4a** is the first step: in a copy-on-write `DELETE`, a row
-group with no deleted rows is copied byte for byte into the new file; only a group with at least one deleted row
-is decoded, filtered and re-encoded.
+bytes that do not change and encodes only the rest. **M4a** copies whole row groups in a copy-on-write `DELETE`:
+a row group with no deleted rows is copied byte for byte into the new file; only a group with at least one
+deleted row is decoded, filtered and re-encoded. On a **format v3** table whose source file does not materialise
+row lineage, the data column chunks are copied byte for byte and only the two lineage columns (`_row_id`,
+`_last_updated_sequence_number`) are freshly encoded from the values the scan resolved per surviving row (the
+DELETE keeps them). **M4b** extends this to copy-on-write `UPDATE`: the columns the `SET` assignments do not
+change are copied byte for byte and only the changed columns (and the v3 lineage) are re-encoded.
 
 The primitive is on the writer. `ColumnarParquetWriter` sits on parquet-java's `ParquetFileWriter`, whose
 `appendRowGroup(SeekableInputStream, BlockMetaData, dropColumnIndexes=false)` (parquet-java 1.16) copies a
@@ -364,7 +368,28 @@ some / all groups, group ranges, schema-evolution and NaN-metrics fallback) and 
 `VectorCopyUnchangedDeleteSuite` (v2/v3, partitioned/unpartitioned, data + within-table lineage + per-file
 metrics oracle).
 
-Column-chunk copying for `UPDATE` / matched-only `MERGE` (M4b) and `rewrite_data_files` (M4c) follow.
+**M4b: column-chunk copy for copy-on-write `UPDATE`.** An `UPDATE` rewrites every row in place (no rows dropped
+or inserted), so every row group is fully present in source order and eligible. The writer's mixed-group
+primitive `ColumnarParquetWriter.copyRowGroupColumns(reader, source, sourceBlock, copy[], encodedRuns,
+rowCount)` writes one row group that copies the chunks a per-column mask marks (via
+`ParquetFileWriter.appendColumnChunk`, keeping each chunk's codec, statistics, column index, offset index and
+Bloom filter -- a nested copied column copies all its leaf chunks) and encodes the rest from the batch's new
+values. The changed columns are derived at plan time: `VectorIcebergWriteStrategy.updateEncodeMask` reads the
+`ReplaceData` rewrite plan -- the assignment `Project` over the scan, whose per-column value is a bare
+pass-through attribute (untouched), `If(cond, newValue, oldAttr)` (conditional assignment) or a computed
+expression (changed) -- and classifies a column as untouched iff, in every branch, its value is the scan
+attribute of the same name. An unrecognised plan shape, a changed **nested** column (the mixed-group writer
+encodes only flat columns), or a changed **partition** column (a row may move partition) all fall back to the
+full rewrite. The copied columns keep the **source** field's repetition (a `REQUIRED` source chunk's level-free
+pages stay valid), the encoded columns use the write schema; v3 lineage is always re-encoded (an updated row
+keeps `_row_id` and gets a new `_last_updated_sequence_number`, matching Iceberg 1.12). Metrics and the NaN
+fallback are the same as M4a. `MERGE` is **not** eligible: its rewrite is a `MergeRows` that does not carry
+`_pos`, so the per-row source position the copy path needs is unavailable, and it takes the full rewrite.
+Covered by `VectorCopyUnchangedUpdateSuite` (v2/v3, partitioned/unpartitioned, update one / several / all
+columns, self-assignment, a nested-column and a partition-column fallback, and the MERGE fallback) with the same
+data + lineage + metrics oracle.
+
+Column-chunk copying for `rewrite_data_files` (M4c) follows.
 
 ## The write side: columnar v3 deletion vectors (#20)
 
