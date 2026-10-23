@@ -213,28 +213,6 @@ class RowLevelModeMatrixSuite extends AnyFunSuite with BeforeAndAfterAll {
   private def planHasVectorWriteDelta(df: DataFrame): Boolean =
     planNodeNames(df).contains("VectorWriteDeltaExec")
 
-  /**
-   * Whether a thrown failure is the known dictionary-UTF8 copy-path re-encode crash: a negative
-   * MemorySegment copy size raised in BinaryChunkWriter while IcebergRewriteFileTaskWriter re-encodes a
-   * changed string column. Matched narrowly on the cause chain so an UNRELATED failure still fails the test.
-   */
-  private def isDictUtf8ReencodeCrash(t: Throwable): Boolean = {
-    var c: Throwable = t
-    val seen = scala.collection.mutable.Set.empty[Throwable]
-    while (c != null && seen.add(c)) {
-      val msg = Option(c.getMessage).getOrElse("")
-      val isNegSize = c.isInstanceOf[IndexOutOfBoundsException] && msg.contains("size is negative")
-      val inWriter = c.getStackTrace.exists { e =>
-        val cn = e.getClassName
-        (cn.contains("BinaryChunkWriter") || cn.contains("IcebergRewriteFileTaskWriter")) &&
-        (e.getMethodName == "idOf" || e.getMethodName == "write" || e.getMethodName == "reencodeAll")
-      }
-      if (isNegSize && inWriter) return true
-      c = c.getCause
-    }
-    false
-  }
-
   /** The snapshot-summary keys compared between the ON and OFF runs. */
   private val SummaryKeys = Seq(
     "added-records",
@@ -282,8 +260,7 @@ class RowLevelModeMatrixSuite extends AnyFunSuite with BeforeAndAfterAll {
       deleteMode: Option[String],
       updateMode: Option[String],
       mergeMode: Option[String],
-      granularity: Option[String],
-      knownStringReencodeBug: Boolean = false
+      granularity: Option[String]
   )(command: String => String): Unit = {
     val off = s"ice.db.${base}_off"
     val on = s"ice.db.${base}_on"
@@ -305,24 +282,11 @@ class RowLevelModeMatrixSuite extends AnyFunSuite with BeforeAndAfterAll {
     // ON run, capturing whether our merge-on-read operator ran and whether a columnar-data task fired.
     val dvBefore = org.apache.spark.sql.vecruntime.VectorWriteDeltaExec.columnarDataTasks.get()
     val (onNode, ourDeltaRan) = withFeatures(on = true) {
-      try {
-        val df = spark.sql(command(on))
-        val node = commandNodeOf(df)
-        val ours = planHasVectorWriteDelta(df)
-        df.collect()
-        (node, ours)
-      } catch {
-        case t: Throwable if knownStringReencodeBug && isDictUtf8ReencodeCrash(t) =>
-          // KNOWN PRODUCT BUG (reported): a copy-on-write UPDATE/MERGE that re-encodes a dictionary-encoded
-          // UTF8 column read from the native Iceberg scan crashes in the M4b copy path
-          // (IcebergRewriteFileTaskWriter.reencodeAll -> BinaryChunkWriter.idOf: a negative MemorySegment
-          // copy size). It reproduces ONLY with all three of: a changed string column, copyUnchanged ON
-          // (default true), and the native scan ON; with any one off it is correct. The mode ROUTING itself
-          // is correct -- the command planned the right ReplaceData node -- so this is an orthogonal
-          // copy-path defect, not a mode/format/granularity failure. Cancelled here (NOT weakened) so the
-          // blocker is explicit until the dictionary-UTF8 re-encode is fixed.
-          cancel(s"$base: blocked by the known dictionary-UTF8 copy-path re-encode crash: ${t.getMessage}")
-      }
+      val df = spark.sql(command(on))
+      val node = commandNodeOf(df)
+      val ours = planHasVectorWriteDelta(df)
+      df.collect()
+      (node, ours)
     }
     val dvTasks = org.apache.spark.sql.vecruntime.VectorWriteDeltaExec.columnarDataTasks.get() - dvBefore
 
@@ -480,8 +444,7 @@ class RowLevelModeMatrixSuite extends AnyFunSuite with BeforeAndAfterAll {
           deleteMode = None,
           updateMode = Some(mode),
           mergeMode = None,
-          granularity = None,
-          knownStringReencodeBug = cow
+          granularity = None
         )(Update)
       }
 
@@ -496,8 +459,7 @@ class RowLevelModeMatrixSuite extends AnyFunSuite with BeforeAndAfterAll {
           deleteMode = None,
           updateMode = None,
           mergeMode = Some(mode),
-          granularity = None,
-          knownStringReencodeBug = cow
+          granularity = None
         )(Merge)
       }
     }
@@ -507,7 +469,7 @@ class RowLevelModeMatrixSuite extends AnyFunSuite with BeforeAndAfterAll {
     test(s"$vp mixed modes: delete=MOR, update=COW, merge=MOR each route independently") {
       val d = Some("merge-on-read"); val u = Some("copy-on-write"); val m = Some("merge-on-read")
       runMode(s"mix_d_$vp", version, partitioned, expectCow = false, rows = 6000, d, u, m, None)(Delete)
-      // update=copy-on-write re-encodes the changed string column -> known copy-path bug (cancelled, not weakened).
+      // update=copy-on-write re-encodes the changed string column (dictionary-UTF8 copy path, #901 M4b).
       runMode(
         s"mix_u_$vp",
         version,
@@ -517,8 +479,7 @@ class RowLevelModeMatrixSuite extends AnyFunSuite with BeforeAndAfterAll {
         d,
         u,
         m,
-        None,
-        knownStringReencodeBug = true
+        None
       )(Update)
       mergeView()
       runMode(s"mix_m_$vp", version, partitioned, expectCow = false, rows = 6000, d, u, m, None)(Merge)
@@ -528,7 +489,7 @@ class RowLevelModeMatrixSuite extends AnyFunSuite with BeforeAndAfterAll {
     // v2 and v3, so all three must plan ReplaceData.
     test(s"$vp unset modes default to copy-on-write (Iceberg 1.12)") {
       runMode(s"def_d_$vp", version, partitioned, expectCow = true, rows = 6000, None, None, None, None)(Delete)
-      // default copy-on-write re-encodes the changed string column -> known copy-path bug (cancelled, not weakened).
+      // default copy-on-write re-encodes the changed string column (dictionary-UTF8 copy path, #901 M4b).
       runMode(
         s"def_u_$vp",
         version,
@@ -538,8 +499,7 @@ class RowLevelModeMatrixSuite extends AnyFunSuite with BeforeAndAfterAll {
         None,
         None,
         None,
-        None,
-        knownStringReencodeBug = true
+        None
       )(Update)
       mergeView()
       runMode(
@@ -551,8 +511,7 @@ class RowLevelModeMatrixSuite extends AnyFunSuite with BeforeAndAfterAll {
         None,
         None,
         None,
-        None,
-        knownStringReencodeBug = true
+        None
       )(Merge)
     }
   }
