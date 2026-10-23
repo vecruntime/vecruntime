@@ -28,6 +28,7 @@ import org.apache.parquet.column.ParquetProperties;
 import org.apache.parquet.column.page.DictionaryPage;
 import org.apache.parquet.column.page.PageWriter;
 import org.apache.parquet.column.statistics.DoubleStatistics;
+import org.apache.parquet.column.statistics.FloatStatistics;
 import org.apache.parquet.column.statistics.IntStatistics;
 import org.apache.parquet.column.statistics.LongStatistics;
 import org.apache.parquet.column.statistics.Statistics;
@@ -66,7 +67,24 @@ final class FixedWidthChunkWriter implements ChunkWriter {
          */
         INT32_FROM_INT64(4),
         INT64(8),
-        DOUBLE(8);
+        /**
+         * A millisecond timestamp carried in an INT64 lane of microseconds,
+         * divided by 1000 and written as INT64 millis.
+         */
+        INT64_MILLIS(8),
+        DOUBLE(8),
+        /** FLOAT narrowed from the FLOAT64 lane a float column is carried in. */
+        FLOAT(4),
+        /**
+         * A decimal of precision up to 9 held as the low limb of a DECIMAL128
+         * lane (16-byte stride), written as INT32.
+         */
+        DECIMAL_INT32(4),
+        /**
+         * A decimal of precision up to 18 held as the low limb of a DECIMAL128
+         * lane (16-byte stride), written as INT64.
+         */
+        DECIMAL_INT64(8);
 
         final int width;
 
@@ -133,15 +151,28 @@ final class FixedWidthChunkWriter implements ChunkWriter {
         return switch (lane) {
             case INT32 -> p == org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.INT32 ? Kind.INT32 : null;
             case INT64 -> {
-                if (p == org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.INT64 && !millis) {
-                    yield Kind.INT64;
+                if (p == org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.INT64) {
+                    yield millis ? Kind.INT64_MILLIS : Kind.INT64;
                 }
                 if (p == org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.INT32 && decimal) {
                     yield Kind.INT32_FROM_INT64;
                 }
                 yield null;
             }
-            case FLOAT64 -> p == org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.DOUBLE ? Kind.DOUBLE : null;
+            case FLOAT64 -> switch (p) {
+                        case DOUBLE -> Kind.DOUBLE;
+                        case FLOAT -> Kind.FLOAT;
+                        default -> null;
+                    };
+            case DECIMAL128 -> {
+                if (p == org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.INT32) {
+                    yield Kind.DECIMAL_INT32;
+                }
+                if (p == org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.INT64) {
+                    yield Kind.DECIMAL_INT64;
+                }
+                yield null;
+            }
             default -> null;
         };
     }
@@ -182,27 +213,8 @@ final class FixedWidthChunkWriter implements ChunkWriter {
         int start = pageValues;
         if (validity == null) {
             // No nulls: the values in one pass, the validity bits as whole words.
-            switch (kind) {
-                case INT32 -> {
-                    for (int i = from; i < to; i++) {
-                        values[pageValues++] = data.get(LE_INT, (long) i << 2);
-                    }
-                }
-                case INT32_FROM_INT64 -> {
-                    for (int i = from; i < to; i++) {
-                        values[pageValues++] = (int) data.get(LE_LONG, (long) i << 3);
-                    }
-                }
-                case INT64 -> {
-                    for (int i = from; i < to; i++) {
-                        values[pageValues++] = data.get(LE_LONG, (long) i << 3);
-                    }
-                }
-                case DOUBLE -> {
-                    for (int i = from; i < to; i++) {
-                        values[pageValues++] = Double.doubleToRawLongBits(data.get(LE_DOUBLE, (long) i << 3));
-                    }
-                }
+            for (int i = from; i < to; i++) {
+                values[pageValues++] = rawAt(data, i);
             }
             setValidRange(pageRows, n);
             pageRows += n;
@@ -212,12 +224,7 @@ final class FixedWidthChunkWriter implements ChunkWriter {
                     pageRows++;
                     continue;
                 }
-                long raw = switch (kind) {
-                    case INT32 -> data.get(LE_INT, (long) i << 2);
-                    case INT32_FROM_INT64 -> (int) data.get(LE_LONG, (long) i << 3);
-                    case INT64 -> data.get(LE_LONG, (long) i << 3);
-                    case DOUBLE -> Double.doubleToRawLongBits(data.get(LE_DOUBLE, (long) i << 3));
-                };
+                long raw = rawAt(data, i);
                 pageValidity[pageRows >>> 6] |= 1L << pageRows;
                 pageRows++;
                 values[pageValues++] = raw;
@@ -227,9 +234,10 @@ final class FixedWidthChunkWriter implements ChunkWriter {
             for (int k = start; k < pageValues; k++) {
                 long raw = values[k];
                 bloom.insertHash(switch (kind) {
-                    case INT32, INT32_FROM_INT64 -> bloom.hash((int) raw);
-                    case INT64 -> bloom.hash(raw);
+                    case INT32, INT32_FROM_INT64, DECIMAL_INT32 -> bloom.hash((int) raw);
+                    case INT64, INT64_MILLIS, DECIMAL_INT64 -> bloom.hash(raw);
                     case DOUBLE -> bloom.hash(Double.longBitsToDouble(raw));
+                    case FLOAT -> bloom.hash(Float.intBitsToFloat((int) raw));
                 });
             }
         }
@@ -244,6 +252,25 @@ final class FixedWidthChunkWriter implements ChunkWriter {
         if (pageRows >= pageRowLimit || encodedBytes() >= pageSize) {
             flushPage();
         }
+    }
+
+    /**
+     * The raw bits of the value at row {@code i}: an INT32 or INT64 straight,
+     * an INT64-lane decimal or a millis timestamp reduced, a DOUBLE as its raw
+     * long bits, a FLOAT as its raw int bits, a DECIMAL128-lane low limb (the
+     * 16-byte stride's first word) as INT32 or INT64.
+     */
+    private long rawAt(MemorySegment data, int i) {
+        return switch (kind) {
+            case INT32 -> data.get(LE_INT, (long) i << 2);
+            case INT32_FROM_INT64 -> (int) data.get(LE_LONG, (long) i << 3);
+            case INT64 -> data.get(LE_LONG, (long) i << 3);
+            case INT64_MILLIS -> Math.floorDiv(data.get(LE_LONG, (long) i << 3), 1000L);
+            case DOUBLE -> Double.doubleToRawLongBits(data.get(LE_DOUBLE, (long) i << 3));
+            case FLOAT -> Float.floatToRawIntBits((float) data.get(LE_DOUBLE, (long) i << 3)) & 0xFFFFFFFFL;
+            case DECIMAL_INT32 -> (int) data.get(LE_LONG, (long) i << 4);
+            case DECIMAL_INT64 -> data.get(LE_LONG, (long) i << 4);
+        };
     }
 
     /** Sets validity bits {@code [from, from + count)} of the page being built. */
@@ -363,7 +390,7 @@ final class FixedWidthChunkWriter implements ChunkWriter {
             RleHybridEncoder.encode(ids, pageValues, bitWidth, body);
             valuesEncoding = Encoding.RLE_DICTIONARY;
             dictionaryPagesWritten++;
-        } else if (kind == Kind.DOUBLE) {
+        } else if (kind == Kind.DOUBLE || kind == Kind.FLOAT) {
             writePlain(values, pageValues, body);
             valuesEncoding = Encoding.PLAIN;
         } else {
@@ -408,7 +435,7 @@ final class FixedWidthChunkWriter implements ChunkWriter {
             return s;
         }
         switch (kind) {
-            case INT32, INT32_FROM_INT64 -> {
+            case INT32, INT32_FROM_INT64, DECIMAL_INT32 -> {
                 int min = Integer.MAX_VALUE, max = Integer.MIN_VALUE;
                 for (int k = 0; k < pageValues; k++) {
                     int x = (int) values[k];
@@ -419,7 +446,7 @@ final class FixedWidthChunkWriter implements ChunkWriter {
                 is.updateStats(min);
                 is.updateStats(max);
             }
-            case INT64 -> {
+            case INT64, INT64_MILLIS, DECIMAL_INT64 -> {
                 long min = Long.MAX_VALUE, max = Long.MIN_VALUE;
                 for (int k = 0; k < pageValues; k++) {
                     min = Math.min(min, values[k]);
@@ -434,6 +461,13 @@ final class FixedWidthChunkWriter implements ChunkWriter {
                 DoubleStatistics ds = (DoubleStatistics) s;
                 for (int k = 0; k < pageValues; k++) {
                     ds.updateStats(Double.longBitsToDouble(values[k]));
+                }
+            }
+            case FLOAT -> {
+                // Per value: parquet-java's NaN and signed-zero rules stay its own.
+                FloatStatistics fs = (FloatStatistics) s;
+                for (int k = 0; k < pageValues; k++) {
+                    fs.updateStats(Float.intBitsToFloat((int) values[k]));
                 }
             }
         }

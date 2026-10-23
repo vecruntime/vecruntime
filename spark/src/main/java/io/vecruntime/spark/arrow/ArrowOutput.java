@@ -731,6 +731,13 @@ public final class ArrowOutput {
      */
     public static ColumnVector nulls(String name, DataType dt, int length,
             BufferAllocator allocator) {
+        if (dt instanceof org.apache.spark.sql.types.NullType) {
+            // The v3 unknown type (#rtypes): always null, no lane. Spark's own all-null vector, which operators
+            // read as such (SparkColumnVectorBuffers.isAllNull), exactly as a missing nested column.
+            org.apache.spark.sql.execution.vectorized.OnHeapColumnVector v = new org.apache.spark.sql.execution.vectorized.OnHeapColumnVector(length, dt);
+            v.setMissing();
+            return v;
+        }
         ArrowVectorBuffers out = TypeMapping.vecTypeOf(dt) == VecType.UTF8 ? allocateUtf8(name, length, 0, allocator) : allocateFixed(name, dt, length, allocator);
         Bitmap.fill(out.validity(), length, false);
         if (out.type() == VecType.UTF8) {

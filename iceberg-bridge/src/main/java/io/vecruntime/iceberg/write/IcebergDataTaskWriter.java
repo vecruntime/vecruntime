@@ -205,16 +205,16 @@ public final class IcebergDataTaskWriter implements AutoCloseable {
     }
 
     private void writeClustered(List<? extends VectorBuffers> columns, int first, int end) {
-        Object[][] values = keys.compute(columns, first, end);
+        PartitionKeys.Values values = keys.compute(columns, first, end);
         int n = end - first;
         int start = 0;
         while (start < n) {
             int stop = start + 1;
-            while (stop < n && PartitionKeys.samePartition(values, start, stop)) {
+            while (stop < n && values.samePartition(start, stop)) {
                 stop++;
             }
-            if (current == null || !PartitionKeys.inPartition(values, start, current.key)) {
-                PartitionKey key = keys.key(values, start);
+            if (current == null || !values.inPartition(start, current.key)) {
+                PartitionKey key = values.key(start);
                 if (closedKeys.contains(key)) {
                     throw new IllegalStateException("Incoming records violate the writer assumption that records are"
                             + " clustered by spec and by partition within each spec. Either cluster the incoming"
@@ -236,17 +236,17 @@ public final class IcebergDataTaskWriter implements AutoCloseable {
     }
 
     private void writeFanout(List<? extends VectorBuffers> columns, int first, int end) {
-        Object[][] values = keys.compute(columns, first, end);
+        PartitionKeys.Values values = keys.compute(columns, first, end);
         int n = end - first;
         // Each row's partition as an index into `partitions` (first-seen order); runs reuse the previous row's.
         List<PartitionKey> partitions = new ArrayList<>();
         Map<PartitionKey, Integer> index = new HashMap<>();
         int[] group = new int[n];
         for (int r = 0; r < n; r++) {
-            if (r > 0 && PartitionKeys.samePartition(values, r - 1, r)) {
+            if (r > 0 && values.samePartition(r - 1, r)) {
                 group[r] = group[r - 1];
             } else {
-                PartitionKey k = keys.key(values, r);
+                PartitionKey k = values.key(r);
                 Integer g = index.get(k);
                 if (g == null) {
                     g = partitions.size();
