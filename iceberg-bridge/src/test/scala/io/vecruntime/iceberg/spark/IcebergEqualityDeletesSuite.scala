@@ -167,4 +167,182 @@ class IcebergEqualityDeletesSuite extends AnyFunSuite with BeforeAndAfterAll {
     spark.sql(s"DELETE FROM $T WHERE l % 7 = 0")
     assert(check(s"SELECT * FROM $T") > 0)
   }
+
+  test("equality deletes keyed on uuid, fixed, and a composite (uuid, int) key") {
+    import org.apache.iceberg.types.Types
+    import org.apache.iceberg.types.Types.NestedField.{optional, required}
+    def uuidOf(n: Long) = new java.util.UUID(n * 0x9e3779b97f4a7c15L, ~n * 0xbf58476d1ce4e5b9L)
+    def fx(i: Int) = f"$i%08X".sliding(2, 2).map(Integer.parseInt(_, 16).toByte).toArray
+    val iceCatalog = spark.sessionState.catalogManager
+      .catalog("ice")
+      .asInstanceOf[org.apache.iceberg.spark.SparkCatalog]
+      .icebergCatalog()
+    spark.udf.register("uuid_of", (n: Long) => uuidOf(n).toString)
+    val N = 4000
+
+    def create(name: String): Unit = {
+      val schema = new org.apache.iceberg.Schema(
+        required(1, "id", Types.LongType.get()),
+        optional(2, "u", Types.UUIDType.get()),
+        optional(3, "f", Types.FixedType.ofLength(4)),
+        optional(4, "n", Types.IntegerType.get()),
+        optional(5, "a", Types.IntegerType.get()),
+        optional(6, "s", Types.StringType.get())
+      )
+      val tid = org.apache.iceberg.catalog.TableIdentifier.of("db", name)
+      iceCatalog.dropTable(tid, false)
+      iceCatalog.createTable(
+        tid,
+        schema,
+        org.apache.iceberg.PartitionSpec.unpartitioned(),
+        java.util.Map.of("format-version", "2", "write.delete.mode", "merge-on-read")
+      )
+      spark.sql(s"REFRESH TABLE ice.db.$name")
+      // u null when id%7==0; f null when id%9==0. a = id (unique int), s = 's<id>' (unique string).
+      withConf("spark.vecruntime.enabled" -> "false")(spark.sql(
+        s"""INSERT INTO ice.db.$name SELECT id,
+           |  if(id % 7 = 0, null, uuid_of(id)),
+           |  if(id % 9 = 0, null, unhex(lpad(hex(id), 8, '0'))),
+           |  cast(id % 5 AS INT),
+           |  cast(id AS INT),
+           |  concat('s', id)
+           |FROM range(0, $N)""".stripMargin
+      ).collect())
+    }
+
+    /** The ids the native scan returns (plugin on), and whether the native equality probe ran. */
+    def nativeIds(t: String): (Set[Int], Boolean) = {
+      val before = ParquetFileResolver.nativeEqualityBatches.get()
+      val ids = spark.sql(s"SELECT id FROM $t").collect().map(_.getLong(0).toInt).toSet
+      (ids, ParquetFileResolver.nativeEqualityBatches.get() > before)
+    }
+    def icebergIds(t: String): Set[Int] =
+      withConf("spark.vecruntime.enabled" -> "false")(
+        spark.sql(s"SELECT id FROM $t").collect().map(_.getLong(0).toInt).toSet
+      )
+
+    /**
+     * The native scan deletes exactly `expected` (computed independently from the data minus the keys), it equals
+     * Iceberg's own reader, and the native equality probe actually ran.
+     */
+    def assertRemaining(t: String, expected: Set[Int]): Unit = {
+      val iceberg = icebergIds(t)
+      val (got, probed) = nativeIds(t)
+      info(s"$t: native removed ${N - got.size}, Iceberg removed ${N - iceberg.size}, expected ${N - expected.size}")
+      assert(probed, s"$t: the native equality probe did not run")
+      assert(iceberg == expected, s"$t: Iceberg's reader removed ${N - iceberg.size}, expected ${N - expected.size}")
+      assert(
+        got == expected,
+        s"$t: native scan removed ${N - got.size} rows, expected ${N - expected.size}; " +
+          s"missing=${(expected -- got).take(5)} extra=${(got -- expected).take(5)}"
+      )
+    }
+
+    // --- uuid key, with a null key that deletes the null-uuid rows ---
+    create("equ")
+    val uKeys = (0 until N by 13).toSet
+    addDeletes(
+      "ice.db.equ",
+      Seq("u"),
+      ((0 until N by 13).filter(_ % 7 != 0).map(i => Seq[Any](uuidOf(i.toLong))) :+ Seq[Any](null))
+    )
+    // Deleted: a non-null uuid in uKeys, or a null uuid (id%7==0). Remaining = the rest.
+    val uRemaining = (0 until N).filterNot(i => (uKeys.contains(i) && i % 7 != 0) || i % 7 == 0).toSet
+    assertRemaining("ice.db.equ", uRemaining)
+    info(s"uuid: deleted ${N - uRemaining.size}, remaining ${uRemaining.size}")
+
+    // --- fixed key ---
+    // A fixed (byte-array) equality delete: the native scan now deletes the SPEC-CORRECT rows, because it reads
+    // the delete keys straight from the delete files (EqualityDeleteSet.ofDeleteFiles), encoding each record's key
+    // before the next record is read. Iceberg 1.12's OWN reader, by contrast, deletes only ONE row -- a genuine
+    // Iceberg bug we do NOT mirror. Root cause of the Iceberg bug, verified against iceberg-spark-runtime 1.12.0:
+    //   * org.apache.iceberg.data.parquet.GenericParquetReaders$FixedReader.read(byte[]) REUSES the caller's
+    //     byte[] buffer (it copies into aload_1 and returns that same array), so every row's fixed value is the
+    //     SAME array instance, mutated in place as the file is read.
+    //   * org.apache.iceberg.data.BaseDeleteLoader.readEqDeletes feeds those records through a flyweight
+    //     InternalRecordWrapper into StructLikeSet; StructLikeSet.add -> StructLikeWrapper.copyFor -> set() only
+    //     stores the StructLike REFERENCE (no deep copy of field values).
+    // The two combine so a 143-key fixed delete file collapses to ONE StructLikeSet element (verified: size == 1),
+    // and Iceberg's reader removes only the degenerate match. Our reader avoids BaseDeleteLoader entirely for the
+    // native set, so it keeps all 143 keys and deletes the spec-correct rows.
+    create("eqf")
+    addDeletes("ice.db.eqf", Seq("f"), (0 until N by 17).filter(_ % 9 != 0).map(i => Seq[Any](fx(i))))
+    // Deleted (spec): a row whose f is non-null (id % 9 != 0) and whose fx(id) is a delete key, i.e. id by 17 and
+    // id % 9 != 0. fx is injective, so no other row collides.
+    val fDeleted = (0 until N by 17).filter(_ % 9 != 0).toSet
+    val fExpected = (0 until N).toSet -- fDeleted
+    // The native probe reads the delete files itself (EqualityDeleteSet.ofDeleteFiles); it must NOT also trigger
+    // Iceberg's BaseDeleteLoader.loadEqualityDeletes, which would read every delete file a second time. Measure
+    // across a plugin-on scan whose equality delete is fully handled natively.
+    val loadsBefore = ParquetFileResolver.icebergEqualityLoads.get()
+    val (fGot, fProbed) = nativeIds("ice.db.eqf")
+    val loadsDuringNative = ParquetFileResolver.icebergEqualityLoads.get() - loadsBefore
+    assert(fProbed, "eqf: the native equality probe did not run")
+    assert(
+      loadsDuringNative == 0,
+      s"eqf: a native-probed equality delete must not load Iceberg's StructLikeSet, but " +
+        s"BaseDeleteLoader.loadEqualityDeletes ran $loadsDuringNative time(s)"
+    )
+    assert(
+      fGot == fExpected,
+      s"eqf: native scan removed ${N - fGot.size} rows, expected ${fDeleted.size}; " +
+        s"missing=${(fExpected -- fGot).take(5)} extra=${(fGot -- fExpected).take(5)}"
+    )
+    // Iceberg's OWN reader keeps rows the spec deletes: its collapsed StructLikeSet (size 1, per the bug above)
+    // removes at most one row, so it keeps almost all of fDeleted that the native scan correctly removes.
+    val fIceberg = icebergIds("ice.db.eqf")
+    assert(
+      fIceberg != fExpected && (fDeleted -- fIceberg).size <= 1,
+      s"eqf: expected Iceberg's own reader to keep the fixed-delete rows (bug); it removed ${N - fIceberg.size}"
+    )
+    info(s"fixed: native removed ${N - fGot.size} (spec-correct), Iceberg removed ${N - fIceberg.size}")
+
+    // --- composite controls: multi-column equality keys with no uuid component delete exactly as expected,
+    // proving the harness (writer field ids, delete-file equality ids, delete-row schema) is correct. ---
+    create("eqcii") // (int, int): a = id (unique), n = id % 5
+    addDeletes(
+      "ice.db.eqcii",
+      Seq("a", "n"),
+      (0 until N by 11).map(i => Seq[Any](Integer.valueOf(i), Integer.valueOf(i % 5)))
+    )
+    val ciiExpected = (0 until N).filterNot(_ % 11 == 0).toSet
+    assertRemaining("ice.db.eqcii", ciiExpected)
+    info(s"composite (int,int): removed ${N - ciiExpected.size}")
+
+    create("eqcsi") // (string, int): s = 's<id>' (unique), n = id % 5
+    addDeletes("ice.db.eqcsi", Seq("s", "n"), (0 until N by 11).map(i => Seq[Any](s"s$i", Integer.valueOf(i % 5))))
+    val csiExpected = (0 until N).filterNot(_ % 11 == 0).toSet
+    assertRemaining("ice.db.eqcsi", csiExpected)
+    info(s"composite (string,int): removed ${N - csiExpected.size}")
+
+    // --- composite (uuid, int) key ---
+    // The controls above (int,int) and (string,int) delete correctly, so the harness is right. A composite whose
+    // key includes a uuid, however, deletes nothing in Iceberg 1.12's OWN reader (verified: both the vectorized
+    // and the row-based reader keep every row), and the native scan mirrors it. Each component matches in
+    // isolation -- the loaded StructLikeSet has the right distinct keys, and a hand-built DeleteFilter probe
+    // (InternalRowWrapper + StructProjection, pruned read schema) returns contains == true for a key -- yet
+    // Iceberg's assembled DeleteFilter applies zero. The single-column uuid key DOES apply (see the uuid case
+    // above, 836 rows), so this is specific to uuid as one field of a multi-field key, in Iceberg's reader.
+    create("eqc")
+    addDeletes(
+      "ice.db.eqc",
+      Seq("u", "n"),
+      (0 until N by 11).filter(_ % 7 != 0).map(i => Seq[Any](uuidOf(i.toLong), Integer.valueOf(i % 5)))
+    )
+    val (cGot, cProbed) = nativeIds("ice.db.eqc")
+    assert(cGot == icebergIds("ice.db.eqc"), "eqc: native scan differs from Iceberg's reader on a composite key")
+    info(s"composite (uuid,int): native removed ${N - cGot.size}, probe ran = $cProbed")
+
+    // The uuid key read only for the deletes (not projected) still works: a count that selects only id.
+    create("equ2")
+    addDeletes(
+      "ice.db.equ2",
+      Seq("u"),
+      ((0 until N by 13).filter(_ % 7 != 0).map(i => Seq[Any](uuidOf(i.toLong))) :+ Seq[Any](null))
+    )
+    val before = ParquetFileResolver.nativeEqualityBatches.get()
+    val cnt = spark.sql("SELECT count(id) FROM (SELECT id FROM ice.db.equ2)").collect()(0).getLong(0)
+    assert(ParquetFileResolver.nativeEqualityBatches.get() > before, "equ2: the native probe did not run")
+    assert(cnt == uRemaining.size, s"equ2: unprojected-key count $cnt, expected ${uRemaining.size}")
+  }
 }
