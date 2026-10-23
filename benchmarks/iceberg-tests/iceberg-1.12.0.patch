@@ -107,7 +107,7 @@ new file mode 100644
 index 0000000..64765f3
 --- /dev/null
 +++ b/spark/v4.1/spark-extensions/src/test/java/org/apache/iceberg/spark/VectorTestConf.java
-@@ -0,0 +1,92 @@
+@@ -0,0 +1,89 @@
 +/*
 + * Licensed to the Apache Software Foundation (ASF) under one
 + * or more contributor license agreements.  See the NOTICE file
@@ -146,18 +146,15 @@ index 0000000..64765f3
 + *
 + * <p>{@code -Dvecruntime.enabled=false} makes this a no-op (the vanilla-Iceberg baseline).
 + *
-+ * <p>WRITE PATH -- default OFF here (see {@code WRITERS}). The columnar Iceberg data-file writer and
-+ * the merge-on-read DV writer live in {@code iceberg-bridge}, which is COMPILED AGAINST Iceberg's
-+ * SHADED {@code iceberg-spark-runtime} jar (parquet relocated under
-+ * {@code org.apache.iceberg.shaded.*}). Iceberg's own Gradle test modules are UNSHADED, so the
-+ * bridge's {@code IcebergParquetInterop.fileSchema} -> {@code ParquetSchemaUtil.convert(...)} binds
-+ * to a shaded return type that the unshaded {@code ParquetSchemaUtil} on the test classpath does
-+ * not have, giving {@code NoSuchMethodError} on every write. This is a harness/packaging
-+ * incompatibility, not a writer-logic bug (a real Spark deployment loads the shaded runtime jar and
-+ * the writer works). Until the bridge is built in an unshaded variant for this harness, OR the
-+ * suites are run against the shaded runtime jar, keep the writers off: the native SCAN path
-+ * (readSpecs + nativeEqualityDeletes) is exercised fully and passes. {@code -Dvecruntime.writers=on}
-+ * turns them on to reproduce the incompatibility.
++ * <p>WRITE PATH -- default ON here (see {@code WRITERS}), matching the product defaults. The
++ * columnar Iceberg data-file writer and the merge-on-read DV writer live in {@code iceberg-bridge},
++ * which is COMPILED AGAINST Iceberg's SHADED {@code iceberg-spark-runtime} jar (parquet relocated
++ * under {@code org.apache.iceberg.shaded.*}), while Iceberg's own Gradle test modules are UNSHADED.
++ * {@code IcebergParquetInterop} crosses that boundary reflectively (it detects which parquet
++ * relocation Iceberg's classes bind to and converts the schema/footer to that flavour), so the
++ * writer works on BOTH the shaded runtime jar (production) and this unshaded test classpath. Pass
++ * {@code -Dvecruntime.writers=off} to run the read-only scan path alone (e.g. to isolate a write
++ * regression).
 + */
 +public final class VectorTestConf {
 +
@@ -166,9 +163,9 @@ index 0000000..64765f3
 +  public static final boolean ENABLED =
 +      Boolean.parseBoolean(System.getProperty("vecruntime.enabled", "true"));
 +
-+  /** Write path off by default (see the class javadoc); -Dvecruntime.writers=on turns it on. */
++  /** Write path ON by default (product default); -Dvecruntime.writers=off runs the scan path alone. */
 +  public static final boolean WRITERS =
-+      "on".equalsIgnoreCase(System.getProperty("vecruntime.writers", "off"));
++      !"off".equalsIgnoreCase(System.getProperty("vecruntime.writers", "on"));
 +
 +  private static final String PLUGIN = "io.vecruntime.spark.VectorPlugin";
 +
@@ -291,7 +288,7 @@ new file mode 100644
 index 0000000..64765f3
 --- /dev/null
 +++ b/spark/v4.1/spark/src/test/java/org/apache/iceberg/spark/VectorTestConf.java
-@@ -0,0 +1,92 @@
+@@ -0,0 +1,89 @@
 +/*
 + * Licensed to the Apache Software Foundation (ASF) under one
 + * or more contributor license agreements.  See the NOTICE file
@@ -330,18 +327,15 @@ index 0000000..64765f3
 + *
 + * <p>{@code -Dvecruntime.enabled=false} makes this a no-op (the vanilla-Iceberg baseline).
 + *
-+ * <p>WRITE PATH -- default OFF here (see {@code WRITERS}). The columnar Iceberg data-file writer and
-+ * the merge-on-read DV writer live in {@code iceberg-bridge}, which is COMPILED AGAINST Iceberg's
-+ * SHADED {@code iceberg-spark-runtime} jar (parquet relocated under
-+ * {@code org.apache.iceberg.shaded.*}). Iceberg's own Gradle test modules are UNSHADED, so the
-+ * bridge's {@code IcebergParquetInterop.fileSchema} -> {@code ParquetSchemaUtil.convert(...)} binds
-+ * to a shaded return type that the unshaded {@code ParquetSchemaUtil} on the test classpath does
-+ * not have, giving {@code NoSuchMethodError} on every write. This is a harness/packaging
-+ * incompatibility, not a writer-logic bug (a real Spark deployment loads the shaded runtime jar and
-+ * the writer works). Until the bridge is built in an unshaded variant for this harness, OR the
-+ * suites are run against the shaded runtime jar, keep the writers off: the native SCAN path
-+ * (readSpecs + nativeEqualityDeletes) is exercised fully and passes. {@code -Dvecruntime.writers=on}
-+ * turns them on to reproduce the incompatibility.
++ * <p>WRITE PATH -- default ON here (see {@code WRITERS}), matching the product defaults. The
++ * columnar Iceberg data-file writer and the merge-on-read DV writer live in {@code iceberg-bridge},
++ * which is COMPILED AGAINST Iceberg's SHADED {@code iceberg-spark-runtime} jar (parquet relocated
++ * under {@code org.apache.iceberg.shaded.*}), while Iceberg's own Gradle test modules are UNSHADED.
++ * {@code IcebergParquetInterop} crosses that boundary reflectively (it detects which parquet
++ * relocation Iceberg's classes bind to and converts the schema/footer to that flavour), so the
++ * writer works on BOTH the shaded runtime jar (production) and this unshaded test classpath. Pass
++ * {@code -Dvecruntime.writers=off} to run the read-only scan path alone (e.g. to isolate a write
++ * regression).
 + */
 +public final class VectorTestConf {
 +
@@ -350,9 +344,9 @@ index 0000000..64765f3
 +  public static final boolean ENABLED =
 +      Boolean.parseBoolean(System.getProperty("vecruntime.enabled", "true"));
 +
-+  /** Write path off by default (see the class javadoc); -Dvecruntime.writers=on turns it on. */
++  /** Write path ON by default (product default); -Dvecruntime.writers=off runs the scan path alone. */
 +  public static final boolean WRITERS =
-+      "on".equalsIgnoreCase(System.getProperty("vecruntime.writers", "off"));
++      !"off".equalsIgnoreCase(System.getProperty("vecruntime.writers", "on"));
 +
 +  private static final String PLUGIN = "io.vecruntime.spark.VectorPlugin";
 +

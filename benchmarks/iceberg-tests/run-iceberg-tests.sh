@@ -34,7 +34,7 @@ ICEBERG_TAG="apache-iceberg-1.12.0"
 PATCH="$ROOT/benchmarks/iceberg-tests/iceberg-1.12.0.patch"
 EXCLUSIONS="$ROOT/benchmarks/iceberg-tests/exclusions.txt"
 VECRUNTIME_ENABLED="${VECRUNTIME_ENABLED:-true}"
-VECRUNTIME_WRITERS="${VECRUNTIME_WRITERS:-off}"  # bridge WRITE path; off by default -- write-side shaded/unshaded parquet mismatch, see README
+VECRUNTIME_WRITERS="${VECRUNTIME_WRITERS:-on}"  # bridge WRITE path ON by default (product default); =off runs the scan path alone
 MEM_CAP="${MEM_CAP:-8G}"
 TS="$(date +%Y%m%d-%H%M%S)"
 LOGDIR="$KEEP/iceberg-tests-$TS"
