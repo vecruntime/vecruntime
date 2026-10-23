@@ -15,7 +15,7 @@
  */
 package org.apache.spark.sql.vecruntime
 
-import java.util.concurrent.{ArrayBlockingQueue, Callable, ExecutorService, Executors, Future, TimeUnit}
+import java.util.concurrent.{ArrayBlockingQueue, ExecutorService, Executors, Future, TimeUnit}
 
 import org.apache.spark.TaskContext
 import org.apache.spark.sql.vectorized.ColumnarBatch
@@ -178,16 +178,29 @@ private[vecruntime] final class ParallelDecodeIterator(
       case job: RowGroupJob =>
         val f: Future[JobResult] =
           if (inline) ParallelDecodeIterator.done(decode(job))
-          else
-            pool.submit(new Callable[JobResult] {
-              override def call(): JobResult = {
-                if (context != null) TaskContext.setTaskContext(context)
-                try decode(job)
-                finally if (context != null) TaskContext.unset()
-              }
-            })
+          else {
+            val t = new DecodeTask(job)
+            pool.execute(t)
+            t.result
+          }
         slots.add(new Slot(f, fromJob = true))
       case other => throw new IllegalStateException(s"unexpected pollJob result: $other")
+    }
+  }
+
+  /**
+   * A helper's unit of work. Its result is ALWAYS delivered to `result`, never discarded, so whoever holds the
+   * slot (the consumer, or `close`) releases the batches and closes the set. A `FutureTask` cancelled while its
+   * job runs drops the job's result when the job returns, leaking that job's allocator and vectors (a few KB
+   * held after a LIMIT ended the task).
+   */
+  private final class DecodeTask(job: RowGroupJob) extends Runnable {
+    val result = new java.util.concurrent.CompletableFuture[JobResult]()
+    override def run(): Unit = {
+      if (context != null) TaskContext.setTaskContext(context)
+      try result.complete(decode(job))
+      catch { case t: Throwable => result.completeExceptionally(t) }
+      finally if (context != null) TaskContext.unset()
     }
   }
 
@@ -230,10 +243,16 @@ private[vecruntime] final class ParallelDecodeIterator(
         }
         o = pending.poll()
       }
-      // Cancel and drain every queued slot, releasing its batches and closing its set.
+      // Stop the helpers: a job not started yet never runs (its slot completes empty); a running one is
+      // interrupted and either finishes or fails (closing its own set). Then drain every queued slot, waiting for a
+      // running job's result, releasing its batches and closing its set. A running job's future is never
+      // cancelled: its result would be dropped with its allocator still open.
+      pool.shutdownNow().forEach {
+        case t: DecodeTask => t.result.completeExceptionally(new java.util.concurrent.CancellationException())
+        case _ => ()
+      }
       var slot = slots.poll()
       while (slot != null) {
-        slot.future.cancel(true)
         try {
           val res = slot.future.get()
           var i = 0
@@ -242,7 +261,6 @@ private[vecruntime] final class ParallelDecodeIterator(
         } catch { case _: Throwable => () }
         slot = slots.poll()
       }
-      pool.shutdownNow()
       try pool.awaitTermination(30, TimeUnit.SECONDS)
       catch { case _: InterruptedException => Thread.currentThread().interrupt() }
     } finally {
