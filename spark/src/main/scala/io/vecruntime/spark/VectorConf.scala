@@ -264,8 +264,8 @@ object VectorConf {
 
   /**
    * #64: write Parquet from our batches (VectorWriteFilesExec and the parquet-writer module), without the
-   * columnar-to-row conversion and Spark's row-by-row ParquetWriteSupport. Off by default while it is a prototype:
-   * unpartitioned, unbucketed writes of flat columns only; anything else keeps Spark's writer with a reason.
+   * columnar-to-row conversion and Spark's row-by-row ParquetWriteSupport. Default ON (owner, 2026-10-23); anything it
+   * does not take keeps Spark's writer with a printed reason.
    */
   val WriteColumnar = "spark.vecruntime.write.columnar.enabled"
 
@@ -807,8 +807,8 @@ object VectorConf {
    */
   def scanNativeParquet(conf: SQLConf): Boolean = bool(conf, ScanNativeParquet, default = !cometScanActive(conf))
 
-  /** #64: the columnar Parquet writer, off by default. */
-  def writeColumnar(conf: SQLConf): Boolean = bool(conf, WriteColumnar, default = false)
+  /** #64: the columnar Parquet writer. Default on (owner, 2026-10-23). */
+  def writeColumnar(conf: SQLConf): Boolean = bool(conf, WriteColumnar, default = true)
   def writeColumnarFromRows(conf: SQLConf): Boolean = bool(conf, WriteColumnarFromRows, default = false)
 
   /** #735: VectorIcebergScanExec, behind the native Parquet scan's own switch too. Default on (owner, 2026-10-23). */

@@ -60,8 +60,9 @@ version may change configuration keys or defaults, always noted here.
 - **Iceberg defaults on** (owner, 2026-10-23): the native Iceberg scan (`spark.vecruntime.scan.nativeIceberg.enabled`),
   the columnar Iceberg writer (`spark.vecruntime.iceberg.writer.enabled`) and the columnar merge-on-read writer --
   deletion vectors on v3, position deletes on v2 (`spark.vecruntime.iceberg.dvWriter.enabled`) -- now default to
-  `true`. Each still declines anything it does not take to Iceberg's / Spark's own path with a printed reason; set
-  the key to `false` to restore the previous behaviour.
+  `true`, and so does the columnar Parquet writer (`spark.vecruntime.write.columnar.enabled`, #64), which writes
+  Parquet v2 data pages. Each still declines anything it does not take to Iceberg's / Spark's own path with a
+  printed reason; set the key to `false` to restore the previous behaviour.
 
 - One Spark-free `parquet` module (`vecruntime-parquet_<spark line>`, #900) replaces `parquet-writer` and takes
   the page decoders out of `kernels`: `io.vecruntime.kernels.parquet` is now `io.vecruntime.parquet.codec`, beside
