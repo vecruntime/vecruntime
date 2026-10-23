@@ -196,8 +196,11 @@ case class VectorIcebergScanExec(
     // by its field id), then the row positions; the extra columns are dropped once the deletes are applied.
     // None: an equality column our reader cannot decode, so those files keep Iceberg's reader.
     val tableSchema = IcebergTasks.tableSchema(scan)
+    // The schema HISTORY (current + superseded): an equality delete can be keyed on a since-dropped column, whose
+    // field id lives only in an older schema. Threaded into both the probe-column resolution and the filter build.
+    val tableSchemas = IcebergTasks.tableSchemas(scan)
     val equalitySchema = IcebergTasks
-      .equalityColumns(scan.inputRDD.partitions, tableSchema, dataColumns.map(_._2).toSet)
+      .equalityColumns(scan.inputRDD.partitions, tableSchemas, dataColumns.map(_._2).toSet)
       .map(extra => VectorIcebergRDD.withPositions(StructType(requiredSchema.fields ++ extra)))
     val equalityConfBroadcast = equalitySchema.map(confFor)
 
@@ -232,6 +235,7 @@ case class VectorIcebergScanExec(
       equalityConfBroadcast,
       equalitySchema,
       tableSchema,
+      tableSchemas,
       requiredSchema,
       dataColumns.map { case (a, _) => (a.name, a.dataType) }.toArray,
       kinds.toArray,
@@ -265,8 +269,17 @@ case class VectorIcebergScanExec(
       ),
       IcebergTasks.nameMapping(scan),
       // #901 R1: Iceberg's own column resolution (iceberg-bridge), when on and the bridge is on the classpath.
+      // The schema history is passed so a since-dropped equality-delete key column (read as a hidden probe
+      // column) resolves against the schema it was dropped from, not only the current schema.
       if (!io.vecruntime.spark.VectorConf.icebergReadSpecsEnabled(sqlConf)) null
-      else ParquetFileResolver.iceberg(IcebergTasks.tableSchema(scan), IcebergTasks.nameMappingJson(scan)).orNull,
+      else
+        ParquetFileResolver
+          .iceberg(
+            IcebergTasks.tableSchema(scan),
+            IcebergTasks.nameMappingJson(scan),
+            tableSchemas.asInstanceOf[Seq[AnyRef]].asJava
+          )
+          .orNull,
       io.vecruntime.spark.VectorConf.icebergNativeEqualityDeletesEnabled(sqlConf),
       // #20 M3a: the table's unified partition type (serializable) and the `_partition` output's Spark struct type,
       // used to build the per-file `_partition` constant; null when `_partition` is not projected.
@@ -325,6 +338,7 @@ private[vecruntime] final class VectorIcebergRDD(
     equalityConfBroadcast: Option[org.apache.spark.broadcast.Broadcast[SerializableConfiguration]],
     equalitySchema: Option[StructType],
     tableSchema: AnyRef, // org.apache.iceberg.Schema (java.io.Serializable)
+    tableSchemas: Seq[AnyRef], // the table's schema history, current first (each a serializable Iceberg Schema)
     requiredSchema: StructType,
     attrs: Array[(String, org.apache.spark.sql.types.DataType)], // the data columns, in output order
     kinds: Array[IcebergTasks.ColumnKind], // per output column
@@ -534,7 +548,7 @@ private[vecruntime] final class VectorIcebergRDD(
       val out = layout(extra, positions = true)
       val rebuild = metaRebuild(fileMeta, posOrdinalOf(extra), fileOrdinalOf(extra, positions = true))
       lazy val equality =
-        IcebergTasks.equalityFilter(p, t.equalityDeletes, tableSchema, schema, equalitySets, nativeEqualityDeletes)
+        IcebergTasks.equalityFilter(p, t.equalityDeletes, tableSchemas, schema, equalitySets, nativeEqualityDeletes)
       readerOf(index, Array(t.file), equalityConfBroadcast.get, schema, context)
         .map(b =>
           if (markDeleted)
@@ -779,7 +793,7 @@ object VectorIcebergScanPlanner {
       )
       val parts = b.inputPartitions
       val projected = b.output.zip(ids).zip(kinds).collect { case ((_, id), IcebergTasks.DataColumn) => id }.toSet
-      val equality = IcebergTasks.equalityColumnsOf(parts, IcebergTasks.tableSchema(b), projected).isDefined
+      val equality = IcebergTasks.equalityColumnsOf(parts, IcebergTasks.tableSchemas(b), projected).isDefined
       // An empty partition list -- every file pruned in Iceberg's planning (e.g. a selective uuid `=`) -- reads
       // nothing and is admitted: there is no metadata-table group to reject and no row group to fall back on.
       if (parts.nonEmpty) {
@@ -1236,7 +1250,7 @@ private[vecruntime] object IcebergTasks {
     (loaderClass, loaderClass.getConstructor(classOf[java.util.function.Function[_, _]]).newInstance(open))
   }
 
-  /** The scanned table's current schema (an `org.apache.iceberg.Schema`, serializable), the ids equality deletes use. */
+  /** The scanned table's current schema (an `org.apache.iceberg.Schema`, serializable), the ids eq-deletes use. */
   /** #849: the table's `schema.name-mapping.default`, parsed; null when it has none. */
   def nameMapping(b: BatchScanExec): IcebergNameMapping = {
     val props = call(call(b.scan, "table"), "properties").asInstanceOf[java.util.Map[String, String]]
@@ -1250,6 +1264,31 @@ private[vecruntime] object IcebergTasks {
 
   def tableSchema(b: BatchScanExec): AnyRef = call(call(b.scan, "table"), "schema")
 
+  /**
+   * Every schema in the table's history (current plus superseded), newest first by schema id. An equality delete
+   * can be keyed on a column that has since been DROPPED from the current schema: the data files written before
+   * the drop still carry that field id, and the delete still applies to them, so the field id is resolved against
+   * these historical schemas, not only the current one. Robust to an older Iceberg without `schemas()`.
+   */
+  def tableSchemas(b: BatchScanExec): Seq[AnyRef] = {
+    val table = call(b.scan, "table")
+    val current = call(table, "schema")
+    val history =
+      try {
+        val map = call(table, "schemas").asInstanceOf[java.util.Map[Integer, AnyRef]]
+        if (map == null) Seq.empty
+        else map.entrySet().asScala.toSeq.sortBy(-_.getKey.intValue()).map(_.getValue)
+      } catch { case _: ReflectiveOperationException => Seq.empty }
+    // Current first, then the rest of the history, de-duplicated by identity.
+    (current +: history).distinct
+  }
+
+  /** The first of `schemas` whose struct contains every id in `ids` (so TypeUtil.select resolves them), or null. */
+  private def schemaContainingAll(schemas: Seq[AnyRef], ids: Seq[Int]): AnyRef = {
+    val findField = schemas.head.getClass.getMethod("findField", classOf[Int])
+    schemas.find(s => ids.forall(id => findField.invoke(s, Int.box(id)) != null)).orNull
+  }
+
   private def equalityFieldIds(d: AnyRef): Seq[Int] =
     call(d, "equalityFieldIds").asInstanceOf[java.util.List[Integer]].asScala.map(_.intValue()).toSeq
 
@@ -1259,11 +1298,15 @@ private[vecruntime] object IcebergTasks {
    * carrying it as its Parquet field id. None when one of them is not a top-level column of a type our reader
    * decodes as Iceberg does: the files with those deletes then keep Iceberg's reader.
    */
-  def equalityColumns(parts: Array[Partition], schema: AnyRef, projected: Set[Int]): Option[Seq[StructField]] =
-    equalityColumnsOf(parts.toSeq.flatMap(shims.SparkShims.dataSourceInputPartitions), schema, projected)
+  def equalityColumns(parts: Array[Partition], schemas: Seq[AnyRef], projected: Set[Int]): Option[Seq[StructField]] =
+    equalityColumnsOf(parts.toSeq.flatMap(shims.SparkShims.dataSourceInputPartitions), schemas, projected)
 
   /** As [[equalityColumns]], over the scan's input partitions themselves (at plan time). */
-  def equalityColumnsOf(inputs: Seq[InputPartition], schema: AnyRef, projected: Set[Int]): Option[Seq[StructField]] = {
+  def equalityColumnsOf(
+      inputs: Seq[InputPartition],
+      schemas: Seq[AnyRef],
+      projected: Set[Int]
+  ): Option[Seq[StructField]] = {
     val ids = scala.collection.mutable.LinkedHashSet.empty[Int]
     // The distinct equality-field-id-sets across the delete files, so a nested ancestor read differently by two
     // groups can be detected and declined (the union read column would not match a group's delete schema).
@@ -1284,25 +1327,36 @@ private[vecruntime] object IcebergTasks {
         }
       }
     }
-    val cl = schema.getClass.getClassLoader
-    val struct = call(schema, "asStruct")
-    val fieldById = struct.getClass.getMethod("field", classOf[Int])
+    // The id is resolved against the schema HISTORY, not only the current schema (`schemas.head`): an equality
+    // delete can be keyed on a since-DROPPED column (top level or a nested struct member). The data files written
+    // before the drop still carry that field id; a file written after reads null for it (our reader fills nulls),
+    // which is exactly the null key Iceberg compares a null delete key against. #956's nested-key resolution is
+    // run against whichever schema in the history still holds the id.
+    val cl = schemas.head.getClass.getClassLoader
+    val schemaClass = Class.forName("org.apache.iceberg.Schema", false, cl)
     val typeClass = Class.forName("org.apache.iceberg.types.Type", false, cl)
     val convert = Class.forName("org.apache.iceberg.spark.SparkSchemaUtil", false, cl).getMethod("convert", typeClass)
-    val schemaClass = Class.forName("org.apache.iceberg.Schema", false, cl)
     val projectStruct =
       Class.forName(
         "org.apache.iceberg.types.TypeUtil",
         false,
         cl
       ).getMethod("project", schemaClass, classOf[java.util.Set[_]])
-    // Resolve each equality field id to its top-level ancestor id (itself when top level) via the dotted column name.
-    def topAncestorId(id: Int): Option[Int] = {
-      val columnName = schemaClass.getMethod("findColumnName", classOf[Int]).invoke(schema, Int.box(id))
-      if (columnName == null) return None
-      val top = columnName.asInstanceOf[String].split("\\.", 2)(0)
-      val topField = schemaClass.getMethod("findField", classOf[String]).invoke(schema, top)
-      if (topField == null) None else Some(call(topField, "fieldId").asInstanceOf[Integer].intValue())
+    val findColumnName = schemaClass.getMethod("findColumnName", classOf[Int])
+    val findFieldByName = schemaClass.getMethod("findField", classOf[String])
+    val findFieldById = schemaClass.getMethod("findField", classOf[Int])
+    // The first schema in the history (current first) that holds `id`, with its struct and column name.
+    def schemaFor(id: Int): Option[AnyRef] = schemas.find(s => findFieldById.invoke(s, Int.box(id)) != null)
+    // Resolve `id`'s top-level ancestor id (itself when top level) via the dotted column name, in the schema that
+    // holds it. None when no schema in the history has the id.
+    def topAncestorId(id: Int): Option[Int] = schemaFor(id).flatMap { s =>
+      val columnName = findColumnName.invoke(s, Int.box(id))
+      if (columnName == null) None
+      else {
+        val top = columnName.asInstanceOf[String].split("\\.", 2)(0)
+        val topField = findFieldByName.invoke(s, top)
+        if (topField == null) None else Some(call(topField, "fieldId").asInstanceOf[Integer].intValue())
+      }
     }
     // Group the wanted (unprojected) equality ids by their top-level ancestor, preserving first-seen order.
     val wanted = ids.toSeq.filterNot(projected)
@@ -1327,15 +1381,21 @@ private[vecruntime] object IcebergTasks {
       }
     }
     val extra = byAncestor.toSeq.sortBy(_._1).map { case (ancId, leafIds) =>
+      // The schema that holds this ancestor AND all of its needed leaves -- the current one, or an older one when
+      // a (nested) key leaf has been dropped. For a dropped NESTED leaf the ancestor struct may still exist in the
+      // current schema while the leaf lives only in history, so resolve against the schema that has every id.
+      val holder = Option(schemaContainingAll(schemas, (leafIds.toSeq :+ ancId).distinct)).getOrElse(return None)
+      val struct = call(holder, "asStruct")
+      val fieldById = struct.getClass.getMethod("field", classOf[Int])
       val ancField = fieldById.invoke(struct, Int.box(ancId))
       if (ancField == null) return None
       val ancType = call(ancField, "type")
       if (call(ancType, "typeId").toString == "STRUCT") {
-        // #901 item 5: a nested equality key. Project the table schema to the ancestor's needed leaves and read the
-        // ancestor struct, every nested field carrying its Iceberg id. The native lane probe does not decode nested
-        // keys, so these groups take the row probe (equalityFilter), which reads the leaf through the struct as
-        // Iceberg's accessor does -- a null leaf under a null parent struct.
-        val projectedSchema = projectStruct.invoke(null, schema, leafIds.map(Int.box).asJava).asInstanceOf[AnyRef]
+        // #901 item 5: a nested equality key. Project the holding schema to the ancestor's needed leaves and read
+        // the ancestor struct, every nested field carrying its Iceberg id. The native lane probe does not decode
+        // nested keys, so these groups take the row probe (equalityFilter), which reads the leaf through the struct
+        // as Iceberg's accessor does -- a null leaf under a null parent struct, and null on post-drop files.
+        val projectedSchema = projectStruct.invoke(null, holder, leafIds.map(Int.box).asJava).asInstanceOf[AnyRef]
         val projectedTop = fieldById.invoke(call(projectedSchema, "asStruct"), Int.box(ancId))
         if (projectedTop == null) return None
         val projectedType = call(projectedTop, "type")
@@ -1374,7 +1434,7 @@ private[vecruntime] object IcebergTasks {
   def equalityFilter(
       p: InputPartition,
       deletes: java.util.List[AnyRef],
-      tableSchema: AnyRef,
+      tableSchemas: Seq[AnyRef],
       schema: StructType,
       cache: scala.collection.mutable.HashMap[(Seq[String], Seq[Int]), AnyRef],
       native: Boolean = false
@@ -1416,7 +1476,12 @@ private[vecruntime] object IcebergTasks {
     // e.g. a projected ancestor struct holds fields the delete does not), and the delete schema + selected delete
     // files (for the native set, read straight from the files).
     val groups = deletes.asScala.groupBy(equalityFieldIds).toSeq.map { case (ids, files) =>
-      val deleteSchema = select.invoke(null, tableSchema, ids.map(Int.box).toSet.asJava)
+      // Resolve the group's equality ids against the schema HISTORY: a dropped equality key (top level or a nested
+      // struct member) is absent from the current schema but present in an older one, and TypeUtil.select needs a
+      // schema that holds every id.
+      val resolveSchema = schemaContainingAll(tableSchemas, ids)
+      require(resolveSchema != null, s"equality delete field ids $ids are in no schema of the table's history")
+      val deleteSchema = select.invoke(null, resolveSchema, ids.map(Int.box).toSet.asJava)
       val deleteStruct = call(deleteSchema, "asStruct")
       val order = call(deleteSchema, "columns")
         .asInstanceOf[java.util.List[AnyRef]]
