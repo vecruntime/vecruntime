@@ -144,9 +144,9 @@ class PortedPartitionValuesSuite extends AnyFunSuite with BeforeAndAfterAll {
 
   test("testPartitionedByNestedString") {
     // identity partition on a string inside a struct; upstream guards a ClassCastException building the path.
-    // FINDING (not a bug): our columnar writer only resolves TOP-LEVEL partition sources
-    // (PartitionKeys.unsupported -> "is not a top-level column"), so a nested partition source makes it fall
-    // back to Iceberg's own row writer. The fallback is correct: the data it writes must still equal the twin.
+    // Whether our columnar writer handles this or falls back to Iceberg's row writer, the data it writes must
+    // equal the twin. Nested partition sources move onto lanes and take the columnar path once #955 lands;
+    // this test asserts only data/partition equality, which holds either way.
     val (off, on) = ("ice.db.nestedstr_off", "ice.db.nestedstr_on")
     Seq(off, on).foreach { t =>
       spark.sql(s"DROP TABLE IF EXISTS $t")
@@ -159,7 +159,6 @@ class PortedPartitionValuesSuite extends AnyFunSuite with BeforeAndAfterAll {
     withWriter(on = false)(spark.sql(s"INSERT INTO $off $src").collect())
     val df = withWriter(on = true)(spark.sql(s"INSERT INTO $on $src"))
     df.collect()
-    assert(!columnar(df), "a nested partition source is a documented fallback to Iceberg's writer")
     def text(t: String) =
       spark.sql(s"SELECT struct.string FROM $t ORDER BY struct.string").collect().map(_.toString).toSeq
     assert(text(on) == text(off), "nested-string-partition rows must match Iceberg's writer")
@@ -209,8 +208,9 @@ class PortedPartitionValuesSuite extends AnyFunSuite with BeforeAndAfterAll {
 
   test("testNestedPartitionValues") {
     // identity partition over a primitive nested inside a struct, for a representative set of types.
-    // Same documented fallback as testPartitionedByNestedString: nested partition sources are not resolved
-    // by our columnar writer, so it falls back to Iceberg's writer; the data it writes must still match.
+    // Asserts only data/partition equality with Iceberg's writer, which holds whether our columnar writer
+    // handles the write directly or routes it through Iceberg's. Nested partition sources are carried on
+    // lanes and take the columnar path once #955 lands.
     val columns =
       "id BIGINT, nested STRUCT<i: INT, s: STRING, d: DOUBLE, dt: DATE, dec: DECIMAL(11,2)>"
     val src =
@@ -234,7 +234,6 @@ class PortedPartitionValuesSuite extends AnyFunSuite with BeforeAndAfterAll {
       withWriter(on = false)(spark.sql(s"INSERT INTO $off $src").collect())
       val df = withWriter(on = true)(spark.sql(s"INSERT INTO $on $src"))
       df.collect()
-      assert(!columnar(df), s"partition by $col: a nested partition source falls back to Iceberg's writer")
       def text(t: String) =
         spark.sql(s"SELECT id, nested FROM $t ORDER BY id").collect().map(_.toString).toSeq
       assert(text(on) == text(off), s"partition by $col: rows must match Iceberg's writer")

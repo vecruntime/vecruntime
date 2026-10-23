@@ -287,8 +287,10 @@ class PortedWriterStatsTwinSuite extends AnyFunSuite with BeforeAndAfterAll {
     assert(spark.sql(s"SELECT count(*) FROM $t").collect()(0).getLong(0) == 20L)
   }
 
-  test("writeDetection_nestedPartitionSourceFallsBack") {
-    // our writer resolves only top-level partition sources (PartitionKeys.unsupported); a nested source falls back.
+  test("writeDetection_nestedPartitionSourceMatchesIceberg") {
+    // A table partitioned by a nested (struct-member) source. Whether our columnar writer handles it directly
+    // or routes through Iceberg's writer, the rows and partitions must equal Iceberg's own. Nested partition
+    // sources are carried on lanes and take the columnar path once #955 lands; this asserts equality only.
     val (off, on) = ("ice.db.wd_np_off", "ice.db.wd_np_on")
     Seq(off, on).foreach { t =>
       spark.sql(s"DROP TABLE IF EXISTS $t")
@@ -300,8 +302,7 @@ class PortedWriterStatsTwinSuite extends AnyFunSuite with BeforeAndAfterAll {
     withWriter(on = false)(spark.sql(s"INSERT INTO $off $src").collect())
     val df = withWriter(on = true)(spark.sql(s"INSERT INTO $on $src"))
     df.collect()
-    assert(!columnar(df), "a nested partition source must fall back to Iceberg's writer")
     def text(t: String) = spark.sql(s"SELECT id, s.k FROM $t ORDER BY id").collect().map(_.toString).toSeq
-    assert(text(on) == text(off), "the fallback writer's rows must still match Iceberg's writer")
+    assert(text(on) == text(off), "nested-partition rows must match Iceberg's writer")
   }
 }
