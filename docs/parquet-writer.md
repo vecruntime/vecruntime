@@ -27,12 +27,22 @@ can be compared page by page in tests:
 | INT32, INT64 | `RLE_DICTIONARY` (PLAIN dictionary page) | `DELTA_BINARY_PACKED` |
 | DOUBLE, FLOAT | `RLE_DICTIONARY` | `PLAIN` |
 | BINARY (strings, binary) | `RLE_DICTIONARY` | `DELTA_BYTE_ARRAY` |
-| BOOLEAN, INT96, FIXED_LEN_BYTE_ARRAY | through parquet-java's v2 column writer | as parquet-java |
+| FIXED_LEN_BYTE_ARRAY (fixed, UUID, decimal > 18) | `RLE_DICTIONARY` | `DELTA_BYTE_ARRAY` |
+| INT96 (Spark timestamp) | `RLE_DICTIONARY` | `PLAIN` |
+| BOOLEAN | `RLE` (no dictionary) | -- |
+
+Since #901 every type is written by our own chunk writers, not parquet-java's v2 column writer. A FLOAT
+narrowed from a FLOAT64 lane, a millisecond timestamp carried in an INT64 lane of microseconds, and a
+decimal of precision up to 18 held in a DECIMAL128 lane go on `FixedWidthChunkWriter`; BOOLEAN on
+`BooleanChunkWriter`; FIXED_LEN_BYTE_ARRAY and INT96 on `FixedBinaryChunkWriter`; and the leaves of
+structs, arrays and maps on `NestedLeafWriter`.
 
 A column chunk's dictionary falls back to the plain encoding when it outgrows
 `parquet.dictionary.page.size`, or after the first page when the dictionary does not pay for itself.
 Definition levels are RLE/bit-packed hybrid. Page statistics (min, max, null count) and the column
-index are written as parquet-java writes them; binary min/max compare unsigned.
+index are written as parquet-java writes them: binary and fixed min/max compare unsigned, a decimal's
+signed two's-complement, a BOOLEAN's by value; INT96 carries only a null count (no min/max), as the
+type is deprecated for statistics.
 
 ## Layout
 
@@ -44,9 +54,11 @@ index are written as parquet-java writes them; binary min/max compare unsigned.
   `ColumnarParquetWriter.footer()` returns the footer it wrote (statistics, encodings, sizes per column chunk),
   which is what a table format such as Iceberg builds its file metrics from. `ColumnarParquetWriter` takes our `VectorBuffers` columns and
   writes a file through parquet-java's `ParquetFileWriter`, so the footer, the column and offset indexes
-  and compression are parquet-java's own. INT32, INT64, DOUBLE and string columns are encoded by our chunk
-  writers (`FixedWidthChunkWriter`, `BinaryChunkWriter`); the other types go to parquet-java's column
-  writer from the same batch.
+  and compression are parquet-java's own. Every column is encoded by our own chunk writers
+  (`FixedWidthChunkWriter` for INT32/INT64/FLOAT/DOUBLE/millis-timestamp/DECIMAL128-lane decimals,
+  `BinaryChunkWriter` for strings, `BooleanChunkWriter` for BOOLEAN, `FixedBinaryChunkWriter` for
+  FIXED_LEN_BYTE_ARRAY and INT96, `NestedLeafWriter` for the leaves of nested columns); parquet-java is
+  kept only for the footer, indexes and compression (#901).
 - **Spark side**: `VectorWriteFilesExec` replaces Spark's `WriteFilesExec` under the write command. Spark
   keeps the command, the commit protocol, file naming, the write statistics and the table refresh; only
   the task changes. The schema is Spark's (`SparkToParquetSchemaConverter`), the footer carries Spark's
@@ -121,8 +133,9 @@ so the only legacy-specific code is recognising the 2-level list's repeated node
 - `NestedFieldWriter` walks each row's nested lane (Arrow's layout) and works out the Dremel repetition and
   definition levels for every leaf. A null at any level writes a null to each leaf under it; an empty array
   or map writes one a level deeper.
-- The leaves are written through parquet-java's column writers, so they get its v2 encodings and statistics,
-  not the flat fast path.
+- Each leaf is written by its own `NestedLeafWriter` (#901): the repetition and definition levels are
+  RLE/bit-packed hybrid in the data-page-v2 level sections, and the values use the same per-type encoders
+  a flat column does. A reader reconstructs the records from the levels.
 - On the Spark side the lane is built from Spark's getters, and a filtered batch is gathered by its
   selection.
 - Tests: `NestedWriteTest` against parquet-java (nulls at every level, a list of structs holding a list,

@@ -28,6 +28,7 @@ import org.apache.parquet.column.ParquetProperties;
 import org.apache.parquet.column.page.DictionaryPage;
 import org.apache.parquet.column.page.PageWriter;
 import org.apache.parquet.column.statistics.DoubleStatistics;
+import org.apache.parquet.column.statistics.FloatStatistics;
 import org.apache.parquet.column.statistics.IntStatistics;
 import org.apache.parquet.column.statistics.LongStatistics;
 import org.apache.parquet.column.statistics.Statistics;
@@ -66,7 +67,24 @@ final class FixedWidthChunkWriter implements ChunkWriter {
          */
         INT32_FROM_INT64(4),
         INT64(8),
-        DOUBLE(8);
+        /**
+         * A millisecond timestamp carried in an INT64 lane of microseconds,
+         * divided by 1000 and written as INT64 millis.
+         */
+        INT64_MILLIS(8),
+        DOUBLE(8),
+        /** FLOAT narrowed from the FLOAT64 lane a float column is carried in. */
+        FLOAT(4),
+        /**
+         * A decimal of precision up to 9 held as the low limb of a DECIMAL128
+         * lane (16-byte stride), written as INT32.
+         */
+        DECIMAL_INT32(4),
+        /**
+         * A decimal of precision up to 18 held as the low limb of a DECIMAL128
+         * lane (16-byte stride), written as INT64.
+         */
+        DECIMAL_INT64(8);
 
         final int width;
 
@@ -138,15 +156,28 @@ final class FixedWidthChunkWriter implements ChunkWriter {
         return switch (lane) {
             case INT32 -> p == org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.INT32 ? Kind.INT32 : null;
             case INT64 -> {
-                if (p == org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.INT64 && !millis) {
-                    yield Kind.INT64;
+                if (p == org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.INT64) {
+                    yield millis ? Kind.INT64_MILLIS : Kind.INT64;
                 }
                 if (p == org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.INT32 && decimal) {
                     yield Kind.INT32_FROM_INT64;
                 }
                 yield null;
             }
-            case FLOAT64 -> p == org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.DOUBLE ? Kind.DOUBLE : null;
+            case FLOAT64 -> switch (p) {
+                        case DOUBLE -> Kind.DOUBLE;
+                        case FLOAT -> Kind.FLOAT;
+                        default -> null;
+                    };
+            case DECIMAL128 -> {
+                if (p == org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.INT32) {
+                    yield Kind.DECIMAL_INT32;
+                }
+                if (p == org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.INT64) {
+                    yield Kind.DECIMAL_INT64;
+                }
+                yield null;
+            }
             default -> null;
         };
     }
@@ -168,9 +199,12 @@ final class FixedWidthChunkWriter implements ChunkWriter {
         WriteRebase r = rebase == null ? WriteRebase.NONE : rebase;
         var logical = column.getPrimitiveType().getLogicalTypeAnnotation();
         boolean date = kind == Kind.INT32 && logical instanceof org.apache.parquet.schema.LogicalTypeAnnotation.DateLogicalTypeAnnotation;
-        // A non-INT96 TIMESTAMP adjusted to UTC on the INT64 lane of micros (MILLIS goes through ColumnEncoder,
-        // so this fast path is only the micros timestamp); TIMESTAMP_NTZ (not adjusted) is written as stored.
-        boolean timestamp = kind == Kind.INT64 && logical instanceof org.apache.parquet.schema.LogicalTypeAnnotation.TimestampLogicalTypeAnnotation ts && ts.isAdjustedToUTC();
+        // A TIMESTAMP adjusted to UTC needs the calendar rebase: on the INT64 lane of micros (Kind.INT64) and, with
+        // #958's own v2 encoders, on the millis fast path too (Kind.INT64_MILLIS, rebased as millis in
+        // rebaseStaged). TIMESTAMP_NTZ (not adjusted) is written as stored.
+        boolean timestamp = (kind == Kind.INT64 || kind == Kind.INT64_MILLIS)
+                && logical instanceof org.apache.parquet.schema.LogicalTypeAnnotation.TimestampLogicalTypeAnnotation ts
+                && ts.isAdjustedToUTC();
         this.rebaseDate = date && r.datetimeActive();
         this.rebaseTimestamp = timestamp && r.datetimeActive();
         this.rebase = r;
@@ -201,27 +235,8 @@ final class FixedWidthChunkWriter implements ChunkWriter {
         int start = pageValues;
         if (validity == null) {
             // No nulls: the values in one pass, the validity bits as whole words.
-            switch (kind) {
-                case INT32 -> {
-                    for (int i = from; i < to; i++) {
-                        values[pageValues++] = data.get(LE_INT, (long) i << 2);
-                    }
-                }
-                case INT32_FROM_INT64 -> {
-                    for (int i = from; i < to; i++) {
-                        values[pageValues++] = (int) data.get(LE_LONG, (long) i << 3);
-                    }
-                }
-                case INT64 -> {
-                    for (int i = from; i < to; i++) {
-                        values[pageValues++] = data.get(LE_LONG, (long) i << 3);
-                    }
-                }
-                case DOUBLE -> {
-                    for (int i = from; i < to; i++) {
-                        values[pageValues++] = Double.doubleToRawLongBits(data.get(LE_DOUBLE, (long) i << 3));
-                    }
-                }
+            for (int i = from; i < to; i++) {
+                values[pageValues++] = rawAt(data, i);
             }
             setValidRange(pageRows, n);
             pageRows += n;
@@ -231,12 +246,7 @@ final class FixedWidthChunkWriter implements ChunkWriter {
                     pageRows++;
                     continue;
                 }
-                long raw = switch (kind) {
-                    case INT32 -> data.get(LE_INT, (long) i << 2);
-                    case INT32_FROM_INT64 -> (int) data.get(LE_LONG, (long) i << 3);
-                    case INT64 -> data.get(LE_LONG, (long) i << 3);
-                    case DOUBLE -> Double.doubleToRawLongBits(data.get(LE_DOUBLE, (long) i << 3));
-                };
+                long raw = rawAt(data, i);
                 pageValidity[pageRows >>> 6] |= 1L << pageRows;
                 pageRows++;
                 values[pageValues++] = raw;
@@ -254,9 +264,10 @@ final class FixedWidthChunkWriter implements ChunkWriter {
             for (int k = start; k < pageValues; k++) {
                 long raw = values[k];
                 bloom.insertHash(switch (kind) {
-                    case INT32, INT32_FROM_INT64 -> bloom.hash((int) raw);
-                    case INT64 -> bloom.hash(raw);
+                    case INT32, INT32_FROM_INT64, DECIMAL_INT32 -> bloom.hash((int) raw);
+                    case INT64, INT64_MILLIS, DECIMAL_INT64 -> bloom.hash(raw);
                     case DOUBLE -> bloom.hash(Double.longBitsToDouble(raw));
+                    case FLOAT -> bloom.hash(Float.intBitsToFloat((int) raw));
                 });
             }
         }
@@ -279,7 +290,10 @@ final class FixedWidthChunkWriter implements ChunkWriter {
      * rebase pass only when some value is below the Gregorian switch (every
      * value of modern data is above it, so the rebase is the identity and the
      * pass is skipped). Under EXCEPTION the rebase call throws on an ancient
-     * value, as Spark's write does.
+     * value, as Spark's write does. A millisecond timestamp ({@link
+     * Kind#INT64_MILLIS}) was already reduced to millis by {@link #rawAt}; the
+     * calendar offset is a whole number of days, so the millis switch and the
+     * rebase are the micros ones scaled by 1000 (see {@link #rebaseMillis}).
      */
     private void rebaseStaged(int start) {
         if (rebaseDate) {
@@ -297,6 +311,20 @@ final class FixedWidthChunkWriter implements ChunkWriter {
             for (int k = start; k < pageValues; k++) {
                 values[k] = rebase.rebaseDays((int) values[k]);
             }
+        } else if (kind == Kind.INT64_MILLIS) {
+            long sw = Math.floorDiv(rebase.switchGregorianTs(), 1000L);
+            long min = Long.MAX_VALUE;
+            for (int k = start; k < pageValues; k++) {
+                if (values[k] < min) {
+                    min = values[k];
+                }
+            }
+            if (min >= sw) {
+                return;
+            }
+            for (int k = start; k < pageValues; k++) {
+                values[k] = rebaseMillis(values[k]);
+            }
         } else {
             long sw = rebase.switchGregorianTs();
             long min = Long.MAX_VALUE;
@@ -312,6 +340,34 @@ final class FixedWidthChunkWriter implements ChunkWriter {
                 values[k] = rebase.rebaseMicros(values[k]);
             }
         }
+    }
+
+    /**
+     * A millisecond timestamp rebased: micros and millis differ only by the
+     * x1000 scale, and the LEGACY calendar shift is a whole number of days, so
+     * the rebase of the micros is exactly 1000x the rebase of the millis.
+     */
+    private long rebaseMillis(long millis) {
+        return Math.floorDiv(rebase.rebaseMicros(Math.multiplyExact(millis, 1000L)), 1000L);
+    }
+
+    /**
+     * The raw bits of the value at row {@code i}: an INT32 or INT64 straight,
+     * an INT64-lane decimal or a millis timestamp reduced, a DOUBLE as its raw
+     * long bits, a FLOAT as its raw int bits, a DECIMAL128-lane low limb (the
+     * 16-byte stride's first word) as INT32 or INT64.
+     */
+    private long rawAt(MemorySegment data, int i) {
+        return switch (kind) {
+            case INT32 -> data.get(LE_INT, (long) i << 2);
+            case INT32_FROM_INT64 -> (int) data.get(LE_LONG, (long) i << 3);
+            case INT64 -> data.get(LE_LONG, (long) i << 3);
+            case INT64_MILLIS -> Math.floorDiv(data.get(LE_LONG, (long) i << 3), 1000L);
+            case DOUBLE -> Double.doubleToRawLongBits(data.get(LE_DOUBLE, (long) i << 3));
+            case FLOAT -> Float.floatToRawIntBits((float) data.get(LE_DOUBLE, (long) i << 3)) & 0xFFFFFFFFL;
+            case DECIMAL_INT32 -> (int) data.get(LE_LONG, (long) i << 4);
+            case DECIMAL_INT64 -> data.get(LE_LONG, (long) i << 4);
+        };
     }
 
     /** Sets validity bits {@code [from, from + count)} of the page being built. */
@@ -431,7 +487,7 @@ final class FixedWidthChunkWriter implements ChunkWriter {
             RleHybridEncoder.encode(ids, pageValues, bitWidth, body);
             valuesEncoding = Encoding.RLE_DICTIONARY;
             dictionaryPagesWritten++;
-        } else if (kind == Kind.DOUBLE) {
+        } else if (kind == Kind.DOUBLE || kind == Kind.FLOAT) {
             writePlain(values, pageValues, body);
             valuesEncoding = Encoding.PLAIN;
         } else {
@@ -476,7 +532,7 @@ final class FixedWidthChunkWriter implements ChunkWriter {
             return s;
         }
         switch (kind) {
-            case INT32, INT32_FROM_INT64 -> {
+            case INT32, INT32_FROM_INT64, DECIMAL_INT32 -> {
                 int min = Integer.MAX_VALUE, max = Integer.MIN_VALUE;
                 for (int k = 0; k < pageValues; k++) {
                     int x = (int) values[k];
@@ -487,7 +543,7 @@ final class FixedWidthChunkWriter implements ChunkWriter {
                 is.updateStats(min);
                 is.updateStats(max);
             }
-            case INT64 -> {
+            case INT64, INT64_MILLIS, DECIMAL_INT64 -> {
                 long min = Long.MAX_VALUE, max = Long.MIN_VALUE;
                 for (int k = 0; k < pageValues; k++) {
                     min = Math.min(min, values[k]);
@@ -502,6 +558,13 @@ final class FixedWidthChunkWriter implements ChunkWriter {
                 DoubleStatistics ds = (DoubleStatistics) s;
                 for (int k = 0; k < pageValues; k++) {
                     ds.updateStats(Double.longBitsToDouble(values[k]));
+                }
+            }
+            case FLOAT -> {
+                // Per value: parquet-java's NaN and signed-zero rules stay its own.
+                FloatStatistics fs = (FloatStatistics) s;
+                for (int k = 0; k < pageValues; k++) {
+                    fs.updateStats(Float.intBitsToFloat((int) values[k]));
                 }
             }
         }
