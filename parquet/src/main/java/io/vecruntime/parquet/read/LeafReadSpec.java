@@ -106,6 +106,13 @@ public final class LeafReadSpec {
     public final boolean float32;
 
     /**
+     * A {@code uuid}: a FIXED_LEN_BYTE_ARRAY(16) staged on the UTF8 path whose
+     * 16 big-endian bytes are formatted into the canonical lowercase
+     * {@code 8-4-4-4-12} text at flush, as Iceberg's Spark reader produces it.
+     */
+    public final boolean uuid;
+
+    /**
      * A UTF8 string compared by bytes: its dictionary-encoded batches may be
      * emitted as dictionary ids.
      */
@@ -122,6 +129,7 @@ public final class LeafReadSpec {
         this.timestampLane = b.timestampLane;
         this.decimal = b.decimal;
         this.float32 = b.float32;
+        this.uuid = b.uuid;
         this.dictionaryIdsAllowed = b.dictionaryIdsAllowed;
     }
 
@@ -163,6 +171,7 @@ public final class LeafReadSpec {
                 + (timestampLane ? ", timestamp" : "")
                 + (decimal ? ", decimal" : "")
                 + (float32 ? ", float32" : "")
+                + (uuid ? ", uuid" : "")
                 + (dictionaryIdsAllowed ? ", ids" : "")
                 + "]";
     }
@@ -179,6 +188,7 @@ public final class LeafReadSpec {
         private boolean timestampLane;
         private boolean decimal;
         private boolean float32;
+        private boolean uuid;
         private boolean dictionaryIdsAllowed;
 
         private Builder(VecType lane) {
@@ -234,6 +244,11 @@ public final class LeafReadSpec {
 
         public Builder float32(boolean on) {
             this.float32 = on;
+            return this;
+        }
+
+        public Builder uuid(boolean on) {
+            this.uuid = on;
             return this;
         }
 

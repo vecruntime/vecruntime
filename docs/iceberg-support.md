@@ -40,6 +40,7 @@ Turn it on with `spark.vecruntime.scan.nativeIceberg.enabled=true`.
 | Copy-on-write `DELETE` / `UPDATE` / `MERGE INTO` | **✓** |
 | Merge-on-read `DELETE` / `UPDATE` / `MERGE INTO`: deletion vectors (v3), position deletes (v2) | **✓** |
 | Partitioned tables, every transform; clustered and fanout | **✓** |
+| Partition sources nested inside structs | **✓** |
 | Distribution modes none / hash / range, without Spark's row exchange | **✓** |
 | Nested columns (struct, list, map) | **✓** |
 | Row lineage on v3 | **✓** |

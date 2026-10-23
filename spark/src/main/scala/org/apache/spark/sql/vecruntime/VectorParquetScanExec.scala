@@ -2144,7 +2144,13 @@ object VectorParquetScanExec {
         // does whatever the column's TIME unit (Spark's own outcome for a TIME(NANOS) file too). An INT32
         // TIME(MILLIS) Spark refuses: it stays on Spark's reader, which raises Spark's error.
         p == INT64
-      case _: StringType => p == BINARY
+      case _: StringType =>
+        // A uuid (#rtypes): FIXED_LEN_BYTE_ARRAY(16) with the UUID logical type, formatted into canonical text at
+        // the Spark boundary. Any other StringType is BINARY.
+        p == BINARY ||
+        (p == FIXED_LEN_BYTE_ARRAY && physical.getTypeLength == 16 &&
+          physical.getLogicalTypeAnnotation
+            .isInstanceOf[org.apache.parquet.schema.LogicalTypeAnnotation.UUIDLogicalTypeAnnotation])
       case d: DecimalType =>
         // Spark's isDecimalTypeMatched: the file's decimal (p, s) reads as (p', s') when s' >= s and the precision
         // grows by at least as much as the scale (#568 schema evolution: the unscaled values times 10^(s' - s));

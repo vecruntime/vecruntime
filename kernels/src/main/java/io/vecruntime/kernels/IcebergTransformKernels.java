@@ -151,6 +151,85 @@ public final class IcebergTransformKernels {
         }
     }
 
+    /**
+     * The byte length of the first {@code codePoints} Unicode code points of a
+     * valid UTF-8 byte string of {@code len} bytes starting at {@code start}:
+     * Iceberg's {@code UnicodeUtil.truncateString}, which truncates by code
+     * point, not byte or {@code char}. A 4-byte sequence (a code point above
+     * the BMP, a surrogate pair in UTF-16) counts as one. A code point starts
+     * at every byte that is not a UTF-8 continuation byte ({@code (b & 0xC0) !=
+     * 0x80}); the result is {@code len} when the string has at most {@code
+     * codePoints} of them.
+     */
+    public static int truncateUtf8ByteLength(MemorySegment s, long start, int len,
+            int codePoints) {
+        int seen = 0;
+        int i = 0;
+        while (i < len) {
+            int b = s.get(java.lang.foreign.ValueLayout.JAVA_BYTE, start + i) & 0xff;
+            if ((b & 0xC0) != 0x80) {
+                // A lead byte: the start of a new code point.
+                if (seen == codePoints) {
+                    return i;
+                }
+                seen++;
+            }
+            i++;
+        }
+        return len;
+    }
+
+    /**
+     * {@code value - floorMod(value, w)} on a 128-bit two's complement unscaled
+     * decimal {@code (hi, lo)}, as Iceberg's {@code TruncateUtil} truncates a
+     * {@code BigInteger} unscaled value: the result into {@code out[2]} as
+     * {@code {hi, lo}}. {@code w} is a positive int (Iceberg's truncate width).
+     */
+    public static void truncateDecimal128(long hi, long lo, int w,
+            long[] out) {
+        // r = value mod w, in [0, w); result = value - r. 128-bit value, small positive w: compute value % w
+        // by processing the two's-complement magnitude, then adjust sign to a non-negative remainder.
+        long rem = mod128(hi, lo, w); // in [0, w)
+        // result = value - rem (128-bit subtract)
+        long newLo = lo - rem;
+        long borrow = Long.compareUnsigned(lo, rem) < 0 ? 1L : 0L;
+        long newHi = hi - borrow;
+        out[0] = newHi;
+        out[1] = newLo;
+    }
+
+    /**
+     * {@code floorMod(value, w)} for a 128-bit two's complement {@code (hi,
+     * lo)} and a positive {@code w}, result in {@code [0, w)}.
+     */
+    private static long mod128(long hi, long lo, int w) {
+        boolean negative = hi < 0;
+        long uhi = hi;
+        long ulo = lo;
+        if (negative) {
+            // magnitude = -(value): two's complement negate
+            ulo = ~lo + 1;
+            uhi = ~hi + (ulo == 0 ? 1 : 0);
+        }
+        // Unsigned 128-bit mod small w: fold the high limb's remainder into the low, limb by limb in base 2^32.
+        long wl = w & 0xffffffffL;
+        long r = 0;
+        for (int limb = 3; limb >= 0; limb--) {
+            long part = switch (limb) {
+                case 3 -> uhi >>> 32;
+                case 2 -> uhi & 0xffffffffL;
+                case 1 -> ulo >>> 32;
+                default -> ulo & 0xffffffffL;
+            };
+            r = ((r << 32) | part) % wl;
+        }
+        long rmag = r; // magnitude mod w, in [0, w)
+        if (negative && rmag != 0) {
+            rmag = wl - rmag; // floorMod of a negative value
+        }
+        return rmag;
+    }
+
     // ---------------------------------------------------------------- bucket
 
     /**
@@ -202,12 +281,92 @@ public final class IcebergTransformKernels {
     }
 
     /**
-     * Bucket hash of a decimal: Murmur3 of the unscaled value's minimal
-     * big-endian two's-complement bytes ({@code BigInteger.toByteArray}).
+     * Bucket hash of a decimal whose unscaled value fits in a {@code long}
+     * (precision up to 18): Murmur3 of the unscaled value's minimal
+     * two's-complement big-endian bytes, as Iceberg's {@code
+     * BucketUtil.hash(BigDecimal)} hashes {@code
+     * unscaledValue().toByteArray()}. The bytes are formed from the limb
+     * directly, without a {@link BigInteger} or a {@code byte[]} per row.
      */
     public static int hashDecimal(long unscaled) {
-        return hashBytes(BigInteger.valueOf(unscaled)
-                .toByteArray());
+        return hashDecimal128(unscaled < 0 ? -1L : 0L, unscaled);
+    }
+
+    /**
+     * Bucket hash of a decimal whose unscaled value is the 128-bit two's
+     * complement integer {@code (hi, lo)} (a wider decimal, up to 38 digits):
+     * Murmur3 of its minimal two's-complement big-endian bytes, matching
+     * Iceberg's {@code BucketUtil.hash(BigDecimal)} byte for byte. No {@link
+     * BigInteger} and no per-row allocation: the bytes are read straight from
+     * the limbs.
+     */
+    public static int hashDecimal128(long hi, long lo) {
+        int len = minimalTwosComplementLength(hi, lo);
+        // Murmur3 over the big-endian bytes, most significant first, four at a time as hashBytes does but
+        // reading the bytes out of the limbs rather than a materialised array.
+        int h = 0;
+        int body = len & ~3;
+        int i = 0;
+        for (; i < body; i += 4) {
+            int b0 = twosComplementByte(hi, lo, len, i);
+            int b1 = twosComplementByte(hi, lo, len, i + 1);
+            int b2 = twosComplementByte(hi, lo, len, i + 2);
+            int b3 = twosComplementByte(hi, lo, len, i + 3);
+            // hashBytes reads each 4-byte block little-endian out of the byte string.
+            int k = (b0 & 0xff)
+                    | (b1 & 0xff) << 8
+                    | (b2 & 0xff) << 16
+                    | (b3 & 0xff) << 24;
+            h = mixH1(h, mixK1(k));
+        }
+        int tail = len & 3;
+        if (tail > 0) {
+            int k = 0;
+            if (tail == 3) {
+                k ^= (twosComplementByte(hi, lo, len, body + 2) & 0xff) << 16;
+            }
+            if (tail >= 2) {
+                k ^= (twosComplementByte(hi, lo, len, body + 1) & 0xff) << 8;
+            }
+            k ^= twosComplementByte(hi, lo, len, body) & 0xff;
+            h ^= mixK1(k);
+        }
+        return fmix(h, len);
+    }
+
+    /**
+     * The number of bytes {@code BigInteger.toByteArray()} produces for the
+     * 128-bit two's complement integer {@code (hi, lo)}: the minimal
+     * big-endian two's-complement form, at least one byte, with one leading
+     * sign byte whenever the high bit of the most significant magnitude byte
+     * would otherwise flip the sign.
+     */
+    static int minimalTwosComplementLength(long hi, long lo) {
+        if (hi == 0 && lo == 0) {
+            return 1;
+        }
+        if (hi >= 0) {
+            // Non-negative: drop leading 0x00 bytes, but keep one if the top magnitude bit is set.
+            int bits = hi != 0 ? 128 - Long.numberOfLeadingZeros(hi) : 64 - Long.numberOfLeadingZeros(lo);
+            return bits / 8 + 1; // always a leading 0x00 sign byte for the top set bit of a positive value
+        }
+        // Negative: drop leading 0xFF bytes, but keep one if the top magnitude bit is clear.
+        int bits = hi != -1L ? 128 - Long.numberOfLeadingZeros(~hi) : 64 - Long.numberOfLeadingZeros(~lo);
+        return bits / 8 + 1;
+    }
+
+    /**
+     * Byte {@code i} (from the most significant, {@code 0}-based) of the
+     * {@code len}-byte minimal two's-complement big-endian form of {@code (hi,
+     * lo)}.
+     */
+    private static int twosComplementByte(long hi, long lo, int len,
+            int i) {
+        // Big-endian byte i counts from the top; its distance from the least significant byte is len-1-i.
+        int fromLsb = len - 1 - i;
+        long limb = fromLsb < 8 ? lo : hi;
+        int shift = (fromLsb & 7) << 3;
+        return (int) (limb >>> shift) & 0xff;
     }
 
     /**
@@ -237,6 +396,38 @@ public final class IcebergTransformKernels {
         int rows = a.length();
         for (int i = 0; i < rows; i++) {
             out.setAtIndex(VectorBuffers.LE_INT, i, bucket(hashDecimal(d.getAtIndex(VectorBuffers.LE_LONG, i)), n));
+        }
+    }
+
+    /**
+     * {@code out[i] = bucket(a[i], n)} over a {@link VecType#DECIMAL128} lane of
+     * decimal unscaled values (precision up to 38), hashed from the two limbs
+     * with no {@code BigInteger}.
+     */
+    public static void bucketDecimal128(VectorBuffers a, int n, MemorySegment out) {
+        MemorySegment d = a.data();
+        int rows = a.length();
+        for (int i = 0; i < rows; i++) {
+            out.setAtIndex(
+                    VectorBuffers.LE_INT,
+                    i,
+                    bucket(hashDecimal128(Decimal128.hi(d, i), Decimal128.lo(d, i)),
+                            n));
+        }
+    }
+
+    /**
+     * {@code out[i] = bucket(a[i], n)} over a {@link VecType#FIXED_BINARY} lane
+     * of {@code width}-byte values (Iceberg's {@code fixed(L)} and {@code
+     * uuid}, which the write side holds as FixedSizeBinary). A null slot's
+     * bytes are unspecified; the caller keeps the input's validity.
+     */
+    public static void bucketFixed(VectorBuffers a, int width, int n,
+            MemorySegment out) {
+        MemorySegment d = a.data();
+        int rows = a.length();
+        for (int i = 0; i < rows; i++) {
+            out.setAtIndex(VectorBuffers.LE_INT, i, bucket(hashBytes(d, (long) i * width, width), n));
         }
     }
 

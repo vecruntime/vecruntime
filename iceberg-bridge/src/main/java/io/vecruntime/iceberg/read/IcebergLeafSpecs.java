@@ -123,8 +123,19 @@ public final class IcebergLeafSpecs {
                         : null;
             case DECIMAL:
                 return decimal((Types.DecimalType) expected, stored);
+            case UUID:
+                // A uuid is stored as FIXED_LEN_BYTE_ARRAY(16) with the UUID logical type; read onto the UTF8 lane
+                // and formatted into the canonical lowercase text at the Spark boundary (#rtypes). Iceberg maps it
+                // to Spark's StringType, so this matches the Spark adapter's spec for that StringType.
+                return p == PrimitiveTypeName.FIXED_LEN_BYTE_ARRAY && stored.getTypeLength() == 16
+                        ? LeafReadSpec.onLane(VecType.UTF8)
+                                .uuid(true)
+                                .arrowType(ArrowType.Utf8.INSTANCE)
+                                .build()
+                        : null;
             default:
-                // time, uuid, timestamp_ns, variant, geometry, unknown: Iceberg's reader.
+                // time, timestamp_ns, variant, geometry, unknown: Iceberg's reader (unknown is produced as a null
+                // column by the resolver, never a leaf).
                 return null;
         }
     }

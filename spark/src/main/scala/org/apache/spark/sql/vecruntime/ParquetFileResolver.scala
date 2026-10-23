@@ -41,6 +41,13 @@ object ParquetFileResolver {
   /** #901 R2: the batches whose equality deletes were probed on their lanes (read by tests). */
   val nativeEqualityBatches = new java.util.concurrent.atomic.AtomicLong()
 
+  /**
+   * #rtypes: how many times Iceberg's own `BaseDeleteLoader.loadEqualityDeletes` was invoked to load an equality
+   * delete group into a `StructLikeSet` (read by tests). The native probe reads the delete files itself and must
+   * NOT trigger this; it bumps only when the row-probe fallback actually needs Iceberg's set.
+   */
+  val icebergEqualityLoads = new java.util.concurrent.atomic.AtomicLong()
+
   private val IcebergResolver = "io.vecruntime.iceberg.spark.SparkParquetFileResolver"
 
   /**

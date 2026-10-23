@@ -85,6 +85,9 @@ public class LeafColumnReader implements ColumnReader, RowLevels {
     private final int narrowBits;
     // #900: FLOAT kept as its own 4-byte bits (a Float4Vector); a string whose dictionary batches may be ids.
     private final boolean float32;
+    // A uuid: a FIXED_LEN_BYTE_ARRAY(16) staged on the UTF8 path whose 16 big-endian bytes are formatted into the
+    // canonical lowercase 8-4-4-4-12 text at flush, as Iceberg's Spark reader produces it.
+    private final boolean uuid;
     private final boolean dictionaryIdsAllowed;
     // #900: the Arrow type of this leaf's batch vectors (the spec's), so vectors are made without the Spark type.
     private final org.apache.arrow.vector.types.pojo.ArrowType arrowType;
@@ -203,6 +206,7 @@ public class LeafColumnReader implements ColumnReader, RowLevels {
         this.narrowBits = spec.narrowBits;
         this.millis = spec.millis;
         this.float32 = spec.float32;
+        this.uuid = spec.uuid;
         this.dictionaryIdsAllowed = spec.dictionaryIdsAllowed;
         this.arrowType = spec.arrowType();
         // Dictionary scratch is GC-managed: closing a shared Arena runs a JVM-wide handshake that walks every
@@ -470,7 +474,9 @@ public class LeafColumnReader implements ColumnReader, RowLevels {
             forRanges(n, decoder::readBatch);
             boolean nulls = decoder.batchNullCount() > 0;
             if (type == VecType.UTF8) {
-                return decoder.batchIsDictionaryIds() ? flushIds(n, nulls) : flushUtf8(n, nulls);
+                return decoder.batchIsDictionaryIds()
+                        ? flushIds(n, nulls)
+                        : uuid ? flushUuid(n, nulls) : flushUtf8(n, nulls);
             }
             return int96
                     ? flushInt96(n, nulls)
@@ -702,7 +708,7 @@ public class LeafColumnReader implements ColumnReader, RowLevels {
             if (decoder.batchIsDictionaryIds()) {
                 return flushIds(n, decoder.batchNullCount() > 0);
             }
-            return flushUtf8(n, decoder.batchNullCount() > 0);
+            return uuid ? flushUuid(n, decoder.batchNullCount() > 0) : flushUtf8(n, decoder.batchNullCount() > 0);
         }
         if (type == VecType.BOOL || binaryDecimal || int96) {
             int filled = 0;
@@ -1089,7 +1095,9 @@ public class LeafColumnReader implements ColumnReader, RowLevels {
         boolean nulls = decoder.batchNullCount() > 0;
         if (type == VecType.UTF8) {
             // #568: a list's or map's strings are dictionary ids too, where the leaf allows it (#612).
-            return decoder.batchIsDictionaryIds() ? flushIds(elements, nulls) : flushUtf8(elements, nulls);
+            return decoder.batchIsDictionaryIds()
+                    ? flushIds(elements, nulls)
+                    : uuid ? flushUuid(elements, nulls) : flushUtf8(elements, nulls);
         }
         if (staged) {
             return int96
@@ -1183,7 +1191,9 @@ public class LeafColumnReader implements ColumnReader, RowLevels {
                     (sel, len, at) -> sel ? decoder.readBatch(len, at) : decoder.skipIntoBatch(len, at));
             boolean nulls = decoder.batchNullCount() > 0;
             if (type == VecType.UTF8) {
-                return decoder.batchIsDictionaryIds() ? flushIds(n, nulls) : flushUtf8(n, nulls);
+                return decoder.batchIsDictionaryIds()
+                        ? flushIds(n, nulls)
+                        : uuid ? flushUuid(n, nulls) : flushUtf8(n, nulls);
             }
             return int96
                     ? flushInt96(n, nulls)
@@ -1485,6 +1495,15 @@ public class LeafColumnReader implements ColumnReader, RowLevels {
                 hasNulls ? out.validity() : null);
         ArrowWrite.finish(out, rows, !hasNulls);
         return v;
+    }
+
+    /**
+     * A uuid batch: the staged 16-byte values formatted into canonical text,
+     * then emitted as the UTF8 batch of that text.
+     */
+    private FieldVector flushUuid(int rows, boolean hasNulls) {
+        decoder.toUuidText(rows, null);
+        return flushUtf8(rows, hasNulls);
     }
 
     private FieldVector flushUtf8(int rows, boolean hasNulls) {
