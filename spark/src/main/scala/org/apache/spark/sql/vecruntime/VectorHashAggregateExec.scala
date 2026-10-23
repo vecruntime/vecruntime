@@ -411,8 +411,9 @@ private[vecruntime] class VectorUngroupedAggregateIterator(
 /**
  * A grouped aggregate's table in Spark's on-heap execution memory (#367): the estimate is acquired from the task's
  * share of the pool as the table grows, and a refusal -- the executor's tasks share it fairly -- is what triggers
- * the emit or the spill, with the configured threshold as a hard cap. Nothing is spilled on another consumer's
- * request (#875 counts it as pinned).
+ * the emit or the spill, with the configured threshold as a hard cap. Another consumer's request reaches the
+ * aggregate through [[setSpillHandler]] (#875): a grace-hash aggregate between two input batches spills its table
+ * to its buckets and returns what it held; anything else gives nothing back and is counted as pinned.
  *
  * #886: returning the reservation on every reset let another task take it, and the regrowing table was refused
  * again a few batches later -- q67 at 10 TB on a 20g heap emitted 19 billion groups early (50 million on 30g), which
@@ -424,10 +425,30 @@ private[vecruntime] final class AggregateMemory(minRefusalBytes: Long = Aggregat
   private val consumer: org.apache.spark.memory.MemoryConsumer = Option(TaskContext.get()).map { tc =>
     val tmm = tc.taskMemoryManager()
     new org.apache.spark.memory.MemoryConsumer(tmm, tmm.pageSizeBytes(), org.apache.spark.memory.MemoryMode.ON_HEAP) {
-      override def spill(size: Long, trigger: org.apache.spark.memory.MemoryConsumer): Long = 0L
+      override def spill(size: Long, trigger: org.apache.spark.memory.MemoryConsumer): Long = {
+        val h = handler
+        // Its own acquire never spills itself: the aggregate is mid-batch then, and decides on its own.
+        if (h == null || (trigger eq this)) 0L else h()
+      }
     }
   }.orNull
   private var reserved = 0L
+  @volatile private var handler: () => Long = _
+
+  /**
+   * #875: what to do when another consumer of the task asks for memory -- the aggregate's own decision whether it
+   * can give its table back now. It returns the bytes it gave back, through [[giveBack]].
+   */
+  def setSpillHandler(h: () => Long): Unit = handler = h
+
+  /** Returns the whole reservation to the pool (the table it covered is gone); the bytes returned. */
+  def giveBack(): Long =
+    if (consumer == null || reserved <= 0) 0L
+    else {
+      val r = reserved
+      consumer.freeMemory(r); PinnedMemory.add(-r); reserved = 0L
+      r
+    }
 
   /** The bytes held in the pool. */
   def held: Long = reserved
@@ -469,7 +490,8 @@ private[vecruntime] class VectorGroupedAggregateIterator(
     metrics: VectorMetrics,
     policy: AggSpillPolicy = AggSpillPolicy.InMemory,
     spillMetrics: Option[(SQLMetric, SQLMetric)] = None,
-    dictionaryStrings: Boolean = true
+    dictionaryStrings: Boolean = true,
+    requestFloor: Long = AggregateMemory.DefaultMinRefusalBytes
 ) extends RollupLevel {
 
   private val OutputBatchSize = 4096
@@ -574,6 +596,42 @@ private[vecruntime] class VectorGroupedAggregateIterator(
   // Spark's execution memory as the arbiter (#367, #886): see [[AggregateMemory]].
   private val memory = new AggregateMemory()
 
+  /**
+   * #875: spill on another consumer's request. The table changes only under `tableLock`, which `fill` holds
+   * from one input batch's arrival until it is consumed; `atBoundary` says the task thread is between two
+   * batches -- pulling the next one from the input, which is where a consumer below (a sort, a join's build)
+   * asks for memory. A request takes the lock with `tryLock`, never waits: the task's memory manager holds its
+   * own lock while it asks, and the table may ask that manager for memory while it consumes a batch, so a
+   * request from another thread of the task (a scan's read-ahead) during a consume gets nothing rather than
+   * deadlocking. Only a grace-hash aggregate's first phase can give back: its table goes to its buckets and is
+   * merged with them in the second phase, as a spill past its own budget is. A reservation below `requestFloor`
+   * is not worth a spill file (a table that small regrows at once).
+   */
+  private val tableLock = new java.util.concurrent.locks.ReentrantLock()
+  @volatile private var atBoundary = false
+  @volatile private var requestSpills = 0
+
+  /** Package-private, for the tests: how many tables were spilled on another consumer's request. */
+  private[vecruntime] def spillsOnRequest: Int = requestSpills
+
+  memory.setSpillHandler(() => spillOnRequest())
+
+  private def spillOnRequest(): Long = {
+    if (!tableLock.tryLock()) return 0L
+    try {
+      if (!atBoundary || inputDone || closed || memory.held < requestFloor || table.size() == 0) 0L
+      else
+        policy match {
+          case AggSpillPolicy.GraceHash(_, buckets) =>
+            spillTable(buckets)
+            reset()
+            requestSpills += 1
+            memory.giveBack()
+          case _ => 0L
+        }
+    } finally tableLock.unlock()
+  }
+
   /** Whether the table has outgrown its budget: the cap, or what Spark's pool grants this task. */
   private def overBudget(budget: Long): Boolean = memory.overBudget(estimatedBytes, budget)
 
@@ -640,20 +698,37 @@ private[vecruntime] class VectorGroupedAggregateIterator(
   private var probed = probeRows <= 0
 
   /** Consumes `source` into the table until it is exhausted (true) or the table passes `budget` (false; 0 = no budget). */
-  private def fill(source: Iterator[ColumnarBatch], budget: Long): Boolean = {
-    while (source.hasNext) {
-      val batch = source.next()
-      fillRows += batch.numRows()
-      consume(batch)
-      if (passThrough) return !source.hasNext
+  private def fill(source: Iterator[ColumnarBatch], budget: Long): Boolean =
+    try fillBatches(source, budget)
+    finally {
+      // A request that saw the last pull's boundary finishes before the caller touches the table (#875).
+      tableLock.lock(); tableLock.unlock()
+    }
+
+  private def fillBatches(source: Iterator[ColumnarBatch], budget: Long): Boolean = {
+    while (pull(source.hasNext)) {
+      val batch = pull(source.next())
+      tableLock.lock()
+      try {
+        fillRows += batch.numRows()
+        consume(batch)
+      } finally tableLock.unlock()
+      if (passThrough) return !pull(source.hasNext)
       if (!probed && fillRows >= probeRows) {
         probed = true
         // A table out now is judged by `advance` as one past the budget: not reduced, the rest passes through.
-        if (source.hasNext) return false
+        if (pull(source.hasNext)) return false
       }
       if (budget > 0 && overBudget(budget)) return false
     }
     true
+  }
+
+  /** The input pulled between two batches: the one place another consumer's request may spill the table (#875). */
+  private def pull[T](f: => T): T = {
+    atBoundary = true
+    try f
+    finally atBoundary = false
   }
 
   private def reset(): Unit = {
