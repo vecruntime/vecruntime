@@ -243,6 +243,37 @@ Per step:
 
 `spark.vecruntime.explainFallback.enabled=true` logs the reason for each declined write.
 
+### Row-level operation modes
+
+A row-level command (`DELETE`, `UPDATE`, `MERGE`) runs in one of two modes, chosen per command by the table
+properties `write.delete.mode`, `write.update.mode` and `write.merge.mode`, each `copy-on-write` or
+`merge-on-read`. We honour the table's mode exactly, on both format version 2 and version 3, and each command
+independently -- a table may set `write.delete.mode=merge-on-read` and `write.update.mode=copy-on-write` at the
+same time, and each command follows its own property.
+
+We never decide the mode ourselves. Spark's optimizer, driven by Iceberg's `SparkRowLevelOperationBuilder`,
+turns the mode property into the plan: a `ReplaceData` for copy-on-write (its rewritten data files replace the
+touched ones, and no delete files are written) and a `WriteDelta` for merge-on-read (the deletes are written as
+delete files beside the unchanged data). Our two planner strategies route only on that node type plus our
+feature flags -- `VectorIcebergWriteStrategy` takes `ReplaceData`, `VectorWriteDeltaStrategy` takes
+`WriteDelta` -- so the mode the table asks for is always the mode that runs.
+
+- **Defaults when unset (Iceberg 1.12):** every command defaults to `copy-on-write` on both v2 and v3, and
+  `write.delete.granularity` defaults to `partition`. We read the defaults from Iceberg (`TableProperties`), so
+  an unset table behaves exactly as Iceberg's own writer would.
+- **Overrides:** Iceberg 1.12 exposes no Spark write-option or session-conf override for the mode itself (there
+  is no `spark.sql.iceberg.*` mode key, and `SparkWriteConf` has no `deleteMode`/`updateMode`/`mergeMode`), so
+  the mode comes only from the table property. The granularity, the delete file format and the delete-file
+  Parquet properties, which Iceberg does resolve on the write's `SparkWriteConf`, we read back from the write's
+  own resolved context (`useDVs`, `deleteGranularity`, `deleteFileFormat`) rather than recomputing them -- so a
+  write option that influences them is honoured.
+- **v2 vs v3 delete-file format (merge-on-read):** on a v2 table the deletes are written as Parquet **position
+  delete files**, at the table's `write.delete.granularity` (`partition`: one delete file per partition;
+  `file`: one per data file, naming the data file it covers). On a v3 table the deletes are written as
+  **deletion vectors** (Puffin), at most one deletion vector per data file, merging any previously committed
+  deletion vector for that file. Which of the two a write uses is Iceberg's decision (`useDVs`, which is v3's
+  Puffin delete format); we follow it.
+
 ### Table properties
 
 | Property | Honoured |
@@ -320,9 +351,13 @@ The partitioned (hash) append, the read A/B for #920, and a CDC `MERGE` A/B for 
 
 A copy-on-write `DELETE` / `UPDATE` / `MERGE` rewrites a whole data file today: every row group is decoded,
 filtered and re-encoded through the columnar writer, even the groups the change never touches. M4 copies the
-bytes that do not change and encodes only the rest. **M4a** is the first step: in a copy-on-write `DELETE`, a row
-group with no deleted rows is copied byte for byte into the new file; only a group with at least one deleted row
-is decoded, filtered and re-encoded.
+bytes that do not change and encodes only the rest. **M4a** copies whole row groups in a copy-on-write `DELETE`:
+a row group with no deleted rows is copied byte for byte into the new file; only a group with at least one
+deleted row is decoded, filtered and re-encoded. On a **format v3** table whose source file does not materialise
+row lineage, the data column chunks are copied byte for byte and only the two lineage columns (`_row_id`,
+`_last_updated_sequence_number`) are freshly encoded from the values the scan resolved per surviving row (the
+DELETE keeps them). **M4b** extends this to copy-on-write `UPDATE`: the columns the `SET` assignments do not
+change are copied byte for byte and only the changed columns (and the v3 lineage) are re-encoded.
 
 The primitive is on the writer. `ColumnarParquetWriter` sits on parquet-java's `ParquetFileWriter`, whose
 `appendRowGroup(SeekableInputStream, BlockMetaData, dropColumnIndexes=false)` (parquet-java 1.16) copies a
@@ -380,7 +415,28 @@ some / all groups, group ranges, schema-evolution and NaN-metrics fallback) and 
 `VectorCopyUnchangedDeleteSuite` (v2/v3, partitioned/unpartitioned, data + within-table lineage + per-file
 metrics oracle).
 
-Column-chunk copying for `UPDATE` / matched-only `MERGE` (M4b) and `rewrite_data_files` (M4c) follow.
+**M4b: column-chunk copy for copy-on-write `UPDATE`.** An `UPDATE` rewrites every row in place (no rows dropped
+or inserted), so every row group is fully present in source order and eligible. The writer's mixed-group
+primitive `ColumnarParquetWriter.copyRowGroupColumns(reader, source, sourceBlock, copy[], encodedRuns,
+rowCount)` writes one row group that copies the chunks a per-column mask marks (via
+`ParquetFileWriter.appendColumnChunk`, keeping each chunk's codec, statistics, column index, offset index and
+Bloom filter -- a nested copied column copies all its leaf chunks) and encodes the rest from the batch's new
+values. The changed columns are derived at plan time: `VectorIcebergWriteStrategy.updateEncodeMask` reads the
+`ReplaceData` rewrite plan -- the assignment `Project` over the scan, whose per-column value is a bare
+pass-through attribute (untouched), `If(cond, newValue, oldAttr)` (conditional assignment) or a computed
+expression (changed) -- and classifies a column as untouched iff, in every branch, its value is the scan
+attribute of the same name. An unrecognised plan shape, a changed **nested** column (the mixed-group writer
+encodes only flat columns), or a changed **partition** column (a row may move partition) all fall back to the
+full rewrite. The copied columns keep the **source** field's repetition (a `REQUIRED` source chunk's level-free
+pages stay valid), the encoded columns use the write schema; v3 lineage is always re-encoded (an updated row
+keeps `_row_id` and gets a new `_last_updated_sequence_number`, matching Iceberg 1.12). Metrics and the NaN
+fallback are the same as M4a. `MERGE` is **not** eligible: its rewrite is a `MergeRows` that does not carry
+`_pos`, so the per-row source position the copy path needs is unavailable, and it takes the full rewrite.
+Covered by `VectorCopyUnchangedUpdateSuite` (v2/v3, partitioned/unpartitioned, update one / several / all
+columns, self-assignment, a nested-column and a partition-column fallback, and the MERGE fallback) with the same
+data + lineage + metrics oracle.
+
+Column-chunk copying for `rewrite_data_files` (M4c) follows.
 
 ## The write side: columnar v3 deletion vectors (#20)
 
