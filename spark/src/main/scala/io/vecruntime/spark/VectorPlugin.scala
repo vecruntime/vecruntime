@@ -80,6 +80,7 @@ class VectorPlugin extends SparkPlugin {
         VectorConf.nativePoolThreadCacheMaxBlockBytes(ctx.conf())
       )
       io.vecruntime.spark.arrow.VectorAllocators.useNativePool(VectorConf.arrowNativePoolEnabled(ctx.conf()))
+      io.vecruntime.kernels.GroupedAccumulators.setNativeState(VectorConf.aggNativeState(ctx.conf())) // #941
       // #868: the executor's Arrow budget, and its use as executor metrics (current and peak bytes) for sizing it.
       io.vecruntime.spark.arrow.VectorAllocators.setLimit(VectorConf.arrowMaxBytes(ctx.conf()))
       ctx.metricRegistry().register(

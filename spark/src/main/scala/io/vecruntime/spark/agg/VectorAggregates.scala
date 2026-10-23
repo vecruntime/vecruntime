@@ -81,6 +81,19 @@ trait GroupedAggState {
    * the lane accumulators spill the same buffer they emit, so the default forwards to [[bufferValue]].
    */
   def spillValue(g: Int, slot: Int): Any = bufferValue(g, slot)
+
+  /**
+   * Gives back what this state holds outside the heap (#941: accumulators in pool segments). The
+   * operator calls it once, when it drops the state -- a reset after a spill or emit, and close --
+   * and never touches the state afterwards. The heap accumulators hold nothing to give back.
+   */
+  def close(): Unit = ()
+
+  /**
+   * Bytes this state holds in pool blocks (#941): charged to the task's account by the pool, so the
+   * operator leaves them out of its on-heap estimate. 0 for state on the heap.
+   */
+  def nativeBytes: Long = 0L
 }
 
 /** Serializable description of a supported aggregate function; states are created per task. */
@@ -150,6 +163,8 @@ final case class SumLongAgg(input: VectorExpr, checked: Boolean, queryContext: o
   }
   override def newGroupedState(): GroupedAggState = new GroupedAggState {
     private val acc = new GroupedAccumulators.LongSum(checked)
+    override def close(): Unit = acc.close()
+    override def nativeBytes: Long = acc.nativeBytes()
     override def update(ctx: EvalContext, groups: GroupAssignment): Unit =
       try acc.update(input.eval(ctx), groups)
       catch { case _: ArithmeticException => overflow() }
@@ -347,6 +362,8 @@ final case class WideDecimalSumAgg(
   }
   override def newGroupedState(): GroupedAggState = new GroupedAggState {
     private val acc = new GroupedAccumulators.WideLongSum
+    override def close(): Unit = acc.close()
+    override def nativeBytes: Long = acc.nativeBytes()
     private val extra = new Escalation
     override def update(ctx: EvalContext, groups: GroupAssignment): Unit = {
       val ids = groups.ids()
@@ -465,6 +482,8 @@ final case class WideDecimalAvgAgg(
   }
   override def newGroupedState(): GroupedAggState = new GroupedAggState {
     private val acc = new GroupedAccumulators.WideLongSum
+    override def close(): Unit = acc.close()
+    override def nativeBytes: Long = acc.nativeBytes()
     private val extra = new Escalation
     override def update(ctx: EvalContext, groups: GroupAssignment): Unit = {
       val ids = groups.ids()
@@ -896,6 +915,8 @@ final case class CountAgg(input: Option[VectorExpr]) extends VectorAggFunction {
   }
   override def newGroupedState(): GroupedAggState = new GroupedAggState {
     private val acc = new GroupedAccumulators.Count
+    override def close(): Unit = acc.close()
+    override def nativeBytes: Long = acc.nativeBytes()
     override def update(ctx: EvalContext, groups: GroupAssignment): Unit = input match {
       case None => acc.updateAll(groups)
       case Some(e) => acc.updateNonNull(e.eval(ctx), groups)
@@ -1030,6 +1051,8 @@ final case class CountMergeAgg(count: VectorExpr) extends VectorAggFunction {
   }
   override def newGroupedState(): GroupedAggState = new GroupedAggState {
     private val acc = new GroupedAccumulators.LongSum
+    override def close(): Unit = acc.close()
+    override def nativeBytes: Long = acc.nativeBytes()
     override def update(ctx: EvalContext, groups: GroupAssignment): Unit = acc.update(count.eval(ctx), groups)
     override def bufferValue(g: Int, slot: Int): Any = java.lang.Long.valueOf(acc.sum(g))
   }
@@ -1055,6 +1078,8 @@ final case class AverageMergeAgg(sum: VectorExpr, count: VectorExpr, strict: Boo
   override def newGroupedState(): GroupedAggState = new GroupedAggState {
     private val sums = new GroupedAccumulators.DoubleSum(strict)
     private val counts = new GroupedAccumulators.LongSum
+    override def close(): Unit = counts.close()
+    override def nativeBytes: Long = counts.nativeBytes()
     override def update(ctx: EvalContext, groups: GroupAssignment): Unit = {
       sums.update(sum.eval(ctx), groups)
       counts.update(count.eval(ctx), groups)

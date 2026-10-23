@@ -1328,6 +1328,10 @@ private[vecruntime] class VectorWindowAggregateIterator(
       ready.clear()
       held.foreach(_.columns.foreach(_.close()))
       held.clear()
+      states.foreach(s =>
+        try s.close()
+        catch { case _: Exception => }
+      ) // #941
       allocator.close()
       memory.releaseTo(0L)
     }
