@@ -36,17 +36,34 @@ import org.apache.spark.sql.vecruntime.ParquetFileResolver
  * the file does not use, which the reader reads as nulls or the column's existence default. A requested column
  * without a field id (the reader's row-index column) is such a missing field too.
  */
-final class SparkParquetFileResolver(tableSchema: Object, nameMappingJson: String) extends ParquetFileResolver {
+final class SparkParquetFileResolver(
+    tableSchema: Object,
+    nameMappingJson: String,
+    historySchemas: java.util.List[Object]
+) extends ParquetFileResolver {
+
+  // Secondary constructor so existing callers that pass no history keep working.
+  def this(tableSchema: Object, nameMappingJson: String) =
+    this(tableSchema, nameMappingJson, java.util.Collections.emptyList())
 
   private val schema = tableSchema.asInstanceOf[Schema]
+  // Superseded schemas (newest first): where a since-dropped equality-delete key column still lives.
+  private val history: Seq[Schema] =
+    if (historySchemas == null) Seq.empty else historySchemas.asScala.toSeq.map(_.asInstanceOf[Schema])
   @transient private lazy val mapping: NameMapping =
     if (nameMappingJson == null) null else NameMappingParser.fromJson(nameMappingJson)
   @transient private lazy val converter = new SparkToParquetSchemaConverter()
 
+  /** `id` resolved against the current schema first, then the schema history (a dropped column). */
+  private def fieldInHistory(id: Int): Option[Types.NestedField] =
+    SparkParquetFileResolver.fieldOf(schema, id).orElse(history.iterator.flatMap(s => Option(s.findField(id))).find(_ =>
+      true
+    ))
+
   override def clip(file: MessageType, requested: StructType): Either[String, ParquetFileResolver.Resolved] = {
     val projected = requested.fields.toSeq.map(f => SparkParquetFileResolver.idOf(f).map(id => (f, id)))
     val fields = projected.flatten.map { case (f, id) =>
-      SparkParquetFileResolver.fieldOf(schema, id) match {
+      fieldInHistory(id) match {
         case Some(ice) => project(ice, f.dataType)
         case None => Left(s"column ${f.name}: no field $id in the table schema")
       }
