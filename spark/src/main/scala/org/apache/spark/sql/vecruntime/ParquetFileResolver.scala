@@ -48,6 +48,13 @@ object ParquetFileResolver {
    */
   val icebergEqualityLoads = new java.util.concurrent.atomic.AtomicLong()
 
+  /**
+   * #shading: how many times the native equality-delete reader was unusable against the Iceberg on the classpath
+   * (a shaded-vs-unshaded Parquet `MessageType` mismatch, or an absent/reshaped generic-reader API) and the scan
+   * fell back to Iceberg's own `BaseDeleteLoader` row probe (read by tests). Zero on a matched classpath.
+   */
+  val nativeEqualityFallbacks = new java.util.concurrent.atomic.AtomicLong()
+
   private val IcebergResolver = "io.vecruntime.iceberg.spark.SparkParquetFileResolver"
 
   /**
