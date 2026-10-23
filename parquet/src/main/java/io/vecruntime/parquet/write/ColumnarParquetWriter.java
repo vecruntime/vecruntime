@@ -300,6 +300,67 @@ public final class ColumnarParquetWriter implements AutoCloseable {
         }
     }
 
+    /**
+     * Copies one row group {@code block} of {@code source} into this file
+     * byte for byte, without decoding it (#901 M4a). The compressed pages are
+     * appended as they are, each chunk keeping its codec, statistics, column
+     * index, offset index and Bloom filter, through parquet-java's {@code
+     * ParquetFileWriter.appendRowGroup}. Any rows buffered in the open row
+     * group are flushed first, so copied and encoded groups keep their order
+     * in the file.
+     *
+     * <p>{@code source} must be positioned-readable for the life of the call
+     * and describe a file whose schema equals {@link #copyableFrom this
+     * writer's schema} (same columns, physical and logical types, repetition
+     * and field ids); the caller checks that with {@link #copyableFrom} and
+     * falls back to decoding the group when it does not hold. The copied
+     * group's statistics reach {@link #footer}, so a metrics builder combines
+     * them with the encoded groups' without reading the file again.
+     *
+     * @param source a seekable stream on the file the group comes from
+     * @param block the group's {@code BlockMetaData} from {@code source}'s
+     *     footer
+     */
+    public void copyRowGroup(org.apache.parquet.io.SeekableInputStream source, org.apache.parquet.hadoop.metadata.BlockMetaData block) throws IOException {
+        if (closed) {
+            throw new IllegalStateException("writer is closed");
+        }
+        flushRowGroup();
+        // dropColumnIndexes = false: keep each chunk's column index, offset index and Bloom filter.
+        file.appendRowGroup(source, block, false);
+        totalRows += block.getRowCount();
+    }
+
+    /**
+     * Whether a file with schema {@code fileSchema} can have its row groups
+     * copied into this file without decoding (#901 M4a): its columns must be
+     * exactly this writer's schema -- same names, order, physical and logical
+     * types, repetition and field ids -- so a copied chunk's pages and
+     * statistics are valid under this file's footer schema. A file that
+     * differs (schema evolution: a renamed, added, dropped, reordered or
+     * promoted column, a different field id) is not copyable and the caller
+     * rewrites it the normal way. The text form is the contract parquet-java
+     * uses between two schemas (see {@code fileSchema} in the Iceberg interop),
+     * and it carries the id and logical-type annotations.
+     */
+    public boolean copyableFrom(MessageType fileSchema) {
+        return schema.equals(fileSchema);
+    }
+
+    /**
+     * Ends the open row group now, if it holds any rows, cutting a row-group
+     * boundary at this point (#901 M4a). The M4a rewrite uses it so a group of
+     * re-encoded surviving rows is closed before a byte-for-byte copied group
+     * follows, keeping the groups separate and in order; {@link #copyRowGroup}
+     * calls it for the same reason. A no-op when the open group is empty.
+     */
+    public void endRowGroup() throws IOException {
+        if (closed) {
+            throw new IllegalStateException("writer is closed");
+        }
+        flushRowGroup();
+    }
+
     private void flushRowGroup() throws IOException {
         if (rowGroupRows == 0) {
             return;

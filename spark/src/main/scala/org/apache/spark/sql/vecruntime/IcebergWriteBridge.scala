@@ -69,6 +69,9 @@ object IcebergWriteBridge {
   /** Why the columnar writer cannot write `write`'s data files (None when it can). */
   def declineReason(write: Write): Option[String] = Option(static("declineReason", write).asInstanceOf[String])
 
+  /** Whether the write's output spec is unpartitioned (#901 M4a copies files one spec at a time). */
+  def isUnpartitioned(write: Write): Boolean = static("isUnpartitioned", write).asInstanceOf[Boolean]
+
   /** The top-level field names of the write's Iceberg write schema, in order. */
   def writeSchemaNames(write: Write): Array[String] = static("writeSchemaNames", write).asInstanceOf[Array[String]]
 
@@ -90,6 +93,39 @@ object IcebergWriteBridge {
     val ctor = c.getConstructors.find(_.getParameterCount == 4).get
     new IcebergDataTaskWriterHandle(
       ctor.newInstance(spec, Integer.valueOf(partitionId), java.lang.Long.valueOf(taskId), conf).asInstanceOf[AnyRef]
+    )
+  }
+
+  private val RewriteWriter = "io.vecruntime.iceberg.write.IcebergRewriteFileTaskWriter"
+  private lazy val rewriteWriter: Option[Class[_]] = load(RewriteWriter)
+
+  /**
+   * One task's copy-on-write DELETE rewrite writer (#901 M4a): it buffers the surviving rows by `_file` and, on
+   * close, copies each file's delete-free row groups and re-encodes the rest. Same `write`/`dataFiles`/`abort`
+   * shape as [[createTaskWriter]], plus the `_file` / `_pos` ordinals and the data columns' ordinals in the
+   * batch it is handed.
+   */
+  def createRewriteTaskWriter(
+      spec: AnyRef,
+      partitionId: Int,
+      taskId: Long,
+      conf: Configuration,
+      fileOrdinal: Int,
+      posOrdinal: Int,
+      dataOrdinals: Array[Int]
+  ): IcebergDataTaskWriterHandle = {
+    val c = rewriteWriter.getOrElse(throw new IllegalStateException("vecruntime: iceberg-bridge not on the classpath"))
+    val ctor = c.getConstructors.find(_.getParameterCount == 7).get
+    new IcebergDataTaskWriterHandle(
+      ctor.newInstance(
+        spec,
+        Integer.valueOf(partitionId),
+        java.lang.Long.valueOf(taskId),
+        conf,
+        Integer.valueOf(fileOrdinal),
+        Integer.valueOf(posOrdinal),
+        dataOrdinals
+      ).asInstanceOf[AnyRef]
     )
   }
 }

@@ -8,6 +8,11 @@ version may change configuration keys or defaults, always noted here.
 
 ### Added
 
+- Grouped aggregate state in the native pool (#941, `spark.vecruntime.agg.nativeState`, on by default): past 16,384
+  groups, the long sum, count and 128-bit decimal sum accumulators keep their state in one pool block each, a group's
+  fields side by side, charged to the task in the operators' memory mode, instead of `long[]` on the heap. At 10 TB
+  (26g heap, two full 99-query rounds each way) the run is 2,307 s against 2,328 s, GC -9.5%, q78's spill 613 GiB
+  against 760 GiB; on the heaviest queries after inlining the decimal-sum loop, -2.5% (q78 -10.8 s).
 - The native Iceberg scan reads the v3 merge-on-read metadata columns `_partition`, `_row_id` and
   `_last_updated_sequence_number` (#20 M3a), so a scan projecting them stays on our operators instead of falling
   back to Iceberg's reader (and, for an UPDATE's delete side over a map column, to rows). `_partition` is the
