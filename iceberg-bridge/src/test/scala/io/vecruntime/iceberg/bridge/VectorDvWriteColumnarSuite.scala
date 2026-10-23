@@ -28,9 +28,16 @@ class VectorDvWriteColumnarSuite extends VectorDvWriteSuite {
   override protected def columnarData: Boolean = true
 
   // The counters are JVM-global and other suites sharing the JVM bump them, so this suite measures from its own
-  // start (suite bodies run their tests in declaration order, after construction).
-  private val rowInputAtStart = VectorWriteDeltaExec.rowInputWrites.get()
-  private val columnarAtStart = VectorWriteDeltaExec.columnarDataTasks.get()
+  // start. The baseline is taken in beforeAll, not at construction: the ScalaTest runner instantiates every
+  // discovered suite before running any of them.
+  private var rowInputAtStart = 0L
+  private var columnarAtStart = 0L
+
+  override protected def beforeAll(): Unit = {
+    super.beforeAll()
+    rowInputAtStart = VectorWriteDeltaExec.rowInputWrites.get()
+    columnarAtStart = VectorWriteDeltaExec.columnarDataTasks.get()
+  }
 
   test("the data half of the UPDATEs and MERGEs above ran on the columnar data writer") {
     val columnar = VectorWriteDeltaExec.columnarDataTasks.get() - columnarAtStart
