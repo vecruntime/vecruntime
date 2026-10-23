@@ -50,16 +50,13 @@
  *                                                -> "position deletes across row groups of one parquet file"
  *   (+ a v3 deletion-vector survivor case)       -> "v3 deletion-vector deletes: survivors correct on native scan"
  *
- * DOCUMENTED NATIVE-SCAN FALLBACK (tagged `DeletedColumnFallsBack`, asserted against Iceberg's reader):
- *   - Projecting Iceberg's `_deleted` metadata column: VectorIcebergScanExec.outputFieldIds returns
- *     Left("Iceberg metadata column _deleted"), so those queries keep Iceberg's reader. Surfacing deleted
- *     rows marked `_deleted=true` is the opposite of our columnar delete-application (which removes the
- *     deleted lanes), so the native path declines by design -- not a bug.
- *   The SURVIVOR set (the part our native scan owns) is still asserted natively in every such case.
- *
- * An equality delete keyed on a column DROPPED from the table now runs natively (the field id is resolved
- * against the schema history and the column read as a hidden probe column) -- see the dedicated
- * TestEqualityDeleteDroppedColumnSuite and the eq-delete schema-evolution case below.
+ * Both features that once fell back to Iceberg's reader now run NATIVELY:
+ *   - Projecting Iceberg's `_deleted` metadata column: PR #956 (#901 item 3) makes the native scan keep the
+ *     deleted rows and mark `_deleted=true` (VectorIcebergScanExec.markDeleted / withAllRows) instead of
+ *     dropping them. The per-row _deleted is asserted on the native scan against the explicit upstream set.
+ *   - An equality delete keyed on a column DROPPED from the table: the field id is resolved against the
+ *     table's schema history and the column read as a hidden probe column -- see the dedicated
+ *     TestEqualityDeleteDroppedColumnSuite and the eq-delete schema-evolution case below.
  *
  * Runtime note: the repo's iceberg-spark-runtime jar reports "Apache Iceberg 1.12.0" at run time (matching
  * the ported tag). Position/equality delete files are written with Iceberg's own `GenericFileWriterFactory`
@@ -78,16 +75,7 @@ import org.apache.iceberg.spark.Spark3Util
 import org.apache.spark.sql.{DataFrame, Row, SparkSession}
 import org.apache.spark.sql.execution.SparkPlan
 import org.scalatest.BeforeAndAfterAll
-import org.scalatest.Tag
 import org.scalatest.funsuite.AnyFunSuite
-
-/**
- * ScalaTest tag for the cases that project Iceberg's `_deleted` metadata column: our native
- * VectorIcebergScanExec declines that column by design (see the suite scaladoc and
- * VectorIcebergScanExec.outputFieldIds), so those assertions run against Iceberg's own reader. Run or
- * exclude them with `-Dtest=... -DexcludedTags=io.vecruntime.iceberg.ported.DeletedColumnFallsBack`.
- */
-object DeletedColumnFallsBack extends Tag("io.vecruntime.iceberg.ported.DeletedColumnFallsBack")
 
 class TestSparkReaderDeletesPortedSuite extends AnyFunSuite with BeforeAndAfterAll {
 
@@ -161,6 +149,9 @@ class TestSparkReaderDeletesPortedSuite extends AnyFunSuite with BeforeAndAfterA
   /** (id, data, _deleted) read through Iceberg's own reader, for the _deleted-column fallback cases. */
   private def icebergDeleted(q: String): Seq[(Int, String, Boolean)] =
     deletedTriples(withConf("spark.vecruntime.enabled" -> "false")(spark.sql(q).collect().toSeq))
+
+  /** (id, data, _deleted) read through our NATIVE scan, asserting VectorIcebergScanExec ran with no fallback. */
+  private def nativeDeleted(q: String): Seq[(Int, String, Boolean)] = deletedTriples(nativeCollect(q))
 
   private def sortById(rows: Seq[Row]): Seq[(Int, String)] =
     rows.map(r => (r.getInt(0), r.getString(1))).sortBy(x => (x._1, x._2))
@@ -258,82 +249,69 @@ class TestSparkReaderDeletesPortedSuite extends AnyFunSuite with BeforeAndAfterA
 
   // testPosDeletesWithDeletedColumn
   //
-  // FINDING / documented fallback: our native VectorIcebergScanExec deliberately declines when the
-  // `_deleted` metadata column is projected -- VectorIcebergScanExec.outputFieldIds returns Left("Iceberg
-  // metadata column _deleted") so the query keeps Iceberg's own reader. Surfacing a deleted row marked
-  // `_deleted = true` is the opposite of our columnar delete-application, which removes deleted lanes from
-  // the batch; emitting them would require a second read mode we do not implement. This is out of scope
-  // for the native scan (not a bug), so the `_deleted`-projection assertion runs against Iceberg's reader
-  // and is tagged. The survivor set -- the part the native scan IS responsible for -- is asserted natively.
-  test("v2 position deletes: survivors native; _deleted column via Iceberg reader", DeletedColumnFallsBack) {
+  // #956 (#901 item 3): projecting Iceberg's `_deleted` column now runs NATIVELY -- our scan keeps the
+  // deleted rows and marks `_deleted = true` instead of dropping them (VectorIcebergScanExec.markDeleted /
+  // withAllRows). So these cases assert the native scan (VectorIcebergScanExec, numIcebergGroups == 0) with
+  // the explicit per-row _deleted the upstream pins.
+  test("v2 position deletes surface through the _deleted column, our native scan ran") {
     val (t, name) = buildTable("ice.db.pd_delcol")
     addPositionDeletes(t, dataFileLocation(t), Seq(0L, 1L, 2L, 3L))
     refresh(name)
     val del = Set(29, 43, 61, 89)
-    // survivors through our native scan
-    assert(
-      sortById(nativeCollect(s"SELECT id, data FROM $name")) ==
-        DATA.filterNot { case (i, _) => del.contains(i) }.sortBy(_._1),
-      "survivors wrong on native scan"
-    )
-    // the _deleted column: Iceberg's reader, pinned to the explicit upstream expectation
     val expected = DATA.map { case (i, d) => (i, d, del.contains(i)) }.sortBy(x => (x._1, x._2))
-    assert(icebergDeleted(s"SELECT id, data, _deleted FROM $name") == expected)
+    assert(nativeDeleted(s"SELECT id, data, _deleted FROM $name") == expected, "native _deleted wrong")
+    assert(icebergDeleted(s"SELECT id, data, _deleted FROM $name") == expected, "must match Iceberg's reader")
   }
 
   // testEqualityDeleteWithDeletedColumn
-  test("v2 equality deletes: survivors native; _deleted column via Iceberg reader", DeletedColumnFallsBack) {
+  test("v2 equality deletes surface through the _deleted column, our native scan ran") {
     val (t, name) = buildTable("ice.db.eq_delcol")
     addEqualityDeletes(t, Seq("data"), Seq(Seq("a"), Seq("d"), Seq("g"))) // ids 29,89,122
     refresh(name)
     val del = Set(29, 89, 122)
-    assert(
-      sortById(nativeCollect(s"SELECT id, data FROM $name")) ==
-        DATA.filterNot { case (i, _) => del.contains(i) }.sortBy(_._1),
-      "survivors wrong on native scan"
-    )
     val expected = DATA.map { case (i, d) => (i, d, del.contains(i)) }.sortBy(x => (x._1, x._2))
-    assert(icebergDeleted(s"SELECT id, data, _deleted FROM $name") == expected)
+    assert(nativeDeleted(s"SELECT id, data, _deleted FROM $name") == expected, "native _deleted wrong")
+    assert(icebergDeleted(s"SELECT id, data, _deleted FROM $name") == expected, "must match Iceberg's reader")
   }
 
   // testMixedPosAndEqDeletesWithDeletedColumn
-  test("v2 mixed position + equality deletes: survivors native; _deleted via Iceberg", DeletedColumnFallsBack) {
+  test("v2 mixed position + equality deletes through _deleted, our native scan ran") {
     val (t, name) = buildTable("ice.db.mix_delcol")
     val f = dataFileLocation(t)
     addEqualityDeletes(t, Seq("data"), Seq(Seq("a"), Seq("d"), Seq("g"))) // 29,89,122
     addPositionDeletes(t, f, Seq(3L, 5L)) // 89,121
     refresh(name)
     val del = Set(29, 89, 121, 122) // union
-    assert(
-      sortById(nativeCollect(s"SELECT id, data FROM $name")) ==
-        DATA.filterNot { case (i, _) => del.contains(i) }.sortBy(_._1),
-      "survivors wrong on native scan"
-    )
     val expected = DATA.map { case (i, d) => (i, d, del.contains(i)) }.sortBy(x => (x._1, x._2))
-    assert(icebergDeleted(s"SELECT id, data, _deleted FROM $name") == expected)
+    assert(nativeDeleted(s"SELECT id, data, _deleted FROM $name") == expected, "native _deleted wrong")
+    assert(icebergDeleted(s"SELECT id, data, _deleted FROM $name") == expected, "must match Iceberg's reader")
   }
 
-  // testFilterOnDeletedMetadataColumn -- a filter on _deleted still forces Iceberg's reader (fallback).
-  test("filter on _deleted = true / false partitions the rows (Iceberg reader)", DeletedColumnFallsBack) {
+  // testFilterOnDeletedMetadataColumn -- a filter on _deleted partitions the rows, on our native scan.
+  test("filter on _deleted = true / false partitions the rows, our native scan ran") {
     val (t, name) = buildTable("ice.db.filt_delcol")
     addPositionDeletes(t, dataFileLocation(t), Seq(0L, 1L, 2L, 3L)) // 29,43,61,89
     refresh(name)
     val del = Set(29, 43, 61, 89)
-    val live = icebergDeleted(s"SELECT id, data, _deleted FROM $name WHERE _deleted = false")
-    assert(live == DATA.filterNot { case (i, _) => del.contains(i) }
-      .map { case (i, d) => (i, d, false) }.sortBy(x => (x._1, x._2)))
-    val gone = icebergDeleted(s"SELECT id, data, _deleted FROM $name WHERE _deleted = true")
-    assert(gone == DATA.filter { case (i, _) => del.contains(i) }
-      .map { case (i, d) => (i, d, true) }.sortBy(x => (x._1, x._2)))
+    val live = nativeDeleted(s"SELECT id, data, _deleted FROM $name WHERE _deleted = false")
+    assert(
+      live == DATA.filterNot { case (i, _) => del.contains(i) }
+        .map { case (i, d) => (i, d, false) }.sortBy(x => (x._1, x._2)),
+      "live rows wrong"
+    )
+    val gone = nativeDeleted(s"SELECT id, data, _deleted FROM $name WHERE _deleted = true")
+    assert(
+      gone == DATA.filter { case (i, _) => del.contains(i) }
+        .map { case (i, d) => (i, d, true) }.sortBy(x => (x._1, x._2)),
+      "deleted rows wrong"
+    )
   }
 
-  // testIsDeletedColumnWithoutDeleteFile -- even with no delete file, projecting _deleted falls back.
-  test("_deleted is all-false when the table has no delete file (Iceberg reader)", DeletedColumnFallsBack) {
+  // testIsDeletedColumnWithoutDeleteFile -- _deleted is all-false, on our native scan.
+  test("_deleted is all-false when the table has no delete file, our native scan ran") {
     val (_, name) = buildTable("ice.db.nodel")
-    // the plain scan (no _deleted) runs natively and returns all 7 rows
-    assert(sortById(nativeCollect(s"SELECT id, data FROM $name")) == DATA.sortBy(_._1))
     val expected = DATA.map { case (i, d) => (i, d, false) }.sortBy(x => (x._1, x._2))
-    assert(icebergDeleted(s"SELECT id, data, _deleted FROM $name") == expected)
+    assert(nativeDeleted(s"SELECT id, data, _deleted FROM $name") == expected, "native _deleted should be all false")
   }
 
   // testEqualityDeleteWithFilter
