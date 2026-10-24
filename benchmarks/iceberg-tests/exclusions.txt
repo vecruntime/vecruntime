@@ -102,4 +102,3 @@ org.apache.iceberg.spark.actions.TestRewriteDataFilesAction#testBinPackCombineMi
 # differs, and only because our smaller setup files shrink the test's self-derived size thresholds.
 # Excluded (category b) -- the per-method exclusion cannot scope to fv3/fv4, and fv2 is already green.
 org.apache.iceberg.spark.actions.TestRewriteDataFilesAction#testBinPackCombineMediumFiles
-org.apache.iceberg.spark.actions.TestRewriteDataFilesAction#testBinPackCombineMediumFiles

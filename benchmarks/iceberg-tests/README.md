@@ -93,36 +93,35 @@ Every failure is one of:
 
 Run each suite once with the plugin **off** (`VECRUNTIME_ENABLED=false`) to confirm a failure is
 ours and not the environment.
+## Last full run (2026-10-24)
 
-## Last full run — writers ON (2026-10-23, logs `draco-keep/iceberg-tests-2026102321*`)
+The run used a JDK-21 Gradle launcher and JDK-25 test JVMs, with every vecruntime Iceberg path on (the main defaults): native scan, columnar writer, DV / position-delete writer and copy-unchanged. vecruntime jars came from `main` plus #992 (`a269bdd9`); Iceberg is `apache-iceberg-1.12.0` (`212aa894`).
 
-JDK-21 launcher, JDK-25 test JVMs, **all** vecruntime iceberg paths on including the columnar writer,
-DV / position-delete writer and copy-unchanged. **Before exclusions**:
+| module | tests | failed | skipped |
+|--------|-------|--------|---------|
+| `iceberg-spark-extensions-4.1_2.13` | 1334 | 0 | 106 |
+| `iceberg-spark-4.1_2.13` | 579 | 0 (after the exclusions below) | 22 |
 
-| module | suite | tests | failed | skipped |
-|--------|-------|-------|--------|---------|
-| `iceberg-spark-extensions-4.1_2.13` | spark-extensions | 1325 | 9 | 106 |
-| `iceberg-spark-4.1_2.13` | spark | 579 | 3 | 22 |
+With the plugin **off** (`VECRUNTIME_ENABLED=false`) the same suites pass, so every exclusion is about the plugin, not the environment.
 
-(With the plugin **off**, `VECRUNTIME_ENABLED=false`, these suites pass fully, so every failure is
-the plugin's, not the environment's.)
+### Exclusions (`exclusions.txt`)
 
-The 12 failures (9 + 3) break down, all handled in `exclusions.txt`:
+| test | reason |
+|------|--------|
+| `*WithVectorizedReads` x 6 (copy-on-write and merge-on-read DELETE / UPDATE / MERGE) | Plan shape: `assertAllBatchScansVectorized` looks for Iceberg's `BatchScanExec`, which vecruntime replaces with `VectorIcebergScanExec`. |
+| `TestMergeOnReadDelete#testAggregatePushDownInMergeOnReadDelete` | Plan text: the test searches EXPLAIN for `max(data)`, which vecruntime's aggregate node prints. |
+| `TestRewriteDataFilesAction#testBinPackCombineMixedFiles` (fails on v3/v4; v2 passes) | The test derives its max file size from the byte sizes of Iceberg's own writer, with a hand-fitted v3 margin. The columnar writer's v2 pages are ~1.7x smaller, so the large input stays under that max and is correctly not split. Rows and `rewrittenBytes` match. |
+| `TestRewriteDataFilesAction#testBinPackCombineMediumFiles` (fails on v3/v4; v2 passes) | Same mechanism: the roll target is derived from input sizes ~1.9x smaller than Iceberg's, and the v3 row-lineage columns push one output past it, so it rolls a ~22 KB remainder. Rows match. |
 
-| kind | failure(s) | disposition |
-|------|-----------|-------------|
-| (b) `*WithVectorizedReads` × 6 — `assertAllBatchScansVectorized` wants Iceberg's `BatchScanExec`, gets `VectorIcebergScanExec` | read-side | excluded (plan-shape) |
-| (b) `testAggregatePushDownInMergeOnReadDelete` — EXPLAIN names the plugin's aggregate node | read-side | excluded (plan-text) |
-| (b) `testCoalesce{Delete,Update}`, `testCopyOnWriteDeleteSetsSortOrderIdOnRewrittenDataFiles`, `testBinPackCombineMixedFiles` — the columnar writer + shuffle lay the rewrite out in a different file count / stamp sort-order-id=0 | write-side output shape | excluded (output-shape; data correct) |
-| (b) `testSkew{Delete,Update,Merge}` — AQE skew split of a rebalance under the vecruntime shuffle | read/shuffle | excluded **TEMPORARY** (PR #988) |
-| (a) 6 × `TestCopyOnWriteUpdate#testUpdateWith{In,NotIn,Exist,NotExists}Subquery`, `testUpdateWithInAndNotInConditions`, `testUpdateWithUserDefinedDistribution` — written row group read back with a projected column "not in the store" (`LeafColumnReader.startRowGroup` → `ColumnChunkPageReadStore.getPageReader`) | write→read, columnar writer/reader | excluded **TEMPORARY** — real pre-existing vecruntime writer/reader bug (NOT shading), reported for a dedicated fix |
+The two bin-pack cases are excluded per method, so their v2 runs are skipped as well. Both were checked numerically (file sizes and thresholds, on vs off). v2 passes because of #997.
 
-The equality-delete read bug (`testEqualityDeletePreservation`,
-`testRemoveDangledEqualityDeletesPartitionEvolution`) and the write-path shading bug are **fixed** on
-`crew/draco/eqdelete-shading-agnostic` and pass with writers on — they are no longer excluded. The
-remaining (a) entries are a genuine columnar-writer/reader defect unrelated to shading, surfaced only
-now that the harness exercises the write path; they are excluded TEMPORARY and reported for a
-separate fix.
+### Fixed in vecruntime because of this harness
 
-After the exclusions both modules are expected green on the next run; the two (a) entries drop out
-once the JOB-1 fix is merged and the harness jars are rebuilt from `main`.
+| PR | Fix | Iceberg tests it fixed |
+|----|-----|------------------------|
+| #988 | Native scan keeps Iceberg's task grouping and per-scan `read.split.*` options | `testSkew*` and the scan side of the bin-pack tests |
+| #989 | iceberg-bridge works with relocated and unshaded Iceberg parquet (read and write) | `testEqualityDeletePreservation`, `testRemoveDangledEqualityDeletesPartitionEvolution` |
+| #991 | Parallel-decode leak on early task end | none (found by vecruntime CI while landing these fixes) |
+| #992 | Copy-on-write chunk copy writes row groups in schema order | 6 x `TestCopyOnWriteUpdate` subquery / distribution cases ("column ... is not in the store") |
+| #993 | Write coalescing honoured, `sort_order_id` on copy-unchanged files, bin-pack copy split size | `testCoalesce*`, `testCopyOnWriteDeleteSetsSortOrderIdOnRewrittenDataFiles` |
+| #997 | Adaptive row-group boundary check in the columnar writer | `testBinPackCombineMediumFiles` v2 |
