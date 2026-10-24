@@ -313,6 +313,18 @@ object AggSpillPolicy {
   val PassThroughKey = "spark.vecruntime.agg.passThroughRatio"
 
   /**
+   * #999: the rows a buffer-emitting (partial) aggregate reads before it judges its reduction, as a local
+   * pre-aggregate does (#693/#708); 0 (the default until a 10 TB A/B) judges only when the table reaches its
+   * budget. A partial whose table never fills -- TPC-DS q78 at 10 TB: 8.8 B rows through three tables of 422 MB
+   * that reduced nothing (ratio 1.0) -- was never judged and hashed every row. Passing through costs only
+   * exchange bytes, never correctness: the final aggregate merges either way.
+   */
+  val PartialProbeRowsKey = "spark.vecruntime.agg.partialProbeRows"
+
+  def partialProbeRows(conf: org.apache.spark.sql.internal.SQLConf): Long =
+    math.max(0L, conf.getConfString(PartialProbeRowsKey, "0").trim.toLong)
+
+  /**
    * 1 GiB, the sort's budget (`spark.vecruntime.sort.spillBytes`, #416/#451). #511: at 512m, TPC-DS q67 at
    * 1 TB on Graviton4 spilled 115 GB from its final ROLLUP aggregate once AQE coalesced the stage to 150
    * partitions (5.5 M groups per task) and took 86.5 s; at 1g nothing spilled and it took 54.4 s (2g:

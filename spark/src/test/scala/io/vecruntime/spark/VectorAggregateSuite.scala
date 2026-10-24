@@ -169,6 +169,22 @@ class VectorAggregateSuite extends VectorQuerySuite {
     }
   }
 
+  test("#999: a partial aggregate whose table never fills is judged after partialProbeRows rows") {
+    // i is unique, the budget (1g) is never reached: without the probe the partial is never judged and hashes
+    // everything (no table emitted early); with it, the first table goes out after the probe and the rest passes
+    // through. A reducing key (i % 3) still aggregates. Same answers either way.
+    def partialSpills(df: org.apache.spark.sql.DataFrame): Seq[Long] =
+      nodesOf[VectorHashAggregateExec](df).filterNot(_.isFinal).map(_.metrics("spills").value)
+    val unique = "SELECT i, sum(l) AS sl, count(*) AS n FROM t GROUP BY i"
+    val off = partialSpills(checkVectorized(unique, Seq(Agg)))
+    assert(off.sum === 0L, s"not judged without the probe: $off")
+    withConf(AggSpillPolicy.PartialProbeRowsKey -> "16") {
+      val on = partialSpills(checkVectorized(unique, Seq(Agg)))
+      assert(on.nonEmpty && on.sum >= 1L, s"judged after the probe: $on")
+      checkVectorized("SELECT i % 3 AS k, sum(l) AS sl, count(*) AS n FROM t GROUP BY i % 3", Seq(Agg))
+    }
+  }
+
   test("final aggregation merges the partial buffers over the shuffle") {
     // Ungrouped: one partial row per partition, one final row; avg is sum / count of the merged buffers.
     val df = checkVectorized(

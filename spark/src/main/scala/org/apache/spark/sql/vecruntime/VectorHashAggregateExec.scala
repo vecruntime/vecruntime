@@ -228,8 +228,9 @@ case class VectorHashAggregateExec(
       ) {
         val buckets = conf.getConfString(AggSpillPolicy.BucketsKey, AggSpillPolicy.DefaultBuckets.toString).toInt
         AggSpillPolicy.GraceHash(threshold, math.max(2, buckets))
-      } else AggSpillPolicy.EmitAndReset(threshold, passThrough)
-    } else if (VectorAggregatePlanner.emitsBuffers(modes)) AggSpillPolicy.EmitAndReset(threshold, passThrough)
+      } else AggSpillPolicy.EmitAndReset(threshold, passThrough, AggSpillPolicy.partialProbeRows(conf))
+    } else if (VectorAggregatePlanner.emitsBuffers(modes))
+      AggSpillPolicy.EmitAndReset(threshold, passThrough, AggSpillPolicy.partialProbeRows(conf))
     else if (
       VectorAggregatePlanner.mergesBuffers(modes) && AggregateSpill.supportsKeys(groupingExpressions.map(_.dataType)) &&
       aggregateExpressions.zip(aggs).forall { case (a, f) =>
