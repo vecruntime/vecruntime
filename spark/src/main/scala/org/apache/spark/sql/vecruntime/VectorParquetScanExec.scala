@@ -27,6 +27,7 @@ import io.vecruntime.spark.parquet.{
 }
 import org.apache.arrow.memory.BufferAllocator
 import org.apache.hadoop.conf.Configuration
+import org.apache.hadoop.fs.statistics.IOStatistics
 import org.apache.parquet.HadoopReadOptions
 import org.apache.parquet.filter2.compat.FilterCompat
 import org.apache.parquet.hadoop.ParquetFileReader
@@ -957,6 +958,7 @@ private[vecruntime] final class VectorParquetPartitionReader(
     var r: ParquetFileReader = null
     try {
       stream = inputFile.newStream()
+      trackStreamStatistics(stream)
       // #834 part 1: a file at or under the threshold is read WHOLE in one GET here, BEFORE the footer, so the
       // footer, column chunks and page indexes all come from that one buffer (no footer-length read, no footer
       // read, no per-page GET). The buffer must hold the WHOLE file -- the footer is at its end -- so it is sized
@@ -1843,13 +1845,27 @@ private[vecruntime] final class VectorParquetPartitionReader(
 
   // The task's input metrics, kept the way FileScanRDD keeps them: records per batch, and bytes as the task
   // thread's FileSystem read count plus what the prefetch threads read for this task.
+  //
+  // #638: on S3A the Analytics Accelerator stream fetches on threads of its own, which neither count reaches
+  // (at 10 TB, q88 + q28 reported 0.36 GiB against 204.8 GiB the file system read). Each stream this task opens
+  // also counts its own bytes (`stream_read_bytes` in its IOStatistics), whichever thread read them. Both
+  // counts measure the same reads and each can only miss some, so the task reports the larger.
   private val inputMetrics = if (context != null) context.taskMetrics().inputMetrics else null
   private val existingBytesRead = if (inputMetrics != null) inputMetrics.bytesRead else 0L
   private val taskThreadBytes: () => Long = SparkHadoopUtil.get.getFSBytesReadOnThreadCallback()
   private val prefetchedBytes = new java.util.concurrent.atomic.AtomicLong()
+  private val streamStatistics = new java.util.concurrent.ConcurrentLinkedQueue[IOStatistics]()
+
+  /** Keeps the statistics of a stream this task opened (#638); may run on a prefetch thread. */
+  private def trackStreamStatistics(stream: SeekableInputStream): Unit =
+    if (inputMetrics != null) VectorParquetScanExec.streamStatistics(stream).foreach(streamStatistics.add)
 
   private def updateBytesRead(): Unit =
-    if (inputMetrics != null) inputMetrics.setBytesRead(existingBytesRead + taskThreadBytes() + prefetchedBytes.get())
+    if (inputMetrics != null) {
+      val threads = taskThreadBytes() + prefetchedBytes.get()
+      val streams = VectorParquetScanExec.streamReadBytes(streamStatistics)
+      inputMetrics.setBytesRead(existingBytesRead + math.max(threads, streams))
+    }
 
   /** Waits for every row-group read in flight (results dropped) so the reader can be closed safely. */
   private def drainRowGroups(): Unit = {
@@ -2387,6 +2403,28 @@ object VectorParquetScanExec {
 
   /** The Parquet value/level encodings the native decoder handles; any other encoding falls the file over. */
   val SupportedEncodings: Set[String] = Set("PLAIN", "PLAIN_DICTIONARY", "RLE_DICTIONARY", "RLE", "BIT_PACKED")
+
+  /**
+   * #638: the IOStatistics of the Hadoop stream under a Parquet input stream, when the file system keeps them
+   * (S3A, the local file system and HDFS do). Parquet's stream wrappers delegate to an FSDataInputStream, which
+   * is an IOStatisticsSource for its own wrapped stream.
+   */
+  private[vecruntime] def streamStatistics(stream: SeekableInputStream): Option[IOStatistics] = stream match {
+    case d: org.apache.parquet.io.DelegatingSeekableInputStream =>
+      Option(org.apache.hadoop.fs.statistics.IOStatisticsSupport.retrieveIOStatistics(d.getStream))
+    case _ => None
+  }
+
+  /** The bytes the given streams read, by their own `stream_read_bytes` counters (#638). */
+  private[vecruntime] def streamReadBytes(stats: java.lang.Iterable[IOStatistics]): Long = {
+    var total = 0L
+    val it = stats.iterator()
+    while (it.hasNext) {
+      val c = it.next().counters().get(org.apache.hadoop.fs.statistics.StreamStatisticNames.STREAM_READ_BYTES)
+      if (c != null) total += c.longValue()
+    }
+    total
+  }
 
   import PrimitiveType.PrimitiveTypeName.{BINARY, DOUBLE, FIXED_LEN_BYTE_ARRAY, INT32, INT64}
 

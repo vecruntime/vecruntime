@@ -47,4 +47,41 @@ class ScanIoStatsSuite extends AnyFunSuite {
       Files.walk(dir).sorted(java.util.Comparator.reverseOrder()).forEach(p => Files.deleteIfExists(p))
     }
   }
+
+  test("#638: a Parquet input stream's own statistics count the bytes read on any thread") {
+    val dir = Files.createTempDirectory("scan-io-stats-")
+    try {
+      val f = dir.resolve("b.bin")
+      Files.write(f, Array.fill[Byte](8192)(3))
+      val in = org.apache.parquet.hadoop.util.HadoopInputFile
+        .fromPath(new Path(f.toUri), new Configuration())
+        .newStream()
+      try {
+        val stats = VectorParquetScanExec.streamStatistics(in)
+        assert(stats.isDefined, "the local file system's stream keeps IOStatistics")
+        val all = java.util.Collections.singletonList(stats.get)
+        val before = VectorParquetScanExec.streamReadBytes(all)
+        // Read on another thread: neither the task thread's nor a prefetch thread's per-thread count sees it.
+        val t = new Thread(() => { val buf = new Array[Byte](8192); in.readFully(buf) })
+        t.start(); t.join()
+        assert(VectorParquetScanExec.streamReadBytes(all) - before >= 8192)
+      } finally in.close()
+    } finally {
+      Files.walk(dir).sorted(java.util.Comparator.reverseOrder()).forEach(p => Files.deleteIfExists(p))
+    }
+  }
+
+  test("#638: a stream that keeps no statistics counts nothing") {
+    val in = new org.apache.parquet.io.SeekableInputStream {
+      override def getPos: Long = 0L
+      override def seek(newPos: Long): Unit = ()
+      override def readFully(bytes: Array[Byte]): Unit = ()
+      override def readFully(bytes: Array[Byte], start: Int, len: Int): Unit = ()
+      override def read(buf: java.nio.ByteBuffer): Int = -1
+      override def readFully(buf: java.nio.ByteBuffer): Unit = ()
+      override def read(): Int = -1
+    }
+    assert(VectorParquetScanExec.streamStatistics(in).isEmpty)
+    assert(VectorParquetScanExec.streamReadBytes(java.util.Collections.emptyList()) == 0L)
+  }
 }
