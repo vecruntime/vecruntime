@@ -8,6 +8,18 @@ version may change configuration keys or defaults, always noted here.
 
 ### Added
 
+- The native Iceberg scan caches loaded delete files per executor, reusing Iceberg's own
+  `SparkExecutorCache` (#857). Previously the scan built a plain `BaseDeleteLoader` whose `canCache()` is false, so
+  a delete file referenced by many data files -- a partition-granularity position-delete file, or an equality
+  delete file read through the row-probe fallback -- was re-read and re-parsed once per data file. It now builds a
+  `CachingDeleteLoader` backed by the same `SparkExecutorCache` Iceberg's own Spark reader uses, scoped per table,
+  so each delete file is read once per executor and served from memory afterwards. There is one knob, Iceberg's
+  own `spark.sql.iceberg.executor-cache.enabled` (default on) with `.timeout`, `.max-entry-size` and
+  `.max-total-size`; disabling it falls back to the uncached loader. Locally (SF10 `store_sales` v2 merge-on-read,
+  `local[8]`) a partition-granularity scan dropped from 2843 ms to 525 ms (5.4x), matching Iceberg's own reader,
+  with identical results. New `IcebergDeleteFileCacheSuite` (iceberg-bridge); the cached
+  `PositionDeleteIndex`/`StructLikeSet` values are only read, never mutated, so sharing them across concurrent
+  tasks is safe.
 - Regression guard that our columnar shuffle and native Iceberg scan both preserve the file count of a row-level
   write (`RebalanceSkewSplitSuite`, iceberg-bridge): the six Iceberg 1.12 `testSkew{Delete,Update,Merge}`
   scenarios (copy-on-write and merge-on-read) run with our features off and on with a tiny Iceberg advisory
