@@ -15,6 +15,7 @@
  */
 package io.vecruntime.kernels;
 
+import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.util.Arrays;
@@ -161,6 +162,59 @@ public final class GroupKeyTable {
      */
     private long[] fast;
 
+    /**
+     * #941 phase 2: {@link #fast} moved into a {@link NativePool} block once the
+     * table reaches {@link #NATIVE_FAST_SLOTS} slots (same layout, key then
+     * id): the heap keeps nothing of it, and the pool charges it to the task.
+     * {@code GroupTableStorageBenchmark}, against these heap pairs: Graviton 4
+     * 1.25-1.48x from 256K groups, Skylake-SP and Sapphire Rapids level
+     * (0.94-1.04x from 1M groups) and slower in cache, hence the size floor.
+     * Null whenever {@link #fast} is in use or the table is not inline.
+     */
+    private MemorySegment fastSeg;
+
+    private Arena fastArena;
+
+    /**
+     * Whether this table may move its pairs into the pool: only an owner that
+     * closes it ({@link #close}) turns it on -- the grouped aggregate does, a
+     * join's build table does not.
+     */
+    private boolean nativeAllowed;
+
+    /**
+     * The heap pairs crossed {@link #NATIVE_FAST_SLOTS} during the last assign:
+     * move them before the next.
+     */
+    private boolean pendingNative;
+
+    /** {@link #fast} into a pool block, same slots; the heap array is dropped. */
+    private void moveFastToPool() {
+        pendingNative = false;
+        if (fast == null) {
+            return; // a null key group ended the inline path meanwhile
+        }
+        int slotCount = fast.length / 2;
+        allocFastSeg(slotCount);
+        MemorySegment.copy(fast, 0, fastSeg, PAIR, 0, fast.length);
+        fast = null;
+    }
+
+    /**
+     * Lets the inline pairs move into the pool past {@link #NATIVE_FAST_SLOTS};
+     * the caller must {@link #close}.
+     */
+    public void allowNative() {
+        nativeAllowed = true;
+    }
+
+    /**
+     * Slots from which an inline table keeps its pairs in the pool: 32 MiB of
+     * pairs.
+     */
+    static final int NATIVE_FAST_SLOTS = Integer.getInteger("vecruntime.agg.nativeFastSlots", 1 << 21);
+
+    private static final ValueLayout.OfLong PAIR = ValueLayout.JAVA_LONG;
     private final int[][] intKeys; // INT32 and BOOL (0/1)
     private final long[][] longKeys; // INT64 and FLOAT64 (raw bits); the low limb of DECIMAL128
     private final long[][] hiKeys; // the high limb of DECIMAL128
@@ -384,6 +438,13 @@ public final class GroupKeyTable {
             HashKernels.mixColumn(key, hashes);
         }
         Bound b = Bound.of(keys, ids);
+        if (pendingNative) {
+            moveFastToPool();
+        }
+        if (fastSeg != null && b.noNulls(n, selection)) {
+            assignFastNative(b, n, hashes, outIds, selection);
+            return size;
+        }
         if (fast != null && b.noNulls(n, selection)) {
             assignFast(b, n, hashes, outIds, selection);
             return size;
@@ -1501,7 +1562,147 @@ public final class GroupKeyTable {
      * inline.
      */
     boolean inlineKeys() {
-        return fast != null;
+        return fast != null || fastSeg != null;
+    }
+
+    /** Package-private, for the tests: whether the inline pairs live in the pool. */
+    boolean nativeInline() {
+        return fastSeg != null;
+    }
+
+    /**
+     * Bytes the table holds in pool blocks (#941): left out of {@link
+     * #memoryBytes}.
+     */
+    public long nativeBytes() {
+        return fastSeg == null ? 0L : fastSeg.byteSize();
+    }
+
+    /** Gives the pool blocks back; the table is not used afterwards. */
+    public void close() {
+        freeFastSeg();
+    }
+
+    private void freeFastSeg() {
+        if (fastArena != null) {
+            fastArena.close();
+            fastArena = null;
+            fastSeg = null;
+        }
+    }
+
+    /** {@code slotCount} empty pairs in a pool block: key 0, id -1. */
+    private void allocFastSeg(int slotCount) {
+        Arena a = NativePool.shared().newArena();
+        MemorySegment s = a.allocate(16L * slotCount, 64);
+        for (long p = 0; p < slotCount; p++) {
+            s.setAtIndex(PAIR, 2 * p, 0L);
+            s.setAtIndex(PAIR, 2 * p + 1, -1L);
+        }
+        fastArena = a;
+        fastSeg = s;
+    }
+
+    /**
+     * {@link #assignFast} over the pairs in the pool: the same batched probe and
+     * one loop per key shape, reading through the segment.
+     */
+    private void assignFastNative(Bound b, int n, int[] hashes,
+            int[] outIds, MemorySegment selection) {
+        if (selection != null) {
+            Arrays.fill(outIds, 0, n, -1);
+            for (int w = 0, words = Bitmap.wordsFor(n);
+                 w < words;
+                 w++) {
+                long bits = Bitmap.wordAt(selection, w, n);
+                while (bits != 0L) {
+                    int i = (w << 6) + Long.numberOfTrailingZeros(bits);
+                    bits &= bits - 1;
+                    outIds[i] = fastRow(b, i, HashKernels.finish(hashes[i]));
+                }
+            }
+            return;
+        }
+        int[] hit = probeHits;
+        if (types.length == 2) {
+            int[] k0 = b.ints[0];
+            int[] k1 = b.ints[1];
+            for (int i0 = 0; i0 < n; i0 += PROBE_BATCH) {
+                int end = Math.min(n, i0 + PROBE_BATCH);
+                MemorySegment f = fastSeg;
+                int m = mask;
+                for (int i = i0; i < end; i++) {
+                    long key = ((long) k0[i] << 32) | (k1[i] & 0xFFFFFFFFL);
+                    long p = HashKernels.finish(hashes[i]) & m;
+                    hit[i - i0] = f.getAtIndex(PAIR, 2 * p) == key ? (int) f.getAtIndex(PAIR, 2 * p + 1) : -1;
+                }
+                for (int i = i0; i < end; i++) {
+                    int g = hit[i - i0];
+                    outIds[i] = g >= 0 ? g : fastLookupOrInsertNative(((long) k0[i] << 32) | (k1[i] & 0xFFFFFFFFL), HashKernels.finish(hashes[i]), k0[i], k1[i],
+                            0L);
+                }
+            }
+        } else if (types[0] == VecType.INT32) {
+            int[] k0 = b.ints[0];
+            for (int i0 = 0; i0 < n; i0 += PROBE_BATCH) {
+                int end = Math.min(n, i0 + PROBE_BATCH);
+                MemorySegment f = fastSeg;
+                int m = mask;
+                for (int i = i0; i < end; i++) {
+                    long p = HashKernels.finish(hashes[i]) & m;
+                    hit[i - i0] = f.getAtIndex(PAIR, 2 * p) == k0[i] ? (int) f.getAtIndex(PAIR, 2 * p + 1) : -1;
+                }
+                for (int i = i0; i < end; i++) {
+                    int g = hit[i - i0];
+                    outIds[i] = g >= 0 ? g : fastLookupOrInsertNative(k0[i], HashKernels.finish(hashes[i]), k0[i], 0, 0L);
+                }
+            }
+        } else {
+            long[] k0 = b.longs[0];
+            for (int i0 = 0; i0 < n; i0 += PROBE_BATCH) {
+                int end = Math.min(n, i0 + PROBE_BATCH);
+                MemorySegment f = fastSeg;
+                int m = mask;
+                for (int i = i0; i < end; i++) {
+                    long p = HashKernels.finish(hashes[i]) & m;
+                    hit[i - i0] = f.getAtIndex(PAIR, 2 * p) == k0[i] ? (int) f.getAtIndex(PAIR, 2 * p + 1) : -1;
+                }
+                for (int i = i0; i < end; i++) {
+                    int g = hit[i - i0];
+                    outIds[i] = g >= 0 ? g : fastLookupOrInsertNative(k0[i], HashKernels.finish(hashes[i]), 0, 0, k0[i]);
+                }
+            }
+        }
+    }
+
+    /** {@link #fastLookupOrInsert} over the pairs in the pool. */
+    private int fastLookupOrInsertNative(long key, int hash, int a,
+            int b, long l) {
+        MemorySegment f = fastSeg;
+        int m = mask;
+        long pos = hash & m;
+        while (true) {
+            int gid = (int) f.getAtIndex(PAIR, 2 * pos + 1);
+            if (gid < 0) {
+                return fastInsert(key, hash, (int) pos, a, b,
+                        l);
+            }
+            if (f.getAtIndex(PAIR, 2 * pos) == key) {
+                return gid;
+            }
+            pos = (pos + 1) & m;
+        }
+    }
+
+    /** Pair {@code pos} := ({@code key}, {@code gid}), wherever the pairs live. */
+    private void setPair(int pos, long key, int gid) {
+        if (fastSeg != null) {
+            fastSeg.setAtIndex(PAIR, 2L * pos, key);
+            fastSeg.setAtIndex(PAIR, 2L * pos + 1, gid);
+        } else {
+            fast[2 * pos] = key;
+            fast[2 * pos + 1] = gid;
+        }
     }
 
     /**
@@ -1657,18 +1858,19 @@ public final class GroupKeyTable {
 
     /** One row of a selected batch on the inline path. */
     private int fastRow(Bound b, int i, int hash) {
+        boolean nat = fastSeg != null;
         if (types.length == 2) {
             int x = b.ints[0][i];
             int y = b.ints[1][i];
-            return fastLookupOrInsert(((long) x << 32) | (y & 0xFFFFFFFFL),
-                    hash, x, y, 0L);
+            long key = ((long) x << 32) | (y & 0xFFFFFFFFL);
+            return nat ? fastLookupOrInsertNative(key, hash, x, y, 0L) : fastLookupOrInsert(key, hash, x, y, 0L);
         }
         if (types[0] == VecType.INT32) {
             int x = b.ints[0][i];
-            return fastLookupOrInsert(x, hash, x, 0, 0L);
+            return nat ? fastLookupOrInsertNative(x, hash, x, 0, 0L) : fastLookupOrInsert(x, hash, x, 0, 0L);
         }
         long l = b.longs[0][i];
-        return fastLookupOrInsert(l, hash, 0, 0, l);
+        return nat ? fastLookupOrInsertNative(l, hash, 0, 0, l) : fastLookupOrInsert(l, hash, 0, 0, l);
     }
 
     /**
@@ -1706,8 +1908,7 @@ public final class GroupKeyTable {
             longKeys[0][gid] = l;
         }
         slots[pos] = gid;
-        fast[2 * pos] = key;
-        fast[2 * pos + 1] = gid;
+        setPair(pos, key, gid);
         size++;
         if (size * 10L > (long) slots.length * 7L) {
             rehash();
@@ -1949,12 +2150,12 @@ public final class GroupKeyTable {
             }
         }
         slots[pos] = gid;
-        if (fast != null) {
+        if (fast != null || fastSeg != null) {
             if (anyNullKey(gid)) {
                 fast = null; // a null key cannot be packed: the general probe from now on
+                freeFastSeg();
             } else {
-                fast[2 * pos] = packedKey(gid);
-                fast[2 * pos + 1] = gid;
+                setPair(pos, packedKey(gid), gid);
             }
         }
         size++;
@@ -2047,13 +2248,30 @@ public final class GroupKeyTable {
     static final int FAST_GROW4_SLOTS = 1 << 17;
 
     private void rehash() {
-        int grow = fast != null && slots.length >= FAST_GROW4_SLOTS
-                ? 4
-                : 2;
+        boolean inline = fast != null || fastSeg != null;
+        int grow = inline && slots.length >= FAST_GROW4_SLOTS ? 4 : 2;
         int[] newSlots = new int[slots.length * grow];
         Arrays.fill(newSlots, -1);
         int newMask = newSlots.length - 1;
-        long[] newFast = fast == null ? null : emptyFast(newSlots.length);
+        // #941: past NATIVE_FAST_SLOTS the inline pairs go to (or stay in) the pool.
+        // A heap table crossing the size moves at the start of the next assign (pendingNative): the loop that
+        // triggered this growth is reading the heap pairs. A table already in the pool regrows there.
+        boolean toNative = fastSeg != null; // once in the pool, a table stays there (its loops read fastSeg)
+        if (fast != null
+                && nativeAllowed
+                && GroupedAccumulators.nativeState()
+                && newSlots.length >= NATIVE_FAST_SLOTS) {
+            pendingNative = true;
+        }
+        Arena oldArena = fastArena;
+        long[] newFast = inline && !toNative
+                ? emptyFast(newSlots.length)
+                : null;
+        if (toNative) {
+            fastArena = null;
+            allocFastSeg(newSlots.length);
+        }
+        MemorySegment nf = toNative ? fastSeg : null;
         for (int gid = 0; gid < size; gid++) {
             int pos = groupHashes[gid] & newMask;
             while (newSlots[pos] >= 0) {
@@ -2063,7 +2281,17 @@ public final class GroupKeyTable {
             if (newFast != null) {
                 newFast[2 * pos] = packedKey(gid);
                 newFast[2 * pos + 1] = gid;
+            } else if (nf != null) {
+                nf.setAtIndex(PAIR, 2L * pos, packedKey(gid));
+                nf.setAtIndex(PAIR, 2L * pos + 1, gid);
             }
+        }
+        if (oldArena != null) {
+            oldArena.close();
+        }
+        if (!toNative) {
+            fastSeg = null;
+            fastArena = null;
         }
         slots = newSlots;
         fast = newFast;
