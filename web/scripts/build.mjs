@@ -56,6 +56,7 @@ const MD_PAGES = [
   ["comet.md", "/comet.html"],
   ["iceberg.md", "/iceberg.html"],
   ["flight-shuffle.md", "/flight-shuffle.html"],
+  ["parquet.md", "/parquet.html"],
   ["native-parquet-reader.md", "/native-parquet-reader.html"],
   ["parquet-writer.md", "/parquet-writer.html"],
   ["acknowledgments.md", "/acknowledgments.html"],
