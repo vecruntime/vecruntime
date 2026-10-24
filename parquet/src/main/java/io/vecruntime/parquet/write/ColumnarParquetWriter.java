@@ -59,6 +59,25 @@ public final class ColumnarParquetWriter implements AutoCloseable {
     /** Rows per slice: the granularity of the page-size checks. */
     static final int SLICE = 1024;
 
+    /**
+     * The fewest rows that pass between two row-group-boundary checks (as in
+     * parquet-java's {@code ColumnWriteStoreBase.MINIMUM_RECORD_COUNT_FOR_CHECK}).
+     * The next check row is predicted from the bytes buffered so far, aimed at
+     * the target and clamped to [{@code this}, {@link #MAX_ROWS_FOR_CHECK}], but
+     * never sooner than this -- so a small {@code row-group-size-bytes} is
+     * honoured to within one minimum step instead of overshooting by a whole
+     * {@link #SLICE}, while the cadence never collapses to a check every row.
+     */
+    static final long MIN_ROWS_FOR_CHECK = 100;
+
+    /**
+     * The most rows that pass between two row-group-boundary checks (as in
+     * parquet-java's {@code ColumnWriteStoreBase.MAXIMUM_RECORD_COUNT_FOR_CHECK}),
+     * so the boundary is tested often enough that an open group -- and a fanout
+     * write keeps one per partition -- never buffers far past the target.
+     */
+    static final long MAX_ROWS_FOR_CHECK = 10_000;
+
     private final ParquetFileWriter file;
     private final MessageType schema;
     private final ParquetProperties props;
@@ -80,6 +99,10 @@ public final class ColumnarParquetWriter implements AutoCloseable {
     private long rowGroupRows;
     private long totalRows;
     private boolean closed;
+    // Adaptive row-group-boundary check, in this open group's own rows: test the boundary once at least
+    // checkInterval rows have accrued since the last test, then re-predict checkInterval from the bytes seen.
+    private long rowsSinceCheck;
+    private long checkInterval = MIN_ROWS_FOR_CHECK;
 
     /**
      * @param out the file to write (created, not overwritten)
@@ -197,6 +220,8 @@ public final class ColumnarParquetWriter implements AutoCloseable {
                 ? null
                 : props.newColumnWriteStore(slowSchema, pageStore, pageStore);
         rowGroupRows = 0;
+        rowsSinceCheck = 0;
+        checkInterval = MIN_ROWS_FOR_CHECK;
         if (fast != null) {
             for (int i = 0; i < fast.length; i++) {
                 if (fast[i] != null) {
@@ -275,32 +300,53 @@ public final class ColumnarParquetWriter implements AutoCloseable {
                 columnStore = props.newColumnWriteStore(slowSchema, pageStore, pageStore);
             }
         }
-        for (int from = first; from < end; from += SLICE) {
-            int to = Math.min(end, from + SLICE);
+        // Write the batch in slices, checking the row-group boundary ADAPTIVELY as records accrue, the way
+        // parquet-java's ColumnWriteStoreBase does (MINIMUM/MAXIMUM_RECORD_COUNT_FOR_CHECK = 100/10000): a
+        // fixed once-per-SLICE check overshoots a SMALL row-group target badly, because the first chance to
+        // test is a whole SLICE (1024 rows) of buffered bytes -- for tiny rows under a small
+        // write.parquet.row-group-size-bytes that is already several times the target, so every group came out
+        // exactly one SLICE long and several times oversized, and Iceberg's byte-midpoint input splits of such
+        // coarse groups fell unevenly (Apache Iceberg testBinPackCombineMediumFiles "add 3 but was 4").
+        // Instead, step through the batch in SLICE-sized slices (the vectorised granularity, unchanged) but
+        // keep a running count of rows since the last boundary test; once that reaches checkInterval, test the
+        // boundary and re-predict checkInterval from the bytes-per-row seen so far, aimed at the remaining
+        // distance to the target and clamped to [MIN_ROWS_FOR_CHECK, MAX_ROWS_FOR_CHECK]. The MIN floor stops
+        // the cadence collapsing to a check every row for a tiny target; the MAX ceiling keeps an open group --
+        // and a fanout write holds one per partition -- from buffering far past the target. rowsSinceCheck and
+        // checkInterval count this open group's own rows: no mixing of batch-local and cumulative indices.
+        int pos = first;
+        while (pos < end) {
+            int to = Math.min(end, pos + Math.min(SLICE, (int) Math.max(1, checkInterval - rowsSinceCheck)));
             for (int i = 0; i < encoders.length; i++) {
                 if (fast[i] != null) {
-                    fast[i].write(vectors.get(i), from, to);
+                    fast[i].write(vectors.get(i), pos, to);
                 } else if (nested[i] != null) {
-                    nested[i].write(vectors.get(i), from, to);
+                    nested[i].write(vectors.get(i), pos, to);
                 } else {
-                    encoders[i].write(vectors.get(i), from, to, columnStore.getColumnWriter(columns.get(i)));
+                    encoders[i].write(vectors.get(i), pos, to, columnStore.getColumnWriter(columns.get(i)));
                 }
             }
             if (columnStore != null) {
-                for (int r = from; r < to; r++) {
+                for (int r = pos; r < to; r++) {
                     columnStore.endRecord();
                 }
             }
-            rowGroupRows += to - from;
-            totalRows += to - from;
-            // Check the row-group boundary once per slice, not once per batch. A caller that hands the whole
-            // file in one write() call (the common unpartitioned path) would otherwise roll only a single row
-            // group however small write.parquet.row-group-size-bytes is, because the check ran after the whole
-            // batch was buffered. Iceberg's own writer checks the block size as records accrue, so this matches
-            // its cadence (a group ends at most one slice past the target) and gives a file the several groups
-            // the copy-on-write row-group copy path (#901 M4a) needs to copy the delete-free ones.
-            if (bufferedSize() >= rowGroupSize) {
-                flushRowGroup();
+            int wrote = to - pos;
+            rowGroupRows += wrote;
+            totalRows += wrote;
+            rowsSinceCheck += wrote;
+            pos = to;
+            if (rowsSinceCheck >= checkInterval) {
+                rowsSinceCheck = 0;
+                long buffered = bufferedSize();
+                if (buffered >= rowGroupSize) {
+                    flushRowGroup(); // resets checkInterval via newRowGroup()
+                } else {
+                    long rowsInGroup = Math.max(1, rowGroupRows);
+                    long remainingBytes = rowGroupSize - buffered;
+                    long bytesPerRow = Math.max(1, buffered / rowsInGroup);
+                    checkInterval = Math.max(MIN_ROWS_FOR_CHECK, Math.min(MAX_ROWS_FOR_CHECK, remainingBytes / bytesPerRow));
+                }
             }
         }
     }
