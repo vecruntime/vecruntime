@@ -8,6 +8,20 @@ version may change configuration keys or defaults, always noted here.
 
 ### Added
 
+- The native Iceberg scan prunes data files by a broadcast hash join's RUNTIME filters before opening them
+  (#iceberg-file-pruning, `spark.vecruntime.scan.nativeIceberg.runtimeFilePruning.enabled`, on by default). Static
+  pushed filters are already pruned by Iceberg's planning, so those files are never opened; the runtime filters
+  (#610 -- an IN set or an integer-key range from the broadcast build side, known only after it runs) were
+  previously only ANDed into the per-file Parquet row-group statistics filter, so every data file was still opened
+  (a HEAD + footer read each) and only its row groups skipped. Iceberg's own runtime filtering prunes by partition
+  values only, never by column bounds. Now the runtime filters are built into an Iceberg `Expression` and the scan
+  re-plans on the driver -- same snapshot, the scan's residual AND the runtime expression (Iceberg strips
+  per-file bounds from its task files) -- and the files Iceberg's `InclusiveMetricsEvaluator` says
+  cannot match are dropped before partitions are built, so they are never opened. Delete files (position deletes,
+  deletion vectors, equality deletes) and v3 row lineage are safe to prune -- deletes only remove rows and lineage
+  is per-file. A file under metrics mode `none` is kept. The re-plan reads the snapshot's manifests again (no data
+  file is opened). New metric `numFilesPrunedByRuntimeFilter`; `numFiles` still counts files read.
+
 - Grouped aggregate state in the native pool (#941, `spark.vecruntime.agg.nativeState`, on by default): past 16,384
   groups, the long sum, count and 128-bit decimal sum accumulators keep their state in one pool block each, a group's
   fields side by side, charged to the task in the operators' memory mode, instead of `long[]` on the heap. At 10 TB

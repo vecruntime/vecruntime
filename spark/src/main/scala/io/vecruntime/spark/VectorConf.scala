@@ -293,6 +293,18 @@ object VectorConf {
    */
   val ScanNativeIcebergPackSplits = "spark.vecruntime.scan.nativeIceberg.packSplits"
 
+  /**
+   * #iceberg-file-pruning: prune Iceberg data files by a broadcast hash join's RUNTIME filters (#610) before the
+   * reader opens them. The static pushed filters are already pruned by Iceberg's own planning
+   * (`InclusiveMetricsEvaluator` over manifests), so those files are never opened; the runtime filters, known
+   * only after the build side runs, are today ANDed into the per-file Parquet row-group statistics filter, so
+   * every file is still opened (its HEAD + footer read) and only its row groups skipped. With this on (default
+   * true), the runtime filters are converted to an Iceberg `Expression` and each native data file is tested with
+   * `InclusiveMetricsEvaluator` on the driver; a file that cannot match is dropped before partitions are built,
+   * so it is never opened. Off restores the row-group-only behaviour.
+   */
+  val ScanNativeIcebergRuntimeFilePruning = "spark.vecruntime.scan.nativeIceberg.runtimeFilePruning.enabled"
+
   /** VectorParquetScanExec read-ahead (#559/#566): files of a split opened ahead, `0` off. */
   val ScanNativeParquetPrefetchFiles = "spark.vecruntime.scan.nativeParquet.prefetchFiles"
 
@@ -816,6 +828,10 @@ object VectorConf {
     bool(conf, ScanNativeIceberg, default = true) && scanNativeParquet(conf)
 
   def scanNativeIcebergPackSplits(conf: SQLConf): Boolean = bool(conf, ScanNativeIcebergPackSplits, default = true)
+
+  /** #iceberg-file-pruning: prune Iceberg data files by runtime filters before opening them (default on). */
+  def scanNativeIcebergRuntimeFilePruning(conf: SQLConf): Boolean =
+    bool(conf, ScanNativeIcebergRuntimeFilePruning, default = true)
 
   /** Whether Comet's scan is active in this session: its plugin or extension registered and its scan not off. */
   def cometScanActive(conf: SQLConf): Boolean = {
