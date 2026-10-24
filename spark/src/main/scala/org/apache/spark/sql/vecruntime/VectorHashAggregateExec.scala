@@ -476,6 +476,13 @@ object AggregateMemory {
   val DefaultMinRefusalBytes: Long = 64L << 20
 }
 
+/** What the task thread is doing with a grouped aggregate's table, for a spill on request (#875). */
+private[vecruntime] object VectorGroupedAggregateIterator {
+  final val Busy = 0
+  final val Boundary = 1
+  final val Spilling = 2
+}
+
 /**
  * Drains the partition into a group table, then emits the groups in batches. Past its memory budget
  * (#363) it either emits the table and starts over (buffer-emitting modes: the next stage merges)
@@ -597,29 +604,33 @@ private[vecruntime] class VectorGroupedAggregateIterator(
   private val memory = new AggregateMemory()
 
   /**
-   * #875: spill on another consumer's request. The table changes only under `tableLock`, which `fill` holds
-   * from one input batch's arrival until it is consumed; `atBoundary` says the task thread is between two
-   * batches -- pulling the next one from the input, which is where a consumer below (a sort, a join's build)
-   * asks for memory. A request takes the lock with `tryLock`, never waits: the task's memory manager holds its
-   * own lock while it asks, and the table may ask that manager for memory while it consumes a batch, so a
-   * request from another thread of the task (a scan's read-ahead) during a consume gets nothing rather than
-   * deadlocking. Only a grace-hash aggregate's first phase can give back: its table goes to its buckets and is
-   * merged with them in the second phase, as a spill past its own budget is. A reservation below `requestFloor`
-   * is not worth a spill file (a table that small regrows at once).
+   * #875: spill on another consumer's request. Only a grace-hash aggregate's first phase can give back: its table
+   * goes to its buckets and is merged with them in the second phase, as a spill past its own budget is. Any other
+   * policy installs no handler and tracks nothing, so it runs exactly as before #875.
+   *
+   * `state` says what the task thread is doing with the table: `Busy` while it consumes a batch, `Boundary`
+   * while it pulls the next one from the input -- which is where a consumer below (a sort, a join's build) asks
+   * for memory. A request moves `Boundary -> Spilling` with one compare-and-set and never waits: the task's
+   * memory manager holds its own lock while it asks, and the table may ask that manager for memory while it
+   * consumes a batch, so a request from another thread of the task (a scan's read-ahead) during a consume gets
+   * nothing rather than deadlocking. The task thread moves `Boundary -> Busy` after each pull, waiting out a
+   * spill another thread is running. A reservation below `requestFloor` is not worth a spill file (a table that
+   * small regrows at once).
    */
-  private val tableLock = new java.util.concurrent.locks.ReentrantLock()
-  @volatile private var atBoundary = false
+  private val spillableOnRequest = policy.isInstanceOf[AggSpillPolicy.GraceHash]
+  private val state = new java.util.concurrent.atomic.AtomicInteger(VectorGroupedAggregateIterator.Busy)
   @volatile private var requestSpills = 0
 
   /** Package-private, for the tests: how many tables were spilled on another consumer's request. */
   private[vecruntime] def spillsOnRequest: Int = requestSpills
 
-  memory.setSpillHandler(() => spillOnRequest())
+  if (spillableOnRequest) memory.setSpillHandler(() => spillOnRequest())
 
   private def spillOnRequest(): Long = {
-    if (!tableLock.tryLock()) return 0L
+    import VectorGroupedAggregateIterator.{Boundary, Spilling}
+    if (!state.compareAndSet(Boundary, Spilling)) return 0L
     try {
-      if (!atBoundary || inputDone || closed || memory.held < requestFloor || table.size() == 0) 0L
+      if (inputDone || closed || memory.held < requestFloor || table.size() == 0) 0L
       else
         policy match {
           case AggSpillPolicy.GraceHash(_, buckets) =>
@@ -629,7 +640,7 @@ private[vecruntime] class VectorGroupedAggregateIterator(
             memory.giveBack()
           case _ => 0L
         }
-    } finally tableLock.unlock()
+    } finally state.set(Boundary)
   }
 
   /** Whether the table has outgrown its budget: the cap, or what Spark's pool grants this task. */
@@ -698,21 +709,12 @@ private[vecruntime] class VectorGroupedAggregateIterator(
   private var probed = probeRows <= 0
 
   /** Consumes `source` into the table until it is exhausted (true) or the table passes `budget` (false; 0 = no budget). */
-  private def fill(source: Iterator[ColumnarBatch], budget: Long): Boolean =
-    try fillBatches(source, budget)
-    finally {
-      // A request that saw the last pull's boundary finishes before the caller touches the table (#875).
-      tableLock.lock(); tableLock.unlock()
-    }
-
-  private def fillBatches(source: Iterator[ColumnarBatch], budget: Long): Boolean = {
+  // Every pull leaves `state` at Busy (#875), so the caller of `fill` always finds the table to itself.
+  private def fill(source: Iterator[ColumnarBatch], budget: Long): Boolean = {
     while (pull(source.hasNext)) {
       val batch = pull(source.next())
-      tableLock.lock()
-      try {
-        fillRows += batch.numRows()
-        consume(batch)
-      } finally tableLock.unlock()
+      fillRows += batch.numRows()
+      consume(batch)
       if (passThrough) return !pull(source.hasNext)
       if (!probed && fillRows >= probeRows) {
         probed = true
@@ -725,11 +727,14 @@ private[vecruntime] class VectorGroupedAggregateIterator(
   }
 
   /** The input pulled between two batches: the one place another consumer's request may spill the table (#875). */
-  private def pull[T](f: => T): T = {
-    atBoundary = true
-    try f
-    finally atBoundary = false
-  }
+  @inline private def pull[T](f: => T): T =
+    if (!spillableOnRequest) f
+    else {
+      import VectorGroupedAggregateIterator.{Boundary, Busy}
+      state.set(Boundary)
+      try f
+      finally while (!state.compareAndSet(Boundary, Busy)) Thread.onSpinWait() // a request mid-spill
+    }
 
   private def reset(): Unit = {
     // #886: the reservation stays -- the next table regrows into it; close returns it.

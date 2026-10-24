@@ -155,29 +155,32 @@ object GraceHashJoin extends Logging {
 
     // #875: another consumer's request, between two build batches -- while the build side is pulled, which is
     // where a consumer below (a sort, an aggregate) asks for memory -- starts the bucketing now and gives the held
-    // rows' bytes back. The builders change only under `buildLock`; a request takes it with tryLock, never waits
-    // (the memory manager holds its own lock while it asks, and an append may ask that manager for memory), so a
-    // request from another thread of the task during an append gets nothing. A build side that cannot bucket, or
-    // holds less than one chunk, gives nothing back.
-    val buildLock = new java.util.concurrent.locks.ReentrantLock()
-    val atBoundary = new java.util.concurrent.atomic.AtomicBoolean(false)
-    def pull[T](f: => T): T = {
-      atBoundary.set(true);
-      try f
-      finally atBoundary.set(false)
-    }
+    // rows' bytes back. `state` (the aggregate's protocol, [[VectorGroupedAggregateIterator]]) is Busy while a
+    // batch is appended and Boundary while the next one is pulled; a request moves Boundary -> Spilling with one
+    // compare-and-set and never waits (the memory manager holds its own lock while it asks, and an append may
+    // ask that manager for memory), so a request from another thread of the task during an append gets nothing.
+    // A build side that cannot bucket tracks nothing; one holding less than one chunk gives nothing back.
+    import VectorGroupedAggregateIterator.{Boundary, Busy, Spilling}
+    val state = new java.util.concurrent.atomic.AtomicInteger(Busy)
+    @inline def pull[T](f: => T): T =
+      if (!canSpill) f
+      else {
+        state.set(Boundary)
+        try f
+        finally while (!state.compareAndSet(Boundary, Busy)) Thread.onSpinWait() // a request mid-bucketing
+      }
     if (canSpill) memory.setSpillHandler { () =>
-      if (!buildLock.tryLock()) 0L
+      if (!state.compareAndSet(Boundary, Spilling)) 0L
       else
         try {
           val held = memory.bytes
-          if (!atBoundary.get() || bucketing || overflowBatch != null || held < requestFloorBytes) 0L
+          if (bucketing || overflowBatch != null || held < requestFloorBytes) 0L
           else {
             requestBucketings.incrementAndGet()
             startBucketing("asked for its memory")
             held
           }
-        } finally buildLock.unlock()
+        } finally state.set(Boundary)
     }
 
     // `overflowBatch == null` first (#771): once a batch overflows, the build side must not be asked for another
@@ -185,26 +188,23 @@ object GraceHashJoin extends Logging {
     // its stream ended, which released the held batch's buffers (q14b at 3 TB read past a 0-byte segment).
     while (overflowBatch == null && pull(buildIter.hasNext)) {
       val batch = pull(buildIter.next())
-      buildLock.lock()
-      try {
-        if (bucketing) spillBuild(batch)
-        else if (batch.numRows() > 0) {
-          EvalContexts.withBatch(batch) { ctx =>
-            val after = bytesAfter(builders, ctx)
-            val granted = memory.hold(after)
-            if (canSpill && (after > budgetBytes || !granted)) overflowBatch = batch
-            else {
-              var c = 0
-              while (c < builders.length) { builders(c).append(ctx.input(c), ctx.selection, ctx.selectedCount); c += 1 }
-              total += ctx.selectedCount
-            }
+      if (bucketing) spillBuild(batch)
+      else if (batch.numRows() > 0) {
+        EvalContexts.withBatch(batch) { ctx =>
+          val after = bytesAfter(builders, ctx)
+          val granted = memory.hold(after)
+          if (canSpill && (after > budgetBytes || !granted)) overflowBatch = batch
+          else {
+            var c = 0
+            while (c < builders.length) { builders(c).append(ctx.input(c), ctx.selection, ctx.selectedCount); c += 1 }
+            total += ctx.selectedCount
           }
         }
-      } finally buildLock.unlock()
+      }
     }
-    // No request is answered from here on: the build side is either in memory or in its buckets.
+    // No request is answered from here on: the build side is either in memory or in its buckets. Every pull
+    // left `state` at Busy, so no request is still running.
     memory.setSpillHandler(null)
-    buildLock.lock(); buildLock.unlock() // a request that saw the last pull's boundary has finished
     if (overflowBatch == null && !bucketing) {
       // As before #416: the whole build side in one table, its bytes held until the task ends.
       val table = new BuildTable(arena, builders.map(_.view()), total, spec, builders = builders).build()
