@@ -10,19 +10,21 @@ Iceberg decides the snapshot, branch or tag, manifest and partition pruning, res
 and task groups. VecRuntime decides how those task groups are read and runs the operators above them. Writes are
 Spark's and Iceberg's, apart from an opt-in columnar deletion-vector writer for v3 tables.
 
-**In short (2026-10-19):**
+**In short (2026-10-24):**
 - **Native scan:** with `spark.vecruntime.scan.nativeIceberg.enabled` (on by default), our native Parquet
   reader reads the data files of an Iceberg table, flat and nested columns alike. It applies position deletes,
-  deletion vectors and equality deletes itself, and reads `_file`, `_pos` and `_spec_id`.
+  deletion vectors and equality deletes itself, and reads `_file`, `_pos`, `_spec_id`, `_partition`, `_row_id`,
+  `_last_updated_sequence_number` and `_deleted`.
 - **When it is declined:** the whole scan or a single task group is read by Iceberg's vectorized reader, and our
   operators adapt its batches. That reader is also the path when the switch is off. Declined are some v3 and
   other column types, other metadata columns, a nested default our reader cannot fill as a constant, and ORC,
   Avro or encrypted files.
 - **No Comet:** Comet is not needed for any of this.
-- **Writes (#913-#921, #936):** a columnar Iceberg writer covers `INSERT`, `INSERT OVERWRITE`, CTAS/RTAS,
+- **Writes (#913-#921, #936, #957):** a columnar Iceberg writer covers `INSERT`, `INSERT OVERWRITE`, CTAS/RTAS,
   copy-on-write and merge-on-read `DELETE` / `UPDATE` / `MERGE INTO`, partitioned tables and hash and range
-  distribution. Merge-on-read writes deletion vectors on v3 and position delete files on v2. It is behind
-  `spark.vecruntime.iceberg.writer.enabled`. See [the columnar writer](#the-write-side-the-columnar-iceberg-writer-842-901).
+  distribution, and the `rewrite_data_files` BINPACK maintenance procedure. Merge-on-read writes deletion
+  vectors on v3 and position delete files on v2. It is behind `spark.vecruntime.iceberg.writer.enabled`
+  (on by default). See [the columnar writer](#the-write-side-the-columnar-iceberg-writer-842-901).
   A one-page summary is in [Iceberg support at a glance](iceberg-support.html).
 
 The tables below give the state of each feature, by format version.
@@ -86,6 +88,75 @@ Everything in the version 2 table applies. The version 3 additions:
 | `unknown` | scan or write | v3 `unknown` is always null and is not stored in a data file (Iceberg's `TypeToMessageType` omits it). The native scan reads it as nulls; the columnar writer writes a table with an `unknown` column at the top level or inside a struct by omitting it, exactly as Iceberg's own writer does, so no data-file column and no metrics carry the unknown field id. An `unknown` list element or map value is declined (Iceberg's writer rejects it too), and a partition source on `unknown` is not carried |
 | Table encryption | group | As encrypted files above |
 
+## Format versions
+
+VecRuntime follows the table's declared format version; it never upgrades or downgrades a table, and both the
+read and the write path behave as Iceberg's own code does for that version.
+
+- **Version 1** reads as version 2 does, without delete files. Our writer writes it as Iceberg writes a v1 table
+  (no row lineage, no deletion vectors).
+- **Version 2 vs version 3** differ in our path only where the format differs:
+
+| Concern | v2 | v3 |
+|---|---|---|
+| Merge-on-read deletes (write) | Parquet **position delete files**, at `write.delete.granularity` (`partition`: one file per partition; `file`: one per data file). Iceberg's `FanoutPositionOnlyDeleteWriter` / `SortingPositionOnlyDeleteWriter` ordering is reproduced | **Deletion vectors** (Puffin), at most one DV per data file, merging any previously committed DV. Which format a write uses is Iceberg's decision (`useDVs`); we follow it |
+| Deletes (read) | Position deletes and equality deletes read natively; the deleted rows are deselected without a copy | Deletion vectors read once per data file and deselected as position deletes; equality deletes still read natively |
+| Row lineage (`_row_id`, `_last_updated_sequence_number`) | not present | Read from the file's own column where it materialises them, else derived as `firstRowId + _pos` / `dataSequenceNumber`, exactly as Iceberg derives them. On the write side a copy-on-write rewrite keeps each surviving/updated row's lineage (M4a/M4b re-encode the two lineage columns and copy the rest); a merge-on-read REINSERT carries its lineage, an INSERT leaves it to the commit (`ExtractRowLineage`) |
+| `first_row_id` inheritance | n/a | A file written by an ordinary append materialises no lineage and inherits it from the data file's `first_row_id` plus the row position; this is why an unmaterialised-lineage v3 source is *not* row-group-copyable and takes the full rewrite (both for copy-on-write DELETE/UPDATE and for `rewrite_data_files`) |
+| Default values (`initial-default`) | — | Filled natively into files written before the column existed, at the top level and inside a struct, for the fillable atomic types; a default of another type keeps Iceberg's reader (see the version-3 table above) |
+| v3 types | — | `variant` (shredded or not) read natively; `unknown` read as nulls and written by omission; `timestamp_ns` / `timestamptz_ns`, `time`, `geometry` / `geography` are out of scope (Iceberg's reader, or Spark's row path) |
+
+We read every version-specific decision (delete file format, granularity, lineage materialisation) back from the
+write's own resolved Iceberg context (`useDVs`, `deleteGranularity`, `deleteFileFormat`) rather than recomputing
+it, so a table behaves exactly as Iceberg's own writer would for its version.
+
+## Table properties
+
+VecRuntime does not own Iceberg's table properties: Iceberg resolves each one into the `SparkReadConf` /
+`SparkWriteConf` it hands the scan or write, and our read and write paths consume that resolved value. So a
+property, its matching per-write option (`spark.read()/write().option(...)`) and the matching session setting
+behave exactly as they do in Iceberg's own reader and writer -- an option overrides the table property, which
+overrides Iceberg's default. The table below says, for each property, whether our path **honours** it (reads or
+writes to it directly), **follows Iceberg** (Iceberg resolves it and we consume the result, so it is honoured
+without us reading the key), or **ignores** it (not applicable to our path).
+
+### Read path
+
+| Property / option | Our path |
+|---|---|
+| `read.split.target-size` (option `split-size`) | **honour** — our task-group packing never merges groups beyond Iceberg's own per-scan target split size, read from the scan's `SparkReadConf.splitSize` (option over property over Iceberg's 128 MB default) |
+| `read.split.open-file-cost` (option `file-open-cost`) | **honour** — each group is weighted by Iceberg's own open-file-cost; a high value (one file per group) keeps one partition per group, as Iceberg planned |
+| `read.split.planning-lookback` | **follow Iceberg** — Iceberg groups the task files; we only coalesce *within* its boundaries, so its lookback is respected as planned |
+| `read.parquet.vectorization.enabled`, `read.parquet.vectorization.batch-size` | **ignore on the native path / follow Iceberg on the fallback** — these govern Iceberg's *own* vectorized reader, which the native scan replaces; our reader uses its own batch sizing. When a scan or group falls back, Iceberg's reader honours them |
+| `schema.name-mapping.default` | **honour** — a file written without field ids (a `migrate` / `add_files` table) gets each column's field id from the mapping by name, nested fields included, before our reader resolves columns (#849) |
+| `write.parquet.*` (page/row-group/dict sizes, codec), `format-version` | **follow Iceberg** — read only as the file's own footer metadata and the table's declared version; the reader matches columns by field id regardless |
+
+### Write path
+
+| Property / option | Our path |
+|---|---|
+| `format-version` | **follow Iceberg** — the writer writes v1/v2/v3 as Iceberg writes them (lineage, delete format); it never changes a table's version |
+| `write.format.default` | **honour (Parquet) / fall back (ORC, Avro)** — the columnar writer writes Parquet only; a non-Parquet data or delete file format declines to Iceberg's writer |
+| `write.target-file-size-bytes`, `write.delete.target-file-size-bytes` | **honour** — the write's resolved target size; delete files roll at the delete target |
+| `write.parquet.row-group-size-bytes`, `page-size-bytes`, `page-row-limit`, `dict-size-bytes` | **honour** — passed to the columnar Parquet writer through the write's resolved `write.parquet.*` properties |
+| `write.parquet.compression-codec`, `compression-level` | **honour** — the resolved codec/level; also the copyability guard for a bin-pack / copy-on-write byte copy (a codec mismatch forces a decode/re-encode) |
+| `write.parquet.bloom-filter-enabled.column.*`, `-fpp.column.*`, `-max-bytes` | **honour** — passed through to the writer; a byte-copied row group keeps its own Bloom filter |
+| `write.delete.parquet.*` | **honour** — for delete files, overriding `write.parquet.*`, as Iceberg resolves them |
+| `write.metadata.metrics.default`, `write.metadata.metrics.column.*` | **honour** — through Iceberg's `MetricsConfig` and its field-metrics builders; the combined-footer metrics path (full rewrite and byte copy alike) respects the metrics modes and bound truncation. A table tracking float/double NaN counts forces a full rewrite where a copy could not supply the NaN count |
+| `write.distribution-mode` (and the per-command `write.delete/update/merge.distribution-mode`) | **honour** — Iceberg turns the mode into the write's required distribution; our native distribution runs none / hash / range on batches through the columnar shuffle, so no Spark `SortExec` / `ShuffleExchangeExec` is left |
+| `write.delete.mode`, `write.update.mode`, `write.merge.mode` | **honour (per command)** — Spark's optimizer turns each into a `ReplaceData` (copy-on-write) or `WriteDelta` (merge-on-read); our two strategies route only on that node type, so the table's mode always runs. Iceberg 1.12 exposes no option/session override for the mode, so it comes only from the property. Default `copy-on-write` on v2 and v3 |
+| `write.delete.granularity` | **honour** — `partition` (one delete file per partition) or `file` (one per data file); read back from the write's resolved context. Default `partition` |
+| `write.spark.fanout.enabled` | **honour** — clustered (one open file) vs fanout (one open file per partition), as Iceberg's `SparkWrite.useFanoutWriter` decides |
+| `write.spark.advisory-partition-size-bytes` (session `spark.sql.iceberg.advisory-partition-size`) | **follow Iceberg** — AQE splits the insert half of a delta write to it; see [the advisory partition size](#write-stage-parallelism-the-advisory-partition-size) |
+| `write.data.path`, `write.object-storage.enabled` and its `write.object-storage.*` keys | **honour** — through Iceberg's `OutputFileFactory` and the table's location provider (file names and locations are Iceberg's) |
+| Sort order (`write.*` ordering, the table's sort order) | **honour** — the rows reach the writer already in Iceberg's required order (`RequiresDistributionAndOrdering`), and the writer stamps the sort-order id Iceberg's own writer would (`SparkWriteConf.outputSortOrderId`) |
+| Partition spec and transforms (identity, bucket, truncate, year, month, day, hour) | **honour** — computed on lanes by `IcebergTransformKernels` / `PartitionKeys`, matching Iceberg's `PartitionKey` byte for byte; a partition source reached only through a list or map declines to Iceberg's writer |
+| `write.parquet.shred-variants` | **honour (read) / fall back (write)** — our reader reads a shredded variant either way; the columnar writer does not encode a shredded variant yet and declines |
+| `write.parquet.row-group-check-min-record-count`, `-max-record-count` | **ignore** — not applicable: the columnar writer tracks the open row group's size after every batch (#997) |
+
+Write options and session settings (`compression-codec`, `target-file-size-bytes`, …) are read from the write's
+resolved `SparkWriteConf`, so they override table properties exactly as in Iceberg's writer.
+
 ## How the native scan reads a table
 
 `VectorIcebergScanExec` wraps the `BatchScanExec` Spark planned for an Iceberg scan and keeps its input partitions
@@ -115,7 +186,8 @@ At plan time the node declines, and Spark's `BatchScanExec` stays:
 - a nested or top-level default our reader cannot fill as a constant;
 - a column type outside the flat types in the table above, or a nested type with such a leaf.
 
-The switch is off by default until the TPC-DS Iceberg A/B is in.
+The switch is on by default (`spark.vecruntime.scan.nativeIceberg.enabled=true`), together with the native
+Parquet scan it rides on; set it to `false` to read every Iceberg table through Iceberg's own reader.
 
 ## Iceberg's vectorized reader under our operators
 
@@ -277,18 +349,12 @@ feature flags -- `VectorIcebergWriteStrategy` takes `ReplaceData`, `VectorWriteD
 
 ### Table properties
 
-| Property | Honoured |
-|---|---|
-| `write.target-file-size-bytes`, `write.delete.target-file-size-bytes` | yes |
-| `write.parquet.row-group-size-bytes`, `page-size-bytes`, `page-row-limit`, `dict-size-bytes` | yes |
-| `write.parquet.compression-codec`, `compression-level` | yes |
-| `write.parquet.bloom-filter-*` | yes |
-| `write.delete.parquet.*` | yes; for delete files they override `write.parquet.*` |
-| `write.metadata.metrics.default`, `write.metadata.metrics.column.*` | yes, through `MetricsConfig` |
-| `write.distribution-mode`, `write.spark.fanout.enabled`, `write.delete.granularity` | yes |
-| Write options and session settings (`compression-codec`, `target-file-size-bytes`, ...) | yes; read from the write's resolved `SparkWriteConf`, so they override table properties as in Iceberg's writer |
-| `write.data.path`, `write.object-storage.enabled` | yes, through `OutputFileFactory` and the location provider |
-| `write.parquet.row-group-check-*` | not applicable: the open row group's size is tracked after every batch |
+The write path honours the table's Iceberg properties as Iceberg's own writer does -- target and delete file
+sizes, the Parquet row-group / page / dictionary sizes, codec and level, Bloom filters, metrics modes,
+distribution mode, fanout, delete granularity, object-storage layout and sort order -- by consuming the write's
+resolved `SparkWriteConf` rather than reading the keys itself. The one non-Parquet case (`write.format.default`
+of ORC or Avro) declines to Iceberg's writer. The full per-property table, read and write, is in
+[Table properties](#table-properties).
 
 ### Tests
 
@@ -437,7 +503,31 @@ Covered by `VectorCopyUnchangedUpdateSuite` (v2/v3, partitioned/unpartitioned, u
 columns, self-assignment, a nested-column and a partition-column fallback, and the MERGE fallback) with the same
 data + lineage + metrics oracle.
 
-Column-chunk copying for `rewrite_data_files` (M4c) follows.
+**M4c: column-chunk copy for `rewrite_data_files` (#957).** The `rewrite_data_files` BINPACK maintenance
+procedure compacts a file group. Stock Iceberg decodes every row of every input file and re-encodes it into
+target-sized outputs; the columnar bin-pack copies each copyable input file's row groups byte for byte instead.
+Because a bin-pack never changes a row -- it only repacks whole files into target-sized outputs -- *every* row
+group of a copyable file is copied (unlike M4a's DELETE, which copies only the delete-free groups). A source file
+falls back to the columnar decode/re-encode path (whose output is byte-for-byte what Iceberg's own bin-pack would
+produce) when `BinPackCopyPlanner` finds any guard failing: deletes attached to the file (a position/equality
+delete or a DV would otherwise keep deleted rows), a partition-spec mismatch (a repartitioning rewrite re-clusters
+rows), schema evolution (the file's Parquet schema no longer matches the table write schema, compared by the same
+normalised Parquet text form as M4a), v3 unmaterialised row lineage (a byte copy into a new file with a new
+`first_row_id` would change each row's `_row_id`; an engine-written v3 file already materialises lineage and is
+copyable), a codec mismatch against the table's `write.parquet.compression-codec`, an unreadable Parquet encoding,
+or a table tracking float/double NaN counts (a footer carries no NaN count, so a copy cannot supply it). Metrics
+come from the same combined-footer path as M4a, honouring `write.metadata.metrics.*`.
+
+The fast path is behind `spark.vecruntime.iceberg.rewrite.binpackCopy.enabled` (default **on**), but it is reached
+only through `VectorRewriteDataFiles.binPackCopy(spark, table)`, which installs the vecruntime runner
+(`VectorBinPackFileRewriteRunner`) on Iceberg's own `RewriteDataFilesSparkAction` by setting the action's private
+`runner` field -- the same field Iceberg's `binPack()` sets. The installation is **fail-closed**: if the flag is
+off, or the field is absent / not a `FileRewriteRunner` / does not hold Iceberg's stock bin-pack runner (so
+Iceberg's internals changed shape), nothing is replaced and the action runs Iceberg's stock bin-pack unchanged,
+with a once-per-JVM warning. The result is correct either way; the flag only selects the byte-copy fast path, so
+an A/B is a config change. The primitive and its guards are covered by `BinPackCopyPlannerSuite`, and the
+end-to-end procedure by the Iceberg upstream test harness's own `TestRewriteDataFilesAction` (see
+[the upstream harness](#the-apache-iceberg-upstream-test-harness-988-997)).
 
 ## The write side: columnar v3 deletion vectors (#20)
 
@@ -485,6 +575,33 @@ nor our shuffle changes this trade-off; the numbers are the same with the writer
 - Over Iceberg's reader, merge-on-read batches pay Iceberg's per-batch `int[]` mapping (19 % of a full-scan probe
   for us at SF1 on v3). Converting it back into a bitmap costs 1.5 %. Removing the mapping needs an Iceberg-side
   option; the native scan has no mapping.
+
+## The Apache Iceberg upstream test harness (#988-#997)
+
+Beyond our own suites, the plugin is run against **Apache Iceberg 1.12.0's own Spark 4.1 test suites**
+(`benchmarks/iceberg-tests/`), the Iceberg analogue of the Spark golden-suite harness. The plugin is injected
+into Iceberg's test bases via `spark.plugins`, with every vecruntime Iceberg path fixed on (native scan, columnar
+writer, DV / position-delete writer, copy-unchanged), so the suites exercise the full read and write path. The
+harness launches Gradle on JDK 17/21 (Iceberg's build refuses anything else) and runs the test JVM on JDK 25 (the
+Vector API incubator module) via a Gradle toolchain.
+
+Current `main`:
+
+| module | tests | failed | skipped |
+|---|---|---|---|
+| `iceberg-spark-extensions-4.1_2.13` | 1334 | 0 | 106 |
+| `iceberg-spark-4.1_2.13` | 579 | 0 (after the exclusions) | 22 |
+
+With the plugin off the same suites pass, so every exclusion is about the plugin, not the environment. There are
+**9 triaged exclusions** (`exclusions.txt`), each a test *assertion* that is plugin-specific rather than a
+correctness failure: six `*WithVectorizedReads` cases (they assert Iceberg's `BatchScanExec`, which the plugin
+replaces with `VectorIcebergScanExec`); one aggregate-pushdown EXPLAIN-text match; and two
+`TestRewriteDataFilesAction` bin-pack cases on v3/v4 whose expected max file size is hand-fitted to Iceberg's own
+writer byte sizes (the columnar writer's pages are ~1.7-1.9x smaller, so rows and `rewrittenBytes` still match --
+checked numerically). Several vecruntime fixes came out of this harness: task-group grouping and per-scan
+`read.split.*` options (#988), shaded/unshaded Iceberg parquet interop (#989), schema-order row-group copy (#992),
+write coalescing and `sort_order_id` on copy-unchanged files (#993), and the adaptive row-group boundary check
+(#997). See `benchmarks/iceberg-tests/README.md`.
 
 ## Tests
 
