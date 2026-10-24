@@ -12,7 +12,7 @@ spark-submit \
   --conf spark.plugins=io.vecruntime.spark.VectorPlugin \
   --conf spark.driver.extraJavaOptions="--add-modules=jdk.incubator.vector --enable-native-access=ALL-UNNAMED --sun-misc-unsafe-memory-access=allow" \
   --conf spark.executor.extraJavaOptions="--add-modules=jdk.incubator.vector --enable-native-access=ALL-UNNAMED --sun-misc-unsafe-memory-access=allow" \
-  --jars vecruntime-spark_4.1_2.13-0.0.7.jar \
+  --jars vecruntime-spark_4.1_2.13-0.0.9.jar \
   ...
 ```
 
