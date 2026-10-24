@@ -525,12 +525,21 @@ object PartitionedIpcFile {
         // offsets buffer at all: no entries, every id null.
         val n = math.max(0, math.min(vector.getValueCount, (buffers.offsets().byteSize() >> 2).toInt - 1))
         starts = new Array[Int](n + 1)
-        if (n > 0) java.lang.foreign.MemorySegment.copy(buffers.offsets(), VectorBuffers.LE_INT, 0L, starts, 0, n + 1)
+        if (n > 0) io.vecruntime.kernels.CopyCounters.copy(
+          "PartitionedIpcFile.heap:528",
+          buffers.offsets(),
+          VectorBuffers.LE_INT,
+          0L,
+          starts,
+          0,
+          n + 1
+        )
         // Likewise the bytes: the data buffer carries the entries the stream references, which can end
         // before the last offset (#345's slices); a referenced entry is always within it.
         val dataLen = math.min(starts(n).toLong, buffers.data().byteSize()).toInt
         bytes = new Array[Byte](dataLen)
-        if (dataLen > 0) java.lang.foreign.MemorySegment.copy(
+        if (dataLen > 0) io.vecruntime.kernels.CopyCounters.copy(
+          "PartitionedIpcFile.heap:533",
           buffers.data(),
           java.lang.foreign.ValueLayout.JAVA_BYTE,
           0L,
@@ -627,11 +636,25 @@ object PartitionedIpcFile {
               srcOff.get(VectorBuffers.LE_INT, i.toLong << 2) + base
             ); i += 1
           }
-          if (bytes > 0) java.lang.foreign.MemorySegment.copy(in.data(), start.toLong, buffers.data(), dataBytes, bytes)
+          if (bytes > 0) io.vecruntime.kernels.CopyCounters.copy(
+            "PartitionedIpcFile.append:630",
+            in.data(),
+            start.toLong,
+            buffers.data(),
+            dataBytes,
+            bytes
+          )
         } else if (isBool) {
           Bitmap.copyBits(in.data(), buffers.data(), rows, n)
         } else {
-          java.lang.foreign.MemorySegment.copy(in.data(), 0L, buffers.data(), rows.toLong * width, n.toLong * width)
+          io.vecruntime.kernels.CopyCounters.copy(
+            "PartitionedIpcFile.append:634",
+            in.data(),
+            0L,
+            buffers.data(),
+            rows.toLong * width,
+            n.toLong * width
+          )
         }
         if (in.validity() != null) Bitmap.copyBits(in.validity(), buffers.validity(), rows, n)
         else Bitmap.fillRange(buffers.validity(), rows, n, true)
@@ -651,12 +674,21 @@ object PartitionedIpcFile {
         val idx = ArrowVectorBuffers.forRead(indices)
         // The block's ids and validity words on the heap: one bulk copy each, then plain array reads.
         if (ids.length < n) ids = new Array[Int](math.max(n, ids.length * 2))
-        java.lang.foreign.MemorySegment.copy(idx.data(), VectorBuffers.LE_INT, 0L, ids, 0, n)
+        io.vecruntime.kernels.CopyCounters.copy(
+          "PartitionedIpcFile.appendEncoded:654",
+          idx.data(),
+          VectorBuffers.LE_INT,
+          0L,
+          ids,
+          0,
+          n
+        )
         val valid = idx.validity()
         val validLen = (n + 7) >>> 3
         if (valid != null) {
           if (validBytes.length < validLen) validBytes = new Array[Byte](math.max(validLen, validBytes.length * 2))
-          java.lang.foreign.MemorySegment.copy(
+          io.vecruntime.kernels.CopyCounters.copy(
+            "PartitionedIpcFile.appendEncoded:659",
             valid,
             java.lang.foreign.ValueLayout.JAVA_BYTE,
             0L,
@@ -692,7 +724,8 @@ object PartitionedIpcFile {
           outOffsets(i) = dataBytes.toInt + out
           i += 1
         }
-        if (out > 0) java.lang.foreign.MemorySegment.copy(
+        if (out > 0) io.vecruntime.kernels.CopyCounters.copy(
+          "PartitionedIpcFile.appendEncoded:695",
           outBytes,
           0,
           buffers.data(),
@@ -700,7 +733,8 @@ object PartitionedIpcFile {
           dataBytes,
           out
         )
-        java.lang.foreign.MemorySegment.copy(
+        io.vecruntime.kernels.CopyCounters.copy(
+          "PartitionedIpcFile.appendEncoded:703",
           outOffsets,
           0,
           buffers.offsets(),

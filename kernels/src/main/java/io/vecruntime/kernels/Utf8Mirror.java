@@ -92,12 +92,12 @@ public final class Utf8Mirror {
     public static Utf8Mirror of(VectorBuffers in) {
         int n = in.length();
         int[] offsets = new int[n + 1];
-        MemorySegment.copy(in.offsets(), VectorBuffers.LE_INT, 0L, offsets, 0,
-                n + 1);
+        CopyCounters.copy("Utf8Mirror.of:95", in.offsets(), VectorBuffers.LE_INT, 0L, offsets,
+                0, n + 1);
         int bytes = offsets[n] - offsets[0];
         byte[] data = new byte[bytes];
-        MemorySegment.copy(in.data(), ValueLayout.JAVA_BYTE, offsets[0], data, 0,
-                bytes);
+        CopyCounters.copy("Utf8Mirror.of:99", in.data(), ValueLayout.JAVA_BYTE, offsets[0], data,
+                0, bytes);
         long[] validity = null;
         if (in.hasNulls()) {
             int words = Bitmap.wordsFor(n);
@@ -232,10 +232,11 @@ public final class Utf8Mirror {
             }
         }
         outOff[count] = pos;
-        MemorySegment.copy(outOff, 0, outOffsets, VectorBuffers.LE_INT, 0L,
+        CopyCounters.copy("Utf8Mirror.gather:235", outOff, 0, outOffsets, VectorBuffers.LE_INT, 0L,
                 count + 1);
         if (pos > 0) {
-            MemorySegment.copy(out, 0, outData, ValueLayout.JAVA_BYTE, 0L, pos);
+            CopyCounters.copy("Utf8Mirror.gather:238", out, 0, outData, ValueLayout.JAVA_BYTE, 0L,
+                    pos);
         }
         if (outValidity != null) {
             int words = Bitmap.wordsFor(count);

@@ -89,12 +89,12 @@ public final class HeapMirror {
         long[] longs = null;
         if (t == VecType.INT32) {
             ints = new int[n];
-            MemorySegment.copy(in.data(), VectorBuffers.LE_INT, 0L, ints, 0,
-                    n);
+            CopyCounters.copy("HeapMirror.of:92", in.data(), VectorBuffers.LE_INT, 0L, ints,
+                    0, n);
         } else {
             longs = new long[n];
-            MemorySegment.copy(in.data(), VectorBuffers.LE_LONG, 0L, longs, 0,
-                    n);
+            CopyCounters.copy("HeapMirror.of:96", in.data(), VectorBuffers.LE_LONG, 0L, longs,
+                    0, n);
         }
         long[] validity = null;
         if (in.hasNulls()) {
@@ -123,14 +123,14 @@ public final class HeapMirror {
             ints = prev != null && prev.ints != null && prev.ints.length >= n
                     ? prev.ints
                     : new int[Math.max(n, 4096)];
-            MemorySegment.copy(in.data(), VectorBuffers.LE_INT, 0L, ints, 0,
-                    n);
+            CopyCounters.copy("HeapMirror.reuse:126", in.data(), VectorBuffers.LE_INT, 0L, ints,
+                    0, n);
         } else {
             longs = prev != null && prev.longs != null && prev.longs.length >= n
                     ? prev.longs
                     : new long[Math.max(n, 4096)];
-            MemorySegment.copy(in.data(), VectorBuffers.LE_LONG, 0L, longs, 0,
-                    n);
+            CopyCounters.copy("HeapMirror.reuse:132", in.data(), VectorBuffers.LE_LONG, 0L, longs,
+                    0, n);
         }
         long[] validity = null;
         if (in.hasNulls()) {
@@ -165,14 +165,16 @@ public final class HeapMirror {
                 int i = idx[from + o];
                 out[o] = i < 0 ? 0 : ints[i];
             }
-            MemorySegment.copy(out, 0, outData, VectorBuffers.LE_INT, 0L, count);
+            CopyCounters.copy("HeapMirror.gather:168", out, 0, outData, VectorBuffers.LE_INT, 0L,
+                    count);
         } else {
             long[] out = scratch.longs(count);
             for (int o = 0; o < count; o++) {
                 int i = idx[from + o];
                 out[o] = i < 0 ? 0L : longs[i];
             }
-            MemorySegment.copy(out, 0, outData, VectorBuffers.LE_LONG, 0L, count);
+            CopyCounters.copy("HeapMirror.gather:175", out, 0, outData, VectorBuffers.LE_LONG, 0L,
+                    count);
         }
         if (outValidity != null) {
             int words = Bitmap.wordsFor(count);

@@ -159,7 +159,8 @@ public final class SparkColumnVectorBuffers {
                 MemorySegment source = wrapData(w, type, numRows);
                 if (source != null) {
                     MemorySegment data = ArrowLayout.allocateData(arena, type, numRows);
-                    MemorySegment.copy(source, 0, data, 0, source.byteSize());
+                    io.vecruntime.kernels.CopyCounters.copy("SparkColumnVectorBuffers.copy:162", source, 0, data, 0,
+                            source.byteSize());
                     return SegmentVectorBuffers.fixedWidth(type, numRows, validity, data);
                 }
             }
@@ -175,20 +176,20 @@ public final class SparkColumnVectorBuffers {
         switch (type) {
             case INT32 -> {
                 MemorySegment data = ArrowLayout.allocateData(arena, type, numRows);
-                MemorySegment.copy(cv.getInts(0, numRows), 0, data, VectorBuffers.LE_INT, 0,
-                        numRows);
+                io.vecruntime.kernels.CopyCounters.copy("SparkColumnVectorBuffers.copy:178", cv.getInts(0, numRows), 0, data, VectorBuffers.LE_INT,
+                        0, numRows);
                 return SegmentVectorBuffers.fixedWidth(type, numRows, validity, data);
             }
             case INT64 -> {
                 MemorySegment data = ArrowLayout.allocateData(arena, type, numRows);
-                MemorySegment.copy(cv.getLongs(0, numRows), 0, data, VectorBuffers.LE_LONG, 0,
-                        numRows);
+                io.vecruntime.kernels.CopyCounters.copy("SparkColumnVectorBuffers.copy:184", cv.getLongs(0, numRows), 0, data, VectorBuffers.LE_LONG,
+                        0, numRows);
                 return SegmentVectorBuffers.fixedWidth(type, numRows, validity, data);
             }
             case FLOAT64 -> {
                 MemorySegment data = ArrowLayout.allocateData(arena, type, numRows);
-                MemorySegment.copy(cv.getDoubles(0, numRows), 0, data, VectorBuffers.LE_DOUBLE, 0,
-                        numRows);
+                io.vecruntime.kernels.CopyCounters.copy("SparkColumnVectorBuffers.copy:190", cv.getDoubles(0, numRows), 0, data, VectorBuffers.LE_DOUBLE,
+                        0, numRows);
                 return SegmentVectorBuffers.fixedWidth(type, numRows, validity, data);
             }
             case BOOL -> {
@@ -297,8 +298,8 @@ public final class SparkColumnVectorBuffers {
                     data.setAtIndex(VectorBuffers.LE_LONG, i, ints[i]);
                 }
             } else {
-                MemorySegment.copy(cv.getLongs(0, numRows), 0, data, VectorBuffers.LE_LONG, 0,
-                        numRows);
+                io.vecruntime.kernels.CopyCounters.copy("SparkColumnVectorBuffers.copyDecimal:300", cv.getLongs(0, numRows), 0, data, VectorBuffers.LE_LONG,
+                        0, numRows);
             }
         } else {
             for (int i = 0; i < numRows; i++) {
@@ -669,7 +670,8 @@ public final class SparkColumnVectorBuffers {
                     out[i] = (int) table[idArray[i] & keep] & keep;
                 }
             }
-            MemorySegment.copy(out, 0, data, VectorBuffers.LE_INT, 0, numRows);
+            io.vecruntime.kernels.CopyCounters.copy("SparkColumnVectorBuffers.decodeDictionaryInto:672",
+                    out, 0, data, VectorBuffers.LE_INT, 0, numRows);
         } else {
             long[] out = longScratch(numRows);
             if (nulls == null) {
@@ -682,7 +684,8 @@ public final class SparkColumnVectorBuffers {
                     out[i] = table[idArray[i] & keep] & keep;
                 }
             }
-            MemorySegment.copy(out, 0, data, VectorBuffers.LE_LONG, 0, numRows);
+            io.vecruntime.kernels.CopyCounters.copy("SparkColumnVectorBuffers.decodeDictionaryInto:685",
+                    out, 0, data, VectorBuffers.LE_LONG, 0, numRows);
         }
         return true;
     }
@@ -721,12 +724,13 @@ public final class SparkColumnVectorBuffers {
         // executors (8.1% + 4.3% of q88's samples at 1 TB) that took back most of what dropping the
         // per-batch arrays saved.
         int[] idArray = idScratch(numRows);
-        MemorySegment.copy(idSeg, ValueLayout.JAVA_INT_UNALIGNED,
+        io.vecruntime.kernels.CopyCounters.copy("SparkColumnVectorBuffers.decodeOffHeapDictionaryInto:724", idSeg, ValueLayout.JAVA_INT_UNALIGNED,
                 0, idArray, 0, numRows);
         byte[] nulls = null;
         if (nullSeg != null) {
             nulls = nullScratch(numRows);
-            MemorySegment.copy(nullSeg, ValueLayout.JAVA_BYTE, 0, nulls, 0, numRows);
+            io.vecruntime.kernels.CopyCounters.copy("SparkColumnVectorBuffers.decodeOffHeapDictionaryInto:729", nullSeg, ValueLayout.JAVA_BYTE,
+                    0, nulls, 0, numRows);
         }
         DecodedDictionary decoded = decodedDictionary(dict, type);
         long[] table;
@@ -759,7 +763,8 @@ public final class SparkColumnVectorBuffers {
                     out[i] = (int) table[idArray[i] & keep] & keep;
                 }
             }
-            MemorySegment.copy(out, 0, data, VectorBuffers.LE_INT, 0, numRows);
+            io.vecruntime.kernels.CopyCounters.copy("SparkColumnVectorBuffers.decodeOffHeapDictionaryInto:762",
+                    out, 0, data, VectorBuffers.LE_INT, 0, numRows);
         } else {
             long[] out = longScratch(numRows);
             if (nulls == null) {
@@ -772,7 +777,8 @@ public final class SparkColumnVectorBuffers {
                     out[i] = table[idArray[i] & keep] & keep;
                 }
             }
-            MemorySegment.copy(out, 0, data, VectorBuffers.LE_LONG, 0, numRows);
+            io.vecruntime.kernels.CopyCounters.copy("SparkColumnVectorBuffers.decodeOffHeapDictionaryInto:775",
+                    out, 0, data, VectorBuffers.LE_LONG, 0, numRows);
         }
         return true;
     }
@@ -929,10 +935,11 @@ public final class SparkColumnVectorBuffers {
         sc.bytes = bytes;
         sc.offsets = offsets;
         MemorySegment dictOffsets = ArrowLayout.allocateOffsets(arena, distinct);
-        MemorySegment.copy(offsets, 0, dictOffsets, VectorBuffers.LE_INT, 0,
-                distinct + 1);
+        io.vecruntime.kernels.CopyCounters.copy("SparkColumnVectorBuffers.copyDictionaryUtf8:932", offsets,
+                0, dictOffsets, VectorBuffers.LE_INT, 0, distinct + 1);
         MemorySegment dictData = ArrowLayout.allocateBytes(arena, used);
-        MemorySegment.copy(bytes, 0, dictData, ValueLayout.JAVA_BYTE, 0, used);
+        io.vecruntime.kernels.CopyCounters.copy("SparkColumnVectorBuffers.copyDictionaryUtf8:935",
+                bytes, 0, dictData, ValueLayout.JAVA_BYTE, 0, used);
         VectorBuffers dictionary = SegmentVectorBuffers.utf8(distinct, null, dictOffsets, dictData);
         return SegmentVectorBuffers.dictionaryUtf8(numRows, validity, indices, dictionary);
     }
@@ -968,10 +975,11 @@ public final class SparkColumnVectorBuffers {
                 if (len > 0) {
                     ByteBuffer bb = bytes.getByteBuffer(cv.getArrayOffset(i), len);
                     if (bb.hasArray()) {
-                        MemorySegment.copy(bb.array(), bb.arrayOffset() + bb.position(), data, ValueLayout.JAVA_BYTE,
-                                pos, len);
+                        io.vecruntime.kernels.CopyCounters.copy("SparkColumnVectorBuffers.copyWritableUtf8:971", bb.array(), bb.arrayOffset() + bb.position(), data,
+                                ValueLayout.JAVA_BYTE, pos, len);
                     } else {
-                        MemorySegment.copy(MemorySegment.ofBuffer(bb), 0, data, pos, len);
+                        io.vecruntime.kernels.CopyCounters.copy("SparkColumnVectorBuffers.copyWritableUtf8:974", MemorySegment.ofBuffer(bb),
+                                0, data, pos, len);
                     }
                     pos += len;
                 }
@@ -1004,7 +1012,8 @@ public final class SparkColumnVectorBuffers {
             UTF8String s = strings[i];
             if (s != null) {
                 byte[] bytes = s.getBytes();
-                MemorySegment.copy(bytes, 0, data, ValueLayout.JAVA_BYTE, pos, bytes.length);
+                io.vecruntime.kernels.CopyCounters.copy("SparkColumnVectorBuffers.copyUtf8:1007",
+                        bytes, 0, data, ValueLayout.JAVA_BYTE, pos, bytes.length);
                 pos += bytes.length;
             }
         }
@@ -1063,7 +1072,8 @@ public final class SparkColumnVectorBuffers {
                 return null;
             }
             byte[] nulls = new byte[numRows];
-            MemorySegment.copy(nativeNulls, ValueLayout.JAVA_BYTE, 0, nulls, 0, numRows);
+            io.vecruntime.kernels.CopyCounters.copy("SparkColumnVectorBuffers.heapNulls:1066", nativeNulls, ValueLayout.JAVA_BYTE,
+                    0, nulls, 0, numRows);
             return nulls;
         }
         return null;
@@ -1083,7 +1093,7 @@ public final class SparkColumnVectorBuffers {
                 return null;
             }
             int[] idArray = new int[numRows];
-            MemorySegment.copy(nativeIds, ValueLayout.JAVA_INT_UNALIGNED,
+            io.vecruntime.kernels.CopyCounters.copy("SparkColumnVectorBuffers.heapIds:1086", nativeIds, ValueLayout.JAVA_INT_UNALIGNED,
                     0, idArray, 0, numRows);
             return idArray;
         }

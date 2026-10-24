@@ -154,7 +154,7 @@ public final class ArrowCData {
                     data = a.data();
                 } else {
                     data = arena.allocate(Math.max((long) n << 4, 16), 16);
-                    MemorySegment.copy(in.data(), 0, data, 0,
+                    io.vecruntime.kernels.CopyCounters.copy("ArrowCData.export:157", in.data(), 0, data, 0,
                             (long) n << 4);
                     if (nullCount > 0) {
                         validity = copyBitmap(arena, in.validity(), n);
@@ -200,8 +200,8 @@ public final class ArrowCData {
                         int k = in.getInt(i);
                         int start = dict.offsets().get(VectorBuffers.LE_INT, (long) k << 2);
                         int len = utf8Length(dict, k);
-                        MemorySegment.copy(dict.data(), ValueLayout.JAVA_BYTE, start, data, ValueLayout.JAVA_BYTE,
-                                pos, len);
+                        io.vecruntime.kernels.CopyCounters.copy("ArrowCData.export:203", dict.data(), ValueLayout.JAVA_BYTE, start, data,
+                                ValueLayout.JAVA_BYTE, pos, len);
                         pos += len;
                     }
                 }
@@ -216,16 +216,18 @@ public final class ArrowCData {
                 if (in.type() == VecType.UTF8) {
                     int end = in.offsets().get(VectorBuffers.LE_INT, (long) n << 2);
                     offsets = arena.allocate(((long) n + 1) << 2, 8);
-                    MemorySegment.copy(in.offsets(), 0, offsets, 0,
+                    io.vecruntime.kernels.CopyCounters.copy("ArrowCData.export:219", in.offsets(), 0, offsets, 0,
                             ((long) n + 1) << 2);
                     data = arena.allocate(Math.max(end, 1), 8);
-                    MemorySegment.copy(in.data(), 0, data, 0, end);
+                    io.vecruntime.kernels.CopyCounters.copy("ArrowCData.export:222", in.data(), 0, data, 0,
+                            end);
                 } else if (in.type() == VecType.BOOL) {
                     data = copyBitmap(arena, in.data(), n);
                 } else {
                     long bytes = (long) n * in.type().byteWidth();
                     data = arena.allocate(Math.max(bytes, 1), 8);
-                    MemorySegment.copy(in.data(), 0, data, 0, bytes);
+                    io.vecruntime.kernels.CopyCounters.copy("ArrowCData.export:228", in.data(), 0, data, 0,
+                            bytes);
                 }
             }
 

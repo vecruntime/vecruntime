@@ -466,7 +466,7 @@ public final class IcebergVectorAdapter implements ColumnVectorAdapters.Adapter 
             if (validity != null && !io.vecruntime.kernels.Bitmap.isSet(validity, i)) {
                 continue;
             }
-            MemorySegment.copy(source, java.lang.foreign.ValueLayout.JAVA_BYTE,
+            io.vecruntime.kernels.CopyCounters.copy("IcebergVectorAdapter.adaptWideDecimal:469", source, java.lang.foreign.ValueLayout.JAVA_BYTE,
                     (long) i * width, be, 0, width);
             Decimal128.set(data, i, Decimal128.hiFromBigEndian(be, 0, width), Decimal128.loFromBigEndian(be, 0, width));
         }
@@ -499,7 +499,8 @@ public final class IcebergVectorAdapter implements ColumnVectorAdapters.Adapter 
         int pos = 0;
         for (int i = 0; i < size; i++) {
             offsets.setAtIndex(VectorBuffers.LE_INT, i, pos);
-            MemorySegment.copy(values[i], 0, bytes, java.lang.foreign.ValueLayout.JAVA_BYTE, pos, values[i].length);
+            io.vecruntime.kernels.CopyCounters.copy("IcebergVectorAdapter.adaptDictionaryUtf8:502", values[i],
+                    0, bytes, java.lang.foreign.ValueLayout.JAVA_BYTE, pos, values[i].length);
             pos += values[i].length;
         }
         offsets.setAtIndex(VectorBuffers.LE_INT, size, pos);
@@ -613,7 +614,8 @@ public final class IcebergVectorAdapter implements ColumnVectorAdapters.Adapter 
         // a valid row; a null row's lane is left 0.
         int[] ids = scratchIds(numRows);
         long[] out = scratchLongs(numRows);
-        MemorySegment.copy(indices, VectorBuffers.LE_INT, 0, ids, 0, numRows);
+        io.vecruntime.kernels.CopyCounters.copy("IcebergVectorAdapter.adaptDictionarySmallDecimal:616", indices, VectorBuffers.LE_INT,
+                0, ids, 0, numRows);
         int size = lut.length;
         for (int i = 0; i < numRows; i++) {
             int id = ids[i];
@@ -625,7 +627,8 @@ public final class IcebergVectorAdapter implements ColumnVectorAdapters.Adapter 
                 out[i] = 0L;
             }
         }
-        MemorySegment.copy(out, 0, data, VectorBuffers.LE_LONG, 0, numRows);
+        io.vecruntime.kernels.CopyCounters.copy("IcebergVectorAdapter.adaptDictionarySmallDecimal:628",
+                out, 0, data, VectorBuffers.LE_LONG, 0, numRows);
         return SegmentVectorBuffers.fixedWidth(VecType.INT64, numRows, validity, data);
     }
 

@@ -286,11 +286,25 @@ final class PartitionedIpcWriter(
             srcOff.get(VectorBuffers.LE_INT, i.toLong << 2) + base
           ); i += 1
         }
-        if (bytes > 0) MemorySegment.copy(in.data(), start.toLong, buffers.data(), dataBytes, bytes)
+        if (bytes > 0) io.vecruntime.kernels.CopyCounters.copy(
+          "PartitionedIpcWriter.appendAll:289",
+          in.data(),
+          start.toLong,
+          buffers.data(),
+          dataBytes,
+          bytes
+        )
       } else if (isBool) {
         Bitmap.copyBits(in.data(), buffers.data(), rows, n)
       } else {
-        MemorySegment.copy(in.data(), 0L, buffers.data(), rows.toLong * width, n.toLong * width)
+        io.vecruntime.kernels.CopyCounters.copy(
+          "PartitionedIpcWriter.appendAll:293",
+          in.data(),
+          0L,
+          buffers.data(),
+          rows.toLong * width,
+          n.toLong * width
+        )
       }
       if (in.validity() != null) {
         Bitmap.copyBits(in.validity(), buffers.validity(), rows, n)
@@ -320,7 +334,14 @@ final class PartitionedIpcWriter(
       settle(in)
       ensure(count, 0L)
       if (isBool) Bitmap.copyBitsFrom(in.data(), from, buffers.data(), rows, count)
-      else MemorySegment.copy(in.data(), from.toLong * width, buffers.data(), rows.toLong * width, count.toLong * width)
+      else io.vecruntime.kernels.CopyCounters.copy(
+        "PartitionedIpcWriter.appendRange:323",
+        in.data(),
+        from.toLong * width,
+        buffers.data(),
+        rows.toLong * width,
+        count.toLong * width
+      )
       if (allValid || in.validity() == null) Bitmap.fillRange(buffers.validity(), rows, count, true)
       else Bitmap.copyBitsFrom(in.validity(), from, buffers.validity(), rows, count)
       rows += count
@@ -532,13 +553,29 @@ final class PartitionedIpcWriter(
       else {
         val words = (rows + 63) >>> 6
         val seg = fin.allocate(math.max(words, 1).toLong << 3, 8)
-        MemorySegment.copy(valid, 0, seg, PartitionedIpcWriter.LeLong, 0L, words)
+        io.vecruntime.kernels.CopyCounters.copy(
+          "PartitionedIpcWriter.finished:535",
+          valid,
+          0,
+          seg,
+          PartitionedIpcWriter.LeLong,
+          0L,
+          words
+        )
         seg
       }
       val offsets = if (!repeated) null
       else {
         val seg = fin.allocate((rows + 1).toLong << 2, 4)
-        MemorySegment.copy(offs, 0, seg, VectorBuffers.LE_INT, 0L, rows + 1)
+        io.vecruntime.kernels.CopyCounters.copy(
+          "PartitionedIpcWriter.finished:541",
+          offs,
+          0,
+          seg,
+          VectorBuffers.LE_INT,
+          0L,
+          rows + 1
+        )
         seg
       }
       val kids: Array[VectorBuffers] = children.map(b => b.finished().slice(0, b.rows))
@@ -841,11 +878,27 @@ final class PartitionedIpcWriter(
         }
       } else {
         if (offs.length < n + 1) offs = new Array[Int](math.max(n + 1, offs.length * 2))
-        MemorySegment.copy(in.offsets(), VectorBuffers.LE_INT, 0L, offs, 0, n + 1)
+        io.vecruntime.kernels.CopyCounters.copy(
+          "PartitionedIpcWriter.map:844",
+          in.offsets(),
+          VectorBuffers.LE_INT,
+          0L,
+          offs,
+          0,
+          n + 1
+        )
         val first = offs(0)
         val total = offs(n) - first
         if (bytes.length < total) bytes = new Array[Byte](math.max(total, bytes.length * 2))
-        MemorySegment.copy(in.data(), java.lang.foreign.ValueLayout.JAVA_BYTE, first.toLong, bytes, 0, total)
+        io.vecruntime.kernels.CopyCounters.copy(
+          "PartitionedIpcWriter.map:848",
+          in.data(),
+          java.lang.foreign.ValueLayout.JAVA_BYTE,
+          first.toLong,
+          bytes,
+          0,
+          total
+        )
         var i = 0
         while (i < n) {
           if (validity != null && !Bitmap.isSet(validity, i)) ids(i) = 0

@@ -191,7 +191,8 @@ public final class ArrowOutput {
                 Bitmap.clear(validity, i);
             } else {
                 Bitmap.set(validity, i);
-                MemorySegment.copy(MemorySegment.ofArray(values[i]), 0, data, pos, values[i].length);
+                io.vecruntime.kernels.CopyCounters.copy("ArrowOutput.utf8Column:194", MemorySegment.ofArray(values[i]),
+                        0, data, pos, values[i].length);
                 pos += values[i].length;
             }
         }
@@ -261,8 +262,8 @@ public final class ArrowOutput {
         indices.allocateNew();
         ArrowVectorBuffers out = ArrowVectorBuffers.forWrite(indices, outCount);
         if (selection == null) {
-            MemorySegment.copy(in.data(), 0, out.data(), 0,
-                    (long) outCount << 2);
+            io.vecruntime.kernels.CopyCounters.copy("ArrowOutput.compactDictionary:264", in.data(), 0, out.data(),
+                    0, (long) outCount << 2);
             if (in.hasNulls()) {
                 BitmapKernels.copy(in.validity(), out.validity(), outCount);
             }
@@ -337,7 +338,8 @@ public final class ArrowOutput {
             remap[id] = -1; // the scratch back to unused for the next slice
             int start = offsets.get(VectorBuffers.LE_INT, (long) id << 2);
             int len = offsets.get(VectorBuffers.LE_INT, (long) (id + 1) << 2) - start;
-            MemorySegment.copy(dict.data(), start, outData, pos, len);
+            io.vecruntime.kernels.CopyCounters.copy("ArrowOutput.usedDictionary:340", dict.data(), start, outData, pos,
+                    len);
             pos += len;
             outOffsets.set(VectorBuffers.LE_INT, (long) (k + 1) << 2, pos);
             if (dictNulls) {
@@ -357,10 +359,10 @@ public final class ArrowOutput {
         int n = dict.length();
         int end = dict.offsets().get(VectorBuffers.LE_INT, (long) n << 2);
         ArrowVectorBuffers out = allocateUtf8(name, n, end, allocator);
-        MemorySegment.copy(dict.offsets(), 0, out.offsets(), 0,
-                ((long) n + 1) << 2);
-        MemorySegment.copy(dict.data(), 0, out.data(), 0,
-                end);
+        io.vecruntime.kernels.CopyCounters.copy("ArrowOutput.copyDictionary:360", dict.offsets(), 0, out.offsets(),
+                0, ((long) n + 1) << 2);
+        io.vecruntime.kernels.CopyCounters.copy("ArrowOutput.copyDictionary:362", dict.data(), 0, out.data(),
+                0, end);
         if (dict.hasNulls()) {
             BitmapKernels.copy(dict.validity(), out.validity(), n);
         } else {
@@ -454,6 +456,7 @@ public final class ArrowOutput {
                 }
                 VectorBuffers dict = in.dictionary();
                 long bytes = GatherKernels.gatherUtf8Bytes(dict, codes, 0, count);
+                io.vecruntime.kernels.CopyCounters.add("ArrowOutput.gather.dictUtf8", bytes + 4L * (count + 1));
                 ArrowVectorBuffers out = allocateUtf8(name, count, bytes, allocator);
                 GatherKernels.gatherUtf8(
                         dict,
@@ -467,6 +470,7 @@ public final class ArrowOutput {
             }
             long bytes = GatherKernels.gatherUtf8Bytes(in, idx, from, to);
             ArrowVectorBuffers out = allocateUtf8(name, count, bytes, allocator);
+            io.vecruntime.kernels.CopyCounters.add("ArrowOutput.gather.utf8", bytes + 4L * (count + 1));
             GatherKernels.gatherUtf8(
                     in,
                     idx,
@@ -478,6 +482,8 @@ public final class ArrowOutput {
             return finish(out, count, !nulls);
         }
         ArrowVectorBuffers out = allocateFixed(name, dt, count, allocator);
+        io.vecruntime.kernels.CopyCounters.add("ArrowOutput.gather.fixed", out.data()
+                .byteSize());
         GatherKernels.gatherFixed(in, idx, from, to, out.data(),
                 nulls ? out.validity() : null);
         return finish(out, count, !nulls);
@@ -652,7 +658,7 @@ public final class ArrowOutput {
             long pos = 0;
             for (int i = 0; i < length; i++) {
                 offsets.setAtIndex(VectorBuffers.LE_INT, i, (int) pos);
-                MemorySegment.copy(src, 0, data, pos, bytes.length);
+                io.vecruntime.kernels.CopyCounters.copy("ArrowOutput.constant:655", src, 0, data, pos, bytes.length);
                 pos += bytes.length;
             }
             offsets.setAtIndex(VectorBuffers.LE_INT, length, (int) pos);
@@ -762,10 +768,10 @@ public final class ArrowOutput {
             }
             int end = in.offsets().get(VectorBuffers.LE_INT, (long) n << 2);
             ArrowVectorBuffers out = allocateUtf8(name, n, end, allocator);
-            MemorySegment.copy(in.offsets(), 0, out.offsets(), 0,
-                    ((long) n + 1) << 2);
-            MemorySegment.copy(in.data(), 0, out.data(), 0,
-                    end);
+            io.vecruntime.kernels.CopyCounters.copy("ArrowOutput.copy:765", in.offsets(), 0, out.offsets(),
+                    0, ((long) n + 1) << 2);
+            io.vecruntime.kernels.CopyCounters.copy("ArrowOutput.copy:767", in.data(), 0, out.data(),
+                    0, end);
             if (in.hasNulls()) {
                 BitmapKernels.copy(in.validity(), out.validity(), n);
             }
@@ -775,8 +781,8 @@ public final class ArrowOutput {
         if (in.type() == VecType.BOOL) {
             BitmapKernels.copy(in.data(), out.data(), n);
         } else {
-            MemorySegment.copy(in.data(), 0, out.data(), 0,
-                    (long) n * in.type().byteWidth());
+            io.vecruntime.kernels.CopyCounters.copy("ArrowOutput.copy:778", in.data(), 0, out.data(),
+                    0, (long) n * in.type().byteWidth());
         }
         if (in.hasNulls()) {
             BitmapKernels.copy(in.validity(), out.validity(), n);

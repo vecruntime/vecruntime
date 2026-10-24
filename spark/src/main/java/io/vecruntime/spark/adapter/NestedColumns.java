@@ -104,7 +104,7 @@ public final class NestedColumns {
         }
         int[] off = n.offsetArray();
         MemorySegment offsets = ArrowLayout.allocateOffsets(arena, numRows);
-        MemorySegment.copy(off, 0, offsets, VectorBuffers.LE_INT, 0,
+        io.vecruntime.kernels.CopyCounters.copy("NestedColumns.adaptForWrite:107", off, 0, offsets, VectorBuffers.LE_INT, 0,
                 numRows + 1);
         int childRows = off[numRows];
         if (dt instanceof ArrayType a) {
@@ -251,7 +251,8 @@ public final class NestedColumns {
         @Override
         VectorBuffers build(Arena arena) {
             MemorySegment data = ArrowLayout.allocateData(arena, VecType.INT32, rows);
-            MemorySegment.copy(values, 0, data, VectorBuffers.LE_INT, 0, rows);
+            io.vecruntime.kernels.CopyCounters.copy("NestedColumns.build:254", values, 0, data, VectorBuffers.LE_INT, 0,
+                    rows);
             return SegmentVectorBuffers.fixedWidth(VecType.INT32, rows, validity(arena), data);
         }
     }
@@ -284,7 +285,8 @@ public final class NestedColumns {
         @Override
         VectorBuffers build(Arena arena) {
             MemorySegment data = ArrowLayout.allocateData(arena, VecType.INT64, rows);
-            MemorySegment.copy(values, 0, data, VectorBuffers.LE_LONG, 0, rows);
+            io.vecruntime.kernels.CopyCounters.copy("NestedColumns.build:287", values, 0, data, VectorBuffers.LE_LONG, 0,
+                    rows);
             return SegmentVectorBuffers.fixedWidth(VecType.INT64, rows, validity(arena), data);
         }
     }
@@ -319,7 +321,8 @@ public final class NestedColumns {
         @Override
         VectorBuffers build(Arena arena) {
             MemorySegment data = ArrowLayout.allocateData(arena, VecType.FLOAT64, rows);
-            MemorySegment.copy(values, 0, data, VectorBuffers.LE_DOUBLE, 0, rows);
+            io.vecruntime.kernels.CopyCounters.copy("NestedColumns.build:322", values, 0, data, VectorBuffers.LE_DOUBLE, 0,
+                    rows);
             return SegmentVectorBuffers.fixedWidth(VecType.FLOAT64, rows, validity(arena), data);
         }
     }
@@ -397,10 +400,11 @@ public final class NestedColumns {
         @Override
         VectorBuffers build(Arena arena) {
             MemorySegment off = ArrowLayout.allocateOffsets(arena, rows);
-            MemorySegment.copy(offsets, 0, off, VectorBuffers.LE_INT, 0,
+            io.vecruntime.kernels.CopyCounters.copy("NestedColumns.build:400", offsets, 0, off, VectorBuffers.LE_INT, 0,
                     rows + 1);
             MemorySegment data = ArrowLayout.allocateBytes(arena, used);
-            MemorySegment.copy(bytes, 0, data, ValueLayout.JAVA_BYTE, 0, used);
+            io.vecruntime.kernels.CopyCounters.copy("NestedColumns.build:403", bytes, 0, data, ValueLayout.JAVA_BYTE, 0,
+                    used);
             return SegmentVectorBuffers.utf8(rows, validity(arena), off, data);
         }
     }
@@ -481,7 +485,7 @@ public final class NestedColumns {
         @Override
         VectorBuffers build(Arena arena) {
             MemorySegment off = ArrowLayout.allocateOffsets(arena, rows);
-            MemorySegment.copy(offsets, 0, off, VectorBuffers.LE_INT, 0,
+            io.vecruntime.kernels.CopyCounters.copy("NestedColumns.build:484", offsets, 0, off, VectorBuffers.LE_INT, 0,
                     rows + 1);
             return NestedVectorBuffers.list(rows, validity(arena), off, elements.build(arena));
         }
@@ -525,7 +529,7 @@ public final class NestedColumns {
         @Override
         VectorBuffers build(Arena arena) {
             MemorySegment off = ArrowLayout.allocateOffsets(arena, rows);
-            MemorySegment.copy(offsets, 0, off, VectorBuffers.LE_INT, 0,
+            io.vecruntime.kernels.CopyCounters.copy("NestedColumns.build:528", offsets, 0, off, VectorBuffers.LE_INT, 0,
                     rows + 1);
             return NestedVectorBuffers.map(rows, validity(arena), off, keys.build(arena),
                     values.build(arena));
