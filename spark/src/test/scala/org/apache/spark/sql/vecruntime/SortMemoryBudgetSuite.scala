@@ -371,6 +371,63 @@ class SortMemoryBudgetSuite extends AnyFunSuite {
     open.close()
   }
 
+  test("#940: an account opened at task start completes after the operators' own completion listeners") {
+    val before = TaskNativeMemory.leakedBytes
+    withPool(1L << 30) { (_, ctx) =>
+      TaskNativeMemory.install()
+      try {
+        TaskNativeMemory.onTaskStart() // the executor plugin's hook, before any operator
+        // An operator that frees its memory in its own completion listener, registered after the account.
+        val a = io.vecruntime.kernels.NativePool.shared().newArena()
+        a.allocate(1L << 20, 8)
+        ctx.addTaskCompletionListener[Unit](_ => a.close())
+      } finally TaskNativeMemory.uninstall()
+    }
+    assert(TaskNativeMemory.leakedBytes === before, "freed in the same completion pass: not a leak")
+  }
+
+  test("#940: memory allocated unaccounted is not charged to the task") {
+    withPool(1L << 30) { (tmm, _) =>
+      TaskNativeMemory.install()
+      try {
+        val shared = TaskNativeMemory.unaccounted {
+          val a = io.vecruntime.kernels.NativePool.shared().newArena()
+          a.allocate(4L << 20, 8)
+          a
+        }
+        assert(tmm.getMemoryConsumptionForThisTask() === 0L, "an executor block, not the task's")
+        val own = io.vecruntime.kernels.NativePool.shared().newArena()
+        own.allocate(1L << 20, 8)
+        assert(tmm.getMemoryConsumptionForThisTask() >= (1L << 20), "accounting resumes after the block")
+        own.close()
+        shared.close()
+      } finally TaskNativeMemory.uninstall()
+    }
+  }
+
+  test("#940: in a traced task the arena left open is reported by its opening site, and its late close by its closer") {
+    val every = TaskNativeMemory.leakTraceEvery
+    TaskNativeMemory.leakTraceEvery = 1
+    val leakedBefore = TaskNativeMemory.tracedLeakedArenas
+    var open: java.lang.foreign.Arena = null
+    try {
+      withPool(1L << 30) { (_, _) =>
+        TaskNativeMemory.install()
+        try {
+          val closedInTask = io.vecruntime.kernels.NativePool.shared().newArena()
+          closedInTask.allocate(1L << 16, 8)
+          closedInTask.close() // closed before the task ends: not a leak
+          open = io.vecruntime.kernels.NativePool.shared().newArena()
+          open.allocate(1L << 20, 8)
+        } finally TaskNativeMemory.uninstall()
+      }
+      assert(TaskNativeMemory.tracedLeakedArenas - leakedBefore === 1, "one arena was still charged")
+      open.close()
+      val sites = scala.jdk.CollectionConverters.SetHasAsScala(TaskNativeMemory.lateCloseSites.keySet()).asScala
+      assert(sites.exists(s => s.contains("opened at") && s.contains("SortMemoryBudgetSuite")), sites.mkString("\n"))
+    } finally TaskNativeMemory.leakTraceEvery = every
+  }
+
   test("#869: no task, no account: an arena opened off a task thread charges nothing") {
     TaskNativeMemory.install()
     try assert(TaskNativeMemory.current() === null)

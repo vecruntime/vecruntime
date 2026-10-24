@@ -39,7 +39,7 @@ import org.apache.spark.memory.{MemoryConsumer, MemoryMode, TaskMemoryManager}
  * budget; reservations for bytes that are not pool blocks (Arrow vectors, heap mirrors) use
  * [[TaskNativeMemory.ownReservation]].
  */
-object TaskNativeMemory {
+object TaskNativeMemory extends org.apache.spark.internal.Logging {
 
   /** The acquire and release step, so that each 64 KiB block is not a call into the memory manager. */
   val Chunk: Long = 4L << 20
@@ -53,6 +53,41 @@ object TaskNativeMemory {
 
   /** Bytes still charged when their task completed (an arena not closed), summed so far. */
   def leakedBytes: Long = leaked.get()
+
+  /**
+   * #940 debug mode: with `-Dvecruntime.pool.leakTrace=N` (N >= 1) one task attempt in N records where each of its
+   * arenas was opened; at its completion the arenas still charged are logged, grouped by opening site, and an arena
+   * closed after its task completed logs the thread and site that closed it. Off (0) by default: an untraced
+   * account records nothing.
+   */
+  @volatile private[vecruntime] var leakTraceEvery: Int = Integer.getInteger("vecruntime.pool.leakTrace", 0)
+
+  /** Frames of a site in the report: past the pool's own frames, enough to name the operator. */
+  private val SiteFrames = 8
+
+  private val tracedLeaks = new AtomicLong()
+
+  /** Arenas a traced task left charged at its completion, so far (tests). */
+  private[vecruntime] def tracedLeakedArenas: Long = tracedLeaks.get()
+
+  private val lateCloses = new ConcurrentHashMap[String, AtomicLong]()
+
+  /** Closing sites of arenas closed after their task completed, with their counts (tests, and the log). */
+  private[vecruntime] def lateCloseSites: java.util.Map[String, AtomicLong] = lateCloses
+
+  /** The frames of `t` from the first one outside the pool and this object, as one line per frame. */
+  private[vecruntime] def site(t: Throwable): String =
+    t.getStackTrace.iterator
+      .dropWhile { f =>
+        val c = f.getClassName
+        c.startsWith("io.vecruntime.kernels.NativePool") || c.startsWith(
+          "org.apache.spark.sql.vecruntime.TaskNativeMemory"
+        ) ||
+        c.startsWith("java.") || c.startsWith("jdk.")
+      }
+      .take(SiteFrames)
+      .map(f => s"${f.getClassName}.${f.getMethodName}:${f.getLineNumber}")
+      .mkString(" < ")
 
   @volatile private var installed = false
 
@@ -101,8 +136,34 @@ object TaskNativeMemory {
 
   /** The account of the task running on this thread, opened on first use; null off a task thread. */
   def current(): NativePool.Account = {
+    if (unaccountedDepth.get()(0) > 0) return null
     val tc = TaskContext.get()
     if (tc == null || tc.taskMemoryManager() == null) null else accountOf(tc, VectorSortIterator.memoryMode())
+  }
+
+  /**
+   * #940: opens the task's account before any operator registers a completion listener. Spark runs those
+   * listeners in reverse order of registration, so an account opened lazily, on the first pooled block, was
+   * completed BEFORE the operators that close their memory in their own listener (the aggregate's
+   * accumulators): its memory counted as leaked although the same completion pass freed it a moment later.
+   * Opened here, from the executor plugin's `onTaskStart`, the account's listener runs last.
+   */
+  def onTaskStart(): Unit = if (installed) current()
+
+  private val unaccountedDepth = ThreadLocal.withInitial[Array[Int]](() => Array(0))
+
+  /**
+   * Runs `f` with no task account: what it allocates from the pool is the executor's, not this task's
+   * (#940). For memory that outlives the task by design -- a broadcast's build table, shared by every task
+   * of the executor and freed by its relation's cleaner -- charging the task that happened to build it
+   * left those bytes charged at that task's completion (counted as leaked), and credited a finished task
+   * when the cleaner closed them.
+   */
+  def unaccounted[T](f: => T): T = {
+    val d = unaccountedDepth.get()
+    d(0) += 1
+    try f
+    finally d(0) -= 1
   }
 
   /**
@@ -114,7 +175,8 @@ object TaskNativeMemory {
     val tmm = tc.taskMemoryManager()
     val existing = accounts.get(id)
     if (existing != null && (existing.tmm eq tmm)) return existing
-    val created = new TaskAccount(tmm, mode)
+    val every = leakTraceEvery
+    val created = new TaskAccount(tmm, mode, traceArenas = every > 0 && tc.taskAttemptId() % every == 0)
     accounts.put(id, created)
     tc.addTaskCompletionListener[Unit] { _ =>
       accounts.remove(id, created)
@@ -152,8 +214,29 @@ object TaskNativeMemory {
    * may be from inside an operator). Calls come from the task's thread; `charge` and `credit` may also come from
    * another (an arena closed elsewhere) and are serialised with them.
    */
-  private[vecruntime] final class TaskAccount(val tmm: TaskMemoryManager, val mode: MemoryMode)
-      extends NativePool.Account {
+  private[vecruntime] final class TaskAccount(
+      val tmm: TaskMemoryManager,
+      val mode: MemoryMode,
+      traceArenas: Boolean = false
+  ) extends NativePool.Account {
+    // #940: the open arenas and where each was opened, in a traced task only.
+    private val openArenas =
+      if (traceArenas) new java.util.IdentityHashMap[java.lang.foreign.Arena, Throwable]() else null
+    @volatile private var completed = false
+
+    override def traced(): Boolean = traceArenas
+
+    override def opened(arena: java.lang.foreign.Arena, where: Throwable): Unit =
+      if (openArenas != null) synchronized(openArenas.put(arena, where))
+
+    override def closed(arena: java.lang.foreign.Arena): Unit = if (openArenas != null) {
+      val where = synchronized(openArenas.remove(arena))
+      if (completed && where != null) {
+        val key = s"[${Thread.currentThread().getName}] closed at ${site(new Throwable)}; opened at ${site(where)}"
+        val n = lateCloses.computeIfAbsent(key, _ => new AtomicLong()).incrementAndGet()
+        if (n == 1) logWarning(s"#940: a pool arena closed after its task completed: $key")
+      }
+    }
     private val consumer = new MemoryConsumer(tmm, tmm.pageSizeBytes(), mode) {
       override def spill(size: Long, trigger: MemoryConsumer): Long = spillFor(size)
     }
@@ -222,12 +305,38 @@ object TaskNativeMemory {
 
     /** The task ended: everything back to the memory manager; what is still charged is a leak. */
     private[vecruntime] def complete(): Unit = synchronized {
+      if (charged > 0 && openArenas != null) reportOpen()
+      completed = true
       if (charged > 0) leaked.addAndGet(charged)
       if (shortfall > 0) overdraft.addAndGet(shortfall)
       if (acquired > 0) consumer.freeMemory(acquired)
       acquired = 0L
       reserved = 0L
       reservations.clear()
+    }
+
+    /** #940: the arenas still charged, by opening site, the largest first. */
+    private def reportOpen(): Unit = {
+      val bySite = new java.util.HashMap[String, Array[Long]]() // site -> (arenas, bytes)
+      val it = openArenas.entrySet().iterator()
+      while (it.hasNext) {
+        val e = it.next()
+        val bytes = NativePool.heldBytes(e.getKey)
+        if (bytes > 0) {
+          val agg = bySite.computeIfAbsent(site(e.getValue), _ => new Array[Long](2))
+          agg(0) += 1; agg(1) += bytes
+          tracedLeaks.incrementAndGet()
+        }
+      }
+      if (!bySite.isEmpty) {
+        val lines = scala.jdk.CollectionConverters.MapHasAsScala(bySite).asScala.toSeq.sortBy(-_._2(1)).take(10).map {
+          case (where, Array(n, b)) => s"  $n arenas, $b bytes: $where"
+          case (where, _) => s"  ?: $where"
+        }
+        logWarning(
+          s"#940: task's pool account completed with $charged bytes charged; open arenas by site:\n${lines.mkString("\n")}"
+        )
+      }
     }
 
     private final class AccountReservation(val onSpill: Long => Long) extends Reservation {

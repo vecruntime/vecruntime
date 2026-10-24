@@ -103,6 +103,29 @@ public final class NativePool {
 
         /** {@code bytes} given back. */
         void credit(long bytes);
+
+        /**
+         * #940 debug mode: whether this account wants to know which arenas it
+         * charges ({@link #opened}, {@link #closed}). False by default: an
+         * arena then records nothing.
+         */
+        default boolean traced() {
+            return false;
+        }
+
+        /** A traced account's new arena, with where it was opened. */
+        default void opened(Arena arena, Throwable where) {}
+
+        /** A traced account's arena closed, on the thread that closed it. */
+        default void closed(Arena arena) {}
+    }
+
+    /**
+     * Bytes an arena of this pool holds now (0 for any other arena): for a
+     * traced account's report (#940).
+     */
+    public static long heldBytes(Arena arena) {
+        return arena instanceof PooledArena p ? p.held() : 0L;
     }
 
     private static volatile Supplier<Account> accountSource = () -> null;
@@ -459,6 +482,17 @@ public final class NativePool {
         PooledArena(NativePool pool, Account account) {
             this.pool = pool;
             this.account = account;
+            if (account != null && account.traced()) {
+                account.opened(this, new Throwable("pool arena opened"));
+            }
+        }
+
+        long held() {
+            long bytes = 0;
+            for (Block b : blocks) {
+                bytes += b.size;
+            }
+            return bytes;
         }
 
         private Block takeCounted(long size) {
@@ -507,6 +541,9 @@ public final class NativePool {
             blocks.clear();
             if (account != null && bytes > 0) {
                 account.credit(bytes);
+            }
+            if (account != null && account.traced()) {
+                account.closed(this);
             }
         }
     }

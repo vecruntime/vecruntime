@@ -138,6 +138,9 @@ class VectorPlugin extends SparkPlugin {
     // the thread's next task.
     override def onTaskSucceeded(): Unit = io.vecruntime.kernels.GroupKeyTable.releaseThreadScratch()
 
+    // #940: the task's pool account, before any operator's completion listener, so it completes after them.
+    override def onTaskStart(): Unit = org.apache.spark.sql.vecruntime.TaskNativeMemory.onTaskStart()
+
     override def onTaskFailed(failureReason: org.apache.spark.TaskFailedReason): Unit =
       io.vecruntime.kernels.GroupKeyTable.releaseThreadScratch()
   }
