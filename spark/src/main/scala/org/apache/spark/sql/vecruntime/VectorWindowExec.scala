@@ -124,33 +124,49 @@ import scala.collection.mutable
  * of the partition each -- a row shifted by a literal offset (the default outside the partition), the
  * partition's first row, the frame's last row (the partition; the current row for `ROWS ... CURRENT
  * ROW`; the end of the peer group for the `RANGE` default), the frame's n-th row -- read from the held
- * copies of the partition's rows, across batch boundaries; `IGNORE NULLS` is refused.
+ * copies of the partition's rows, across batch boundaries. `IGNORE NULLS` (#980) finds the target by
+ * skipping null inputs, as Spark's ignoreNulls frames do: the k-th non-null row backward (`lag`) or
+ * forward (`lead`), the first / last non-null of the frame, the k-th non-null scanning forward
+ * (`nth_value`).
  *
  * The ranking functions that need the partition size -- `percent_rank`, `cume_dist`, `ntile` -- go through
  * the same held-partition path (layer 1b), as do `row_number` / `rank` / `dense_rank` when they share an
  * operator with an offset function.
  *
- * Sliding frames (layer 2c): `sum`, `avg`, `count`, `min`, `max` over `ROWS BETWEEN a AND b` with any
- * literal bounds (`n PRECEDING`/`FOLLOWING`, `CURRENT ROW`, unbounded either side) are re-aggregated per
- * row over the frame's rows in order, as Spark's own sliding frames are -- so double sums are bit-identical
- * -- and a frame starting at the partition is advanced incrementally as its end moves, as Spark's
- * unbounded-preceding frame is. When such an aggregate shares an operator with a running frame, an
- * offset or a ranking function, all of them take this path.
+ * Sliding frames (layer 2c): `sum`, `avg`, `count`, `min`, `max`, `stddev_pop`/`stddev_samp` and
+ * `var_pop`/`var_samp` over `ROWS BETWEEN a AND b` with any literal bounds (`n PRECEDING`/`FOLLOWING`,
+ * `CURRENT ROW`, unbounded either side) are re-aggregated per row over the frame's rows in order, as
+ * Spark's own sliding frames are -- so double sums are bit-identical -- and a frame starting at the
+ * partition is advanced incrementally as its end moves, as Spark's unbounded-preceding frame is. A decimal
+ * input re-aggregates in `BigDecimal` on the same path (#980): the running sum nulls past the buffer
+ * precision as Spark's `CheckOverflowInSum` does (the ANSI error under ANSI), `avg` finalises with
+ * `DecimalAvgResult`, `min`/`max` compare -- so the result matches Spark's decimal buffer. The variance and
+ * standard deviation replay Welford's `(n, avg, m2)` per frame exactly as Spark's `CentralMomentAgg` does
+ * (`n == 0` -> null, and for the sample forms `n == 1` -> null or NaN per `legacyStatisticalAggregate`).
+ * When such an aggregate shares an operator with a running frame, an offset or a ranking function, all of
+ * them take this path.
  *
  * `RANGE` frames with value offsets (layer 2d, `RANGE BETWEEN 5 PRECEDING AND CURRENT ROW`, `1 FOLLOWING
  * AND 3 FOLLOWING`, an unbounded side with an offset on the other): the same five aggregates over one
- * integral or date order key, computed per partition by `WindowFrameKernels` once the partition is held --
- * the keys and the input gathered into primitive arrays reused across partitions, the frame of every row
- * found by Spark's two-pointer walk (`rangeBounds`: the bound is the key plus the offset in the key's own
- * arithmetic, compared in the `SortOrder`'s direction and null ordering, so a null key's frame is the null
- * peer group), and the aggregate re-run in row order per frame as Spark's `SlidingWindowFunctionFrame`
- * does (a frame whose lower bound has not moved continues the previous accumulation; counts and unchecked
- * bigint sums slide). The peer-bounded `RANGE` frames without an offset (`CURRENT ROW AND UNBOUNDED
- * FOLLOWING`, `CURRENT ROW AND CURRENT ROW`) take the row path over any key type.
+ * integral, `date`, decimal or timestamp order key, computed per partition by `WindowFrameKernels` once
+ * the partition is held -- the keys and the input gathered into primitive arrays reused across partitions,
+ * the frame of every row found by Spark's two-pointer walk (`rangeBounds`: the bound is the key plus the
+ * offset in the key's own arithmetic -- a decimal(p <= 18) key rides the INT64 lane as its unscaled long
+ * and its offset carries the same scale, so the long add is Spark's `DecimalAddNoOverflowCheck` and never
+ * wraps or raises; a wide decimal (p > 18) rides the DECIMAL128 lane and `rangeBounds128` adds the bound
+ * on the two limbs and compares with Decimal128 order, saturating the rare 128-bit overflow to +/-inf
+ * since no decimal(38) key reaches it; a timestamp key is micros on the INT64 lane and a day-time interval
+ * offset adds a fixed micro count, as Spark's `TimeAdd` does -- compared in the `SortOrder`'s direction and
+ * null ordering, so a null key's frame is the null peer group), and the aggregate re-run in row order per
+ * frame as Spark's `SlidingWindowFunctionFrame` does (a frame whose lower bound has not moved continues the
+ * previous accumulation; counts and unchecked bigint sums slide). The peer-bounded `RANGE` frames without
+ * an offset (`CURRENT ROW AND UNBOUNDED FOLLOWING`, `CURRENT ROW AND CURRENT ROW`) take the row path over
+ * any key type.
  *
- * `IGNORE NULLS`, decimal aggregates (#28), the other aggregate functions over sliding frames, `RANGE`
- * offsets over decimal, timestamp (interval) and string keys, and `min`/`max` over strings in such a frame
- * are refused with a reason naming the function and frame.
+ * The remaining aggregate functions over sliding frames (`skewness`, `kurtosis`, the pandas moments), a
+ * running frame of `stddev`/`var_*` (no clean prefix form), a decimal input to a *RANGE* sliding frame
+ * (the RANGE kernels are long/double), a month-bearing RANGE offset over a timestamp key or a string key,
+ * and `min`/`max` over strings in such a frame are refused with a reason naming the function and frame.
  */
 case class VectorWindowExec(
     windowExpression: Seq[NamedExpression],
@@ -439,7 +455,30 @@ object VectorWindowPlanner {
       countAll: Boolean = false,
       context: org.apache.spark.QueryContext = null,
       inputType: DataType = null,
-      range: RangeSpec = null
+      range: RangeSpec = null,
+      // IGNORE NULLS on an offset function (lag/lead/first_value/last_value/nth_value): the target row is
+      // found by skipping null inputs, as Spark's ignoreNulls frames do (#980).
+      ignoreNulls: Boolean = false,
+      // Non-null for a sum/avg/min/max over a decimal input in a sliding ROWS frame (#980): the
+      // buffer precision/scale and avg finaliser that make the per-frame re-aggregation bit-identical
+      // to Spark's. The RANGE kernels are long/double, so a decimal input there stays refused.
+      decimal: DecimalSliding = null
+  )
+
+  /**
+   * The exact-decimal state a sliding `ROWS` sum / avg / min / max needs to match Spark: the buffer's
+   * `(precision, scale)` (Spark's `sum`/`avg` widen the result type to the buffer type), whether the
+   * result boxes wide (BigDecimal) or as an unscaled long, and -- for avg -- the finaliser over the
+   * running `(sum, count)`. A sum past the buffer precision is null (legacy) or the ANSI error, exactly
+   * as Spark's `CheckOverflowInSum`; the overflow limit is `10^precision`.
+   */
+  final case class DecimalSliding(
+      bufferPrecision: Int,
+      bufferScale: Int,
+      wide: Boolean,
+      ansi: Boolean,
+      context: org.apache.spark.QueryContext,
+      avg: io.vecruntime.spark.agg.DecimalAvgResult
   )
 
   /**
@@ -458,7 +497,11 @@ object VectorWindowPlanner {
       keyBits: Int,
       descending: Boolean,
       nullsFirst: Boolean,
-      checked: Boolean
+      checked: Boolean,
+      // High limbs of the offsets when the key is a wide decimal (keyBits == 128); for a 64-bit key
+      // they are the sign extension of `lo` / `hi`, so the limb pair equals the single long (#980).
+      loOffHi: Long = 0L,
+      hiOffHi: Long = 0L
   )
 
   /** Sliding-frame aggregates (`ROWS BETWEEN a AND b`, any bounds): re-aggregated per row over the frame's rows, in order, as Spark does. */
@@ -467,6 +510,13 @@ object VectorWindowPlanner {
   val SlidingAvg = 12
   val SlidingMin = 13
   val SlidingMax = 14
+  // Central-moment aggregates over a sliding frame (#980): Welford's (n, avg, m2) replayed per frame in
+  // row order, bit-identical to Spark's CentralMomentAgg; the result is var_pop/var_samp/stddev_pop/
+  // stddev_samp, with n==0 -> null and (for samp) n==1 -> null or NaN per legacyStatisticalAggregate.
+  val SlidingVarPop = 15
+  val SlidingVarSamp = 16
+  val SlidingStddevPop = 17
+  val SlidingStddevSamp = 18
 
   /** Frame bound sentinels in `frameLo` / `frameHi` (relative row offsets otherwise). */
   val UnboundedLo = Int.MinValue
@@ -491,14 +541,34 @@ object VectorWindowPlanner {
     case ShortType => Some(16)
     case IntegerType | DateType => Some(32)
     case LongType => Some(64)
+    // A timestamp key is micros on the INT64 lane; a DayTime interval offset adds a fixed micro count
+    // (Spark's TimeAdd over a DayTime interval is micros + intervalMicros, zone-independent), so it is
+    // the 64-bit path. Month-bearing offsets (CalendarInterval, YearMonth) are zone/calendar-dependent
+    // and refused in rangeSpec. (#980)
+    case TimestampType | TimestampNTZType => Some(64)
+    // A decimal(p <= 18) order key rides the INT64 lane as its unscaled long, exactly as Spark's own
+    // WritableColumnVector stores it, and both the key and the frame offset carry the same scale
+    // (WindowFrameCoercion casts the bound to the order key's type). Spark's bound is
+    // `DecimalAddNoOverflowCheck(key, offset, d)`: plain BigDecimal addition of two scale-s values, no
+    // overflow check -- so unscaled `key + offset` in 64-bit arithmetic is the same value, and it never
+    // wraps (|unscaled| < 10^18, so the sum is below 2^63). The comparison is Decimal order, which at a
+    // shared scale is the order of the unscaled longs. A wider decimal (p > 18) rides the DECIMAL128
+    // lane as two limbs: the 128-bit `rangeBounds128` adds the bound on the limbs and compares with
+    // Decimal128 order, saturating the rare 128-bit overflow to +/-inf (no decimal(38) key reaches it).
+    // (#980)
+    case d: SparkDecimalType if d.precision <= TypeMapping.MAX_DECIMAL_PRECISION => Some(64)
+    case _: SparkDecimalType => Some(128)
     case _ => None
   }
 
   /**
    * The [[RangeSpec]] of a `RANGE` frame with at least one value offset, or why it is not computed: the
-   * order key must be one integral or date column (Spark itself rejects several order keys here) and
-   * each offset a foldable value of the key's type -- an int for a date key, as `DateAdd` takes;
-   * interval offsets over date and timestamp keys and decimal keys are refused.
+   * order key must be one integral, `date`, or `decimal` column (Spark itself rejects several order keys
+   * here) and each offset a foldable value of the key's type -- an int for a date key, as `DateAdd`
+   * takes; a `decimal(p, s)` of the key's own scale for a decimal key, read as its unscaled value (a long
+   * for p <= 18, two limbs otherwise); a day-time interval (fixed microseconds) for a timestamp key, as
+   * Spark's `TimeAdd` adds (#980). Month-bearing interval offsets (CalendarInterval, year-month) over a
+   * timestamp key are zone/calendar-dependent and refused.
    */
   private def rangeSpec(
       name: String,
@@ -516,21 +586,51 @@ object VectorWindowPlanner {
     val bits = rangeKeyBits(keyType) match {
       case Some(b) => b
       case None => return Left(
-          s"window aggregate $name over frame ${frame.sql}: RANGE offsets over a ${keyType.simpleString} order key not supported (integral and date keys are)"
+          s"window aggregate $name over frame ${frame.sql}: RANGE offsets over a ${keyType.simpleString} order key not supported (integral, date, decimal and timestamp keys are)"
         )
     }
     val descending = order.direction == org.apache.spark.sql.catalyst.expressions.Descending
-    // Spark's WindowFrameCoercion cast the offsets to the key's type; a date key keeps an int offset (DateAdd).
-    def offset(b: Expression): Either[String, Option[Long]] = b match {
+    val decimalKey = keyType.isInstanceOf[SparkDecimalType]
+    val timestampKey = keyType == TimestampType || keyType == TimestampNTZType
+    val wideKey = bits == 128
+    // A month-bearing interval offset over a timestamp key is zone/calendar-dependent (a month is not a
+    // fixed micro count, and TimeAdd/TimestampAddYMInterval consult the session zone): refuse it before
+    // reading, since only a day-time interval maps to the fixed-micros 64-bit path.
+    if (timestampKey) {
+      def monthBearing(b: Expression): Boolean = b match {
+        case _: SpecialFrameBoundary => false
+        case other => other.dataType.isInstanceOf[org.apache.spark.sql.types.YearMonthIntervalType] ||
+          other.dataType == org.apache.spark.sql.types.CalendarIntervalType
+      }
+      if (monthBearing(frame.lower) || monthBearing(frame.upper))
+        return Left(
+          s"window aggregate $name over frame ${frame.sql}: a month-bearing RANGE offset over a timestamp key not supported (day-time intervals are)"
+        )
+    }
+    // Spark's WindowFrameCoercion cast the offsets to the key's type; a date key keeps an int offset
+    // (DateAdd), a decimal key a decimal offset of the key's own (p, s), and a timestamp key a day-time
+    // interval whose value is a fixed micro count (TimeAdd adds micros + intervalMicros). The offset is
+    // returned as two's complement limbs (hi, lo); for a 64-bit key hi is the sign extension of lo, for a
+    // wide decimal the unscaled value may exceed a long and is split from its BigInteger (#980).
+    def offset(b: Expression): Either[String, Option[(Long, Long)]] = b match {
       case UnboundedPreceding | UnboundedFollowingBound => Right(None)
-      case CurrentRow => Right(Some(0L))
+      case CurrentRow => Right(Some((0L, 0L)))
       case other
-          if other.foldable && (other.dataType == keyType || (keyType == DateType && other.dataType == IntegerType)) =>
+          if other.foldable && (other.dataType == keyType || (keyType == DateType && other.dataType == IntegerType) ||
+            (timestampKey && other.dataType.isInstanceOf[org.apache.spark.sql.types.DayTimeIntervalType])) =>
         other.eval(EmptyRow) match {
           case null => Left(s"window aggregate $name over frame ${frame.sql}: a null RANGE offset")
+          case d: org.apache.spark.sql.types.Decimal if wideKey =>
+            // Spark's UnaryMinus under DESC, in BigInteger so a wide unscaled value is exact.
+            val u = d.toJavaBigDecimal.unscaledValue()
+            val signed = if (descending) u.negate() else u
+            Right(Some((io.vecruntime.kernels.Decimal128.hiOf(signed), io.vecruntime.kernels.Decimal128.loOf(signed))))
+          case d: org.apache.spark.sql.types.Decimal =>
+            val signed = if (descending) -d.toUnscaledLong else d.toUnscaledLong // Spark's UnaryMinus under DESC
+            Right(Some((signed >> 63, signed)))
           case v: java.lang.Number =>
             val signed = if (descending) -v.longValue() else v.longValue() // Spark's UnaryMinus under DESC
-            Right(Some(signed))
+            Right(Some((signed >> 63, signed)))
           case _ => Left(s"window aggregate $name over frame ${frame.sql}: RANGE offset ${other.sql} is not integral")
         }
       case other => Left(
@@ -539,14 +639,19 @@ object VectorWindowPlanner {
     }
     for (lo <- offset(frame.lower); hi <- offset(frame.upper)) yield RangeSpec(
       loUnbounded = lo.isEmpty,
-      lo = lo.getOrElse(0L),
+      lo = lo.map(_._2).getOrElse(0L),
       hiUnbounded = hi.isEmpty,
-      hi = hi.getOrElse(0L),
+      hi = hi.map(_._2).getOrElse(0L),
       keyBits = bits,
       descending = descending,
       nullsFirst = order.nullOrdering == org.apache.spark.sql.catalyst.expressions.NullsFirst,
-      // Add in the key's type raises under ANSI; DateAdd never does.
-      checked = keyType != DateType && org.apache.spark.sql.internal.SQLConf.get.ansiEnabled
+      loOffHi = lo.map(_._1).getOrElse(0L),
+      hiOffHi = hi.map(_._1).getOrElse(0L),
+      // Add in the key's type raises under ANSI; DateAdd never does, a decimal key's bound is
+      // DecimalAddNoOverflowCheck and a timestamp key's is TimeAdd -- neither raises -- so those are
+      // unchecked regardless of ANSI.
+      checked =
+        keyType != DateType && !decimalKey && !timestampKey && org.apache.spark.sql.internal.SQLConf.get.ansiEnabled
     )
   }
 
@@ -570,11 +675,15 @@ object VectorWindowPlanner {
     val name = a.aggregateFunction.prettyName
     if (a.filter.nonEmpty) return Left(s"window aggregate $name with FILTER not supported")
     if (a.mode != Complete) return Left(s"window aggregate $name in mode ${a.mode} not supported")
-    if (
+    val isRows = frame.isInstanceOf[SpecifiedWindowFrame] &&
+      frame.asInstanceOf[SpecifiedWindowFrame].frameType == RowFrame
+    val decimalInput =
       a.dataType.isInstanceOf[DecimalType] || a.aggregateFunction.children.exists(_.dataType.isInstanceOf[DecimalType])
-    )
+    // Decimals run per row over the frame on the exact-decimal states (#980), but only for a ROWS frame:
+    // the RANGE path goes through the long/double WindowFrameKernels, which have no decimal lane.
+    if (decimalInput && !isRows)
       return Left(
-        s"window aggregate $name over decimals in a sliding frame not supported (the sliding kernels are long and double)"
+        s"window aggregate $name over decimals in a RANGE sliding frame not supported (the RANGE kernels are long and double)"
       )
     val bounds: Either[String, (Int, Int, RangeSpec)] = frame match {
       case SpecifiedWindowFrame(RowFrame, lower, upper) =>
@@ -606,6 +715,33 @@ object VectorWindowPlanner {
       a.aggregateFunction match {
         case sum: Sum if sum.evalContext.evalMode == EvalMode.TRY =>
           Left(s"window aggregate try_sum over a sliding frame not supported")
+        case sum: Sum if sum.dataType.isInstanceOf[DecimalType] =>
+          // Spark's sum buffer/result is decimal(min(38, p + 10), s); the per-frame state adds in
+          // BigDecimal and nulls past the buffer precision, exactly as CheckOverflowInSum does.
+          val d = sum.dataType.asInstanceOf[SparkDecimalType]
+          inputOrdinal(sum.child, output).map(ord =>
+            OffsetFunction(
+              SlidingSum,
+              ord,
+              sum.dataType,
+              0,
+              null,
+              WholePartition,
+              lo,
+              hi,
+              context = sum.origin.context,
+              inputType = sum.child.dataType,
+              range = range,
+              decimal = DecimalSliding(
+                d.precision,
+                d.scale,
+                d.precision > TypeMapping.MAX_DECIMAL_PRECISION,
+                sum.evalContext.evalMode == EvalMode.ANSI,
+                sum.origin.context,
+                null
+              )
+            )
+          )
         case sum: Sum if sum.dataType == LongType || sum.dataType == DoubleType =>
           inputOrdinal(sum.child, output).map(ord =>
             OffsetFunction(
@@ -653,6 +789,34 @@ object VectorWindowPlanner {
               )
             case _ => Left("window count over several columns in a sliding frame not supported")
           }
+        case av: Average if av.child.dataType.isInstanceOf[DecimalType] =>
+          // Spark rewrites a decimal avg to cast(sum(UnscaledValue) / count ...); the buffer sum is
+          // decimal(min(38, p + 10), s). The state runs the running (sum, count) and DecimalAvgResult
+          // finalises per frame, bit-identical to the merge.
+          val buf = av.aggBufferAttributes.head.dataType.asInstanceOf[SparkDecimalType]
+          inputOrdinal(av.child, output).map(ord =>
+            OffsetFunction(
+              SlidingAvg,
+              ord,
+              av.dataType,
+              0,
+              null,
+              WholePartition,
+              lo,
+              hi,
+              context = av.origin.context,
+              inputType = av.child.dataType,
+              range = range,
+              decimal = DecimalSliding(
+                buf.precision,
+                buf.scale,
+                av.dataType.asInstanceOf[SparkDecimalType].precision > TypeMapping.MAX_DECIMAL_PRECISION,
+                ansi = false,
+                av.origin.context,
+                io.vecruntime.spark.agg.DecimalAvgResult(av)
+              )
+            )
+          )
         case av: Average if av.dataType == DoubleType =>
           inputOrdinal(av.child, output).map(ord =>
             OffsetFunction(
@@ -671,20 +835,86 @@ object VectorWindowPlanner {
         case m: Min => inputOrdinal(m.child, output).flatMap(ord =>
             laneChecked(
               m.child,
-              OffsetFunction(SlidingMin, ord, m.dataType, 0, null, WholePartition, lo, hi, range = range)
+              OffsetFunction(
+                SlidingMin,
+                ord,
+                m.dataType,
+                0,
+                null,
+                WholePartition,
+                lo,
+                hi,
+                inputType = m.child.dataType,
+                range = range,
+                decimal = decimalMinMax(m.child.dataType)
+              )
             )
           )
         case m: Max => inputOrdinal(m.child, output).flatMap(ord =>
             laneChecked(
               m.child,
-              OffsetFunction(SlidingMax, ord, m.dataType, 0, null, WholePartition, lo, hi, range = range)
+              OffsetFunction(
+                SlidingMax,
+                ord,
+                m.dataType,
+                0,
+                null,
+                WholePartition,
+                lo,
+                hi,
+                inputType = m.child.dataType,
+                range = range,
+                decimal = decimalMinMax(m.child.dataType)
+              )
+            )
+          )
+        case cm: org.apache.spark.sql.catalyst.expressions.aggregate.CentralMomentAgg
+            if isRows && isCentralMomentKind(cm).isDefined =>
+          // stddev_pop/samp, var_pop/samp over a sliding ROWS frame: Welford replayed per frame in order,
+          // bit-identical to Spark's CentralMomentAgg (double input, nullOnDivideByZero carried). Only ROWS
+          // frames -- the RANGE path (peer-bounded or value offsets) keeps moments on Spark for now.
+          val kind = isCentralMomentKind(cm).get
+          inputOrdinal(cm.child, output).map(ord =>
+            OffsetFunction(
+              kind,
+              ord,
+              DoubleType,
+              0,
+              null,
+              WholePartition,
+              lo,
+              hi,
+              checked = nullOnDivideByZeroOf(cm), // reuse `checked` as the nullOnDivideByZero flag for moments
+              context = cm.origin.context,
+              inputType = cm.child.dataType
             )
           )
         case other => Left(
-            s"window aggregate ${other.prettyName} over a sliding frame not supported (sum, avg, count, min and max are)"
+            s"window aggregate ${other.prettyName} over a sliding frame not supported (sum, avg, count, min, max, stddev and variance are)"
           )
       }
     }
+  }
+
+  /** The sliding kind of a central-moment aggregate we compute (var/stddev, pop/samp), or None for skewness/kurtosis/pandas. */
+  private def isCentralMomentKind(
+      cm: org.apache.spark.sql.catalyst.expressions.aggregate.CentralMomentAgg
+  ): Option[Int] = cm match {
+    case _: org.apache.spark.sql.catalyst.expressions.aggregate.VariancePop => Some(SlidingVarPop)
+    case _: org.apache.spark.sql.catalyst.expressions.aggregate.VarianceSamp => Some(SlidingVarSamp)
+    case _: org.apache.spark.sql.catalyst.expressions.aggregate.StddevPop => Some(SlidingStddevPop)
+    case _: org.apache.spark.sql.catalyst.expressions.aggregate.StddevSamp => Some(SlidingStddevSamp)
+    case _ => None // skewness, kurtosis, pandas_* -- not in scope
+  }
+
+  /** Spark's `nullOnDivideByZero` for a central-moment aggregate (null at n==1 for samp), read reflectively. */
+  private def nullOnDivideByZeroOf(
+      cm: org.apache.spark.sql.catalyst.expressions.aggregate.CentralMomentAgg
+  ): Boolean = !org.apache.spark.sql.internal.SQLConf.get.legacyStatisticalAggregate
+  private def decimalMinMax(dt: DataType): DecimalSliding = dt match {
+    case d: SparkDecimalType =>
+      DecimalSliding(d.precision, d.scale, d.precision > TypeMapping.MAX_DECIMAL_PRECISION, ansi = false, null, null)
+    case _ => null
   }
 
   private def literalInt(e: Expression): Option[Int] = e match {
@@ -722,23 +952,23 @@ object VectorWindowPlanner {
       orderSpec: Seq[SortOrder]
   ): Either[String, OffsetFunction] = e match {
     case Alias(WindowExpression(f: FrameLessOffsetWindowFunction, _), _) =>
-      if (f.ignoreNulls) Left(s"${f.prettyName} IGNORE NULLS not supported")
-      else literalInt(f.offset) match {
+      literalInt(f.offset) match {
         case None => Left(s"${f.prettyName} offset must be an integer literal")
         case Some(off) =>
           for (
             ord <- inputOrdinal(f.input, output);
             dflt <- literalDefault(f.default, f.dataType).left.map(r => s"${f.prettyName}: $r")
           )
-            yield OffsetFunction(Shift, ord, f.dataType, off, dflt, WholePartition)
+            yield OffsetFunction(Shift, ord, f.dataType, off, dflt, WholePartition, ignoreNulls = f.ignoreNulls)
       }
     case Alias(WindowExpression(n: NthValue, WindowSpecDefinition(_, _, frame)), _) =>
-      if (n.ignoreNulls) Left("nth_value IGNORE NULLS not supported")
-      else (literalInt(n.offset), frameKind(frame)) match {
+      (literalInt(n.offset), frameKind(frame)) match {
         case (None, _) => Left("nth_value offset must be an integer literal")
         case (_, None) => Left(s"nth_value over frame ${frame.sql} not supported")
         case (Some(k), Some(fk)) =>
-          inputOrdinal(n.input, output).map(ord => OffsetFunction(NthValueKind, ord, n.dataType, k, null, fk))
+          inputOrdinal(n.input, output).map(ord =>
+            OffsetFunction(NthValueKind, ord, n.dataType, k, null, fk, ignoreNulls = n.ignoreNulls)
+          )
       }
     case Alias(WindowExpression(a: AggregateExpression, WindowSpecDefinition(_, _, frame)), _)
         if a.aggregateFunction.isInstanceOf[First] || a.aggregateFunction.isInstanceOf[Last] =>
@@ -747,12 +977,19 @@ object VectorWindowPlanner {
         case lst: Last => (lst.child, lst.ignoreNulls, false)
       }
       val name = a.aggregateFunction.prettyName
-      if (ignoreNulls) Left(s"$name IGNORE NULLS not supported")
-      else if (a.filter.nonEmpty) Left(s"$name with FILTER not supported")
+      if (a.filter.nonEmpty) Left(s"$name with FILTER not supported")
       else frameKind(frame) match {
         case None => Left(s"$name over frame ${frame.sql} not supported")
         case Some(fk) => inputOrdinal(child, output).map(ord =>
-            OffsetFunction(if (isFirst) FirstValue else LastValue, ord, a.dataType, 0, null, fk)
+            OffsetFunction(
+              if (isFirst) FirstValue else LastValue,
+              ord,
+              a.dataType,
+              0,
+              null,
+              fk,
+              ignoreNulls = ignoreNulls
+            )
           )
       }
     case Alias(WindowExpression(a: AggregateExpression, WindowSpecDefinition(_, _, frame)), _) =>
@@ -1539,6 +1776,9 @@ private[vecruntime] class VectorWindowOffsetIterator(
       val posOf: Array[Int],
       val peerOf: Array[Int],
       val keys: Array[Long],
+      // High limbs of a wide-decimal (DECIMAL128) order key; null for a 64-bit key, where `keys` is the
+      // whole value. The low limbs live in `keys` either way (#980).
+      val keysHi: Array[Long],
       val keyValidity: Array[Long]
   ) {
 
@@ -1610,8 +1850,11 @@ private[vecruntime] class VectorWindowOffsetIterator(
       val posOf = new Array[Int](outRows)
       val peerOf = new Array[Int](outRows)
       val keys = if (rangeMode) new Array[Long](outRows) else null
-      val keyValidity = if (rangeMode) new Array[Long]((outRows + 63) >>> 6) else null
       val keyLane = if (rangeMode) order.lane(0) else null
+      val keyWide = rangeMode && keyLane.`type`() == io.vecruntime.kernels.VecType.DECIMAL128
+      val keysHi = if (keyWide) new Array[Long](outRows) else null
+      val keyData = if (keyWide) keyLane.data() else null
+      val keyValidity = if (rangeMode) new Array[Long]((outRows + 63) >>> 6) else null
       val keyIsInt = rangeMode && keyLane.`type`() == io.vecruntime.kernels.VecType.INT32
       var anyNullKey = false
       var out = 0
@@ -1636,7 +1879,10 @@ private[vecruntime] class VectorWindowOffsetIterator(
           peerOf(out) = numPeers - 1
           if (rangeMode) {
             if (Rows.valid(keyLane, i)) {
-              keys(out) = if (keyIsInt) keyLane.getInt(i).toLong else keyLane.getLong(i)
+              if (keyWide) {
+                keysHi(out) = io.vecruntime.kernels.Decimal128.hi(keyData, i)
+                keys(out) = io.vecruntime.kernels.Decimal128.lo(keyData, i)
+              } else keys(out) = if (keyIsInt) keyLane.getInt(i).toLong else keyLane.getLong(i)
               keyValidity(out >>> 6) |= 1L << (out & 63)
             } else anyNullKey = true
           }
@@ -1661,6 +1907,7 @@ private[vecruntime] class VectorWindowOffsetIterator(
         posOf,
         peerOf,
         keys,
+        keysHi,
         if (anyNullKey) keyValidity else null
       ))
       memory.track(allocator.getAllocatedMemory)
@@ -1730,56 +1977,153 @@ private[vecruntime] class VectorWindowOffsetIterator(
 
   /** Running aggregate over the rows of one frame, fed in row order (Spark re-aggregates a frame the same way). */
   private abstract class SlidingState { def reset(): Unit; def add(v: Any): Unit; def result: Any }
-  private def newState(fn: VectorWindowPlanner.OffsetFunction): SlidingState = fn.kind match {
-    case VectorWindowPlanner.SlidingSum if fn.dataType == LongType =>
-      new SlidingState {
-        var sum = 0L; var count = 0L
-        def reset(): Unit = { sum = 0L; count = 0L }
-        def add(v: Any): Unit = if (v != null) {
-          val x = v match { case l: java.lang.Long => l.longValue(); case i: java.lang.Integer => i.longValue() }
-          if (fn.checked) {
-            try sum = Math.addExact(sum, x)
-            catch {
-              case _: ArithmeticException =>
-                throw VectorErrors.arithmeticOverflow("long overflow", "try_sum", fn.context)
+  private def newState(fn: VectorWindowPlanner.OffsetFunction): SlidingState =
+    if (fn.decimal != null) newDecimalState(fn)
+    else fn.kind match {
+      case VectorWindowPlanner.SlidingSum if fn.dataType == LongType =>
+        new SlidingState {
+          var sum = 0L; var count = 0L
+          def reset(): Unit = { sum = 0L; count = 0L }
+          def add(v: Any): Unit = if (v != null) {
+            val x = v match { case l: java.lang.Long => l.longValue(); case i: java.lang.Integer => i.longValue() }
+            if (fn.checked) {
+              try sum = Math.addExact(sum, x)
+              catch {
+                case _: ArithmeticException =>
+                  throw VectorErrors.arithmeticOverflow("long overflow", "try_sum", fn.context)
+              }
+            } else sum += x
+            count += 1
+          }
+          def result: Any = if (count == 0) null else java.lang.Long.valueOf(sum)
+        }
+      case VectorWindowPlanner.SlidingSum => new SlidingState {
+          var sum = 0.0; var count = 0L
+          def reset(): Unit = { sum = 0.0; count = 0L }
+          def add(v: Any): Unit =
+            if (v != null) { sum += v.asInstanceOf[Number].doubleValue(); count += 1 } // a float input widens (#712)
+          def result: Any = if (count == 0) null else java.lang.Double.valueOf(sum)
+        }
+      case VectorWindowPlanner.SlidingCount => new SlidingState {
+          var n = 0L
+          def reset(): Unit = n = 0L
+          def add(v: Any): Unit = if (fn.countAll || v != null) n += 1
+          def result: Any = java.lang.Long.valueOf(n)
+        }
+      case VectorWindowPlanner.SlidingAvg => new SlidingState {
+          var sum = 0.0; var count = 0L
+          def reset(): Unit = { sum = 0.0; count = 0L }
+          def add(v: Any): Unit = if (v != null) { sum += v.asInstanceOf[Number].doubleValue(); count += 1 }
+          def result: Any = if (count == 0) null else java.lang.Double.valueOf(sum / count)
+        }
+      case k
+          if k == VectorWindowPlanner.SlidingVarPop || k == VectorWindowPlanner.SlidingVarSamp ||
+            k == VectorWindowPlanner.SlidingStddevPop || k == VectorWindowPlanner.SlidingStddevSamp =>
+        new SlidingState {
+          // Welford's (n, avg, m2), exactly Spark's CentralMomentAgg.updateExpressions over the frame's
+          // non-null rows in order (a null leaves the buffer unchanged). fn.checked carries nullOnDivideByZero.
+          val samp = k == VectorWindowPlanner.SlidingVarSamp || k == VectorWindowPlanner.SlidingStddevSamp
+          val stddev = k == VectorWindowPlanner.SlidingStddevPop || k == VectorWindowPlanner.SlidingStddevSamp
+          var n = 0.0; var avg = 0.0; var m2 = 0.0
+          def reset(): Unit = { n = 0.0; avg = 0.0; m2 = 0.0 }
+          def add(v: Any): Unit = if (v != null) {
+            val x = v.asInstanceOf[Number].doubleValue()
+            val newN = n + 1.0
+            val delta = x - avg
+            val deltaN = delta / newN
+            avg += deltaN
+            m2 += delta * (delta - deltaN)
+            n = newN
+          }
+          def result: Any =
+            if (n == 0.0) null
+            else if (samp && n == 1.0) { if (fn.checked) null else java.lang.Double.valueOf(Double.NaN) }
+            else {
+              val variance = if (samp) m2 / (n - 1.0) else m2 / n
+              java.lang.Double.valueOf(if (stddev) math.sqrt(variance) else variance)
             }
-          } else sum += x
-          count += 1
         }
-        def result: Any = if (count == 0) null else java.lang.Long.valueOf(sum)
-      }
-    case VectorWindowPlanner.SlidingSum => new SlidingState {
-        var sum = 0.0; var count = 0L
-        def reset(): Unit = { sum = 0.0; count = 0L }
-        def add(v: Any): Unit =
-          if (v != null) { sum += v.asInstanceOf[Number].doubleValue(); count += 1 } // a float input widens (#712)
-        def result: Any = if (count == 0) null else java.lang.Double.valueOf(sum)
-      }
-    case VectorWindowPlanner.SlidingCount => new SlidingState {
-        var n = 0L
-        def reset(): Unit = n = 0L
-        def add(v: Any): Unit = if (fn.countAll || v != null) n += 1
-        def result: Any = java.lang.Long.valueOf(n)
-      }
-    case VectorWindowPlanner.SlidingAvg => new SlidingState {
-        var sum = 0.0; var count = 0L
-        def reset(): Unit = { sum = 0.0; count = 0L }
-        def add(v: Any): Unit = if (v != null) { sum += v.asInstanceOf[Number].doubleValue(); count += 1 }
-        def result: Any = if (count == 0) null else java.lang.Double.valueOf(sum / count)
-      }
-    case k => new SlidingState {
-        val isMin = k == VectorWindowPlanner.SlidingMin
-        var current: Any = null
-        def reset(): Unit = current = null
-        def add(v: Any): Unit = if (v != null) {
-          if (current == null) current = v
-          else { val cmp = current.asInstanceOf[Comparable[Any]].compareTo(v); if ((cmp > 0) == isMin) current = v }
+      case k => new SlidingState {
+          val isMin = k == VectorWindowPlanner.SlidingMin
+          var current: Any = null
+          def reset(): Unit = current = null
+          def add(v: Any): Unit = if (v != null) {
+            if (current == null) current = v
+            else { val cmp = current.asInstanceOf[Comparable[Any]].compareTo(v); if ((cmp > 0) == isMin) current = v }
+          }
+          def result: Any = current
         }
-        def result: Any = current
-      }
+    }
+
+  /**
+   * The exact-decimal sliding states (#980): a per-frame re-aggregation over `BigDecimal`, matching
+   * Spark's `SlidingWindowFunctionFrame` on a decimal buffer. Inputs arrive boxed as `valueAt` reads a
+   * decimal -- an unscaled `Long` at the input scale for p <= 18, a `BigDecimal` for a wide input --
+   * and are normalised to a `BigDecimal` at the input scale. `sum` adds exactly and nulls past the
+   * buffer precision (`10^precision`), finalising as `CheckOverflowInSum` (null in legacy, the ANSI
+   * error otherwise); `avg` runs the same running `(sum, count)` and finalises with `DecimalAvgResult`;
+   * `min`/`max` compare, boxing the winner as the result column holds it (unscaled long or BigDecimal).
+   */
+  private def newDecimalState(fn: VectorWindowPlanner.OffsetFunction): SlidingState = {
+    val dec = fn.decimal
+    val inScale = fn.inputType.asInstanceOf[SparkDecimalType].scale
+    def big(v: Any): java.math.BigDecimal = v match {
+      case l: java.lang.Long => java.math.BigDecimal.valueOf(l.longValue(), inScale)
+      case b: java.math.BigDecimal => b
+    }
+    fn.kind match {
+      case VectorWindowPlanner.SlidingSum => new SlidingState {
+          private val limit = java.math.BigInteger.TEN.pow(dec.bufferPrecision)
+          var sum: java.math.BigDecimal = java.math.BigDecimal.valueOf(0L, dec.bufferScale)
+          var count = 0L
+          var overflow = false
+          def reset(): Unit = { sum = java.math.BigDecimal.valueOf(0L, dec.bufferScale); count = 0L; overflow = false }
+          def add(v: Any): Unit = if (v != null) {
+            sum = sum.add(big(v))
+            if (sum.unscaledValue().abs().compareTo(limit) >= 0) overflow = true
+            count += 1
+          }
+          def result: Any =
+            if (count == 0) null
+            else if (overflow) {
+              if (dec.ansi) throw VectorErrors.overflowInSumOfDecimal(dec.context) else null
+            } else {
+              val scaled = sum.setScale(dec.bufferScale, java.math.RoundingMode.UNNECESSARY)
+              if (dec.wide) scaled
+              else java.lang.Long.valueOf(org.apache.spark.sql.types.Decimal(scaled).toUnscaledLong)
+            }
+        }
+      case VectorWindowPlanner.SlidingAvg => new SlidingState {
+          private val limit = java.math.BigInteger.TEN.pow(dec.bufferPrecision)
+          var sum: java.math.BigDecimal = java.math.BigDecimal.valueOf(0L, dec.bufferScale)
+          var count = 0L
+          var overflow = false
+          def reset(): Unit = { sum = java.math.BigDecimal.valueOf(0L, dec.bufferScale); count = 0L; overflow = false }
+          def add(v: Any): Unit = if (v != null) {
+            sum = sum.add(big(v))
+            if (sum.unscaledValue().abs().compareTo(limit) >= 0) overflow = true
+            count += 1
+          }
+          // DecimalAvgResult over the running (sum, count); an overflowed buffer sum is a null sum, as the merge sees it.
+          def result: Any = if (count == 0) null else dec.avg.value(if (overflow) null else sum, count)
+        }
+      case k => new SlidingState { // SlidingMin / SlidingMax over a decimal: compare the BigDecimal values
+          val isMin = k == VectorWindowPlanner.SlidingMin
+          var current: java.math.BigDecimal = _
+          def reset(): Unit = current = null
+          def add(v: Any): Unit = if (v != null) {
+            val x = big(v)
+            if (current == null) current = x
+            else { val cmp = current.compareTo(x); if ((cmp > 0) == isMin) current = x }
+          }
+          def result: Any =
+            if (current == null) null
+            else if (dec.wide) current
+            else java.lang.Long.valueOf(org.apache.spark.sql.types.Decimal(current).toUnscaledLong)
+        }
+    }
   }
 
-  /** Reads the function's input at partition-relative position `target` of the partition row `r` of `h` belongs to. */
   private def inputAt(fn: VectorWindowPlanner.OffsetFunction, h: Held, r: Int, pos: Int, target: Int): Any = {
     if (fn.inputOrdinal < 0) java.lang.Boolean.TRUE
     else {
@@ -1792,6 +2136,69 @@ private[vecruntime] class VectorWindowOffsetIterator(
         if (fn.inputType != null) fn.inputType else fn.dataType
       )
     }
+  }
+
+  /** The input value at partition-relative position `t` of the partition row `r` of `h` belongs to (result type). */
+  private def valueAtPartitionPos(fn: VectorWindowPlanner.OffsetFunction, h: Held, r: Int, pos: Int, t: Int): Any = {
+    val g = h.firstGlobal + r + (t - pos)
+    val src = if (g >= h.firstGlobal && g < h.firstGlobal + h.numRows) h else batchOf(g)
+    valueAt(src, fn.inputOrdinal, (g - src.firstGlobal).toInt, fn.dataType)
+  }
+
+  /**
+   * An offset function with `IGNORE NULLS`, Spark's `ignoreNulls` offset frames: the target row is the
+   * n-th non-null one, counting only non-null inputs. `lag(x, k)` scans backward from the row before the
+   * current, `lead(x, k)` forward from the row after, to the k-th non-null (else the default);
+   * `first_value` / `last_value` are the first / last non-null in `[0, frameEnd]`; `nth_value(x, k)` the
+   * k-th non-null scanning forward from the frame's start. Null (the default for lag/lead) when fewer than
+   * k non-null rows exist.
+   */
+  private def offsetValueIgnoreNulls(
+      fn: VectorWindowPlanner.OffsetFunction,
+      h: Held,
+      r: Int,
+      pos: Int,
+      len: Int,
+      frameEnd: Int
+  ): Any = fn.kind match {
+    case VectorWindowPlanner.Shift =>
+      // fn.offset carries Spark's sign, as the plain path's `pos + fn.offset` does: negative looks back
+      // (lag), positive forward (lead). Scan that direction to the k-th non-null row.
+      val backward = fn.offset < 0
+      val k = math.abs(fn.offset)
+      if (k == 0) valueAtPartitionPos(fn, h, r, pos, pos) // lag/lead 0 is the current row
+      else {
+        var seen = 0
+        var t = if (backward) pos - 1 else pos + 1
+        var out: Any = fn.default
+        val step = if (backward) -1 else 1
+        while (t >= 0 && t < len && seen < k) {
+          val v = valueAtPartitionPos(fn, h, r, pos, t)
+          if (v != null) { seen += 1; if (seen == k) out = v }
+          t += step
+        }
+        out
+      }
+    case VectorWindowPlanner.FirstValue =>
+      var t = 0
+      var out: Any = null
+      while (t <= frameEnd && out == null) { out = valueAtPartitionPos(fn, h, r, pos, t); t += 1 }
+      out
+    case VectorWindowPlanner.LastValue =>
+      var t = frameEnd
+      var out: Any = null
+      while (t >= 0 && out == null) { out = valueAtPartitionPos(fn, h, r, pos, t); t -= 1 }
+      out
+    case _ => // nth_value: the k-th non-null in [0, frameEnd]
+      var seen = 0
+      var t = 0
+      var out: Any = null
+      while (t <= frameEnd && out == null) {
+        val v = valueAtPartitionPos(fn, h, r, pos, t)
+        if (v != null) { seen += 1; if (seen == fn.offset) out = v }
+        t += 1
+      }
+      out
   }
 
   // Per function: the running state of an UNBOUNDED PRECEDING frame for the partition being released
@@ -1842,7 +2249,9 @@ private[vecruntime] class VectorWindowOffsetIterator(
     private val doubles = fn.kind == VectorWindowPlanner.SlidingAvg ||
       (fn.kind != VectorWindowPlanner.SlidingCount && inputLane == io.vecruntime.kernels.VecType.FLOAT64)
     private var capacity = 0
+    private val wideKey = spec.keyBits == 128
     private var keys: Array[Long] = _
+    private var keysHi: Array[Long] = _
     private var keyValidity: Array[Long] = _
     private var lo: Array[Int] = _
     private var hi: Array[Int] = _
@@ -1858,6 +2267,7 @@ private[vecruntime] class VectorWindowOffsetIterator(
       capacity = math.max(len, math.max(1024, capacity * 2))
       val words = (capacity + 63) >>> 6
       keys = new Array[Long](capacity)
+      if (wideKey) keysHi = new Array[Long](capacity)
       keyValidity = new Array[Long](words)
       lo = new Array[Int](capacity)
       hi = new Array[Int](capacity)
@@ -1889,6 +2299,7 @@ private[vecruntime] class VectorWindowOffsetIterator(
           val r0 = (from - h.firstGlobal).toInt
           val count = (to - from).toInt
           System.arraycopy(h.keys, r0, keys, o, count)
+          if (wideKey) System.arraycopy(h.keysHi, r0, keysHi, o, count)
           if (h.keyValidity != null) {
             anyNullKey = true
             var j = 0
@@ -1925,30 +2336,48 @@ private[vecruntime] class VectorWindowOffsetIterator(
       }
       val kv = if (anyNullKey) keyValidity else null
       val vv = if (anyNullValue) validity else null
-      try {
-        io.vecruntime.kernels.WindowFrameKernels.rangeBounds(
+      if (wideKey) {
+        io.vecruntime.kernels.WindowFrameKernels.rangeBounds128(
+          keysHi,
           keys,
           kv,
           len,
           spec.descending,
           spec.nullsFirst,
           spec.loUnbounded,
+          spec.loOffHi,
           spec.lo,
           spec.hiUnbounded,
+          spec.hiOffHi,
           spec.hi,
-          spec.keyBits,
-          spec.checked,
           lo,
           hi
         )
-      } catch {
-        case _: ArithmeticException =>
-          throw VectorErrors.arithmeticOverflow(
-            if (spec.keyBits == 64) "long overflow" else "integer overflow",
-            "try_add",
-            fn.context
+      } else
+        try {
+          io.vecruntime.kernels.WindowFrameKernels.rangeBounds(
+            keys,
+            kv,
+            len,
+            spec.descending,
+            spec.nullsFirst,
+            spec.loUnbounded,
+            spec.lo,
+            spec.hiUnbounded,
+            spec.hi,
+            spec.keyBits,
+            spec.checked,
+            lo,
+            hi
           )
-      }
+        } catch {
+          case _: ArithmeticException =>
+            throw VectorErrors.arithmeticOverflow(
+              if (spec.keyBits == 64) "long overflow" else "integer overflow",
+              "try_add",
+              fn.context
+            )
+        }
       fn.kind match {
         case VectorWindowPlanner.SlidingCount =>
           io.vecruntime.kernels.WindowFrameKernels.frameCount(vv, lo, hi, len, fn.countAll, outLongs)
@@ -2066,6 +2495,7 @@ private[vecruntime] class VectorWindowOffsetIterator(
             }
             if (fn.kind >= VectorWindowPlanner.SlidingSum) slidingValue(f, fn, h, r, pos, len)
             else if (fn.kind >= VectorWindowPlanner.RowNumberAt) rankingValue(fn, h, r, pos, len)
+            else if (fn.ignoreNulls) offsetValueIgnoreNulls(fn, h, r, pos, len, frameEnd)
             else {
               val target: Int = fn.kind match {
                 case VectorWindowPlanner.Shift => pos + fn.offset

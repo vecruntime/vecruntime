@@ -384,38 +384,155 @@ class VectorWindowSuite extends VectorQuerySuite {
     withConf("spark.sql.ansi.enabled" -> "false") {
       checkWindow(overflowingSum, Seq[Class[_ <: org.apache.spark.sql.execution.SparkPlan]](classOf[VectorFilterExec]))
     }
-    // Refused with a reason: a decimal order key, a string input to min/max, a timestamp key with an interval offset.
-    checkFallback(
-      "SELECT i, sum(l) OVER (PARTITION BY s ORDER BY cast(i AS decimal(12,2)) RANGE BETWEEN 5 PRECEDING AND CURRENT ROW) AS moving FROM t",
-      Seq(Window),
-      "RANGE offsets over a decimal(12,2) order key not supported"
-    )
+    // Refused with a reason: a string input to min/max, a timestamp key with an interval offset.
     checkFallback(
       "SELECT i, max(s) OVER (PARTITION BY b ORDER BY i RANGE BETWEEN 5 PRECEDING AND CURRENT ROW) AS m FROM t",
       Seq(Window),
       "integral, date and double inputs are"
     )
+  }
+
+  test("RANGE value offsets over a decimal order key equal Spark, narrow and wide (#980)") {
+    // A decimal(p <= 18) order key rides the INT64 lane as its unscaled long; its frame offset carries the
+    // same scale (WindowFrameCoercion) and Spark's bound is DecimalAddNoOverflowCheck -- so the kernel's
+    // 64-bit `key + offset` matches bit for bit. Fractional offsets (the scale is real, not a widened int),
+    // preceding-only / following-only / both-sided frames, nulls in the key (a null partition s, nullif).
+    checkWindow(
+      "SELECT i, l, sum(l) OVER (PARTITION BY s ORDER BY cast(i % 100 AS decimal(12,2)) RANGE BETWEEN 5.50 PRECEDING AND CURRENT ROW) AS moving, count(*) OVER (PARTITION BY s ORDER BY cast(i % 100 AS decimal(12,2)) RANGE BETWEEN 5.50 PRECEDING AND CURRENT ROW) AS n, count(l) OVER (PARTITION BY s ORDER BY cast(i % 100 AS decimal(12,2)) RANGE BETWEEN 3.00 PRECEDING AND 3.00 FOLLOWING) AS nn FROM t"
+    )
+    // FOLLOWING-only and PRECEDING-only frames (empty near the ends), avg and min/max over the decimal key.
+    checkWindow(
+      "SELECT i, sum(l) OVER (PARTITION BY s ORDER BY cast(i % 100 AS decimal(10,1)) RANGE BETWEEN 1.0 FOLLOWING AND 3.0 FOLLOWING) AS ahead, avg(i) OVER (PARTITION BY s ORDER BY cast(i % 100 AS decimal(10,1)) RANGE BETWEEN 10.0 PRECEDING AND 5.0 PRECEDING) AS behind, min(l) OVER (PARTITION BY s ORDER BY cast(i % 100 AS decimal(10,1)) RANGE BETWEEN 2.0 PRECEDING AND 2.0 FOLLOWING) AS lo, max(i) OVER (PARTITION BY s ORDER BY cast(i % 100 AS decimal(10,1)) RANGE BETWEEN 2.0 PRECEDING AND 2.0 FOLLOWING) AS hi FROM t"
+    )
+    // DESC over a decimal key with nulls (NULLS LAST default, then NULLS FIRST): a null key's frame is the null peer group.
+    checkWindow(
+      "SELECT i, l, sum(i) OVER (PARTITION BY i % 7 ORDER BY cast(nullif(l % 97, 0) AS decimal(14,3)) DESC RANGE BETWEEN 6.000 PRECEDING AND 3.000 FOLLOWING) AS moving, count(*) OVER (PARTITION BY i % 7 ORDER BY cast(nullif(l % 97, 0) AS decimal(14,3)) ASC NULLS FIRST RANGE BETWEEN 6.000 PRECEDING AND 3.000 FOLLOWING) AS n FROM t"
+    )
+    // An unbounded side with an offset on the other, and the peer-only RANGE frames over a decimal key.
+    checkWindow(
+      "SELECT i, sum(l) OVER (PARTITION BY s ORDER BY cast(i % 100 AS decimal(12,2)) RANGE BETWEEN UNBOUNDED PRECEDING AND 6.00 FOLLOWING) AS ahead, sum(i) OVER (PARTITION BY s ORDER BY cast(i % 100 AS decimal(12,2)) RANGE BETWEEN 6.00 PRECEDING AND UNBOUNDED FOLLOWING) AS behind FROM t"
+    )
+    // A partition of 20000 rows across several held batches, a decimal key with many ties (i % 5000).
+    checkWindow(
+      "SELECT i, sum(l) OVER (ORDER BY cast(i % 5000 AS decimal(12,2)) RANGE BETWEEN 100.00 PRECEDING AND 100.00 FOLLOWING) AS wide FROM t"
+    )
+    // decimal(18, s) -- the widest precision on the long lane -- beside a ROWS frame, a running frame and a rank in one operator.
+    checkWindow(
+      "SELECT i, sum(l) OVER (PARTITION BY s ORDER BY cast(i % 100 AS decimal(18,4)) RANGE BETWEEN 5.0000 PRECEDING AND CURRENT ROW) AS moving, sum(l) OVER (PARTITION BY s ORDER BY cast(i % 100 AS decimal(18,4)) ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS rows3, rank() OVER (PARTITION BY s ORDER BY cast(i % 100 AS decimal(18,4))) AS rk FROM t"
+    )
+    // A wide decimal key (precision > 18, DECIMAL128): the 128-bit rangeBounds adds the bound on the two
+    // limbs and compares in Decimal128 order. decimal(28,2) and decimal(38,4) (the latter exercises the
+    // 128-bit overflow saturation: a bound beyond every decimal(38) key is treated as +/-inf), ASC and DESC.
+    checkWindow(
+      "SELECT i, l, sum(l) OVER (PARTITION BY s ORDER BY cast(i % 100 AS decimal(28,2)) RANGE BETWEEN 5.50 PRECEDING AND CURRENT ROW) AS moving, count(*) OVER (PARTITION BY s ORDER BY cast(i % 100 AS decimal(28,2)) RANGE BETWEEN 3.00 PRECEDING AND 3.00 FOLLOWING) AS n FROM t"
+    )
+    checkWindow(
+      "SELECT i, l, sum(i) OVER (PARTITION BY i % 7 ORDER BY cast(nullif(l % 97, 0) AS decimal(38,4)) DESC RANGE BETWEEN 6.0000 PRECEDING AND 3.0000 FOLLOWING) AS moving, avg(l) OVER (PARTITION BY i % 7 ORDER BY cast(nullif(l % 97, 0) AS decimal(38,4)) ASC NULLS FIRST RANGE BETWEEN 2.0000 PRECEDING AND CURRENT ROW) AS mean FROM t"
+    )
+    // Negative keys and a wide decimal across batches (one partition of 20000 rows, many ties).
+    checkWindow(
+      "SELECT i, sum(l) OVER (ORDER BY cast((i % 5000) - 2500 AS decimal(30,3)) RANGE BETWEEN 100.000 PRECEDING AND 100.000 FOLLOWING) AS wide FROM t"
+    )
+  }
+
+  test("RANGE value offsets over a timestamp order key with a day-time interval equal Spark (#980)") {
+    // A timestamp key is micros on the INT64 lane; a day-time interval offset adds a fixed micro count
+    // (Spark's TimeAdd). dt is a date; cast to timestamp gives midnight micros. Day, hour and sub-day
+    // offsets, preceding/following/both, an unbounded side, ASC and DESC, a null key (nullif), and
+    // TimestampNTZType as well as TimestampType.
+    checkWindow(
+      "SELECT i, dt, count(*) OVER (PARTITION BY b ORDER BY cast(dt AS timestamp) RANGE BETWEEN INTERVAL '30' DAY PRECEDING AND CURRENT ROW) AS month, avg(l) OVER (PARTITION BY b ORDER BY cast(dt AS timestamp) RANGE BETWEEN INTERVAL '7' DAY PRECEDING AND INTERVAL '7' DAY FOLLOWING) AS fortnight, max(i) OVER (PARTITION BY b ORDER BY cast(dt AS timestamp) RANGE BETWEEN CURRENT ROW AND INTERVAL '10' DAY FOLLOWING) AS next FROM t"
+    )
+    checkWindow(
+      "SELECT i, sum(l) OVER (PARTITION BY s ORDER BY cast(dt AS timestamp) DESC RANGE BETWEEN INTERVAL '5' DAY PRECEDING AND INTERVAL '2' DAY FOLLOWING) AS moving, sum(i) OVER (PARTITION BY s ORDER BY cast(dt AS timestamp) RANGE BETWEEN UNBOUNDED PRECEDING AND INTERVAL '3' DAY FOLLOWING) AS ahead FROM t"
+    )
+    // A sub-day (hour) interval and a null timestamp key (nullif on the second), over TimestampNTZType.
+    checkWindow(
+      "SELECT i, sum(l) OVER (PARTITION BY b ORDER BY cast(timestamp_seconds(nullif(i % 50, 0)) AS timestamp_ntz) RANGE BETWEEN INTERVAL '36' HOUR PRECEDING AND CURRENT ROW) AS moving FROM t WHERE i < 8000"
+    )
+    // A month-bearing (year-month / calendar) offset over a timestamp key is zone/calendar-dependent: falls back.
     checkFallback(
-      "SELECT i, sum(l) OVER (PARTITION BY s ORDER BY cast(dt AS timestamp) RANGE BETWEEN INTERVAL 5 DAYS PRECEDING AND CURRENT ROW) AS moving FROM t",
+      "SELECT i, sum(l) OVER (PARTITION BY s ORDER BY cast(dt AS timestamp) RANGE BETWEEN INTERVAL '1' MONTH PRECEDING AND CURRENT ROW) AS moving FROM t",
       Seq(Window),
-      "RANGE offsets over a timestamp order key not supported"
+      "month-bearing RANGE offset over a timestamp key not supported"
+    )
+  }
+
+  test("sliding ROWS frames over a decimal input equal Spark (#980 slice B)") {
+    // sum / avg / min / max over a decimal input in a ROWS sliding frame, re-aggregated per frame in
+    // BigDecimal. decimal(12,2) (long lane) and decimal(30,4) (wide lane), preceding/following/both,
+    // nulls in the input, and a partition across batches.
+    checkWindow(
+      "SELECT i, sum(cast(l AS decimal(12,2))) OVER (PARTITION BY s ORDER BY i ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS s2, avg(cast(l AS decimal(12,2))) OVER (PARTITION BY s ORDER BY i ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS a3, min(cast(l AS decimal(12,2))) OVER (PARTITION BY s ORDER BY i ROWS BETWEEN 3 PRECEDING AND CURRENT ROW) AS mn, max(cast(l AS decimal(12,2))) OVER (PARTITION BY s ORDER BY i ROWS BETWEEN CURRENT ROW AND 3 FOLLOWING) AS mx FROM t"
+    )
+    // FOLLOWING-only (empty near the end), a whole-partition-anchored sliding frame, and a wide decimal.
+    checkWindow(
+      "SELECT i, sum(cast(l AS decimal(30,4))) OVER (PARTITION BY s ORDER BY i ROWS BETWEEN 1 FOLLOWING AND 3 FOLLOWING) AS ahead, avg(cast(l AS decimal(30,4))) OVER (PARTITION BY s ORDER BY i ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running FROM t"
+    )
+    // A partition of 20000 rows across batches, no PARTITION BY, a decimal sliding sum.
+    checkWindow(
+      "SELECT i, sum(cast(l AS decimal(12,2))) OVER (ORDER BY i ROWS BETWEEN 5 PRECEDING AND 5 FOLLOWING) AS moving FROM t"
+    )
+    // ANSI: a decimal sliding sum that overflows the buffer precision raises like Spark; non-ANSI nulls.
+    val overflowing =
+      "SELECT i, sum(cast(CASE WHEN i = 1 THEN 9e16 ELSE l END AS decimal(18,0))) OVER (ORDER BY i ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS moving FROM t WHERE i < 10"
+    withConf("spark.sql.ansi.enabled" -> "false") {
+      checkWindow(overflowing, Seq[Class[_ <: org.apache.spark.sql.execution.SparkPlan]](classOf[VectorFilterExec]))
+    }
+  }
+
+  test("offset functions with IGNORE NULLS equal Spark (#980)") {
+    // l is null for one row in seven, so IGNORE NULLS skips real nulls. lag/lead skip backward/forward to
+    // the k-th non-null (with and without a default); first_value/last_value/nth_value find the non-null
+    // in the frame. Compared against Spark row-for-row.
+    checkWindow(
+      "SELECT i, l, lag(l, 2) IGNORE NULLS OVER (PARTITION BY s ORDER BY i) AS lag2, lead(l, 1) IGNORE NULLS OVER (PARTITION BY s ORDER BY i) AS lead1, lag(l, 3, -1) IGNORE NULLS OVER (PARTITION BY s ORDER BY i) AS lag3d FROM t"
+    )
+    checkWindow(
+      "SELECT i, l, first_value(l) IGNORE NULLS OVER (PARTITION BY s ORDER BY i) AS fv, last_value(l) IGNORE NULLS OVER (PARTITION BY s ORDER BY i ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS lv, nth_value(l, 2) IGNORE NULLS OVER (PARTITION BY s ORDER BY i) AS nv FROM t"
+    )
+    // A partition longer than a batch, no PARTITION BY, and a string input (nulls in s).
+    checkWindow(
+      "SELECT i, s, lag(s, 1) IGNORE NULLS OVER (ORDER BY i) AS prev, first_value(s) IGNORE NULLS OVER (ORDER BY i ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS fv FROM t"
+    )
+  }
+
+  test("sliding ROWS frames of stddev / variance equal Spark (#980)") {
+    // Welford replayed per frame. var_pop/var_samp/stddev_pop/stddev_samp over a sliding ROWS frame; a
+    // single-row frame exercises the n==1 sample edge (null by default). Compared bit-identically to Spark.
+    checkWindow(
+      "SELECT i, stddev_pop(l) OVER (PARTITION BY s ORDER BY i ROWS BETWEEN 3 PRECEDING AND CURRENT ROW) AS sp, stddev_samp(l) OVER (PARTITION BY s ORDER BY i ROWS BETWEEN 3 PRECEDING AND CURRENT ROW) AS ss, var_pop(l) OVER (PARTITION BY s ORDER BY i ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING) AS vp, var_samp(l) OVER (PARTITION BY s ORDER BY i ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING) AS vs FROM t"
+    )
+    // A single-row frame (CURRENT ROW AND CURRENT ROW): var_samp/stddev_samp are the n==1 null edge; var_pop is 0.
+    checkWindow(
+      "SELECT i, var_pop(l) OVER (PARTITION BY s ORDER BY i ROWS BETWEEN CURRENT ROW AND CURRENT ROW) AS vp1, var_samp(l) OVER (PARTITION BY s ORDER BY i ROWS BETWEEN CURRENT ROW AND CURRENT ROW) AS vs1 FROM t"
+    )
+    // A double input (NaN / infinities / nulls in d), a partition across batches, beside a sliding sum.
+    checkWindow(
+      "SELECT i, stddev_samp(d) OVER (ORDER BY i ROWS BETWEEN 10 PRECEDING AND CURRENT ROW) AS sd, sum(l) OVER (ORDER BY i ROWS BETWEEN 10 PRECEDING AND CURRENT ROW) AS sm FROM t"
     )
   }
 
   test("other window functions and frames fall back with a reason; the operator can be disabled") {
     // Sliding frames of functions without a form here, and two frame kinds in one operator.
     checkFallback(
-      "SELECT i, stddev(l) OVER (PARTITION BY s ORDER BY i ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS sd FROM t",
+      "SELECT i, skewness(l) OVER (PARTITION BY s ORDER BY i ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS sk FROM t",
       Seq(Window),
       "over a sliding frame not supported"
     )
     checkWindow(
       "SELECT i, sum(l) OVER (PARTITION BY s ORDER BY i) AS running, first(l) OVER (PARTITION BY s ORDER BY i) AS f FROM t"
     )
+    // A decimal input over a sliding ROWS frame now runs (#980): per-frame re-aggregation in BigDecimal,
+    // bit-identical to Spark's decimal buffer. A decimal input over a RANGE frame still falls back (the
+    // RANGE kernels are long/double).
+    checkWindow(
+      "SELECT i, sum(l) OVER (PARTITION BY s ORDER BY i) AS running, sum(cast(l AS decimal(12,2))) OVER (PARTITION BY s ORDER BY i ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS dec FROM t"
+    )
     checkFallback(
-      "SELECT i, sum(l) OVER (PARTITION BY s ORDER BY i) AS running, sum(cast(l AS decimal(12,2))) OVER (PARTITION BY s ORDER BY i ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS dec FROM t",
+      "SELECT i, sum(cast(l AS decimal(12,2))) OVER (PARTITION BY s ORDER BY i % 100 RANGE BETWEEN 5 PRECEDING AND CURRENT ROW) AS dec FROM t",
       Seq(Window),
-      "over decimals in a sliding frame not supported"
+      "over decimals in a RANGE sliding frame not supported"
     )
     // A decimal window aggregate over a whole partition or a running frame runs since #259 (the buffer is the 128-bit lane).
     checkVectorized(
@@ -434,11 +551,6 @@ class VectorWindowSuite extends VectorQuerySuite {
       "SELECT i, lag(l) OVER (PARTITION BY s ORDER BY i) AS previous, stddev(l) OVER (PARTITION BY s ORDER BY i) AS sd FROM t",
       Seq(Window),
       "running frame for stddev not supported"
-    )
-    checkFallback(
-      "SELECT i, lag(l, 1) IGNORE NULLS OVER (PARTITION BY s ORDER BY i) AS previous FROM t",
-      Seq(Window),
-      "IGNORE NULLS not supported"
     )
     checkFallback(
       "SELECT i, first_value(l) OVER (PARTITION BY s ORDER BY i ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS f FROM t",
