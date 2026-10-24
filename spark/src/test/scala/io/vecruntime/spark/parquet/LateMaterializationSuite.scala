@@ -149,7 +149,10 @@ class LateMaterializationSuite extends VectorQuerySuite {
       }
       assert(scanOf(rnd).forall(_.decodeFilter.isEmpty))
     }
-    val off = checkVectorized("SELECT k, splain FROM lm_t WHERE small = 1", Nil)
+    // With the switch off, no decode filter (the default is now `auto`, so set it explicitly, #962).
+    val off = withConf(VectorConf.ScanNativeParquetLateMaterialization -> "off")(
+      checkVectorized("SELECT k, splain FROM lm_t WHERE small = 1", Nil)
+    )
     assert(scanOf(off).forall(_.decodeFilter.isEmpty))
     // A scan smaller than minScanBytes gets no decode filter.
     withConf(
