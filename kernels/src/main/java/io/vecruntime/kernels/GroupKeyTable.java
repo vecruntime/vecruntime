@@ -237,6 +237,11 @@ public final class GroupKeyTable {
      */
     public void allowNative() {
         nativeAllowed = true;
+        for (StringDictionary d : dicts) {
+            if (d != null) {
+                d.allowNative(); // #941 phase 2d: past its size a dictionary moves into the pool (aarch64 default)
+            }
+        }
     }
 
     /**
@@ -252,9 +257,25 @@ public final class GroupKeyTable {
      * on Graviton4, Skylake-SP, Sapphire Rapids, Granite Rapids, Genoa and
      * Turin, 1.43-2.12x from 1M; below it, in cache, the split arrays are
      * faster on every recent x86 (Turin 0.64x at 1K groups, Granite Rapids
-     * 0.84-0.88x to 64K) and only Graviton and Skylake gain.
+     * 0.84-0.88x to 64K) and only Graviton and Skylake gain -- so on aarch64
+     * (#941 phase 2d; Graviton4 1.04-1.08x in cache) the table packs from the
+     * start.
      */
-    static final int PACKED_SLOTS = Integer.getInteger("vecruntime.agg.packedSlots", 1 << 19);
+    static final int PACKED_SLOTS = Integer.getInteger("vecruntime.agg.packedSlots", StringDictionary.AARCH64 ? 0 : 1 << 19);
+
+    /**
+     * {@link #PACKED_SLOTS} unless a test moved it ({@link
+     * #setPackedSlotsForTests}).
+     */
+    private static int packedFrom = PACKED_SLOTS;
+
+    /**
+     * Package-private, for the tests: the slot count from which new tables
+     * pack; -1 restores the default.
+     */
+    static void setPackedSlotsForTests(int slots) {
+        packedFrom = slots < 0 ? PACKED_SLOTS : slots;
+    }
 
     /** An empty slot: no group has id -1. */
     private static final long EMPTY = -1L;
@@ -574,7 +595,7 @@ public final class GroupKeyTable {
         this.types = types.clone();
         this.dictionaryLimit = dictionaryLimit;
         this.slotCount = INITIAL_CAPACITY * 2;
-        if (slotCount < PACKED_SLOTS) {
+        if (slotCount < packedFrom) {
             this.splitSlots = new int[slotCount];
             this.groupHashes = new int[INITIAL_CAPACITY];
         } else {
@@ -1880,7 +1901,8 @@ public final class GroupKeyTable {
     public long nativeBytes() {
         return (fastSeg == null ? 0L : fastSeg.byteSize())
                 + (slotSeg == null ? 0L : slotSeg.byteSize())
-                + (rowSeg == null ? 0L : rowSeg.byteSize());
+                + (rowSeg == null ? 0L : rowSeg.byteSize())
+                + dictNativeBytes();
     }
 
     /** Package-private, for the tests: whether the slot entries live in the pool. */
@@ -1909,6 +1931,29 @@ public final class GroupKeyTable {
             rowArena = null;
             rowSeg = null;
         }
+        for (StringDictionary d : dicts) {
+            if (d != null) {
+                d.close();
+            }
+        }
+    }
+
+    private long dictNativeBytes() {
+        long b = 0L;
+        for (StringDictionary d : dicts) {
+            if (d != null) {
+                b += d.nativeBytes();
+            }
+        }
+        return b;
+    }
+
+    /**
+     * Package-private, for the tests: whether column {@code c}'s dictionary
+     * lives in the pool.
+     */
+    boolean nativeDictionary(int c) {
+        return dicts[c] != null && dicts[c].isNative();
     }
 
     /** Package-private, for the tests: whether the key rows live in the pool. */
@@ -2413,7 +2458,8 @@ public final class GroupKeyTable {
             recOff[c] = new int[Math.max(size + 1, groupCap + 1)];
         }
         ensureRecordBytes(c, (int) Math.min(Integer.MAX_VALUE - 8, Math.max(256, d.valueBytes() * 2)));
-        byte[] store = d.bytes();
+        byte[] store = d.isNative() ? null : d.bytes();
+        MemorySegment storeSeg = d.dataSegment();
         int[] off = recOff[c];
         int used = 0;
         for (int gid = 0; gid < size; gid++) {
@@ -2421,12 +2467,18 @@ public final class GroupKeyTable {
                 int id = keyInt(c, gid);
                 int len = d.length(id);
                 ensureRecordBytes(c, used + len);
-                System.arraycopy(store, d.offset(id), recBytes[c], used, len);
+                if (store != null) {
+                    System.arraycopy(store, d.offset(id), recBytes[c], used, len);
+                } else {
+                    MemorySegment.copy(storeSeg, ValueLayout.JAVA_BYTE, d.offset(id), recBytes[c], used,
+                            len);
+                }
                 used += len;
             }
             off[gid + 1] = used;
         }
         recUsed[c] = used;
+        d.close();
         dicts[c] = null;
         clearSlots();
         for (int gid = 0; gid < size; gid++) {
@@ -2586,7 +2638,7 @@ public final class GroupKeyTable {
         // Below PACKED_SLOTS the split arrays stay (the faster layout in cache); a table never goes back.
         boolean slotsNative = slotSeg != null
                 || (nativeAllowed && GroupedAccumulators.nativeState() && newCount >= NATIVE_FAST_SLOTS);
-        boolean packed = !slotsNative && (slots != null || newCount >= PACKED_SLOTS);
+        boolean packed = !slotsNative && (slots != null || newCount >= packedFrom);
         int[] newSplit = null;
         long[] newSlots = null;
         Arena newSlotArena = null;
@@ -2709,6 +2761,12 @@ public final class GroupKeyTable {
         }
         StringDictionary d = dicts[c];
         int id = keyInt(c, gid);
+        if (d.isNative()) {
+            byte[] b = new byte[d.length(id)];
+            MemorySegment.copy(d.dataSegment(), ValueLayout.JAVA_BYTE, d.offset(id), b,
+                    0, b.length);
+            return new String(b, java.nio.charset.StandardCharsets.UTF_8);
+        }
         return new String(d.bytes(), d.offset(id), d.length(id),
                 java.nio.charset.StandardCharsets.UTF_8);
     }
@@ -2837,7 +2895,8 @@ public final class GroupKeyTable {
                     emitScratch = new byte[Math.max(total, emitScratch.length * 2)];
                 }
                 byte[] scratch = emitScratch;
-                byte[] store = d.bytes();
+                byte[] store = d.isNative() ? null : d.bytes();
+                MemorySegment storeSeg = d.dataSegment();
                 int out = 0;
                 offsets.set(VectorBuffers.LE_INT, 0L, 0);
                 for (int o = 0; o < count; o++) {
@@ -2845,7 +2904,12 @@ public final class GroupKeyTable {
                     if (!nul.get(gid)) {
                         int id = ids[o];
                         int len = d.length(id);
-                        System.arraycopy(store, d.offset(id), scratch, out, len);
+                        if (store != null) {
+                            System.arraycopy(store, d.offset(id), scratch, out, len);
+                        } else {
+                            MemorySegment.copy(storeSeg, ValueLayout.JAVA_BYTE, d.offset(id), scratch, out,
+                                    len);
+                        }
                         out += len;
                     }
                     offsets.set(VectorBuffers.LE_INT, (long) (o + 1) << 2, out);
