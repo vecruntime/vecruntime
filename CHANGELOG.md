@@ -8,6 +8,20 @@ version may change configuration keys or defaults, always noted here.
 
 ### Added
 
+- The native Iceberg scan prunes data files by a broadcast hash join's RUNTIME filters before opening them
+  (#iceberg-file-pruning, `spark.vecruntime.scan.nativeIceberg.runtimeFilePruning.enabled`, on by default). Static
+  pushed filters are already pruned by Iceberg's planning, so those files are never opened; the runtime filters
+  (#610 -- an IN set or an integer-key range from the broadcast build side, known only after it runs) were
+  previously only ANDed into the per-file Parquet row-group statistics filter, so every data file was still opened
+  (a HEAD + footer read each) and only its row groups skipped. Iceberg's own runtime filtering prunes by partition
+  values only, never by column bounds. Now the runtime filters are built into an Iceberg `Expression` and the scan
+  re-plans on the driver -- same snapshot, the scan's residual AND the runtime expression (Iceberg strips
+  per-file bounds from its task files) -- and the files Iceberg's `InclusiveMetricsEvaluator` says
+  cannot match are dropped before partitions are built, so they are never opened. Delete files (position deletes,
+  deletion vectors, equality deletes) and v3 row lineage are safe to prune -- deletes only remove rows and lineage
+  is per-file. A file under metrics mode `none` is kept. The re-plan reads the snapshot's manifests again (no data
+  file is opened). New metric `numFilesPrunedByRuntimeFilter`; `numFiles` still counts files read.
+
 - Grouped aggregate state in the native pool (#941, `spark.vecruntime.agg.nativeState`, on by default): past 16,384
   groups, the long sum, count and 128-bit decimal sum accumulators keep their state in one pool block each, a group's
   fields side by side, charged to the task in the operators' memory mode, instead of `long[]` on the heap. At 10 TB
@@ -72,8 +86,9 @@ version may change configuration keys or defaults, always noted here.
 - **Iceberg defaults on** (owner, 2026-10-23): the native Iceberg scan (`spark.vecruntime.scan.nativeIceberg.enabled`),
   the columnar Iceberg writer (`spark.vecruntime.iceberg.writer.enabled`) and the columnar merge-on-read writer --
   deletion vectors on v3, position deletes on v2 (`spark.vecruntime.iceberg.dvWriter.enabled`) -- now default to
-  `true`. Each still declines anything it does not take to Iceberg's / Spark's own path with a printed reason; set
-  the key to `false` to restore the previous behaviour.
+  `true`, and so does the columnar Parquet writer (`spark.vecruntime.write.columnar.enabled`, #64), which writes
+  Parquet v2 data pages. Each still declines anything it does not take to Iceberg's / Spark's own path with a
+  printed reason; set the key to `false` to restore the previous behaviour.
 
 - One Spark-free `parquet` module (`vecruntime-parquet_<spark line>`, #900) replaces `parquet-writer` and takes
   the page decoders out of `kernels`: `io.vecruntime.kernels.parquet` is now `io.vecruntime.parquet.codec`, beside
@@ -97,6 +112,20 @@ version may change configuration keys or defaults, always noted here.
   buffers leave `-XX:MaxDirectMemorySize`, which then holds only the Flight transport's: TPC-DS 10 TB passed with a
   6 GB direct cap at Netty's speed, where Arrow on Netty needed about 10 GB. Older images lack the jar: render
   their runs with `ARROW_ALLOCATOR=`.
+
+### Fixed
+
+- The native Parquet scan's parallel row-group decode (#606) no longer leaks Arrow buffers when a task ends early
+  (a `LIMIT`, or a failure), fixing the intermittent `ParallelDecodeSuite` "a LIMIT that ends the task early leaks
+  no vectors" failure on CI, where the whole `spark` module runs in one JVM (#981). The first fix stopped
+  `close()` from `cancel(true)`-ing running helper futures; this one removes the remaining leak path.
+  On close the iterator stopped its helper pool with `shutdownNow()`, which interrupts the running decode threads.
+  A helper decodes pure CPU over already-fetched pages and does not poll for interruption, so the interrupt did not
+  stop it cleanly -- it only made a later buffer allocation inside `readBatch` throw once the flag was set, and
+  that throw escaped with buffers already taken from the job's child allocator but not yet owned by a reader's
+  pool, which the decode's own cleanup could not free. The iterator now stops the pool with `shutdown()` (no
+  interrupt) and drains every in-flight job to completion before closing the lead, so each job's child allocator is
+  released and closed exactly once.
 
 ## 0.0.9 -- 2026-10-19
 

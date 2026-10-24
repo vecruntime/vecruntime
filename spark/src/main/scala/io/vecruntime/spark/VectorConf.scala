@@ -264,8 +264,8 @@ object VectorConf {
 
   /**
    * #64: write Parquet from our batches (VectorWriteFilesExec and the parquet-writer module), without the
-   * columnar-to-row conversion and Spark's row-by-row ParquetWriteSupport. Off by default while it is a prototype:
-   * unpartitioned, unbucketed writes of flat columns only; anything else keeps Spark's writer with a reason.
+   * columnar-to-row conversion and Spark's row-by-row ParquetWriteSupport. Default ON (owner, 2026-10-23); anything it
+   * does not take keeps Spark's writer with a printed reason.
    */
   val WriteColumnar = "spark.vecruntime.write.columnar.enabled"
 
@@ -292,6 +292,18 @@ object VectorConf {
    * Only when the scan reports no partitioning (a storage-partitioned join keeps Iceberg's groups).
    */
   val ScanNativeIcebergPackSplits = "spark.vecruntime.scan.nativeIceberg.packSplits"
+
+  /**
+   * #iceberg-file-pruning: prune Iceberg data files by a broadcast hash join's RUNTIME filters (#610) before the
+   * reader opens them. The static pushed filters are already pruned by Iceberg's own planning
+   * (`InclusiveMetricsEvaluator` over manifests), so those files are never opened; the runtime filters, known
+   * only after the build side runs, are today ANDed into the per-file Parquet row-group statistics filter, so
+   * every file is still opened (its HEAD + footer read) and only its row groups skipped. With this on (default
+   * true), the runtime filters are converted to an Iceberg `Expression` and each native data file is tested with
+   * `InclusiveMetricsEvaluator` on the driver; a file that cannot match is dropped before partitions are built,
+   * so it is never opened. Off restores the row-group-only behaviour.
+   */
+  val ScanNativeIcebergRuntimeFilePruning = "spark.vecruntime.scan.nativeIceberg.runtimeFilePruning.enabled"
 
   /** VectorParquetScanExec read-ahead (#559/#566): files of a split opened ahead, `0` off. */
   val ScanNativeParquetPrefetchFiles = "spark.vecruntime.scan.nativeParquet.prefetchFiles"
@@ -807,8 +819,8 @@ object VectorConf {
    */
   def scanNativeParquet(conf: SQLConf): Boolean = bool(conf, ScanNativeParquet, default = !cometScanActive(conf))
 
-  /** #64: the columnar Parquet writer, off by default. */
-  def writeColumnar(conf: SQLConf): Boolean = bool(conf, WriteColumnar, default = false)
+  /** #64: the columnar Parquet writer. Default on (owner, 2026-10-23). */
+  def writeColumnar(conf: SQLConf): Boolean = bool(conf, WriteColumnar, default = true)
   def writeColumnarFromRows(conf: SQLConf): Boolean = bool(conf, WriteColumnarFromRows, default = false)
 
   /** #735: VectorIcebergScanExec, behind the native Parquet scan's own switch too. Default on (owner, 2026-10-23). */
@@ -816,6 +828,10 @@ object VectorConf {
     bool(conf, ScanNativeIceberg, default = true) && scanNativeParquet(conf)
 
   def scanNativeIcebergPackSplits(conf: SQLConf): Boolean = bool(conf, ScanNativeIcebergPackSplits, default = true)
+
+  /** #iceberg-file-pruning: prune Iceberg data files by runtime filters before opening them (default on). */
+  def scanNativeIcebergRuntimeFilePruning(conf: SQLConf): Boolean =
+    bool(conf, ScanNativeIcebergRuntimeFilePruning, default = true)
 
   /** Whether Comet's scan is active in this session: its plugin or extension registered and its scan not off. */
   def cometScanActive(conf: SQLConf): Boolean = {
