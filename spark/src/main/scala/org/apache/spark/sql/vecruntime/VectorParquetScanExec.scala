@@ -947,6 +947,7 @@ private[vecruntime] final class VectorParquetPartitionReader(
     // 103 s with this HEAD (bisect on #559). newStream() then opens through fs.openFile(...).withFileStatus
     // (status) with the Parquet read policy, so the open itself issues no second HEAD.
     val inputFile = HadoopInputFile.fromPath(path, hadoopConf)
+    if (ScanIoStats.enabled) ScanIoStats.register(path.getFileSystem(hadoopConf))
     // Open the file ONCE: a single SeekableInputStream, read the footer from it with the split range, then
     // build the reader from THAT footer + the SAME stream -- no reopen, no second footer read. The split
     // range keeps the row groups whose midpoint falls in the range, so a file Spark split into several
