@@ -54,14 +54,18 @@ GitHub Pages **project** site uses, so links and assets resolve exactly as they 
 
 ## Content
 
-- **Overview / home** (`../docs/index.md`) — rendered with the animated-terminal hero.
-- **User guide** — `operators.md`, `expressions.md`, `configuration.md`, `comet.md`, `iceberg.md`,
-  `flight-shuffle.md`.
-- **Benchmarks** — the four generated benchmark pages. `docs/results.md` (the lab notebook) stays in
-  the repository but is not published; links to it from the site go to the file on GitHub.
+The site publishes its own short pages from `content/*.md`: what works, what is not implemented or falls
+back, and how to turn it on, with no history. The detailed pages (design notes, every fallback reason, the
+lab notebook `docs/results.md`) stay in the repository's `../docs/` and are **not** published: a link from a
+site page to a `docs/*.md` page that is not on the site points at the file on GitHub.
 
-Doc content is read straight from `../docs/*.md`. To change wording, edit those Markdown files (they
-serve both this site and the Jekyll site) and rebuild.
+- **Overview / home** (`content/index.md`) — rendered with the animated-terminal hero.
+- **User guide**, **Testing** — `content/*.md`, listed in `scripts/build.mjs` (`MD_PAGES`) and `nav.json`. A
+  page with no `content/` version falls back to `../docs/<name>.md`.
+- **Benchmarks** — the generated benchmark pages.
+
+To change the site's wording, edit `content/*.md`; to change the detailed documentation, edit `../docs/`.
+Keep the two consistent: the short page links the detailed one.
 
 ### Benchmark pages stay generated
 
