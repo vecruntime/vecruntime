@@ -147,7 +147,14 @@ is separate: Spark adds it to the container on top of the heap and the overhead.
 On 11 such executors this passes the 99 TPC-DS queries at 10 TB in 2,344 s. With a 20 GB heap and
 28,928 MB off-heap (the same pod) it took 2,430 s, with 19 % more GC and q78 spilling 947 GiB instead of
 758 GiB: the aggregates' tables are on the heap, and execution off-heap peaked under 4 GiB per executor
-(#926; 30 GB / 18,688 MB measured the same 2,340 s with 2.4 GiB more RSS). Earlier, the 20 GB heap with
+(#926; 30 GB / 18,688 MB measured the same 2,340 s with 2.4 GiB more RSS). Measured again after the
+aggregate tables moved into the native pool (#941), on the same pod and 1,500 partitions, all four runs
+99/99 (#926): 26 GB / 22,784 MB took 2,222 s and 2,208 s, 22 GB / 26,880 MB 2,210 s with 8 % more spill and
+27 % more GC, and 18 GB / 30,976 MB 2,192 s (1 % faster) but spilled 1,338 GiB instead of 618 GiB with 56 %
+more GC and 9 GiB lower peak RSS. The extra off-heap does not cut spill, which the sorts and aggregates
+decide from their own thresholds and the task's share, while the smaller heap adds GC. 26 GB stays the
+default; 18 GB / 30,976 MB is an option where the node's scratch disks are fast local NVMe and not shared,
+since on slower or shared disks the doubled spill is likely to cost more than the 1 %. Earlier, the 20 GB heap with
 10 GB overhead and a 6 GB direct cap passed in 2,893 s against 2,806 s for 14 GB overhead and a 10 GB
 direct cap with Arrow on Netty, with GC time down 45 % (#840). Below a 6 GB direct cap
 the Flight transport's own buffers run out; a fixed 4 MiB HTTP/2 window
