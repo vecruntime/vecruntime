@@ -57,10 +57,12 @@ public final class PoolAllocationManager extends AllocationManager {
      * #924 step 1: an Arrow buffer allocated on a task thread is charged to that
      * task's pool account, and credited when it is released, on any thread;
      * one allocated outside a task (the Flight server's gRPC threads) is
-     * charged nowhere, as before. {@code -Dvecruntime.arrow.chargeTasks}; off
-     * until a full 10 TB run says it costs nothing.
+     * charged nowhere, as before. On by default ({@code -Dvecruntime.arrow.chargeTasks=false}
+     * turns it off): at 10 TB, full 99 queries, it ran 2,242 s against 2,288 s off, with
+     * spill (611 vs 614 GiB) and GC (2,432 vs 2,618 s) unchanged or lower.
      */
-    static final boolean CHARGE_TASKS = Boolean.getBoolean("vecruntime.arrow.chargeTasks");
+    static final boolean CHARGE_TASKS =
+            Boolean.parseBoolean(System.getProperty("vecruntime.arrow.chargeTasks", "true"));
 
     private final NativePool.Lease lease;
     private final long size;
