@@ -17,7 +17,7 @@ package io.vecruntime.iceberg.spark
 
 import java.nio.file.{Files, Path}
 
-import org.apache.iceberg.spark.Spark3Util
+import org.apache.iceberg.spark.{Spark3Util, SparkExecutorCache}
 import org.apache.spark.sql.{Row, SparkSession}
 import org.apache.spark.sql.vecruntime.ParquetFileResolver
 import org.scalatest.BeforeAndAfterAll
@@ -116,6 +116,9 @@ class IcebergDeleteFileCacheSuite extends AnyFunSuite with BeforeAndAfterAll {
   private def scan(cacheOn: Boolean): (Seq[Row], Long) =
     withConf(Cache -> cacheOn.toString) {
       spark.sql(s"REFRESH TABLE $T")
+      // The executor cache is shared with Iceberg's own reader (the oracle above runs it with the cache on), so
+      // drop this table's entries first: otherwise our scan is served by the oracle's load and opens nothing.
+      Option(SparkExecutorCache.get()).foreach(_.invalidate(T))
       val before = ParquetFileResolver.deleteFileOpens.get()
       val got = sorted(spark.sql(s"SELECT id, v FROM $T").collect().toSeq)
       (got, ParquetFileResolver.deleteFileOpens.get() - before)
