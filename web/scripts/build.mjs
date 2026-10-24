@@ -41,7 +41,10 @@ const SITE_TITLE = nav.site.title;
 const pageTpl = fs.readFileSync(path.join(WEB, "templates", "page.html"), "utf8");
 const homeTpl = fs.readFileSync(path.join(WEB, "templates", "home.html"), "utf8");
 
-// Markdown pages to port: filename -> nav url (must match nav.json).
+// Markdown pages published on the site: filename -> nav url (must match nav.json). The site has its own short
+// pages in web/content/ (no history, what works and what does not); the detailed pages stay in the repository's
+// docs/ and are linked on GitHub (see OFF_SITE). A page missing from web/content/ falls back to docs/.
+const CONTENT = path.join(WEB, "content");
 const MD_PAGES = [
   ["index.md", "/index.html"],
   ["operators.md", "/operators.html"],
@@ -54,15 +57,16 @@ const MD_PAGES = [
   ["aqe-dpp-rules.md", "/aqe-dpp-rules.html"],
   ["testing.md", "/testing.html"],
   ["comet.md", "/comet.html"],
-  ["iceberg-support.md", "/iceberg-support.html"],
   ["iceberg.md", "/iceberg.html"],
   ["flight-shuffle.md", "/flight-shuffle.html"],
   ["parquet.md", "/parquet.html"],
-  ["native-parquet-reader.md", "/native-parquet-reader.html"],
-  ["parquet-writer.md", "/parquet-writer.html"],
   ["acknowledgments.md", "/acknowledgments.html"],
   ["roadmap.md", "/roadmap.html"],
 ];
+const sourceOf = (file) => {
+  const own = path.join(CONTENT, file);
+  return fs.existsSync(own) ? own : path.join(DOCS, file);
+};
 const BENCH_PAGES = [
   "tpcds-1tb.html",
   "tpcds-1tb-graviton.html",
@@ -73,11 +77,14 @@ const BENCH_PAGES = [
 ];
 
 // Docs kept in the repository but not published on the site. A link to one of them -- from a
-// Markdown page (`results.html`) or a generated benchmark page (Liquid `'/results.html'`) -- points
-// at the file on GitHub instead of a page that does not exist.
-const OFF_SITE = {
-  "results.html": `${REPO_URL}/blob/main/docs/results.md`,
-};
+// Markdown page (`results.html`, `native-parquet-reader.html`) or a generated benchmark page (Liquid
+// `'/results.html'`) -- points at the file on GitHub instead of a page that does not exist. Every docs/*.md
+// that is not a site page is off-site.
+const OFF_SITE = Object.fromEntries(
+  fs.readdirSync(DOCS)
+    .filter((f) => f.endsWith(".md") && !MD_PAGES.some(([p]) => p === f))
+    .map((f) => [f.replace(/\.md$/, ".html"), `${REPO_URL}/blob/main/docs/${f}`])
+);
 
 // The set of internal doc targets, for link rewriting.
 const INTERNAL = new Set([
@@ -183,7 +190,7 @@ let count = 0;
 
 // Markdown pages.
 for (const [file, url] of MD_PAGES) {
-  const src = fs.readFileSync(path.join(DOCS, file), "utf8");
+  const src = fs.readFileSync(sourceOf(file), "utf8");
   const { title, description, body } = stripFrontMatter(src);
   Object.keys(_used).forEach((k) => delete _used[k]); // reset per-page anchor dedup
   let contentHtml = rewriteLinks(md.render(body));

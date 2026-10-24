@@ -24,16 +24,8 @@
         { "title": "Planner rules (AQE, DPP)", "url": "/aqe-dpp-rules.html" },
         { "title": "Comet as the scan", "url": "/comet.html" },
         { "title": "Apache Parquet", "url": "/parquet.html" },
-        { "title": "Apache Iceberg", "url": "/iceberg-support.html" },
+        { "title": "Apache Iceberg", "url": "/iceberg.html" },
         { "title": "Flight shuffle", "url": "/flight-shuffle.html" }
-      ]
-    },
-    {
-      "section": "In depth",
-      "items": [
-        { "title": "Iceberg in depth", "url": "/iceberg.html" },
-        { "title": "Native Parquet reader in depth", "url": "/native-parquet-reader.html" },
-        { "title": "Columnar Parquet writer in depth", "url": "/parquet-writer.html" }
       ]
     },
     {

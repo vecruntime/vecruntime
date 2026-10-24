@@ -25,7 +25,7 @@ Spark's and Iceberg's, apart from an opt-in columnar deletion-vector writer for 
   distribution, and the `rewrite_data_files` BINPACK maintenance procedure. Merge-on-read writes deletion
   vectors on v3 and position delete files on v2. It is behind `spark.vecruntime.iceberg.writer.enabled`
   (on by default). See [the columnar writer](#the-write-side-the-columnar-iceberg-writer-842-901).
-  A one-page summary is in [Iceberg support at a glance](iceberg-support.html).
+  The website has a one-page summary.
 
 The tables below give the state of each feature, by format version.
 

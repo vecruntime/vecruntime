@@ -116,7 +116,7 @@ Version 0.0.9, a preview release under the Apache License 2.0. The plugin runs t
 - [Compatibility matrix](compatibility.html) -- what runs on VecRuntime and what falls back, row by
   row from the ported Comet test suites; [Testing & correctness](testing.html) -- how correctness is
   established (Spark's golden suite, the ported matrices, the benchmark checksums).
-- [Comet as the scan](comet.html), [Apache Iceberg](iceberg.html) ([at a glance](iceberg-support.html)),
+- [Comet as the scan](comet.html), [Apache Iceberg](iceberg.html),
   [The Flight shuffle](flight-shuffle.html).
 - [Native Parquet reader](native-parquet-reader.html) -- design of `VectorParquetScanExec` (#559): data
   path, read-ahead, the support matrix (every flat type and v1/v2 encoding; INT96 and nested types go

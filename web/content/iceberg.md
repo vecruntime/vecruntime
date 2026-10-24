@@ -12,7 +12,7 @@ Whenever a case is not covered, the query falls back to Iceberg's or Spark's own
 
 Iceberg 1.12 · Spark 4.1 · format versions 1, 2 and 3. Everything below is **on by default**.
 
-The detailed page is [Iceberg in depth](iceberg.html): the design, every fallback reason, the table-property
+The detailed page is [detailed Iceberg page](https://github.com/vecruntime/vecruntime/blob/main/docs/iceberg.md): the design, every fallback reason, the table-property
 table and the tests.
 
 ---
@@ -72,7 +72,7 @@ setting behave as they do in Iceberg's reader/writer (option over property over 
 | Mode | `write.delete.mode`, `write.update.mode`, `write.merge.mode` (per command) |
 
 The full table, read and write, with honour / follow-Iceberg / ignore for each, is on the
-[detailed page](iceberg.html#table-properties).
+[detailed page](https://github.com/vecruntime/vecruntime/blob/main/docs/iceberg.md#table-properties).
 
 ## Configuration switches
 
@@ -115,4 +115,4 @@ triaged plugin-specific exclusions (plan-shape and byte-size assertions, not cor
 ---
 
 The design, every fallback reason, and the tests are on the detailed page,
-[Apache Iceberg](iceberg.html).
+[the detailed Iceberg page](https://github.com/vecruntime/vecruntime/blob/main/docs/iceberg.md).
