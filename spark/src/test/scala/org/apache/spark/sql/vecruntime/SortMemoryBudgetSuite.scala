@@ -443,7 +443,10 @@ class SortMemoryBudgetSuite extends AnyFunSuite {
   }
 
   test("#924: memory no task owns is held in storage memory, and returned when freed") {
-    val mm = new UnifiedMemoryManager(new SparkConf(false), 1L << 30, 0L, 1)
+    // Storage in either mode: the account holds it in the sort's mode, which an earlier suite's session may have
+    // turned to off-heap.
+    val mmConf = new SparkConf(false).set("spark.memory.offHeap.enabled", "true").set("spark.memory.offHeap.size", "1g")
+    val mm = new UnifiedMemoryManager(mmConf, 1L << 30, 0L, 1)
     val ex = TaskNativeMemory.ExecutorAccount
     ex.memoryManagerForTests = mm
     TaskNativeMemory.install()
