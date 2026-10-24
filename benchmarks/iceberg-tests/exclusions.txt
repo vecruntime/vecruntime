@@ -73,9 +73,16 @@ org.apache.iceberg.spark.actions.TestRewriteDataFilesAction#testBinPackCombineMi
 # testBinPackCombineMediumFiles (fv 2,3,4). 4 equal input files, all below MIN so all 4 are
 # rewritten (rewritten=4 OK). TARGET = sum/3. Iceberg writes 4x ~327,000 B (sum 1,307,776);
 # packing + rolling at TARGET=435,925 yields 3 output files [456190,456714,392594] -> 3 added.
-# Our columnar writer writes 4x ~170,000 B (sum 684,899, ~1.9x smaller); TARGET = 228,299 and
-# rolling the combined stream at that size yields [227888,227874,221749, 7778] -> 4 files, the
-# 4th a ~7.8 KB remainder. "expected 3 but was 4". Same mechanism on fv3/fv4 (outputs scale with
-# the fv>=3 MAX factor of 2 vs 1.8 but still roll to 4). rewrittenBytes == dataSizeBefore and
-# rows match in every case; the count is a pure byte-size artifact of our smaller files.
+# ROOT CAUSE (NOT (b)): our columnar writer tested the row-group boundary only once per 1024-row
+# SLICE, so with tiny rows under the test's small row-group-size-bytes every group came out exactly
+# one SLICE long and ~2.9x oversized (measured: 25 groups avg 50,707 B vs parquet-java 85 groups avg
+# 17,521 B at a 20 KB target). That coarse grouping made Iceberg's byte-midpoint input splits fall
+# unevenly. FIXED for fv2 by the adaptive row-group check in ColumnarParquetWriter
+# (crew/draco/binpack-medium-v3 commit 9e7d72a2): fv2 now adds 3 files [237630,236705,216872] and
+# PASSES. STILL FAILING fv3/fv4 ("add 3 but was 5"): a DIFFERENT, v3/v4-only root cause -- with the
+# row-lineage columns the rewrite writes near-MAX files each trailed by a ~22 KB straggler
+# ([411300,23005,411618,21182,397728]); the lineage write path inflates output and mis-splits,
+# independent of row-group size. Excluded TEMPORARY (category a, partially fixed) pending the v3/v4
+# lineage-write investigation -- the per-method exclusion cannot scope to fv3/fv4 alone, and fv2 is
+# already green, so remove this entry once the v3/v4 straggler is fixed.
 org.apache.iceberg.spark.actions.TestRewriteDataFilesAction#testBinPackCombineMediumFiles
