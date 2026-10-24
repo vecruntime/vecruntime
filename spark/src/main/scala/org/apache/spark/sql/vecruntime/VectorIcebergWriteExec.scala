@@ -144,18 +144,31 @@ case class VectorIcebergWriteStrategy(session: SparkSession) extends SparkStrate
       case None =>
         val rowOrdinals = ordinals.getOrElse(query.output.indices.toArray)
         // #901 M4a: for the copy path, cluster the input by _file with a plain hash partitioning
-        // (RepartitionByExpression -> ShuffleExchange hashpartitioning(_file), ENSURE_REQUIREMENTS). This
-        // replaces Iceberg's REBALANCE_PARTITIONS_BY_COL distribution: a plain hash exchange sends every row
-        // of a file to one reducer and is never split by AQE's OptimizeSkewInRebalancePartitions (which only
-        // touches REBALANCE exchanges), so a source file is whole in one task and its row groups can be copied.
+        // (RepartitionByExpression -> ShuffleExchange hashpartitioning(_file), ENSURE_REQUIREMENTS): a plain
+        // hash exchange sends every row of a file to one reducer and is never split by AQE's
+        // OptimizeSkewInRebalancePartitions (which only touches REBALANCE exchanges), so a source file is whole
+        // in one task and its row groups can be copied. This REPLACES Iceberg's REBALANCE_PARTITIONS_BY_COL
+        // distribution.
+        //
+        // EXCEPTION (coalesce intent): when the user has configured write-side coalescing -- AQE
+        // coalescePartitions on AND a large Iceberg write advisory partition size
+        // (spark.sql.iceberg.advisory-partition-size, which Iceberg's own write would feed to its REBALANCE so
+        // AQE fuses many small shuffle blocks into ONE task and writes ONE file) -- our plain _file hash would
+        // instead write one file per source file (it carries Spark's tiny default advisory, which AQE cannot
+        // coalesce, and one reducer per _file key). Honour Iceberg's own distribution in that case: leave the
+        // query's REBALANCE in place so AQE coalesces it, and let the runtime clusteredByFile gate decline the
+        // copy (a RANGE distribution is not a single-_file hash) so the coalesced input takes the full rewrite,
+        // matching Iceberg's one-file result (TestDelete/TestUpdate#testCoalesce{Delete,Update}). The ordinary
+        // copy case -- no coalescing, or the default small write advisory the copy-unchanged path relies on to
+        // keep files separate -- keeps the _file override.
         val child = copy match {
-          case Some(cp) =>
+          case Some(cp) if !VectorIcebergWriteStrategy.writeSideCoalescing(conf) =>
             org.apache.spark.sql.catalyst.plans.logical.RepartitionByExpression(
               Seq(query.output(cp.fileOrdinal)),
               query,
               None
             )
-          case None => query
+          case _ => query
         }
         Seq(
           VectorIcebergWriteExec(
@@ -175,6 +188,31 @@ case class VectorIcebergWriteStrategy(session: SparkSession) extends SparkStrate
 }
 
 object VectorIcebergWriteStrategy {
+
+  /**
+   * Whether the user configured WRITE-SIDE coalescing for this session: AQE `coalescePartitions` is on AND the
+   * Iceberg write advisory partition size (`spark.sql.iceberg.advisory-partition-size`) is set larger than
+   * Spark's own advisory partition size. That is the signal Iceberg's own copy-on-write write uses to fuse many
+   * small shuffle blocks into ONE output file (it feeds the large advisory to its REBALANCE exchange and AQE
+   * coalesces it). In that configuration the M4a copy path must NOT replace Iceberg's distribution with a plain
+   * `_file` hash: the hash carries Spark's tiny default advisory, which AQE cannot coalesce, so the rewrite
+   * writes one file per source file instead of the single coalesced file Iceberg produces. The copy-unchanged
+   * path, by contrast, leaves the Iceberg advisory at its (small) default precisely to keep files separate for
+   * copying, so this returns false there and the `_file` override stands.
+   */
+  def writeSideCoalescing(conf: org.apache.spark.sql.internal.SQLConf): Boolean = {
+    if (!conf.coalesceShufflePartitionsEnabled) {
+      return false
+    }
+    // Iceberg's write advisory (session conf). Unset -> Iceberg defaults it to the target file size (small),
+    // which is NOT a coalesce-into-large-files signal; only an explicit, larger-than-Spark value is. Referenced
+    // by its string key (the spark module has no compile-time Iceberg dependency).
+    val icebergAdvisory =
+      try Option(conf.getConfString("spark.sql.iceberg.advisory-partition-size", null))
+          .map(_.trim.toLong)
+      catch { case _: Throwable => None }
+    icebergAdvisory.exists(_ > conf.getConf(org.apache.spark.sql.internal.SQLConf.ADVISORY_PARTITION_SIZE_IN_BYTES))
+  }
 
   /**
    * Recaches the target after the commit, as Spark's `DataSourceV2Strategy` does for its own write execs: by
