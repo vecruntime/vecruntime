@@ -164,10 +164,7 @@ public final class EqualityDeleteSet {
         List<byte[]> encoded = new java.util.ArrayList<>();
         KeyBuffer buf = new KeyBuffer();
         for (org.apache.iceberg.io.InputFile file : files) {
-            try (org.apache.iceberg.io.CloseableIterable<org.apache.iceberg.data.Record> reader = org.apache.iceberg.parquet.Parquet.read(file)
-                    .project(deleteSchema)
-                    .createReaderFunc(fileSchema -> org.apache.iceberg.data.parquet.GenericParquetReaders.buildReader(deleteSchema, fileSchema))
-                    .build()) {
+            try (org.apache.iceberg.io.CloseableIterable<org.apache.iceberg.data.Record> reader = openDeleteReader(deleteSchema, file)) {
                 for (org.apache.iceberg.data.Record record : reader) {
                     StructLike row = wrapper.wrap(record);
                     buf.reset();
@@ -181,6 +178,131 @@ public final class EqualityDeleteSet {
             }
         }
         return new EqualityDeleteSet(kinds, encoded);
+    }
+
+    /**
+     * Opens an Iceberg generic Parquet reader over an equality-delete file,
+     * built WITHOUT naming {@code org.apache.parquet.schema.MessageType}
+     * anywhere in this class's bytecode (#shading).
+     *
+     * <p>This module compiles against {@code iceberg-spark-runtime}, whose
+     * Parquet classes are RELOCATED to {@code
+     * org.apache.iceberg.shaded.org.apache.parquet.*}. Iceberg's OWN test
+     * classpath (and any deployment that puts the unshaded {@code
+     * iceberg-parquet}/{@code iceberg-data} modules ahead of the runtime jar)
+     * uses the UNSHADED {@code org.apache.parquet.*} instead. A {@code
+     * createReaderFunc(fileSchema -> ...)} lambda has a synthetic bridge method
+     * whose parameter is the {@code MessageType} the LAMBDA WAS COMPILED
+     * AGAINST (shaded here); when the Parquet reader on the classpath is
+     * unshaded it invokes that bridge with an unshaded {@code MessageType}, and
+     * the bridge's implicit cast throws {@code ClassCastException:
+     * org.apache.parquet.schema.MessageType cannot be cast to
+     * org.apache.iceberg.shaded.org.apache.parquet.schema.MessageType} (the
+     * reverse under the other layout). Either way the native equality-delete
+     * path crashed the query.
+     *
+     * <p>Fix: build the reader chain reflectively. The {@code
+     * java.util.function.Function} we pass to {@code createReaderFunc} is
+     * parameterised only as {@code Function<Object, Object>}, so its bridge
+     * method takes {@code Object} and casts nothing; inside, {@code
+     * GenericParquetReaders .buildReader(Schema, MessageType)} is called by
+     * {@link java.lang.reflect.Method#invoke} with the {@code fileSchema} the
+     * reader hands us as an {@code Object}. Reflection resolves {@code
+     * MessageType} from whichever Iceberg (and whichever Parquet shading) is
+     * actually on the classpath, so the SAME bytecode works under both the
+     * shaded runtime jar and the unshaded modules -- it is never pinned to one
+     * relocation. The reflected target classes ({@code Parquet}, {@code
+     * GenericParquetReaders}, {@code CloseableIterable}) are plain Iceberg API
+     * resolved by name, so they too follow the classpath.
+     *
+     * <p>If the reflected API is absent or shaped differently from 1.12.0, this
+     * throws {@link UnsupportedEqualityReaderException}; {@code
+     * VectorIcebergScanExec} catches it and falls back to Iceberg's own {@code
+     * BaseDeleteLoader} row probe, which is correct for every equality-key type
+     * except the fixed/binary collapse this native path exists to avoid (an
+     * upstream Iceberg bug). The fallback is thus a graceful degradation, not a
+     * wrong answer.
+     */
+    @SuppressWarnings("unchecked")
+    private static org.apache.iceberg.io.CloseableIterable<org.apache.iceberg.data.Record> openDeleteReader(org.apache.iceberg.Schema deleteSchema, org.apache.iceberg.io.InputFile file) {
+        try {
+            Class<?> parquetCls = Class.forName("org.apache.iceberg.parquet.Parquet", true, loader());
+            Class<?> readersCls = Class.forName("org.apache.iceberg.data.parquet.GenericParquetReaders",
+                    true, loader());
+            Class<?> schemaCls = org.apache.iceberg.Schema.class;
+            // GenericParquetReaders.buildReader(Schema expected, MessageType fileSchema); its 2nd
+            // parameter is the Parquet MessageType of whichever Iceberg is loaded -- we never name it.
+            java.lang.reflect.Method buildReader = null;
+            for (java.lang.reflect.Method m : readersCls.getMethods()) {
+                if (m.getName().equals("buildReader") && m.getParameterCount() == 2 && m.getParameterTypes()[0] == schemaCls) {
+                    buildReader = m;
+                    break;
+                }
+            }
+            if (buildReader == null) {
+                throw new UnsupportedEqualityReaderException("GenericParquetReaders.buildReader(Schema, MessageType) not found");
+            }
+            final java.lang.reflect.Method build = buildReader;
+            // Function<Object,Object>: the file schema (a MessageType) arrives as Object and is passed
+            // straight through to buildReader by reflection; no cast to any MessageType relocation.
+            java.util.function.Function<Object, Object> readerFunc = fileSchema -> {
+                try {
+                    return build.invoke(null, deleteSchema, fileSchema);
+                } catch (ReflectiveOperationException e) {
+                    throw new UnsupportedEqualityReaderException("GenericParquetReaders.buildReader failed", e);
+                }
+            };
+
+            Object readBuilder = parquetCls.getMethod("read", org.apache.iceberg.io.InputFile.class).invoke(null, file);
+            readBuilder = readBuilder.getClass()
+                    .getMethod("project", schemaCls)
+                    .invoke(readBuilder, deleteSchema);
+            // Pick the createReaderFunc(Function) overload specifically (there are BiFunction and
+            // ReaderFunction overloads too). getMethod with java.util.function.Function matches it.
+            readBuilder = readBuilder.getClass()
+                    .getMethod("createReaderFunc", java.util.function.Function.class)
+                    .invoke(readBuilder, readerFunc);
+            Object built = readBuilder.getClass()
+                    .getMethod("build")
+                    .invoke(readBuilder);
+            return (org.apache.iceberg.io.CloseableIterable<org.apache.iceberg.data.Record>) built;
+        } catch (UnsupportedEqualityReaderException e) {
+            throw e;
+        } catch (java.lang.reflect.InvocationTargetException e) {
+            Throwable c = e.getCause();
+            if (c instanceof RuntimeException re) {
+                throw re;
+            }
+            if (c instanceof Error err) {
+                throw err;
+            }
+            throw new UnsupportedEqualityReaderException("native equality-delete reader failed", c);
+        } catch (ReflectiveOperationException | LinkageError e) {
+            throw new UnsupportedEqualityReaderException("native equality-delete reader unavailable", e);
+        }
+    }
+
+    private static ClassLoader loader() {
+        ClassLoader cl = Thread.currentThread().getContextClassLoader();
+        return cl != null ? cl : EqualityDeleteSet.class.getClassLoader();
+    }
+
+    /**
+     * Thrown when the reflective generic Parquet reader cannot be built against
+     * the Iceberg on the classpath (absent or reshaped API). The scan's native
+     * equality-delete path treats it as "unsupported here" and falls back to
+     * Iceberg's own delete loader.
+     */
+    public static final class UnsupportedEqualityReaderException extends RuntimeException {
+        private static final long serialVersionUID = 1L;
+
+        UnsupportedEqualityReaderException(String message) {
+            super(message);
+        }
+
+        UnsupportedEqualityReaderException(String message, Throwable cause) {
+            super(message, cause);
+        }
     }
 
     /** The number of distinct keys. */
