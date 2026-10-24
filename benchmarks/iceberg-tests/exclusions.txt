@@ -79,10 +79,18 @@ org.apache.iceberg.spark.actions.TestRewriteDataFilesAction#testBinPackCombineMi
 # 17,521 B at a 20 KB target). That coarse grouping made Iceberg's byte-midpoint input splits fall
 # unevenly. FIXED for fv2 by the adaptive row-group check in ColumnarParquetWriter
 # (crew/draco/binpack-medium-v3 commit 9e7d72a2): fv2 now adds 3 files [237630,236705,216872] and
-# PASSES. STILL FAILING fv3/fv4 ("add 3 but was 5"): a DIFFERENT, v3/v4-only root cause -- with the
-# row-lineage columns the rewrite writes near-MAX files each trailed by a ~22 KB straggler
-# ([411300,23005,411618,21182,397728]); the lineage write path inflates output and mis-splits,
-# independent of row-group size. Excluded TEMPORARY (category a, partially fixed) pending the v3/v4
-# lineage-write investigation -- the per-method exclusion cannot scope to fv3/fv4 alone, and fv2 is
-# already green, so remove this entry once the v3/v4 straggler is fixed.
+# PASSES. STILL FAILING fv3/fv4 ("add 3 but was 5", outputs [411300,23005,411618,21182,397728] =
+# 3 near-full files + 2 ~22 KB stragglers): a DIFFERENT, v3/v4-only root cause in the WRITE path,
+# NOT a file-roll or row-group-size issue. Evidence (2026-10-24): with writers OFF (our scan, Iceberg's
+# own writer) medium passes all fv; with writers ON only fv3/fv4 fail. The rewrite runs with AQE OFF
+# (TestRewriteDataFilesAction @BeforeAll disables it) and our Rolling writer receives target-file-size
+# = 512 MB (never rolls -- each Spark write-partition is exactly one output file), so the 5 files are
+# 5 write partitions where Iceberg's own writer makes 3 from the SAME input (identical input DataFile
+# sizes on vs off). The two ~22 KB stragglers are near-empty partitions -- a skewed
+# distribution/range-partition split that appears only once the v3 row-lineage columns
+# (_row_id / _last_updated_sequence_number) are materialised in the write. So it is a write-path
+# partitioning/distribution interaction with v3 lineage, not the columnar writer's roll check.
+# Excluded TEMPORARY (category a, partially fixed) pending that v3 write-partitioning investigation --
+# the per-method exclusion cannot scope to fv3/fv4 alone, and fv2 is already green, so remove this
+# entry once the v3/v4 partition split is fixed.
 org.apache.iceberg.spark.actions.TestRewriteDataFilesAction#testBinPackCombineMediumFiles
