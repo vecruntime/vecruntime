@@ -54,6 +54,7 @@ const MD_PAGES = [
   ["aqe-dpp-rules.md", "/aqe-dpp-rules.html"],
   ["testing.md", "/testing.html"],
   ["comet.md", "/comet.html"],
+  ["iceberg-support.md", "/iceberg-support.html"],
   ["iceberg.md", "/iceberg.html"],
   ["flight-shuffle.md", "/flight-shuffle.html"],
   ["parquet.md", "/parquet.html"],

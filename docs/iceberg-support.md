@@ -12,7 +12,7 @@ Whenever a case is not covered, the query falls back to Iceberg's or Spark's own
 
 Iceberg 1.12 · Spark 4.1 · format versions 1, 2 and 3. Everything below is **on by default**.
 
-The detailed page is [Apache Iceberg](iceberg.html): the design, every fallback reason, the table-property
+The detailed page is [Iceberg in depth](iceberg.html): the design, every fallback reason, the table-property
 table and the tests.
 
 ---
