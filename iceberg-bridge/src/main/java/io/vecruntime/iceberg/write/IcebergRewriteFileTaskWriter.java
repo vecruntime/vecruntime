@@ -393,6 +393,12 @@ public final class IcebergRewriteFileTaskWriter implements AutoCloseable {
                 .withFormat(FileFormat.PARQUET)
                 .withFileSizeInBytes(appender.length())
                 .withMetrics(appender.metrics())
+                // Stamp the sort order id Iceberg's own writer would (SparkWriteConf.outputSortOrderId): a
+                // copy-on-write rewrite keeps the surviving rows in the table's required order, so the
+                // rewritten files carry the table's sort order id, not 0. The streaming full-rewrite writer
+                // (IcebergDataTaskWriter) already does this (#964); the copy path must match, or a rewrite
+                // routed here reports an unsorted order where Iceberg reports the table order.
+                .withSortOrderId(spec.sortOrderId())
                 .withSplitOffsets(appender.splitOffsets());
         if (partition != null) {
             b.withPartition(partition);
