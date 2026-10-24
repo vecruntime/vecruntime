@@ -1222,6 +1222,10 @@ object CountingLocalFileSystem {
     new java.util.concurrent.ConcurrentHashMap[String, java.util.concurrent.atomic.AtomicInteger]()
   private val statCounts =
     new java.util.concurrent.ConcurrentHashMap[String, java.util.concurrent.atomic.AtomicInteger]()
+  // #834: ranged reads -- a read that starts where the last one did not end (a seek, or the first read) is one
+  // request; a sequential run of reads is one. This is the count the small-file prefetch and range merging cut.
+  private val readCounts =
+    new java.util.concurrent.ConcurrentHashMap[String, java.util.concurrent.atomic.AtomicInteger]()
 
   private def counter(
       m: java.util.concurrent.ConcurrentHashMap[String, java.util.concurrent.atomic.AtomicInteger],
@@ -1232,12 +1236,70 @@ object CountingLocalFileSystem {
   def reset(absPath: String): Unit = {
     counter(openCounts, absPath).set(0)
     counter(statCounts, absPath).set(0)
+    counter(readCounts, absPath).set(0)
   }
   def opens(absPath: String): Int = counter(openCounts, absPath).get()
   def getFileStatus(absPath: String): Int = counter(statCounts, absPath).get()
 
+  /** #834: the number of ranged reads (seek+read runs) issued against `absPath` inside a Spark task. */
+  def reads(absPath: String): Int = counter(readCounts, absPath).get()
+
   private[parquet] def countOpen(absPath: String): Unit = counter(openCounts, absPath).incrementAndGet()
   private[parquet] def countStat(absPath: String): Unit = counter(statCounts, absPath).incrementAndGet()
+  private[parquet] def countRead(absPath: String): Unit = counter(readCounts, absPath).incrementAndGet()
+
+  /**
+   * #834: an [[org.apache.hadoop.fs.FSInputStream]] that delegates to the raw local stream and tallies a
+   * ranged read whenever a read starts at a position the previous read did not end at -- i.e. after a seek, or
+   * the first read. A sequential run of reads counts once. This mirrors how S3A turns seeks into new GETs, so
+   * the tally is the request count that whole-object prefetch (one request) and range merging (fewer, larger
+   * requests) cut.
+   */
+  private[parquet] final class CountingInputStream(
+      delegate: org.apache.hadoop.fs.FSDataInputStream,
+      key: String
+  ) extends org.apache.hadoop.fs.FSInputStream {
+    private var lastEnd = -1L
+
+    private def account(startPos: Long, n: Int): Unit = {
+      if (n > 0) {
+        if (startPos != lastEnd) countRead(key)
+        lastEnd = startPos + n
+      }
+    }
+
+    override def seek(pos: Long): Unit = delegate.seek(pos)
+    override def getPos: Long = delegate.getPos
+    override def seekToNewSource(targetPos: Long): Boolean = delegate.seekToNewSource(targetPos)
+
+    override def read(): Int = {
+      val at = delegate.getPos
+      val b = delegate.read()
+      if (b >= 0) account(at, 1)
+      b
+    }
+
+    override def read(b: Array[Byte], off: Int, len: Int): Int = {
+      val at = delegate.getPos
+      val n = delegate.read(b, off, len)
+      account(at, n)
+      n
+    }
+
+    // Positioned reads (readFully(pos, ...)) are each their own ranged request at an explicit offset.
+    override def read(position: Long, buffer: Array[Byte], offset: Int, length: Int): Int = {
+      val n = delegate.read(position, buffer, offset, length)
+      if (n > 0) countRead(key)
+      n
+    }
+    override def readFully(position: Long, buffer: Array[Byte], offset: Int, length: Int): Unit = {
+      if (length > 0) countRead(key)
+      delegate.readFully(position, buffer, offset, length)
+    }
+
+    override def available(): Int = delegate.available()
+    override def close(): Unit = delegate.close()
+  }
 }
 
 class CountingLocalFileSystem extends org.apache.hadoop.fs.RawLocalFileSystem {
@@ -1263,8 +1325,12 @@ class CountingLocalFileSystem extends org.apache.hadoop.fs.RawLocalFileSystem {
   override def open(f: HPath, bufferSize: Int): FSDataInputStream = {
     if (inTask) CountingLocalFileSystem.countOpen(key(f))
     insideOpen.set(java.lang.Boolean.TRUE)
-    try super.open(f, bufferSize)
-    finally insideOpen.set(java.lang.Boolean.FALSE)
+    try {
+      val raw = super.open(f, bufferSize)
+      // #834: wrap the stream so a read after a non-contiguous position (a seek, or the first read) is tallied
+      // as one ranged request. Only inside a task, so driver planning is excluded as above.
+      if (inTask) new FSDataInputStream(new CountingLocalFileSystem.CountingInputStream(raw, key(f))) else raw
+    } finally insideOpen.set(java.lang.Boolean.FALSE)
   }
 
   override def getFileStatus(f: HPath): FileStatus = {

@@ -33,7 +33,6 @@ import org.apache.iceberg.TableProperties;
 import org.apache.iceberg.io.FileAppender;
 import org.apache.iceberg.io.OutputFile;
 import org.apache.iceberg.mapping.NameMapping;
-import org.apache.iceberg.parquet.ParquetUtil;
 import org.apache.parquet.column.ParquetProperties;
 import org.apache.parquet.hadoop.CodecFactory;
 import org.apache.parquet.hadoop.metadata.BlockMetaData;
@@ -244,6 +243,51 @@ public final class IcebergParquetAppender implements FileAppender<IcebergParquet
     }
 
     /**
+     * Writes one row group that mixes chunks copied byte for byte from a source
+     * group with chunks encoded from buffered values (#901 M4a v3 lineage, M4b
+     * column-chunk copy), through {@link ColumnarParquetWriter#copyRowGroupColumns}.
+     * The encoded columns' values also feed {@link FloatingMetrics} (the
+     * float/double NaN counts a footer cannot carry); a copied float/double
+     * chunk's NaN count cannot be recovered from the footer, so the caller must
+     * only copy a float/double chunk when the table does not track its NaN
+     * count (the planner's NaN guard), exactly as the whole-group copy does.
+     *
+     * @param reader a reader on the source file (column index, offset index,
+     *     Bloom filter of copied chunks)
+     * @param source a seekable stream on the same file (copied chunks' pages)
+     * @param sourceBlock the source group whose copied chunks are taken
+     * @param copy per output column, copy its chunk ({@code true}) or encode it
+     *     ({@code false})
+     * @param runs the group's values for the ENCODED columns, as one or more
+     *     schema-ordered, {@code outCols}-wide column sets whose rows
+     *     concatenate to the whole group; a COPIED column's slot is {@code
+     *     null} (its bytes come from the source, not these values)
+     * @param rowCount the group's row count (the runs' rows sum to it)
+     */
+    public void copyRowGroupColumns(org.apache.parquet.hadoop.ParquetFileReader reader, org.apache.parquet.io.SeekableInputStream source, org.apache.parquet.hadoop.metadata.BlockMetaData sourceBlock,
+            boolean[] copy, List<? extends List<? extends VectorBuffers>> runs, int rowCount) {
+        try {
+            writer.copyRowGroupColumns(reader, source, sourceBlock, copy, runs, rowCount);
+            // Feed the ENCODED columns to FloatingMetrics (it reads float/double leaves by position and skips
+            // null, i.e. copied, slots). A copied float/double column never needs a NaN count: the planner's
+            // NaN guard declines the copy when the table tracks any float/double, so a tracked column is always
+            // encoded (its slot populated) and an untracked copied column contributes nothing reported.
+            for (List<? extends VectorBuffers> run : runs) {
+                int n = 0;
+                for (VectorBuffers v : run) {
+                    if (v != null) {
+                        n = v.length();
+                        break;
+                    }
+                }
+                floating.add(run, 0, n);
+            }
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+
+    /**
      * The file's metrics, from its footer; available once {@link #close} has
      * returned.
      */
@@ -295,7 +339,6 @@ public final class IcebergParquetAppender implements FileAppender<IcebergParquet
         }
         offsets.sort(null);
         splitOffsets = List.copyOf(offsets);
-        metrics = ParquetUtil.footerMetrics(IcebergParquetInterop.shadedFooter(footer),
-                floating.metrics(), metricsConfig, nameMapping);
+        metrics = IcebergParquetInterop.footerMetrics(footer, floating.metrics(), metricsConfig, nameMapping);
     }
 }

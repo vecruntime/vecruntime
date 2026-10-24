@@ -7,8 +7,8 @@ title: Columnar v3 deletion-vector writer (design)
 
 This is the design and placement decision for the columnar deletion-vector (DV) writer, and the
 record of slice 1 (the profile split that gates the work). The writer itself lands in slices; this
-document is the map, and `spark.vecruntime.iceberg.dvWriter.enabled` (default off) is the switch it will
-hang from.
+document is the map, and `spark.vecruntime.iceberg.dvWriter.enabled` (default on since 2026-10-23) is the switch it
+hangs from.
 
 ## What it does
 
@@ -181,8 +181,8 @@ with JFR on the executors of an "on" and an "off" run of the patched-Iceberg ima
 
 ## Configuration
 
-`spark.vecruntime.iceberg.dvWriter.enabled` (session `SQLConf`, boolean, default `false`). Off because
-it is correct but brings no measured wall-time gain yet (next section). See `docs/configuration.md`.
+`spark.vecruntime.iceberg.dvWriter.enabled` (session `SQLConf`, boolean, default `true` since
+2026-10-23). See `docs/configuration.md`.
 
 ## Running the tests
 

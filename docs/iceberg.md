@@ -11,7 +11,7 @@ and task groups. VecRuntime decides how those task groups are read and runs the 
 Spark's and Iceberg's, apart from an opt-in columnar deletion-vector writer for v3 tables.
 
 **In short (2026-10-19):**
-- **Native scan:** with `spark.vecruntime.scan.nativeIceberg.enabled=true` (off by default), our native Parquet
+- **Native scan:** with `spark.vecruntime.scan.nativeIceberg.enabled` (on by default), our native Parquet
   reader reads the data files of an Iceberg table, flat and nested columns alike. It applies position deletes,
   deletion vectors and equality deletes itself, and reads `_file`, `_pos` and `_spec_id`.
 - **When it is declined:** the whole scan or a single task group is read by Iceberg's vectorized reader, and our
@@ -62,11 +62,12 @@ Format version 1 reads as version 2 does, without delete files.
 | Metadata columns `_partition`, `_row_id`, `_last_updated_sequence_number` | yes (#20 M3a) | `_partition` is the per-file struct of the table's unified partition type (empty on an unpartitioned table, where Iceberg returns it null); `_row_id` and `_last_updated_sequence_number` are the file's own column where it materialises them (copy-on-write, compaction), else `firstRowId + _pos` / `dataSequenceNumber`. All three come from `PartitionUtil.constantsMap` and the data file, per batch |
 | Metadata column `_deleted` | yes (#901 item 3) | Computed by the scan: `false` for a live row, `true` for a row a position delete, deletion vector or equality delete marks. When `_deleted` is projected the scan keeps the marked rows instead of dropping them, exactly as Iceberg's reader does, so a changelog or `SELECT _deleted` read sees them |
 | Types: boolean, int, long, float, double, date, timestamp (with zone and without), string, binary, decimal | yes | `decimal(p > 18)` becomes a DECIMAL128 lane |
-| Types: uuid, fixed, time | scan | Iceberg's reader reads them as Spark types our reader does not produce from these files |
+| Types: uuid, fixed | yes (#954) | `uuid` (16 bytes in the file, a string in Spark) and `fixed` (a `FIXED_LEN_BYTE_ARRAY`, binary in Spark) are decoded by our reader as Iceberg's reader produces them, including under equality deletes keyed on them |
+| Types: time | scan | Iceberg's reader reads it as a Spark type our reader does not produce from these files |
 | Types: struct, list, map | yes | At any depth, when every leaf is one of the flat types above. Nested struct fields are matched by their Iceberg field ids, so a renamed nested field reads as Iceberg reads it, and a field added to a struct later reads as nulls from older files. Iceberg's reader does not vectorize nested columns; a task group our reader cannot read (an ORC/Avro file, an encrypted file) is read by Iceberg's own row reader inside the node and converted to batches (#901 item 6), so the other groups stay native. Only a scan with no native group at all keeps Spark's row path |
 | Encrypted files | group | Iceberg's `FileIO` decrypts them |
-| `DELETE`, `UPDATE`, `MERGE INTO` (merge-on-read) | yes, with `spark.vecruntime.iceberg.writer.enabled` (#921) | Their reads run on our operators, and the `MERGE INTO` join and `MergeRows` are columnar (#21, #273). The writes are columnar too: position delete files on v2, deletion vectors on v3, and the inserted and updated rows through the columnar data writer. Off, Spark's `WriteDeltaExec` and Iceberg's writers write them |
-| Copy-on-write rewrites, `INSERT`, CTAS | yes, with `spark.vecruntime.iceberg.writer.enabled` (#913-#919) | Written by the columnar writer, see [the columnar writer](#the-write-side-the-columnar-iceberg-writer-842-901). Off, the write is Spark's row path into Iceberg's Parquet writer |
+| `DELETE`, `UPDATE`, `MERGE INTO` (merge-on-read) | yes (on by default, `spark.vecruntime.iceberg.writer.enabled`, #921) | Their reads run on our operators, and the `MERGE INTO` join and `MergeRows` are columnar (#21, #273). The writes are columnar too: position delete files on v2, deletion vectors on v3, and the inserted and updated rows through the columnar data writer. Off, Spark's `WriteDeltaExec` and Iceberg's writers write them |
+| Copy-on-write rewrites, `INSERT`, CTAS | yes (on by default, `spark.vecruntime.iceberg.writer.enabled`, #913-#919) | Written by the columnar writer, see [the columnar writer](#the-write-side-the-columnar-iceberg-writer-842-901). Off, the write is Spark's row path into Iceberg's Parquet writer |
 
 ### Format version 3
 
@@ -75,14 +76,14 @@ Everything in the version 2 table applies. The version 3 additions:
 | Feature | Native | How |
 |---|---|---|
 | Deletion vectors (Puffin) | yes | Read once per data file, and the deleted rows are deselected as for position deletes |
-| Writing deletion vectors | opt-in | `spark.vecruntime.iceberg.dvWriter.enabled` (off by default) builds each data file's `PositionDeleteIndex` from our batches and hands it to Iceberg's DV writer, for `DELETE`, `UPDATE` and `MERGE INTO`. The commit stays Iceberg's `RowDelta`. See [the write side](#the-write-side-columnar-v3-deletion-vectors-20) |
+| Writing deletion vectors | yes | `spark.vecruntime.iceberg.dvWriter.enabled` (on by default) builds each data file's `PositionDeleteIndex` from our batches and hands it to Iceberg's DV writer, for `DELETE`, `UPDATE` and `MERGE INTO`. The commit stays Iceberg's `RowDelta`. See [the write side](#the-write-side-columnar-v3-deletion-vectors-20) |
 | Default values: `initial-default` | yes, or scan | A column's default is filled into the files written before the column existed, as a constant (Spark's existence default), for boolean, int, long, float, double, decimal, string, binary, date and timestamp columns -- at the top level and (#901 item 4) for a field added inside a struct, which returns the default from older files, not null. A default of another type keeps Iceberg's reader for the scan |
 | Default values: `write-default` | n/a | Applied by Iceberg's writer |
 | Row lineage (`_row_id`, `_last_updated_sequence_number`) | yes (#20 M3a) | The file's own column where it materialises them, else `firstRowId + _pos` / `dataSequenceNumber`, exactly as Iceberg derives them from the manifests and the files' first row ids |
 | `variant`, shredded or not | yes | Iceberg writes the spec's Parquet variant group, with `typed_value` when `write.parquet.shred-variants` is on. Our Parquet reader reads it as it reads Spark's variants (#787, #812), at the top level and inside structs, under deletes. Iceberg's own vectorized reader cannot read a shredded variant ("Unsupported variant: shredded typed_value primitive"); our scan reads it either way |
 | `timestamp_ns`, `timestamptz_ns` | scan | |
 | `geometry`, `geography` | scan or row | |
-| `unknown` | scan | |
+| `unknown` | scan or write | v3 `unknown` is always null and is not stored in a data file (Iceberg's `TypeToMessageType` omits it). The native scan reads it as nulls; the columnar writer writes a table with an `unknown` column at the top level or inside a struct by omitting it, exactly as Iceberg's own writer does, so no data-file column and no metrics carry the unknown field id. An `unknown` list element or map value is declined (Iceberg's writer rejects it too), and a partition source on `unknown` is not carried |
 | Table encryption | group | As encrypted files above |
 
 ## How the native scan reads a table
@@ -243,6 +244,37 @@ Per step:
 
 `spark.vecruntime.explainFallback.enabled=true` logs the reason for each declined write.
 
+### Row-level operation modes
+
+A row-level command (`DELETE`, `UPDATE`, `MERGE`) runs in one of two modes, chosen per command by the table
+properties `write.delete.mode`, `write.update.mode` and `write.merge.mode`, each `copy-on-write` or
+`merge-on-read`. We honour the table's mode exactly, on both format version 2 and version 3, and each command
+independently -- a table may set `write.delete.mode=merge-on-read` and `write.update.mode=copy-on-write` at the
+same time, and each command follows its own property.
+
+We never decide the mode ourselves. Spark's optimizer, driven by Iceberg's `SparkRowLevelOperationBuilder`,
+turns the mode property into the plan: a `ReplaceData` for copy-on-write (its rewritten data files replace the
+touched ones, and no delete files are written) and a `WriteDelta` for merge-on-read (the deletes are written as
+delete files beside the unchanged data). Our two planner strategies route only on that node type plus our
+feature flags -- `VectorIcebergWriteStrategy` takes `ReplaceData`, `VectorWriteDeltaStrategy` takes
+`WriteDelta` -- so the mode the table asks for is always the mode that runs.
+
+- **Defaults when unset (Iceberg 1.12):** every command defaults to `copy-on-write` on both v2 and v3, and
+  `write.delete.granularity` defaults to `partition`. We read the defaults from Iceberg (`TableProperties`), so
+  an unset table behaves exactly as Iceberg's own writer would.
+- **Overrides:** Iceberg 1.12 exposes no Spark write-option or session-conf override for the mode itself (there
+  is no `spark.sql.iceberg.*` mode key, and `SparkWriteConf` has no `deleteMode`/`updateMode`/`mergeMode`), so
+  the mode comes only from the table property. The granularity, the delete file format and the delete-file
+  Parquet properties, which Iceberg does resolve on the write's `SparkWriteConf`, we read back from the write's
+  own resolved context (`useDVs`, `deleteGranularity`, `deleteFileFormat`) rather than recomputing them -- so a
+  write option that influences them is honoured.
+- **v2 vs v3 delete-file format (merge-on-read):** on a v2 table the deletes are written as Parquet **position
+  delete files**, at the table's `write.delete.granularity` (`partition`: one delete file per partition;
+  `file`: one per data file, naming the data file it covers). On a v3 table the deletes are written as
+  **deletion vectors** (Puffin), at most one deletion vector per data file, merging any previously committed
+  deletion vector for that file. Which of the two a write uses is Iceberg's decision (`useDVs`, which is v3's
+  Puffin delete format); we follow it.
+
 ### Table properties
 
 | Property | Honoured |
@@ -320,9 +352,13 @@ The partitioned (hash) append, the read A/B for #920, and a CDC `MERGE` A/B for 
 
 A copy-on-write `DELETE` / `UPDATE` / `MERGE` rewrites a whole data file today: every row group is decoded,
 filtered and re-encoded through the columnar writer, even the groups the change never touches. M4 copies the
-bytes that do not change and encodes only the rest. **M4a** is the first step: in a copy-on-write `DELETE`, a row
-group with no deleted rows is copied byte for byte into the new file; only a group with at least one deleted row
-is decoded, filtered and re-encoded.
+bytes that do not change and encodes only the rest. **M4a** copies whole row groups in a copy-on-write `DELETE`:
+a row group with no deleted rows is copied byte for byte into the new file; only a group with at least one
+deleted row is decoded, filtered and re-encoded. On a **format v3** table whose source file does not materialise
+row lineage, the data column chunks are copied byte for byte and only the two lineage columns (`_row_id`,
+`_last_updated_sequence_number`) are freshly encoded from the values the scan resolved per surviving row (the
+DELETE keeps them). **M4b** extends this to copy-on-write `UPDATE`: the columns the `SET` assignments do not
+change are copied byte for byte and only the changed columns (and the v3 lineage) are re-encoded.
 
 The primitive is on the writer. `ColumnarParquetWriter` sits on parquet-java's `ParquetFileWriter`, whose
 `appendRowGroup(SeekableInputStream, BlockMetaData, dropColumnIndexes=false)` (parquet-java 1.16) copies a
@@ -380,7 +416,28 @@ some / all groups, group ranges, schema-evolution and NaN-metrics fallback) and 
 `VectorCopyUnchangedDeleteSuite` (v2/v3, partitioned/unpartitioned, data + within-table lineage + per-file
 metrics oracle).
 
-Column-chunk copying for `UPDATE` / matched-only `MERGE` (M4b) and `rewrite_data_files` (M4c) follow.
+**M4b: column-chunk copy for copy-on-write `UPDATE`.** An `UPDATE` rewrites every row in place (no rows dropped
+or inserted), so every row group is fully present in source order and eligible. The writer's mixed-group
+primitive `ColumnarParquetWriter.copyRowGroupColumns(reader, source, sourceBlock, copy[], encodedRuns,
+rowCount)` writes one row group that copies the chunks a per-column mask marks (via
+`ParquetFileWriter.appendColumnChunk`, keeping each chunk's codec, statistics, column index, offset index and
+Bloom filter -- a nested copied column copies all its leaf chunks) and encodes the rest from the batch's new
+values. The changed columns are derived at plan time: `VectorIcebergWriteStrategy.updateEncodeMask` reads the
+`ReplaceData` rewrite plan -- the assignment `Project` over the scan, whose per-column value is a bare
+pass-through attribute (untouched), `If(cond, newValue, oldAttr)` (conditional assignment) or a computed
+expression (changed) -- and classifies a column as untouched iff, in every branch, its value is the scan
+attribute of the same name. An unrecognised plan shape, a changed **nested** column (the mixed-group writer
+encodes only flat columns), or a changed **partition** column (a row may move partition) all fall back to the
+full rewrite. The copied columns keep the **source** field's repetition (a `REQUIRED` source chunk's level-free
+pages stay valid), the encoded columns use the write schema; v3 lineage is always re-encoded (an updated row
+keeps `_row_id` and gets a new `_last_updated_sequence_number`, matching Iceberg 1.12). Metrics and the NaN
+fallback are the same as M4a. `MERGE` is **not** eligible: its rewrite is a `MergeRows` that does not carry
+`_pos`, so the per-row source position the copy path needs is unavailable, and it takes the full rewrite.
+Covered by `VectorCopyUnchangedUpdateSuite` (v2/v3, partitioned/unpartitioned, update one / several / all
+columns, self-assignment, a nested-column and a partition-column fallback, and the MERGE fallback) with the same
+data + lineage + metrics oracle.
+
+Column-chunk copying for `rewrite_data_files` (M4c) follows.
 
 ## The write side: columnar v3 deletion vectors (#20)
 
@@ -393,7 +450,7 @@ as lanes, and the delta write's REBALANCE exchange already clusters by `_spec_id
 Inserts and the insert half of updates stay on Iceberg's data writer; v2 tables and unsupported shapes go to
 Spark's writer unchanged.
 
-It is behind `spark.vecruntime.iceberg.dvWriter.enabled`, off by default. It covers DELETE, UPDATE and MERGE,
+It is behind `spark.vecruntime.iceberg.dvWriter.enabled`, on by default. It covers DELETE, UPDATE and MERGE,
 partitioned tables and repeated deletes. On a CDC MERGE, though, the write is a small share of the statement, so it
 stays opt-in until a released Iceberg shows a clear gain. The design, the placement decision (an optional
 Iceberg-compiled bridge module or reflection) and the profile that gates the work are in

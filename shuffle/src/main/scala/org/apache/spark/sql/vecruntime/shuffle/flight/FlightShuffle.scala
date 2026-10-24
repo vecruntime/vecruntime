@@ -548,13 +548,14 @@ final class FlightBlockStream(
     )
 
   private val stream: FlightStream = {
-    val start = System.nanoTime()
-    val s = FlightShuffle.Clients.client(location, conf).getStream(
+    // getStream only issues the DoGet; it does not block for the first message (the streams to
+    // several executors are opened together so they transfer concurrently). The time the task
+    // thread actually blocks waiting for bytes is in `ChunkChannel.fill`'s `stream.next()` below,
+    // where it is charged to fetchWaitTime -- timing this call alone reported ~0 (#932).
+    FlightShuffle.Clients.client(location, conf).getStream(
       FlightShuffle.ticket(shuffleId, reduce, endReduce, mapIds),
       FlightShuffle.Clients.callOptions(conf): _*
     )
-    metrics.incFetchWaitTime((System.nanoTime() - start) / 1000000)
-    s
   }
 
   /**
@@ -565,9 +566,23 @@ final class FlightBlockStream(
     private var current: java.nio.ByteBuffer = _
     private var ended = false
     private var open = true
+    // #932: nanos the task thread has blocked in stream.next() but not yet reported as whole
+    // milliseconds (incFetchWaitTime takes ms, so per-chunk sub-ms waits would each round to 0 and
+    // the stall would read as ~0 -- exactly the bug). The whole-ms part is reported as it accrues;
+    // the remainder carries to the next fill.
+    private var waitNanosCarry = 0L
+    private def reportWait(nanos: Long): Unit = {
+      waitNanosCarry += nanos
+      val ms = waitNanosCarry / 1000000L
+      if (ms > 0) { metrics.incFetchWaitTime(ms); waitNanosCarry -= ms * 1000000L }
+    }
     private def fill(): Boolean = {
       while ((current == null || !current.hasRemaining) && !ended) {
-        if (!stream.next()) ended = true
+        val start = System.nanoTime()
+        val more =
+          try stream.next()
+          finally reportWait(System.nanoTime() - start)
+        if (!more) ended = true
         else {
           val root = stream.getRoot
           if (root.getRowCount > 0) {

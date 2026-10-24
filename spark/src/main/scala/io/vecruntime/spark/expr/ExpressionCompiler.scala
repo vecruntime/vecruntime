@@ -524,7 +524,12 @@ object ExpressionCompiler {
 
     // A typed null is an all-invalid column; the operators that need a *value* literal (comparison
     // operands, IN lists, string arguments) match the Spark node before compiling and keep their reasons.
-    case Literal(null, dt) if TypeMapping.isSupported(dt) => Right(NullLiteralExpr(dt))
+    // Any type that HAS A LANE can carry it (not only the compute-supported ones): a null column needs no
+    // kernel to read the lane, only an all-clear validity bitmap, so a carried-but-not-computed lane -- a
+    // wide DECIMAL128 (#257), a collated string (#705) -- is a valid null column too. This is what keeps a
+    // MERGE whose projection carries a `CAST(NULL AS DECIMAL(38,6))` (Spark's row-level rewrite emits one
+    // for a wide-decimal column in a non-assigning clause) on the columnar path end to end.
+    case Literal(null, dt) if TypeMapping.hasLane(dt) => Right(NullLiteralExpr(dt))
     case Literal(null, dt) => Left(s"null literal of ${dt.simpleString}")
     // A non-null boolean literal is a real constant BOOL column (a `WHERE true`, a join `ON true` /
     // `ON false`, a projected constant); a NULL boolean fell to the NullLiteralExpr case above.

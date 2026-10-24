@@ -18,9 +18,12 @@ package io.vecruntime.iceberg.write;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.lang.reflect.Method;
+import java.util.stream.Stream;
 
+import org.apache.iceberg.Metrics;
 import org.apache.iceberg.Schema;
-import org.apache.iceberg.parquet.ParquetSchemaUtil;
+import org.apache.iceberg.mapping.NameMapping;
 import org.apache.parquet.hadoop.ParquetFileWriter;
 import org.apache.parquet.hadoop.metadata.ParquetMetadata;
 import org.apache.parquet.schema.MessageType;
@@ -35,48 +38,153 @@ import org.apache.parquet.schema.MessageTypeParser;
  * and the footer's Thrift bytes -- so the field ids, logical types and
  * statistics are Iceberg's own on both sides and nothing about them is
  * re-derived here.
+ *
+ * <p>#shading: which relocation Iceberg's own classes carry is NOT fixed. On the
+ * shaded {@code iceberg-spark-runtime} jar (production, and our own iceberg-bridge
+ * suites) {@code ParquetSchemaUtil.convert} / {@code ParquetUtil.footerMetrics}
+ * bind to {@code org.apache.iceberg.shaded.org.apache.parquet.*}; on Iceberg's own
+ * Gradle test classpath (the upstream-suite harness) they bind to the UNSHADED
+ * {@code org.apache.parquet.*}. If this class named either relocation in its
+ * bytecode it would {@code ClassCastException} under the other (an unshaded
+ * {@code MessageType} assigned to a shaded-typed local, or a shaded footer handed
+ * to an unshaded {@code footerMetrics}). So every call that touches Iceberg's
+ * parquet flavour is made REFLECTIVELY and the footer is re-materialised into
+ * whichever flavour the loaded {@code ParquetUtil} expects -- the same bytecode
+ * then works under both layouts. Our OWN side ({@code ParquetFileWriter},
+ * {@code MessageTypeParser}, the Thrift {@code ParquetMetadataConverter}) is
+ * always unshaded and is named directly.
  */
 final class IcebergParquetInterop {
 
     private IcebergParquetInterop() {}
 
+    /**
+     * Our (unshaded) Thrift converter: turns our writer's footer into the
+     * portable Thrift bytes.
+     */
     private static final org.apache.parquet.format.converter.ParquetMetadataConverter TO_THRIFT = new org.apache.parquet.format.converter.ParquetMetadataConverter();
 
-    /**
-     * Built once: the read options' default Thrift message-size limit is the
-     * one a file reader uses (the no-argument converter has none, -1, and
-     * refuses to read), and building them creates a Hadoop {@code
-     * Configuration}, which parses the default XML resources -- milliseconds a
-     * file must not pay.
-     */
-    private static final org.apache.iceberg.shaded.org.apache.parquet.format.converter.ParquetMetadataConverter FROM_THRIFT = new org.apache.iceberg.shaded.org.apache.parquet.format.converter.ParquetMetadataConverter(org.apache.iceberg.shaded.org.apache.parquet.ParquetReadOptions.builder()
-            .build());
+    // ---- reflected Iceberg-flavour parquet handles, resolved once against the classpath ---------
+    private static final ClassLoader CL = loader();
 
     /**
-     * The Parquet schema Iceberg writes for {@code schema}: Iceberg's own conversion
-     * ({@code ParquetSchemaUtil.convert}), field ids included, re-parsed into
-     * parquet-java's unshaded {@link MessageType}.
+     * The package Iceberg's own parquet classes live under: shaded on the
+     * runtime jar, unshaded on Iceberg's test classpath. Derived from the
+     * actual return type of ParquetSchemaUtil.convert.
      */
-    static MessageType fileSchema(Schema schema, String name) {
-        org.apache.iceberg.shaded.org.apache.parquet.schema.MessageType shaded = ParquetSchemaUtil.convert(schema, name);
-        MessageType unshaded = MessageTypeParser.parseMessageType(shaded.toString());
-        if (!unshaded.toString().equals(shaded.toString())) {
-            // The text form is the contract between the two copies; a difference means one of
-            // them prints or parses an annotation the other does not know.
-            throw new IllegalStateException("Parquet schema did not survive conversion: " + shaded + " vs " + unshaded);
+    private static final String ICE_PARQUET_PKG = detectIcebergParquetPackage();
+
+    private static ClassLoader loader() {
+        ClassLoader cl = Thread.currentThread().getContextClassLoader();
+        return cl != null ? cl : IcebergParquetInterop.class.getClassLoader();
+    }
+
+    private static String detectIcebergParquetPackage() {
+        try {
+            Class<?> schemaUtil = Class.forName("org.apache.iceberg.parquet.ParquetSchemaUtil", true, CL);
+            for (Method m : schemaUtil.getMethods()) {
+                if (m.getName().equals("convert") && m.getParameterCount() == 2 && m.getParameterTypes()[0] == Schema.class) {
+                    String ret = m.getReturnType().getName(); // ...parquet.schema.MessageType
+                    int i = ret.indexOf(".schema.MessageType");
+                    if (i > 0) {
+                        return ret.substring(0, i); // ...parquet
+                    }
+                }
+            }
+        } catch (ReflectiveOperationException e) {
+            // fall through to the shaded default (production layout)
         }
-        return unshaded;
+        return "org.apache.iceberg.shaded.org.apache.parquet";
     }
 
     /**
-     * {@code footer} as the Iceberg runtime's (shaded) {@code ParquetMetadata},
-     * by writing it to its Thrift form and reading that back, as both copies do
-     * for a file's footer.
+     * The Parquet schema Iceberg writes for {@code schema}: Iceberg's own
+     * conversion ({@code ParquetSchemaUtil.convert}, field ids included),
+     * re-parsed into parquet-java's unshaded {@link MessageType}. The convert
+     * result is captured as {@code Object} and read through its text form, so
+     * this never names Iceberg's parquet relocation.
      */
-    static org.apache.iceberg.shaded.org.apache.parquet.hadoop.metadata.ParquetMetadata shadedFooter(ParquetMetadata footer) throws IOException {
+    static MessageType fileSchema(Schema schema, String name) {
+        try {
+            Class<?> schemaUtil = Class.forName("org.apache.iceberg.parquet.ParquetSchemaUtil", true, CL);
+            Method convert = schemaUtil.getMethod("convert", Schema.class, String.class);
+            Object iceMsgType = convert.invoke(null, schema, name); // Iceberg-flavour MessageType
+            String text = String.valueOf(iceMsgType);
+            MessageType unshaded = MessageTypeParser.parseMessageType(text);
+            if (!unshaded.toString().equals(text)) {
+                // The text form is the contract between the two copies; a difference means one of
+                // them prints or parses an annotation the other does not know.
+                throw new IllegalStateException("Parquet schema did not survive conversion: " + text + " vs " + unshaded);
+            }
+            return unshaded;
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("ParquetSchemaUtil.convert unavailable", e);
+        }
+    }
+
+    /**
+     * Iceberg's {@code Metrics} for a just-written file, computed by {@code
+     * ParquetUtil.footerMetrics} over our writer's {@code footer}. The footer
+     * (unshaded, parquet-java's) is written to its Thrift form and re-read with
+     * Iceberg's OWN parquet converter -- shaded or unshaded, whichever the
+     * loaded {@code ParquetUtil} expects -- so the {@code ParquetMetadata}
+     * handed to {@code footerMetrics} is of its own flavour. Both the converter
+     * and the {@code footerMetrics} call are made reflectively, so no
+     * relocation is pinned in this class's bytecode.
+     */
+    static Metrics footerMetrics(ParquetMetadata footer, Stream<?> fieldMetrics, Object metricsConfig,
+            NameMapping nameMapping)
+            throws IOException {
+        // 1. our footer -> portable Thrift bytes
         ByteArrayOutputStream bytes = new ByteArrayOutputStream();
         org.apache.parquet.format.Util.writeFileMetaData(TO_THRIFT.toParquetMetadata(ParquetFileWriter.CURRENT_VERSION, footer), bytes);
-        return FROM_THRIFT.readParquetMetadata(new ByteArrayInputStream(bytes.toByteArray()), org.apache.iceberg.shaded.org.apache.parquet.format.converter.ParquetMetadataConverter.NO_FILTER);
+        try {
+            // 2. Thrift bytes -> Iceberg-flavour ParquetMetadata, via Iceberg's own converter class.
+            Class<?> convCls = Class.forName(ICE_PARQUET_PKG + ".format.converter.ParquetMetadataConverter", true, CL);
+            Class<?> readOptsCls = Class.forName(ICE_PARQUET_PKG + ".ParquetReadOptions", true, CL);
+            Object readOpts = readOptsCls.getMethod("builder").invoke(null);
+            readOpts = readOpts.getClass()
+                               .getMethod("build")
+                               .invoke(readOpts);
+            Object converter = convCls.getConstructor(readOptsCls).newInstance(readOpts);
+            Object noFilter = convCls.getField("NO_FILTER").get(null);
+            Class<?> filterCls = noFilter.getClass();
+            // readParquetMetadata(InputStream, Filter) -- Filter is a nested type of the converter.
+            Method readMeta = null;
+            for (Method m : convCls.getMethods()) {
+                if (m.getName().equals("readParquetMetadata") && m.getParameterCount() == 2 && m.getParameterTypes()[0] == java.io.InputStream.class) {
+                    readMeta = m;
+                    break;
+                }
+            }
+            if (readMeta == null) {
+                throw new IllegalStateException("ParquetMetadataConverter.readParquetMetadata(InputStream, Filter) not found");
+            }
+            Object iceFooter = readMeta.invoke(converter, new ByteArrayInputStream(bytes.toByteArray()), filterCls.cast(noFilter));
+
+            // 3. ParquetUtil.footerMetrics(ParquetMetadata, Stream, MetricsConfig, NameMapping)
+            Class<?> parquetUtil = Class.forName("org.apache.iceberg.parquet.ParquetUtil", true, CL);
+            Method footerMetrics = null;
+            for (Method m : parquetUtil.getMethods()) {
+                if (m.getName().equals("footerMetrics") && m.getParameterCount() == 4) {
+                    footerMetrics = m;
+                    break;
+                }
+            }
+            if (footerMetrics == null) {
+                throw new IllegalStateException("ParquetUtil.footerMetrics(ParquetMetadata, Stream, MetricsConfig, NameMapping) not found");
+            }
+            return (Metrics) footerMetrics.invoke(null, iceFooter, fieldMetrics, metricsConfig, nameMapping);
+        } catch (ReflectiveOperationException e) {
+            Throwable c = e instanceof java.lang.reflect.InvocationTargetException ? e.getCause() : e;
+            if (c instanceof RuntimeException re) {
+                throw re;
+            }
+            if (c instanceof Error err) {
+                throw err;
+            }
+            throw new IllegalStateException("ParquetUtil.footerMetrics failed", c);
+        }
     }
 
     /**

@@ -59,6 +59,25 @@ public final class ColumnarParquetWriter implements AutoCloseable {
     /** Rows per slice: the granularity of the page-size checks. */
     static final int SLICE = 1024;
 
+    /**
+     * The fewest rows that pass between two row-group-boundary checks (as in
+     * parquet-java's {@code ColumnWriteStoreBase.MINIMUM_RECORD_COUNT_FOR_CHECK}).
+     * The next check row is predicted from the bytes buffered so far, aimed at
+     * the target and clamped to [{@code this}, {@link #MAX_ROWS_FOR_CHECK}], but
+     * never sooner than this -- so a small {@code row-group-size-bytes} is
+     * honoured to within one minimum step instead of overshooting by a whole
+     * {@link #SLICE}, while the cadence never collapses to a check every row.
+     */
+    static final long MIN_ROWS_FOR_CHECK = 100;
+
+    /**
+     * The most rows that pass between two row-group-boundary checks (as in
+     * parquet-java's {@code ColumnWriteStoreBase.MAXIMUM_RECORD_COUNT_FOR_CHECK}),
+     * so the boundary is tested often enough that an open group -- and a fanout
+     * write keeps one per partition -- never buffers far past the target.
+     */
+    static final long MAX_ROWS_FOR_CHECK = 10_000;
+
     private final ParquetFileWriter file;
     private final MessageType schema;
     private final ParquetProperties props;
@@ -80,6 +99,10 @@ public final class ColumnarParquetWriter implements AutoCloseable {
     private long rowGroupRows;
     private long totalRows;
     private boolean closed;
+    // Adaptive row-group-boundary check, in this open group's own rows: test the boundary once at least
+    // checkInterval rows have accrued since the last test, then re-predict checkInterval from the bytes seen.
+    private long rowsSinceCheck;
+    private long checkInterval = MIN_ROWS_FOR_CHECK;
 
     /**
      * @param out the file to write (created, not overwritten)
@@ -197,6 +220,8 @@ public final class ColumnarParquetWriter implements AutoCloseable {
                 ? null
                 : props.newColumnWriteStore(slowSchema, pageStore, pageStore);
         rowGroupRows = 0;
+        rowsSinceCheck = 0;
+        checkInterval = MIN_ROWS_FOR_CHECK;
         if (fast != null) {
             for (int i = 0; i < fast.length; i++) {
                 if (fast[i] != null) {
@@ -229,7 +254,6 @@ public final class ColumnarParquetWriter implements AutoCloseable {
      * maxRecordsPerFile} in the middle of a batch).
      */
     public void write(List<? extends VectorBuffers> vectors, int first, int end) throws IOException {
-        int rowCount = end - first;
         if (vectors.size() != columns.size()) {
             throw new IllegalArgumentException("expected " + columns.size() + " columns, got " + vectors.size());
         }
@@ -276,27 +300,54 @@ public final class ColumnarParquetWriter implements AutoCloseable {
                 columnStore = props.newColumnWriteStore(slowSchema, pageStore, pageStore);
             }
         }
-        for (int from = first; from < end; from += SLICE) {
-            int to = Math.min(end, from + SLICE);
+        // Write the batch in slices, checking the row-group boundary ADAPTIVELY as records accrue, the way
+        // parquet-java's ColumnWriteStoreBase does (MINIMUM/MAXIMUM_RECORD_COUNT_FOR_CHECK = 100/10000): a
+        // fixed once-per-SLICE check overshoots a SMALL row-group target badly, because the first chance to
+        // test is a whole SLICE (1024 rows) of buffered bytes -- for tiny rows under a small
+        // write.parquet.row-group-size-bytes that is already several times the target, so every group came out
+        // exactly one SLICE long and several times oversized, and Iceberg's byte-midpoint input splits of such
+        // coarse groups fell unevenly (Apache Iceberg testBinPackCombineMediumFiles "add 3 but was 4").
+        // Instead, step through the batch in SLICE-sized slices (the vectorised granularity, unchanged) but
+        // keep a running count of rows since the last boundary test; once that reaches checkInterval, test the
+        // boundary and re-predict checkInterval from the bytes-per-row seen so far, aimed at the remaining
+        // distance to the target and clamped to [MIN_ROWS_FOR_CHECK, MAX_ROWS_FOR_CHECK]. The MIN floor stops
+        // the cadence collapsing to a check every row for a tiny target; the MAX ceiling keeps an open group --
+        // and a fanout write holds one per partition -- from buffering far past the target. rowsSinceCheck and
+        // checkInterval count this open group's own rows: no mixing of batch-local and cumulative indices.
+        int pos = first;
+        while (pos < end) {
+            int to = Math.min(end, pos + Math.min(SLICE, (int) Math.max(1, checkInterval - rowsSinceCheck)));
             for (int i = 0; i < encoders.length; i++) {
                 if (fast[i] != null) {
-                    fast[i].write(vectors.get(i), from, to);
+                    fast[i].write(vectors.get(i), pos, to);
                 } else if (nested[i] != null) {
-                    nested[i].write(vectors.get(i), from, to);
+                    nested[i].write(vectors.get(i), pos, to);
                 } else {
-                    encoders[i].write(vectors.get(i), from, to, columnStore.getColumnWriter(columns.get(i)));
+                    encoders[i].write(vectors.get(i), pos, to, columnStore.getColumnWriter(columns.get(i)));
                 }
             }
             if (columnStore != null) {
-                for (int r = from; r < to; r++) {
+                for (int r = pos; r < to; r++) {
                     columnStore.endRecord();
                 }
             }
-        }
-        rowGroupRows += rowCount;
-        totalRows += rowCount;
-        if (bufferedSize() >= rowGroupSize) {
-            flushRowGroup();
+            int wrote = to - pos;
+            rowGroupRows += wrote;
+            totalRows += wrote;
+            rowsSinceCheck += wrote;
+            pos = to;
+            if (rowsSinceCheck >= checkInterval) {
+                rowsSinceCheck = 0;
+                long buffered = bufferedSize();
+                if (buffered >= rowGroupSize) {
+                    flushRowGroup(); // resets checkInterval via newRowGroup()
+                } else {
+                    long rowsInGroup = Math.max(1, rowGroupRows);
+                    long remainingBytes = rowGroupSize - buffered;
+                    long bytesPerRow = Math.max(1, buffered / rowsInGroup);
+                    checkInterval = Math.max(MIN_ROWS_FOR_CHECK, Math.min(MAX_ROWS_FOR_CHECK, remainingBytes / bytesPerRow));
+                }
+            }
         }
     }
 
@@ -329,6 +380,221 @@ public final class ColumnarParquetWriter implements AutoCloseable {
         // dropColumnIndexes = false: keep each chunk's column index, offset index and Bloom filter.
         file.appendRowGroup(source, block, false);
         totalRows += block.getRowCount();
+    }
+
+    /**
+     * Writes one row group whose columns are a mix of chunks copied byte for
+     * byte from a source row group and chunks freshly encoded from buffered
+     * values (#901 M4a v3 lineage, M4b column-chunk copy). Every column holds
+     * the same {@code rowCount} rows, in source order, so the group is valid.
+     *
+     * <p>This is the partial-columnar-merge unit: a copy-on-write rewrite that
+     * drops no row from this group (a v3 DELETE copy, or an UPDATE/MERGE group
+     * whose rows all survive) copies the chunks it does not touch and re-encodes
+     * only the rest. On a v3 DELETE copy the two row-lineage chunks are encoded
+     * (their values come from the scan, which already resolved {@code _row_id}
+     * and {@code _last_updated_sequence_number} per surviving row) while every
+     * data chunk is copied. On an UPDATE/MERGE the changed columns are encoded
+     * and the untouched ones copied.
+     *
+     * <p>The columns are written in this writer's (output) schema order. A
+     * copied chunk keeps its codec, statistics, column index, offset index and
+     * Bloom filter, read from {@code source}. An encoded chunk goes through the
+     * same page, encoding and statistics code {@link #write} uses, so its
+     * statistics reach the footer the same way. Any rows buffered in the open
+     * row group are flushed first, so this group keeps its order in the file.
+     *
+     * <p>Only flat top-level columns are supported here (the copy-on-write
+     * write schema is flat: data columns and, on v3, two lineage longs); a
+     * nested column makes the caller fall back to the full rewrite, as the
+     * schema guard already does.
+     *
+     * @param reader a reader on the source file, for its column index, offset
+     *     index and Bloom filter (read per copied chunk)
+     * @param source a seekable stream on the same file, positioned by {@code
+     *     appendColumnChunk} to each copied chunk's pages
+     * @param sourceBlock the source group whose chunks are copied; its columns
+     *     are in the source schema's order, which equals this writer's data
+     *     columns' order (the schema guard verified it)
+     * @param copy per output column, whether to copy its chunk from {@code
+     *     sourceBlock} ({@code true}) or encode it from {@code encodedRuns}
+     *     ({@code false})
+     * @param encodedRuns the group's values as one or more schema-ordered
+     *     column sets whose rows concatenate to the whole group (a group may
+     *     span several buffered batches); the encoded columns are read, a
+     *     copied column's entry is ignored
+     * @param rowCount the group's row count (every column's)
+     */
+    public void copyRowGroupColumns(org.apache.parquet.hadoop.ParquetFileReader reader, org.apache.parquet.io.SeekableInputStream source, org.apache.parquet.hadoop.metadata.BlockMetaData sourceBlock,
+            boolean[] copy, List<? extends List<? extends VectorBuffers>> encodedRuns, int rowCount)
+            throws IOException {
+        if (closed) {
+            throw new IllegalStateException("writer is closed");
+        }
+        if (copy.length != columns.size()) {
+            throw new IllegalArgumentException("expected " + columns.size() + " columns, got " + copy.length);
+        }
+        flushRowGroup();
+
+        // The source block's per-LEAF chunk metadata, in leaf order (depth-first over the schema). The source
+        // schema equals this writer's copied fields (the schema guard verified it), so the copied fields' leaf
+        // chunks are exactly the leading source chunks, in order. A nested copied field copies ALL its leaf
+        // chunks; a flat copied field copies its one chunk.
+        List<org.apache.parquet.hadoop.metadata.ColumnChunkMetaData> srcChunks = sourceBlock.getColumns();
+        // All output leaf descriptors in schema (leaf) order, so a copied chunk is appended under the right one.
+        List<ColumnDescriptor> outLeaves = schema.getColumns();
+
+        file.startBlock(rowCount);
+        // Write every column's chunk in SCHEMA (leaf) order, interleaving copied and encoded chunks, so a
+        // copy-path file's physical chunk layout is identical to a file written column by column from scratch.
+        // The physical order of chunks within a block is otherwise free (the footer records each chunk's offset
+        // and a reader seeks by it), but parquet-java's column-index-filtered read path (used by the engine's
+        // own sampling / sort scans) builds the row group's page store assuming schema-ordered chunks, so a
+        // block whose chunks were out of schema order (copied-then-encoded) lost the physically-first column and
+        // failed read-back with "column ... is not in the store". Keeping schema order removes that divergence.
+        //
+        // The source file holds a chunk for every DATA column (copied OR changed/encoded), in schema order, but
+        // NOT the v3 lineage columns (which the source never materialises). So the source leaf cursor `srcIdx`
+        // must advance over a changed data column's leaves too -- otherwise a later copied column would read the
+        // wrong source chunk. It must NOT advance over a source-absent (lineage) encoded column. A column is
+        // source-absent iff it is a v3 lineage column (reserved field id).
+        int leaf = 0;
+        int srcIdx = 0;
+        for (int i = 0; i < schema.getFieldCount(); i++) {
+            int leaves = leafCount(schema.getType(i));
+            boolean sourceAbsent = isLineageField(schema.getType(i));
+            if (copy[i]) {
+                for (int l = 0; l < leaves; l++) {
+                    ColumnDescriptor desc = outLeaves.get(leaf + l);
+                    org.apache.parquet.hadoop.metadata.ColumnChunkMetaData src = srcChunks.get(srcIdx + l);
+                    file.appendColumnChunk(desc, source, src, reader.readBloomFilter(src),
+                            reader.readColumnIndex(src), reader.readOffsetIndex(src));
+                }
+            } else {
+                if (nested[i] != null) {
+                    throw new IllegalArgumentException("mixed-group copy can ENCODE only flat columns; field " + schema.getType(i).getName() + " is nested (a changed nested column must take the full rewrite)");
+                }
+                encodeColumnChunk(i, encodedRuns, rowCount);
+            }
+            if (!sourceAbsent) {
+                srcIdx += leaves; // this data column occupies leaves in the source, whether copied or re-encoded
+            }
+            leaf += leaves;
+        }
+        file.endBlock();
+        totalRows += rowCount;
+    }
+
+    /**
+     * Whether a schema field is a v3 row-lineage column (reserved field id),
+     * which a source file never holds.
+     */
+    private static boolean isLineageField(org.apache.parquet.schema.Type type) {
+        if (type.getId() == null) {
+            return false;
+        }
+        int id = type.getId().intValue();
+        return id == Integer.MAX_VALUE - 107 || id == Integer.MAX_VALUE - 108;
+    }
+
+    /**
+     * The number of leaf (primitive) columns under a schema field: 1 for a flat
+     * field, more for a nested one.
+     */
+    private static int leafCount(org.apache.parquet.schema.Type type) {
+        if (type.isPrimitive()) {
+            return 1;
+        }
+        int n = 0;
+        for (org.apache.parquet.schema.Type f : type.asGroupType().getFields()) {
+            n += leafCount(f);
+        }
+        return n;
+    }
+
+    /**
+     * Encodes one output column {@code i} into its own single-column chunk and
+     * writes it to the file at the current position (within an open block). The
+     * column's values come from {@code runs}: each run is a schema-ordered
+     * column set holding a contiguous slice of the group's rows (a group may
+     * span several buffered batches), and they are written in order so the one
+     * chunk holds the whole group. The column is bound and written exactly as
+     * {@link #write} binds and writes it, into a one-column page store so the
+     * one chunk can be flushed on its own.
+     */
+    private void encodeColumnChunk(int i, List<? extends List<? extends VectorBuffers>> runs,
+            int rowCount)
+            throws IOException {
+        if (nested[i] != null) {
+            throw new IllegalArgumentException("mixed-group copy supports flat columns only; field " + schema.getType(i).getName() + " is nested");
+        }
+        int runTotal = 0;
+        for (List<? extends VectorBuffers> run : runs) {
+            runTotal += run.get(i).length();
+        }
+        if (runTotal != rowCount) {
+            throw new IllegalArgumentException("encoded column "
+                    + columns.get(i)
+                    + " has "
+                    + runTotal
+                    + " rows across runs, expected "
+                    + rowCount);
+        }
+        ColumnDescriptor desc = columns.get(i);
+        VecType lane = runs.get(0)
+                           .get(i)
+                           .type();
+        MessageType oneCol = new MessageType(schema.getName(), schema.getType(i));
+        ColumnChunkPageWriteStore pages = new ColumnChunkPageWriteStore(compressor, oneCol, new HeapByteBufferAllocator(), props.getColumnIndexTruncateLength(),
+                props.getPageWriteChecksumEnabled());
+        org.apache.parquet.column.values.bloomfilter.BloomFilterWriter bloom = props.isBloomFilterEnabled(desc) ? pages.getBloomFilterWriter(desc) : null;
+        FixedWidthChunkWriter.Kind kind = FixedWidthChunkWriter.kindFor(lane, desc);
+        if (kind != null) {
+            ChunkWriter w = new FixedWidthChunkWriter(kind, desc, props);
+            w.startChunk(pages.getPageWriter(desc), bloom);
+            for (List<? extends VectorBuffers> run : runs) {
+                writeInSlices(w, run.get(i),
+                        run.get(i).length());
+            }
+            w.endChunk();
+        } else if (lane == VecType.UTF8 && desc.getMaxRepetitionLevel() == 0 && desc.getPrimitiveType().getPrimitiveTypeName() == org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.BINARY) {
+            ChunkWriter w = new BinaryChunkWriter(desc, props);
+            w.startChunk(pages.getPageWriter(desc), bloom);
+            for (List<? extends VectorBuffers> run : runs) {
+                writeInSlices(w, run.get(i),
+                        run.get(i).length());
+            }
+            w.endChunk();
+        } else {
+            ColumnEncoder enc = ColumnEncoder.forColumn(lane, desc);
+            ColumnWriteStore store = props.newColumnWriteStore(oneCol, pages, pages);
+            org.apache.parquet.column.ColumnWriter cw = store.getColumnWriter(desc);
+            for (List<? extends VectorBuffers> run : runs) {
+                VectorBuffers values = run.get(i);
+                int n = values.length();
+                for (int from = 0; from < n; from += SLICE) {
+                    int to = Math.min(n, from + SLICE);
+                    enc.write(values, from, to, cw);
+                    for (int r = from; r < to; r++) {
+                        store.endRecord();
+                    }
+                }
+            }
+            store.flush();
+            store.close();
+        }
+        pages.flushToFileWriter(file);
+        pages.close();
+    }
+
+    /**
+     * Writes rows {@code [0, rowCount)} of {@code values} to a fast {@link
+     * ChunkWriter} in slices.
+     */
+    private void writeInSlices(ChunkWriter w, VectorBuffers values, int rowCount) throws IOException {
+        for (int from = 0; from < rowCount; from += SLICE) {
+            w.write(values, from, Math.min(rowCount, from + SLICE));
+        }
     }
 
     /**

@@ -106,12 +106,37 @@ public final class IcebergDataCommitBridge {
     }
 
     static String unsupportedType(Type type) {
+        return unsupportedType(type, false);
+    }
+
+    /**
+     * Why the columnar Parquet writer cannot encode {@code type}, or {@code
+     * null} when it can. {@code inCollection} is true when {@code type} is
+     * reached as a list element or a map key/value: it changes only how the v3
+     * {@code unknown} type is treated.
+     *
+     * <p>The v3 {@code unknown} type is "not stored in data files" (Iceberg
+     * spec): Iceberg's own {@code TypeToMessageType} omits an unknown field
+     * from the Parquet schema at the top level and inside a struct (so the
+     * column is simply absent and reads back null), but {@code
+     * TypeToMessageType.list}/{@code map} fail a {@code Preconditions} check on
+     * an unknown element or value ("Cannot convert element/value Parquet").
+     * We match that exactly: an unknown top-level or struct field is written
+     * natively (the writer drops it, see {@code SparkLanes}), and an unknown
+     * list element or map key/value is declined so the write falls back to
+     * Iceberg's own writer, which would itself throw on such a schema.
+     */
+    private static String unsupportedType(Type type, boolean inCollection) {
         switch (type.typeId()) {
             case BOOLEAN, INTEGER, LONG, FLOAT, DOUBLE, DATE, TIMESTAMP, STRING, BINARY, DECIMAL, FIXED, UUID, VARIANT:
                 return null;
+            case UNKNOWN:
+                // Omitted from data files at the top level and inside a struct, as Iceberg's writer omits it;
+                // not writable as a list element or map key/value (Iceberg's own writer rejects it there).
+                return inCollection ? type.toString() : null;
             case STRUCT:
                 for (Types.NestedField f : type.asStructType().fields()) {
-                    String t = unsupportedType(f.type());
+                    String t = unsupportedType(f.type(), inCollection);
                     if (t != null) {
                         return t;
                     }
@@ -119,14 +144,17 @@ public final class IcebergDataCommitBridge {
                 return null;
             case LIST:
                 return unsupportedType(type.asListType()
-                        .elementType());
+                        .elementType(),
+                        true);
             case MAP:
                 String k = unsupportedType(type.asMapType()
-                        .keyType());
+                        .keyType(),
+                        true);
                 return k != null ? k : unsupportedType(type.asMapType()
-                        .valueType());
+                        .valueType(),
+                        true);
             default:
-                // TIME, TIMESTAMP_NANO, GEOMETRY, GEOGRAPHY, UNKNOWN: not encoded natively yet.
+                // TIME, TIMESTAMP_NANO, GEOMETRY, GEOGRAPHY: not encoded natively yet.
                 return type.toString();
         }
     }
@@ -152,7 +180,27 @@ public final class IcebergDataCommitBridge {
                 field(w, "targetFileSize", Long.class),
                 props,
                 field(w, "queryId", String.class),
-                field(w, "useFanoutWriter", Boolean.class));
+                field(w, "useFanoutWriter", Boolean.class),
+                outputSortOrderId(w));
+    }
+
+    /**
+     * The sort order id Iceberg's own data writer stamps on this write's files:
+     * {@code SparkWriteConf.outputSortOrderId(writeRequirements)}, computed from
+     * the two private {@code SparkWrite} fields Iceberg itself reads in {@code
+     * createWriterFactory} (#901 R3). The table's sort order id when the write's
+     * required ordering satisfies it, 0 (unsorted) otherwise.
+     */
+    private static int outputSortOrderId(SparkWrite w) {
+        Object writeConf = field(w, "writeConf", Object.class);
+        Object requirements = field(w, "writeRequirements", Object.class);
+        try {
+            java.lang.reflect.Method m = writeConf.getClass().getMethod("outputSortOrderId", requirements.getClass());
+            m.setAccessible(true);
+            return (Integer) m.invoke(writeConf, requirements);
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("SparkWriteConf.outputSortOrderId is not callable in this Iceberg version", e);
+        }
     }
 
     /**
@@ -164,6 +212,25 @@ public final class IcebergDataCommitBridge {
         Schema schema = field((SparkWrite) write, "writeSchema", Schema.class);
         return schema.columns().stream()
                 .map(Types.NestedField::name)
+                .toArray(String[]::new);
+    }
+
+    /**
+     * The names of the columns the write's output spec partitions by -- each
+     * partition field's source column, resolved against the table schema (#901
+     * M4b). An UPDATE that changes any of these columns is NOT eligible for the
+     * copy path (a row might move partition), so the strategy declines it.
+     */
+    public static String[] partitionSourceNames(Write write) {
+        SparkWrite w = (SparkWrite) write;
+        org.apache.iceberg.Table table = field(w, "table", org.apache.iceberg.Table.class);
+        int specId = field(w, "outputSpecId", Integer.class);
+        org.apache.iceberg.PartitionSpec spec = table.specs().get(specId);
+        org.apache.iceberg.Schema schema = table.schema();
+        return spec.fields().stream()
+                .map(f -> schema.findColumnName(f.sourceId()))
+                .filter(java.util.Objects::nonNull)
+                .distinct()
                 .toArray(String[]::new);
     }
 
