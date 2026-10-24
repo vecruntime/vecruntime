@@ -1801,7 +1801,17 @@ private[vecruntime] object IcebergTasks {
           }
           if (all.forall(_.isDefined)) Some(all.map(_.get)) else None
         } catch {
+          // No bridge, or a bridge class a type/relocation mismatch keeps us from using: drop to the row probe
+          // below, which reads deletes through Iceberg's own BaseDeleteLoader and is correct for every key type
+          // except the fixed/binary StructLikeSet collapse the native path exists to avoid. The reflective reader
+          // raises EqualityDeleteSet.UnsupportedEqualityReaderException (reaching us as InvocationTargetException)
+          // when Iceberg's generic Parquet reader API is absent/reshaped; a shaded-vs-unshaded parquet MessageType
+          // mismatch surfaces as ClassCastException/LinkageError. All mean "native not usable here" -> fall back.
           case _: ClassNotFoundException | _: NoClassDefFoundError => None
+          case e: java.lang.reflect.InvocationTargetException if isNativeEqualityUnsupported(e.getCause) => None
+          case _: ClassCastException | _: LinkageError =>
+            ParquetFileResolver.nativeEqualityFallbacks.incrementAndGet()
+            None
         }
     if (nativeGroups.isDefined) {
       val native = nativeGroups.get
@@ -1848,6 +1858,29 @@ private[vecruntime] object IcebergTasks {
       }
       (i: Int) => probes.exists(probe => probe(i))
     }
+  }
+
+  /**
+   * #shading: whether a Throwable thrown out of the native equality-delete reader means "not usable against this
+   * classpath" -- so the scan should fall back to Iceberg's own delete loader rather than fail the query. True for
+   * the bridge's `EqualityDeleteSet.UnsupportedEqualityReaderException` (matched by name, since iceberg-bridge is
+   * reflected, not a compile dependency of this module in this direction) and for a shaded-vs-unshaded Parquet
+   * `MessageType` mismatch surfacing as `ClassCastException`/`LinkageError`. Walks the cause chain.
+   */
+  private def isNativeEqualityUnsupported(t: Throwable): Boolean = {
+    var c = t
+    var depth = 0
+    while (c != null && depth < 8) {
+      val n = c.getClass.getName
+      if (
+        n == "io.vecruntime.iceberg.read.EqualityDeleteSet$UnsupportedEqualityReaderException"
+        || c.isInstanceOf[ClassCastException]
+        || c.isInstanceOf[LinkageError]
+      ) return true
+      c = c.getCause
+      depth += 1
+    }
+    false
   }
 
   /**
