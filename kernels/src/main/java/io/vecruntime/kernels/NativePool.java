@@ -242,17 +242,34 @@ public final class NativePool {
      * charged to no account: Arrow's own allocator and its cap count it.
      */
     public Lease lease(long size) {
-        return new Lease(this, take(size, false));
+        return new Lease(this, take(size, false), null);
+    }
+
+    /**
+     * #924: {@link #lease} charged to the account of the thread that opens it
+     * (a task's, when one is set; none on a thread outside any task -- a
+     * Flight server's): the account sees the Arrow buffers its task holds, and
+     * gets them back when the lease closes, on whichever thread closes it.
+     */
+    public Lease leaseCharged(long size) {
+        Block b = take(size, false);
+        Account a = accountSource.get();
+        if (a != null) {
+            a.charge(b.size);
+        }
+        return new Lease(this, b, a);
     }
 
     /** A block from {@link #lease}; {@link #close()} gives it back, once. */
     public static final class Lease implements AutoCloseable {
         private final NativePool pool;
+        private final Account account;
         private Block block;
 
-        Lease(NativePool pool, Block block) {
+        Lease(NativePool pool, Block block, Account account) {
             this.pool = pool;
             this.block = block;
+            this.account = account;
         }
 
         /** The block's address, 64-byte aligned. */
@@ -268,8 +285,12 @@ public final class NativePool {
         @Override
         public synchronized void close() {
             if (block != null) {
+                long bytes = block.size;
                 pool.release(block);
                 block = null;
+                if (account != null) {
+                    account.credit(bytes);
+                }
             }
         }
     }
