@@ -181,6 +181,26 @@ public class VectorBinPackFileRewriteRunner extends SparkBinPackFileRewriteRunne
 
         Set<DataFile> out = new LinkedHashSet<>();
 
+        // A byte copy moves WHOLE row groups: it can COMBINE small files into a target-sized output, but it
+        // cannot SPLIT a row group that is already bigger than the target split size. Iceberg's stock bin-pack
+        // decodes and re-encodes, so it splits a large file into several target-sized outputs and may combine
+        // one of those pieces with other small files in the group (TestRewriteDataFilesAction
+        // #testBinPackCombineMixedFiles). When any copyable file holds a row group larger than the group's
+        // input split size, our copy cannot reproduce that split-and-combine layout -- it would emit the
+        // oversized row group whole, a different file count for identical data -- so fall the WHOLE group back
+        // to the stock bin-pack, which produces exactly Iceberg's layout. The copy fast path then applies only
+        // to groups whose files merely COMBINE up to the target (the common small-file compaction case), which
+        // is where a byte copy is both valid and worthwhile. Correctness never depends on the copy running.
+        long splitSize = group.inputSplitSize();
+        boolean needsSplit = copyTasks.stream().anyMatch(
+                task -> footers.get(task).getBlocks().stream()
+                        .anyMatch(b -> b.getCompressedSize() > splitSize));
+        if (needsSplit) {
+            LOG.debug("vecruntime bin-pack: group {} has a row group larger than the split size {}; decoding the whole group",
+                    group.info(), splitSize);
+            return super.rewrite(group);
+        }
+
         // Copy path: bin-pack the copyable files by raw byte copy, per partition.
         if (!copyTasks.isEmpty()) {
             out.addAll(copyBinPack(group, outputSpec, icebergSchema, copyTasks, footers, conf));
@@ -198,7 +218,15 @@ public class VectorBinPackFileRewriteRunner extends SparkBinPackFileRewriteRunne
 
     private Set<DataFile> copyBinPack(RewriteFileGroup group, PartitionSpec outputSpec, Schema writeSchema,
             List<FileScanTask> copyTasks, Map<FileScanTask, ParquetMetadata> footers, Configuration conf) {
-        long target = group.maxOutputFileSize();
+        // The size each output bin is filled to. Iceberg's stock bin-pack reads the group with SPLIT_SIZE =
+        // group.inputSplitSize() (the planner's input split size, ~ inputSize / expectedOutputFiles, floored at
+        // the target file size) and writes each split as one output file, using maxOutputFileSize() only as the
+        // write-side roll CAP. So the output file count is driven by inputSplitSize(), NOT maxOutputFileSize().
+        // We must fill our copy bins to the same inputSplitSize(), or a mixed-size group (e.g. one large file
+        // plus small ones) packs into fewer, larger bins than Iceberg produces -- a different file layout for
+        // identical data. Packing to maxOutputFileSize() (1.8x target by default) collapsed the whole group
+        // into one bin where Iceberg split it into expectedOutputFiles files.
+        long target = group.inputSplitSize();
 
         // Group copyable files by partition; files in different partitions must not share an output file.
         Map<PartKey, List<FileScanTask>> byPartition = new LinkedHashMap<>();

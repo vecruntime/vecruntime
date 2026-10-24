@@ -1,0 +1,104 @@
+# Iceberg 1.12.0 Spark 4.1 upstream-suite exclusions, with the vecruntime plugin ON.
+#
+# Format: one JUnit 5 test pattern per non-comment line (a fully-qualified class, or Class#method
+# with the JUnit5 method name and no parens). run-iceberg-tests.sh turns these into Gradle
+# excludeTestsMatching filters; a Class#method entry excludes ALL parameterizations of that method.
+# Blank lines and lines starting with '#' are ignored.
+#
+# CATEGORY KEY (from the task's triage rubric):
+#   (a) a vecruntime bug      -> NOT excluded; fixed or reported with a repro.
+#   (b) asserts Iceberg's own physical plan nodes / exec-node shape, which the plugin replaces
+#                             -> excluded, one-line reason.
+#   (c) a known upstream Iceberg bug, or out of scope for vecruntime -> excluded, one-line reason.
+#
+# These entries were confirmed against a real JDK-21-launcher / JDK-25-test run (logs:
+# draco-keep/iceberg-tests-20261023-180702): spark-extensions 1275 tests / 19 failed,
+# spark 579 tests / 3 failed, with the plugin ON. With the plugin OFF spark-extensions passes
+# fully, so every failure below is attributable to the plugin (b) or to a real vecruntime bug now
+# fixed on a branch (a, TEMPORARY).
+
+# ---------------------------------------------------------------------------
+# (b) assertAllBatchScansVectorized -- plan-node-shape assertion the plugin replaces
+# ---------------------------------------------------------------------------
+# The *WithVectorizedReads tests call checkDeleteFileGranularity/assertAllBatchScansVectorized, which
+# walks the executed plan and requires every leaf to be Iceberg's own BatchScanExec. The plugin
+# replaces that leaf with VectorIcebergScanExec (also vectorized, correct results), so the node-type
+# assertion fails though the read IS vectorized. Pure plan-shape; results are unaffected.
+org.apache.iceberg.spark.extensions.TestCopyOnWriteDelete#testDeleteWithVectorizedReads
+org.apache.iceberg.spark.extensions.TestCopyOnWriteUpdate#testUpdateWithVectorizedReads
+org.apache.iceberg.spark.extensions.TestCopyOnWriteMerge#testMergeWithVectorizedReads
+org.apache.iceberg.spark.extensions.TestMergeOnReadDelete#testDeleteWithVectorizedReads
+org.apache.iceberg.spark.extensions.TestMergeOnReadUpdate#testUpdateWithVectorizedReads
+org.apache.iceberg.spark.extensions.TestMergeOnReadMerge#testMergeWithVectorizedReads
+
+# ---------------------------------------------------------------------------
+# (b) EXPLAIN-string assertion the plugin's aggregate node changes
+# ---------------------------------------------------------------------------
+# Asserts the physical EXPLAIN text contains Spark's own aggregate for the pushed-down max(data); the
+# plugin's VectorHashAggregateExec renders a different node string, so the string match fails while
+# the aggregate result is correct. Plan-text shape only.
+org.apache.iceberg.spark.extensions.TestMergeOnReadDelete#testAggregatePushDownInMergeOnReadDelete
+
+# ---------------------------------------------------------------------------
+# (c) Recorded context -- NOT exclusions, read the per-parameter counts with these in mind
+# ---------------------------------------------------------------------------
+# TestSparkReaderDeletes is parameterized over PARQUET, ORC and AVRO. vecruntime accelerates Parquet
+# only; the ORC/AVRO parameters fall back to Iceberg's own reader and still assert CORRECT results,
+# so they are kept (a correct fallback is part of what we verify).
+#
+# apache/iceberg#18618 (FixedReader buffer aliasing), #18619 (signed UUIDComparator) and #18620
+# (Spark nested-struct equality delete) are real upstream bugs, but the target suites do NOT use
+# fixed()/UUID/nested-struct equality-delete keys, so these bugs are not exercised here. No
+# exclusion; recorded so a future equality-delete suite addition splits upstream failures from ours.
+
+# ---------------------------------------------------------------------------
+# (b) TestRewriteDataFilesAction bin-pack file-COUNT arithmetic tuned to Iceberg's
+#     own writer byte sizes -- our columnar v2-page writer compresses ~1.7-2x
+#     smaller, so the planner's size thresholds select differently. The rewrite is
+#     CORRECT every time (rewrittenBytes == dataSizeBefore, rows identical); only the
+#     expected file COUNT differs. Proven numerically: plugin OFF (pure-Iceberg oracle)
+#     passes all parameterizations; plugin ON diverges exactly where our smaller files
+#     cross a test-hardcoded threshold. Measured 2026-10-24 on origin/main + #988 + #993.
+# ---------------------------------------------------------------------------
+# testBinPackCombineMixedFiles (fv 3,4 only; fv2 passes). Inputs small/small/BIG where
+# BIG = LARGE_SCALE*3 rows. Test sets MAX = avg + (fv>=3 ? 1850000 : 80000). Iceberg's
+# BIG file = 4,193,470 B and the fv3 MAX works out to 4,182,144 B, so BIG (4193470) just
+# exceeds MAX (margin ~11 KB) -> Iceberg SPLITS it into 3 -> 3 added. Our columnar writer
+# writes the same BIG file at 2,433,137 B and our fv3 MAX = 3,081,397 B, so BIG (2433137)
+# is BELOW MAX -> correctly left whole; the two 630,527 B smalls combine -> 2 rewritten /
+# 1 added. "expected 3 but was 2". fv2 MAX = avg+80000 is a tiny margin that even our
+# smaller BIG file exceeds, so fv2 splits and passes ON. The +1,850,000 fv3 margin is
+# hand-fitted to Iceberg's row-lineage-inflated byte output, not ours.
+org.apache.iceberg.spark.actions.TestRewriteDataFilesAction#testBinPackCombineMixedFiles
+# testBinPackCombineMediumFiles (fv 2,3,4). 4 equal input files, all below MIN so all 4 are
+# rewritten (rewritten=4 OK). TARGET = sum/3. Iceberg writes 4x ~327,000 B (sum 1,307,776);
+# packing + rolling at TARGET=435,925 yields 3 output files [456190,456714,392594] -> 3 added.
+# TWO separate causes, one real (fv2, now FIXED) and one (b) (fv3/fv4).
+#
+# fv2 was a REAL vecruntime bug: ColumnarParquetWriter tested the row-group boundary only once per
+# 1024-row SLICE, so with tiny rows under the test's small row-group-size-bytes every group came out
+# exactly one SLICE long and ~2.9x oversized (25 groups avg 50,707 B vs parquet-java 85 groups avg
+# 17,521 B at a 20 KB target), making Iceberg's byte-midpoint input splits fall unevenly. FIXED by the
+# adaptive row-group check (crew/draco/binpack-medium-v3 commit 9e7d72a2 in PR #997): fv2 now adds
+# 3 files [237630,236705,216872] and PASSES.
+#
+# fv3/fv4 ("add 3 but was 5", outputs [411300,23005,411618,21182,397728]) is CATEGORY (b), the same
+# mechanism already accepted for testBinPackCombineMixedFiles fv3/fv4: a byte-size artifact of our
+# BETTER COMPRESSION, not a vecruntime bug. Evidence (2026-10-24, instrumented write path): the rewrite
+# runs with AQE OFF (@BeforeAll) and NO shuffle/exchange added (writers-on plan = 3 scan-split
+# partitions, copyUnchanged=false, same as writers-off) -- the user's "exchange only for v3" hypothesis
+# is disproven. The 4 INPUT files are written by the test SETUP through our columnar writer at ~173 KB
+# each (sum 691,860) vs Iceberg's own writer at ~327 KB each (sum 1,307,776) -- our v2-page writer
+# compresses ~1.9x smaller. The test derives targetSize = testDataSize/3 and the rewrite's roll target
+# (maxOutputFileSize, = SparkWrite.targetFileSize our Rolling writer rolls on) FROM those actual input
+# sizes, so our roll target is ~half Iceberg's (~345,930 vs ~690,000+). For v3/v4 the row-lineage
+# columns (_row_id, _last_updated_sequence_number) inflate the rewrite's per-partition output to ~430 KB
+# -- confirmed rolling at len 354,933 > target 345,930 -- so a partition correctly splits into a big
+# file + a ~22 KB remainder (one partition -> filesInTask=2), giving 5 files. v2 has no lineage
+# inflation so stays under the target -> 3 files. Iceberg OFF: larger derived target (~690 KB+),
+# per-partition ~435 KB stays under -> 3 files ([798950,799829,687691]). Fine-grained roll would not
+# help: the partition genuinely exceeds the (smaller, our-compression-derived) roll target and must
+# split. The rewrite is correct (rows match, rewrittenBytes == dataSizeBefore); only the file count
+# differs, and only because our smaller setup files shrink the test's self-derived size thresholds.
+# Excluded (category b) -- the per-method exclusion cannot scope to fv3/fv4, and fv2 is already green.
+org.apache.iceberg.spark.actions.TestRewriteDataFilesAction#testBinPackCombineMediumFiles

@@ -533,20 +533,36 @@ class VectorShuffleSuite extends AnyFunSuite with BeforeAndAfterAll {
   }
 
   test("the stage metrics see our shuffle: bytes and records written, local blocks and bytes read, AQE's data size") {
+    // The listener bus is asynchronous: stage-completed events of EARLIER tests' jobs can still be delivered
+    // after this listener is registered, which used to add their shuffle reads to this query's totals (CI:
+    // "bytes read 9605 vs written 5156"). Count only the stages of this test's own jobs, tagged by a job
+    // group, and wait until every one of those jobs has ended.
+    val group = s"vec-stage-metrics-${System.nanoTime()}"
+    val ownStages = scala.collection.mutable.Set.empty[Int]
+    val runningJobs = scala.collection.mutable.Set.empty[Int]
     val stages = scala.collection.mutable.ArrayBuffer.empty[org.apache.spark.scheduler.StageInfo]
     val listener = new org.apache.spark.scheduler.SparkListener {
+      override def onJobStart(e: org.apache.spark.scheduler.SparkListenerJobStart): Unit =
+        if (e.properties != null && e.properties.getProperty("spark.jobGroup.id") == group) stages.synchronized {
+          ownStages ++= e.stageIds
+          runningJobs += e.jobId
+        }
+      override def onJobEnd(e: org.apache.spark.scheduler.SparkListenerJobEnd): Unit =
+        stages.synchronized { runningJobs -= e.jobId }
       override def onStageCompleted(e: org.apache.spark.scheduler.SparkListenerStageCompleted): Unit =
-        stages.synchronized { stages += e.stageInfo }
+        stages.synchronized { if (ownStages.contains(e.stageInfo.stageId)) stages += e.stageInfo }
     }
     spark.sparkContext.addSparkListener(listener)
+    spark.sparkContext.setJobGroup(group, "stage metrics test", interruptOnCancel = false)
     try {
       val df = spark.sql("select k, count(*) c, sum(x) sx from t group by k")
       val plan = collectPlan(df)
       val deadline = System.nanoTime() + 10000000000L
       while (
         System.nanoTime() < deadline && stages.synchronized(
-          stages.map(_.taskMetrics.shuffleReadMetrics.localBlocksFetched).sum
-        ) == 0
+          ownStages.isEmpty || runningJobs.nonEmpty ||
+            stages.map(_.taskMetrics.shuffleReadMetrics.localBlocksFetched).sum == 0
+        )
       ) Thread.sleep(50)
       val ex = exchanges(plan).collectFirst { case e: VectorShuffleExchangeExec => e }.get
       val write = stages.synchronized(stages.map(_.taskMetrics.shuffleWriteMetrics.bytesWritten).sum)
@@ -570,7 +586,10 @@ class VectorShuffleSuite extends AnyFunSuite with BeforeAndAfterAll {
         s"AQE's data size ${ex.metrics("dataSize").value} vs bytes written $write"
       )
       assert(ex.runtimeStatistics.sizeInBytes.toLong === ex.metrics("dataSize").value)
-    } finally spark.sparkContext.removeSparkListener(listener)
+    } finally {
+      spark.sparkContext.clearJobGroup()
+      spark.sparkContext.removeSparkListener(listener)
+    }
   }
 
   test("#358: unregistering a shuffle deletes our map outputs' data and index files") {

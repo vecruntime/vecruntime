@@ -25,6 +25,7 @@ import io.vecruntime.spark.parquet.{
   NativeParquetListReader,
   NativeParquetStructReader
 }
+import org.apache.arrow.memory.BufferAllocator
 import org.apache.hadoop.conf.Configuration
 import org.apache.parquet.HadoopReadOptions
 import org.apache.parquet.filter2.compat.FilterCompat
@@ -209,6 +210,10 @@ case class VectorParquetScanExec(
     val prefetchExecutorMaxBytes = io.vecruntime.spark.VectorConf.scanNativeParquetPrefetchExecutorMaxBytes(sqlConf)
     val decodeAhead = io.vecruntime.spark.VectorConf.scanNativeParquetDecodeAhead(sqlConf)
     val decodeAheadVirtual = io.vecruntime.spark.VectorConf.scanNativeParquetDecodeAheadVirtual(sqlConf)
+    val parallelDecode = io.vecruntime.spark.VectorConf.scanNativeParquetParallelDecode(sqlConf)
+    val parallelDecodeVirtual = io.vecruntime.spark.VectorConf.scanNativeParquetParallelDecodeVirtual(sqlConf)
+    val parallelDecodeMinRowGroupBytes =
+      io.vecruntime.spark.VectorConf.scanNativeParquetParallelDecodeMinRowGroupBytes(sqlConf)
     val dictionaryStrings = io.vecruntime.spark.VectorConf.scanNativeParquetDictionaryStrings(sqlConf)
     val reuseDecompressBuffers = io.vecruntime.spark.VectorConf.scanNativeParquetReuseDecompressBuffers(sqlConf)
     val poolChunkBuffers = io.vecruntime.spark.VectorConf.scanNativeParquetPoolChunkBuffers(sqlConf)
@@ -272,7 +277,10 @@ case class VectorParquetScanExec(
       metadataFields,
       metadataExtractors,
       prefetchMaxBytes,
-      prefetchExecutorMaxBytes
+      prefetchExecutorMaxBytes,
+      parallelDecode,
+      parallelDecodeVirtual,
+      parallelDecodeMinRowGroupBytes
     )
     // Counted by the task of partition 0, once per execution (a driver-side count is reset when a plan
     // whose stages are already materialised runs again).
@@ -331,7 +339,10 @@ private[vecruntime] final class VectorParquetRDD(
     metadataFields: Array[(String, org.apache.spark.sql.types.DataType)],
     metadataExtractors: Map[String, PartitionedFile => Any],
     prefetchMaxBytes: Long,
-    prefetchExecutorMaxBytes: Long
+    prefetchExecutorMaxBytes: Long,
+    parallelDecode: Int,
+    parallelDecodeVirtual: Boolean,
+    parallelDecodeMinRowGroupBytes: Long
 ) extends RDD[ColumnarBatch](sc, Nil) {
 
   // The wrapped scan's file partitions (DPP / bucketing / splitting applied). Read lazily inside
@@ -371,7 +382,7 @@ private[vecruntime] final class VectorParquetRDD(
       prefetchRowGroups,
       metrics,
       context,
-      handOff = decodeAhead > 0,
+      handOff = decodeAhead > 0 || parallelDecode > 0,
       // Up to `decodeAhead` queued, one handed out and one being decoded per column.
       poolLimit = math.max(4, decodeAhead + 2),
       dictionaryStrings = dictionaryStrings,
@@ -382,9 +393,15 @@ private[vecruntime] final class VectorParquetRDD(
       prefetchMaxBytes = prefetchMaxBytes,
       prefetchExecutorMaxBytes = prefetchExecutorMaxBytes,
       reuseDecompressBuffers = reuseDecompressBuffers,
-      poolChunkBuffers = poolChunkBuffers
+      poolChunkBuffers = poolChunkBuffers,
+      parallelDecode = parallelDecode,
+      parallelDecodeMinRowGroupBytes = parallelDecodeMinRowGroupBytes
     )
-    if (decodeAhead > 0) new DecodeAheadIterator(reader, decodeAhead, decodeAheadVirtual, context) else reader
+    // #606: parallel row-group decode wraps the reader when on (and takes precedence over single-producer
+    // decode-ahead). Otherwise decode-ahead, else the reader on the task thread.
+    if (parallelDecode > 0) new ParallelDecodeIterator(reader, parallelDecode, parallelDecodeVirtual, context)
+    else if (decodeAhead > 0) new DecodeAheadIterator(reader, decodeAhead, decodeAheadVirtual, context)
+    else reader
   }
 }
 
@@ -438,7 +455,12 @@ private[vecruntime] final class VectorParquetPartitionReader(
     // clipped, so its columns are matched by id as every other file's; null: none.
     nameMapping: IcebergNameMapping = null,
     // #901 R1: the table format's own column resolution, in place of clipParquetSchema (null: Spark's).
-    fileResolver: ParquetFileResolver = null
+    fileResolver: ParquetFileResolver = null,
+    // #606: parallel row-group decode -- how many helper threads decode this file's row groups (0: single
+    // producer / serial), the row-group byte threshold a file must clear on >= 2 row groups to engage, and the
+    // helpers' thread kind. Driven by ParallelDecodeIterator, which reads the lead reader's row-group JOBS.
+    parallelDecode: Int = 0,
+    parallelDecodeMinRowGroupBytes: Long = 0L
 ) extends Iterator[ColumnarBatch]
     with AutoCloseable {
 
@@ -934,6 +956,22 @@ private[vecruntime] final class VectorParquetPartitionReader(
     var r: ParquetFileReader = null
     try {
       stream = inputFile.newStream()
+      // #834 part 1: a file at or under the threshold is read WHOLE in one GET here, BEFORE the footer, so the
+      // footer, column chunks and page indexes all come from that one buffer (no footer-length read, no footer
+      // read, no per-page GET). The buffer must hold the WHOLE file -- the footer is at its end -- so it is sized
+      // by the file's length, not by this split's: Spark splits and packs files by maxPartitionBytes, and a split
+      // can cover only part of a file (reading split-length bytes then hit EOF in readFooter on S3).
+      // The column-share gate cannot apply before the footer; for a file this small the whole-object read is
+      // the point, so size alone decides. Range merging (part 2) still applies to larger files in openStream.
+      val fileLength = VectorParquetPartitionReader.fileLength(file, inputFile)
+      if (
+        smallFileThreshold > 0 && fileLength > 0 && fileLength <= smallFileThreshold &&
+        fileLength <= Integer.MAX_VALUE - 8
+      ) {
+        val whole = io.vecruntime.spark.parquet.BufferBackedSeekableInputStream.wholeObject(stream, fileLength)
+        stream.close()
+        stream = whole
+      }
       val read0: ParquetMetadata = ParquetFileReader.readFooter(inputFile, rangeOpts, stream)
       // #901 R1: the table format resolves the file's columns itself (by its field ids, its name mapping, its
       // positional fallback): the footer carries the ids the columns were matched by, and the clipped schema is
@@ -1039,7 +1077,12 @@ private[vecruntime] final class VectorParquetPartitionReader(
         poolChunkBuffers
       )
       val readOpts = readOptsBuilder.build()
-      r = ParquetFileReader.open(inputFile, footer, readOpts, stream)
+      // #834: serve the reader from an in-memory buffer where it pays, so ParquetFileReader issues fewer and
+      // larger GETs. readStream is the original S3A stream unless small-object prefetch or range merging
+      // replaces it; openStream handles closing/keeping the source.
+      val readStream = openStream(inputFile, file, footer, clipped, stream)
+      if (readStream ne stream) stream = null // the buffer stream owns (or has consumed+closed) the source now
+      r = ParquetFileReader.open(inputFile, footer, readOpts, readStream)
       stream = null
       r.setRequestedSchema(clipped)
       // #812: under two-pass the first row group is read by index too (twoPassRowGroup), not ahead here.
@@ -1051,6 +1094,62 @@ private[vecruntime] final class VectorParquetPartitionReader(
       if (stream != null) stream.close()
       if (r != null) r.close()
     }
+  }
+
+  /**
+   * #834 part 2 (range merging): the stream `ParquetFileReader.open` reads from, when the file was NOT already
+   * read whole by small-object prefetch (which runs before the footer read, in `prepare`). By default this is
+   * the original S3A `source`, returned as is. When range merging fires, the projected column chunks of the
+   * split's row groups are planned into coalesced, split byte ranges ({@link ParquetReadRangePlanner}) and read
+   * into a sparse buffer here on this (prefetch) thread; `source` is kept as the delegate for any read the plan
+   * did not cover (there should be none, but a miss stays correct). It fires only when it actually reduces the
+   * request count. The buffered bytes are charged to the executor's read-ahead budget (`prefetchExecutorMaxBytes`)
+   * through the enclosing file's reserved size, released when the Prepared is used or dropped.
+   */
+  private def openStream(
+      inputFile: HadoopInputFile,
+      file: PartitionedFile,
+      footer: ParquetMetadata,
+      clipped: MessageType,
+      source: SeekableInputStream
+  ): SeekableInputStream = {
+    // Already a whole-object buffer (small-file prefetch ran before the footer): nothing more to do.
+    if (source.isInstanceOf[io.vecruntime.spark.parquet.BufferBackedSeekableInputStream]) return source
+    if (rangeMergeGap < 0) return source
+    // The projected column chunks of the row groups this split keeps (its range), by path, as the reader reads.
+    val wanted = new java.util.HashSet[Seq[String]]()
+    clipped.getColumns.forEach(cd => wanted.add(cd.getPath.toArray.toSeq))
+    val start = file.start
+    val end = file.start + file.length
+    val chunkRanges = new java.util.ArrayList[io.vecruntime.spark.parquet.ParquetReadRangePlanner.Range]()
+    footer.getBlocks.forEach { block =>
+      val mid = block.getStartingPos + block.getCompressedSize / 2
+      if (mid >= start && mid < end) {
+        block.getColumns.forEach { cc =>
+          if (wanted.contains(cc.getPath.toArray.toSeq)) {
+            val len = cc.getTotalSize
+            if (len > 0) {
+              chunkRanges.add(new io.vecruntime.spark.parquet.ParquetReadRangePlanner.Range(cc.getStartingPos, len))
+            }
+          }
+        }
+      }
+    }
+    // Range merging over the projected column chunks. No chunk, or a single chunk already contiguous, is
+    // nothing to merge -- leave the original stream (parquet-java merges exactly-consecutive chunks itself).
+    if (chunkRanges.size() < 2) return source
+    val planner =
+      new io.vecruntime.spark.parquet.ParquetReadRangePlanner(rangeMergeGap, rangeTargetSize, RangeToleranceRatio)
+    val planned = planner.plan(chunkRanges)
+    // Only serve from a buffer when it issues fewer requests than the chunks themselves would (coalescing won
+    // over splitting). Otherwise the original stream is as good and keeps memory to zero.
+    if (planned.size() >= chunkRanges.size()) return source
+    io.vecruntime.spark.parquet.BufferBackedSeekableInputStream.plannedRanges(
+      source,
+      planned,
+      VectorParquetPartitionReader.fileLength(file, null),
+      source
+    )
   }
 
   /** Makes a prepared file the current one (task thread): column readers, partition values, metrics. */
@@ -1093,34 +1192,66 @@ private[vecruntime] final class VectorParquetPartitionReader(
       if (m == null) io.vecruntime.spark.parquet.ParquetRebase.CORRECTED
       else
         new io.vecruntime.spark.parquet.ParquetRebase(m.datetimeMode, m.datetimeTz, m.int96Mode, m.int96Tz, m.convertTz)
-    columnReaders = new Array[NativeParquetColumn](dataColumnCount)
+    columnReaders = newColumnReaders(p.read, p.clipped, fileSchema, fileRebase, allocator, poolLimit)
+    // #606: keep this file's decode context for parallel-decode helpers, and whether it is eligible: at least
+    // two row groups (after statistics pruning) at or above the byte threshold. A decode filter, two-pass and
+    // a column-index-filtered (repeated-leaf range) read stay on the lead -- parallel decode handles the plain
+    // whole-row-group case only, so a file outside it decodes single-producer as before.
+    currentFileSchema = fileSchema
+    currentRead = p.read
+    currentRebase = fileRebase
+    currentEligible =
+      parallelDecode > 0 && decodeFilter == null && !twoPass &&
+        bigRowGroups(p.reader, parallelDecodeMinRowGroupBytes) >= 2
+    buildPartitionColumns(p.file)
+    metrics.numFiles += 1
+  }
+
+  /**
+   * #606: builds a fresh, independent set of column readers for one file, over `alloc` with pool limit `limit`.
+   * This is the exact mapping [[install]] uses -- a row-index column, a null column for a schema-evolved
+   * missing column (#568), a struct / list / map reader (#568), a variant assembler (#812), else a leaf reader
+   * -- lifted so a parallel-decode helper ([[ParallelDecodeIterator]]) can own its own set over the same file,
+   * decoding a different row group concurrently with its own vectors. A set is stateful and single-threaded, so
+   * each helper has its own; nothing here reads or writes the reader's per-file decode state.
+   */
+  private[vecruntime] def newColumnReaders(
+      read: StructType,
+      clipped: MessageType,
+      fileSchema: MessageType,
+      fileRebase: io.vecruntime.spark.parquet.ParquetRebase,
+      alloc: BufferAllocator,
+      limit: Int
+  ): Array[NativeParquetColumn] = {
+    val out = new Array[NativeParquetColumn](dataColumnCount)
+    val cols = clipped.getColumns
     // Map each required data column to its clipped ColumnDescriptor by leaf name; a struct (#568) to its group.
     var i = 0
     while (i < dataColumnCount) {
-      val field = p.read.fields(i)
+      val field = read.fields(i)
       val decoded: NativeParquetColumn = field.dataType match {
         case _ if i == rowIndexOrdinal =>
-          new io.vecruntime.spark.parquet.NativeParquetRowIndexColumn(field.name, allocator)
-        case dt if !NativeParquetStructReader.holds(fileSchema, Array(clippedName(p.clipped, i))) =>
+          new io.vecruntime.spark.parquet.NativeParquetRowIndexColumn(field.name, alloc)
+        case dt if !NativeParquetStructReader.holds(fileSchema, Array(clippedName(clipped, i))) =>
           // #568 schema evolution: a column added since the file was written, null in every row, or its
           // existence default when it was added with one (#812).
-          new io.vecruntime.spark.parquet.NativeParquetNullColumn(field.name, dt, allocator, existenceDefault(i))
+          new io.vecruntime.spark.parquet.NativeParquetNullColumn(field.name, dt, alloc, existenceDefault(i))
         case st: StructType =>
-          val name = clippedName(p.clipped, i)
-          NativeParquetStructReader.create(p.clipped, fileSchema, Array(name), st, field.name, batchSize, allocator)
+          val name = clippedName(clipped, i)
+          NativeParquetStructReader.create(clipped, fileSchema, Array(name), st, field.name, batchSize, alloc)
         case dt @ (_: org.apache.spark.sql.types.ArrayType | _: org.apache.spark.sql.types.MapType) =>
           NativeParquetListReader.create(
-            p.clipped,
+            clipped,
             fileSchema,
-            Array(clippedName(p.clipped, i)),
+            Array(clippedName(clipped, i)),
             dt,
             field.name,
             batchSize,
-            allocator
+            alloc
           )
         case dt =>
-          val leafName = clippedName(p.clipped, i)
-          val cd = columns.asScala.find(_.getPath()(0).equals(leafName))
+          val leafName = clippedName(clipped, i)
+          val cd = cols.asScala.find(_.getPath()(0).equals(leafName))
             .getOrElse(throw new IllegalStateException(s"column ${field.name} missing from clipped schema"))
           new NativeParquetColumnReader(
             cd,
@@ -1128,12 +1259,12 @@ private[vecruntime] final class VectorParquetPartitionReader(
             dt,
             field.name,
             batchSize,
-            allocator
+            alloc
           )
       }
       // #812: a shredded variant or a pushed variant struct: the file group decoded as its struct, assembled per row.
       val requested = requiredSchema.fields(i).dataType
-      columnReaders(i) = (requested, field.dataType) match {
+      out(i) = (requested, field.dataType) match {
         case (_, st: StructType)
             if i != rowIndexOrdinal && !decoded.isInstanceOf[io.vecruntime.spark.parquet.NativeParquetNullColumn] &&
               (io.vecruntime.spark.parquet.NativeParquetSupport.isVariantStruct(requested) ||
@@ -1148,16 +1279,216 @@ private[vecruntime] final class VectorParquetPartitionReader(
           )
         case _ => decoded
       }
-      columnReaders(i).setPoolLimit(poolLimit)
-      columnReaders(i).setDictionaryIds(dictionaryStrings)
-      columnReaders(i).setRebase(fileRebase)
+      out(i).setPoolLimit(limit)
+      out(i).setDictionaryIds(dictionaryStrings)
+      out(i).setRebase(fileRebase)
       // #735: a repeated leaf must copy a page out of the decompressor's reused buffer (it queues several).
-      columnReaders(i).setReuseDecompress(reuseDecompressBuffers)
+      out(i).setReuseDecompress(reuseDecompressBuffers)
       i += 1
     }
-    buildPartitionColumns(p.file)
-    metrics.numFiles += 1
+    out
   }
+
+  /** #606: row groups of `r` (after statistics pruning) whose requested column chunks total >= `minBytes`. */
+  private def bigRowGroups(r: ParquetFileReader, minBytes: Long): Int = {
+    val blocks = r.getRowGroups
+    var n = 0
+    var b = 0
+    while (b < blocks.size()) {
+      val bytes = blocks.get(b).getColumns.asScala
+        .filter(c => requestedPaths.contains(c.getPath.toArray.toSeq)).map(_.getTotalSize).sum
+      if (bytes >= minBytes) n += 1
+      b += 1
+    }
+    n
+  }
+
+  /**
+   * #606: the next unit of work for [[ParallelDecodeIterator]]. The lead reader owns all of file iteration,
+   * read-ahead I/O, per-file fallback and ordering; this hands the consumer either
+   *   - a [[VectorParquetPartitionReader.RowGroupJob]] -- a fetched row group of an ELIGIBLE native file
+   *     ([[currentEligible]]), to be decoded on a helper thread with its own column-reader set built from the
+   *     job's context; or
+   *   - [[VectorParquetPartitionReader.LeadBatch]] -- this batch must be produced by the lead itself
+   *     ([[nextOwned]]): a per-file fallback (Spark's recycled batch), or a native file that is not eligible
+   *     (too few / too small row groups, a decode filter, two-pass), decoded single-producer as before; or
+   *   - [[VectorParquetPartitionReader.NoJob]] when the split is exhausted.
+   *
+   * The job carries the row group's store and the file's decode context, plus the file's partition and metadata
+   * VALUES, so a helper builds constants from them without touching the lead's state.
+   */
+  def pollJob(): AnyRef = {
+    // A fallback file in progress is the lead's to emit, batch by batch.
+    if (fallback != null) {
+      if (fallback.hasNext) return VectorParquetPartitionReader.LeadBatch
+      closeFile()
+    }
+    // A native file still has rows the lead is emitting itself (an ineligible file).
+    if (reader != null && rgRows > 0 && rgOffset < rgRows) return VectorParquetPartitionReader.LeadBatch
+    while (true) {
+      if (reader != null) {
+        val t0 = System.nanoTime()
+        val store = readNextFilteredRowGroup()
+        if (store != null) {
+          val rgRowCount = store.getRowCount.toInt
+          metrics.scanTime += (System.nanoTime() - t0) / 1000000L
+          if (rgRowCount <= 0) {
+            // An empty row group: nothing to decode, go on.
+          } else if (currentEligible) {
+            metrics.numRowGroups += 1
+            // #626: an eligible file never has a column-index range break (requires decodeFilter), so the whole
+            // row group decodes in batchSize chunks; the helper owns its store and readers.
+            return new VectorParquetPartitionReader.RowGroupJob(
+              store,
+              rgRowCount,
+              currentClipped,
+              currentFileSchema,
+              currentRead,
+              currentRebase,
+              currentFile,
+              if (partitionValues == null) null else partitionValues.copy(),
+              metadataValues.clone()
+            )
+          } else {
+            // The lead decodes this row group itself.
+            startRowGroup(store, rgRowCount)
+            metrics.numRowGroups += 1
+            rgRows = rgRowCount
+            rgOffset = 0
+            lateOff = false
+            lateDenseRun = 0
+            return VectorParquetPartitionReader.LeadBatch
+          }
+        } else {
+          metrics.scanTime += (System.nanoTime() - t0) / 1000000L
+          closeFile()
+        }
+      }
+      if (reader == null && fallback == null) {
+        if (!files.hasNext && ahead.isEmpty) return VectorParquetPartitionReader.NoJob
+        openNextFile()
+        if (fallback != null && fallback.hasNext) return VectorParquetPartitionReader.LeadBatch
+      }
+    }
+    VectorParquetPartitionReader.NoJob
+  }
+
+  /**
+   * #606: decode one [[VectorParquetPartitionReader.RowGroupJob]] fully, on a helper thread, into its batches --
+   * each an [[VectorParquetPartitionReader.OwnedBatch]] the caller releases ([[releaseOwned]]). `readers` is the
+   * helper's OWN column-reader set (built once per helper by [[newColumnReaders]] when its file changes) and
+   * `alloc` the helper's own child allocator, so nothing here touches the lead's per-row-group state and two
+   * helpers never share a vector. The plain whole-row-group path only (an eligible file has no decode filter,
+   * no two-pass and no column-index range break), so this is [[nextOwned]]'s batch body without the filter.
+   */
+  def decodeJob(
+      job: VectorParquetPartitionReader.RowGroupJob,
+      readers: Array[NativeParquetColumn],
+      alloc: BufferAllocator
+  ): java.util.List[VectorParquetPartitionReader.OwnedBatch] = {
+    var c = 0
+    while (c < dataColumnCount) {
+      readers(c).startRowGroup(job.store, job.rowCount)
+      c += 1
+    }
+    val out = new java.util.ArrayList[VectorParquetPartitionReader.OwnedBatch]()
+    var off = 0
+    while (off < job.rowCount) {
+      val n = math.min(batchSize, job.rowCount - off)
+      out.add(decodeOneBatch(n, readers, alloc, job))
+      off += n
+    }
+    out
+  }
+
+  /** One batch of `n` rows from `readers` into `alloc`, with `job`'s partition/metadata constants (#606). */
+  private def decodeOneBatch(
+      n: Int,
+      readers: Array[NativeParquetColumn],
+      alloc: BufferAllocator,
+      job: VectorParquetPartitionReader.RowGroupJob
+  ): VectorParquetPartitionReader.OwnedBatch = {
+    val columns = new Array[ColumnVector](attrs.length)
+    val dataVectors = new Array[AnyRef](dataColumnCount)
+    val partitionVectors = new Array[ColumnVector](constantCount)
+    try {
+      var c = 0
+      while (c < dataColumnCount) {
+        val fv = readers(c).readBatch(n)
+        dataVectors(c) = fv
+        columns(c) = readers(c).wrap(fv)
+        c += 1
+      }
+      var p = 0
+      while (p < partitionSchema.length) {
+        val f = partitionSchema.fields(p)
+        val v = if (job.partitionValues == null) null else job.partitionValues.get(p, f.dataType)
+        val col =
+          if (v == null) ArrowOutput.nulls(f.name, f.dataType, n, alloc)
+          else ArrowOutput.constant(f.name, f.dataType, v, n, alloc)
+        columns(dataColumnCount + p) = col
+        partitionVectors(p) = col
+        p += 1
+      }
+      var k = 0
+      while (k < metadataCount) {
+        val (name, dt) = metadataFields(k)
+        val v = job.metadataValues(k)
+        val col =
+          if (v == null) ArrowOutput.nulls(name, dt, n, alloc) else ArrowOutput.constant(name, dt, v, n, alloc)
+        columns(dataColumnCount + partitionSchema.length + k) = col
+        partitionVectors(partitionSchema.length + k) = col
+        k += 1
+      }
+    } catch {
+      case t: Throwable =>
+        var k = 0
+        while (k < dataColumnCount) {
+          if (dataVectors(k) != null) readers(k).release(dataVectors(k))
+          k += 1
+        }
+        var pp = 0
+        while (pp < partitionVectors.length) {
+          if (partitionVectors(pp) != null) partitionVectors(pp).close()
+          pp += 1
+        }
+        throw t
+    }
+    new VectorParquetPartitionReader.OwnedBatch(
+      new ColumnarBatch(columns, n),
+      dataVectors,
+      partitionVectors,
+      readers,
+      recycled = false,
+      file = job.file
+    )
+  }
+
+  /** #606: the lead's next batch when [[pollJob]] returned LeadBatch (a fallback or an ineligible native file). */
+  def leadBatch(): VectorParquetPartitionReader.OwnedBatch = nextOwned()
+
+  /**
+   * #606: count one helper-decoded job batch of `n` rows into the scan's output metrics, on the CONSUMER
+   * thread (so the counters are touched by one thread; [[decodeJob]] on the helper does not touch them). A
+   * LeadBatch is already counted by [[nextOwned]] -- the consumer must not re-count it.
+   */
+  def countOutput(n: Int): Unit = {
+    metrics.numOutputBatches += 1
+    metrics.numOutputRows += n
+    if (inputMetrics != null) inputMetrics.incRecordsRead(n)
+    updateBytesRead()
+  }
+
+  /** #606: build a helper's own column-reader set for a job's file, over `alloc`. */
+  def readersForJob(
+      job: VectorParquetPartitionReader.RowGroupJob,
+      alloc: BufferAllocator
+  ): Array[NativeParquetColumn] =
+    newColumnReaders(job.read, job.clipped, job.fileSchema, job.rebase, alloc, poolLimit)
+
+  /** #606: accessors the parallel-decode coordinator needs. */
+  def dataColumns: Int = dataColumnCount
+  def taskContext: TaskContext = context
 
   /**
    * Spark's batch for a fallback file, with this file's metadata columns after its partition columns (Spark's
@@ -1267,6 +1598,44 @@ private[vecruntime] final class VectorParquetPartitionReader(
     hadoopConf.getDouble(io.vecruntime.spark.VectorConf.ScanNativeParquetLateMaterializationTwoPassMaxFraction, 0.5)
   private var currentClipped: MessageType = _
   private var twoPassDenseRun = 0
+  // #606: the current file's decode context, kept so a parallel-decode helper can build its own column-reader
+  // set over it (ParallelDecodeIterator). `currentEligible` is set in install when the file has >= 2 row groups
+  // at or above `parallelDecodeMinRowGroupBytes`, so a file that does not clear it decodes on the lead itself.
+  private var currentFileSchema: MessageType = _
+  private var currentRead: StructType = _
+  private var currentRebase: io.vecruntime.spark.parquet.ParquetRebase = _
+  private var currentEligible = false
+
+  // ----- #834: small-object prefetch and range merging, read from the Hadoop conf (it carries spark.* keys,
+  // as two-pass above does). All off/identity when their keys are unset, so the read path is unchanged by default.
+
+  /** #834 part 1: a file at or under this length is read whole in one GET; `<= 0` off. */
+  private lazy val smallFileThreshold: Long =
+    scala.util.Try(
+      hadoopConf.get(io.vecruntime.spark.VectorConf.ScanNativeParquetSmallFileThreshold, "").trim match {
+        case "" => 0L
+        case s => org.apache.spark.network.util.JavaUtils.byteStringAsBytes(s)
+      }
+    ).getOrElse(0L)
+
+  /** #834 part 2: coalesce planned ranges whose gap is at or under this; `< 0` (the default) disables merging. */
+  private lazy val rangeMergeGap: Long =
+    hadoopConf.get(io.vecruntime.spark.VectorConf.ScanNativeParquetRangeMergeGap, "").trim match {
+      case "" => -1L
+      case s if s.startsWith("-") => -1L
+      case s => scala.util.Try(org.apache.spark.network.util.JavaUtils.byteStringAsBytes(s)).getOrElse(-1L)
+    }
+
+  /** #834 part 2: split a coalesced run longer than this into parallel GETs; `0` never splits. */
+  private lazy val rangeTargetSize: Long =
+    scala.util.Try(
+      hadoopConf.get(io.vecruntime.spark.VectorConf.ScanNativeParquetRangeTargetSize, "").trim match {
+        case "" => 8L << 20
+        case s => math.max(0L, org.apache.spark.network.util.JavaUtils.byteStringAsBytes(s))
+      }
+    ).getOrElse(8L << 20)
+
+  private val RangeToleranceRatio = 1.4
 
   /**
    * #812: row group `i` (an index into the reader's filtered row groups) read in two passes. First its filter
@@ -1800,6 +2169,17 @@ private[vecruntime] final class VectorParquetPartitionReader(
 private[vecruntime] object VectorParquetPartitionReader {
 
   /**
+   * #834: the length of the whole FILE a split belongs to (`PartitionedFile.fileSize`, the store's length),
+   * not the split's own `length` -- Spark splits and packs files, so a split may cover only part of a file. A
+   * split without a recorded file size (0, e.g. one built by hand) falls back to `inputFile`'s length when one
+   * is given, else to the split's end.
+   */
+  def fileLength(file: PartitionedFile, inputFile: org.apache.parquet.io.InputFile): Long =
+    if (file.fileSize > 0) file.fileSize
+    else if (inputFile != null) inputFile.getLength
+    else file.start + file.length
+
+  /**
    * #626: the next row group of `r` (Parquet's `readNextFilteredRowGroup`), recording in `skipped` how many
    * of its requested pages the column index dropped. Runs on the thread that reads the row group, which is
    * the only one using `r` then; the offset indexes it reads were already read by Parquet's filter.
@@ -1914,6 +2294,30 @@ private[vecruntime] object VectorParquetPartitionReader {
     override def getFirstRowIndex(pageIndex: Int): Long = starts.get(pageIndex)
     override def getLastRowIndex(pageIndex: Int, rowGroupRowCount: Long): Long = ends.get(pageIndex) - 1
   }
+
+  /**
+   * #606: one native row group handed to a parallel-decode helper -- its fetched compressed pages
+   * (`store`, already read by the lead's read-ahead) and `rowCount`, plus the file's decode context (the
+   * clipped and file schemas, the read schema, the calendar rebase) and its partition / metadata VALUES, so a
+   * helper builds its own column-reader set and constants with no access to the lead reader's state.
+   */
+  final class RowGroupJob(
+      val store: org.apache.parquet.column.page.PageReadStore,
+      val rowCount: Int,
+      val clipped: MessageType,
+      val fileSchema: MessageType,
+      val read: org.apache.spark.sql.types.StructType,
+      val rebase: io.vecruntime.spark.parquet.ParquetRebase,
+      val file: PartitionedFile,
+      val partitionValues: org.apache.spark.sql.catalyst.InternalRow,
+      val metadataValues: Array[Any]
+  )
+
+  /** #606: `pollJob` says the lead must emit this batch itself (a fallback or an ineligible native file). */
+  val LeadBatch = new AnyRef
+
+  /** #606: `pollJob` says the split is exhausted. */
+  val NoJob = new AnyRef
 
   /**
    * A decoded batch with what it owns (#606): its data vectors (each returned to `readers(c)`'s pool) and

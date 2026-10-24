@@ -106,7 +106,11 @@ public final class IcebergRewriteFileTaskWriter implements AutoCloseable {
     private final int fileOrdinal;
     private final int posOrdinal;
     private final int[] dataOrdinals;
+    // Per write-schema column, true to RE-ENCODE the column (a changed UPDATE column, or a v3 lineage column),
+    // false to COPY its chunk byte for byte. Length == dataOrdinals.length.
+    private final boolean[] encodeColumns;
     private final PartitionKeys keys;
+    private final boolean arrowLanes;
     private final Arena arena = Arena.ofShared();
     private final Map<String, FileBuffer> buffers = new LinkedHashMap<>();
     private final List<DataFile> done = new ArrayList<>();
@@ -119,6 +123,9 @@ public final class IcebergRewriteFileTaskWriter implements AutoCloseable {
      * @param posOrdinal the {@code _pos} column's ordinal in the batches
      * @param dataOrdinals the write-schema columns' ordinals in the batches
      *     (data columns and, on v3, the row-lineage columns)
+     * @param encodeColumns per write-schema column, true to re-encode the
+     *     column (a changed UPDATE column, or a v3 lineage column), false to
+     *     copy its chunk byte for byte
      */
     public IcebergRewriteFileTaskWriter(
             IcebergWriteSpec spec,
@@ -127,7 +134,8 @@ public final class IcebergRewriteFileTaskWriter implements AutoCloseable {
             Configuration conf,
             int fileOrdinal,
             int posOrdinal,
-            int[] dataOrdinals) {
+            int[] dataOrdinals,
+            boolean[] encodeColumns) {
         this.spec = spec;
         this.files = OutputFileFactory.builderFor(spec.table(), partitionId, taskId)
                 .format(FileFormat.PARQUET)
@@ -144,7 +152,9 @@ public final class IcebergRewriteFileTaskWriter implements AutoCloseable {
         this.fileOrdinal = fileOrdinal;
         this.posOrdinal = posOrdinal;
         this.dataOrdinals = dataOrdinals;
+        this.encodeColumns = encodeColumns == null ? new boolean[dataOrdinals.length] : encodeColumns;
         this.keys = spec.spec().isUnpartitioned() ? null : new PartitionKeys(spec.spec(), spec.writeSchema());
+        this.arrowLanes = SparkLanes.needed(spec.writeSchema());
     }
 
     /**
@@ -181,7 +191,12 @@ public final class IcebergRewriteFileTaskWriter implements AutoCloseable {
             for (int o : dataOrdinals) {
                 picked.add(columns.get(o));
             }
-            data.addAll(Gather.rows(picked, rows, arena));
+            List<VectorBuffers> gathered = Gather.rows(picked, rows, arena);
+            // As the streaming writer does (IcebergDataTaskWriter): convert Spark's fixed/uuid lanes to the
+            // Arrow lanes the file format holds, and DROP any v3 unknown field, so the buffered columns line up
+            // one-for-one with this writer's Parquet schema (which omits unknown fields). The converted lanes
+            // are kept across batches, so they live in this writer's own (shared) arena.
+            data.addAll(arrowLanes ? SparkLanes.toArrow(spec.writeSchema(), gathered, arena) : gathered);
             buffers.computeIfAbsent(e.getKey(), k -> new FileBuffer()).add(data, pos);
         }
     }
@@ -274,16 +289,26 @@ public final class IcebergRewriteFileTaskWriter implements AutoCloseable {
             deleted = new long[0];
         }
 
-        RowGroupCopyPlanner plan = safe ? RowGroupCopyPlanner.plan(footer, writeSchema, deleted, spec.writeSchema(), metricsConfig) : null;
+        RowGroupCopyPlanner plan = safe ? RowGroupCopyPlanner.plan(footer, writeSchema, deleted, spec.writeSchema(), metricsConfig,
+                maskOrNull())
+                : null;
         boolean copyable = safe && plan.copyable();
 
-        // #901 M4a required-column guard: on the copy path the output file uses the source schema, which may
-        // mark a top-level column REQUIRED (Iceberg's writer does for an always-non-null column). A re-encoded
-        // group written under that schema MUST NOT receive a null in such a column. This cannot happen for a
-        // survivor whose data came from that very column -- a REQUIRED column holds no nulls -- but guard
-        // anyway: if any buffered survivor is null in a source-REQUIRED top-level column, decline the copy and
-        // fall back to the full rewrite (output schema then = the all-optional write schema).
-        if (copyable && survivorHasNullInRequired(buffer, plan.fileSchema())) {
+        // #901 M4a/M4b required-column guard: a COPIED column keeps the SOURCE's repetition, which may be
+        // REQUIRED (Iceberg's writer marks an always-non-null column REQUIRED). A re-encoded group writes all
+        // columns under the output schema, so a null in a REQUIRED copied column would be invalid. This cannot
+        // happen for a survivor whose value came from that very column -- a REQUIRED column holds no nulls --
+        // but guard anyway. Only COPIED columns matter: an ENCODED (changed) column uses the write schema's
+        // OPTIONAL field, so a null there is fine.
+        if (copyable && survivorHasNullInRequiredCopied(buffer, plan.fileSchema(), plan.copyMask())) {
+            copyable = false;
+        }
+
+        // #901 M4b partition-change guard: if an UPDATE changes a column the table partitions by, a rewritten
+        // row may move partition, but the copy path keeps the source file's partition. Decline the copy and
+        // fall back to the full rewrite (which routes rows to the right partition). Only relevant when a data
+        // column is re-encoded (an UPDATE); a DELETE never changes a value.
+        if (copyable && changesPartitionColumn()) {
             copyable = false;
         }
 
@@ -296,12 +321,12 @@ public final class IcebergRewriteFileTaskWriter implements AutoCloseable {
         written.add(location);
         IcebergParquetAppender appender;
         try {
-            // #901 M4a: on the copy path the output file uses the SOURCE file's own Parquet schema, so a
-            // copied group's pages are valid under the footer and a re-encoded group in the same file is
-            // written with the same schema. The source schema carries Iceberg's field ids, so the footer
-            // metrics stay keyed by the same ids. The full-rewrite path keeps Iceberg's own conversion of the
-            // write schema (outputSchema = null).
-            MessageType outputSchema = copyable ? plan.fileSchema() : null;
+            // #901 M4a: on the copy path the output file uses the planner's copy output schema -- the SOURCE
+            // file's own Parquet schema for a v2 whole-group copy, or the full write schema (data + the two v3
+            // lineage columns) for a v3 mixed-group copy, where the data chunks are copied and the lineage
+            // chunks encoded. Either carries Iceberg's field ids, so footer metrics stay keyed by the same ids.
+            // The full-rewrite path keeps Iceberg's own conversion of the write schema (outputSchema = null).
+            MessageType outputSchema = copyable ? plan.copyOutputSchema() : null;
             appender = IcebergParquetAppender.create(out.encryptingOutputFile(), spec.writeSchema(), outputSchema,
                     spec.properties(), metricsConfig, nameMapping, conf);
         } catch (IOException ioe) {
@@ -318,15 +343,34 @@ public final class IcebergRewriteFileTaskWriter implements AutoCloseable {
         }
 
         if (copyable) {
-            int dataCols = plan.dataFieldCount();
-            try (SeekableInputStream stream = in.newStream()) {
+            // How many columns a re-encoded group writes: the output schema's field count. On a v2 whole-group
+            // copy that is the source field count (no lineage); on a v3 mixed-group copy it is the write
+            // schema's (data + the two lineage columns), so a re-encoded group matches the copied groups' layout.
+            int outCols = plan.outputFieldCount();
+            try (SeekableInputStream stream = in.newStream();
+                 ParquetFileReader indexReader = ParquetFileReader.open(in)) {
                 for (RowGroupCopyPlanner.Group g : plan.groups()) {
                     if (g.action() == RowGroupCopyPlanner.Action.COPY) {
-                        appender.copyRowGroup(stream, footer.getBlocks()
-                                .get(g.ordinal()));
+                        if (g.copiesWholeGroup()) {
+                            appender.copyRowGroup(stream, footer.getBlocks()
+                                    .get(g.ordinal()));
+                        } else {
+                            // Mixed group (v3): copy the data chunks, encode the lineage chunks from the
+                            // group's surviving (here: all) rows, resolved by the scan into the batch.
+                            copyMixedGroup(
+                                    appender,
+                                    indexReader,
+                                    stream,
+                                    footer.getBlocks().get(g.ordinal()),
+                                    g,
+                                    plan.copyMask(),
+                                    buffer,
+                                    posToPacked,
+                                    outCols);
+                        }
                         COPIED_ROW_GROUPS.increment();
                     } else if (g.action() == RowGroupCopyPlanner.Action.REENCODE) {
-                        reencodeGroup(appender, buffer, g, posToPacked, dataCols);
+                        reencodeGroup(appender, buffer, g, posToPacked, outCols);
                     }
                     // SKIP: every row of the group was deleted -- nothing written.
                 }
@@ -349,6 +393,12 @@ public final class IcebergRewriteFileTaskWriter implements AutoCloseable {
                 .withFormat(FileFormat.PARQUET)
                 .withFileSizeInBytes(appender.length())
                 .withMetrics(appender.metrics())
+                // Stamp the sort order id Iceberg's own writer would (SparkWriteConf.outputSortOrderId): a
+                // copy-on-write rewrite keeps the surviving rows in the table's required order, so the
+                // rewritten files carry the table's sort order id, not 0. The streaming full-rewrite writer
+                // (IcebergDataTaskWriter) already does this (#964); the copy path must match, or a rewrite
+                // routed here reports an unsorted order where Iceberg reports the table order.
+                .withSortOrderId(spec.sortOrderId())
                 .withSplitOffsets(appender.splitOffsets());
         if (partition != null) {
             b.withPartition(partition);
@@ -379,9 +429,13 @@ public final class IcebergRewriteFileTaskWriter implements AutoCloseable {
      * instead. Checks only the lineage-free data columns (ids below the write
      * schema's data field count); v3 lineage columns are the writer's own.
      */
-    private boolean survivorHasNullInRequired(FileBuffer buffer, MessageType fileSchema) {
+    private boolean survivorHasNullInRequiredCopied(FileBuffer buffer, MessageType fileSchema, boolean[] copyMask) {
         int fields = Math.min(fileSchema.getFieldCount(), dataOrdinals.length);
         for (int f = 0; f < fields; f++) {
+            // Only a COPIED REQUIRED column matters; an ENCODED column uses the write schema's OPTIONAL field.
+            if (copyMask != null && f < copyMask.length && !copyMask[f]) {
+                continue;
+            }
             org.apache.parquet.schema.Type type = fileSchema.getType(f);
             if (!type.isRepetition(org.apache.parquet.schema.Type.Repetition.REQUIRED)) {
                 continue;
@@ -400,6 +454,62 @@ public final class IcebergRewriteFileTaskWriter implements AutoCloseable {
             }
         }
         return false;
+    }
+
+    /**
+     * Whether an UPDATE re-encodes (changes) a column the table partitions by,
+     * so a rewritten row might move partition. The write-schema Parquet fields
+     * carry Iceberg's source field ids; a partition field's {@code sourceId}
+     * names the column it transforms. Only meaningful when a data column is
+     * re-encoded (an UPDATE); a DELETE changes no value.
+     */
+    private boolean changesPartitionColumn() {
+        if (maskOrNull() == null || spec.spec().isUnpartitioned()) {
+            return false;
+        }
+        java.util.Set<Integer> partitionSourceIds = new java.util.HashSet<>();
+        for (org.apache.iceberg.PartitionField pf : spec.spec().fields()) {
+            partitionSourceIds.add(pf.sourceId());
+        }
+        int dataCols = writeSchema.getFieldCount();
+        for (int i = 0;
+             i < dataCols && i < encodeColumns.length;
+             i++) {
+            if (!encodeColumns[i]) {
+                continue;
+            }
+            org.apache.parquet.schema.Type t = writeSchema.getType(i);
+            if (t.getId() != null && partitionSourceIds.contains(t.getId()
+                    .intValue())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * The encode mask to hand the planner, or {@code null} to keep the M4a copy
+     * logic (copy every data column, encode only v3 lineage). Returns the mask
+     * only when a DATA column (not just lineage) is marked for re-encoding --
+     * i.e. an UPDATE whose changed columns the strategy identified. A DELETE
+     * (lineage-only mask) returns {@code null} so M4a's whole-group / lineage
+     * copy runs unchanged.
+     */
+    private boolean[] maskOrNull() {
+        // The two v3 lineage columns are the trailing write-schema columns; a mask that marks only those (or
+        // nothing) is a DELETE-shaped mask. Treat the leading (data) columns only.
+        int dataCols = writeSchema.getFieldCount();
+        // Lineage columns are those whose field id is one of the reserved lineage ids.
+        for (int i = 0;
+             i < dataCols && i < encodeColumns.length;
+             i++) {
+            org.apache.parquet.schema.Type t = writeSchema.getType(i);
+            boolean lineage = t.getId() != null && (t.getId().intValue() == Integer.MAX_VALUE - 107 || t.getId().intValue() == Integer.MAX_VALUE - 108);
+            if (encodeColumns[i] && !lineage) {
+                return encodeColumns;
+            }
+        }
+        return null;
     }
 
     /**
@@ -430,6 +540,69 @@ public final class IcebergRewriteFileTaskWriter implements AutoCloseable {
                 appender.write(gathered, 0, rows.length);
                 i = j;
             }
+        }
+    }
+
+    /**
+     * Copies one row group as a MIX of copied and encoded column chunks (#901
+     * M4a v3 lineage): the data chunks are copied byte for byte from {@code
+     * sourceBlock} and the columns the mask marks for encoding (the two v3
+     * lineage columns) are encoded from the group's rows. Every row of the
+     * group survives (this is a COPY group, no deletions), so the rows are the
+     * whole group in {@code _pos} order. The group may span several buffered
+     * batches, so its rows are gathered into one or more sub-runs (one per
+     * source chunk run) and the writer concatenates them into one group.
+     */
+    private void copyMixedGroup(
+            IcebergParquetAppender appender,
+            ParquetFileReader indexReader,
+            SeekableInputStream stream,
+            org.apache.parquet.hadoop.metadata.BlockMetaData sourceBlock,
+            RowGroupCopyPlanner.Group g,
+            boolean[] copyMask,
+            FileBuffer buffer,
+            long[] posToPacked,
+            int outCols)
+            throws IOException {
+        long start = g.start();
+        long endPos = start + g.rowCount();
+        // The (chunk,row) of every position in this group, in position order. A COPY group has every position.
+        List<Long> packed = new ArrayList<>((int) g.rowCount());
+        for (long p = start; p < endPos; p++) {
+            long pk = posToPacked[(int) p];
+            if (pk >= 0) {
+                packed.add(pk);
+            }
+        }
+        if (packed.isEmpty()) {
+            return;
+        }
+        try (Arena a = Arena.ofConfined()) {
+            // Gather, per source chunk, the rows that fall in this group, in position order: one sub-run per
+            // contiguous run of the same chunk. Gather ONLY the columns the writer will ENCODE (copyMask[c] ==
+            // false) within outCols -- a copied column's bytes come straight from the source, so gathering its
+            // values is wasted work. Un-gathered slots are null and never read.
+            boolean[] gather = new boolean[outCols];
+            for (int c = 0; c < outCols; c++) {
+                gather[c] = c >= copyMask.length || !copyMask[c];
+            }
+            List<List<VectorBuffers>> runs = new ArrayList<>();
+            int i = 0;
+            while (i < packed.size()) {
+                int chunk = (int) (packed.get(i) >>> 32);
+                int j = i;
+                while (j < packed.size() && (int) (packed.get(j) >>> 32) == chunk) {
+                    j++;
+                }
+                int[] rows = new int[j - i];
+                for (int t = 0; t < rows.length; t++) {
+                    rows[t] = (int) (packed.get(i + t) & 0xffffffffL);
+                }
+                runs.add(Gather.rowsSelected(buffer.dataChunks.get(chunk), rows, gather, outCols, a));
+                i = j;
+            }
+            appender.copyRowGroupColumns(indexReader, stream, sourceBlock, copyMask, runs,
+                    packed.size());
         }
     }
 

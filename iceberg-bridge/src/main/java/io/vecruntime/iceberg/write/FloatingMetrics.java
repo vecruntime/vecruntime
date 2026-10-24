@@ -82,12 +82,23 @@ final class FloatingMetrics {
 
     FloatingMetrics(Schema schema) {
         List<Types.NestedField> fields = schema.asStruct().fields();
+        // The column index is PHYSICAL: a v3 unknown field is not stored in the data file (Iceberg's
+        // TypeToMessageType omits it) and is dropped from the columns handed to #add, so it takes no column
+        // slot. An unknown field holds no float/double leaf, so it is simply skipped here.
+        int column = 0;
         for (int c = 0; c < fields.size(); c++) {
+            if (fields.get(c)
+                      .type()
+                      .typeId()
+                    == Type.TypeID.UNKNOWN) {
+                continue;
+            }
             collect(
                     fields.get(c).fieldId(),
                     fields.get(c).type(),
-                    c,
+                    column,
                     List.of());
+            column++;
         }
     }
 
@@ -98,12 +109,22 @@ final class FloatingMetrics {
             case DOUBLE -> leaves.add(new Leaf(id, column, List.copyOf(steps), false));
             case STRUCT -> {
                 List<Types.NestedField> fields = type.asStructType().fields();
+                // Physical child index: an unknown struct field is dropped from the struct's children, so it
+                // takes no slot (and holds no float/double leaf).
+                int child = 0;
                 for (int k = 0; k < fields.size(); k++) {
+                    if (fields.get(k)
+                              .type()
+                              .typeId()
+                            == Type.TypeID.UNKNOWN) {
+                        continue;
+                    }
                     collect(
                             fields.get(k).fieldId(),
                             fields.get(k).type(),
                             column,
-                            with(steps, new Step(false, k)));
+                            with(steps, new Step(false, child)));
+                    child++;
                 }
             }
             case LIST -> {
@@ -135,6 +156,12 @@ final class FloatingMetrics {
     void add(List<? extends VectorBuffers> columns, int first, int end) {
         for (Leaf leaf : leaves) {
             VectorBuffers v = columns.get(leaf.column);
+            // A null column is a COPIED column on the M4b copy path (its values were not gathered). A copied
+            // float/double is never NaN-tracked (the planner declines the copy otherwise), so it contributes
+            // no metric -- skip it.
+            if (v == null) {
+                continue;
+            }
             if (leaf.steps.isEmpty() && v.validity() == null) {
                 addAll(leaf, v.data(), first, end);
                 continue;
