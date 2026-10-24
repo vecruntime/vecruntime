@@ -399,9 +399,13 @@ public final class ColumnarParquetWriter implements AutoCloseable {
         List<ColumnDescriptor> outLeaves = schema.getColumns();
 
         file.startBlock(rowCount);
-        // Copied chunks first (in leaf order), then encoded chunks: the physical order of chunks within a block
-        // is free (the footer records each chunk's offset and a reader seeks by it), and keeping copies and
-        // encodes in two passes avoids interleaving a direct file append with a page-store flush.
+        // Write every column's chunk in SCHEMA (leaf) order, interleaving copied and encoded chunks, so a
+        // copy-path file's physical chunk layout is identical to a file written column by column from scratch.
+        // The physical order of chunks within a block is otherwise free (the footer records each chunk's offset
+        // and a reader seeks by it), but parquet-java's column-index-filtered read path (used by the engine's
+        // own sampling / sort scans) builds the row group's page store assuming schema-ordered chunks, so a
+        // block whose chunks were out of schema order (copied-then-encoded) lost the physically-first column and
+        // failed read-back with "column ... is not in the store". Keeping schema order removes that divergence.
         //
         // The source file holds a chunk for every DATA column (copied OR changed/encoded), in schema order, but
         // NOT the v3 lineage columns (which the source never materialises). So the source leaf cursor `srcIdx`
@@ -420,20 +424,16 @@ public final class ColumnarParquetWriter implements AutoCloseable {
                     file.appendColumnChunk(desc, source, src, reader.readBloomFilter(src),
                             reader.readColumnIndex(src), reader.readOffsetIndex(src));
                 }
+            } else {
+                if (nested[i] != null) {
+                    throw new IllegalArgumentException("mixed-group copy can ENCODE only flat columns; field " + schema.getType(i).getName() + " is nested (a changed nested column must take the full rewrite)");
+                }
+                encodeColumnChunk(i, encodedRuns, rowCount);
             }
             if (!sourceAbsent) {
                 srcIdx += leaves; // this data column occupies leaves in the source, whether copied or re-encoded
             }
             leaf += leaves;
-        }
-        for (int i = 0; i < schema.getFieldCount(); i++) {
-            if (copy[i]) {
-                continue;
-            }
-            if (nested[i] != null) {
-                throw new IllegalArgumentException("mixed-group copy can ENCODE only flat columns; field " + schema.getType(i).getName() + " is nested (a changed nested column must take the full rewrite)");
-            }
-            encodeColumnChunk(i, encodedRuns, rowCount);
         }
         file.endBlock();
         totalRows += rowCount;

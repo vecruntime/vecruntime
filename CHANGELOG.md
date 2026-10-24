@@ -77,6 +77,15 @@ version may change configuration keys or defaults, always noted here.
 
 ### Fixed
 
+- The copy-on-write UPDATE / MERGE column-chunk copy writer (#901 M4b) now writes a rewritten row group's column
+  chunks in **schema order**, interleaving copied and re-encoded chunks, instead of "all copied columns first,
+  then all re-encoded columns". A file whose UPDATE changed a schema-later column had its chunks physically out of
+  schema order; parquet-java's column-index-filtered read path -- which the engine's own sampling / sort scans use
+  during the next copy-on-write rewrite -- builds a row group's page store assuming schema-ordered chunks and
+  dropped the physically-first column, so read-back failed with `column ... is not in the store`. Surfaced by
+  Apache Iceberg 1.12's own `TestCopyOnWriteUpdate` subquery cases run with the plugin and writers on; regression
+  test `CowUpdateSubqueryReadbackSuite` (two sequential copy-on-write UPDATEs on a tiny table). The copy-path file
+  is now byte-order-identical to one written column by column, which the reader handles everywhere.
 - The native Iceberg scan no longer re-packs Iceberg's task groups with Spark's file-scan heuristics, which could
   merge groups Iceberg deliberately kept separate and collapse the output-file count of a row-level write. Iceberg
   plans its task groups honouring `read.split.target-size`, `read.split.open-file-cost` and
