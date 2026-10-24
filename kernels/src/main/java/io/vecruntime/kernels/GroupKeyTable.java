@@ -384,6 +384,72 @@ public final class GroupKeyTable {
         }
     }
 
+    private int[] gatherInts = new int[0];
+    private long[] gatherLongs = new long[0];
+
+    /**
+     * Column {@code c}'s keys (its int {@code at}) of groups {@code [from, from
+     * + count)}, gathered from the rows in one strided pass: the key output
+     * then copies them out in one go, as it did from a column array.
+     */
+    private int[] gatherInts(int c, int at, int from,
+            int count) {
+        if (gatherInts.length < count) {
+            gatherInts = new int[Math.max(count, 2 * gatherInts.length)];
+        }
+        int[] out = gatherInts;
+        int w = width;
+        if (rowSeg == null) {
+            int[] r = rows;
+            int i = from * w + keyOff[c] + at;
+            for (int o = 0;
+                 o < count;
+                 o++, i += w) {
+                out[o] = r[i];
+            }
+        } else {
+            MemorySegment r = rowSeg;
+            long i = (long) from * w + keyOff[c] + at;
+            for (int o = 0;
+                 o < count;
+                 o++, i += w) {
+                out[o] = r.getAtIndex(ROW_INT, i);
+            }
+        }
+        return out;
+    }
+
+    /**
+     * {@link #gatherInts} for a long key (or limb) at int {@code at} of column
+     * {@code c}.
+     */
+    private long[] gatherLongs(int c, int at, int from,
+            int count) {
+        if (gatherLongs.length < count) {
+            gatherLongs = new long[Math.max(count, 2 * gatherLongs.length)];
+        }
+        long[] out = gatherLongs;
+        int w = width;
+        if (rowSeg == null) {
+            int[] r = rows;
+            int i = from * w + keyOff[c] + at;
+            for (int o = 0;
+                 o < count;
+                 o++, i += w) {
+                out[o] = (r[i] & 0xFFFF_FFFFL) | ((long) r[i + 1] << 32);
+            }
+        } else {
+            MemorySegment r = rowSeg;
+            long i = (long) from * w + keyOff[c] + at;
+            for (int o = 0;
+                 o < count;
+                 o++, i += w) {
+                out[o] = r.get(ROW_LONG, 4L * i);
+            }
+        }
+        return out;
+    }
+
     /**
      * Room for {@code cap} groups' rows, copying the first {@link #size}; moves
      * them to the pool past the size.
@@ -2698,9 +2764,8 @@ public final class GroupKeyTable {
         for (int o = 0; o < count; o++) {
             Bitmap.setTo(validity, o, !nulls[c].get(from + o));
         }
-        for (int o = 0; o < count; o++) {
-            ids.set(VectorBuffers.LE_INT, (long) o << 2, keyInt(c, from + o));
-        }
+        MemorySegment.copy(gatherInts(c, 0, from, count), 0, ids, VectorBuffers.LE_INT, 0,
+                count);
     }
 
     /** Total UTF-8 bytes of the keys in {@code [from, to)} of column {@code c}. */
@@ -2710,10 +2775,11 @@ public final class GroupKeyTable {
         }
         StringDictionary d = dicts[c];
         BitSet nul = nulls[c];
+        int[] ids = gatherInts(c, 0, from, to - from);
         long total = 0;
         for (int gid = from; gid < to; gid++) {
             if (!nul.get(gid)) {
-                total += d.length(keyInt(c, gid));
+                total += d.length(ids[gid - from]);
             }
         }
         return total;
@@ -2731,21 +2797,16 @@ public final class GroupKeyTable {
             Bitmap.setTo(validity, o, !nulls[c].get(from + o));
         }
         switch (types[c]) {
-            case INT32 -> {
-                for (int o = 0; o < count; o++) {
-                    data.set(VectorBuffers.LE_INT, (long) o << 2, keyInt(c, from + o));
-                }
-            }
+            case INT32 -> MemorySegment.copy(gatherInts(c, 0, from, count), 0, data, VectorBuffers.LE_INT, 0,
+                    count);
             case BOOL -> {
+                int[] v = gatherInts(c, 0, from, count);
                 for (int o = 0; o < count; o++) {
-                    Bitmap.setTo(data, o, keyInt(c, from + o) != 0);
+                    Bitmap.setTo(data, o, v[o] != 0);
                 }
             }
-            case INT64, FLOAT64 -> {
-                for (int o = 0; o < count; o++) {
-                    data.set(VectorBuffers.LE_LONG, (long) o << 3, keyLong(c, from + o, 0));
-                }
-            }
+            case INT64, FLOAT64 -> MemorySegment.copy(gatherLongs(c, 0, from, count), 0, data, VectorBuffers.LE_LONG, 0,
+                    count);
             case DECIMAL128 -> {
                 for (int o = 0; o < count; o++) {
                     Decimal128.set(data, o, keyLong(c, from + o, 2), keyLong(c, from + o, 0));
@@ -2771,6 +2832,7 @@ public final class GroupKeyTable {
                 StringDictionary d = dicts[c];
                 BitSet nul = nulls[c];
                 int total = (int) utf8Bytes(c, from, to);
+                int[] ids = gatherInts(c, 0, from, count);
                 if (emitScratch.length < total) {
                     emitScratch = new byte[Math.max(total, emitScratch.length * 2)];
                 }
@@ -2781,7 +2843,7 @@ public final class GroupKeyTable {
                 for (int o = 0; o < count; o++) {
                     int gid = from + o;
                     if (!nul.get(gid)) {
-                        int id = keyInt(c, gid);
+                        int id = ids[o];
                         int len = d.length(id);
                         System.arraycopy(store, d.offset(id), scratch, out, len);
                         out += len;
