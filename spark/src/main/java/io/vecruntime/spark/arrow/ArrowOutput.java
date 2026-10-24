@@ -417,6 +417,24 @@ public final class ArrowOutput {
     }
 
     /**
+     * #928 step 2 counter: "fromZero" when {@code idx[from..to)} is 0, 1, 2,
+     * ... (the output is the input's leading rows), "slice" when it is any
+     * other run of consecutive rows, null otherwise.
+     */
+    static String consecutiveRun(int[] idx, int from, int to) {
+        if (to <= from) {
+            return null;
+        }
+        int first = idx[from];
+        for (int o = from + 1; o < to; o++) {
+            if (idx[o] != first + (o - from)) {
+                return null;
+            }
+        }
+        return first == 0 ? "fromZero" : "slice";
+    }
+
+    /**
      * Gathers rows {@code idx[from..to)} of {@code in} into a new Arrow vector;
      * an index of {@code -1} becomes a null (outer-join padding).
      * Dictionary-encoded strings are decoded: the output is a plain vector
@@ -484,6 +502,15 @@ public final class ArrowOutput {
         ArrowVectorBuffers out = allocateFixed(name, dt, count, allocator);
         io.vecruntime.kernels.CopyCounters.add("ArrowOutput.gather.fixed", out.data()
                 .byteSize());
+        if (io.vecruntime.kernels.CopyCounters.ON && !padded) {
+            // #928 step 2: how much of this gather is a run of consecutive input rows -- an output that a
+            // slice of the input buffer (or the whole buffer, from row 0) could stand for without a copy.
+            String run = consecutiveRun(idx, from, to);
+            if (run != null) {
+                io.vecruntime.kernels.CopyCounters.add("ArrowOutput.gather.fixed." + run,
+                        out.data().byteSize());
+            }
+        }
         GatherKernels.gatherFixed(in, idx, from, to, out.data(),
                 nulls ? out.validity() : null);
         return finish(out, count, !nulls);
