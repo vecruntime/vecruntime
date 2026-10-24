@@ -1266,23 +1266,56 @@ private[vecruntime] object IcebergTasks {
   }
 
   /**
-   * Iceberg's own split target size for the scanned table (`read.split.target-size`, default 128 MB), the size
-   * Iceberg groups task files up to. Our packing never merges task groups beyond this, so it respects the same
-   * file-size contract Iceberg's own grouping did. (A split size set as a scan READ OPTION overrides the table
-   * property in Iceberg; for the row-level writes and the skew tests the value comes from the table property, which
-   * this reads, matching `SparkReadConf.splitSize`'s fallback.)
+   * The Iceberg scan's own `SparkReadConf` (`org.apache.iceberg.spark.source.SparkScan`'s private `readConf`
+   * field), which resolves the split settings as Iceberg does -- a per-scan READ OPTION
+   * (`spark.read().option("split-size"|"file-open-cost"|"lookback", ...)`, as the bin-pack rewrite runner sets
+   * them) overriding the table property, then the table property, then Iceberg's default. None when the scan is
+   * not a `SparkScan` or has no such field (an older Iceberg), where the caller falls back to the table property.
    */
-  def splitSize(scan: BatchScanExec): Long =
-    tableLongProperty(scan, "read.split.target-size", 128L * 1024 * 1024)
+  private def readConf(scan: BatchScanExec): Option[AnyRef] = {
+    var c: Class[_] = scan.scan.getClass
+    while (c != null) {
+      try {
+        val f = c.getDeclaredField("readConf")
+        f.setAccessible(true)
+        return Option(f.get(scan.scan))
+      } catch { case _: NoSuchFieldException => c = c.getSuperclass }
+    }
+    None
+  }
+
+  /** Call a no-arg numeric method on the scan's `readConf` (e.g. `splitSize`), None if it or the conf is absent. */
+  private def readConfLong(scan: BatchScanExec, method: String): Option[Long] =
+    readConf(scan).flatMap { rc =>
+      try {
+        val m = rc.getClass.getMethod(method)
+        m.setAccessible(true)
+        Some(m.invoke(rc).asInstanceOf[Number].longValue())
+      } catch { case _: ReflectiveOperationException => None }
+    }
 
   /**
-   * Iceberg's own per-file open cost for the scanned table (`read.split.open-file-cost`, default 4 MB), the weight
-   * Iceberg adds per file when grouping. A table that sets this very high (the Iceberg copy-on-write skew tests set
-   * it to Int.MAX so every file is its own group) makes each group weigh more than the split size, so our packing
-   * keeps one partition per group, as Iceberg planned.
+   * Iceberg's own split target size for THIS scan (`SparkReadConf.splitSize`): a per-scan `split-size` read option
+   * (as `SparkBinPackFileRewriteRunner` / `SparkRewriteFileRunner` set via `spark.read().option(...)`) overriding
+   * the table's `read.split.target-size`, then Iceberg's 128 MB default. Our packing never merges task groups
+   * beyond this, so it respects the same file-size contract Iceberg's own grouping used for this very scan --
+   * reading only the table property would diverge from Iceberg when a read option is in force.
+   */
+  def splitSize(scan: BatchScanExec): Long =
+    readConfLong(scan, "splitSize").getOrElse(tableLongProperty(scan, "read.split.target-size", 128L * 1024 * 1024))
+
+  /**
+   * Iceberg's own per-file open cost for THIS scan (`SparkReadConf.splitOpenFileCost`): a per-scan `file-open-cost`
+   * read option overriding the table's `read.split.open-file-cost`, then Iceberg's 4 MB default. A scan that sets
+   * this very high (one file per group, as the Iceberg copy-on-write skew tests and the bin-pack copy runner's
+   * split-declining do) makes each group weigh more than the split size, so our packing keeps one partition per
+   * group, as Iceberg planned.
    */
   def splitOpenFileCost(scan: BatchScanExec): Long =
-    tableLongProperty(scan, "read.split.open-file-cost", 4L * 1024 * 1024)
+    readConfLong(
+      scan,
+      "splitOpenFileCost"
+    ).getOrElse(tableLongProperty(scan, "read.split.open-file-cost", 4L * 1024 * 1024))
 
   /** Iceberg's own `BaseDeleteLoader`, opening delete files through the partition's `FileIO`, and its class. */
   private def deleteLoader(p: InputPartition): (Class[_], AnyRef) = {

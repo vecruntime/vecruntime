@@ -73,7 +73,12 @@ version may change configuration keys or defaults, always noted here.
   -- the Iceberg 1.12 `TestCopyOnWrite/MergeOnRead#testSkew*` cases read `added-data-files` 2 where 4 was expected.
   Packing now weighs each group by Iceberg's own open-file-cost and merges only up to Iceberg's own target split size,
   so it never crosses a boundary Iceberg itself kept (a high open-file-cost keeps one partition per group); for an
-  ordinary table, whose groups Iceberg has already packed to the target size, it is a no-op.
+  ordinary table, whose groups Iceberg has already packed to the target size, it is a no-op. The split size and
+  open-file cost are read from the Iceberg scan's OWN `SparkReadConf` (reflectively, via the scan object's private
+  `readConf`), so a PER-SCAN read option (`spark.read().option("split-size"|"file-open-cost", ...)`, as the bin-pack
+  rewrite runner passes them) overrides the table property exactly as Iceberg resolves it -- a prior version read
+  only the table property and diverged from Iceberg's grouping when a read option was in force (e.g. the bin-pack
+  rewrite of mixed-size files after the copy runner declines a group that needs splitting).
 
 ### Changed
 

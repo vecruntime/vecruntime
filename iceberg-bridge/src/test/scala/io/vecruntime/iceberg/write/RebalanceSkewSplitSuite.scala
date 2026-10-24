@@ -273,4 +273,49 @@ class RebalanceSkewSplitSuite extends AnyFunSuite with BeforeAndAfterAll {
       "our native Iceberg scan merged Iceberg's 4 one-file task groups into fewer Spark partitions"
     )
   }
+
+  /** Our scan's partition count and Iceberg's planned task-group count for a read of `t` with `options`. */
+  private def partitionsWithOptions(t: String, featuresOn: Boolean, options: Map[String, String]): (Int, Int) = {
+    withSQLConf("spark.sql.files.minPartitionNum" -> "1") {
+      withFeatures(on = featuresOn) {
+        val reader = options.foldLeft(spark.read.format("iceberg"))((r, kv) => r.option(kv._1, kv._2))
+        val df = reader.load(t).selectExpr("id", "dep")
+        val plan = df.queryExecution.executedPlan
+        if (featuresOn) {
+          val scan = nodesOf(plan).collectFirst {
+            case s: org.apache.spark.sql.vecruntime.VectorIcebergScanExec => s
+          }.getOrElse(fail(s"no VectorIcebergScanExec in\n$plan"))
+          (scan.executeColumnar().getNumPartitions, scan.scan.inputRDD.partitions.length)
+        } else {
+          val scan = nodesOf(plan).collectFirst {
+            case s: org.apache.spark.sql.execution.datasources.v2.BatchScanExec => s
+          }.getOrElse(fail(s"no BatchScanExec in\n$plan"))
+          val n = scan.inputRDD.partitions.length
+          (n, n)
+        }
+      }
+    }
+  }
+
+  test("per-scan read options (file-open-cost / split-size) drive our grouping, not table properties") {
+    // The table property leaves the default open-file-cost; the per-scan read option raises it so Iceberg
+    // plans one task group per file -- exactly how the bin-pack rewrite runner passes split settings. Our
+    // scan must read the scan's OWN SparkReadConf, not the table property, so it keeps one partition per group.
+    val t = "ice.db.opt_scan"
+    spark.sql(s"DROP TABLE IF EXISTS $t")
+    spark.sql(s"CREATE TABLE $t (id INT, dep STRING) USING iceberg PARTITIONED BY (dep)")
+    (0 until 4).foreach(_ =>
+      spark.sql(s"INSERT INTO $t SELECT cast(id as int) id, 'hr' dep FROM range(0, 100)")
+    )
+    val opts = Map("file-open-cost" -> Int.MaxValue.toString)
+    val (offParts, offGroups) = partitionsWithOptions(t, featuresOn = false, opts)
+    val (onParts, onGroups) = partitionsWithOptions(t, featuresOn = true, opts)
+    // scalastyle:off println
+    println(s"[SCAN-OPT] offParts=$offParts offGroups=$offGroups onParts=$onParts onGroups=$onGroups")
+    // scalastyle:on println
+    assert(offGroups == 4, s"the read option should make Iceberg plan 4 task groups (got $offGroups)")
+    assert(onGroups == 4, s"features on: Iceberg should plan 4 task groups under the read option (got $onGroups)")
+    assert(onParts == onGroups, s"our scan merged groups the read option kept separate: $onParts vs $onGroups")
+    assert(onParts == offParts, s"features on ($onParts) differs from plugin off ($offParts) under the read option")
+  }
 }
