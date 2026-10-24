@@ -763,7 +763,7 @@ object BuildTable {
     perRelation.synchronized {
       var t = perRelation.get(key)
       if (t == null) {
-        t = make
+        t = TaskNativeMemory.unaccounted(make) // the executor's memory, freed by the cleaner, not the task's (#940)
         val table = t
         cleaner.register(relation, () => table.release())
         perRelation.put(key, t)

@@ -136,8 +136,34 @@ object TaskNativeMemory extends org.apache.spark.internal.Logging {
 
   /** The account of the task running on this thread, opened on first use; null off a task thread. */
   def current(): NativePool.Account = {
+    if (unaccountedDepth.get()(0) > 0) return null
     val tc = TaskContext.get()
     if (tc == null || tc.taskMemoryManager() == null) null else accountOf(tc, VectorSortIterator.memoryMode())
+  }
+
+  /**
+   * #940: opens the task's account before any operator registers a completion listener. Spark runs those
+   * listeners in reverse order of registration, so an account opened lazily, on the first pooled block, was
+   * completed BEFORE the operators that close their memory in their own listener (the aggregate's
+   * accumulators): its memory counted as leaked although the same completion pass freed it a moment later.
+   * Opened here, from the executor plugin's `onTaskStart`, the account's listener runs last.
+   */
+  def onTaskStart(): Unit = if (installed) current()
+
+  private val unaccountedDepth = ThreadLocal.withInitial[Array[Int]](() => Array(0))
+
+  /**
+   * Runs `f` with no task account: what it allocates from the pool is the executor's, not this task's
+   * (#940). For memory that outlives the task by design -- a broadcast's build table, shared by every task
+   * of the executor and freed by its relation's cleaner -- charging the task that happened to build it
+   * left those bytes charged at that task's completion (counted as leaked), and credited a finished task
+   * when the cleaner closed them.
+   */
+  def unaccounted[T](f: => T): T = {
+    val d = unaccountedDepth.get()
+    d(0) += 1
+    try f
+    finally d(0) -= 1
   }
 
   /**
