@@ -5,7 +5,7 @@ title: Columnar Parquet writer
 
 # Columnar Parquet writer (#64)
 
-`spark.vecruntime.write.columnar.enabled` (default `false`) writes a Spark Parquet write
+`spark.vecruntime.write.columnar.enabled` (default `true` since 2026-10-23) writes a Spark Parquet write
 (`df.write.parquet`, `INSERT` into a Parquet table, `CREATE TABLE ... USING parquet AS SELECT`) straight
 from our columnar batches, with no conversion to rows and no parquet-java `ParquetWriteSupport` in
 between. The work list for a complete writer (nested types, Iceberg, the remaining options) is #842.

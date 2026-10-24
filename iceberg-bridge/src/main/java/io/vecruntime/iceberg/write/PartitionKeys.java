@@ -177,54 +177,60 @@ final class PartitionKeys {
      * down to it.
      */
     private static Located locate(Schema schema, int sourceId) {
+        // The column and struct-child indices are PHYSICAL: a v3 unknown field is dropped from the columns the
+        // writer sees (SparkLanes), so it takes no slot. An unknown field can never be (or contain) a partition
+        // source, so skipping it here only renumbers the siblings a source is actually found among.
         List<Types.NestedField> columns = schema.columns();
+        int column = 0;
         for (int c = 0; c < columns.size(); c++) {
             Types.NestedField top = columns.get(c);
+            if (top.type().typeId() == Type.TypeID.UNKNOWN) {
+                continue;
+            }
             if (top.fieldId() == sourceId) {
-                return new Located(c, List.of(), top);
+                return new Located(column, List.of(), top);
             }
-            List<Integer> path = pathTo(top.type(), sourceId);
-            if (path != null) {
-                return new Located(c, path, leafAt(top, path));
+            Located nested = pathTo(top, sourceId);
+            if (nested != null) {
+                return new Located(column, nested.structPath(), nested.leaf());
             }
+            column++;
         }
         throw new IllegalStateException("partition source " + sourceId + " is not in the write schema");
     }
 
     /**
-     * The struct-child path from {@code type} to field {@code id}, or null when
-     * not a struct descendant.
+     * The PHYSICAL struct-child path from {@code field}'s type to field {@code
+     * id} and the leaf field itself, or null when {@code id} is not a struct
+     * descendant. Physical means an unknown struct child takes no slot, matching
+     * the children the writer keeps.
      */
-    private static List<Integer> pathTo(Type type, int id) {
-        if (!type.isStructType()) {
+    private static Located pathTo(Types.NestedField field, int id) {
+        if (!field.type().isStructType()) {
             return null;
         }
-        List<Types.NestedField> fs = type.asStructType().fields();
+        List<Types.NestedField> fs = field.type()
+                .asStructType()
+                .fields();
+        int child = 0;
         for (int i = 0; i < fs.size(); i++) {
             Types.NestedField f = fs.get(i);
+            if (f.type().typeId() == Type.TypeID.UNKNOWN) {
+                continue;
+            }
             if (f.fieldId() == id) {
-                return List.of(i);
+                return new Located(0, List.of(child), f);
             }
-            List<Integer> rest = pathTo(f.type(), id);
+            Located rest = pathTo(f, id);
             if (rest != null) {
-                List<Integer> p = new java.util.ArrayList<>(rest.size() + 1);
-                p.add(i);
-                p.addAll(rest);
-                return List.copyOf(p);
+                List<Integer> p = new java.util.ArrayList<>(rest.structPath().size() + 1);
+                p.add(child);
+                p.addAll(rest.structPath());
+                return new Located(0, List.copyOf(p), rest.leaf());
             }
+            child++;
         }
         return null;
-    }
-
-    private static Types.NestedField leafAt(Types.NestedField top, List<Integer> path) {
-        Types.NestedField f = top;
-        for (int idx : path) {
-            f = f.type()
-                 .asStructType()
-                 .fields()
-                 .get(idx);
-        }
-        return f;
     }
 
     /**

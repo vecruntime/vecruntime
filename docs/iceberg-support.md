@@ -28,9 +28,9 @@ Iceberg 1.12 · Spark 4.1 · format versions 1, 2 and 3
 | Partition transforms and partition-spec evolution | **✓** |
 | Time travel, branches and tags | **✓** |
 | v3 default values, variants | **✓** |
-| ORC / Avro files, encrypted files, `time` / `uuid` / `timestamp_ns` | **✗** |
+| ORC / Avro files, encrypted files, `time` / `timestamp_ns` | **✗** |
 
-Turn it on with `spark.vecruntime.scan.nativeIceberg.enabled=true`.
+On by default; turn it off with `spark.vecruntime.scan.nativeIceberg.enabled=false`.
 
 ## Writing
 
@@ -44,14 +44,15 @@ Turn it on with `spark.vecruntime.scan.nativeIceberg.enabled=true`.
 | Distribution modes none / hash / range, without Spark's row exchange | **✓** |
 | Nested columns (struct, list, map) | **✓** |
 | Row lineage on v3 | **✓** |
-| Merge-on-read on tables with map columns | **◐** `DELETE` and `UPDATE` are columnar end to end; a `MERGE` still reads its input as rows |
+| Merge-on-read on tables with map columns | **✓** `DELETE`, `UPDATE` and `MERGE` are columnar end to end, including `map<_, struct>` and a map nested in a struct |
 | float / double inside a list or map | **✓** |
 | `fixed`, `uuid` columns | **✓** |
 | `variant` columns (not shredded) | **✓** |
+| `unknown` columns (v3), at the top level and inside structs | **✓** not stored, as Iceberg's writer omits them |
 | ORC / Avro, encrypted tables | **✗** |
 
-Turn it on with `spark.vecruntime.iceberg.writer.enabled=true`. For merge-on-read, also set
-`spark.vecruntime.iceberg.dvWriter.enabled=true`.
+On by default; turn it off with `spark.vecruntime.iceberg.writer.enabled=false`. Merge-on-read writes
+also hang from `spark.vecruntime.iceberg.dvWriter.enabled` (on by default).
 
 Table properties are honoured as Iceberg's own writer honours them: target file size, Parquet row-group,
 page and dictionary sizes, codec and level, bloom filters, metrics modes, distribution mode, fanout and

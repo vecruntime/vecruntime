@@ -93,6 +93,18 @@ public final class SparkColumnVectorBuffers {
     }
 
     public static VectorBuffers copy(ColumnVector cv, int numRows, Arena arena) {
+        if (cv.dataType() == null || cv.dataType() instanceof org.apache.spark.sql.types.NullType) {
+            // An all-null column with no engine type (#901 R3: an UPDATE / MERGE metadata-row projection
+            // carries a typed-null slot that reaches our Expand / Filter as a vector whose dataType() is
+            // NullType -- or literally null, as Iceberg's metadata-struct child vector reports it). It has
+            // no lane of its own -- every value is null -- so it rides an INT32 lane whose validity marks
+            // every row null; the data bytes are never read. Consumers keyed on the output type
+            // (ArrowOutput.compact / copy / gather) short-circuit an all-null lane to a typed null column,
+            // so the placeholder lane's own width never matters.
+            MemorySegment validity = ArrowLayout.allocateBitmap(arena, numRows);
+            MemorySegment data = ArrowLayout.allocateData(arena, VecType.INT32, numRows);
+            return SegmentVectorBuffers.fixedWidth(VecType.INT32, numRows, validity, data);
+        }
         VecType type = TypeMapping.vecTypeOf(cv.dataType());
         if (type == null) {
             throw new UnsupportedOperationException("unsupported Spark type " + cv.dataType());

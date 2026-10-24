@@ -8,6 +8,31 @@ version may change configuration keys or defaults, always noted here.
 
 ### Added
 
+- Regression guard that our columnar shuffle and native Iceberg scan both preserve the file count of a row-level
+  write (`RebalanceSkewSplitSuite`, iceberg-bridge): the six Iceberg 1.12 `testSkew{Delete,Update,Merge}`
+  scenarios (copy-on-write and merge-on-read) run with our features off and on with a tiny Iceberg advisory
+  partition size (100) and `spark.sql.adaptive.optimizeSkewsInRebalancePartitions.enabled=true` and both produce
+  four files; plus a direct check that the native scan keeps one Spark partition per Iceberg task group when the
+  table sets a high `read.split.open-file-cost`.
+- The native Iceberg scan prunes data files by a broadcast hash join's RUNTIME filters before opening them
+  (#iceberg-file-pruning, `spark.vecruntime.scan.nativeIceberg.runtimeFilePruning.enabled`, on by default). Static
+  pushed filters are already pruned by Iceberg's planning, so those files are never opened; the runtime filters
+  (#610 -- an IN set or an integer-key range from the broadcast build side, known only after it runs) were
+  previously only ANDed into the per-file Parquet row-group statistics filter, so every data file was still opened
+  (a HEAD + footer read each) and only its row groups skipped. Iceberg's own runtime filtering prunes by partition
+  values only, never by column bounds. Now the runtime filters are built into an Iceberg `Expression` and the scan
+  re-plans on the driver -- same snapshot, the scan's residual AND the runtime expression (Iceberg strips
+  per-file bounds from its task files) -- and the files Iceberg's `InclusiveMetricsEvaluator` says
+  cannot match are dropped before partitions are built, so they are never opened. Delete files (position deletes,
+  deletion vectors, equality deletes) and v3 row lineage are safe to prune -- deletes only remove rows and lineage
+  is per-file. A file under metrics mode `none` is kept. The re-plan reads the snapshot's manifests again (no data
+  file is opened). New metric `numFilesPrunedByRuntimeFilter`; `numFiles` still counts files read.
+
+- Grouped aggregate state in the native pool (#941, `spark.vecruntime.agg.nativeState`, on by default): past 16,384
+  groups, the long sum, count and 128-bit decimal sum accumulators keep their state in one pool block each, a group's
+  fields side by side, charged to the task in the operators' memory mode, instead of `long[]` on the heap. At 10 TB
+  (26g heap, two full 99-query rounds each way) the run is 2,307 s against 2,328 s, GC -9.5%, q78's spill 613 GiB
+  against 760 GiB; on the heaviest queries after inlining the decimal-sum loop, -2.5% (q78 -10.8 s).
 - The native Iceberg scan reads the v3 merge-on-read metadata columns `_partition`, `_row_id` and
   `_last_updated_sequence_number` (#20 M3a), so a scan projecting them stays on our operators instead of falling
   back to Iceberg's reader (and, for an UPDATE's delete side over a map column, to rows). `_partition` is the
@@ -67,6 +92,42 @@ version may change configuration keys or defaults, always noted here.
 - `spark.vecruntime.scan.nativeParquet.lateMaterialization` default changed from `false` to `auto` (#962); the
   key now accepts `off`/`on`/`auto` as well as the legacy `false`/`true`. `auto` keeps the eager path except
   where a filter is selective on a wide projection, so it is safe to leave on by default.
+### Fixed
+
+- The copy-on-write UPDATE / MERGE column-chunk copy writer (#901 M4b) now writes a rewritten row group's column
+  chunks in **schema order**, interleaving copied and re-encoded chunks, instead of "all copied columns first,
+  then all re-encoded columns". A file whose UPDATE changed a schema-later column had its chunks physically out of
+  schema order; parquet-java's column-index-filtered read path -- which the engine's own sampling / sort scans use
+  during the next copy-on-write rewrite -- builds a row group's page store assuming schema-ordered chunks and
+  dropped the physically-first column, so read-back failed with `column ... is not in the store`. Surfaced by
+  Apache Iceberg 1.12's own `TestCopyOnWriteUpdate` subquery cases run with the plugin and writers on; regression
+  test `CowUpdateSubqueryReadbackSuite` (two sequential copy-on-write UPDATEs on a tiny table). The copy-path file
+  is now byte-order-identical to one written column by column, which the reader handles everywhere.
+- The native Iceberg scan no longer re-packs Iceberg's task groups with Spark's file-scan heuristics, which could
+  merge groups Iceberg deliberately kept separate and collapse the output-file count of a row-level write. Iceberg
+  plans its task groups honouring `read.split.target-size`, `read.split.open-file-cost` and
+  `read.split.planning-lookback`; `VectorIcebergRDD.packed` was re-grouping them by `spark.sql.files.maxPartitionBytes`
+  / `openCostInBytes` / `minPartitionNum`, so on a small cluster (or `files.minPartitionNum` low) it merged a table's
+  per-file groups down to the cluster's parallelism. A copy-on-write / merge-on-read DELETE, UPDATE or MERGE on a
+  table with a high `read.split.open-file-cost` (one file per group) then wrote fewer files than Spark's own writers
+  -- the Iceberg 1.12 `TestCopyOnWrite/MergeOnRead#testSkew*` cases read `added-data-files` 2 where 4 was expected.
+  Packing now weighs each group by Iceberg's own open-file-cost and merges only up to Iceberg's own target split size,
+  so it never crosses a boundary Iceberg itself kept (a high open-file-cost keeps one partition per group); for an
+  ordinary table, whose groups Iceberg has already packed to the target size, it is a no-op. The split size and
+  open-file cost are read from the Iceberg scan's OWN `SparkReadConf` (reflectively, via the scan object's private
+  `readConf`), so a PER-SCAN read option (`spark.read().option("split-size"|"file-open-cost", ...)`, as the bin-pack
+  rewrite runner passes them) overrides the table property exactly as Iceberg resolves it -- a prior version read
+  only the table property and diverged from Iceberg's grouping when a read option was in force (e.g. the bin-pack
+  rewrite of mixed-size files after the copy runner declines a group that needs splitting).
+
+### Changed
+
+- **Iceberg defaults on** (owner, 2026-10-23): the native Iceberg scan (`spark.vecruntime.scan.nativeIceberg.enabled`),
+  the columnar Iceberg writer (`spark.vecruntime.iceberg.writer.enabled`) and the columnar merge-on-read writer --
+  deletion vectors on v3, position deletes on v2 (`spark.vecruntime.iceberg.dvWriter.enabled`) -- now default to
+  `true`, and so does the columnar Parquet writer (`spark.vecruntime.write.columnar.enabled`, #64), which writes
+  Parquet v2 data pages. Each still declines anything it does not take to Iceberg's / Spark's own path with a
+  printed reason; set the key to `false` to restore the previous behaviour.
 
 - One Spark-free `parquet` module (`vecruntime-parquet_<spark line>`, #900) replaces `parquet-writer` and takes
   the page decoders out of `kernels`: `io.vecruntime.kernels.parquet` is now `io.vecruntime.parquet.codec`, beside
@@ -90,6 +151,20 @@ version may change configuration keys or defaults, always noted here.
   buffers leave `-XX:MaxDirectMemorySize`, which then holds only the Flight transport's: TPC-DS 10 TB passed with a
   6 GB direct cap at Netty's speed, where Arrow on Netty needed about 10 GB. Older images lack the jar: render
   their runs with `ARROW_ALLOCATOR=`.
+
+### Fixed
+
+- The native Parquet scan's parallel row-group decode (#606) no longer leaks Arrow buffers when a task ends early
+  (a `LIMIT`, or a failure), fixing the intermittent `ParallelDecodeSuite` "a LIMIT that ends the task early leaks
+  no vectors" failure on CI, where the whole `spark` module runs in one JVM (#981). The first fix stopped
+  `close()` from `cancel(true)`-ing running helper futures; this one removes the remaining leak path.
+  On close the iterator stopped its helper pool with `shutdownNow()`, which interrupts the running decode threads.
+  A helper decodes pure CPU over already-fetched pages and does not poll for interruption, so the interrupt did not
+  stop it cleanly -- it only made a later buffer allocation inside `readBatch` throw once the flag was set, and
+  that throw escaped with buffers already taken from the job's child allocator but not yet owned by a reader's
+  pool, which the decode's own cleanup could not free. The iterator now stops the pool with `shutdown()` (no
+  interrupt) and drains every in-flight job to completion before closing the lead, so each job's child allocator is
+  released and closed exactly once.
 
 ## 0.0.9 -- 2026-10-19
 
@@ -140,9 +215,24 @@ OOM-killed executors at 1 TB.
 
 ### Fixed
 
-- The native Parquet scan's codec factory released only itself, never the zstd decompress contexts it handed
-  out per column chunk, so native memory grew until Kubernetes OOM-killed the executors at 1 TB (#828); a
-  test now checks every codec's decompressor is released (#829).
+- A copy-on-write `DELETE` / `UPDATE` whose table requests write-side coalescing (AQE `coalescePartitions`
+  on plus a large `spark.sql.iceberg.advisory-partition-size`, as Iceberg's own write would use to fuse many
+  small shuffle blocks into one file) now honours Iceberg's REBALANCE distribution instead of forcing the
+  M4a copy path's `_file` hash, so AQE coalesces the rewrite into a single added data file the way Iceberg
+  does (Apache Iceberg 1.12 `TestDelete`/`TestUpdate#testCoalesce{Delete,Update}`, snapshot
+  `added-data-files` 1, not one file per source file). The ordinary copy case -- no coalescing, or the small
+  default write advisory the copy-unchanged path relies on to keep files separate -- keeps the `_file`
+  override, so the byte-copy fast path is unchanged.
+- The columnar copy-on-write rewrite writer now stamps the table's sort order id on the data files it writes
+  (`IcebergRewriteFileTaskWriter`), as Iceberg's `SparkWrite` does, instead of leaving them unsorted
+  (`sortOrderId` 0). The streaming full-rewrite writer already did this (#964); the copy path matched it only
+  after this fix (Apache Iceberg 1.12 `TestCopyOnWrite*#testCopyOnWrite*SetsSortOrderIdOnRewrittenDataFiles`).
+- The columnar bin-pack rewrite (#967 M4c) now packs copied row groups to Iceberg's own input split size
+  (`RewriteFileGroup.inputSplitSize()`), not the larger max-output roll cap, and declines the byte copy for a
+  whole file group when a file holds a row group larger than that split size -- a case Iceberg handles by
+  decoding and splitting the file, which a whole-row-group copy cannot reproduce -- so the compacted layout
+  matches Iceberg's own `rewrite_data_files` for mixed-size inputs (Apache Iceberg 1.12
+  `TestRewriteDataFilesAction#testBinPackCombineMixedFiles`).
 
 ### Documentation
 

@@ -99,6 +99,8 @@ case class VectorIcebergScanExec(
   override lazy val metrics: Map[String, SQLMetric] = Map(
     "numRuntimeFilters" -> SQLMetrics.createMetric(sparkContext, "number of runtime filters from joins"),
     "numFiles" -> SQLMetrics.createMetric(sparkContext, "number of files read"),
+    "numFilesPrunedByRuntimeFilter" ->
+      SQLMetrics.createMetric(sparkContext, "data files not opened, pruned by a join's runtime filter"),
     "numOutputRows" -> SQLMetrics.createMetric(sparkContext, "number of output rows"),
     "numOutputBatches" -> SQLMetrics.createMetric(sparkContext, "number of output batches"),
     "numRowGroups" -> SQLMetrics.createMetric(sparkContext, "number of row groups read"),
@@ -134,6 +136,15 @@ case class VectorIcebergScanExec(
     // driver before executing this side.
     val runtime = if (sqlConf.parquetFilterPushDown) runtimeFilters else Nil
     val filters = pushedFilters ++ runtime
+    // #iceberg-file-pruning: the data-file locations a join's runtime filters prove cannot match, computed on the
+    // driver from each file's Iceberg metrics (InclusiveMetricsEvaluator). Those files are dropped before the
+    // partitions are built, so they are never opened (a HEAD + footer read each avoided), instead of being opened
+    // and only their row groups skipped. Empty when pruning is off, there is no runtime filter, or none converts.
+    val runtimeDropLocations: Set[String] =
+      if (runtime.isEmpty || !io.vecruntime.spark.VectorConf.scanNativeIcebergRuntimeFilePruning(sqlConf)) Set.empty
+      else IcebergTasks.runtimeFilePruneDropSet(scan, runtime, sqlConf.caseSensitiveAnalysis).getOrElse(Set.empty)
+    // The count is exact and known on the driver (these files are never scheduled), so set the metric here.
+    if (runtimeDropLocations.nonEmpty) longMetric("numFilesPrunedByRuntimeFilter") += runtimeDropLocations.size
     // As the Parquet scan: runtime filters prune row groups by statistics only; with no static filter but null
     // checks, Parquet's dictionary and bloom checks (an object-store request per row group) are off.
     val statsOnly = runtime.nonEmpty && pushedFilters.forall(_.isInstanceOf[org.apache.spark.sql.sources.IsNotNull])
@@ -200,8 +211,11 @@ case class VectorIcebergScanExec(
     // by its field id), then the row positions; the extra columns are dropped once the deletes are applied.
     // None: an equality column our reader cannot decode, so those files keep Iceberg's reader.
     val tableSchema = IcebergTasks.tableSchema(scan)
+    // The schema HISTORY (current + superseded): an equality delete can be keyed on a since-dropped column, whose
+    // field id lives only in an older schema. Threaded into both the probe-column resolution and the filter build.
+    val tableSchemas = IcebergTasks.tableSchemas(scan)
     val equalitySchema = IcebergTasks
-      .equalityColumns(scan.inputRDD.partitions, tableSchema, dataColumns.map(_._2).toSet)
+      .equalityColumns(scan.inputRDD.partitions, tableSchemas, dataColumns.map(_._2).toSet)
       .map(extra => VectorIcebergRDD.withPositions(StructType(requiredSchema.fields ++ extra)))
     val equalityConfBroadcast = equalitySchema.map(confFor)
 
@@ -231,7 +245,7 @@ case class VectorIcebergScanExec(
     )
     val rdd = new VectorIcebergRDD(
       session.sparkContext,
-      VectorIcebergRDD.packed(scan, sqlConf, session.leafNodeDefaultParallelism),
+      VectorIcebergRDD.packed(scan, sqlConf, runtimeDropLocations),
       scan.readerFactory,
       fieldIds.toArray,
       confBroadcast,
@@ -239,6 +253,7 @@ case class VectorIcebergScanExec(
       equalityConfBroadcast,
       equalitySchema,
       tableSchema,
+      tableSchemas,
       requiredSchema,
       dataColumns.map { case (a, _) => (a.name, a.dataType) }.toArray,
       kinds.toArray,
@@ -253,6 +268,9 @@ case class VectorIcebergScanExec(
       io.vecruntime.spark.VectorConf.scanNativeParquetPrefetchRowGroups(sqlConf),
       io.vecruntime.spark.VectorConf.scanNativeParquetDecodeAhead(sqlConf),
       io.vecruntime.spark.VectorConf.scanNativeParquetDecodeAheadVirtual(sqlConf),
+      io.vecruntime.spark.VectorConf.scanNativeParquetParallelDecode(sqlConf),
+      io.vecruntime.spark.VectorConf.scanNativeParquetParallelDecodeVirtual(sqlConf),
+      io.vecruntime.spark.VectorConf.scanNativeParquetParallelDecodeMinRowGroupBytes(sqlConf),
       io.vecruntime.spark.VectorConf.scanNativeParquetDictionaryStrings(sqlConf),
       io.vecruntime.spark.VectorConf.scanNativeParquetPrefetchMaxBytes(sqlConf),
       io.vecruntime.spark.VectorConf.scanNativeParquetPrefetchExecutorMaxBytes(sqlConf),
@@ -272,8 +290,17 @@ case class VectorIcebergScanExec(
       ),
       IcebergTasks.nameMapping(scan),
       // #901 R1: Iceberg's own column resolution (iceberg-bridge), when on and the bridge is on the classpath.
+      // The schema history is passed so a since-dropped equality-delete key column (read as a hidden probe
+      // column) resolves against the schema it was dropped from, not only the current schema.
       if (!io.vecruntime.spark.VectorConf.icebergReadSpecsEnabled(sqlConf)) null
-      else ParquetFileResolver.iceberg(IcebergTasks.tableSchema(scan), IcebergTasks.nameMappingJson(scan)).orNull,
+      else
+        ParquetFileResolver
+          .iceberg(
+            IcebergTasks.tableSchema(scan),
+            IcebergTasks.nameMappingJson(scan),
+            tableSchemas.asInstanceOf[Seq[AnyRef]].asJava
+          )
+          .orNull,
       io.vecruntime.spark.VectorConf.icebergNativeEqualityDeletesEnabled(sqlConf),
       // #20 M3a: the table's unified partition type (serializable) and the `_partition` output's Spark struct type,
       // used to build the per-file `_partition` constant; null when `_partition` is not projected.
@@ -282,7 +309,8 @@ case class VectorIcebergScanExec(
         a.dataType.asInstanceOf[StructType]
       }.orNull,
       // #901 item 6: the output schema for the Iceberg row-reader fallback's row-to-columnar conversion.
-      StructType(output.map(a => StructField(a.name, a.dataType, a.nullable)))
+      StructType(output.map(a => StructField(a.name, a.dataType, a.nullable))),
+      runtimeDropLocations
     )
     val out: RDD[ColumnarBatch] =
       if (emitSelection) rdd else rdd.mapPartitionsInternal(_.map(VectorIcebergScanExec.compacted))
@@ -332,6 +360,7 @@ private[vecruntime] final class VectorIcebergRDD(
     equalityConfBroadcast: Option[org.apache.spark.broadcast.Broadcast[SerializableConfiguration]],
     equalitySchema: Option[StructType],
     tableSchema: AnyRef, // org.apache.iceberg.Schema (java.io.Serializable)
+    tableSchemas: Seq[AnyRef], // the table's schema history, current first (each a serializable Iceberg Schema)
     requiredSchema: StructType,
     attrs: Array[(String, org.apache.spark.sql.types.DataType)], // the data columns, in output order
     kinds: Array[IcebergTasks.ColumnKind], // per output column
@@ -341,6 +370,9 @@ private[vecruntime] final class VectorIcebergRDD(
     prefetchRowGroups: Int,
     decodeAhead: Int,
     decodeAheadVirtual: Boolean,
+    parallelDecode: Int,
+    parallelDecodeVirtual: Boolean,
+    parallelDecodeMinRowGroupBytes: Long,
     dictionaryStrings: Boolean,
     prefetchMaxBytes: Long,
     prefetchExecutorMaxBytes: Long,
@@ -361,7 +393,10 @@ private[vecruntime] final class VectorIcebergRDD(
     partitionSparkType: StructType,
     // #901 item 6: the scan's output schema (names + types, in output order), to convert an Iceberg row-reader
     // group's InternalRows into columnar batches and reorder them into output order.
-    outputSchema: StructType
+    outputSchema: StructType,
+    // #iceberg-file-pruning: data-file locations a join's runtime filters proved cannot match. A native task
+    // whose data file is in this set is dropped in `compute`, so the file is never opened. Empty: nothing pruned.
+    runtimeDropLocations: Set[String]
 ) extends RDD[ColumnarBatch](sc, Nil) {
 
   override protected def getPartitions: Array[Partition] = parts
@@ -411,15 +446,19 @@ private[vecruntime] final class VectorIcebergRDD(
         case Some(tasks) =>
           nativeGroups += 1
           tasks.foreach { t =>
-            if (needsMeta) fileMeta.getOrElseUpdate(t.location, IcebergTasks.fileMetadata(t.task, partitionType))
-            if (t.deletes.isEmpty && t.equalityDeletes.isEmpty) {
-              pending += t.file
-              pendingCount += 1
-            } else {
-              // A file with delete files: read with its row positions (and its equality columns), the deleted
-              // rows deselected (its delete files are loaded when its first batch is read).
-              flush()
-              segments += (() => deletedIterator(split.index, p, t, equalitySets, fileMeta, context))
+            // #iceberg-file-pruning: a data file a join's runtime filter proved cannot match is dropped here, so
+            // its reader is never built and the file is never opened. (The pruned-file count is set on the driver.)
+            if (!runtimeDropLocations.contains(t.location)) {
+              if (needsMeta) fileMeta.getOrElseUpdate(t.location, IcebergTasks.fileMetadata(t.task, partitionType))
+              if (t.deletes.isEmpty && t.equalityDeletes.isEmpty) {
+                pending += t.file
+                pendingCount += 1
+              } else {
+                // A file with delete files: read with its row positions (and its equality columns), the deleted
+                // rows deselected (its delete files are loaded when its first batch is read).
+                flush()
+                segments += (() => deletedIterator(split.index, p, t, equalitySets, fileMeta, context))
+              }
             }
           }
         case None =>
@@ -541,7 +580,7 @@ private[vecruntime] final class VectorIcebergRDD(
       val out = layout(extra, positions = true)
       val rebuild = metaRebuild(fileMeta, posOrdinalOf(extra), fileOrdinalOf(extra, positions = true))
       lazy val equality =
-        IcebergTasks.equalityFilter(p, t.equalityDeletes, tableSchema, schema, equalitySets, nativeEqualityDeletes)
+        IcebergTasks.equalityFilter(p, t.equalityDeletes, tableSchemas, schema, equalitySets, nativeEqualityDeletes)
       readerOf(index, Array(t.file), equalityConfBroadcast.get, schema, context)
         .map(b =>
           if (markDeleted)
@@ -608,7 +647,7 @@ private[vecruntime] final class VectorIcebergRDD(
       prefetchRowGroups = prefetchRowGroups,
       metrics = metrics,
       context = context,
-      handOff = decodeAhead > 0,
+      handOff = decodeAhead > 0 || parallelDecode > 0,
       poolLimit = math.max(4, decodeAhead + 2),
       dictionaryStrings = dictionaryStrings,
       prefetchMaxBytes = prefetchMaxBytes,
@@ -617,9 +656,13 @@ private[vecruntime] final class VectorIcebergRDD(
       poolChunkBuffers = poolChunkBuffers,
       filterFieldIds = filterFieldIds,
       nameMapping = nameMapping,
-      fileResolver = fileResolver
+      fileResolver = fileResolver,
+      parallelDecode = parallelDecode,
+      parallelDecodeMinRowGroupBytes = parallelDecodeMinRowGroupBytes
     )
-    if (decodeAhead > 0) new DecodeAheadIterator(reader, decodeAhead, decodeAheadVirtual, context) else reader
+    if (parallelDecode > 0) new ParallelDecodeIterator(reader, parallelDecode, parallelDecodeVirtual, context)
+    else if (decodeAhead > 0) new DecodeAheadIterator(reader, decodeAhead, decodeAheadVirtual, context)
+    else reader
   }
 
   private def icebergIterator(p: InputPartition, context: TaskContext): Iterator[ColumnarBatch] = {
@@ -698,25 +741,44 @@ private[vecruntime] object VectorIcebergRDD {
   }
 
   /**
-   * The wrapped scan's partitions packed as Spark packs a file scan's splits (`FilePartition.maxSplitBytes` and
-   * `getFilePartitions`), see [[io.vecruntime.spark.VectorConf.ScanNativeIcebergPackSplits]]: each input partition
-   * weighs its task group's bytes plus `spark.sql.files.openCostInBytes` per file, the largest first, next-fit into
-   * tasks of at most `min(maxPartitionBytes, max(openCost, total / minPartitionNum))`. The scan's own partitions
-   * when it reports a partitioning, when packing is off or merges nothing, or when a group's size is unknown.
+   * The wrapped scan's partitions coalesced only within Iceberg's own split boundary: Iceberg already grouped the
+   * task files honouring `read.split.target-size`, `read.split.open-file-cost` and `read.split.planning-lookback`
+   * (see [[io.vecruntime.spark.VectorConf.ScanNativeIcebergPackSplits]]), so we may merge adjacent groups ONLY up
+   * to Iceberg's own target split size, weighing each group by Iceberg's own open-file-cost per file. This still
+   * coalesces genuinely tiny groups (Iceberg's lookback can leave several small groups), but it never merges groups
+   * Iceberg deliberately kept apart -- e.g. a table with a huge `read.split.open-file-cost` (one file per group, as
+   * the Iceberg copy-on-write skew tests set it) keeps one partition per group, so the write produces one file per
+   * group as Spark's own path does. The scan's own partitions when it reports a partitioning, when packing is off
+   * or merges nothing, or when a group's size is unknown.
    */
-  def packed(scan: BatchScanExec, conf: SQLConf, leafParallelism: Int): Array[Partition] = {
+  def packed(scan: BatchScanExec, conf: SQLConf, dropLocations: Set[String]): Array[Partition] = {
     val parts = scan.inputRDD.partitions
     if (
       parts.length < 2 || !io.vecruntime.spark.VectorConf.scanNativeIcebergPackSplits(conf) ||
       !scan.outputPartitioning.isInstanceOf[org.apache.spark.sql.catalyst.plans.physical.UnknownPartitioning]
     ) return parts
-    val openCost = conf.filesOpenCostInBytes
+    // Iceberg's OWN split settings (table properties, with Iceberg's defaults), not Spark's file-scan knobs: using
+    // Spark's spark.sql.files.openCostInBytes / maxPartitionBytes / minPartitionNum re-packs the groups to the
+    // cluster's parallelism and merges groups Iceberg kept separate (a read.split.open-file-cost it set high), which
+    // collapses the output-file count of a row-level write below what Iceberg planned.
+    val openCost = IcebergTasks.splitOpenFileCost(scan)
+    val targetSize = IcebergTasks.splitSize(scan)
     val inputs = parts.map(p => shims.SparkShims.dataSourceInputPartitions(p))
     val sizes = inputs.map(_.map(IcebergTasks.groupBytes(_, openCost)))
     if (sizes.exists(_.exists(_ < 0))) return parts
-    val weights = sizes.map(_.sum)
-    val minPartitions = conf.filesMinPartitionNum.getOrElse(leafParallelism).max(1)
-    val maxSplit = math.min(conf.filesMaxPartitionBytes, math.max(openCost, weights.sum / minPartitions))
+    // #iceberg-file-pruning (#987): a pruned file is never opened, so it carries no weight. Discount the pruned
+    // files' bytes + open cost from each group's weight; a group left at weight 0 (every file pruned) is dropped
+    // from packing entirely. The pruned tasks themselves are skipped in `compute`, so an un-dropped partial group
+    // is still correct -- this only keeps the packing balanced and avoids scheduling an all-pruned group.
+    val weights =
+      if (dropLocations.isEmpty) sizes.map(_.sum)
+      else inputs.map(ps => ps.map(p => IcebergTasks.groupBytes(p, openCost, dropLocations)).filter(_ >= 0).sum)
+    // Never beyond Iceberg's own target split size: a merge up to targetSize keeps the file-size contract Iceberg's
+    // grouping already enforced, so no group Iceberg kept separate (because merging would exceed its target) is
+    // merged here either. We do NOT widen the split to weights.sum / parallelism the way a Spark file scan does;
+    // openCost and targetSize come from the scan's own SparkReadConf (read option over table property), so a
+    // per-scan split-size / file-open-cost (the bin-pack rewrite runner's) is honoured exactly as Iceberg does.
+    val maxSplit = math.max(openCost, targetSize)
     val out = Array.newBuilder[Partition]
     var current = Seq.newBuilder[InputPartition]
     var currentSize = 0L
@@ -728,13 +790,18 @@ private[vecruntime] object VectorIcebergRDD {
       currentSize = 0L
     }
     weights.indices.sortBy(i => -weights(i)).foreach { i =>
-      if (currentSize > 0 && currentSize + weights(i) > maxSplit) close()
-      current ++= inputs(i)
-      currentSize += weights(i)
+      // An all-pruned group (weight 0) is dropped: it would open no file and schedule an empty task.
+      if (weights(i) > 0) {
+        if (currentSize > 0 && currentSize + weights(i) > maxSplit) close()
+        current ++= inputs(i)
+        currentSize += weights(i)
+      }
     }
     close()
     val packedParts = out.result()
-    if (packedParts.length == parts.length) parts else packedParts
+    // Nothing merged AND nothing pruned: keep the scan's own partitions (identity). When pruning dropped whole
+    // groups the packed list is the pruned one, even if its length matches.
+    if (packedParts.length == parts.length && dropLocations.isEmpty) parts else packedParts
   }
 
   /**
@@ -786,7 +853,7 @@ object VectorIcebergScanPlanner {
       )
       val parts = b.inputPartitions
       val projected = b.output.zip(ids).zip(kinds).collect { case ((_, id), IcebergTasks.DataColumn) => id }.toSet
-      val equality = IcebergTasks.equalityColumnsOf(parts, IcebergTasks.tableSchema(b), projected).isDefined
+      val equality = IcebergTasks.equalityColumnsOf(parts, IcebergTasks.tableSchemas(b), projected).isDefined
       // An empty partition list -- every file pruned in Iceberg's planning (e.g. a selective uuid `=`) -- reads
       // nothing and is admitted: there is no metadata-table group to reject and no row group to fall back on.
       if (parts.nonEmpty) {
@@ -1168,6 +1235,129 @@ private[vecruntime] object IcebergTasks {
     }
 
   /**
+   * #iceberg-file-pruning: the data-file LOCATIONS that `runtimeFilters` prove cannot match, so the files are
+   * never opened. The runtime filters (a broadcast hash join's build-key min/max ranges and IN sets, #610) are
+   * built directly into ONE Iceberg `Expression` (an IN set, a range `And(>=, <=)`, equality, null checks; any
+   * other shape skipped, so pruning stays conservative). Iceberg's Spark scan strips per-file column bounds from
+   * its task `DataFile`s, so they cannot be evaluated directly; instead a FRESH table scan is planned on the
+   * driver on the SAME snapshot, with the scan's residual AND the runtime expression. Iceberg's manifest reader
+   * applies its own `InclusiveMetricsEvaluator` to each entry while planning (re-reading the snapshot's manifests;
+   * no data file is opened), yielding exactly the files that can still match -- the KEEP set.
+   * Every task file NOT in the KEEP set is dropped. A file under metrics mode `none` (no bounds) stays in the
+   * KEEP set, as the evaluator keeps it; truncated string bounds are handled by the evaluator itself.
+   *
+   * `None` when nothing is pruned -- no runtime filter converted, the snapshot has no files, or the Iceberg
+   * classes are not on the classpath -- so the caller leaves the task list untouched. Dropping a data file is
+   * always safe for its delete files (position deletes, deletion vectors and equality deletes only REMOVE rows,
+   * so a file with no matching row has no matching row after deletes either) and for v3 row lineage (`_row_id` /
+   * `_last_updated_sequence_number` are per-file, so dropping a file drops only its own rows). The re-plan is
+   * driver-side and reads the snapshot's manifests again -- it opens no data file.
+   */
+  def runtimeFilePruneDropSet(
+      scan: BatchScanExec,
+      runtimeFilters: Seq[org.apache.spark.sql.sources.Filter],
+      caseSensitive: Boolean
+  ): Option[Set[String]] = {
+    if (runtimeFilters.isEmpty) return None
+    try {
+      // The data-file locations our plan will read, and the classloader that reaches Iceberg's classes.
+      val taskLocations = scala.collection.mutable.HashSet.empty[String]
+      var loader: ClassLoader = null
+      scan.inputRDD.partitions.foreach { part =>
+        shims.SparkShims.dataSourceInputPartitions(part).foreach { p =>
+          if (p.getClass.getName == "org.apache.iceberg.spark.source.SparkInputPartition") {
+            call(call(p, "taskGroup"), "tasks").asInstanceOf[java.util.Collection[AnyRef]].asScala.foreach { task =>
+              if (task.getClass.getName.contains("FileScanTask")) {
+                if (loader == null) loader = task.getClass.getClassLoader
+                taskLocations += call(call(task, "file"), "location").toString
+              }
+            }
+          }
+        }
+      }
+      if (taskLocations.isEmpty || loader == null) return None
+      val cl = loader
+      val exprClass = Class.forName("org.apache.iceberg.expressions.Expression", false, cl)
+      val expressionsClass = Class.forName("org.apache.iceberg.expressions.Expressions", false, cl)
+      // The #610 runtime filters are v1 `org.apache.spark.sql.sources.Filter`s (Iceberg 1.12 dropped the v1
+      // `SparkFilters` converter). Build the Iceberg `Expression` DIRECTLY from the shapes #610 produces -- an IN
+      // set, a range `And(>=lo, <=hi)`, equality, null checks -- skipping any other shape (so pruning stays
+      // conservative: an unconvertible filter simply prunes nothing).
+      val andM = expressionsClass.getMethod("and", exprClass, exprClass)
+      val inM = expressionsClass.getMethod("in", classOf[String], classOf[java.lang.Iterable[_]])
+      val equalM = expressionsClass.getMethod("equal", classOf[String], classOf[Object])
+      val geM = expressionsClass.getMethod("greaterThanOrEqual", classOf[String], classOf[Object])
+      val leM = expressionsClass.getMethod("lessThanOrEqual", classOf[String], classOf[Object])
+      val notNullM = expressionsClass.getMethod("notNull", classOf[String])
+      def lit(v: Any): AnyRef = v match {
+        case us: org.apache.spark.unsafe.types.UTF8String => us.toString
+        case other => other.asInstanceOf[AnyRef]
+      }
+      import org.apache.spark.sql.sources._
+      def toIceberg(f: Filter): Option[AnyRef] = f match {
+        case In(a, vs) if vs != null && vs.nonEmpty => Some(inM.invoke(null, a, vs.toSeq.map(lit).asJava))
+        case EqualTo(a, v) if v != null => Some(equalM.invoke(null, a, lit(v)))
+        case GreaterThan(a, v) if v != null => Some(geM.invoke(null, a, lit(v))) // widen to >= (sound, keeps more)
+        case GreaterThanOrEqual(a, v) if v != null => Some(geM.invoke(null, a, lit(v)))
+        case LessThan(a, v) if v != null => Some(leM.invoke(null, a, lit(v))) // widen to <=
+        case LessThanOrEqual(a, v) if v != null => Some(leM.invoke(null, a, lit(v)))
+        case IsNotNull(a) => Some(notNullM.invoke(null, a))
+        case And(l, r) => for (x <- toIceberg(l); y <- toIceberg(r)) yield andM.invoke(null, x, y)
+        case _ => None
+      }
+      val exprs = runtimeFilters.flatMap(toIceberg)
+      if (exprs.isEmpty) return None
+      val runtimeExpr = exprs.reduceLeft((a, b) => andM.invoke(null, a, b))
+
+      // Iceberg's Spark scan STRIPS per-file column bounds from its task `DataFile`s (they keep only the record
+      // count), so `task.file()` cannot be evaluated directly. Re-plan on the driver instead: a fresh table scan
+      // on the SAME snapshot, with the scan's residual AND the runtime expression. Iceberg's manifest reader
+      // applies its own `InclusiveMetricsEvaluator` to each entry's bounds while planning (the returned tasks need
+      // no stats, so none are kept) and yields exactly the files that can still match. This opens no data file;
+      // it reads the snapshot's manifests again. The KEEP set is those files; our task files NOT in it are pruned.
+      val sparkScan = scan.scan // Iceberg's SparkBatchQueryScan
+      val table = call(sparkScan, "table")
+      val residual = call(sparkScan, "filter") // the scan's already-applied residual expression
+      val fullExpr = if (residual == null) runtimeExpr else andM.invoke(null, residual, runtimeExpr)
+      val tableScan0 = table.getClass.getMethod("newScan").invoke(table)
+      val tableScanClass = Class.forName("org.apache.iceberg.TableScan", false, cl)
+      val snapshotId = call(sparkScan, "snapshotId").asInstanceOf[java.lang.Long]
+      val onSnapshot =
+        if (snapshotId == null) tableScan0
+        else tableScanClass.getMethod("useSnapshot", java.lang.Long.TYPE).invoke(tableScan0, snapshotId)
+      val scanClass = Class.forName("org.apache.iceberg.Scan", false, cl)
+      val caseSens =
+        scanClass.getMethod("caseSensitive", java.lang.Boolean.TYPE)
+          .invoke(onSnapshot, java.lang.Boolean.valueOf(caseSensitive))
+      val filtered = scanClass.getMethod("filter", exprClass).invoke(caseSens, fullExpr)
+      val plan = scanClass.getMethod("planFiles").invoke(filtered)
+      val keep = scala.collection.mutable.HashSet.empty[String]
+      val closeable = plan.asInstanceOf[java.lang.Iterable[AnyRef]]
+      val it = closeable.iterator()
+      try {
+        while (it.hasNext) {
+          val task = it.next()
+          if (task.getClass.getName.contains("FileScanTask"))
+            keep += call(call(task, "file"), "location").toString
+        }
+      } finally plan match {
+          case c: java.io.Closeable => c.close()
+          case _ =>
+        }
+      // Drop any file our plan holds that the re-plan with the runtime filter did NOT keep.
+      val drop = taskLocations.diff(keep)
+      if (drop.isEmpty) None else Some(drop.toSet)
+    } catch {
+      // Any Iceberg-API mismatch, a non-convertible shape, or the classes being absent: prune nothing (correct,
+      // just not optimised). Never let pruning change results or fail the scan.
+      case _: ReflectiveOperationException | _: ClassNotFoundException | _: NoClassDefFoundError => None
+    }
+  }
+
+  /** The data-file location of one native `FileScanTask` (for pruning), via reflection. */
+  def taskFileLocation(task: AnyRef): String = call(call(task, "file"), "location").toString
+
+  /**
    * #20 M3a: the per-file constants of the three v3 merge-on-read metadata columns, for the data file of one
    * native task: the `_partition` struct as a Spark `InternalRow` (Iceberg's `PartitionUtil.constantsMap`
    * converted with `SparkUtil.internalToSpark`, keyed by `PARTITION_COLUMN_ID`), the file's `firstRowId` (null
@@ -1231,6 +1421,85 @@ private[vecruntime] object IcebergTasks {
       bytes + files.toLong * openCost
     }
 
+  /** A long table property of the scanned table, or `default` when unset or unparsable. */
+  private def tableLongProperty(scan: BatchScanExec, key: String, default: Long): Long = {
+    val props = call(call(scan.scan, "table"), "properties").asInstanceOf[java.util.Map[String, String]]
+    Option(props.get(key)).flatMap(v => scala.util.Try(v.trim.toLong).toOption).getOrElse(default)
+  }
+
+  /**
+   * The Iceberg scan's own `SparkReadConf` (`org.apache.iceberg.spark.source.SparkScan`'s private `readConf`
+   * field), which resolves the split settings as Iceberg does -- a per-scan READ OPTION
+   * (`spark.read().option("split-size"|"file-open-cost"|"lookback", ...)`, as the bin-pack rewrite runner sets
+   * them) overriding the table property, then the table property, then Iceberg's default. None when the scan is
+   * not a `SparkScan` or has no such field (an older Iceberg), where the caller falls back to the table property.
+   */
+  private def readConf(scan: BatchScanExec): Option[AnyRef] = {
+    var c: Class[_] = scan.scan.getClass
+    while (c != null) {
+      try {
+        val f = c.getDeclaredField("readConf")
+        f.setAccessible(true)
+        return Option(f.get(scan.scan))
+      } catch { case _: NoSuchFieldException => c = c.getSuperclass }
+    }
+    None
+  }
+
+  /** Call a no-arg numeric method on the scan's `readConf` (e.g. `splitSize`), None if it or the conf is absent. */
+  private def readConfLong(scan: BatchScanExec, method: String): Option[Long] =
+    readConf(scan).flatMap { rc =>
+      try {
+        val m = rc.getClass.getMethod(method)
+        m.setAccessible(true)
+        Some(m.invoke(rc).asInstanceOf[Number].longValue())
+      } catch { case _: ReflectiveOperationException => None }
+    }
+
+  /**
+   * Iceberg's own split target size for THIS scan (`SparkReadConf.splitSize`): a per-scan `split-size` read option
+   * (as `SparkBinPackFileRewriteRunner` / `SparkRewriteFileRunner` set via `spark.read().option(...)`) overriding
+   * the table's `read.split.target-size`, then Iceberg's 128 MB default. Our packing never merges task groups
+   * beyond this, so it respects the same file-size contract Iceberg's own grouping used for this very scan --
+   * reading only the table property would diverge from Iceberg when a read option is in force.
+   */
+  def splitSize(scan: BatchScanExec): Long =
+    readConfLong(scan, "splitSize").getOrElse(tableLongProperty(scan, "read.split.target-size", 128L * 1024 * 1024))
+
+  /**
+   * Iceberg's own per-file open cost for THIS scan (`SparkReadConf.splitOpenFileCost`): a per-scan `file-open-cost`
+   * read option overriding the table's `read.split.open-file-cost`, then Iceberg's 4 MB default. A scan that sets
+   * this very high (one file per group, as the Iceberg copy-on-write skew tests and the bin-pack copy runner's
+   * split-declining do) makes each group weigh more than the split size, so our packing keeps one partition per
+   * group, as Iceberg planned.
+   */
+  def splitOpenFileCost(scan: BatchScanExec): Long =
+    readConfLong(
+      scan,
+      "splitOpenFileCost"
+    ).getOrElse(tableLongProperty(scan, "read.split.open-file-cost", 4L * 1024 * 1024))
+
+  /**
+   * #iceberg-file-pruning: as [[groupBytes]] but discounting files whose location is in `dropLocations` (pruned,
+   * never opened), so a group packs at only the weight of the files that are actually read. Walks the group's
+   * `FileScanTask`s to sum each surviving data file's size + `openCost`; `-1` when `p` is not an Iceberg input
+   * partition. `0` when every file is pruned.
+   */
+  def groupBytes(p: InputPartition, openCost: Long, dropLocations: Set[String]): Long = {
+    if (p.getClass.getName != "org.apache.iceberg.spark.source.SparkInputPartition") return -1L
+    if (dropLocations.isEmpty) return groupBytes(p, openCost)
+    val tasks = call(call(p, "taskGroup"), "tasks").asInstanceOf[java.util.Collection[AnyRef]].asScala
+    var total = 0L
+    tasks.foreach { task =>
+      if (!task.getClass.getName.contains("FileScanTask")) return groupBytes(p, openCost) // not a pure data group
+      val file = call(task, "file")
+      if (!dropLocations.contains(call(file, "location").toString)) {
+        total += call(task, "length").asInstanceOf[java.lang.Long].longValue() + openCost
+      }
+    }
+    total
+  }
+
   /** Iceberg's own `BaseDeleteLoader`, opening delete files through the partition's `FileIO`, and its class. */
   private def deleteLoader(p: InputPartition): (Class[_], AnyRef) = {
     val cl = p.getClass.getClassLoader
@@ -1243,7 +1512,7 @@ private[vecruntime] object IcebergTasks {
     (loaderClass, loaderClass.getConstructor(classOf[java.util.function.Function[_, _]]).newInstance(open))
   }
 
-  /** The scanned table's current schema (an `org.apache.iceberg.Schema`, serializable), the ids equality deletes use. */
+  /** The scanned table's current schema (an `org.apache.iceberg.Schema`, serializable), the ids eq-deletes use. */
   /** #849: the table's `schema.name-mapping.default`, parsed; null when it has none. */
   def nameMapping(b: BatchScanExec): IcebergNameMapping = {
     val props = call(call(b.scan, "table"), "properties").asInstanceOf[java.util.Map[String, String]]
@@ -1257,6 +1526,31 @@ private[vecruntime] object IcebergTasks {
 
   def tableSchema(b: BatchScanExec): AnyRef = call(call(b.scan, "table"), "schema")
 
+  /**
+   * Every schema in the table's history (current plus superseded), newest first by schema id. An equality delete
+   * can be keyed on a column that has since been DROPPED from the current schema: the data files written before
+   * the drop still carry that field id, and the delete still applies to them, so the field id is resolved against
+   * these historical schemas, not only the current one. Robust to an older Iceberg without `schemas()`.
+   */
+  def tableSchemas(b: BatchScanExec): Seq[AnyRef] = {
+    val table = call(b.scan, "table")
+    val current = call(table, "schema")
+    val history =
+      try {
+        val map = call(table, "schemas").asInstanceOf[java.util.Map[Integer, AnyRef]]
+        if (map == null) Seq.empty
+        else map.entrySet().asScala.toSeq.sortBy(-_.getKey.intValue()).map(_.getValue)
+      } catch { case _: ReflectiveOperationException => Seq.empty }
+    // Current first, then the rest of the history, de-duplicated by identity.
+    (current +: history).distinct
+  }
+
+  /** The first of `schemas` whose struct contains every id in `ids` (so TypeUtil.select resolves them), or null. */
+  private def schemaContainingAll(schemas: Seq[AnyRef], ids: Seq[Int]): AnyRef = {
+    val findField = schemas.head.getClass.getMethod("findField", classOf[Int])
+    schemas.find(s => ids.forall(id => findField.invoke(s, Int.box(id)) != null)).orNull
+  }
+
   private def equalityFieldIds(d: AnyRef): Seq[Int] =
     call(d, "equalityFieldIds").asInstanceOf[java.util.List[Integer]].asScala.map(_.intValue()).toSeq
 
@@ -1266,11 +1560,15 @@ private[vecruntime] object IcebergTasks {
    * carrying it as its Parquet field id. None when one of them is not a top-level column of a type our reader
    * decodes as Iceberg does: the files with those deletes then keep Iceberg's reader.
    */
-  def equalityColumns(parts: Array[Partition], schema: AnyRef, projected: Set[Int]): Option[Seq[StructField]] =
-    equalityColumnsOf(parts.toSeq.flatMap(shims.SparkShims.dataSourceInputPartitions), schema, projected)
+  def equalityColumns(parts: Array[Partition], schemas: Seq[AnyRef], projected: Set[Int]): Option[Seq[StructField]] =
+    equalityColumnsOf(parts.toSeq.flatMap(shims.SparkShims.dataSourceInputPartitions), schemas, projected)
 
   /** As [[equalityColumns]], over the scan's input partitions themselves (at plan time). */
-  def equalityColumnsOf(inputs: Seq[InputPartition], schema: AnyRef, projected: Set[Int]): Option[Seq[StructField]] = {
+  def equalityColumnsOf(
+      inputs: Seq[InputPartition],
+      schemas: Seq[AnyRef],
+      projected: Set[Int]
+  ): Option[Seq[StructField]] = {
     val ids = scala.collection.mutable.LinkedHashSet.empty[Int]
     // The distinct equality-field-id-sets across the delete files, so a nested ancestor read differently by two
     // groups can be detected and declined (the union read column would not match a group's delete schema).
@@ -1291,25 +1589,36 @@ private[vecruntime] object IcebergTasks {
         }
       }
     }
-    val cl = schema.getClass.getClassLoader
-    val struct = call(schema, "asStruct")
-    val fieldById = struct.getClass.getMethod("field", classOf[Int])
+    // The id is resolved against the schema HISTORY, not only the current schema (`schemas.head`): an equality
+    // delete can be keyed on a since-DROPPED column (top level or a nested struct member). The data files written
+    // before the drop still carry that field id; a file written after reads null for it (our reader fills nulls),
+    // which is exactly the null key Iceberg compares a null delete key against. #956's nested-key resolution is
+    // run against whichever schema in the history still holds the id.
+    val cl = schemas.head.getClass.getClassLoader
+    val schemaClass = Class.forName("org.apache.iceberg.Schema", false, cl)
     val typeClass = Class.forName("org.apache.iceberg.types.Type", false, cl)
     val convert = Class.forName("org.apache.iceberg.spark.SparkSchemaUtil", false, cl).getMethod("convert", typeClass)
-    val schemaClass = Class.forName("org.apache.iceberg.Schema", false, cl)
     val projectStruct =
       Class.forName(
         "org.apache.iceberg.types.TypeUtil",
         false,
         cl
       ).getMethod("project", schemaClass, classOf[java.util.Set[_]])
-    // Resolve each equality field id to its top-level ancestor id (itself when top level) via the dotted column name.
-    def topAncestorId(id: Int): Option[Int] = {
-      val columnName = schemaClass.getMethod("findColumnName", classOf[Int]).invoke(schema, Int.box(id))
-      if (columnName == null) return None
-      val top = columnName.asInstanceOf[String].split("\\.", 2)(0)
-      val topField = schemaClass.getMethod("findField", classOf[String]).invoke(schema, top)
-      if (topField == null) None else Some(call(topField, "fieldId").asInstanceOf[Integer].intValue())
+    val findColumnName = schemaClass.getMethod("findColumnName", classOf[Int])
+    val findFieldByName = schemaClass.getMethod("findField", classOf[String])
+    val findFieldById = schemaClass.getMethod("findField", classOf[Int])
+    // The first schema in the history (current first) that holds `id`, with its struct and column name.
+    def schemaFor(id: Int): Option[AnyRef] = schemas.find(s => findFieldById.invoke(s, Int.box(id)) != null)
+    // Resolve `id`'s top-level ancestor id (itself when top level) via the dotted column name, in the schema that
+    // holds it. None when no schema in the history has the id.
+    def topAncestorId(id: Int): Option[Int] = schemaFor(id).flatMap { s =>
+      val columnName = findColumnName.invoke(s, Int.box(id))
+      if (columnName == null) None
+      else {
+        val top = columnName.asInstanceOf[String].split("\\.", 2)(0)
+        val topField = findFieldByName.invoke(s, top)
+        if (topField == null) None else Some(call(topField, "fieldId").asInstanceOf[Integer].intValue())
+      }
     }
     // Group the wanted (unprojected) equality ids by their top-level ancestor, preserving first-seen order.
     val wanted = ids.toSeq.filterNot(projected)
@@ -1334,15 +1643,21 @@ private[vecruntime] object IcebergTasks {
       }
     }
     val extra = byAncestor.toSeq.sortBy(_._1).map { case (ancId, leafIds) =>
+      // The schema that holds this ancestor AND all of its needed leaves -- the current one, or an older one when
+      // a (nested) key leaf has been dropped. For a dropped NESTED leaf the ancestor struct may still exist in the
+      // current schema while the leaf lives only in history, so resolve against the schema that has every id.
+      val holder = Option(schemaContainingAll(schemas, (leafIds.toSeq :+ ancId).distinct)).getOrElse(return None)
+      val struct = call(holder, "asStruct")
+      val fieldById = struct.getClass.getMethod("field", classOf[Int])
       val ancField = fieldById.invoke(struct, Int.box(ancId))
       if (ancField == null) return None
       val ancType = call(ancField, "type")
       if (call(ancType, "typeId").toString == "STRUCT") {
-        // #901 item 5: a nested equality key. Project the table schema to the ancestor's needed leaves and read the
-        // ancestor struct, every nested field carrying its Iceberg id. The native lane probe does not decode nested
-        // keys, so these groups take the row probe (equalityFilter), which reads the leaf through the struct as
-        // Iceberg's accessor does -- a null leaf under a null parent struct.
-        val projectedSchema = projectStruct.invoke(null, schema, leafIds.map(Int.box).asJava).asInstanceOf[AnyRef]
+        // #901 item 5: a nested equality key. Project the holding schema to the ancestor's needed leaves and read
+        // the ancestor struct, every nested field carrying its Iceberg id. The native lane probe does not decode
+        // nested keys, so these groups take the row probe (equalityFilter), which reads the leaf through the struct
+        // as Iceberg's accessor does -- a null leaf under a null parent struct, and null on post-drop files.
+        val projectedSchema = projectStruct.invoke(null, holder, leafIds.map(Int.box).asJava).asInstanceOf[AnyRef]
         val projectedTop = fieldById.invoke(call(projectedSchema, "asStruct"), Int.box(ancId))
         if (projectedTop == null) return None
         val projectedType = call(projectedTop, "type")
@@ -1381,7 +1696,7 @@ private[vecruntime] object IcebergTasks {
   def equalityFilter(
       p: InputPartition,
       deletes: java.util.List[AnyRef],
-      tableSchema: AnyRef,
+      tableSchemas: Seq[AnyRef],
       schema: StructType,
       cache: scala.collection.mutable.HashMap[(Seq[String], Seq[Int]), AnyRef],
       native: Boolean = false
@@ -1423,7 +1738,12 @@ private[vecruntime] object IcebergTasks {
     // e.g. a projected ancestor struct holds fields the delete does not), and the delete schema + selected delete
     // files (for the native set, read straight from the files).
     val groups = deletes.asScala.groupBy(equalityFieldIds).toSeq.map { case (ids, files) =>
-      val deleteSchema = select.invoke(null, tableSchema, ids.map(Int.box).toSet.asJava)
+      // Resolve the group's equality ids against the schema HISTORY: a dropped equality key (top level or a nested
+      // struct member) is absent from the current schema but present in an older one, and TypeUtil.select needs a
+      // schema that holds every id.
+      val resolveSchema = schemaContainingAll(tableSchemas, ids)
+      require(resolveSchema != null, s"equality delete field ids $ids are in no schema of the table's history")
+      val deleteSchema = select.invoke(null, resolveSchema, ids.map(Int.box).toSet.asJava)
       val deleteStruct = call(deleteSchema, "asStruct")
       val order = call(deleteSchema, "columns")
         .asInstanceOf[java.util.List[AnyRef]]
@@ -1488,7 +1808,17 @@ private[vecruntime] object IcebergTasks {
           }
           if (all.forall(_.isDefined)) Some(all.map(_.get)) else None
         } catch {
+          // No bridge, or a bridge class a type/relocation mismatch keeps us from using: drop to the row probe
+          // below, which reads deletes through Iceberg's own BaseDeleteLoader and is correct for every key type
+          // except the fixed/binary StructLikeSet collapse the native path exists to avoid. The reflective reader
+          // raises EqualityDeleteSet.UnsupportedEqualityReaderException (reaching us as InvocationTargetException)
+          // when Iceberg's generic Parquet reader API is absent/reshaped; a shaded-vs-unshaded parquet MessageType
+          // mismatch surfaces as ClassCastException/LinkageError. All mean "native not usable here" -> fall back.
           case _: ClassNotFoundException | _: NoClassDefFoundError => None
+          case e: java.lang.reflect.InvocationTargetException if isNativeEqualityUnsupported(e.getCause) => None
+          case _: ClassCastException | _: LinkageError =>
+            ParquetFileResolver.nativeEqualityFallbacks.incrementAndGet()
+            None
         }
     if (nativeGroups.isDefined) {
       val native = nativeGroups.get
@@ -1535,6 +1865,29 @@ private[vecruntime] object IcebergTasks {
       }
       (i: Int) => probes.exists(probe => probe(i))
     }
+  }
+
+  /**
+   * #shading: whether a Throwable thrown out of the native equality-delete reader means "not usable against this
+   * classpath" -- so the scan should fall back to Iceberg's own delete loader rather than fail the query. True for
+   * the bridge's `EqualityDeleteSet.UnsupportedEqualityReaderException` (matched by name, since iceberg-bridge is
+   * reflected, not a compile dependency of this module in this direction) and for a shaded-vs-unshaded Parquet
+   * `MessageType` mismatch surfacing as `ClassCastException`/`LinkageError`. Walks the cause chain.
+   */
+  private def isNativeEqualityUnsupported(t: Throwable): Boolean = {
+    var c = t
+    var depth = 0
+    while (c != null && depth < 8) {
+      val n = c.getClass.getName
+      if (
+        n == "io.vecruntime.iceberg.read.EqualityDeleteSet$UnsupportedEqualityReaderException"
+        || c.isInstanceOf[ClassCastException]
+        || c.isInstanceOf[LinkageError]
+      ) return true
+      c = c.getCause
+      depth += 1
+    }
+    false
   }
 
   /**

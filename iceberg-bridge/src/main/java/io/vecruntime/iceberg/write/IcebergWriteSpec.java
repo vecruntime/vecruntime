@@ -48,6 +48,11 @@ public final class IcebergWriteSpec implements Serializable {
 
     private final String operationId;
     private final boolean fanout;
+    // The sort order id Iceberg's own writer would stamp on the data files of this write
+    // (SparkWriteConf.outputSortOrderId(writeRequirements)): the table's sort order id when the write's
+    // required ordering satisfies it, else 0 (unsorted). The rows reach the writer already in that order
+    // because the write requests it (RequiresDistributionAndOrdering), so stamping it is sound (#901 R3).
+    private final int sortOrderId;
 
     public IcebergWriteSpec(
             Table table,
@@ -56,7 +61,8 @@ public final class IcebergWriteSpec implements Serializable {
             long targetFileSize,
             Map<String, String> properties,
             String operationId,
-            boolean fanout) {
+            boolean fanout,
+            int sortOrderId) {
         this.table = table;
         this.writeSchema = writeSchema;
         this.specId = specId;
@@ -64,6 +70,7 @@ public final class IcebergWriteSpec implements Serializable {
         this.properties = Map.copyOf(properties);
         this.operationId = operationId;
         this.fanout = fanout;
+        this.sortOrderId = sortOrderId;
     }
 
     public Table table() {
@@ -101,6 +108,16 @@ public final class IcebergWriteSpec implements Serializable {
      */
     public boolean fanout() {
         return fanout;
+    }
+
+    /**
+     * The sort order id to stamp on this write's data files -- what Iceberg's
+     * own writer stamps ({@code SparkWriteConf.outputSortOrderId}): the table's
+     * sort order id when the write's required ordering satisfies it, 0 (the
+     * unsorted order) otherwise.
+     */
+    public int sortOrderId() {
+        return sortOrderId;
     }
 
     /**

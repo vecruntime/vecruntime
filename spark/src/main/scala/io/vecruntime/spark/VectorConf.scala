@@ -48,9 +48,8 @@ object VectorConf {
    * `BaseDVFileWriter.delete(path, index, spec, partition)` call per file -- instead of Spark's
    * row-by-row `WriteDeltaExec`. Inserts and the insert half of updates stay on Iceberg's data
    * writer, and the commit stays Iceberg's own `RowDelta`. v2 tables and anything unsupported decline
-   * to Spark's writer unchanged, with a printed fallback reason. Default OFF while the writer is being
-   * landed slice by slice (the operator is not yet wired); it will default on once every Iceberg
-   * merge-on-read suite is byte-identical with it on and off. See `docs/iceberg.md`.
+   * to Spark's writer unchanged, with a printed fallback reason. Default ON (owner, 2026-10-23). See
+   * `docs/iceberg.md`.
    */
   val IcebergDvWriterEnabled = "spark.vecruntime.iceberg.dvWriter.enabled"
 
@@ -80,8 +79,8 @@ object VectorConf {
    * The columnar Iceberg data-file writer (#842, W2): `INSERT INTO`, `INSERT OVERWRITE` and copy-on-write
    * `DELETE` / `UPDATE` / `MERGE INTO` into an Iceberg table write their Parquet data files from our batches
    * through `IcebergParquetAppender` (the `iceberg-bridge` module) instead of Iceberg's row writer; the commit
-   * stays Iceberg's own (`write.toBatch()`). Unpartitioned output specs only for now; anything else declines to
-   * Spark's writer with a printed reason. Default OFF while it lands.
+   * stays Iceberg's own (`write.toBatch()`). Anything it does not take declines to Spark's writer with a printed
+   * reason. Default ON (owner, 2026-10-23).
    */
   val IcebergWriterEnabled = "spark.vecruntime.iceberg.writer.enabled"
 
@@ -90,9 +89,21 @@ object VectorConf {
    * byte-for-byte row groups of a rewritten file that have no deleted rows, instead of decoding and re-encoding
    * them. Needs the write's `_file` / `_pos` on the batches (Iceberg's copy-on-write scan projects both).
    * Unpartitioned tables only for now; a file whose schema differs from the write schema, or whose tracked
-   * float/double NaN counts a copy cannot supply, falls back to the full rewrite. Default OFF while it lands.
+   * float/double NaN counts a copy cannot supply, falls back to the full rewrite. Default ON.
    */
   val IcebergCopyUnchangedEnabled = "spark.vecruntime.iceberg.copyUnchanged.enabled"
+
+  /**
+   * Columnar bin-pack compaction (#957 M4c): `rewrite_data_files` with the BINPACK strategy compacts a file
+   * group by copying its input files' Parquet row groups byte for byte into target-sized outputs, instead of
+   * decoding and re-encoding every row. A file that cannot be copied -- deletes attached, schema evolution, a
+   * different partition spec, a codec mismatch, v3 unmaterialised row lineage, an unreadable encoding, or a
+   * table tracking float/double NaN counts -- falls back per file to Iceberg's own bin-pack, so the result is
+   * indistinguishable from the stock rewrite. Engaged only through `VectorRewriteDataFiles`, which installs the
+   * vecruntime runner on Iceberg's `RewriteDataFilesSparkAction`. Default ON when the runner is used (there is
+   * no correctness difference, only speed); set false to force the stock decode/encode path for A/B.
+   */
+  val IcebergBinPackCopyEnabled = "spark.vecruntime.iceberg.rewrite.binpackCopy.enabled"
 
   /**
    * Logical rewrite (#632): `IsNotNull` on a grouping key that is the only difference between the
@@ -261,8 +272,8 @@ object VectorConf {
 
   /**
    * #64: write Parquet from our batches (VectorWriteFilesExec and the parquet-writer module), without the
-   * columnar-to-row conversion and Spark's row-by-row ParquetWriteSupport. Off by default while it is a prototype:
-   * unpartitioned, unbucketed writes of flat columns only; anything else keeps Spark's writer with a reason.
+   * columnar-to-row conversion and Spark's row-by-row ParquetWriteSupport. Default ON (owner, 2026-10-23); anything it
+   * does not take keeps Spark's writer with a printed reason.
    */
   val WriteColumnar = "spark.vecruntime.write.columnar.enabled"
 
@@ -276,7 +287,7 @@ object VectorConf {
   /**
    * #735: Iceberg tables read with our native Parquet reader (VectorIcebergScanExec) over Iceberg's own planning:
    * each task group of data files without deletes is decoded by VectorParquetPartitionReader, any other group by
-   * Iceberg's reader. Off by default until the TPC-DS Iceberg A/B.
+   * Iceberg's reader. Default ON (owner, 2026-10-23).
    */
   val ScanNativeIceberg = "spark.vecruntime.scan.nativeIceberg.enabled"
 
@@ -289,6 +300,18 @@ object VectorConf {
    * Only when the scan reports no partitioning (a storage-partitioned join keeps Iceberg's groups).
    */
   val ScanNativeIcebergPackSplits = "spark.vecruntime.scan.nativeIceberg.packSplits"
+
+  /**
+   * #iceberg-file-pruning: prune Iceberg data files by a broadcast hash join's RUNTIME filters (#610) before the
+   * reader opens them. The static pushed filters are already pruned by Iceberg's own planning
+   * (`InclusiveMetricsEvaluator` over manifests), so those files are never opened; the runtime filters, known
+   * only after the build side runs, are today ANDed into the per-file Parquet row-group statistics filter, so
+   * every file is still opened (its HEAD + footer read) and only its row groups skipped. With this on (default
+   * true), the runtime filters are converted to an Iceberg `Expression` and each native data file is tested with
+   * `InclusiveMetricsEvaluator` on the driver; a file that cannot match is dropped before partitions are built,
+   * so it is never opened. Off restores the row-group-only behaviour.
+   */
+  val ScanNativeIcebergRuntimeFilePruning = "spark.vecruntime.scan.nativeIceberg.runtimeFilePruning.enabled"
 
   /** VectorParquetScanExec read-ahead (#559/#566): files of a split opened ahead, `0` off. */
   val ScanNativeParquetPrefetchFiles = "spark.vecruntime.scan.nativeParquet.prefetchFiles"
@@ -303,6 +326,26 @@ object VectorConf {
 
   /** The decode-ahead producer's thread kind (#606): `virtual` or `platform`. */
   val ScanNativeParquetDecodeAheadThreads = "spark.vecruntime.scan.nativeParquet.decodeAhead.threads"
+
+  /**
+   * VectorParquetScanExec parallel row-group decode (#606): how many HELPER threads decode the row groups
+   * AFTER the one the task thread consumes, each on its own column-reader set and vectors, handed over in
+   * file order so the output is identical. `0` (the default) decodes serially / single-producer
+   * (decode-ahead). It engages only for a file with at least two row groups above `parallelDecode.minRowGroupBytes`.
+   */
+  val ScanNativeParquetParallelDecode = "spark.vecruntime.scan.nativeParquet.parallelDecode"
+
+  /** The parallel-decode helper threads' kind (#606): `virtual` (the default) or `platform`. */
+  val ScanNativeParquetParallelDecodeThreads = "spark.vecruntime.scan.nativeParquet.parallelDecode.threads"
+
+  /**
+   * The row-group size (its requested column chunks' compressed bytes) at or above which a file's row groups
+   * are decoded in parallel (#606), when `parallelDecode` > 0 and the file has at least two such row groups.
+   * Default 32 MiB. Below it the file decodes single-producer, since small row groups gain nothing from a
+   * second decode thread (the TPC-DS store_sales shape, ~7 MB single-row-group files).
+   */
+  val ScanNativeParquetParallelDecodeMinRowGroupBytes =
+    "spark.vecruntime.scan.nativeParquet.parallelDecode.minRowGroupBytes"
 
   /** VectorParquetScanExec (#612): dictionary-encoded string columns as dictionary vectors, default on. */
   val ScanNativeParquetDictionaryStrings = "spark.vecruntime.scan.nativeParquet.dictionaryStrings"
@@ -363,6 +406,33 @@ object VectorConf {
   /** #735: parquet-java's per-row-group column-chunk buffers come from a small bounded heap pool. Default on. */
   val ScanNativeParquetPoolChunkBuffers = "spark.vecruntime.scan.parquet.poolChunkBuffers.enabled"
 
+  /**
+   * #834: a file whose length is at or under this is fetched WHOLE in one ranged GET on the prefetch thread,
+   * and {@code ParquetFileReader} is served footer, chunks and page indexes from that buffer -- so a 7 MB
+   * {@code store_sales} file (one row group) costs one request instead of footer-length + footer + row-group
+   * reads plus any per-page GETs. The threshold itself is the gate (the Accelerator prefetches a small object
+   * whole), so keep it at the size where reading every byte is cheaper than several ranged reads. `0` off (the
+   * default until a 1 TB A/B settles it); e.g. `8m`.
+   */
+  val ScanNativeParquetSmallFileThreshold = "spark.vecruntime.scan.nativeParquet.smallFileThreshold"
+
+  /**
+   * #834: range merging. When a file is read over its planned byte ranges (the projected column chunks of the
+   * split's row groups, and with the column index on only the selected pages plus the index reads), ranges
+   * whose gap is at or under this are coalesced into one larger GET instead of many small seeks. `<0` (the
+   * DEFAULT, until a 1 TB A/B settles it) turns range merging off, so the read path is parquet-java's own; `0`
+   * merges only exactly-adjacent ranges; a positive value such as `1m` (the Accelerator's
+   * {@code request.coalesce.tolerance}) swallows gaps up to that size.
+   */
+  val ScanNativeParquetRangeMergeGap = "spark.vecruntime.scan.nativeParquet.rangeMergeGap"
+
+  /**
+   * #834: a coalesced run longer than this is split into parts of about this size, issued in parallel on the
+   * prefetch threads, so a long sequential run is not one giant stream that starves S3 bandwidth (DuckDB 2.0's
+   * too-few-too-large result). `0` never splits. Default 8 MiB, the Accelerator's {@code target.request.size}.
+   */
+  val ScanNativeParquetRangeTargetSize = "spark.vecruntime.scan.nativeParquet.rangeTargetSize"
+
   /** Mixed chains (#280): Comet's native operators above ours through the sink leaf. Off until #281 decides an allowlist. */
   val CometMixedEnabled = "spark.vecruntime.comet.mixed.enabled"
 
@@ -396,12 +466,11 @@ object VectorConf {
   def shuffleEnabled(conf: SQLConf): Boolean = bool(conf, ShuffleEnabled, default = true)
 
   /**
-   * The columnar Iceberg v3 DV writer (#20). Default `false`: the operator is being landed in slices
-   * and is not wired to the planner yet, so turning it on is currently a no-op reserved for the
-   * writer's own tests. Flips to `true` once the writer is byte-identical to Spark's on every
-   * merge-on-read suite.
+   * The columnar Iceberg merge-on-read writer (#20, #901 M1/M2): deletion vectors on v3, position delete files on
+   * v2, the insert half on the columnar data writer. Default `true` (owner, 2026-10-23); anything it does not take
+   * declines to Spark's `WriteDeltaExec` with a printed reason.
    */
-  def icebergDvWriterEnabled(conf: SQLConf): Boolean = bool(conf, IcebergDvWriterEnabled, default = false)
+  def icebergDvWriterEnabled(conf: SQLConf): Boolean = bool(conf, IcebergDvWriterEnabled, default = true)
   def icebergReadSpecsEnabled(conf: SQLConf): Boolean = bool(conf, IcebergReadSpecsEnabled, default = true)
   def icebergNativeEqualityDeletesEnabled(conf: SQLConf): Boolean =
     bool(conf, IcebergNativeEqualityDeletesEnabled, default = true)
@@ -410,10 +479,10 @@ object VectorConf {
   def icebergPositionDeletesEnabled(conf: SQLConf): Boolean =
     bool(conf, IcebergPositionDeletesEnabled, default = true)
 
-  /** The columnar Iceberg data-file writer (#842, W2). Default `false` while it lands. */
-  def icebergWriterEnabled(conf: SQLConf): Boolean = bool(conf, IcebergWriterEnabled, default = false)
+  /** The columnar Iceberg data-file writer (#842, W2). Default `true` (owner, 2026-10-23). */
+  def icebergWriterEnabled(conf: SQLConf): Boolean = bool(conf, IcebergWriterEnabled, default = true)
 
-  /** Copy delete-free row groups in a copy-on-write DELETE (#901 M4a). Default `false` while it lands. */
+  /** Copy delete-free row groups in a copy-on-write DELETE (#901 M4a). Default `true`. */
   def icebergCopyUnchangedEnabled(conf: SQLConf): Boolean = bool(conf, IcebergCopyUnchangedEnabled, default = true)
   def aggDictionaryKeys(conf: SQLConf): Boolean = bool(conf, AggDictionaryKeys, default = true)
 
@@ -695,6 +764,16 @@ object VectorConf {
     sparkConf.getBoolean(PoolAccountingEnabled, true)
 
   /**
+   * #941: grouped accumulators past 16,384 groups keep their state in native pool blocks, charged to the task in
+   * the operators' memory mode, instead of `long[]` on the heap (at 10 TB those arrays fill the executors' old
+   * generation). Below that the state stays on the heap. On by default: at 10 TB the full TPC-DS run is the same or
+   * faster with GC -10% and q78's spill -19%. Read once, when the executor starts.
+   */
+  val AggNativeState = "spark.vecruntime.agg.nativeState"
+  def aggNativeState(sparkConf: org.apache.spark.SparkConf): Boolean =
+    sparkConf.getBoolean(AggNativeState, true)
+
+  /**
    * #869 step 4: Arrow's buffers (the Flight shuffle's, the shuffle readers', the operators' output vectors) from
    * the native pool instead of Arrow's allocation manager (`-Darrow.allocation.manager.type`), so they are reused
    * blocks of the same pool. Arrow still accounts them and `spark.vecruntime.arrow.maxBytes` still caps them. Read
@@ -772,15 +851,19 @@ object VectorConf {
    */
   def scanNativeParquet(conf: SQLConf): Boolean = bool(conf, ScanNativeParquet, default = !cometScanActive(conf))
 
-  /** #64: the columnar Parquet writer, off by default. */
-  def writeColumnar(conf: SQLConf): Boolean = bool(conf, WriteColumnar, default = false)
+  /** #64: the columnar Parquet writer. Default on (owner, 2026-10-23). */
+  def writeColumnar(conf: SQLConf): Boolean = bool(conf, WriteColumnar, default = true)
   def writeColumnarFromRows(conf: SQLConf): Boolean = bool(conf, WriteColumnarFromRows, default = false)
 
-  /** #735: VectorIcebergScanExec, behind the native Parquet scan's own switch too. */
+  /** #735: VectorIcebergScanExec, behind the native Parquet scan's own switch too. Default on (owner, 2026-10-23). */
   def scanNativeIceberg(conf: SQLConf): Boolean =
-    bool(conf, ScanNativeIceberg, default = false) && scanNativeParquet(conf)
+    bool(conf, ScanNativeIceberg, default = true) && scanNativeParquet(conf)
 
   def scanNativeIcebergPackSplits(conf: SQLConf): Boolean = bool(conf, ScanNativeIcebergPackSplits, default = true)
+
+  /** #iceberg-file-pruning: prune Iceberg data files by runtime filters before opening them (default on). */
+  def scanNativeIcebergRuntimeFilePruning(conf: SQLConf): Boolean =
+    bool(conf, ScanNativeIcebergRuntimeFilePruning, default = true)
 
   /** Whether Comet's scan is active in this session: its plugin or extension registered and its scan not off. */
   def cometScanActive(conf: SQLConf): Boolean = {
@@ -841,6 +924,29 @@ object VectorConf {
   /** The decode-ahead producer's thread kind: `virtual` (the default) or `platform`. */
   def scanNativeParquetDecodeAheadVirtual(conf: SQLConf): Boolean =
     !conf.getConfString(ScanNativeParquetDecodeAheadThreads, "virtual").trim.equalsIgnoreCase("platform")
+
+  /**
+   * Parallel row-group decode (#606): how many HELPER threads `VectorParquetScanExec` uses to decode the row
+   * groups after the one the task thread consumes, each with its own column-reader set and vectors, handed
+   * over in file order. `0` (the default) keeps the serial / single-producer (decode-ahead) path. It engages
+   * only for a file with at least two row groups at or above `parallelDecode.minRowGroupBytes`; a file that
+   * does not clear that (the TPC-DS store_sales shape) decodes as before. Off by default: a cluster running as
+   * many tasks as cores already keeps every core busy, so a second decode thread per task only adds contention
+   * there; the win is where cores sit idle (wide row groups, few large files). Capped at 8.
+   */
+  def scanNativeParquetParallelDecode(conf: SQLConf): Int = intIn(conf, ScanNativeParquetParallelDecode, 0, 8)
+
+  /** The parallel-decode helper threads' kind: `virtual` (the default) or `platform`. */
+  def scanNativeParquetParallelDecodeVirtual(conf: SQLConf): Boolean =
+    !conf.getConfString(ScanNativeParquetParallelDecodeThreads, "virtual").trim.equalsIgnoreCase("platform")
+
+  /** The per-row-group byte threshold for parallel decode (#606), default 32 MiB; `0` engages at any size. */
+  def scanNativeParquetParallelDecodeMinRowGroupBytes(conf: SQLConf): Long = {
+    val v = scala.util.Try(
+      conf.getConfString(ScanNativeParquetParallelDecodeMinRowGroupBytes, (32L << 20).toString).trim.toLong
+    ).getOrElse(32L << 20)
+    math.max(0L, v)
+  }
 
   /**
    * #612: the native scan emits a string column's dictionary-encoded batches as dictionary vectors (ids over
@@ -917,6 +1023,38 @@ object VectorConf {
    */
   def scanNativeParquetPoolChunkBuffers(conf: SQLConf): Boolean =
     bool(conf, ScanNativeParquetPoolChunkBuffers, default = true)
+
+  /**
+   * #834: a file at or under this length is read whole in one GET on the prefetch thread, before the footer,
+   * so the footer, column chunks and page indexes all come from that one buffer. `0` (the default, until a
+   * 1 TB A/B settles it) off. Parsed as a byte string (`8m`); `<= 0` means off.
+   */
+  def scanNativeParquetSmallFileThreshold(conf: SQLConf): Long = {
+    val explicit = conf.getConfString(ScanNativeParquetSmallFileThreshold, "").trim
+    if (explicit.isEmpty) 0L
+    else scala.util.Try(org.apache.spark.network.util.JavaUtils.byteStringAsBytes(explicit)).toOption.getOrElse(0L)
+  }
+
+  /**
+   * #834: the gap (bytes) at or under which two planned byte ranges are coalesced into one GET. `<0` (the
+   * default) turns range merging off; `0` merges only adjacent; a positive byte string (`1m`) swallows gaps.
+   */
+  def scanNativeParquetRangeMergeGap(conf: SQLConf): Long = {
+    val explicit = conf.getConfString(ScanNativeParquetRangeMergeGap, "").trim
+    if (explicit.isEmpty) -1L
+    else if (explicit.startsWith("-")) -1L
+    else scala.util.Try(org.apache.spark.network.util.JavaUtils.byteStringAsBytes(explicit)).toOption.getOrElse(-1L)
+  }
+
+  /** #834: a coalesced run longer than this is split into parallel GETs. `0` never splits. Default 8 MiB. */
+  def scanNativeParquetRangeTargetSize(conf: SQLConf): Long = {
+    val explicit = conf.getConfString(ScanNativeParquetRangeTargetSize, "").trim
+    if (explicit.isEmpty) 8L << 20
+    else
+      scala.util.Try(org.apache.spark.network.util.JavaUtils.byteStringAsBytes(explicit)).toOption
+        .map(v => math.max(0L, v))
+        .getOrElse(8L << 20)
+  }
 
   private def intIn(conf: SQLConf, key: String, default: Int, max: Int): Int =
     scala.util.Try(conf.getConfString(key, default.toString).trim.toInt).toOption.map(n =>
