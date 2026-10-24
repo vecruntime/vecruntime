@@ -211,6 +211,45 @@ class NativePoolTest {
         assertEquals(0, held[0]);
     }
 
+    @Test
+    void aChargedLeaseChargesTheOpeningThreadsAccountAndAnyThreadCreditsIt() throws Exception {
+        NativePool pool = new NativePool(1L << 30, false);
+        java.util.concurrent.atomic.AtomicLong held = new java.util.concurrent.atomic.AtomicLong();
+        NativePool.Account account = new NativePool.Account() {
+            @Override
+            public void charge(long bytes) {
+                held.addAndGet(bytes);
+            }
+
+            @Override
+            public void credit(long bytes) {
+                held.addAndGet(-bytes);
+            }
+        };
+        NativePool.setAccountSource(() -> account);
+        NativePool.Lease charged;
+        NativePool.Lease plain;
+        try {
+            charged = pool.leaseCharged(100_000);
+            plain = pool.lease(100_000);
+        } finally {
+            NativePool.setAccountSource(null);
+        }
+        assertEquals(1L << 17, held.get(), "only the charged lease, at its class size");
+        // Released on another thread (a buffer handed to the next operator): the opening account gets it back.
+        ExecutorService other = Executors.newSingleThreadExecutor();
+        try {
+            other.submit(charged::close).get();
+        } finally {
+            other.shutdown();
+        }
+        assertEquals(0L, held.get());
+        charged.close(); // once
+        assertEquals(0L, held.get());
+        plain.close();
+        assertEquals(0L, pool.inUseBytes());
+    }
+
     private static void assertAllZero(MemorySegment s) {
         for (long i = 0; i < s.byteSize(); i += 8) {
             long left = Math.min(8, s.byteSize() - i);
