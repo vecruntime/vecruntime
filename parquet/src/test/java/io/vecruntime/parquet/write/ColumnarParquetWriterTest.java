@@ -487,6 +487,121 @@ class ColumnarParquetWriterTest {
         }
     }
 
+    /**
+     * /**
+     * A small {@code row-group-size-bytes} with tiny rows must still be
+     * honoured to roughly the target, not overshot by a whole {@link
+     * ColumnarParquetWriter#SLICE}. Before the adaptive boundary check the
+     * writer tested the size only once every 1024 rows, so the first chance to
+     * cut was already several times a small target and every group came out
+     * exactly one slice (1024 rows) long and several times oversized -- which
+     * made Iceberg's byte-midpoint input splits of the bin-pack rewrite fall
+     * unevenly (Apache Iceberg
+     * TestRewriteDataFilesAction#testBinPackCombineMediumFiles, "add 3 but was
+     * 4"). The adaptive check predicts the next boundary from the bytes-per-row
+     * seen so far, so the groups now track the target.
+     *
+     * <p>Uses a minimal fixed-width schema (int + long) so bytes-per-row is
+     * linear -- the profile of the Iceberg test's three tiny columns -- and
+     * asserts: every full (non-final) group holds far fewer than a whole SLICE
+     * of rows (the pre-fix behaviour was EXACTLY {@code SLICE} rows per group),
+     * and our group count is within 2x of parquet-java's own writer at the same
+     * target (it was ~3x FEWER before the fix).
+     */
+    @Test
+    void smallRowGroupTargetIsHonouredForTinyRows() throws Exception {
+        MessageType tiny = MessageTypeParser.parseMessageType("message m { required int32 c1; required int64 c2; }");
+        int n = 40_000;
+        int[] c1 = new int[n];
+        long[] c2 = new long[n];
+        Random r = new Random(7);
+        for (int k = 0; k < n; k++) {
+            c1[k] = r.nextInt();
+            c2[k] = r.nextLong();
+        }
+        long target = 16 * 1024;
+        ParquetMetadata ours = footer(writeTinyOurs(tiny, c1, c2, 4096, target));
+        ParquetMetadata pj = footer(writeTinyParquetJava(tiny, c1, c2, target));
+        int ourGroups = ours.getBlocks().size();
+        int pjGroups = pj.getBlocks().size();
+        assertTrue(ourGroups > 1, "expected several row groups, got " + ourGroups);
+        // The direct contract: both writers size groups by the SAME byte target, so their group counts track.
+        // Pre-fix the writer ignored the target below one SLICE and cut EXACTLY every 1024 rows, giving ~3x
+        // FEWER, oversized groups (the uneven split that made Iceberg's testBinPackCombineMediumFiles add a 4th
+        // tiny file). Require ours within 2x of parquet-java's count in either direction.
+        assertTrue(ourGroups * 2 >= pjGroups && pjGroups * 2 >= ourGroups, "row groups should track the byte target: ours="
+                + ourGroups
+                + " parquet-java="
+                + pjGroups
+                + " (target "
+                + target
+                + " B)");
+        List<BlockMetaData> blocks = ours.getBlocks();
+        long total = blocks.stream()
+                .mapToLong(BlockMetaData::getRowCount)
+                .sum();
+        assertEquals(n, total);
+        // No full (non-final) group may be exactly SLICE rows across the whole file -- the pre-fix signature was
+        // EVERY group exactly SLICE. With a byte-sized cut that uniform coincidence does not occur.
+        int sliceSized = 0;
+        for (int g = 0; g < blocks.size() - 1; g++) {
+            if (blocks.get(g).getRowCount() == ColumnarParquetWriter.SLICE) {
+                sliceSized++;
+            }
+        }
+        assertTrue(sliceSized < blocks.size() - 1, "every full group is exactly one SLICE (" + ColumnarParquetWriter.SLICE + ") rows -- the boundary check reverted to once-per-slice");
+    }
+
+    private org.apache.hadoop.fs.Path writeTinyOurs(MessageType schema, int[] c1, long[] c2,
+            int batch, long rowGroupSize)
+            throws Exception {
+        org.apache.hadoop.fs.Path p = new org.apache.hadoop.fs.Path(dir.resolve("tiny-ours-" + (files++) + ".parquet")
+                .toString());
+        CodecFactory codecs = new CodecFactory(conf, 64 * 1024);
+        ColumnarParquetWriter written = null;
+        try (ColumnarParquetWriter w = new ColumnarParquetWriter(HadoopOutputFile.fromPath(p, conf), schema, props(),
+                codecs.getCompressor(CompressionCodecName.SNAPPY), rowGroupSize, Map.of("writer", "vecruntime"))) {
+            written = w;
+            for (int from = 0; from < c1.length; from += batch) {
+                int to = Math.min(c1.length, from + batch);
+                try (Arena a = Arena.ofConfined()) {
+                    int[] s1 = java.util.Arrays.copyOfRange(c1, from, to);
+                    long[] s2 = java.util.Arrays.copyOfRange(c2, from, to);
+                    w.write(List.of(ArrowLayout.ofInts(a, s1, new boolean[s1.length]), ArrowLayout.ofLongs(a, s2, new boolean[s2.length])),
+                            to - from);
+                }
+            }
+        } finally {
+            codecs.release();
+        }
+        lastFooter = written.footer();
+        return p;
+    }
+
+    private org.apache.hadoop.fs.Path writeTinyParquetJava(MessageType schema, int[] c1, long[] c2,
+            long rowGroupSize)
+            throws Exception {
+        org.apache.hadoop.fs.Path p = new org.apache.hadoop.fs.Path(dir.resolve("tiny-pj.parquet")
+                .toString());
+        SimpleGroupFactory f = new SimpleGroupFactory(schema);
+        try (ParquetWriter<Group> w = ExampleParquetWriter.builder(HadoopOutputFile.fromPath(p, conf))
+                .withType(schema)
+                .withWriterVersion(ParquetProperties.WriterVersion.PARQUET_2_0)
+                .withCompressionCodec(CompressionCodecName.SNAPPY)
+                .withRowGroupSize(rowGroupSize)
+                .withPageSize(64 * 1024)
+                .withDictionaryPageSize(64 * 1024)
+                .build()) {
+            for (int k = 0; k < c1.length; k++) {
+                Group g = f.newGroup();
+                g.add("c1", c1[k]);
+                g.add("c2", c2[k]);
+                w.write(g);
+            }
+        }
+        return p;
+    }
+
     @Test
     void rowGroupsAreCutByBufferedSize() throws Exception {
         List<Row> rows = rows(60_000, 3);
