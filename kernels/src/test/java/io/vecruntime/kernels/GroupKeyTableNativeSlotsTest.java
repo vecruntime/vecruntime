@@ -96,6 +96,8 @@ class GroupKeyTableNativeSlotsTest {
         assertFalse(table.inlineKeys(), "two INT64 keys probe the generic way");
         assertTrue(table.nativeSlots(), "past " + GroupKeyTable.NATIVE_FAST_SLOTS + " slots the entries are in the pool");
         assertTrue(table.nativeBytes() >= 8L * GroupKeyTable.NATIVE_FAST_SLOTS, "pool bytes " + table.nativeBytes());
+        // #941 phase 2c: ~1.1M groups of two INT64 keys are 17 MiB of rows, past NATIVE_ROW_BYTES
+        assertTrue(table.nativeRows(), "the key rows are in the pool too");
         table.close();
         assertEquals(0L, table.nativeBytes(), "closed");
     }
@@ -106,6 +108,7 @@ class GroupKeyTableNativeSlotsTest {
         fillLongPairs(table);
         assertFalse(table.nativeSlots(), "a table that was not allowed keeps its slots on the heap");
         assertTrue(table.packedSlots(), "past " + GroupKeyTable.PACKED_SLOTS + " slots, packed");
+        assertFalse(table.nativeRows(), "and its key rows on the heap");
         assertEquals(0L, table.nativeBytes());
     }
 

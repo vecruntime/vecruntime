@@ -304,10 +304,184 @@ public final class GroupKeyTable {
     }
 
     private static final ValueLayout.OfLong PAIR = ValueLayout.JAVA_LONG;
-    private final int[][] intKeys; // INT32 and BOOL (0/1)
-    private final long[][] longKeys; // INT64 and FLOAT64 (raw bits); the low limb of DECIMAL128
-    private final long[][] hiKeys; // the high limb of DECIMAL128
-    private final int[][] strIds; // UTF8 in dictionary mode: the id of the group's value in dicts[c]
+
+    /**
+     * The groups' keys, one row of {@link #width} ints per group, column {@code
+     * c} at {@link #keyOff}{@code [c]} (#941 phase 2c): INT32 and BOOL (0/1) and
+     * a UTF8 key's dictionary id take one int, INT64 and FLOAT64 (raw bits) two,
+     * DECIMAL128 four (low limb, then high). A probe's key compare then reads
+     * one line per group instead of one per column -- {@code
+     * KeyColumnStorageBenchmark}, five INT32 keys, against one array per
+     * column: 1.43-4.39x on the heap and 1.29-4.08x in a pool block, on
+     * Graviton4, Skylake-SP, Sapphire Rapids, Granite Rapids, Genoa and Turin,
+     * from 1K to 4M groups. Null while the rows are in the pool ({@link
+     * #rowSeg}).
+     */
+    private int[] rows;
+
+    /**
+     * The rows in a {@link NativePool} block once a table that {@link
+     * #allowNative allows it} would hold {@link #NATIVE_ROW_BYTES} of them: off
+     * the heap, charged to the task. Null otherwise.
+     */
+    private MemorySegment rowSeg;
+
+    private Arena rowArena;
+    private final int width; // ints per group row
+    private final int[] keyOff; // per column: its first int in a row
+
+    /**
+     * Row bytes from which an allowed table keeps its rows in the pool: an
+     * array this size is a humongous object for G1 with 32 MiB regions (half a
+     * region), allocated and freed as whole regions and never moved.
+     */
+    static final long NATIVE_ROW_BYTES = Long.getLong("vecruntime.agg.nativeRowBytes", 16L << 20);
+
+    private static final ValueLayout.OfInt ROW_INT = ValueLayout.JAVA_INT;
+    private static final ValueLayout.OfLong ROW_LONG = ValueLayout.JAVA_LONG_UNALIGNED;
+
+    private long rowIndex(int c, int gid) {
+        return (long) gid * width + keyOff[c];
+    }
+
+    /** Int {@code k} of column {@code c}'s key of group {@code gid}. */
+    private int keyInt(int c, int gid) {
+        long i = rowIndex(c, gid);
+        return rowSeg == null ? rows[(int) i] : rowSeg.getAtIndex(ROW_INT, i);
+    }
+
+    private void setKeyInt(int c, int gid, int v) {
+        long i = rowIndex(c, gid);
+        if (rowSeg == null) {
+            rows[(int) i] = v;
+        } else {
+            rowSeg.setAtIndex(ROW_INT, i, v);
+        }
+    }
+
+    /**
+     * The long at int {@code at} of column {@code c}'s key of group {@code gid}
+     * (0: INT64/low limb, 2: high).
+     */
+    private long keyLong(int c, int gid, int at) {
+        long i = rowIndex(c, gid) + at;
+        if (rowSeg == null) {
+            int j = (int) i;
+            return (rows[j] & 0xFFFF_FFFFL) | ((long) rows[j + 1] << 32);
+        }
+        return rowSeg.get(ROW_LONG, 4L * i);
+    }
+
+    private void setKeyLong(int c, int gid, int at,
+                            long v) {
+        long i = rowIndex(c, gid) + at;
+        if (rowSeg == null) {
+            int j = (int) i;
+            rows[j] = (int) v;
+            rows[j + 1] = (int) (v >>> 32);
+        } else {
+            rowSeg.set(ROW_LONG, 4L * i, v);
+        }
+    }
+
+    private int[] gatherInts = new int[0];
+    private long[] gatherLongs = new long[0];
+
+    /**
+     * Column {@code c}'s keys (its int {@code at}) of groups {@code [from, from
+     * + count)}, gathered from the rows in one strided pass: the key output
+     * then copies them out in one go, as it did from a column array.
+     */
+    private int[] gatherInts(int c, int at, int from,
+            int count) {
+        if (gatherInts.length < count) {
+            gatherInts = new int[Math.max(count, 2 * gatherInts.length)];
+        }
+        int[] out = gatherInts;
+        int w = width;
+        if (rowSeg == null) {
+            int[] r = rows;
+            int i = from * w + keyOff[c] + at;
+            for (int o = 0;
+                 o < count;
+                 o++, i += w) {
+                out[o] = r[i];
+            }
+        } else {
+            MemorySegment r = rowSeg;
+            long i = (long) from * w + keyOff[c] + at;
+            for (int o = 0;
+                 o < count;
+                 o++, i += w) {
+                out[o] = r.getAtIndex(ROW_INT, i);
+            }
+        }
+        return out;
+    }
+
+    /**
+     * {@link #gatherInts} for a long key (or limb) at int {@code at} of column
+     * {@code c}.
+     */
+    private long[] gatherLongs(int c, int at, int from,
+            int count) {
+        if (gatherLongs.length < count) {
+            gatherLongs = new long[Math.max(count, 2 * gatherLongs.length)];
+        }
+        long[] out = gatherLongs;
+        int w = width;
+        if (rowSeg == null) {
+            int[] r = rows;
+            int i = from * w + keyOff[c] + at;
+            for (int o = 0;
+                 o < count;
+                 o++, i += w) {
+                out[o] = (r[i] & 0xFFFF_FFFFL) | ((long) r[i + 1] << 32);
+            }
+        } else {
+            MemorySegment r = rowSeg;
+            long i = (long) from * w + keyOff[c] + at;
+            for (int o = 0;
+                 o < count;
+                 o++, i += w) {
+                out[o] = r.get(ROW_LONG, 4L * i);
+            }
+        }
+        return out;
+    }
+
+    /**
+     * Room for {@code cap} groups' rows, copying the first {@link #size}; moves
+     * them to the pool past the size.
+     */
+    private void growRows(int cap) {
+        long ints = (long) cap * width;
+        long used = (long) size * width;
+        boolean toPool = rowSeg != null
+                || (nativeAllowed && GroupedAccumulators.nativeState() && 4L * ints >= NATIVE_ROW_BYTES);
+        if (toPool) {
+            Arena a = NativePool.shared().newArena();
+            MemorySegment seg = a.allocate(4L * ints, 64);
+            if (rowSeg != null) {
+                MemorySegment.copy(rowSeg, 0, seg, 0, 4L * used);
+            } else {
+                MemorySegment.copy(rows, 0, seg, ROW_INT, 0,
+                        (int) used);
+            }
+            if (rowArena != null) {
+                rowArena.close();
+            }
+            rows = null;
+            rowSeg = seg;
+            rowArena = a;
+        } else {
+            if (ints > Integer.MAX_VALUE - 8) {
+                throw new IllegalStateException(cap + " groups of " + width + " key ints do not fit one heap array");
+            }
+            rows = Arrays.copyOf(rows, (int) ints);
+        }
+    }
+
     private final StringDictionary[] dicts; // UTF8 in dictionary mode: the column's distinct values; null once in record mode
 
     /**
@@ -412,10 +586,18 @@ public final class GroupKeyTable {
             this.fast = emptyFast(slotCount);
         }
         int k = types.length;
-        intKeys = new int[k][];
-        longKeys = new long[k][];
-        hiKeys = new long[k][];
-        strIds = new int[k][];
+        keyOff = new int[k];
+        int w = 0;
+        for (int c = 0; c < k; c++) {
+            keyOff[c] = w;
+            w += switch (types[c]) {
+                        case INT64, FLOAT64 -> 2;
+                        case DECIMAL128 -> 4;
+                        default -> 1; // INT32, BOOL, a UTF8 id (nested types are refused below)
+                    };
+        }
+        width = Math.max(1, w);
+        rows = new int[INITIAL_CAPACITY * width];
         dicts = new StringDictionary[k];
         record = new boolean[k];
         recBytes = new byte[k][];
@@ -429,18 +611,14 @@ public final class GroupKeyTable {
             nulls[c] = new BitSet();
             strCol[c] = -1;
             switch (types[c]) {
-                case INT32, BOOL -> intKeys[c] = new int[INITIAL_CAPACITY];
-                case INT64, FLOAT64 -> longKeys[c] = new long[INITIAL_CAPACITY];
-                case DECIMAL128 -> {
-                    longKeys[c] = new long[INITIAL_CAPACITY];
-                    hiKeys[c] = new long[INITIAL_CAPACITY];
+                case INT32, BOOL, INT64, FLOAT64, DECIMAL128 -> {
+                    // in the rows
                 }
                 case LIST, MAP, STRUCT, FIXED_BINARY ->
                         throw new IllegalStateException("no nested or FIXED_BINARY lane here (#705)");
                 case UTF8 -> {
                     strCol[c] = s++;
                     if (dictionaryLimit > 0) {
-                        strIds[c] = new int[INITIAL_CAPACITY];
                         dicts[c] = new StringDictionary();
                     } else {
                         startRecord(c);
@@ -948,10 +1126,10 @@ public final class GroupKeyTable {
                 continue;
             }
             if (types[c] == VecType.INT32) {
-                if (intKeys[c][gid] != keys.ints[c][row]) {
+                if (keyInt(c, gid) != keys.ints[c][row]) {
                     return false;
                 }
-            } else if (longKeys[c][gid] != keys.longs[c][row]) {
+            } else if (keyLong(c, gid, 0) != keys.longs[c][row]) {
                 return false;
             }
         }
@@ -1701,7 +1879,8 @@ public final class GroupKeyTable {
      */
     public long nativeBytes() {
         return (fastSeg == null ? 0L : fastSeg.byteSize())
-                + (slotSeg == null ? 0L : slotSeg.byteSize());
+                + (slotSeg == null ? 0L : slotSeg.byteSize())
+                + (rowSeg == null ? 0L : rowSeg.byteSize());
     }
 
     /** Package-private, for the tests: whether the slot entries live in the pool. */
@@ -1725,6 +1904,16 @@ public final class GroupKeyTable {
             slotArena = null;
             slotSeg = null;
         }
+        if (rowArena != null) {
+            rowArena.close();
+            rowArena = null;
+            rowSeg = null;
+        }
+    }
+
+    /** Package-private, for the tests: whether the key rows live in the pool. */
+    boolean nativeRows() {
+        return rowSeg != null;
     }
 
     private void freeFastSeg() {
@@ -1874,9 +2063,9 @@ public final class GroupKeyTable {
      */
     private long packedKey(int gid) {
         if (types.length == 2) {
-            return ((long) intKeys[0][gid] << 32) | (intKeys[1][gid] & 0xFFFFFFFFL);
+            return ((long) keyInt(0, gid) << 32) | (keyInt(1, gid) & 0xFFFFFFFFL);
         }
-        return types[0] == VecType.INT32 ? intKeys[0][gid] : longKeys[0][gid];
+        return types[0] == VecType.INT32 ? keyInt(0, gid) : keyLong(0, gid, 0);
     }
 
     /**
@@ -2043,12 +2232,12 @@ public final class GroupKeyTable {
         int gid = size;
         ensureGroupCapacity(gid + 1);
         if (types.length == 2) {
-            intKeys[0][gid] = a;
-            intKeys[1][gid] = b;
+            setKeyInt(0, gid, a);
+            setKeyInt(1, gid, b);
         } else if (types[0] == VecType.INT32) {
-            intKeys[0][gid] = a;
+            setKeyInt(0, gid, a);
         } else {
-            longKeys[0][gid] = l;
+            setKeyLong(0, gid, 0, l);
         }
         setEntry(pos, hash, gid);
         setPair(pos, key, gid);
@@ -2099,35 +2288,35 @@ public final class GroupKeyTable {
             }
             switch (types[c]) {
                 case INT32 -> {
-                    if (intKeys[c][gid] != keys.getInt(c, row)) {
+                    if (keyInt(c, gid) != keys.getInt(c, row)) {
                         return false;
                     }
                 }
                 case BOOL -> {
-                    if (intKeys[c][gid] != (keys.getBoolean(c, row) ? 1 : 0)) {
+                    if (keyInt(c, gid) != (keys.getBoolean(c, row) ? 1 : 0)) {
                         return false;
                     }
                 }
                 case INT64 -> {
-                    if (longKeys[c][gid] != keys.getLong(c, row)) {
+                    if (keyLong(c, gid, 0) != keys.getLong(c, row)) {
                         return false;
                     }
                 }
                 case FLOAT64 -> {
-                    if (longKeys[c][gid] != Double.doubleToRawLongBits(keys.getDouble(c, row))) {
+                    if (keyLong(c, gid, 0) != Double.doubleToRawLongBits(keys.getDouble(c, row))) {
                         return false;
                     }
                 }
                 case DECIMAL128 -> {
                     MemorySegment d = keys.data[c];
-                    if (longKeys[c][gid] != Decimal128.lo(d, row) || hiKeys[c][gid] != Decimal128.hi(d, row)) {
+                    if (keyLong(c, gid, 0) != Decimal128.lo(d, row) || keyLong(c, gid, 2) != Decimal128.hi(d, row)) {
                         return false;
                     }
                 }
                 case LIST, MAP, STRUCT, FIXED_BINARY ->
                         throw new IllegalStateException("no nested or FIXED_BINARY lane here (#705)");
                 case UTF8 -> {
-                    if (record[c] ? !recordEquals(c, gid, keys, row) : strIds[c][gid] != keys.getId(c, row)) {
+                    if (record[c] ? !recordEquals(c, gid, keys, row) : keyInt(c, gid) != keys.getId(c, row)) {
                         return false;
                     }
                 }
@@ -2218,7 +2407,6 @@ public final class GroupKeyTable {
      */
     private void toRecord(int c) {
         StringDictionary d = dicts[c];
-        int[] ids = strIds[c];
         BitSet nul = nulls[c];
         startRecord(c);
         if (recOff[c].length < size + 1) {
@@ -2230,7 +2418,7 @@ public final class GroupKeyTable {
         int used = 0;
         for (int gid = 0; gid < size; gid++) {
             if (!nul.get(gid)) {
-                int id = ids[gid];
+                int id = keyInt(c, gid);
                 int len = d.length(id);
                 ensureRecordBytes(c, used + len);
                 System.arraycopy(store, d.offset(id), recBytes[c], used, len);
@@ -2240,7 +2428,6 @@ public final class GroupKeyTable {
         }
         recUsed[c] = used;
         dicts[c] = null;
-        strIds[c] = null;
         clearSlots();
         for (int gid = 0; gid < size; gid++) {
             int hash = groupHash(gid); // the record bytes hash differently from the dictionary ids
@@ -2260,10 +2447,10 @@ public final class GroupKeyTable {
                 v = HashKernels.NULL_MARK;
             } else {
                 v = switch (types[c]) {
-                            case INT32, BOOL -> intKeys[c][gid];
-                            case INT64, FLOAT64 -> HashKernels.fold(longKeys[c][gid]);
-                            case DECIMAL128 -> HashKernels.fold(Decimal128.hash(hiKeys[c][gid], longKeys[c][gid]));
-                            case UTF8 -> record[c] ? HashKernels.hashBytes(recSeg[c], recOff[c][gid], recOff[c][gid + 1] - recOff[c][gid]) : strIds[c][gid];
+                            case INT32, BOOL -> keyInt(c, gid);
+                            case INT64, FLOAT64 -> HashKernels.fold(keyLong(c, gid, 0));
+                            case DECIMAL128 -> HashKernels.fold(Decimal128.hash(keyLong(c, gid, 2), keyLong(c, gid, 0)));
+                            case UTF8 -> record[c] ? HashKernels.hashBytes(recSeg[c], recOff[c][gid], recOff[c][gid + 1] - recOff[c][gid]) : keyInt(c, gid);
                             case LIST, MAP, STRUCT -> throw new IllegalStateException("no nested grouping keys (#705)");
                             case FIXED_BINARY -> throw new IllegalStateException("no FIXED_BINARY grouping keys: the lane does not reach operators");
                         };
@@ -2281,13 +2468,18 @@ public final class GroupKeyTable {
             boolean isNull = keys.isNull(c, row);
             nulls[c].set(gid, isNull);
             switch (types[c]) {
-                case INT32 -> intKeys[c][gid] = isNull ? 0 : keys.getInt(c, row);
-                case BOOL -> intKeys[c][gid] = isNull ? 0 : (keys.getBoolean(c, row) ? 1 : 0);
-                case INT64 -> longKeys[c][gid] = isNull ? 0L : keys.getLong(c, row);
-                case FLOAT64 -> longKeys[c][gid] = isNull ? 0L : Double.doubleToRawLongBits(keys.getDouble(c, row));
+                case INT32 -> setKeyInt(c, gid, isNull ? 0 : keys.getInt(c, row));
+                case BOOL -> setKeyInt(c, gid,
+                        isNull ? 0 : (keys.getBoolean(c, row) ? 1 : 0));
+                case INT64 -> setKeyLong(c, gid, 0,
+                        isNull ? 0L : keys.getLong(c, row));
+                case FLOAT64 -> setKeyLong(c, gid, 0,
+                        isNull ? 0L : Double.doubleToRawLongBits(keys.getDouble(c, row)));
                 case DECIMAL128 -> {
-                    longKeys[c][gid] = isNull ? 0L : Decimal128.lo(keys.data[c], row);
-                    hiKeys[c][gid] = isNull ? 0L : Decimal128.hi(keys.data[c], row);
+                    setKeyLong(c, gid, 0,
+                            isNull ? 0L : Decimal128.lo(keys.data[c], row));
+                    setKeyLong(c, gid, 2,
+                            isNull ? 0L : Decimal128.hi(keys.data[c], row));
                 }
                 case LIST, MAP, STRUCT, FIXED_BINARY ->
                         throw new IllegalStateException("no nested or FIXED_BINARY lane here (#705)");
@@ -2295,7 +2487,7 @@ public final class GroupKeyTable {
                     if (record[c]) {
                         appendRecord(c, gid, keys, row, isNull);
                     } else {
-                        strIds[c][gid] = isNull ? 0 : keys.getId(c, row);
+                        setKeyInt(c, gid, isNull ? 0 : keys.getId(c, row));
                     }
                 }
             }
@@ -2334,23 +2526,10 @@ public final class GroupKeyTable {
         if (groupHashes != null) {
             groupHashes = Arrays.copyOf(groupHashes, cap);
         }
+        growRows(cap);
         for (int c = 0; c < types.length; c++) {
-            switch (types[c]) {
-                case INT32, BOOL -> intKeys[c] = Arrays.copyOf(intKeys[c], cap);
-                case INT64, FLOAT64 -> longKeys[c] = Arrays.copyOf(longKeys[c], cap);
-                case DECIMAL128 -> {
-                    longKeys[c] = Arrays.copyOf(longKeys[c], cap);
-                    hiKeys[c] = Arrays.copyOf(hiKeys[c], cap);
-                }
-                case LIST, MAP, STRUCT, FIXED_BINARY ->
-                        throw new IllegalStateException("no nested or FIXED_BINARY lane here (#705)");
-                case UTF8 -> {
-                    if (record[c]) {
-                        recOff[c] = Arrays.copyOf(recOff[c], cap + 1);
-                    } else {
-                        strIds[c] = Arrays.copyOf(strIds[c], cap);
-                    }
-                }
+            if (types[c] == VecType.UTF8 && record[c]) {
+                recOff[c] = Arrays.copyOf(recOff[c], cap + 1);
             }
         }
     }
@@ -2366,14 +2545,10 @@ public final class GroupKeyTable {
         long bytes = (slots == null ? 0L : 8L * slots.length)
                 + (splitSlots == null ? 0L : 4L * splitSlots.length + 4L * groupHashes.length)
                 + (fast == null ? 0L : 8L * fast.length);
+        bytes += rows == null ? 0L : 4L * rows.length;
         for (int c = 0; c < types.length; c++) {
-            switch (types[c]) {
-                case INT32, BOOL -> bytes += 4L * intKeys[c].length;
-                case INT64, FLOAT64 -> bytes += 8L * longKeys[c].length;
-                case DECIMAL128 -> bytes += 16L * longKeys[c].length;
-                case LIST, MAP, STRUCT, FIXED_BINARY ->
-                        throw new IllegalStateException("no nested or FIXED_BINARY lane here (#705)");
-                case UTF8 -> bytes += record[c] ? 4L * recOff[c].length + recBytes[c].length : 4L * strIds[c].length + dicts[c].memoryBytes();
+            if (types[c] == VecType.UTF8) {
+                bytes += record[c] ? 4L * recOff[c].length + recBytes[c].length : dicts[c].memoryBytes();
             }
         }
         if (strCols > 0) {
@@ -2507,24 +2682,24 @@ public final class GroupKeyTable {
     }
 
     public int getInt(int c, int gid) {
-        return intKeys[c][gid];
+        return keyInt(c, gid);
     }
 
     public boolean getBoolean(int c, int gid) {
-        return intKeys[c][gid] != 0;
+        return keyInt(c, gid) != 0;
     }
 
     public long getLong(int c, int gid) {
-        return longKeys[c][gid];
+        return keyLong(c, gid, 0);
     }
 
     public double getDouble(int c, int gid) {
-        return Double.longBitsToDouble(longKeys[c][gid]);
+        return Double.longBitsToDouble(keyLong(c, gid, 0));
     }
 
     /** The 128-bit key of group {@code gid} of a DECIMAL128 column. */
     public java.math.BigInteger getDecimal128(int c, int gid) {
-        return Decimal128.toBigInteger(hiKeys[c][gid], longKeys[c][gid]);
+        return Decimal128.toBigInteger(keyLong(c, gid, 2), keyLong(c, gid, 0));
     }
 
     public String getString(int c, int gid) {
@@ -2533,7 +2708,7 @@ public final class GroupKeyTable {
             return new String(recBytes[c], start, recOff[c][gid + 1] - start, java.nio.charset.StandardCharsets.UTF_8);
         }
         StringDictionary d = dicts[c];
-        int id = strIds[c][gid];
+        int id = keyInt(c, gid);
         return new String(d.bytes(), d.offset(id), d.length(id),
                 java.nio.charset.StandardCharsets.UTF_8);
     }
@@ -2543,7 +2718,7 @@ public final class GroupKeyTable {
      * (0 for a null); -1 for a column in record mode.
      */
     public int getStringId(int c, int gid) {
-        return record[c] ? -1 : strIds[c][gid];
+        return record[c] ? -1 : keyInt(c, gid);
     }
 
     /**
@@ -2589,7 +2764,8 @@ public final class GroupKeyTable {
         for (int o = 0; o < count; o++) {
             Bitmap.setTo(validity, o, !nulls[c].get(from + o));
         }
-        MemorySegment.copy(strIds[c], from, ids, VectorBuffers.LE_INT, 0, count);
+        MemorySegment.copy(gatherInts(c, 0, from, count), 0, ids, VectorBuffers.LE_INT, 0,
+                count);
     }
 
     /** Total UTF-8 bytes of the keys in {@code [from, to)} of column {@code c}. */
@@ -2598,12 +2774,12 @@ public final class GroupKeyTable {
             return (long) recOff[c][to] - recOff[c][from];
         }
         StringDictionary d = dicts[c];
-        int[] ids = strIds[c];
         BitSet nul = nulls[c];
+        int[] ids = gatherInts(c, 0, from, to - from);
         long total = 0;
         for (int gid = from; gid < to; gid++) {
             if (!nul.get(gid)) {
-                total += d.length(ids[gid]);
+                total += d.length(ids[gid - from]);
             }
         }
         return total;
@@ -2621,16 +2797,19 @@ public final class GroupKeyTable {
             Bitmap.setTo(validity, o, !nulls[c].get(from + o));
         }
         switch (types[c]) {
-            case INT32 -> MemorySegment.copy(intKeys[c], from, data, VectorBuffers.LE_INT, 0, count);
+            case INT32 -> MemorySegment.copy(gatherInts(c, 0, from, count), 0, data, VectorBuffers.LE_INT, 0,
+                    count);
             case BOOL -> {
+                int[] v = gatherInts(c, 0, from, count);
                 for (int o = 0; o < count; o++) {
-                    Bitmap.setTo(data, o, intKeys[c][from + o] != 0);
+                    Bitmap.setTo(data, o, v[o] != 0);
                 }
             }
-            case INT64, FLOAT64 -> MemorySegment.copy(longKeys[c], from, data, VectorBuffers.LE_LONG, 0, count);
+            case INT64, FLOAT64 -> MemorySegment.copy(gatherLongs(c, 0, from, count), 0, data, VectorBuffers.LE_LONG, 0,
+                    count);
             case DECIMAL128 -> {
                 for (int o = 0; o < count; o++) {
-                    Decimal128.set(data, o, hiKeys[c][from + o], longKeys[c][from + o]);
+                    Decimal128.set(data, o, keyLong(c, from + o, 2), keyLong(c, from + o, 0));
                 }
             }
             case LIST, MAP, STRUCT, FIXED_BINARY ->
@@ -2651,9 +2830,9 @@ public final class GroupKeyTable {
                 // segment checks) and copy them out once: one small MemorySegment.copy per value was 15% of
                 // an executor's time in q67 at 1 TB, whose finest level emits nearly every row.
                 StringDictionary d = dicts[c];
-                int[] ids = strIds[c];
                 BitSet nul = nulls[c];
                 int total = (int) utf8Bytes(c, from, to);
+                int[] ids = gatherInts(c, 0, from, count);
                 if (emitScratch.length < total) {
                     emitScratch = new byte[Math.max(total, emitScratch.length * 2)];
                 }
@@ -2664,7 +2843,7 @@ public final class GroupKeyTable {
                 for (int o = 0; o < count; o++) {
                     int gid = from + o;
                     if (!nul.get(gid)) {
-                        int id = ids[gid];
+                        int id = ids[o];
                         int len = d.length(id);
                         System.arraycopy(store, d.offset(id), scratch, out, len);
                         out += len;
