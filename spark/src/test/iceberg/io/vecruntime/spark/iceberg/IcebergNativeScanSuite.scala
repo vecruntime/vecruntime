@@ -496,29 +496,38 @@ class IcebergNativeScanSuite extends IcebergMorSuiteBase {
     }
   }
 
-  icebergTest("Iceberg's task groups are packed into tasks as Spark packs a file scan's splits") {
-    // Small files, each its own task group (a 1 KB split target).
+  icebergTest("our scan keeps Iceberg's task grouping -- it never merges groups Iceberg kept separate") {
+    // read.split.open-file-cost = Int.MAX makes Iceberg plan one task group per file (as the Iceberg
+    // copy-on-write skew tests set it, so a row-level write produces one file per source file). Our scan must
+    // keep one Spark partition per group: merging them would collapse the output-file count below Iceberg's,
+    // which was the #20-M3a regression (added-data-files 2 vs 4). We honour Iceberg's own read.split.target-size
+    // and read.split.open-file-cost, so a merge never crosses a boundary Iceberg itself kept.
     spark.sql(
       s"CREATE OR REPLACE TABLE $Db.t_pack (a INT, b BIGINT, s STRING) USING iceberg " +
-        "TBLPROPERTIES ('read.split.target-size'='1024')"
+        "TBLPROPERTIES ('read.split.open-file-cost'='" + Int.MaxValue + "')"
     )
+    // 16 input partitions -> 16 data files, each its own Iceberg task group.
     spark.sql(
       s"INSERT INTO $Db.t_pack SELECT CAST(id AS INT), id * 3, concat('s', CAST(id % 40 AS STRING)) " +
         "FROM range(0, 20000, 1, 16)"
     )
     useTable("t_pack")
     def tasks(df: DataFrame): Int = scans(df).map(_.executeColumnar().getNumPartitions).sum
+    def icebergGroups(df: DataFrame): Int = scans(df).map(_.scan.inputRDD.partitions.length).sum
     val sql = "SELECT s, count(*), sum(b) FROM t WHERE a % 7 <> 3 GROUP BY s"
-    val off = withConf(VectorConf.ScanNativeIcebergPackSplits -> "false") { checkVectorized(sql, Seq(Filter, Agg)) }
-    val on = checkVectorized(sql, Seq(Filter, Agg))
-    assert(tasks(off) >= 16, s"${tasks(off)} tasks unpacked")
-    assert(tasks(on) < tasks(off), s"${tasks(on)} tasks packed, ${tasks(off)} unpacked")
-    // Packed to fill the cores: never fewer tasks than Spark's own packing of the same bytes would make.
-    withConf("spark.sql.files.minPartitionNum" -> "4") {
-      val four = checkVectorized(sql, Seq(Filter, Agg))
-      assert(tasks(four) >= 4 && tasks(four) <= tasks(off), s"${tasks(four)} tasks with minPartitionNum 4")
+    val df = checkVectorized(sql, Seq(Filter, Agg))
+    assert(icebergGroups(df) === 16, s"Iceberg planned ${icebergGroups(df)} groups, expected 16 (one per file)")
+    // One Spark partition per Iceberg group -- not merged down to the cluster's parallelism (even if that is < 16).
+    assert(
+      tasks(df) === 16,
+      s"${tasks(df)} Spark partitions for 16 Iceberg one-file groups -- our scan merged groups Iceberg kept separate"
+    )
+    // Forcing Spark's minPartitionNum low must NOT make us merge Iceberg's groups (the old bug).
+    withConf("spark.sql.files.minPartitionNum" -> "1") {
+      val one = checkVectorized(sql, Seq(Filter, Agg))
+      assert(tasks(one) === 16, s"${tasks(one)} partitions with minPartitionNum=1 -- Iceberg's grouping not honoured")
     }
-    // A table with deletes keeps its rows when its groups are packed.
+    // A table with deletes keeps its rows when its groups are read (one per group).
     spark.sql(s"DELETE FROM $Db.t_pack WHERE a % 11 = 4")
     checkVectorized(sql, Seq(Filter, Agg))
     assert(count("SELECT count(*) FROM t") === 20000 - (0 until 20000).count(_ % 11 == 4))

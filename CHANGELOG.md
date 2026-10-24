@@ -8,6 +8,12 @@ version may change configuration keys or defaults, always noted here.
 
 ### Added
 
+- Regression guard that our columnar shuffle and native Iceberg scan both preserve the file count of a row-level
+  write (`RebalanceSkewSplitSuite`, iceberg-bridge): the six Iceberg 1.12 `testSkew{Delete,Update,Merge}`
+  scenarios (copy-on-write and merge-on-read) run with our features off and on with a tiny Iceberg advisory
+  partition size (100) and `spark.sql.adaptive.optimizeSkewsInRebalancePartitions.enabled=true` and both produce
+  four files; plus a direct check that the native scan keeps one Spark partition per Iceberg task group when the
+  table sets a high `read.split.open-file-cost`.
 - The native Iceberg scan prunes data files by a broadcast hash join's RUNTIME filters before opening them
   (#iceberg-file-pruning, `spark.vecruntime.scan.nativeIceberg.runtimeFilePruning.enabled`, on by default). Static
   pushed filters are already pruned by Iceberg's planning, so those files are never opened; the runtime filters
@@ -80,6 +86,22 @@ version may change configuration keys or defaults, always noted here.
   Apache Iceberg 1.12's own `TestCopyOnWriteUpdate` subquery cases run with the plugin and writers on; regression
   test `CowUpdateSubqueryReadbackSuite` (two sequential copy-on-write UPDATEs on a tiny table). The copy-path file
   is now byte-order-identical to one written column by column, which the reader handles everywhere.
+- The native Iceberg scan no longer re-packs Iceberg's task groups with Spark's file-scan heuristics, which could
+  merge groups Iceberg deliberately kept separate and collapse the output-file count of a row-level write. Iceberg
+  plans its task groups honouring `read.split.target-size`, `read.split.open-file-cost` and
+  `read.split.planning-lookback`; `VectorIcebergRDD.packed` was re-grouping them by `spark.sql.files.maxPartitionBytes`
+  / `openCostInBytes` / `minPartitionNum`, so on a small cluster (or `files.minPartitionNum` low) it merged a table's
+  per-file groups down to the cluster's parallelism. A copy-on-write / merge-on-read DELETE, UPDATE or MERGE on a
+  table with a high `read.split.open-file-cost` (one file per group) then wrote fewer files than Spark's own writers
+  -- the Iceberg 1.12 `TestCopyOnWrite/MergeOnRead#testSkew*` cases read `added-data-files` 2 where 4 was expected.
+  Packing now weighs each group by Iceberg's own open-file-cost and merges only up to Iceberg's own target split size,
+  so it never crosses a boundary Iceberg itself kept (a high open-file-cost keeps one partition per group); for an
+  ordinary table, whose groups Iceberg has already packed to the target size, it is a no-op. The split size and
+  open-file cost are read from the Iceberg scan's OWN `SparkReadConf` (reflectively, via the scan object's private
+  `readConf`), so a PER-SCAN read option (`spark.read().option("split-size"|"file-open-cost", ...)`, as the bin-pack
+  rewrite runner passes them) overrides the table property exactly as Iceberg resolves it -- a prior version read
+  only the table property and diverged from Iceberg's grouping when a read option was in force (e.g. the bin-pack
+  rewrite of mixed-size files after the copy runner declines a group that needs splitting).
 
 ### Changed
 
@@ -176,9 +198,24 @@ OOM-killed executors at 1 TB.
 
 ### Fixed
 
-- The native Parquet scan's codec factory released only itself, never the zstd decompress contexts it handed
-  out per column chunk, so native memory grew until Kubernetes OOM-killed the executors at 1 TB (#828); a
-  test now checks every codec's decompressor is released (#829).
+- A copy-on-write `DELETE` / `UPDATE` whose table requests write-side coalescing (AQE `coalescePartitions`
+  on plus a large `spark.sql.iceberg.advisory-partition-size`, as Iceberg's own write would use to fuse many
+  small shuffle blocks into one file) now honours Iceberg's REBALANCE distribution instead of forcing the
+  M4a copy path's `_file` hash, so AQE coalesces the rewrite into a single added data file the way Iceberg
+  does (Apache Iceberg 1.12 `TestDelete`/`TestUpdate#testCoalesce{Delete,Update}`, snapshot
+  `added-data-files` 1, not one file per source file). The ordinary copy case -- no coalescing, or the small
+  default write advisory the copy-unchanged path relies on to keep files separate -- keeps the `_file`
+  override, so the byte-copy fast path is unchanged.
+- The columnar copy-on-write rewrite writer now stamps the table's sort order id on the data files it writes
+  (`IcebergRewriteFileTaskWriter`), as Iceberg's `SparkWrite` does, instead of leaving them unsorted
+  (`sortOrderId` 0). The streaming full-rewrite writer already did this (#964); the copy path matched it only
+  after this fix (Apache Iceberg 1.12 `TestCopyOnWrite*#testCopyOnWrite*SetsSortOrderIdOnRewrittenDataFiles`).
+- The columnar bin-pack rewrite (#967 M4c) now packs copied row groups to Iceberg's own input split size
+  (`RewriteFileGroup.inputSplitSize()`), not the larger max-output roll cap, and declines the byte copy for a
+  whole file group when a file holds a row group larger than that split size -- a case Iceberg handles by
+  decoding and splitting the file, which a whole-row-group copy cannot reproduce -- so the compacted layout
+  matches Iceberg's own `rewrite_data_files` for mixed-size inputs (Apache Iceberg 1.12
+  `TestRewriteDataFilesAction#testBinPackCombineMixedFiles`).
 
 ### Documentation
 
