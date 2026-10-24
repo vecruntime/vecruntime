@@ -45,6 +45,27 @@ final class Gather {
         return out;
     }
 
+    /**
+     * Gathers only the columns {@code gather[c]} marks, up to {@code width},
+     * into a {@code width}-long list; un-gathered slots are {@code null} (#901
+     * M4b). The mixed-group copy only needs the ENCODED columns' values -- the
+     * copied columns' bytes come straight from the source file, so gathering
+     * them is wasted work (it dominated the every-row UPDATE). A {@code null}
+     * slot is never read: the writer encodes only the non-copied columns, and
+     * the float/double metrics skip null columns (a tracked float/double is
+     * always encoded, never copied, so its slot is populated).
+     */
+    static List<VectorBuffers> rowsSelected(List<? extends VectorBuffers> columns, int[] idx, boolean[] gather,
+            int width, Arena arena) {
+        List<VectorBuffers> out = new ArrayList<>(width);
+        for (int c = 0; c < width; c++) {
+            out.add(c < gather.length && gather[c]
+                    ? column(columns.get(c), idx, arena)
+                    : null);
+        }
+        return out;
+    }
+
     private static VectorBuffers column(VectorBuffers in, int[] idx, Arena arena) {
         int n = idx.length;
         if (in.type().isNested()) {
@@ -63,6 +84,42 @@ final class Gather {
         VecType physical = in.isDictionaryEncoded() ? VecType.INT32 : in.type();
         MemorySegment data = physical == VecType.BOOL ? ArrowLayout.allocateBitmap(arena, n) : ArrowLayout.allocateData(arena, physical, n);
         GatherKernels.gatherFixed(in, idx, 0, n, data, validity);
-        return in.isDictionaryEncoded() ? SegmentVectorBuffers.dictionaryUtf8(n, validity, data, in.dictionary()) : SegmentVectorBuffers.fixedWidth(in.type(), n, validity, data);
+        // A dictionary-encoded column gathers its int32 ids (above), but its DICTIONARY (the UTF8 values the
+        // ids point into) is the producer's buffer. The native Iceberg scan reuses/releases that buffer when
+        // it emits its next batch (#901 M4b), while the rewrite retains these gathered columns across every
+        // batch until close(). Retaining the dictionary BY REFERENCE therefore leaves the ids pointing at a
+        // dictionary whose offsets/bytes have since been overwritten -- at re-encode time BinaryChunkWriter
+        // reads offsets[id+1]-offsets[id] and gets a negative length (IndexOutOfBoundsException: negative
+        // size). Copy the dictionary into this arena so the retained column is self-contained.
+        return in.isDictionaryEncoded() ? SegmentVectorBuffers.dictionaryUtf8(n, validity, data, copyUtf8(in.dictionary(), arena)) : SegmentVectorBuffers.fixedWidth(in.type(), n, validity, data);
+    }
+
+    /**
+     * A deep copy of a plain UTF8 dictionary (its validity, offsets and bytes)
+     * into {@code arena}, so a retained dictionary-encoded column no longer
+     * aliases the producer's reusable buffer (#901 M4b).
+     */
+    private static VectorBuffers copyUtf8(VectorBuffers dict, Arena arena) {
+        int d = dict.length();
+        MemorySegment srcOffsets = dict.offsets();
+        int base = srcOffsets.get(VectorBuffers.LE_INT, 0L);
+        long byteLen = (long) srcOffsets.get(VectorBuffers.LE_INT, (long) d << 2) - base;
+        // Rebase the offsets to the copied bytes buffer (which starts at 0), not the source's base: a
+        // dictionary read from the producer need not start at offset 0.
+        MemorySegment offsets = ArrowLayout.allocateOffsets(arena, d);
+        for (int i = 0; i <= d; i++) {
+            offsets.set(VectorBuffers.LE_INT, (long) i << 2, srcOffsets.get(VectorBuffers.LE_INT, (long) i << 2) - base);
+        }
+        MemorySegment bytes = ArrowLayout.allocateBytes(arena, Math.max(1, byteLen));
+        if (byteLen > 0) {
+            MemorySegment.copy(dict.data(), base, bytes, 0L, byteLen);
+        }
+        MemorySegment validity = null;
+        if (dict.hasNulls() && dict.validity() != null) {
+            long vbytes = io.vecruntime.kernels.Bitmap.bytesFor(d);
+            validity = ArrowLayout.allocateBitmap(arena, d);
+            MemorySegment.copy(dict.validity(), 0L, validity, 0L, vbytes);
+        }
+        return SegmentVectorBuffers.utf8(d, validity, offsets, bytes);
     }
 }

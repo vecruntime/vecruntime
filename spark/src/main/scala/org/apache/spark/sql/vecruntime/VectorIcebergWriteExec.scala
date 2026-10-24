@@ -76,20 +76,39 @@ case class VectorIcebergWriteStrategy(session: SparkSession) extends SparkStrate
           if (ordinals.exists(_.isEmpty)) {
             declined(s"write column ${names(ordinals.indexWhere(_.isEmpty))} is in neither projection")
           } else {
-            // #901 M4a: a copy-on-write DELETE (no row data changes, just rows dropped) copies the row groups
-            // it does not touch, when the flag is on and the scan projects _file / _pos (Iceberg's
-            // copy-on-write scan does). Partitioned and unpartitioned both work -- a rewritten file keeps its
-            // source file's partition. An UPDATE or MERGE rewrites values and is not eligible.
-            val copy =
-              if (
-                VectorConf.icebergCopyUnchangedEnabled(conf) &&
-                VectorIcebergWriteStrategy.isDelete(r)
-              ) {
+            // #901 M4a/M4b: a copy-on-write DELETE or UPDATE copies the row groups (DELETE) or column chunks
+            // (UPDATE) it does not touch, when the flag is on and the scan projects _file / _pos (Iceberg's
+            // copy-on-write scan does). For a DELETE every surviving row is an unchanged copy, so the per-column
+            // encode mask is all-false (copy every data column). For an UPDATE the changed columns are extracted
+            // from the rewrite plan (the SET assignments); untouched columns are copied, changed columns and the
+            // v3 lineage columns are re-encoded. A MERGE is not eligible: its rewrite is a MergeRows that does
+            // not carry _pos, so the per-row source position the copy path needs is unavailable.
+            val copy: Option[VectorIcebergWriteStrategy.CopyPlan] =
+              if (VectorConf.icebergCopyUnchangedEnabled(conf)) {
                 (ordinal("_file"), ordinal("_pos")) match {
-                  case (Some(f), Some(p)) => Some((f, p))
+                  case (Some(f), Some(p)) if VectorIcebergWriteStrategy.isDelete(r) =>
+                    // DELETE: copy every data column (encode nothing); the v3 lineage re-encode is decided by
+                    // the planner from the source schema, as M4a does.
+                    Some(VectorIcebergWriteStrategy.CopyPlan(f, p, names.map(VectorIcebergWriteStrategy.isLineage)))
+                  case (Some(f), Some(p)) if VectorIcebergWriteStrategy.isUpdate(r) =>
+                    VectorIcebergWriteStrategy.updateEncodeMask(r, names).flatMap { encode =>
+                      // Decline when a CHANGED column is one the table partitions by: a row may move partition,
+                      // which the copy path (one output file per source file/partition) cannot do -- fall back
+                      // to Iceberg's native partitioned writer, which re-partitions.
+                      val partCols = IcebergWriteBridge.partitionSourceNames(w).toSet
+                      val changesPartition = names.indices.exists(i => encode(i) && partCols.contains(names(i)))
+                      if (changesPartition) None
+                      else Some(VectorIcebergWriteStrategy.CopyPlan(f, p, encode))
+                    }
                   case _ => None
                 }
               } else None
+
+            // #901 M4b: MERGE is NOT eligible for the copy path. Its copy-on-write rewrite is a MergeRows
+            // whose target scan Iceberg builds to project only `_file`, never `_pos`, and `_pos` cannot be
+            // threaded in from a Spark extension (the relation exposes no `_pos` metadata column at resolution
+            // and the scan is Iceberg's to build). Without a per-row source position the copy path cannot map
+            // rows to groups, so a MERGE takes the full rewrite. DELETE and UPDATE are the eligible operations.
             take(plan, r.table, r.query, r.write, Some(ordinals.map(_.get)), r.originalTable, copy)
           }
         case _ => take(plan, r.table, r.query, r.write, None, r.originalTable)
@@ -111,7 +130,7 @@ case class VectorIcebergWriteStrategy(session: SparkSession) extends SparkStrate
       write: Option[Write],
       ordinals: Option[Array[Int]],
       original: LogicalPlan = null,
-      copy: Option[(Int, Int)] = None
+      copy: Option[VectorIcebergWriteStrategy.CopyPlan] = None
   ): Seq[SparkPlan] = {
     val conf = session.sessionState.conf
     val reason =
@@ -125,18 +144,31 @@ case class VectorIcebergWriteStrategy(session: SparkSession) extends SparkStrate
       case None =>
         val rowOrdinals = ordinals.getOrElse(query.output.indices.toArray)
         // #901 M4a: for the copy path, cluster the input by _file with a plain hash partitioning
-        // (RepartitionByExpression -> ShuffleExchange hashpartitioning(_file), ENSURE_REQUIREMENTS). This
-        // replaces Iceberg's REBALANCE_PARTITIONS_BY_COL distribution: a plain hash exchange sends every row
-        // of a file to one reducer and is never split by AQE's OptimizeSkewInRebalancePartitions (which only
-        // touches REBALANCE exchanges), so a source file is whole in one task and its row groups can be copied.
+        // (RepartitionByExpression -> ShuffleExchange hashpartitioning(_file), ENSURE_REQUIREMENTS): a plain
+        // hash exchange sends every row of a file to one reducer and is never split by AQE's
+        // OptimizeSkewInRebalancePartitions (which only touches REBALANCE exchanges), so a source file is whole
+        // in one task and its row groups can be copied. This REPLACES Iceberg's REBALANCE_PARTITIONS_BY_COL
+        // distribution.
+        //
+        // EXCEPTION (coalesce intent): when the user has configured write-side coalescing -- AQE
+        // coalescePartitions on AND a large Iceberg write advisory partition size
+        // (spark.sql.iceberg.advisory-partition-size, which Iceberg's own write would feed to its REBALANCE so
+        // AQE fuses many small shuffle blocks into ONE task and writes ONE file) -- our plain _file hash would
+        // instead write one file per source file (it carries Spark's tiny default advisory, which AQE cannot
+        // coalesce, and one reducer per _file key). Honour Iceberg's own distribution in that case: leave the
+        // query's REBALANCE in place so AQE coalesces it, and let the runtime clusteredByFile gate decline the
+        // copy (a RANGE distribution is not a single-_file hash) so the coalesced input takes the full rewrite,
+        // matching Iceberg's one-file result (TestDelete/TestUpdate#testCoalesce{Delete,Update}). The ordinary
+        // copy case -- no coalescing, or the default small write advisory the copy-unchanged path relies on to
+        // keep files separate -- keeps the _file override.
         val child = copy match {
-          case Some((fileOrd, _)) =>
+          case Some(cp) if !VectorIcebergWriteStrategy.writeSideCoalescing(conf) =>
             org.apache.spark.sql.catalyst.plans.logical.RepartitionByExpression(
-              Seq(query.output(fileOrd)),
+              Seq(query.output(cp.fileOrdinal)),
               query,
               None
             )
-          case None => query
+          case _ => query
         }
         Seq(
           VectorIcebergWriteExec(
@@ -146,8 +178,9 @@ case class VectorIcebergWriteStrategy(session: SparkSession) extends SparkStrate
             planLater(child),
             VectorIcebergWriteStrategy.refreshCache(session, Option(original).getOrElse(table)),
             plan.nodeName,
-            copy.map(_._1).getOrElse(-1),
-            copy.map(_._2).getOrElse(-1)
+            copy.map(_.fileOrdinal).getOrElse(-1),
+            copy.map(_.posOrdinal).getOrElse(-1),
+            copy.map(_.encodeColumns).orNull
           )
         )
     }
@@ -155,6 +188,31 @@ case class VectorIcebergWriteStrategy(session: SparkSession) extends SparkStrate
 }
 
 object VectorIcebergWriteStrategy {
+
+  /**
+   * Whether the user configured WRITE-SIDE coalescing for this session: AQE `coalescePartitions` is on AND the
+   * Iceberg write advisory partition size (`spark.sql.iceberg.advisory-partition-size`) is set larger than
+   * Spark's own advisory partition size. That is the signal Iceberg's own copy-on-write write uses to fuse many
+   * small shuffle blocks into ONE output file (it feeds the large advisory to its REBALANCE exchange and AQE
+   * coalesces it). In that configuration the M4a copy path must NOT replace Iceberg's distribution with a plain
+   * `_file` hash: the hash carries Spark's tiny default advisory, which AQE cannot coalesce, so the rewrite
+   * writes one file per source file instead of the single coalesced file Iceberg produces. The copy-unchanged
+   * path, by contrast, leaves the Iceberg advisory at its (small) default precisely to keep files separate for
+   * copying, so this returns false there and the `_file` override stands.
+   */
+  def writeSideCoalescing(conf: org.apache.spark.sql.internal.SQLConf): Boolean = {
+    if (!conf.coalesceShufflePartitionsEnabled) {
+      return false
+    }
+    // Iceberg's write advisory (session conf). Unset -> Iceberg defaults it to the target file size (small),
+    // which is NOT a coalesce-into-large-files signal; only an explicit, larger-than-Spark value is. Referenced
+    // by its string key (the spark module has no compile-time Iceberg dependency).
+    val icebergAdvisory =
+      try Option(conf.getConfString("spark.sql.iceberg.advisory-partition-size", null))
+          .map(_.trim.toLong)
+      catch { case _: Throwable => None }
+    icebergAdvisory.exists(_ > conf.getConf(org.apache.spark.sql.internal.SQLConf.ADVISORY_PARTITION_SIZE_IN_BYTES))
+  }
 
   /**
    * Recaches the target after the commit, as Spark's `DataSourceV2Strategy` does for its own write execs: by
@@ -184,6 +242,94 @@ object VectorIcebergWriteStrategy {
   def isDelete(r: ReplaceData): Boolean =
     try r.operation.command() == org.apache.spark.sql.connector.write.RowLevelOperation.Command.DELETE
     catch { case _: Throwable => false }
+
+  /** Whether a `ReplaceData` is a copy-on-write UPDATE. */
+  def isUpdate(r: ReplaceData): Boolean =
+    try r.operation.command() == org.apache.spark.sql.connector.write.RowLevelOperation.Command.UPDATE
+    catch { case _: Throwable => false }
+
+  /** The two v3 row-lineage column names, which are always re-encoded on a copy (never copied byte for byte). */
+  private val LineageColumns = Set("_row_id", "_last_updated_sequence_number")
+
+  /** Whether a write-schema column is a v3 row-lineage column. */
+  def isLineage(name: String): Boolean = LineageColumns.contains(name)
+
+  /**
+   * The copy plan for a copy-on-write rewrite eligible for the row-group / column-chunk copy path (#901 M4a,
+   * M4b): the `_file` and `_pos` ordinals in the batch, and `encodeColumns`, a per-write-schema-column flag --
+   * `true` to RE-ENCODE the column (a changed column, or a v3 lineage column), `false` to COPY its chunk byte
+   * for byte. A DELETE encodes nothing but lineage; an UPDATE encodes its changed columns and lineage.
+   */
+  final case class CopyPlan(fileOrdinal: Int, posOrdinal: Int, encodeColumns: Array[Boolean])
+
+  /**
+   * The per-write-schema-column encode mask for a copy-on-write UPDATE, derived from the rewrite plan, or
+   * `None` when the plan shape is not the one `RewriteUpdateTable` produces (then the whole write takes the
+   * existing full-rewrite path -- conservative: an unrecognised plan copies nothing).
+   *
+   * Spark 4.1's `RewriteUpdateTable` builds `ReplaceData.query` as a tag `Project` over an assignment `Project`
+   * over the table scan (`RelationV2`). In the assignment `Project` each data column's expression is either the
+   * bare source attribute (unassigned) or `If(cond, newValue, oldAttr)` (assigned). A column is UNTOUCHED iff,
+   * in every branch, the value is the SAME source attribute the column reads from -- the bare attribute, or
+   * `If(c, attr, attr)` (a self-assignment `SET x = x`). Anything else -- a different attribute, a cast, a
+   * literal, an arithmetic or string expression -- is CHANGED and must be re-encoded.
+   *
+   * The two v3 lineage columns are always re-encoded: Iceberg nulls a matched row's
+   * `_last_updated_sequence_number` so the commit assigns the new one, and keeps `_row_id`; both are written by
+   * the engine, not copied. A partition column that is CHANGED makes the whole file ineligible (rows may move
+   * partition), handled downstream by the planner / task writer from the spec, not here.
+   */
+  def updateEncodeMask(r: ReplaceData, writeNames: Array[String]): Option[Array[Boolean]] = {
+    import org.apache.spark.sql.catalyst.expressions.{Alias, AttributeReference, Expression, If, NamedExpression}
+    import org.apache.spark.sql.catalyst.plans.logical.Project
+    try {
+      // Find the assignment Project: in the optimized plan the tag + assignment Projects collapse into ONE
+      // Project that sits over the table scan subtree (possibly a Filter carrying a dynamic-pruning
+      // expression). Its named expressions give each output column its value -- a bare attribute (untouched),
+      // If(cond, newValue, oldAttr) (conditional assignment), or a computed expression (changed). We find the
+      // Project whose child subtree's output carries `_pos` (the scan), and classify against that child's
+      // output attributes (a Filter passes them through unchanged, so names still match the scan).
+      def overScan(p: org.apache.spark.sql.catalyst.plans.logical.LogicalPlan): Boolean =
+        p.output.exists(_.name == "_pos")
+      def unwrap(p: org.apache.spark.sql.catalyst.plans.logical.LogicalPlan): Option[Project] = p match {
+        case pr: Project if overScan(pr.child) => Some(pr)
+        case other => other.children.iterator.flatMap(c => unwrap(c)).toSeq.headOption
+      }
+      unwrap(r.query).map { assign =>
+        // The scan attributes by name (the assignment Project's child is the scan). A column is UNTOUCHED iff
+        // its value is, in every branch, the scan attribute of the SAME column name -- a bare pass-through
+        // `attr`, or `If(c, attr, attr)` (a conditional self-assignment). An unconditional `SET a = b` makes
+        // a's value the scan attribute `b` (a different name) -> CHANGED; a literal/cast/arithmetic -> CHANGED.
+        val scanByName: Map[String, Long] =
+          assign.child.output.map(a => a.name -> a.exprId.id).toMap
+        def isScanAttrNamed(e: Expression, name: String): Boolean = e match {
+          case a: AttributeReference => scanByName.get(name).contains(a.exprId.id)
+          case _ => false
+        }
+        def untouched(value: Expression, name: String): Boolean = value match {
+          case a: AttributeReference => isScanAttrNamed(a, name)
+          case If(_, t, f) => isScanAttrNamed(t, name) && isScanAttrNamed(f, name)
+          case _ => false
+        }
+        // Per assignment-Project output column NAME -> untouched?
+        val byName: Map[String, Boolean] = assign.projectList.collect {
+          case ne: NamedExpression =>
+            val value = ne match {
+              case Alias(child, _) => child
+              case a => a
+            }
+            ne.name -> untouched(value, ne.name)
+        }.toMap
+        writeNames.map { name =>
+          if (isLineage(name)) true // lineage always re-encoded
+          else byName.get(name) match {
+            case Some(ut) => !ut // encode iff NOT untouched
+            case None => true // not found -> be safe, re-encode
+          }
+        }
+      }
+    } catch { case _: Throwable => None }
+  }
 }
 
 /**
@@ -207,7 +353,8 @@ case class VectorIcebergWriteExec(
     refreshCache: () => Unit,
     operation: String,
     fileOrdinal: Int = -1,
-    posOrdinal: Int = -1
+    posOrdinal: Int = -1,
+    encodeColumns: Array[Boolean] = null
 ) extends V2CommandExec
     with AdaptiveSparkPlanHelper
     with Logging {
@@ -239,6 +386,7 @@ case class VectorIcebergWriteExec(
     val ordinals = rowOrdinals
     val fileOrd = fileOrdinal
     val posOrd = posOrdinal
+    val encodeCols = encodeColumns
     // #901 M4a safe by construction: copy only when the input is clustered by _file (a HashPartitioning on
     // exactly the _file attribute, after AQE). Our strategy wraps the copy child in RepartitionByExpression
     // (_file) so this holds; if for any reason it does not (AQE changed it, a plan we did not expect), fall
@@ -259,6 +407,7 @@ case class VectorIcebergWriteExec(
                 ordinals,
                 fileOrd,
                 posOrd,
+                encodeCols,
                 batches
               )
             else
@@ -305,27 +454,111 @@ object VectorIcebergWriteExec extends Logging {
   /**
    * The child's batches -- from below the row transition Spark (or adaptive execution) put above it -- and
    * whether they had to be built from rows.
+   *
+   * A command declares a row child, so Spark puts a `ColumnarToRow` above the child's final plan and adaptive
+   * execution wraps the whole thing in query-stage nodes. When the stage below that transition is actually
+   * columnar -- our shuffle read, our Expand/Filter/MergeRows chain -- reading it row by row and converting
+   * back with `RowToColumnarExec` is a pointless columnar->row->columnar round trip that drops the whole
+   * merge-on-read MERGE/UPDATE write to rows (the `_spec_id`/`_partition`/`_file` clustering Iceberg requires
+   * is satisfied by our columnar exchange, but the write never read it columnar). So descend through the
+   * transparent adaptive wrappers (`AdaptiveSparkPlanExec`, the query stages, whole-stage codegen, the input
+   * adapter) and peel the `ColumnarToRow` transition, and read the first columnar node directly. Only a child
+   * that is genuinely row at the stage root (a Spark row MergeRows over a row source) is converted from rows.
    */
   def columnar(query: SparkPlan): (RDD[ColumnarBatch], Boolean) = {
-    val plan = query match {
-      case a: AdaptiveSparkPlanExec => a.finalPhysicalPlan
-      case p => p
+    VectorIcebergWriteExec.columnarChild(query) match {
+      case Some(columnar) =>
+        logDebug(s"reads ${columnar.nodeName} columnar")
+        (columnar.executeColumnar(), false)
+      case None =>
+        val rowRoot = VectorIcebergWriteExec.nullSafeRowRoot(VectorIcebergWriteExec.rowStageRoot(query))
+        logInfo(s"vecruntime: the columnar Iceberg writer reads rows from ${rowRoot.nodeName} (RowToColumnarExec)")
+        (RowToColumnarExec(rowRoot).executeColumnar(), true)
     }
-    plan match {
-      case t: ColumnarToRowTransition if t.child.supportsColumnar =>
-        logDebug(s"reads ${t.child.nodeName} columnar, from below ${t.nodeName}")
-        (t.child.executeColumnar(), false)
-      case w: org.apache.spark.sql.execution.WholeStageCodegenExec
-          if w.child.isInstanceOf[ColumnarToRowTransition] && w.child.children.head.supportsColumnar =>
-        // A transition collapsed into a codegen stage (adaptive execution plans the child on its own).
-        (w.child.children.head.executeColumnar(), false)
-      case p if p.supportsColumnar =>
-        logDebug(s"reads ${p.nodeName} columnar")
-        (p.executeColumnar(), false)
-      case p =>
-        logInfo(s"vecruntime: the columnar Iceberg writer reads rows from ${p.nodeName} (RowToColumnarExec)")
-        (RowToColumnarExec(p).executeColumnar(), true)
+  }
+
+  /**
+   * The row root made safe for Spark's `RowToColumnarExec`, which cannot convert a `NullType` (VOID) column at
+   * any depth (`[UNSUPPORTED_DATATYPE] Unsupported data type "VOID"`). A `NullType` is the Spark form of a v3
+   * `unknown` field, whose value is never stored and is dropped from the write (`SparkLanes`), so its value is
+   * irrelevant here. Each output column that carries a `NullType` -- at the top level, or inside a struct at
+   * any depth -- is rewritten, in place, to an expression that holds a typed null (`null` as `int`) in place of
+   * every `NullType` leaf, through a `ProjectExec`; the leaf is dropped before the Parquet writer. A struct is
+   * rebuilt with `CreateNamedStruct` so its real fields keep their values and only the unknown field is
+   * substituted. Lists and maps need no handling: an unknown element or map value is declined before the write
+   * reaches the columnar path. When no output column carries a `NullType` the root is returned unchanged, so
+   * the common path is untouched.
+   */
+  def nullSafeRowRoot(root: SparkPlan): SparkPlan = {
+    import org.apache.spark.sql.catalyst.expressions.{
+      Alias,
+      CreateNamedStruct,
+      Expression,
+      GetStructField,
+      If,
+      IsNull,
+      Literal,
+      NamedExpression
     }
+    import org.apache.spark.sql.types.{DataType, IntegerType, NullType, StructType}
+
+    def hasNull(dt: DataType): Boolean = dt match {
+      case _: NullType => true
+      case s: StructType => s.fields.exists(f => hasNull(f.dataType))
+      case _ => false // an array/map of unknown is declined, so it never reaches here
+    }
+
+    // An expression of the same shape as `e` with every NullType leaf replaced by a typed null literal. A
+    // rebuilt struct keeps its own nullability: a null struct stays null rather than becoming a struct of
+    // nulls (CreateNamedStruct is never null), so the rows match Iceberg's writer.
+    def rewrite(e: Expression): Expression = e.dataType match {
+      case _: NullType => Literal(null, IntegerType)
+      case s: StructType =>
+        val fields = s.fields.zipWithIndex.flatMap { case (f, i) =>
+          Seq(Literal(f.name), rewrite(GetStructField(e, i, Some(f.name))))
+        }
+        val rebuilt = CreateNamedStruct(fields.toIndexedSeq)
+        If(IsNull(e), Literal(null, rebuilt.dataType), rebuilt)
+      case _ => e
+    }
+
+    if (!root.output.exists(a => hasNull(a.dataType))) {
+      root
+    } else {
+      val projectList: Seq[NamedExpression] = root.output.map { a =>
+        if (hasNull(a.dataType)) Alias(rewrite(a), a.name)(exprId = a.exprId) else a
+      }
+      org.apache.spark.sql.execution.ProjectExec(projectList, root)
+    }
+  }
+
+  /**
+   * The first columnar node reachable from a command's child through the transparent adaptive wrappers Spark
+   * puts above it, or None when the stage is genuinely row at its root. The wrappers are single-child nodes
+   * whose output is their child's output unchanged: the adaptive plan (its final physical plan), a query stage
+   * (its wrapped plan), whole-stage codegen, the input adapter, and the `ColumnarToRow` transition Spark
+   * inserts because a command declares a row child. A node that already produces batches ends the descent;
+   * the transition is peeled rather than executed so the batches below it are read directly.
+   */
+  def columnarChild(plan: SparkPlan): Option[SparkPlan] = plan match {
+    case p if p.supportsColumnar => Some(p)
+    case a: AdaptiveSparkPlanExec => columnarChild(a.finalPhysicalPlan)
+    case q: org.apache.spark.sql.execution.adaptive.QueryStageExec => columnarChild(q.plan)
+    case w: org.apache.spark.sql.execution.WholeStageCodegenExec => columnarChild(w.child)
+    case i: org.apache.spark.sql.execution.InputAdapter => columnarChild(i.child)
+    case t: ColumnarToRowTransition => columnarChild(t.child)
+    case _ => None
+  }
+
+  /**
+   * The row node to convert when the stage is genuinely row: the adaptive plan's final physical plan (or the
+   * query stage's wrapped plan), so a `RowToColumnarExec` sits over the real stage root rather than over the
+   * `AdaptiveSparkPlanExec` wrapper (which cannot be re-executed columnar).
+   */
+  def rowStageRoot(plan: SparkPlan): SparkPlan = plan match {
+    case a: AdaptiveSparkPlanExec => rowStageRoot(a.finalPhysicalPlan)
+    case q: org.apache.spark.sql.execution.adaptive.QueryStageExec => rowStageRoot(q.plan)
+    case p => p
   }
 
   /**
@@ -402,10 +635,13 @@ object VectorIcebergWriteExec extends Logging {
   }
 
   /**
-   * One task of a copy-on-write DELETE rewritten with row-group copies (#901 M4a). The batch's data columns
-   * (at `ordinals`) and its `_file` / `_pos` columns are handed to the bridge's rewrite task writer, which
-   * buffers by source file and, on close, copies the delete-free row groups of each file and re-encodes the
-   * rest. Returns Iceberg's own commit message for the new data files.
+   * One task of a copy-on-write DELETE or UPDATE rewritten with the copy path (#901 M4a/M4b). The batch's data
+   * columns (at `ordinals`) and its `_file` / `_pos` columns are handed to the bridge's rewrite task writer,
+   * which buffers by source file and, on close, copies the untouched chunks of each file and re-encodes the
+   * rest. `encodeColumns` is the per-write-schema-column re-encode mask: `true` to re-encode (a changed column
+   * or a v3 lineage column), `false` to copy the chunk byte for byte. For a DELETE it is all-false except
+   * lineage (copy every data column); for an UPDATE it carries the changed columns. Null means copy every data
+   * column (the M4a default). Returns Iceberg's own commit message for the new data files.
    */
   def rewriteTask(
       spec: AnyRef,
@@ -413,6 +649,7 @@ object VectorIcebergWriteExec extends Logging {
       ordinals: Array[Int],
       fileOrdinal: Int,
       posOrdinal: Int,
+      encodeColumns: Array[Boolean],
       batches: Iterator[ColumnarBatch]
   ): WriterCommitMessage = {
     val ctx = TaskContext.get()
@@ -420,6 +657,9 @@ object VectorIcebergWriteExec extends Logging {
     // [0, ordinals.length), _file at ordinals.length, _pos at ordinals.length + 1.
     val all = ordinals :+ fileOrdinal :+ posOrdinal
     val dataIdx = ordinals.indices.toArray
+    // The encode mask is over the write-schema (data) columns, in the same order as `ordinals`; null -> copy
+    // every data column. A changed data column (true) is re-encoded instead of copied.
+    val encode = if (encodeColumns == null) new Array[Boolean](ordinals.length) else encodeColumns
     val writer =
       IcebergWriteBridge.createRewriteTaskWriter(
         spec,
@@ -428,7 +668,8 @@ object VectorIcebergWriteExec extends Logging {
         conf,
         ordinals.length,
         ordinals.length + 1,
-        dataIdx
+        dataIdx,
+        encode
       )
     try {
       while (batches.hasNext) {

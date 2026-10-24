@@ -48,17 +48,32 @@ object ParquetFileResolver {
    */
   val icebergEqualityLoads = new java.util.concurrent.atomic.AtomicLong()
 
+  /**
+   * #shading: how many times the native equality-delete reader was unusable against the Iceberg on the classpath
+   * (a shaded-vs-unshaded Parquet `MessageType` mismatch, or an absent/reshaped generic-reader API) and the scan
+   * fell back to Iceberg's own `BaseDeleteLoader` row probe (read by tests). Zero on a matched classpath.
+   */
+  val nativeEqualityFallbacks = new java.util.concurrent.atomic.AtomicLong()
+
   private val IcebergResolver = "io.vecruntime.iceberg.spark.SparkParquetFileResolver"
 
   /**
    * The Iceberg resolver (iceberg-bridge's `IcebergReadSpecs`) for a table's schema and name mapping JSON (null:
    * none); None when the bridge is not on the classpath, in which case the scan resolves columns as before.
+   * `historySchemas` is the table's superseded schemas (newest first): a requested field id absent from the
+   * current schema -- an equality delete keyed on a since-dropped column, read as a hidden probe column -- is
+   * resolved against these, so our reader reads that column from the files that predate the drop by its field id.
    */
-  def iceberg(tableSchema: AnyRef, nameMappingJson: String): Option[ParquetFileResolver] =
+  def iceberg(
+      tableSchema: AnyRef,
+      nameMappingJson: String,
+      historySchemas: java.util.List[AnyRef] = java.util.Collections.emptyList()
+  ): Option[ParquetFileResolver] =
     try {
       val cls = Class.forName(IcebergResolver, true, Thread.currentThread().getContextClassLoader)
       Some(
-        cls.getConstructor(classOf[Object], classOf[String]).newInstance(tableSchema, nameMappingJson)
+        cls.getConstructor(classOf[Object], classOf[String], classOf[java.util.List[_]])
+          .newInstance(tableSchema, nameMappingJson, historySchemas)
           .asInstanceOf[ParquetFileResolver]
       )
     } catch {

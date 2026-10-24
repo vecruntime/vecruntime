@@ -107,7 +107,14 @@ case class VectorShuffleExchangeExec(
   override lazy val metrics: Map[String, SQLMetric] = Map(
     "dataSize" -> SQLMetrics.createSizeMetric(sparkContext, "data size"),
     "stringBytes" -> SQLMetrics.createSizeMetric(sparkContext, "string bytes as UnsafeRow (AQE sizing)"),
-    "numPartitions" -> SQLMetrics.createMetric(sparkContext, "partitions")
+    "numPartitions" -> SQLMetrics.createMetric(sparkContext, "partitions"),
+    // #932: the reduce task's time decoding the fetched blocks into columnar batches (zstd
+    // decompression + Arrow IPC decode + coalescing), so the UI and the event log separate the
+    // decode cost from the fetch wait Spark's standard shuffleReadMetrics already carry. Distinct
+    // from fetchWaitTime, which is the time the task thread blocks on the network for a block's
+    // bytes; this is what it then spends turning those bytes into batches.
+    VectorShuffleExchangeExec.BlockReadTime ->
+      SQLMetrics.createNanoTimingMetric(sparkContext, "shuffle block-read (decode) time")
   ) ++ readMetrics ++ writeMetrics
 
   @transient private lazy val inputRDD: RDD[ColumnarBatch] = child.executeColumnar()
@@ -191,7 +198,12 @@ case class VectorShuffleExchangeExec(
   override def shuffleId: Int = shuffleDependency.shuffleId
 
   override def getShuffleRDD(partitionSpecs: Array[ShufflePartitionSpec]): RDD[ColumnarBatch] =
-    new ShuffledColumnarRDD(shuffleDependency, readMetrics, partitionSpecs)
+    new ShuffledColumnarRDD(
+      shuffleDependency,
+      readMetrics,
+      partitionSpecs,
+      Some(metrics(VectorShuffleExchangeExec.BlockReadTime))
+    )
 
   override def runtimeStatistics: Statistics = {
     val dataSize = metrics("dataSize").value
@@ -219,7 +231,12 @@ case class VectorShuffleExchangeExec(
   private var cachedShuffleRDD: ShuffledColumnarRDD = _
 
   override protected def doExecuteColumnar(): RDD[ColumnarBatch] = {
-    if (cachedShuffleRDD == null) cachedShuffleRDD = new ShuffledColumnarRDD(shuffleDependency, readMetrics)
+    if (cachedShuffleRDD == null) cachedShuffleRDD = new ShuffledColumnarRDD(
+      shuffleDependency,
+      readMetrics,
+      Array.tabulate(shuffleDependency.partitioner.numPartitions)(i => CoalescedPartitionSpec(i, i + 1)),
+      Some(metrics(VectorShuffleExchangeExec.BlockReadTime))
+    )
     cachedShuffleRDD
   }
 
@@ -229,6 +246,9 @@ case class VectorShuffleExchangeExec(
 }
 
 object VectorShuffleExchangeExec {
+
+  /** #932: the SQL-metric key for the reduce task's block decode time (zstd + IPC + coalescing). */
+  val BlockReadTime = "blockReadTime"
 
   /** #694 kill switch: `false` submits a late stage as Spark does. */
   val SkipEndedExecutionStages = "spark.vecruntime.shuffle.skipEndedExecutionStages"
@@ -518,8 +538,16 @@ final class ShuffledColumnarRDDPartition(val index: Int, val spec: ShufflePartit
 final class ShuffledColumnarRDD(
     dependency: ShuffleDependency[Int, ColumnarBatch, ColumnarBatch],
     metrics: Map[String, SQLMetric],
-    partitionSpecs: Array[ShufflePartitionSpec]
+    partitionSpecs: Array[ShufflePartitionSpec],
+    /** #932: the exchange's block-read (decode) timing metric, or None for a direct construction (tests). */
+    blockReadTime: Option[SQLMetric]
 ) extends RDD[ColumnarBatch](dependency.rdd.context, Nil) {
+
+  def this(
+      dependency: ShuffleDependency[Int, ColumnarBatch, ColumnarBatch],
+      metrics: Map[String, SQLMetric],
+      partitionSpecs: Array[ShufflePartitionSpec]
+  ) = this(dependency, metrics, partitionSpecs, metrics.get(VectorShuffleExchangeExec.BlockReadTime))
 
   def this(dependency: ShuffleDependency[Int, ColumnarBatch, ColumnarBatch], metrics: Map[String, SQLMetric]) =
     this(
@@ -599,8 +627,34 @@ final class ShuffledColumnarRDD(
           sqlMetricsReporter
         )
     }
-    reader.read().asInstanceOf[Iterator[Product2[Int, ColumnarBatch]]].map(_._2)
+    timed(reader.read().asInstanceOf[Iterator[Product2[Int, ColumnarBatch]]].map(_._2))
   }
+
+  /**
+   * #932: the reduce task's block-read (decode) time -- the wall time its own thread spends pulling
+   * batches out of the fetched blocks: zstd decompression, Arrow IPC decode and the reader's
+   * coalescing. Because the Flight path decodes straight off the gRPC stream, a pull that runs dry
+   * blocks for the next message inside this window too, so for a remote read this time is the gross
+   * decode-plus-wait and Spark's fetchWaitTime isolates the network portion within it; a local read
+   * has no wait, so it is decode alone. A dropped metric (`blockReadTime` absent, e.g. a direct
+   * ShuffledColumnarRDD in a test) leaves the iterator untouched.
+   */
+  private def timed(it: Iterator[ColumnarBatch]): Iterator[ColumnarBatch] =
+    blockReadTime match {
+      case None => it
+      case Some(metric) => new Iterator[ColumnarBatch] {
+          override def hasNext: Boolean = {
+            val start = System.nanoTime()
+            try it.hasNext
+            finally metric.add(System.nanoTime() - start)
+          }
+          override def next(): ColumnarBatch = {
+            val start = System.nanoTime()
+            try it.next()
+            finally metric.add(System.nanoTime() - start)
+          }
+        }
+    }
 
   override def clearDependencies(): Unit = super.clearDependencies()
 }

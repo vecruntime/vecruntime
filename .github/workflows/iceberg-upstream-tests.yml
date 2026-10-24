@@ -1,0 +1,85 @@
+# Apache Iceberg 1.12.0's OWN Spark 4.1 test suites, run with the spark-vector plugin on its path.
+# A reproducible upstream-compatibility harness: it checks out Iceberg at apache-iceberg-1.12.0,
+# applies benchmarks/iceberg-tests/iceberg-1.12.0.patch (which injects our plugin + jars + JVM args
+# into Iceberg's Spark test bases), builds our jars, and runs the row-level-operation and write
+# suites. Iceberg's Gradle refuses any launcher JVM but 17/21, while our jars need JDK 25 at test
+# runtime -- so Gradle runs on JDK 21 with a JDK 25 test toolchain. Mirrors the setup of
+# .github/workflows/spark-sql-tests.yml (which runs Spark's own golden suite under the plugin).
+name: Iceberg upstream tests
+
+on:
+  schedule:
+    - cron: '0 4 * * *'   # nightly 04:00 UTC
+  workflow_dispatch:
+    inputs:
+      suites:
+        description: 'Space-separated fully-qualified suite classes (empty = the default set)'
+        required: false
+        default: ''
+      vecruntime_enabled:
+        description: 'Run with the plugin ON (true) or the vanilla-Iceberg baseline (false)'
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  iceberg-tests:
+    name: Iceberg 1.12.0 Spark 4.1 suites (Gradle JDK 21 / test JDK 25)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout vecruntime
+        uses: actions/checkout@v4
+
+      # JDK 21 first so JAVA_HOME points at it (Gradle launcher); JDK 25 is referenced by path.
+      - name: Set up JDK 25 (test runtime)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+      - name: Remember JDK 25 home
+        run: echo "TEST_JDK=$JAVA_HOME" >> "$GITHUB_ENV"
+
+      - name: Set up JDK 21 (Gradle launcher)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+      - name: Remember JDK 21 home
+        run: echo "GRADLE_JDK=$JAVA_HOME" >> "$GITHUB_ENV"
+
+      - name: Checkout Iceberg 1.12.0
+        uses: actions/checkout@v4
+        with:
+          repository: apache/iceberg
+          ref: apache-iceberg-1.12.0
+          path: iceberg-1.12.0
+
+      - name: Run the suites
+        env:
+          ICEBERG_SRC: ${{ github.workspace }}/iceberg-1.12.0
+          KEEP: ${{ github.workspace }}/iceberg-logs
+          M2: ${{ github.workspace }}/iceberg-logs/m2b
+          SUITES: ${{ inputs.suites }}
+          VECRUNTIME_ENABLED: ${{ inputs.vecruntime_enabled == false && 'false' || 'true' }}
+          MEM_CAP: '8G'
+        run: |
+          mkdir -p "$KEEP"
+          # The driver reads GRADLE_JDK / TEST_JDK from the env set above.
+          benchmarks/iceberg-tests/run-iceberg-tests.sh
+
+      - name: Suite reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: iceberg-upstream-tests
+          if-no-files-found: ignore
+          retention-days: 30
+          path: |
+            iceberg-logs/**/*.log
+            iceberg-1.12.0/spark/v4.1/*/build/reports/tests/**
+            iceberg-1.12.0/spark/v4.1/*/build/test-results/test/*.xml

@@ -125,7 +125,8 @@ public final class IcebergDeltaDataBridge {
                 context(write, "targetDataFileSize", Long.class),
                 props,
                 context(write, "queryId", String.class),
-                !table.spec().isUnpartitioned());
+                !table.spec().isUnpartitioned(),
+                field(write, "sortOrderId", Integer.class));
     }
 
     /**

@@ -227,6 +227,12 @@ public final class ArrowOutput {
      */
     public static ColumnVector compact(String name, DataType dt, VectorBuffers in,
             MemorySegment selection, int outCount, BufferAllocator allocator) {
+        if (isAllNullOverSelection(in, selection)) {
+            // An all-null lane over the selected rows -- in particular the INT32 placeholder a NullType
+            // column adapts to (#901 R3): emit the declared type's all-null column, independent of the
+            // placeholder lane's own width.
+            return nulls(name, dt, outCount, allocator);
+        }
         if (in.type() == VecType.UTF8) {
             if (in.isDictionaryEncoded()) {
                 return compactDictionary(name, in, selection, outCount, allocator);
@@ -689,6 +695,36 @@ public final class ArrowOutput {
     }
 
     /**
+     * Whether every row {@code in} contributes to the output is null: it has a
+     * validity bitmap and no selected row (all rows when {@code selection} is
+     * null) is valid. True for the all-null INT32 placeholder a {@link
+     * org.apache.spark.sql.types.NullType} column adapts to (#901 R3), and for
+     * any column that happens to be entirely null over the selection -- both of
+     * which a consumer emits as the destination type's all-null column rather
+     * than running a kernel over a lane whose width may not be the output's.
+     * An empty selection is dropped upstream, so a validity bitmap with no set
+     * bit over the selection means all contributing rows are null.
+     */
+    private static boolean isAllNullOverSelection(VectorBuffers in, MemorySegment selection) {
+        MemorySegment validity = in.validity();
+        if (validity == null || in.isDictionaryEncoded() || in.type().isNested()) {
+            return false;
+        }
+        int n = in.length();
+        int words = Bitmap.wordsFor(n);
+        for (int w = 0; w < words; w++) {
+            long valid = Bitmap.wordAt(validity, w, n);
+            if (selection != null) {
+                valid &= Bitmap.wordAt(selection, w, n);
+            }
+            if (valid != 0L) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
      * A column of {@code length} nulls. Used for the streamed side of the build
      * rows a full outer join emits after the last streamed batch, where there
      * is no input column to gather from.
@@ -716,6 +752,10 @@ public final class ArrowOutput {
     public static ColumnVector copy(String name, DataType dt, VectorBuffers in,
             BufferAllocator allocator) {
         int n = in.length();
+        if (isAllNullOverSelection(in, null)) {
+            // An all-null lane (the NullType placeholder, #901 R3): the declared type's all-null column.
+            return nulls(name, dt, n, allocator);
+        }
         if (in.type() == VecType.UTF8) {
             if (in.isDictionaryEncoded()) {
                 return compactDictionary(name, in, null, n, allocator);
