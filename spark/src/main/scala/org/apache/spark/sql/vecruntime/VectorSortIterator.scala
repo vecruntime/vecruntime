@@ -42,6 +42,15 @@ import org.apache.spark.sql.vectorized.{ColumnarBatch, ColumnVector}
  */
 private[vecruntime] object VectorSortIterator {
 
+  /** #999: the spill counters below, readable outside this package (the executor's memory probe). */
+  final val Cap = SortSpills.Cap
+  final val NativeRefused = SortSpills.NativeRefused
+  final val HeapRefused = SortSpills.HeapRefused
+  final val NativeRequest = SortSpills.NativeRequest
+  final val HeapRequest = SortSpills.HeapRequest
+
+  private[vecruntime] def countSpill(cause: Int, runs: Long, bytes: Long): Unit = SortSpills.count(cause, runs, bytes)
+
   /** #867: the pool the operators' native memory comes from: off-heap execution memory when Spark has one. */
   def memoryMode(conf: org.apache.spark.SparkConf): org.apache.spark.memory.MemoryMode =
     if (conf.getBoolean("spark.memory.offHeap.enabled", false)) org.apache.spark.memory.MemoryMode.OFF_HEAP
@@ -224,7 +233,11 @@ private[vecruntime] class VectorSortIterator(
    * a second time.
    */
   private val reservation: TaskNativeMemory.Reservation =
-    TaskNativeMemory.reservation(memoryMode, size => if (!draining || hasNested) 0L else spillResident(size, 0L)._1)
+    TaskNativeMemory.reservation(
+      memoryMode,
+      size =>
+        if (!draining || hasNested) 0L else countedRequest(VectorSortIterator.NativeRequest)(spillResident(size, 0L)._1)
+    )
   private def reserved: Long = if (reservation == null) 0L else reservation.held
   private var draining = false
 
@@ -249,7 +262,17 @@ private[vecruntime] class VectorSortIterator(
         org.apache.spark.memory.MemoryMode.ON_HEAP
       ) {
     override def spill(size: Long, trigger: org.apache.spark.memory.MemoryConsumer): Long =
-      if ((trigger eq this) || !draining || hasNested) 0L else spillResident(0L, size)._2
+      if ((trigger eq this) || !draining || hasNested) 0L
+      else countedRequest(VectorSortIterator.HeapRequest)(spillResident(0L, size)._2)
+  }
+
+  /** #999: runs `f` (a spill on another consumer's request) and counts the runs and bytes it spilled under `cause`. */
+  private def countedRequest(cause: Int)(f: => Long): Long = {
+    val runsBefore = spilledRuns
+    val bytesBefore = spilledBytes
+    val freed = f
+    VectorSortIterator.countSpill(cause, spilledRuns - runsBefore, spilledBytes - bytesBefore)
+    freed
   }
 
   private def holdHeap(bytes: Long): Boolean = {
@@ -410,6 +433,7 @@ private[vecruntime] class VectorSortIterator(
     /** Seals the builders into a run: plain string columns (a dictionary decoded once), the keys, the permutation. */
     def seal(): Unit = {
       if (runTotal > 0) {
+        var cause = -1
         val cols = columnBuilders.map(_.view()).map { v =>
           if (v.`type`() == VecType.UTF8 && v.isDictionaryEncoded) ArrowOutput.decodeDictionary(v, runArena) else v
         }
@@ -432,7 +456,19 @@ private[vecruntime] class VectorSortIterator(
         // Past the budget -- the cap, or what the pool grants this task (#867), native or heap side (#868) -- the
         // newest run goes to disk in sorted order and its memory is returned, then the largest resident runs until
         // the rest fit.
-        if (!hasNested && (residentBytes > spillTrigger || !hold(residentBytes) || !holdHeap(residentHeap))) {
+        if (
+          !hasNested && {
+            // #999: which budget sends the run to disk, in the order the check has always tested them.
+            cause =
+              if (residentBytes > spillTrigger) VectorSortIterator.Cap
+              else if (!hold(residentBytes)) VectorSortIterator.NativeRefused
+              else if (!holdHeap(residentHeap)) VectorSortIterator.HeapRefused
+              else -1
+            cause >= 0
+          }
+        ) {
+          val runsBefore = spilledRuns
+          val bytesBefore = spilledBytes
           runs += spill(run)
           residentBytes -= bytes
           residentHeap -= run.heapBytes
@@ -443,6 +479,7 @@ private[vecruntime] class VectorSortIterator(
             spillResident(math.max(0L, residentBytes - allowed), math.max(0L, residentHeap - heapAllowed))
           releaseTo(residentBytes)
           releaseHeapTo(residentHeap)
+          VectorSortIterator.countSpill(cause, spilledRuns - runsBefore, spilledBytes - bytesBefore)
         } else {
           // #878: a nested run is never spilled (the spill files hold lanes only), but its bytes are held in the
           // pool all the same -- a refusal is not acted on -- so the task's other consumers can be made to spill.
@@ -635,4 +672,32 @@ private[vecruntime] class VectorSortIterator(
       allocator.close()
     }
   }
+}
+
+/**
+ * #999: the sort's spills on this executor by what triggered them -- [[Cap]] its resident bytes past `spillTrigger`,
+ * [[NativeRefused]] the native reservation refused, [[HeapRefused]] the heap side (the runs' heap mirrors) refused,
+ * [[NativeRequest]] / [[HeapRequest]] another consumer of the task asking for native / heap memory -- each counted as
+ * runs and bytes spilled, so a run's memory profile says which budget sends sorts to disk.
+ */
+object SortSpills {
+  final val Cap = 0
+  final val NativeRefused = 1
+  final val HeapRefused = 2
+  final val NativeRequest = 3
+  final val HeapRequest = 4
+
+  /** The causes' names, in index order. */
+  val CauseNames: Array[String] = Array("cap", "nativeRefused", "heapRefused", "nativeRequest", "heapRequest")
+
+  private val runs = Array.fill(CauseNames.length)(new java.util.concurrent.atomic.AtomicLong())
+  private val bytes = Array.fill(CauseNames.length)(new java.util.concurrent.atomic.AtomicLong())
+
+  private[vecruntime] def count(cause: Int, spilledRuns: Long, spilledBytes: Long): Unit = if (spilledRuns > 0) {
+    runs(cause).addAndGet(spilledRuns)
+    bytes(cause).addAndGet(spilledBytes)
+  }
+
+  /** (runs, bytes) spilled for `cause` on this executor so far. */
+  def spilledBy(cause: Int): (Long, Long) = (runs(cause).get(), bytes(cause).get())
 }

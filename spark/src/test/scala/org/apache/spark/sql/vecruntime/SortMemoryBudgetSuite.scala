@@ -112,6 +112,20 @@ class SortMemoryBudgetSuite extends AnyFunSuite {
     }
   }
 
+  test("#999: a spill is counted under the budget that triggered it") {
+    val (runsBefore, _) = SortSpills.spilledBy(SortSpills.NativeRefused)
+    val (capBefore, _) = SortSpills.spilledBy(SortSpills.Cap)
+    withPool(256L * 1024) { (_, _) =>
+      val it = sorter(input)
+      check(it)
+      assert(it.spilledRuns > 0)
+      val counted = (SortSpills.spilledBy(SortSpills.NativeRefused)._1 - runsBefore) +
+        (SortSpills.spilledBy(SortSpills.Cap)._1 - capBefore)
+      assert(counted > 0, "a refused (or capped) budget sent runs to disk, and they were counted")
+      it.close()
+    }
+  }
+
   test("#867: a pool large enough keeps the partition in memory") {
     withPool(1L << 30) { (_, _) =>
       val it = sorter(input)

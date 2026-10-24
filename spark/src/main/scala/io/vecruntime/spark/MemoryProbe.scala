@@ -46,6 +46,12 @@ object MemoryProbe {
       "nativePoolLeaked" -> org.apache.spark.sql.vecruntime.TaskNativeMemory.leakedBytes,
       "pinned" -> org.apache.spark.sql.vecruntime.PinnedMemory.bytes,
       "pinnedPeak" -> org.apache.spark.sql.vecruntime.PinnedMemory.peakBytes,
+    ) ++ org.apache.spark.sql.vecruntime.SortSpills.CauseNames.indices.flatMap { i =>
+      // #999: the sort's spilled runs and bytes on this executor, by what triggered them.
+      val n = org.apache.spark.sql.vecruntime.SortSpills.CauseNames(i)
+      val (runs, bytes) = org.apache.spark.sql.vecruntime.SortSpills.spilledBy(i)
+      Seq(s"sortSpillRuns.$n" -> runs, s"sortSpillBytes.$n" -> bytes)
+    } ++ Map(
       "arrow" -> io.vecruntime.spark.arrow.VectorAllocators.allocatedBytes(),
       "arrowPeakSinceStart" -> io.vecruntime.spark.arrow.VectorAllocators.peakBytes(),
       "prefetchPeak" -> org.apache.spark.sql.vecruntime.VectorParquetScanExec.prefetchPeakBytes,
