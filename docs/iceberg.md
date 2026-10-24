@@ -174,6 +174,15 @@ resolved `SparkWriteConf`, so they override table properties exactly as in Icebe
   own row reader inside the node, converted to batches, when it does not (a nested-column scan); either way the
   other groups stay native and its rows match what Iceberg's own reader returns.
 
+The delete loader caches loaded delete files per executor, reusing Iceberg's own `SparkExecutorCache` (#857): a
+delete file referenced by many data files -- a partition-granularity position-delete file, or an equality delete
+file read through the loader -- is read and parsed once per executor and served from memory for the rest of that
+executor's data files, instead of once per data file. This is the same cache and the same knob Iceberg's own Spark
+reader uses: `spark.sql.iceberg.executor-cache.enabled` (default on), with `spark.sql.iceberg.executor-cache`
+`.timeout`, `.max-entry-size` (default 64 MiB; a larger delete file is not cached) and `.max-total-size` (default
+128 MiB). Disabling it reverts to reading each shared delete file once per data file. The cached values are only
+read, never mutated, so they are shared safely across a task's concurrent reads.
+
 The node reports how many task groups each reader read (`numNativeGroups`, `numIcebergGroups`), plus files, row
 groups and pages skipped.
 

@@ -55,6 +55,15 @@ object ParquetFileResolver {
    */
   val nativeEqualityFallbacks = new java.util.concurrent.atomic.AtomicLong()
 
+  /**
+   * #857: how many times the scan's delete loader actually OPENED a delete file to read it (read by tests). Each
+   * `InputFile` the loader's `loadInputFile` function builds bumps this once. With the per-executor delete cache
+   * on (`spark.sql.iceberg.executor-cache.enabled`, the default), a delete file shared by many data files of the
+   * same table is opened once and served from the cache thereafter; with the cache off it is opened once per data
+   * file. The regression test for #857 reads this to prove the shared delete file is loaded once per executor.
+   */
+  val deleteFileOpens = new java.util.concurrent.atomic.AtomicLong()
+
   private val IcebergResolver = "io.vecruntime.iceberg.spark.SparkParquetFileResolver"
 
   /**

@@ -1507,9 +1507,63 @@ private[vecruntime] object IcebergTasks {
     val newInputFile =
       Class.forName("org.apache.iceberg.io.FileIO", false, cl).getMethod("newInputFile", deleteFileClass)
     val fileIo = call(p, "io")
-    val open: java.util.function.Function[AnyRef, AnyRef] = d => newInputFile.invoke(fileIo, d)
+    // #857: count each actual delete-file open. BaseDeleteLoader opens a delete file only through this function,
+    // and the executor cache wraps the whole read, so with the cache on this fires once per delete file per
+    // executor (a cache miss) rather than once per data file. Tests read ParquetFileResolver.deleteFileOpens.
+    val open: java.util.function.Function[AnyRef, AnyRef] = { d =>
+      ParquetFileResolver.deleteFileOpens.incrementAndGet()
+      newInputFile.invoke(fileIo, d)
+    }
     val loaderClass = Class.forName("org.apache.iceberg.data.BaseDeleteLoader", false, cl)
-    (loaderClass, loaderClass.getConstructor(classOf[java.util.function.Function[_, _]]).newInstance(open))
+    // #857: when Iceberg's executor delete cache is enabled for this scan, build the bridge's CachingDeleteLoader,
+    // which delegates to Iceberg's own SparkExecutorCache (same conf keys, same per-table group), so a delete file
+    // shared by many data files is read and parsed once per executor instead of once per data file -- exactly as
+    // Iceberg's own reader caches it. `cacheDeleteFilesOnExecutors()` is Iceberg's already-resolved
+    // spark.sql.iceberg.executor-cache.enabled gate on the partition; `getOrCreate()` returns the shared cache only
+    // while enabled. Any linkage failure (a relocated/unrelocated Iceberg the bridge class cannot bind to, #989)
+    // falls back to the plain loader, which is correct, just uncached.
+    val caching = cachingDeleteLoader(p, cl, open)
+    (
+      loaderClass,
+      caching.getOrElse(loaderClass.getConstructor(classOf[java.util.function.Function[_, _]]).newInstance(open))
+    )
+  }
+
+  /**
+   * #857: the bridge's `CachingDeleteLoader` (a `BaseDeleteLoader` backed by Iceberg's per-executor
+   * `SparkExecutorCache`), or None when the executor cache is disabled for this scan or the bridge class cannot be
+   * bound against the Iceberg on the partition's classpath. The cache group is the table name, matching Iceberg's
+   * own reader, so entries are scoped and invalidated per table.
+   */
+  private def cachingDeleteLoader(
+      p: InputPartition,
+      cl: ClassLoader,
+      open: java.util.function.Function[AnyRef, AnyRef]
+  ): Option[AnyRef] = {
+    // Iceberg's own resolved spark.sql.iceberg.executor-cache.enabled gate for this scan.
+    val enabled =
+      try call(p, "cacheDeleteFilesOnExecutors").asInstanceOf[java.lang.Boolean].booleanValue()
+      catch { case _: ReflectiveOperationException => false }
+    if (!enabled) return None
+    try {
+      val cacheClass = Class.forName("org.apache.iceberg.spark.SparkExecutorCache", false, cl)
+      // getOrCreate() builds the cache from the session's executor-cache conf, or returns null if disabled; it is
+      // the same singleton Iceberg's reader uses, so the two readers share one bounded per-executor cache.
+      val cache = cacheClass.getMethod("getOrCreate").invoke(null)
+      if (cache == null) return None
+      val group = call(call(p, "table"), "name").toString
+      val caching = Class.forName("io.vecruntime.iceberg.bridge.CachingDeleteLoader", true, cl)
+      Some(
+        caching
+          .getConstructor(classOf[java.util.function.Function[_, _]], cacheClass, classOf[String])
+          .newInstance(open, cache, group)
+      )
+    } catch {
+      // No bridge class, or an Iceberg whose relocation the bridge class was not compiled against (#989): use the
+      // plain uncached loader. Correctness is unaffected -- only the per-executor reuse is lost.
+      case _: ClassNotFoundException | _: NoClassDefFoundError | _: LinkageError => None
+      case _: ReflectiveOperationException => None
+    }
   }
 
   /** The scanned table's current schema (an `org.apache.iceberg.Schema`, serializable), the ids eq-deletes use. */
