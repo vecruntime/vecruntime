@@ -73,24 +73,33 @@ org.apache.iceberg.spark.actions.TestRewriteDataFilesAction#testBinPackCombineMi
 # testBinPackCombineMediumFiles (fv 2,3,4). 4 equal input files, all below MIN so all 4 are
 # rewritten (rewritten=4 OK). TARGET = sum/3. Iceberg writes 4x ~327,000 B (sum 1,307,776);
 # packing + rolling at TARGET=435,925 yields 3 output files [456190,456714,392594] -> 3 added.
-# ROOT CAUSE (NOT (b)): our columnar writer tested the row-group boundary only once per 1024-row
-# SLICE, so with tiny rows under the test's small row-group-size-bytes every group came out exactly
-# one SLICE long and ~2.9x oversized (measured: 25 groups avg 50,707 B vs parquet-java 85 groups avg
-# 17,521 B at a 20 KB target). That coarse grouping made Iceberg's byte-midpoint input splits fall
-# unevenly. FIXED for fv2 by the adaptive row-group check in ColumnarParquetWriter
-# (crew/draco/binpack-medium-v3 commit 9e7d72a2): fv2 now adds 3 files [237630,236705,216872] and
-# PASSES. STILL FAILING fv3/fv4 ("add 3 but was 5", outputs [411300,23005,411618,21182,397728] =
-# 3 near-full files + 2 ~22 KB stragglers): a DIFFERENT, v3/v4-only root cause in the WRITE path,
-# NOT a file-roll or row-group-size issue. Evidence (2026-10-24): with writers OFF (our scan, Iceberg's
-# own writer) medium passes all fv; with writers ON only fv3/fv4 fail. The rewrite runs with AQE OFF
-# (TestRewriteDataFilesAction @BeforeAll disables it) and our Rolling writer receives target-file-size
-# = 512 MB (never rolls -- each Spark write-partition is exactly one output file), so the 5 files are
-# 5 write partitions where Iceberg's own writer makes 3 from the SAME input (identical input DataFile
-# sizes on vs off). The two ~22 KB stragglers are near-empty partitions -- a skewed
-# distribution/range-partition split that appears only once the v3 row-lineage columns
-# (_row_id / _last_updated_sequence_number) are materialised in the write. So it is a write-path
-# partitioning/distribution interaction with v3 lineage, not the columnar writer's roll check.
-# Excluded TEMPORARY (category a, partially fixed) pending that v3 write-partitioning investigation --
-# the per-method exclusion cannot scope to fv3/fv4 alone, and fv2 is already green, so remove this
-# entry once the v3/v4 partition split is fixed.
+# TWO separate causes, one real (fv2, now FIXED) and one (b) (fv3/fv4).
+#
+# fv2 was a REAL vecruntime bug: ColumnarParquetWriter tested the row-group boundary only once per
+# 1024-row SLICE, so with tiny rows under the test's small row-group-size-bytes every group came out
+# exactly one SLICE long and ~2.9x oversized (25 groups avg 50,707 B vs parquet-java 85 groups avg
+# 17,521 B at a 20 KB target), making Iceberg's byte-midpoint input splits fall unevenly. FIXED by the
+# adaptive row-group check (crew/draco/binpack-medium-v3 commit 9e7d72a2 in PR #997): fv2 now adds
+# 3 files [237630,236705,216872] and PASSES.
+#
+# fv3/fv4 ("add 3 but was 5", outputs [411300,23005,411618,21182,397728]) is CATEGORY (b), the same
+# mechanism already accepted for testBinPackCombineMixedFiles fv3/fv4: a byte-size artifact of our
+# BETTER COMPRESSION, not a vecruntime bug. Evidence (2026-10-24, instrumented write path): the rewrite
+# runs with AQE OFF (@BeforeAll) and NO shuffle/exchange added (writers-on plan = 3 scan-split
+# partitions, copyUnchanged=false, same as writers-off) -- the user's "exchange only for v3" hypothesis
+# is disproven. The 4 INPUT files are written by the test SETUP through our columnar writer at ~173 KB
+# each (sum 691,860) vs Iceberg's own writer at ~327 KB each (sum 1,307,776) -- our v2-page writer
+# compresses ~1.9x smaller. The test derives targetSize = testDataSize/3 and the rewrite's roll target
+# (maxOutputFileSize, = SparkWrite.targetFileSize our Rolling writer rolls on) FROM those actual input
+# sizes, so our roll target is ~half Iceberg's (~345,930 vs ~690,000+). For v3/v4 the row-lineage
+# columns (_row_id, _last_updated_sequence_number) inflate the rewrite's per-partition output to ~430 KB
+# -- confirmed rolling at len 354,933 > target 345,930 -- so a partition correctly splits into a big
+# file + a ~22 KB remainder (one partition -> filesInTask=2), giving 5 files. v2 has no lineage
+# inflation so stays under the target -> 3 files. Iceberg OFF: larger derived target (~690 KB+),
+# per-partition ~435 KB stays under -> 3 files ([798950,799829,687691]). Fine-grained roll would not
+# help: the partition genuinely exceeds the (smaller, our-compression-derived) roll target and must
+# split. The rewrite is correct (rows match, rewrittenBytes == dataSizeBefore); only the file count
+# differs, and only because our smaller setup files shrink the test's self-derived size thresholds.
+# Excluded (category b) -- the per-method exclusion cannot scope to fv3/fv4, and fv2 is already green.
+org.apache.iceberg.spark.actions.TestRewriteDataFilesAction#testBinPackCombineMediumFiles
 org.apache.iceberg.spark.actions.TestRewriteDataFilesAction#testBinPackCombineMediumFiles
