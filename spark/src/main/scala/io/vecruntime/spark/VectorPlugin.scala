@@ -116,6 +116,11 @@ class VectorPlugin extends SparkPlugin {
         "nativePoolRetainedBytes" -> (() => io.vecruntime.kernels.NativePool.shared().retainedBytes()),
         "nativePoolOverdraftBytes" -> (() => org.apache.spark.sql.vecruntime.TaskNativeMemory.overdraftBytes),
         "nativePoolLeakedBytes" -> (() => org.apache.spark.sql.vecruntime.TaskNativeMemory.leakedBytes),
+        // #924 step 2: memory no task owns, held as storage memory, and what storage could not grant.
+        "nativePoolExecutorBytes" -> (() => org.apache.spark.sql.vecruntime.TaskNativeMemory.executorBytes),
+        "nativePoolExecutorShortfallBytes" -> (() =>
+          org.apache.spark.sql.vecruntime.TaskNativeMemory.executorShortfallBytes
+        ),
         // #915: the scan's read-ahead held in execution memory, its peak, and the grants the pool refused.
         "scanReadAheadHeldBytes" -> (() => org.apache.spark.sql.vecruntime.VectorParquetScanExec.readAheadHeldBytes),
         "scanReadAheadPeakBytes" -> (() => org.apache.spark.sql.vecruntime.VectorParquetScanExec.readAheadPeakBytes),

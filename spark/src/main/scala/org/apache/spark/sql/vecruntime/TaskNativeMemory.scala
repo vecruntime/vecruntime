@@ -54,6 +54,12 @@ object TaskNativeMemory extends org.apache.spark.internal.Logging {
   /** Bytes still charged when their task completed (an arena not closed), summed so far. */
   def leakedBytes: Long = leaked.get()
 
+  /** #924: memory no task owns, charged to the executor's account now. */
+  def executorBytes: Long = ExecutorAccount.chargedBytes
+
+  /** #924: the executor account's largest shortfall: bytes past what storage memory granted. */
+  def executorShortfallBytes: Long = ExecutorAccount.shortfallBytes
+
   /**
    * #940 debug mode: with `-Dvecruntime.pool.leakTrace=N` (N >= 1) one task attempt in N records where each of its
    * arenas was opened; at its completion the arenas still charged are logged, grouped by opening site, and an arena
@@ -136,9 +142,74 @@ object TaskNativeMemory extends org.apache.spark.internal.Logging {
 
   /** The account of the task running on this thread, opened on first use; null off a task thread. */
   def current(): NativePool.Account = {
-    if (unaccountedDepth.get()(0) > 0) return null
+    if (unaccountedDepth.get()(0) > 0) return executorOrNull
     val tc = TaskContext.get()
-    if (tc == null || tc.taskMemoryManager() == null) null else accountOf(tc, VectorSortIterator.memoryMode())
+    if (tc == null || tc.taskMemoryManager() == null) executorOrNull
+    else accountOf(tc, VectorSortIterator.memoryMode())
+  }
+
+  /**
+   * #924 step 2: whether memory no task owns -- pool blocks and Arrow buffers opened off any task thread (the
+   * Flight server's), and what [[unaccounted]] builds (a broadcast's shared table) -- is charged to the
+   * [[ExecutorAccount]]. On by default; `-Dvecruntime.pool.executorAccount=false` leaves it uncharged, as before.
+   */
+  @volatile private[vecruntime] var executorAccountEnabled: Boolean =
+    java.lang.Boolean.parseBoolean(System.getProperty("vecruntime.pool.executorAccount", "true"))
+
+  private def executorOrNull: NativePool.Account = if (executorAccountEnabled) ExecutorAccount else null
+
+  /**
+   * #924 step 2: the executor's own account, for memory that outlives every task by design. Spark grants execution
+   * memory only to a task attempt, so these bytes are held as off-heap (or on-heap, in the sort's mode) STORAGE
+   * memory under a block id of their own -- the pool Spark already uses for memory that outlives tasks (cached and
+   * broadcast blocks): it shrinks what execution can borrow exactly as a cached block does. Acquired in
+   * [[Chunk]] steps as the bytes grow and given back past a chunk of slack as they shrink; what storage cannot grant
+   * is recorded as overdraft, never refused (a block is already handed out when it is charged).
+   */
+  private[vecruntime] object ExecutorAccount extends NativePool.Account {
+    private val blockId = org.apache.spark.storage.TestBlockId("vecruntime-executor-native-pool")
+    private var charged = 0L
+    private var acquired = 0L
+    private var shortfall = 0L
+
+    /** Bytes charged to the executor now. */
+    def chargedBytes: Long = synchronized(charged)
+
+    /** Bytes held in Spark's storage memory for them. */
+    def acquiredBytes: Long = synchronized(acquired)
+
+    /** The largest shortfall so far: bytes charged past what storage granted. */
+    def shortfallBytes: Long = synchronized(shortfall)
+
+    private def memoryManager: org.apache.spark.memory.MemoryManager = {
+      val o = memoryManagerForTests
+      if (o != null) return o
+      val env = org.apache.spark.SparkEnv.get
+      if (env == null) null else env.memoryManager
+    }
+
+    /** The memory manager to hold storage in instead of SparkEnv's (tests). */
+    @volatile private[vecruntime] var memoryManagerForTests: org.apache.spark.memory.MemoryManager = null
+
+    override def charge(bytes: Long): Unit = synchronized {
+      charged += bytes
+      if (charged > acquired) {
+        val mm = memoryManager
+        val step = math.max(charged - acquired, Chunk)
+        if (mm != null && mm.acquireStorageMemory(blockId, step, VectorSortIterator.memoryMode())) acquired += step
+        if (charged > acquired) shortfall = math.max(shortfall, charged - acquired)
+      }
+    }
+
+    override def credit(bytes: Long): Unit = synchronized {
+      charged -= bytes
+      val keep = math.max(charged, 0L) + Chunk
+      if (acquired > keep + Chunk) {
+        val mm = memoryManager
+        if (mm != null) mm.releaseStorageMemory(acquired - keep, VectorSortIterator.memoryMode())
+        acquired = keep
+      }
+    }
   }
 
   /**

@@ -428,10 +428,56 @@ class SortMemoryBudgetSuite extends AnyFunSuite {
     } finally TaskNativeMemory.leakTraceEvery = every
   }
 
-  test("#869: no task, no account: an arena opened off a task thread charges nothing") {
+  test("#869: no task, no account: an arena opened off a task thread charges no task") {
     TaskNativeMemory.install()
-    try assert(TaskNativeMemory.current() === null)
-    finally TaskNativeMemory.uninstall()
+    val was = TaskNativeMemory.executorAccountEnabled
+    try {
+      TaskNativeMemory.executorAccountEnabled = false
+      assert(TaskNativeMemory.current() === null)
+      TaskNativeMemory.executorAccountEnabled = true
+      assert(TaskNativeMemory.current() eq TaskNativeMemory.ExecutorAccount, "#924: the executor's own account")
+    } finally {
+      TaskNativeMemory.executorAccountEnabled = was
+      TaskNativeMemory.uninstall()
+    }
+  }
+
+  test("#924: memory no task owns is held in storage memory, and returned when freed") {
+    val mm = new UnifiedMemoryManager(new SparkConf(false), 1L << 30, 0L, 1)
+    val ex = TaskNativeMemory.ExecutorAccount
+    ex.memoryManagerForTests = mm
+    TaskNativeMemory.install()
+    try {
+      val base = ex.chargedBytes
+      // Off any task thread (a Flight server's): the executor's.
+      var offTask: java.lang.foreign.Arena = null
+      val t = new Thread(() => {
+        offTask = io.vecruntime.kernels.NativePool.shared().newArena()
+        offTask.allocate(4L << 20, 8)
+      })
+      t.start(); t.join()
+      assert(ex.chargedBytes - base >= (4L << 20))
+      assert(mm.storageMemoryUsed >= (4L << 20), "held as storage memory")
+      assert(mm.executionMemoryUsed === 0L, "not as any task's execution memory")
+      // On a task thread, built unaccounted (a broadcast's shared table): the executor's too, not the task's.
+      withPool(1L << 30) { (tmm, _) =>
+        TaskNativeMemory.install() // withPool turns the accounting off for its body
+        val shared = TaskNativeMemory.unaccounted {
+          val a = io.vecruntime.kernels.NativePool.shared().newArena()
+          a.allocate(4L << 20, 8)
+          a
+        }
+        assert(tmm.getMemoryConsumptionForThisTask() === 0L)
+        assert(ex.chargedBytes - base >= (8L << 20))
+        shared.close() // the cleaner may close it on any thread; the executor's account is credited
+      }
+      offTask.close()
+      assert(ex.chargedBytes === base)
+      assert(mm.storageMemoryUsed <= 2 * TaskNativeMemory.Chunk, "given back past a chunk of slack")
+    } finally {
+      ex.memoryManagerForTests = null
+      TaskNativeMemory.uninstall()
+    }
   }
 
   test("#869: with the pool's accounting on, a pool too small still makes the sort spill, and all is returned") {

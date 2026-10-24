@@ -44,6 +44,8 @@ object MemoryProbe {
       "nativePoolRetained" -> pool.retainedBytes(),
       "nativePoolOverdraft" -> org.apache.spark.sql.vecruntime.TaskNativeMemory.overdraftBytes,
       "nativePoolLeaked" -> org.apache.spark.sql.vecruntime.TaskNativeMemory.leakedBytes,
+      "nativePoolExecutor" -> org.apache.spark.sql.vecruntime.TaskNativeMemory.executorBytes,
+      "nativePoolExecutorShortfall" -> org.apache.spark.sql.vecruntime.TaskNativeMemory.executorShortfallBytes,
       "pinned" -> org.apache.spark.sql.vecruntime.PinnedMemory.bytes,
       "pinnedPeak" -> org.apache.spark.sql.vecruntime.PinnedMemory.peakBytes,
       "arrow" -> io.vecruntime.spark.arrow.VectorAllocators.allocatedBytes(),
