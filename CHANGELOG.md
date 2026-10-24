@@ -164,9 +164,24 @@ OOM-killed executors at 1 TB.
 
 ### Fixed
 
-- The native Parquet scan's codec factory released only itself, never the zstd decompress contexts it handed
-  out per column chunk, so native memory grew until Kubernetes OOM-killed the executors at 1 TB (#828); a
-  test now checks every codec's decompressor is released (#829).
+- A copy-on-write `DELETE` / `UPDATE` whose table requests write-side coalescing (AQE `coalescePartitions`
+  on plus a large `spark.sql.iceberg.advisory-partition-size`, as Iceberg's own write would use to fuse many
+  small shuffle blocks into one file) now honours Iceberg's REBALANCE distribution instead of forcing the
+  M4a copy path's `_file` hash, so AQE coalesces the rewrite into a single added data file the way Iceberg
+  does (Apache Iceberg 1.12 `TestDelete`/`TestUpdate#testCoalesce{Delete,Update}`, snapshot
+  `added-data-files` 1, not one file per source file). The ordinary copy case -- no coalescing, or the small
+  default write advisory the copy-unchanged path relies on to keep files separate -- keeps the `_file`
+  override, so the byte-copy fast path is unchanged.
+- The columnar copy-on-write rewrite writer now stamps the table's sort order id on the data files it writes
+  (`IcebergRewriteFileTaskWriter`), as Iceberg's `SparkWrite` does, instead of leaving them unsorted
+  (`sortOrderId` 0). The streaming full-rewrite writer already did this (#964); the copy path matched it only
+  after this fix (Apache Iceberg 1.12 `TestCopyOnWrite*#testCopyOnWrite*SetsSortOrderIdOnRewrittenDataFiles`).
+- The columnar bin-pack rewrite (#967 M4c) now packs copied row groups to Iceberg's own input split size
+  (`RewriteFileGroup.inputSplitSize()`), not the larger max-output roll cap, and declines the byte copy for a
+  whole file group when a file holds a row group larger than that split size -- a case Iceberg handles by
+  decoding and splitting the file, which a whole-row-group copy cannot reproduce -- so the compacted layout
+  matches Iceberg's own `rewrite_data_files` for mixed-size inputs (Apache Iceberg 1.12
+  `TestRewriteDataFilesAction#testBinPackCombineMixedFiles`).
 
 ### Documentation
 
